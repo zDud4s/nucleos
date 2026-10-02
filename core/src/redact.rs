@@ -55,6 +55,7 @@ pub(crate) fn scan_secrets(input: &str) -> Vec<Finding> {
     findings.extend(json_web_tokens(input));
     findings.extend(bearer_tokens(input));
     findings.extend(daemon_tokens(input));
+    findings.extend(nucleos_secrets(input));
     findings.extend(checksummed_numbers(input));
 
     // Earliest first; on a tie the longest wins, so an enclosing block swallows what is inside it.
@@ -338,9 +339,11 @@ fn bearer_tokens(input: &str) -> Vec<Finding> {
 }
 
 /// The daemon's own credentials, as `auth.rs` mints them: `api:<name>.<secret>`,
-/// `team:<id>.<secret>` and `chat:<id>.<secret>`, where the secret is 32 alphanumerics. Matched on
-/// the marker plus the secret's shape; a bare `<id>.<secret>` or `<service>.<secret>` has nothing
-/// recognisable besides the 32-character tail, so it is left to the generic rules.
+/// `team:<id>.<secret>` and `chat:<id>.<secret>`, where the secret is 32 alphanumerics (minted
+/// before the `nos_` prefix) or `nos_<kind>_<32 alnum>` (since). Matched on the marker plus the
+/// secret's shape, so the whole key goes, name and all. Every other family — a run's
+/// `<id>.<secret>`, a sidecar's `<service>.<secret>`, the control token — is caught by
+/// [`nucleos_secrets`] on its prefix alone.
 fn daemon_tokens(input: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     for marker in ["api:", "team:", "chat:"] {
@@ -359,7 +362,9 @@ fn daemon_tokens(input: &str) -> Vec<Finding> {
                     .next_back()
                     .is_some_and(is_token_character);
             let secret_ok = candidate.rsplit_once('.').is_some_and(|(_, secret)| {
-                secret.len() >= 32 && secret.bytes().all(|b| b.is_ascii_alphanumeric())
+                let legacy =
+                    secret.len() >= 32 && secret.bytes().all(|b| b.is_ascii_alphanumeric());
+                legacy || nucleos_secret_len(secret) == Some(secret.len())
             });
             if boundary && secret_ok {
                 findings.push(Finding {
@@ -372,6 +377,55 @@ fn daemon_tokens(input: &str) -> Vec<Finding> {
         }
     }
     findings
+}
+
+/// Every secret `auth::mint_secret` produces: `nos_<kind>_<random>`, with `kind` 2 to 8 lowercase
+/// letters and at least 32 alphanumerics of random after it. High-confidence on its own, like
+/// `ghp_`: nothing ordinary has that shape, so no trigger word is needed and none of `file.rs`,
+/// `v1.2` or a `nos_` identifier in code with a short tail can match.
+///
+/// **Deliberately no rule for the bare legacy forms.** A run key minted before the prefix was
+/// `<id>.<32 alnum>` and a sidecar key `<service>.<32 alnum>` — indistinguishable from a dotted
+/// name with a long random-looking tail, and a pattern for them would redact ordinary text far
+/// more often than it caught a key. They are not worth that: run keys die with their run, and
+/// sidecar and conversation keys are re-minted (now prefixed) on the next start or turn, so the
+/// bare ones rotate out on their own. The one long-lived exception is a control token or API key
+/// created before the prefix; re-minting it is the owner's call, not this file's.
+fn nucleos_secrets(input: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut from = 0;
+    while let Some(relative) = input[from..].find(crate::auth::SECRET_PREFIX) {
+        let start = from + relative;
+        let boundary = start == 0
+            || !input[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_token_character);
+        if boundary && let Some(len) = nucleos_secret_len(&input[start..]) {
+            findings.push(Finding {
+                start,
+                end: start + len,
+                label: "[SECRET:nucleos-token]",
+            });
+        }
+        from = start + crate::auth::SECRET_PREFIX.len();
+    }
+    findings
+}
+
+/// How many bytes of `text`, from its start, are a `nos_<kind>_<32+ alnum>` secret, if it opens
+/// with one.
+fn nucleos_secret_len(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix(crate::auth::SECRET_PREFIX)?;
+    let kind = rest.bytes().take_while(u8::is_ascii_lowercase).count();
+    if !(2..=8).contains(&kind) || rest.as_bytes().get(kind) != Some(&b'_') {
+        return None;
+    }
+    let random = rest[kind + 1..]
+        .bytes()
+        .take_while(u8::is_ascii_alphanumeric)
+        .count();
+    (random >= 32).then_some(crate::auth::SECRET_PREFIX.len() + kind + 1 + random)
 }
 
 fn is_token_character(character: char) -> bool {
@@ -838,6 +892,66 @@ mod tests {
             redact_secrets("api:deploy-bot is a name"),
             "api:deploy-bot is a name"
         );
+    }
+
+    /// `auth::mint_secret`'s `nos_<kind>_<32 alnum>`, found on its prefix alone wherever it sits:
+    /// in prose, as a JSON value, in a header, behind a run id's `<id>.`, and inside the marker
+    /// families, where the whole key goes rather than just its tail.
+    #[test]
+    fn prefixed_nucleos_secrets_are_redacted_wherever_they_appear() {
+        let random = "Zq9".repeat(11);
+        let secret = format!("nos_run_{random}");
+        for (input, expected) in [
+            (
+                format!("the key is {secret}, keep it"),
+                "the key is [SECRET:nucleos-token], keep it".to_owned(),
+            ),
+            (
+                format!(r#"{{"token":"{secret}","n":1}}"#),
+                r#"{"token":"[SECRET:nucleos-token]","n":1}"#.to_owned(),
+            ),
+            (
+                format!("NUCLEOS_DAEMON_TOKEN=42.{secret}"),
+                "NUCLEOS_DAEMON_TOKEN=42.[SECRET:nucleos-token]".to_owned(),
+            ),
+            (
+                format!("x-api-key: nos_ctl_{random}"),
+                "x-api-key: [SECRET:nucleos-token]".to_owned(),
+            ),
+            (
+                format!("use api:deploy-bot.nos_api_{random} now"),
+                "use [SECRET:nucleos-token] now".to_owned(),
+            ),
+            (
+                format!("use chat:c-1.nos_chat_{random} now"),
+                "use [SECRET:nucleos-token] now".to_owned(),
+            ),
+        ] {
+            assert_eq!(redact_secrets(&input), expected, "{input}");
+        }
+        let r = redact_secrets(&format!("Authorization: Bearer {secret}"));
+        assert!(!r.contains(&random), "{r}");
+    }
+
+    /// The shape is what makes the prefix safe without a trigger word, so everything short of it
+    /// is ordinary text: filenames and versions, a `nos_` identifier with a short tail, a kind
+    /// that is not lowercase letters, the prefix inside a longer word, and - deliberately - a
+    /// legacy bare run key, which has no marker to find.
+    #[test]
+    fn text_that_only_resembles_a_nucleos_secret_is_left_alone() {
+        let long = "a".repeat(40);
+        for input in [
+            "see file.rs and v1.2 for details".to_owned(),
+            "nos_run_short".to_owned(),
+            "call nos_helper_fn() here".to_owned(),
+            format!("nos_x_{long}"),
+            format!("nos_toolongkind_{long}"),
+            format!("nos__{long}"),
+            format!("casinos_run_{long}"),
+            "42.abcdefghijklmnopqrstuvwxyzABCDEF is a legacy run key".to_owned(),
+        ] {
+            assert_eq!(redact_secrets(&input), input);
+        }
     }
 
     #[test]

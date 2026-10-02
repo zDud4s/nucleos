@@ -12,12 +12,43 @@ use crate::state::AppState;
 #[derive(Clone)]
 pub struct Token(pub String);
 
-pub fn generate_token() -> String {
+/// 32 random alphanumerics, with no marker. The raw material of every credential below; nothing
+/// the daemon hands out should be this bare string any more — see [`mint_secret`].
+fn generate_token() -> String {
     rand::rng()
         .sample_iter(&rand::distr::Alphanumeric)
         .take(32)
         .map(char::from)
         .collect()
+}
+
+/// The marker every secret this daemon mints opens with, the way GitHub's open with `ghp_`.
+///
+/// It exists for `redact.rs`. Before it, a run key was `<run_id>.<32 alnum>` and a sidecar key
+/// `<service>.<32 alnum>` — nothing in either that a scanner could tell from `file.rs` with a long
+/// tail, so the redactor could only catch the families that happened to carry `api:`/`team:`/
+/// `chat:`. With it, every key is recognisable on its own, wherever it lands in a log.
+pub const SECRET_PREFIX: &str = "nos_";
+
+/// A fresh secret of one family: `nos_<kind>_<32 alnum>`.
+///
+/// The marker goes in the SECRET half, never in front of the whole key, so the `<id>.` /
+/// `api:<name>.` / `team:<id>.` / `chat:<id>.` structure `resolve` splits on is untouched. And
+/// because what is stored is exactly this string, verification needs no change of its own: a new
+/// key's secret compares against a new stored value, and a key minted before the prefix existed
+/// still compares against the bare value stored beside it. Nothing is rewritten, so nothing that
+/// already works stops working; the bare keys retire as their runs end and their rows are
+/// re-minted.
+///
+/// `kind` is a short lowercase tag naming the family (`ctl`, `run`, `api`, ...), 2 to 8 letters,
+/// which is the shape `redact::nucleos_secrets` looks for. It is never parsed back: it is there so
+/// a person reading a redaction knows what leaked, nothing more.
+pub fn mint_secret(kind: &str) -> String {
+    debug_assert!(
+        (2..=8).contains(&kind.len()) && kind.bytes().all(|b| b.is_ascii_lowercase()),
+        "secret kind {kind:?} must be 2-8 lowercase letters"
+    );
+    format!("{SECRET_PREFIX}{kind}_{}", generate_token())
 }
 
 /// Generates an RFC 9562 UUID version 4 without adding a second randomness dependency.
@@ -522,13 +553,13 @@ fn path_matches(pattern: &str, path: &str, target: Target) -> bool {
 /// The id travels in the token so the lookup is by primary key rather than by the secret itself,
 /// which keeps the comparison in Rust — and constant-time — instead of in SQLite's `=`.
 pub fn mint_run_token(id: i64) -> (String, String) {
-    let secret = generate_token();
+    let secret = mint_secret("run");
     (format!("{id}.{secret}"), secret)
 }
 
 /// A durable API key and the secret stored for it: `api:<name>.<secret>`.
 pub fn mint_api_token(name: &str) -> (String, String) {
-    let secret = generate_token();
+    let secret = mint_secret("api");
     (format!("api:{name}.{secret}"), secret)
 }
 
@@ -659,7 +690,7 @@ const TEAM_ROUTES: &[(Method, &str)] = &[
 /// established, so the comment saying the prefix "picks the table without a second marker" now
 /// names four families instead of three.
 pub fn mint_team_token(team_run_id: &str) -> (String, String) {
-    let secret = generate_token();
+    let secret = mint_secret("team");
     (format!("team:{team_run_id}.{secret}"), secret)
 }
 
@@ -708,7 +739,7 @@ pub async fn mint_service_token(
     pool: &sqlx::SqlitePool,
     service: Service,
 ) -> Result<String, sqlx::Error> {
-    let secret = generate_token();
+    let secret = mint_secret("svc");
     sqlx::query("INSERT OR REPLACE INTO service_tokens (name, token) VALUES (?, ?)")
         .bind(service.name())
         .bind(&secret)
@@ -729,7 +760,7 @@ pub async fn mint_chat_token(
     pool: &sqlx::SqlitePool,
     chat_id: &str,
 ) -> Result<String, sqlx::Error> {
-    let secret = generate_token();
+    let secret = mint_secret("chat");
     sqlx::query("INSERT OR REPLACE INTO chat_tokens (chat_id, token) VALUES (?, ?)")
         .bind(chat_id)
         .bind(&secret)
@@ -751,7 +782,8 @@ async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
     // others take everything before the FIRST dot as their prefix, which is safe for a fixed
     // service name and for an integer, and is not safe for a conversation id: ids are UUIDs today,
     // but a dotted one would silently become somebody else's lookup rather than a failed one. The
-    // secret is `generate_token`'s alphanumerics and can never hold a dot, so the last one is
+    // secret is `mint_secret`'s `nos_<kind>_` plus alphanumerics (or, for a key minted before the
+    // prefix, the alphanumerics alone) and can never hold a dot, so the last one is
     // always the separator.
     if let Some(rest) = presented.strip_prefix("chat:") {
         let (chat_id, secret) = rest.rsplit_once('.')?;
@@ -3169,5 +3201,126 @@ mod tests {
                 "{method} {uri}"
             );
         }
+    }
+
+    /// Every family the daemon mints now carries `nos_<kind>_`, in the secret half, with the
+    /// lookup structure in front of it exactly as it was — and the redactor recognises each one
+    /// without help, including the run and service keys that used to be a bare `<id>.<secret>`.
+    #[tokio::test]
+    async fn every_minted_key_carries_the_prefix_and_is_redacted_whole() {
+        let state = test_state("control-token").await;
+        let (run, run_secret) = mint_run_token(42);
+        let (api, api_secret) = mint_api_token("deploy-bot");
+        let (team, team_secret) = mint_team_token("tr-1");
+        let service = mint_service_token(&state.pool, Service::Email)
+            .await
+            .unwrap();
+        let chat = mint_chat_token(&state.pool, "c-1").await.unwrap();
+        let control = mint_secret("ctl");
+
+        assert!(run.starts_with("42.nos_run_"), "{run}");
+        assert!(api.starts_with("api:deploy-bot.nos_api_"), "{api}");
+        assert!(team.starts_with("team:tr-1.nos_team_"), "{team}");
+        assert!(service.starts_with("email.nos_svc_"), "{service}");
+        assert!(chat.starts_with("chat:c-1.nos_chat_"), "{chat}");
+        assert!(control.starts_with("nos_ctl_"), "{control}");
+        for secret in [&run_secret, &api_secret, &team_secret] {
+            assert!(secret.starts_with(SECRET_PREFIX), "{secret}");
+            assert!(
+                !secret.contains('.'),
+                "the separator must stay unambiguous: {secret}"
+            );
+        }
+
+        for key in [&run, &api, &team, &service, &chat, &control] {
+            let redacted = crate::redact::redact_secrets(&format!("leaked {key} here"));
+            assert!(
+                redacted.contains("[SECRET:nucleos-token]"),
+                "{key} was not redacted: {redacted}"
+            );
+            let secret = key.rsplit('.').next().unwrap();
+            assert!(!redacted.contains(secret), "{redacted}");
+        }
+    }
+
+    /// Backward compatibility, the hard constraint of the prefix: a key minted before it — a bare
+    /// 32-alphanumeric secret stored, and presented in the old shape — must still resolve to the
+    /// scope it always did, for every family. Nothing was migrated, so nothing may stop working.
+    #[tokio::test]
+    async fn keys_minted_before_the_prefix_still_resolve() {
+        let bare = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
+        assert_eq!(bare.len(), 32);
+
+        // The control token, as an older daemon stored it.
+        let state = test_state(bare).await;
+        assert_eq!(resolve(&state, bare).await, Some(Scope::Control));
+
+        // A run.
+        let (run_id, _) = running_run_with_token(&state).await;
+        sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
+            .bind(bare)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve(&state, &format!("{run_id}.{bare}")).await,
+            Some(Scope::Run(run_id))
+        );
+
+        // An API key somebody pasted into a script months ago.
+        sqlx::query(
+            "INSERT INTO api_tokens (name, token, access_level, created_at)
+             VALUES ('old-bot', ?, 'read-only', '2026-01-01T00:00:00Z')",
+        )
+        .bind(bare)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            resolve(&state, &format!("api:old-bot.{bare}")).await,
+            Some(Scope::ApiToken(ApiTokenLevel::ReadOnly))
+        );
+
+        // A team run still working when the daemon was upgraded.
+        live_team_run_with_token(&state, "tr-old").await;
+        sqlx::query("UPDATE team_runs SET token = ? WHERE id = 'tr-old'")
+            .bind(bare)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve(&state, &format!("team:tr-old.{bare}")).await,
+            Some(Scope::TeamRun("tr-old".to_owned()))
+        );
+
+        // A sidecar's key, from the row an older daemon left behind.
+        sqlx::query("INSERT OR REPLACE INTO service_tokens (name, token) VALUES ('email', ?)")
+            .bind(bare)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve(&state, &format!("email.{bare}")).await,
+            Some(Scope::Service(Service::Email))
+        );
+
+        // A conversation's key, held by a CLI spawned before the upgrade.
+        sqlx::query("INSERT OR REPLACE INTO chat_tokens (chat_id, token) VALUES ('c-old', ?)")
+            .bind(bare)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let turn = running_turn_of(&state, "c-old").await;
+        assert_eq!(
+            resolve(&state, &format!("chat:c-old.{bare}")).await,
+            Some(Scope::Run(turn))
+        );
+
+        // And the prefix is no master key: a bare row does not answer to the marker glued on.
+        assert_eq!(
+            resolve(&state, &format!("{run_id}.nos_run_{bare}")).await,
+            None
+        );
     }
 }

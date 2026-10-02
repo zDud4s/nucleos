@@ -2133,7 +2133,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                         format!(
                             "chat:{}.{}",
                             turn.slot.chat_id,
-                            crate::auth::generate_token()
+                            crate::auth::mint_secret("chat")
                         )
                     }
                 };
