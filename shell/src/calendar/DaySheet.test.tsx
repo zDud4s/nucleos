@@ -12,7 +12,7 @@ vi.mock("../data/client", async (original) => ({
 import type { ReactNode } from "react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { ApiRefusal } from "../data/client";
-import { DaySheet, DraftEventForm, OccurrenceActions } from "./DaySheet";
+import { DaySheet, DraftEventForm, OccurrenceActions, OccurrenceRow } from "./DaySheet";
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
 import { renderWithQuery } from "../test/harness";
 
@@ -164,14 +164,16 @@ describe("moving an occurrence", () => {
     );
   });
 
-  it("says where a moved occurrence came from", () => {
+  it("says where a moved occurrence came from, on the line itself", () => {
     renderWithQuery(
-      <OccurrenceActions
+      <OccurrenceRow
         occurrence={occurrence({
           occurrence_local: "2026-08-04T09:00:00",
           starts_at: "2026-08-20T14:00:00Z",
           ends_at: "2026-08-20T14:30:00Z",
         })}
+        expanded={false}
+        onToggle={() => {}}
       />,
     );
 
@@ -273,12 +275,12 @@ describe("the draft form", () => {
    */
   it("opens at the selected day and the working hour when no hour was named", () => {
     renderWithQuery(<DraftEventForm slot={{ day: new Date(2026, 7, 20), hour: null }} config={CONFIG} />);
-    expect((screen.getByLabelText("Starts") as HTMLInputElement).value).toBe("2026-08-20T09:00");
+    expect(screen.getByRole("button", { name: /^Starts,/ }).textContent).toBe("09:00");
   });
 
   it("opens at the clicked hour when the week named one", () => {
     renderWithQuery(<DraftEventForm slot={{ day: new Date(2026, 7, 20), hour: 14 }} config={CONFIG} />);
-    expect((screen.getByLabelText("Starts") as HTMLInputElement).value).toBe("2026-08-20T14:00");
+    expect(screen.getByRole("button", { name: /^Starts,/ }).textContent).toBe("14:00");
   });
 
   it("follows the selection when it moves, without throwing away a half-typed title", () => {
@@ -289,13 +291,26 @@ describe("the draft form", () => {
 
     rerender(<DraftEventForm slot={{ day: new Date(2026, 7, 25), hour: 11 }} config={CONFIG} />);
 
-    expect((screen.getByLabelText("Starts") as HTMLInputElement).value).toBe("2026-08-25T11:00");
+    expect(screen.getByRole("button", { name: /^Starts,/ }).textContent).toBe("11:00");
     expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe("Half typed");
+  });
+
+  it("asks only for the time — the day is the one the sheet was opened on", async () => {
+    const seen = recorder();
+    renderWithQuery(<DraftEventForm slot={{ day: new Date(2026, 7, 20), hour: null }} config={CONFIG} />);
+
+    expect(document.querySelector('input[type="datetime-local"], input[type="date"]')).toBeNull();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Coffee" } });
+    fireEvent.keyDown(screen.getByRole("button", { name: /^Starts,/ }), { key: "ArrowUp" });
+    fireEvent.click(screen.getByRole("button", { name: "Add to calendar" }));
+
+    await waitFor(() => expect(seen["POST /calendar/events"]).toBeDefined());
+    expect((seen["POST /calendar/events"] as Record<string, unknown>).starts_at_local).toBe("2026-08-20T09:05:00");
   });
 
   it("falls back to nine when the config has not answered yet", () => {
     renderWithQuery(<DraftEventForm slot={{ day: new Date(2026, 7, 20), hour: null }} config={undefined} />);
-    expect((screen.getByLabelText("Starts") as HTMLInputElement).value).toBe("2026-08-20T09:00");
+    expect(screen.getByRole("button", { name: /^Starts,/ }).textContent).toBe("09:00");
   });
 });
 
@@ -354,26 +369,60 @@ describe("the sheet itself", () => {
         occurrences={[]}
         now={new Date(2026, 9, 20)}
         config={CONFIG}
+        open
+        onOpenChange={() => {}}
       />,
     );
 
+    // The day is the dialog's name, so a screen reader hears which day opened.
+    expect(screen.getByRole("dialog", { name: /25/ })).toBeDefined();
     // 25 October 2026 is Lisbon's long day AND a Sunday — two facts, said separately.
     expect(screen.getByText("25h — long day")).toBeDefined();
     expect(screen.getByText("not a working day")).toBeDefined();
     expect(screen.getByText("nothing on this day.")).toBeDefined();
   });
 
-  it("lists the day's occurrences with their controls", () => {
+  it("lists the day as lines, and opens one line's controls at a time", () => {
     renderWithQuery(
       <DaySheet
         slot={{ day: new Date(2026, 7, 20), hour: null }}
         occurrences={[occurrence(), occurrence({ event_id: 5, title: "Retro" })]}
         now={new Date(2026, 7, 20)}
         config={CONFIG}
+        open
+        onOpenChange={() => {}}
       />,
     );
 
-    expect(screen.getAllByRole("button", { name: "Skip this occurrence" })).toHaveLength(2);
+    // Closed, the day is a column of times and names — no controls yet.
     expect(screen.getByText("Retro")).toBeDefined();
+    expect(screen.getAllByText("30 min", { selector: ".calendar-occurrence-length" })).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "Skip this occurrence" })).toBeNull();
+
+    const [first, second] = screen.getAllByRole("button", { expanded: false });
+    fireEvent.click(first);
+    expect(screen.getAllByRole("button", { name: "Skip this occurrence" })).toHaveLength(1);
+
+    // Opening the second closes the first.
+    fireEvent.click(second);
+    expect(screen.getAllByRole("button", { name: "Skip this occurrence" })).toHaveLength(1);
+    expect(second.getAttribute("aria-expanded")).toBe("true");
+    expect(first.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("draws nothing while it is closed", () => {
+    renderWithQuery(
+      <DaySheet
+        slot={{ day: new Date(2026, 7, 20), hour: null }}
+        occurrences={[occurrence()]}
+        now={new Date(2026, 7, 20)}
+        config={CONFIG}
+        open={false}
+        onOpenChange={() => {}}
+      />,
+    );
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Skip this occurrence" })).toBeNull();
   });
 });

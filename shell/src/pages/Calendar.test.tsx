@@ -259,16 +259,47 @@ describe("the page", () => {
     });
   }
 
-  it("opens on this month, with today selected and its day in the sheet", async () => {
+  it("opens on this month, with today selected and no sheet over it", async () => {
     answering([occurrence()]);
-    await page();
+    const { container } = await page();
 
     // The month's own name, and the honest count beside it.
     expect(await screen.findByText(/1 occurrence this month/)).toBeDefined();
-    // The sheet opens on today rather than on nothing.
-    const sheet = await screen.findByRole("heading", { level: 3 });
+    // Today is the selected cell, and nothing is drawn over the grid until it is clicked.
+    await waitFor(() =>
+      expect(container.querySelector('[data-day="2026-08-20"]')?.getAttribute("aria-pressed")).toBe("true"),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("opens the day's sheet when a day is clicked, and closes it again", async () => {
+    answering([occurrence()]);
+    const { container } = await page();
+
+    await waitFor(() => expect(container.querySelector('[data-day="2026-08-20"]')).not.toBeNull());
+    fireEvent.click(container.querySelector('[data-day="2026-08-20"]') as HTMLElement);
+
+    const sheet = await screen.findByRole("dialog");
     expect(sheet.textContent).toContain("20");
+    fireEvent.click(await screen.findByRole("button", { name: /Standup/, expanded: false }));
     expect(await screen.findByRole("button", { name: "Skip this occurrence" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Add to calendar" })).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("does not open the sheet when the arrows move the selection", async () => {
+    answering([]);
+    const { container } = await page();
+
+    await waitFor(() => expect(container.querySelector(".calendar-grid")).not.toBeNull());
+    fireEvent.keyDown(container.querySelector(".calendar-grid") as HTMLElement, { key: "ArrowRight" });
+
+    await waitFor(() =>
+      expect(container.querySelector('[data-day="2026-08-21"]')?.getAttribute("aria-pressed")).toBe("true"),
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("renders the period label in the shell's own locale", async () => {
@@ -298,12 +329,13 @@ describe("the page", () => {
     );
     expect(heads).toEqual(["17", "18", "19", "20", "21", "22", "23"]);
     // And the day that was selected in the month is still the selected one.
-    expect(screen.getByRole("heading", { level: 3 }).textContent).toContain("20");
+    const selected = container.querySelector('.calendar-week-head[aria-pressed="true"]');
+    expect(selected?.querySelector(".calendar-week-head-number")?.textContent).toBe("20");
   });
 
   it("pages to the next month and takes the selection with it", async () => {
     answering([]);
-    await page();
+    const { container, router } = await page();
 
     fireEvent.click(await screen.findByRole("button", { name: "Next ›" }));
 
@@ -313,9 +345,8 @@ describe("the page", () => {
       heading that disagreed with the whole screen.
     */
     await waitFor(() => {
-      const sheet = screen.getByRole("heading", { level: 3 });
-      expect(sheet.textContent).toContain("2026");
-      expect(sheet.textContent).not.toContain("20 de agosto");
+      expect((router.state.location.search as CalendarSearch).on).toBe("2026-09-01");
+      expect(container.querySelector('[data-day="2026-09-01"]')?.getAttribute("aria-pressed")).toBe("true");
     });
   });
 
