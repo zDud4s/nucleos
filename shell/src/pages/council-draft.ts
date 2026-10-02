@@ -71,3 +71,36 @@ export function draftFrom(view: CouncilView): CouncilDraft {
     rounds: view.rounds,
   };
 }
+
+/**
+ * PURE: a picked rounds count held to `[1, max]`, or `fallback` when it is not
+ * a whole number. Unchanged while the config has not said what `max` is.
+ */
+export function clampRounds(
+  picked: number,
+  max: number | undefined,
+  fallback: number | undefined,
+): number | undefined {
+  if (max === undefined) return picked;
+  if (!Number.isInteger(picked)) return fallback;
+  return Math.min(Math.max(picked, 1), max);
+}
+
+/**
+ * PURE: the seat if the pickers still offer it, else `null`.
+ *
+ * A draft names the seats the old council sat; since then a model may have left
+ * the menu or an agent stopped being seatable. Kept as it was, the select would
+ * show "choose…" while the state still held the seat, Convene would be enabled
+ * and the daemon would refuse it. As `null` it is an unchosen row, and the
+ * composer's half-chosen gate waits for it.
+ */
+export function offeredSeat(
+  seat: RosterSeat | null,
+  agentIds: ReadonlySet<string>,
+  modelIds: ReadonlySet<string>,
+): RosterSeat | null {
+  if (seat === null) return null;
+  if ("agent" in seat) return agentIds.has(seat.agent) ? seat : null;
+  return modelIds.has(seat.ref) ? seat : null;
+}

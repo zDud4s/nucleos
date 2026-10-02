@@ -2095,3 +2095,208 @@ describe("Council - the detail, redesigned", () => {
     expect(await screen.findByText("No ranking — fewer than two answers to rank.")).toBeDefined();
   });
 });
+
+/* ------------------------------------------------------- the review rework -- */
+
+const DETAIL_KEY = [...keys.council.all, "detail", "c-1"];
+
+describe("Council - review rework", () => {
+  it("F1: a row whose council settled after its detail was cached running shows the confidence", async () => {
+    const summaries = [councilSummary({ status: "running" })];
+    const views: Record<string, CouncilView> = { "c-1": councilView({ status: "running" }) };
+    daemon.apiFetch.mockImplementation(councilFetch(summaries, views));
+
+    const { queryClient } = await renderCouncil("/council/c-1");
+    await panelFor("This council");
+
+    fireEvent.click(screen.getByRole("link", { name: "Councils" }));
+    const link = await screen.findByRole("link", { name: /should we ship the frontend rewrite\?/ });
+    expect(link.textContent).toContain("round");
+
+    // The list poll lands the council as done; its detail is done with a synthesis.
+    summaries[0] = councilSummary({ status: "done", rounds_run: 1 });
+    views["c-1"] = synthesisView({ status: "done" });
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: [...keys.council.all, "list"] });
+    });
+
+    await waitFor(() => expect(link.textContent).toContain("high confidence"));
+  });
+
+  it("F2: the Round 1 tab and its live tail follow a council that advances while it is open", async () => {
+    const views: Record<string, CouncilView> = {
+      "c-1": pendingView({ rounds: 2, current_round: 0 }),
+    };
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], views));
+
+    const { queryClient } = await renderCouncil("/council/c-1");
+    const first = await screen.findByRole("tab", { name: "Answers" });
+    expect(first.getAttribute("aria-selected")).toBe("true");
+
+    views["c-1"] = pendingView({
+      rounds: 2,
+      current_round: 1,
+      current_phase: "critique",
+      seats: [
+        seatNamed("alpha", 0, [
+          stepView({ status: "ok" }),
+          stepView({ round: 1, phase: "critique", run_id: 8, status: "pending", answer: null }),
+        ]),
+      ],
+    });
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: DETAIL_KEY });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "Round 1" }).getAttribute("aria-selected")).toBe("true"),
+    );
+    expect(await screen.findByRole("log", { name: "Live tail of alpha" })).toBeDefined();
+  });
+
+  it("F2: a tab the reader picked while the council runs is kept when the round advances", async () => {
+    const views: Record<string, CouncilView> = {
+      "c-1": pendingView({
+        rounds: 2,
+        current_round: 1,
+        seats: [
+          seatNamed("alpha", 0, [
+            stepView({ status: "ok" }),
+            stepView({ round: 1, phase: "critique", run_id: 8, status: "pending", answer: null }),
+          ]),
+        ],
+      }),
+    };
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], views));
+
+    const { queryClient } = await renderCouncil("/council/c-1");
+    expect((await screen.findByRole("tab", { name: "Round 1" })).getAttribute("aria-selected")).toBe("true");
+    await openRound("Answers");
+    expect(screen.getByRole("tab", { name: "Answers" }).getAttribute("aria-selected")).toBe("true");
+
+    views["c-1"] = pendingView({
+      rounds: 2,
+      current_round: 2,
+      seats: [
+        seatNamed("alpha", 0, [
+          stepView({ status: "ok" }),
+          critiqueStep(1, ["B"]),
+          stepView({ round: 1, phase: "revise", run_id: 9, answer: "again", changed: true, why: "x" }),
+          stepView({ round: 2, phase: "critique", run_id: 10, status: "pending", answer: null }),
+        ]),
+      ],
+    });
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: DETAIL_KEY });
+    });
+
+    await screen.findByRole("tab", { name: "Round 2" });
+    expect(screen.getByRole("tab", { name: "Answers" }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("tab", { name: "Round 2" }).getAttribute("aria-selected")).toBe("false");
+  });
+
+  it("F3: with no roster configured the chips never claim a default", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, { config: councilConfig({ configured: false }) }),
+    );
+
+    const { container } = await renderCouncil("/council");
+    await screen.findByText("No roster in ~/.nucleos/council.yaml — add one and restart the núcleo.");
+
+    const chips = container.querySelector(".council-ask-bar button");
+    expect(chips).not.toBeNull();
+    expect((chips as HTMLElement).textContent ?? "").not.toMatch(/default/i);
+  });
+
+  it("F4: a failed background refetch of the config leaves Convene enabled", async () => {
+    let failing = false;
+    const inner = councilFetch([], {});
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (failing && path === "/council/config") throw new ApiRefusal(500, "internal", "config blew up");
+      return inner(path, init);
+    });
+
+    const { queryClient } = await renderCouncil("/council");
+    fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
+    const convene = screen.getByRole("button", { name: "Convene" });
+    await waitFor(() => expect(convene.hasAttribute("disabled")).toBe(false));
+
+    failing = true;
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: [...keys.council.all, "config"] });
+    });
+    await waitFor(() =>
+      expect(queryClient.getQueryState([...keys.council.all, "config"])?.status).toBe("error"),
+    );
+
+    expect(screen.queryByText("The council config could not be read.")).toBeNull();
+    expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(false);
+  });
+
+  it("F5: ask again with a seat no longer offered leaves it unchosen and Convene waits", async () => {
+    const view = councilView({
+      status: "done",
+      chairman_ref: "claude-opus-5",
+      seats: [seatView({ seat_idx: 0, kind: "cloud", ref: "model-that-left" })],
+    });
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": view }, {
+        agents: [agentRow()],
+        models: [modelRow()],
+      }),
+    );
+
+    const { router } = await renderCouncil("/council/c-1");
+    fireEvent.click(await screen.findByRole("button", { name: "Ask again" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/council"));
+
+    const seat = (await screen.findByLabelText("Seat 1")) as HTMLSelectElement;
+    await waitFor(() => expect(seat.querySelectorAll("option").length).toBeGreaterThan(1));
+    // The config must have answered too, or Convene is disabled for the wrong reason.
+    await within(await screen.findByRole("group", { name: "Rounds" })).findByRole("button", { name: "1" });
+
+    expect(seat.value).toBe("");
+    await waitFor(() =>
+      expect(screen.getByText("Choose every seat, or close the panel.")).toBeDefined(),
+    );
+    expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(true);
+  });
+
+  it("F5: ask again clamps draft rounds above the config's maximum", async () => {
+    const view = councilView({ status: "done", rounds: 5, rounds_run: 5 });
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": view }, { config: councilConfig({ max_rounds: 3 }) }),
+    );
+
+    const { router } = await renderCouncil("/council/c-1");
+    fireEvent.click(await screen.findByRole("button", { name: "Ask again" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/council"));
+
+    const rounds = await screen.findByRole("group", { name: "Rounds" });
+    const pressed = within(rounds)
+      .getAllByRole("button")
+      .filter((button) => button.getAttribute("aria-pressed") === "true");
+    expect(pressed.map((button) => button.textContent)).toEqual(["3"]);
+  });
+
+  it("F7: ctrl+enter while an IME is composing does not convene", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}));
+
+    await renderCouncil("/council");
+    const question = await screen.findByLabelText("Question");
+    fireEvent.change(question, { target: { value: "well?" } });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(false),
+    );
+
+    fireEvent.keyDown(question, { key: "Enter", ctrlKey: true, isComposing: true });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const posted = daemon.apiFetch.mock.calls.filter(
+      (call) => call[0] === "/council" && (call[1] as RequestInit | undefined)?.method === "POST",
+    );
+    expect(posted).toHaveLength(0);
+  });
+});

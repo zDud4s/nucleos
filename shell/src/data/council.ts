@@ -350,6 +350,11 @@ export function useCouncils() {
     queryKey: COUNCIL_KEYS.list,
     queryFn: () => apiFetch<CouncilSummary[]>("/council"),
     placeholderData: keepPreviousData,
+    // Every landed read re-renders the list, not only one whose rows compare
+    // unequal: structural sharing keeps the old reference when `apiFetch`
+    // hands back the very array it handed last time (a mocked daemon does),
+    // and a row whose council settled would then keep drawing it running.
+    notifyOnChangeProps: ["data", "isError", "dataUpdatedAt"],
   });
 }
 
@@ -393,16 +398,22 @@ export function useCouncil(id: string) {
 /**
  * How a settled council ended, for its list row — the same read as
  * `useCouncil` under the same key, so opening a council warms its row and the
- * reverse. Never polled and never stale: a settled council answers the same
- * bytes forever. `enabled` is the caller's bound — `CouncilSummary` carries no
- * error, synthesis or agreement, so every row that shows one costs a read.
+ * reverse. Never polled. Never stale once settled — a settled council answers
+ * the same bytes forever — but a cached view that is still `running` (left by
+ * opening the council while it ran) is stale at once, or the row would keep
+ * that view after the list lands the council settled and never show how it
+ * ended. `enabled` is the caller's bound — `CouncilSummary` carries no error,
+ * synthesis or agreement, so every row that shows one costs a read.
  */
 export function useCouncilOutcome(id: string, enabled: boolean) {
   return useQuery({
     queryKey: COUNCIL_KEYS.detail(id),
     queryFn: () => apiFetch<CouncilView>(`/council/${encodeURIComponent(id)}`),
     enabled,
-    staleTime: Infinity,
+    staleTime: (query) => {
+      const view = query.state.data;
+      return view !== undefined && councilIsAlive(view.status) ? 0 : Infinity;
+    },
   });
 }
 
@@ -430,9 +441,11 @@ export function agreementText(agreement: Agreement): string {
 
 /**
  * How a council ended, in one line: why it failed, that it was cancelled, or
- * the chairman's confidence and the ballots' agreement.
+ * the chairman's confidence and the ballots' agreement. `null` while it has
+ * not ended — a running view has no outcome, and "answered" would claim one.
  */
-export function outcomeOf(view: CouncilView): string {
+export function outcomeOf(view: CouncilView): string | null {
+  if (councilIsAlive(view.status)) return null;
   if (view.status === "error") return view.error ?? "failed — no reason recorded";
   if (view.status === "cancelled") return "cancelled";
   const structured = view.synthesis_structured;

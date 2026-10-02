@@ -211,11 +211,8 @@
  * it is going or how it ended. The row draws the hairline and the padding, so
  * the link adds neither.
  *
- * The current row is marked by `Row current` in `Council.tsx` — `.ui-current`, a
- * 2px rule on the leading edge and nothing else. It was `--accent` plus
- * `--accent-quiet` here: the brand colour doing a job it is not allowed to do,
- * over a fill that disappears in the light theme, where `--surface` and
- * `--surface-raised` are both white. See the comment on `.ui-current`.
+ * No row is ever marked current: the list is only drawn while no council is
+ * open, since an open council replaces the list.
  */
 .council-row-link {
   display: grid;

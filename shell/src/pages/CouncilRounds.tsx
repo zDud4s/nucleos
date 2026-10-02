@@ -48,12 +48,17 @@ export function CouncilDeliberation({ view, running }: { view: CouncilView; runn
     ...view.seats.flatMap((seat) => seat.steps.map((step) => step.round)),
   );
   const rounds = Array.from({ length: lastRound + 1 }, (_, round) => round);
+  // Controlled, because a `defaultValue` is read once: a council opened at
+  // round 0 would stay on "Answers" while round 1 runs, and the live tail would
+  // leave the screen. The tab follows the newest round until the reader picks
+  // one, and from then on their pick stays put as the rounds advance.
+  const [picked, setPicked] = useState<string | null>(null);
   return (
     <Panel title="Deliberation" aside={<Count n={view.seats.length} />}>
       {view.seats.length === 0 ? (
         <Quiet says="no seat has been recorded for this council yet." />
       ) : (
-        <Tabs defaultValue={String(lastRound)}>
+        <Tabs value={picked ?? String(lastRound)} onValueChange={setPicked}>
           <TabsList aria-label="Rounds">
             {rounds.map((round) => (
               <TabsTrigger key={round} value={String(round)}>

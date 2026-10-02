@@ -27,7 +27,7 @@ import {
 } from "../data/council";
 import { CouncilDeliberation } from "./CouncilRounds";
 import { CouncilSynthesis } from "./CouncilSynthesis";
-import { clearDraft, draftFrom, offerDraft, peekDraft } from "./council-draft";
+import { clampRounds, clearDraft, draftFrom, offerDraft, offeredSeat, peekDraft } from "./council-draft";
 import {
   Button,
   ConfirmButton,
@@ -301,11 +301,18 @@ function Composer() {
   const roster = rosterFrom(chairman, members);
   const halfChosen = choosing && roster === null;
   const defaultRounds = config?.default_rounds;
-  const rounds = pickedRounds ?? defaultRounds;
+  // A pick is held to the current ceiling: a draft from "Ask again" carries the
+  // old council's rounds, which may sit above what the file now allows.
+  const rounds =
+    pickedRounds === null ? defaultRounds : clampRounds(pickedRounds, config?.max_rounds, defaultRounds);
   const estimate = estimateMembers(choosing, members, config?.default_roster?.members.length);
+  const configPending = configQuery.data === undefined && configQuery.isPending;
+  // Failed only when nothing usable is cached: a background refetch that
+  // errors leaves the last good config in `data`, and it still holds.
+  const configFailed = configQuery.isError && config === null;
   const reason = conveneBlocked(
-    configQuery.data === undefined && configQuery.isPending,
-    configQuery.isError,
+    configPending,
+    configFailed,
     config,
     halfChosen,
   );
@@ -356,6 +363,8 @@ function Composer() {
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
           onKeyDown={(event) => {
+            // An IME still composing owns the Enter; it is not a send.
+            if (event.nativeEvent.isComposing) return;
             if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
               event.preventDefault();
               submit();
@@ -369,7 +378,7 @@ function Composer() {
           {choosing ? (
             `Chosen panel · ${members.length} ${members.length === 1 ? "seat" : "seats"}`
           ) : (
-            <RosterChips config={config} />
+            <RosterChips config={config} pending={configPending} />
           )}
         </Button>
 
@@ -436,8 +445,13 @@ function Composer() {
 /**
  * The configured roster as bare-text chips: "Chair: X · Seats: A, B, C". One
  * run of text with spans inside, so the button's name is the whole sentence.
+ * While the config is unread, unreadable or names no roster, the chips say so
+ * rather than "default" — the reason line beside them says the same.
  */
-function RosterChips({ config }: { config: CouncilConfig | null }) {
+function RosterChips({ config, pending }: { config: CouncilConfig | null; pending: boolean }) {
+  if (pending) return <>Roster: reading…</>;
+  if (config === null) return <>Roster unavailable</>;
+  if (!config.configured) return <>No roster configured</>;
   const roster = config?.default_roster ?? null;
   const chair = roster === null ? "default" : configuredSeatName(roster.chairman);
   const seats = roster === null ? ["default"] : roster.members.map(configuredSeatName);
@@ -544,6 +558,20 @@ function RosterPicker({
   const seatable = (agents.data ?? []).filter(canTakeASeat);
   const choices = models.data?.choices ?? [];
   const full = members.length >= MAX_COUNCIL_SEATS;
+
+  // Once both menus have answered, a seat they no longer offer — one an "Ask
+  // again" draft brought back — becomes an unchosen row. Only a real change is
+  // written back, so the effect settles after one pass.
+  const answered = agents.data !== undefined && models.data !== undefined;
+  useEffect(() => {
+    if (!answered) return;
+    const agentIds = new Set(seatable.map((agent) => agent.id));
+    const modelIds = new Set(choices.map((model) => model.id));
+    const nextChairman = offeredSeat(chairman, agentIds, modelIds);
+    if (nextChairman !== chairman) onChairman(nextChairman);
+    const nextMembers = members.map((member) => offeredSeat(member, agentIds, modelIds));
+    if (nextMembers.some((member, at) => member !== members[at])) onMembers(nextMembers);
+  });
 
   return (
     <div className="council-roster ui-panel-inset">
@@ -826,7 +854,8 @@ function CouncilDetail({ id }: { id: string }) {
       <Leaderboard leaderboard={detail.leaderboard} seats={detail.seats} />
       {/* Always drawn: before any critique round its one tab, "Answers", is
           where the seats' answers live, and it is the only place they do. */}
-      <CouncilDeliberation view={detail} running={councilIsAlive(detail.status)} />
+      {/* Keyed by council: the tab a reader picked belongs to this one. */}
+      <CouncilDeliberation key={detail.id} view={detail} running={councilIsAlive(detail.status)} />
     </>
   );
 }
