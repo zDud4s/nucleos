@@ -6,6 +6,8 @@ import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   useCancelCouncil,
   useCouncil,
+  useCouncilOutcome,
+  outcomeOf,
   useCouncils,
   useCreateCouncil,
   useCouncilConfig,
@@ -81,13 +83,9 @@ export function Council() {
 
       <CouncilList rows={rows} answered={councils.data !== undefined} selected={councilId} />
 
-      {councilId === null && (
-        <Teach title="Choose a council">
-          <p>
-            Pick a question from the list, or convene a new one above. Each row says which round
-            its council has reached and what it is doing in it, and this page shows every seat's
-            answer and latest step whichever round that is.
-          </p>
+      {councilId === null && councils.data !== undefined && rows.length === 0 && (
+        <Teach title="No council has met yet">
+          <p>Ask a question above. Each seat answers on its own, and the chair writes one answer.</p>
         </Teach>
       )}
 
@@ -699,8 +697,8 @@ function CouncilList({
       {!answered && <p className="council-loading">reading the councils…</p>}
       {rows.length > 0 && (
         <Rows label="Councils">
-          {rows.map((row) => (
-            <CouncilRow key={row.id} row={row} active={row.id === selected} />
+          {rows.map((row, index) => (
+            <CouncilRow key={row.id} row={row} active={row.id === selected} readOutcome={index < OUTCOME_ROWS} />
           ))}
         </Rows>
       )}
@@ -726,14 +724,29 @@ function progressOf(council: { current_round: number; current_phase: string }): 
   return `round ${council.current_round} · ${council.current_phase}`;
 }
 
-function CouncilRow({ row, active }: { row: CouncilSummary; active: boolean }) {
+/**
+ * How many of the newest rows read their own outcome. The summary carries no
+ * error, synthesis or agreement, so each outcome is one detail read; past the
+ * tenth a row shows its badge alone rather than the list costing fifty reads.
+ */
+const OUTCOME_ROWS = 10;
+
+function CouncilRow({ row, active, readOutcome }: { row: CouncilSummary; active: boolean; readOutcome: boolean }) {
+  const running = councilIsAlive(row.status);
+  // A running council's detail is still moving and is read on its own page,
+  // polled; the row says where it is from the summary alone.
+  const outcome = useCouncilOutcome(row.id, readOutcome && !running);
+  // The open council's outcome is said in full by its detail below, so its row
+  // does not say it a second time.
+  const ended = !active && outcome.data !== undefined ? outcomeOf(outcome.data) : null;
+  const second = running ? progressOf(row) : ended;
   return (
     <Row current={active}>
       <Link className="council-row-link" to={`/council/${row.id}`} aria-current={active ? "page" : undefined}>
         <span className="council-row-question">{row.question}</span>
         <StateBadge domain="council" state={row.status} />
-        <span className="council-phase">{progressOf(row)}</span>
         <RelativeTime at={row.created_at} />
+        {second !== null && <span className="council-row-outcome">{second}</span>}
       </Link>
     </Row>
   );

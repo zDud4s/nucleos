@@ -390,6 +390,57 @@ export function useCouncil(id: string) {
   });
 }
 
+/**
+ * How a settled council ended, for its list row — the same read as
+ * `useCouncil` under the same key, so opening a council warms its row and the
+ * reverse. Never polled and never stale: a settled council answers the same
+ * bytes forever. `enabled` is the caller's bound — `CouncilSummary` carries no
+ * error, synthesis or agreement, so every row that shows one costs a read.
+ */
+export function useCouncilOutcome(id: string, enabled: boolean) {
+  return useQuery({
+    queryKey: COUNCIL_KEYS.detail(id),
+    queryFn: () => apiFetch<CouncilView>(`/council/${encodeURIComponent(id)}`),
+    enabled,
+    staleTime: Infinity,
+  });
+}
+
+/**
+ * How far the ballots agreed, in the words a reader uses.
+ *
+ * The daemon's `tally::Agreement` level is a code ("strong", "none"); "none"
+ * printed bare reads as "no data", which is the opposite of what it says — the
+ * seats were compared and did not agree. A level this table does not know is
+ * printed as the daemon sent it rather than hidden: an unknown word is still
+ * the fact, and a missing badge would claim there was nothing to report.
+ */
+export const AGREEMENT_WORDS: Record<string, string> = {
+  strong: "strong consensus",
+  split: "split",
+  none: "no consensus",
+  insufficient: "too few votes",
+};
+
+/** "τ 0.42 · split", or the words alone when there was nothing to compare. */
+export function agreementText(agreement: Agreement): string {
+  const words = AGREEMENT_WORDS[agreement.level] ?? agreement.level;
+  return agreement.tau === null ? words : `τ ${agreement.tau.toFixed(2)} · ${words}`;
+}
+
+/**
+ * How a council ended, in one line: why it failed, that it was cancelled, or
+ * the chairman's confidence and the ballots' agreement.
+ */
+export function outcomeOf(view: CouncilView): string {
+  if (view.status === "error") return view.error ?? "failed — no reason recorded";
+  if (view.status === "cancelled") return "cancelled";
+  const structured = view.synthesis_structured;
+  if (structured === null) return "answered";
+  const confidence = `${structured.confidence.level} confidence`;
+  return view.agreement === null ? confidence : `${confidence} · ${agreementText(view.agreement)}`;
+}
+
 /* --------------------------------------------------------------- writes -- */
 
 /**

@@ -1,23 +1,7 @@
 import type { ReactNode } from "react";
-import { seatName, type CouncilView, type Synthesis } from "../data/council";
+import { AGREEMENT_WORDS, seatName, type CouncilView, type Synthesis } from "../data/council";
 import { Panel, Quiet } from "../ui";
 import { CouncilRich } from "./CouncilRich";
-
-/**
- * How far the ballots agreed, in the words a reader uses.
- *
- * The daemon's `tally::Agreement` level is a code ("strong", "none"); "none"
- * printed bare reads as "no data", which is the opposite of what it says — the
- * seats were compared and did not agree. A level this table does not know is
- * printed as the daemon sent it rather than hidden: an unknown word is still
- * the fact, and a missing badge would claim there was nothing to report.
- */
-const AGREEMENT_WORDS: Record<string, string> = {
-  strong: "strong consensus",
-  split: "split",
-  none: "no consensus",
-  insufficient: "too few votes",
-};
 
 /**
  * The chairman's synthesis — or the fact that the chairman never produced one.

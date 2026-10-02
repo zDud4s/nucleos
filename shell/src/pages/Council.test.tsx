@@ -238,7 +238,7 @@ describe("Council - the empty catalogue", () => {
 
     await renderCouncil("/council");
 
-    expect(await screen.findByRole("heading", { level: 3, name: "Choose a council" })).toBeDefined();
+    expect(await screen.findByRole("heading", { level: 3, name: "No council has met yet" })).toBeDefined();
     expect(screen.queryByRole("region", { name: "Councils" })).toBeNull();
   });
 
@@ -1245,6 +1245,85 @@ describe("Council - the list row and the config", () => {
     await waitFor(() =>
       expect(daemon.apiFetch.mock.calls.map((call) => call[0])).toContain("/council/config"),
     );
+  });
+
+  it("a failed council's row says why it failed", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch(
+        [councilSummary({ status: "error" })],
+        { "c-1": councilView({ status: "error", error: "the chair ran out of budget" }) },
+      ),
+    );
+
+    await renderCouncil("/council");
+
+    const link = await screen.findByRole("link", { name: /should we ship the frontend rewrite\?/ });
+    await waitFor(() => expect(link.textContent).toContain("the chair ran out of budget"));
+  });
+
+  it("a finished council's row carries its confidence and agreement", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch(
+        [councilSummary({ status: "done", rounds_run: 1 })],
+        {
+          "c-1": synthesisView({
+            status: "done",
+            agreement: { tau: 0.42, level: "split", ballots: 4, comparisons: 6 },
+          }),
+        },
+      ),
+    );
+
+    await renderCouncil("/council");
+
+    const link = await screen.findByRole("link", { name: /should we ship the frontend rewrite\?/ });
+    await waitFor(() => expect(link.textContent).toContain("high confidence · τ 0.42 · split"));
+  });
+
+  it("a running row says its round and phase and reads no detail", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch(
+        [councilSummary({ rounds: 2, current_round: 1, current_phase: "critique" })],
+        { "c-1": councilView() },
+      ),
+    );
+
+    await renderCouncil("/council");
+
+    const link = await screen.findByRole("link", { name: /should we ship the frontend rewrite\?/ });
+    await waitFor(() => expect(link.textContent).toContain("round 1 · critique"));
+    expect(daemon.apiFetch.mock.calls.map((call) => call[0])).not.toContain("/council/c-1");
+  });
+
+  it("reads the outcome of at most the ten newest settled councils", async () => {
+    const summaries = Array.from({ length: 12 }, (_, i) =>
+      councilSummary({ id: `c-${i + 1}`, status: "done", question: `question number ${i + 1}` }),
+    );
+    const views: Record<string, CouncilView> = {};
+    for (const s of summaries) views[s.id] = synthesisView({ id: s.id, status: "done" });
+    daemon.apiFetch.mockImplementation(councilFetch(summaries, views));
+
+    await renderCouncil("/council");
+
+    await screen.findByRole("link", { name: /question number 12/ });
+    await waitFor(() =>
+      expect(screen.getAllByText(/high confidence/).length).toBeGreaterThanOrEqual(10),
+    );
+    const details = daemon.apiFetch.mock.calls
+      .map((call) => String(call[0]))
+      .filter((path) => /^\/council\/c-\d+$/.test(path));
+    expect(new Set(details).size).toBeGreaterThan(0);
+    expect(new Set(details).size).toBeLessThanOrEqual(10);
+  });
+
+  it("with councils listed and none open draws no teach block", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], {}));
+
+    await renderCouncil("/council");
+
+    await screen.findByRole("link", { name: /should we ship the frontend rewrite\?/ });
+    expect(screen.queryByRole("heading", { level: 3, name: "No council has met yet" })).toBeNull();
+    expect(screen.queryByRole("heading", { level: 3, name: "Choose a council" })).toBeNull();
   });
 });
 

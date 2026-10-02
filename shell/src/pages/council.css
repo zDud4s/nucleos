@@ -206,9 +206,10 @@
 /* =================================================================== list == */
 
 /**
- * One council, as a link across its whole `Row`: the question, then state,
- * phase and age in tracks that line up down the column. The row draws the
- * hairline and the padding, so the link adds neither.
+ * One council, as a link across its whole `Row`: the question, then state and
+ * age in tracks that line up down the column, and under them one line of how
+ * it is going or how it ended. The row draws the hairline and the padding, so
+ * the link adds neither.
  *
  * The current row is marked by `Row current` in `Council.tsx` — `.ui-current`, a
  * 2px rule on the leading edge and nothing else. It was `--accent` plus
@@ -218,7 +219,7 @@
  */
 .council-row-link {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: baseline;
   gap: var(--space-2) var(--space-3);
   padding: 0;
@@ -227,10 +228,25 @@
 }
 
 .council-row-question {
-  flex: 1 1 14rem;
   min-width: 0;
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow-wrap: anywhere;
+}
+
+/* The second line spans every track: the round and phase while running, the
+   failure reason, or the confidence and agreement. Muted, never red — the
+   badge already carries the state's colour. */
+.council-row-outcome {
+  grid-column: 1 / -1;
+  min-width: 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
