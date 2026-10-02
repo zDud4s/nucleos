@@ -75,18 +75,13 @@ function Frame() {
    */
   const chats = useChats();
   /**
-   * The roster, for the sidebar's project group.
+   * The roster, for the sidebar's project switcher.
    *
    * Already polled — this is the same query the roster page and the pending
-   * counts read, so the rail costs no extra request. `undefined` until it has
-   * answered once, and the rail draws no rows for that rather than an empty
-   * group: a heading with nothing under it reads as "you have no projects",
-   * which is a claim about the daemon's answer before it gave one.
-   *
-   * Handed over on every page even though the rail only draws it inside the
-   * projects area, and that is not waste: the query is shared, so the request
-   * happens either way, and deciding *where* the roster is shown is the rail's
-   * business rather than something this component should have to know.
+   * counts read, so the switcher costs no extra request. `undefined` until it
+   * has answered once, and the switcher says nothing about projects for that:
+   * "you have no projects" would be a claim about the daemon's answer before it
+   * gave one.
    */
   const projects = useProjects();
   /**

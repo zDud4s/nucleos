@@ -474,13 +474,18 @@ const SHOTS_TO_TAKE = [
      reached from and the one surface of this pillar nothing had photographed. */
   ["37-roster", { path: "/projects" }],
   ["38-roster-light", { path: "/projects", theme: "light" }],
-  /* The way out, open. The press lands on the FIRST `remove` in the table, and
-     the ordering puts `bravo` there — which is the fixture with a record and
-     nothing in flight, so the shot carries the ordinary case: the folder
-     reassurance, the counts, and the checkbox left unticked. */
-  ["39-roster-remove", { path: "/projects", press: "remove" }],
-  /* The other exit, which is not on that page at all: the folder delete, at
-     the foot of a project's own State mode. `alpha` because it is the fixture
+  /* The two other ways into a project: the switcher at the top of the rail, open,
+     and the rail's own project rows, which the route opens inside a workspace. */
+  ["37a-switcher-open", { path: "/fleet", press: "NucleOS" }],
+  ["37b-rail-in-project", { path: "/projects/alpha/state" }],
+  /* The way out, open — inside the project now, in State's Leaving section, since
+     the roster's cards are one link each and carry no control. `bravo` because
+     it is the fixture with a record and nothing in flight, so the shot carries
+     the ordinary case: the folder reassurance, the counts, and the checkbox left
+     unticked. The name is kept so the before/after pair stays comparable. */
+  ["39-roster-remove", { path: "/projects/bravo/state", press: "remove from NucleOS…" }],
+  /* The other exit, just below it: the folder delete, at the foot of the same
+     State mode. `alpha` because it is the fixture
      with work in flight AND uncommitted work — the panel says what would be
      lost and why the button is off, which is the pair worth a picture. */
   [

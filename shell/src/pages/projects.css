@@ -1154,3 +1154,202 @@
   line-height: var(--leading-normal);
   color: var(--tone-paused-fg);
 }
+
+/* ============================================================= the roster == */
+
+/**
+ * `/projects`, grouped by what each project asks of somebody — `rs-`, the
+ * roster's own family in the slice's sheet.
+ *
+ * Cards for the groups that carry a reason (*Needs you*, *Working*), and a
+ * compact ruled grid for *Quiet*, because a quiet project is looked up by name
+ * rather than read about. Hover is one rung up the neutral ladder everywhere,
+ * never a tint: the tones belong to the reasons, and a card that went amber on
+ * hover would be saying something about the project that is not true.
+ */
+.rs-groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.rs-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.rs-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(21rem, 1fr));
+  gap: var(--space-3);
+}
+
+/* One link, the whole card. Not underlined: the card is the affordance, and an
+   underline across a block of sentences would read as a paragraph of links. */
+.rs-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+  padding: 0.875rem var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: inherit;
+  text-decoration: none;
+  transition:
+    background-color var(--dur-quick) var(--ease),
+    border-color var(--dur-quick) var(--ease);
+}
+
+.rs-card:hover {
+  background: var(--surface-raised);
+  border-color: var(--border-strong);
+  text-decoration: none;
+}
+
+.rs-card:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.rs-card-top {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+}
+
+.rs-card-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-display);
+  font-size: 1rem;
+  font-weight: var(--weight-semibold);
+  line-height: 1.35;
+}
+
+.rs-card-mode {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.rs-card-reasons {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.rs-card-reasons li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+/* The reason's tone, as a small square: a dot is the mode's shape, and the two
+   must not be mistaken for each other on the same card. */
+.rs-mark {
+  flex: none;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 2px;
+  transform: translateY(-1px);
+}
+
+.rs-mark[data-mark="review"],
+.rs-mark[data-mark="unnamed"] {
+  background: var(--tone-pending-fg);
+}
+
+.rs-mark[data-mark="fault"] {
+  background: var(--tone-danger-fg);
+}
+
+.rs-mark[data-mark="unmeasured"] {
+  background: var(--tone-info-fg);
+}
+
+.rs-mark[data-mark="flight"] {
+  background: var(--tone-active-fg);
+}
+
+.rs-card-act {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-top: 0.125rem;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+/* The rail's mode mark, at the rail's recipe: filled for a mode that runs,
+   hollow for `off`, which is known and doing nothing. */
+.rs-dot {
+  flex: none;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: var(--radius-pill);
+  background: var(--tone-active-fg);
+}
+
+.rs-dot[data-mode="shadow"] {
+  background: var(--tone-shadow-fg);
+}
+
+.rs-dot[data-mode="off"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--tone-off-fg);
+}
+
+.rs-quiet {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+  column-gap: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.rs-quiet-item {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  min-width: 0;
+  min-height: 38px;
+  padding: 0 var(--space-2);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  text-decoration: none;
+  transition:
+    background-color var(--dur-quick) var(--ease),
+    color var(--dur-quick) var(--ease);
+}
+
+.rs-quiet-item:hover {
+  background: var(--surface);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.rs-quiet-item:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.rs-quiet-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rs-quiet-off {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}

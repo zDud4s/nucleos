@@ -13,6 +13,7 @@ import { ErrorNote, Section, StaleNote, StatCard } from "../ui";
 import { Branches } from "./Branches";
 import { Commands } from "./Commands";
 import { DeleteFolder } from "./DeleteFolder";
+import { LeaveRoster } from "./LeaveRoster";
 import { Occupancy } from "./Occupancy";
 import { OwnedFiles } from "./OwnedFiles";
 import { Settings } from "./Settings";
@@ -122,12 +123,20 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
       </Section>
 
       {/*
-        Last, and below everything, because it is the only thing on this page that cannot be undone.
-        Here rather than on the roster on purpose: that page compares projects, and a control that
-        destroys one has no business in a column beside three that describe it. Somebody reaching
-        this has already opened the project they mean and scrolled past everything it is doing.
+        Last, and below everything, because it holds the only thing on this page that cannot be
+        undone. Here rather than on the roster on purpose: that page compares projects, and a control
+        that removes one has no business beside the cards that describe it. Somebody reaching this has
+        already opened the project they mean and scrolled past everything it is doing.
       */}
       <Section label="Leaving">
+        {/*
+          The reversible exit first, and only over a roster this page can vouch for: removing on a
+          stale read would act on a project nobody can say is still there, and the panel needs the
+          recorded root to say where the folder stays. Gone rather than disabled, as the roster did.
+        */}
+        {project !== undefined && !(projects.isError && projects.data !== undefined) && (
+          <LeaveRoster projectId={projectId} projectRoot={project.project_root} />
+        )}
         <DeleteFolder projectId={projectId} />
       </Section>
     </div>

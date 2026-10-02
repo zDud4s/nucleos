@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode, type TransitionEvent } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode, type TransitionEvent } from "react";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
-import { ChevronDown, ChevronRight, PanelLeftClose, Plus, type LucideIcon } from "lucide-react";
+import { Check, ChevronsUpDown, LayoutList, PanelLeftClose, Plus, Search } from "lucide-react";
 import { NAV, SYSTEM_ITEM, type NavBadge, type NavItem } from "./nav";
 import type { AutopilotMode } from "../data/system";
+import { readState } from "../ui/state-map";
 import mark from "../assets/brand/mark.png";
 
 /**
@@ -39,40 +40,6 @@ function writeCollapsed(collapsed: boolean): void {
 }
 
 /**
- * Whether the project list under `All projects` is open.
- *
- * Same storage and same reasoning as the collapse above: one window, one screen.
- */
-const ROSTER_KEY = "nucleos.sidebar.projects";
-
-/**
- * Three answers, not two.
- *
- * `undefined` — nothing stored, nobody has said — means **the route decides**,
- * which is exactly the rule the rail followed before the disclosure existed: the
- * list is open where projects are the subject and closed everywhere else. The
- * moment somebody opens or closes it by hand that answer is theirs, and it is
- * kept, on every page, until they change it again. A dropdown that silently
- * re-decided itself on navigation would not be a control.
- */
-function readRosterOpen(): boolean | undefined {
-  try {
-    const stored = window.localStorage.getItem(ROSTER_KEY);
-    return stored === null ? undefined : stored === "1";
-  } catch {
-    return undefined;
-  }
-}
-
-function writeRosterOpen(open: boolean): void {
-  try {
-    window.localStorage.setItem(ROSTER_KEY, open ? "1" : "0");
-  } catch {
-    // See `writeCollapsed`.
-  }
-}
-
-/**
  * Is this item the page you are on?
  *
  * Prefix-matching on the segment boundary rather than plain equality, so that
@@ -81,14 +48,9 @@ function writeRosterOpen(open: boolean): void {
  * `/` is exempt: every path starts with it, and a prefix rule would light Home
  * on every page in the app.
  *
- * One case the prefix rule gets wrong, and it is not fixed here. A row that owns the rows
- * under it matches every one of their paths: inside `/projects/alpha/state` both
- * `All projects` and `alpha` were active, so two rows carried `aria-current="page"` and the
- * rail said "you are here" twice on every project screen — with the quiet fill, the `--text`
- * label, the glyph and the 2px bar on both. The row that discloses a roster passes an
- * `active` override of its own instead (`pathname === entry.path`, in `item`'s call below),
- * because knowing which paths have children is `nav.ts`'s business: encode it here and this
- * function has to hold a list it cannot see.
+ * `Projects` follows the same rule and stays lit inside `/projects/alpha/state`.
+ * That is intended: the rail has no project rows any more, so the one row about
+ * projects is the right answer to "where am I" anywhere under it.
  */
 function isActive(pathname: string, path: string): boolean {
   if (path === "/") return pathname === "/";
@@ -123,62 +85,30 @@ const BADGE_NOUN: Record<NavBadge, string> = {
 const PROJECT_BADGE_NOUN = "items to review";
 
 /**
- * One project, as the rail needs it.
+ * One project, as the switcher needs it.
  *
- * Deliberately not `ProjectSummary`: the rail wants three fields and that type
- * has fifteen, and taking the whole thing would tie the sidebar to the roster
- * route's shape. What is here is what is drawn — the name, the dot, the summons.
+ * Deliberately not `ProjectSummary`: the switcher wants three fields and that
+ * type has fifteen, and taking the whole thing would tie the sidebar to the
+ * roster route's shape. What is here is what is drawn — the name, the dot, the
+ * summons.
  */
 export interface ProjectNavEntry {
   /** The daemon's project id, which is also the name it is known by. */
   id: string;
   mode: AutopilotMode;
-  /** Decisions waiting in this project. Zero draws no badge — a badge is a summons. */
+  /** Decisions waiting in this project. Zero draws no count — a count is a summons. */
   pending: number;
 }
 
 /**
- * Where in the path a project is, so a workspace stays lit across its modes.
+ * The project a path is inside, so the switcher names it across all its modes.
  *
- * The rail's ordinary prefix rule compares against the item's own path, which
- * for a project is its Estado mode. Someone reading the Workflows mode is still
- * *in* that project, and a rail that went dark on the way between modes would
- * say they had left it.
+ * Three segments and not two: `/projects/new` is the wizard, and a project that
+ * happened to be called `new` lives at `/projects/new/state`.
  */
 function projectOf(pathname: string): string | undefined {
   const parts = pathname.split("/").filter((part) => part !== "");
-  return parts[0] === "projects" ? parts[1] : undefined;
-}
-
-/**
- * Whether the roster belongs on screen **unless somebody says otherwise**.
- *
- * This used to be the whole rule. Since the disclosure on `All projects` it is
- * the default the disclosure starts from — see `readRosterOpen` — and the
- * argument below is why that default is this and not "always" or "never".
- *
- * **The rail is destinations; the roster is content, and content grows.** Every
- * other entry in the sidebar is one of a fixed list decided at design time — one
- * more project is one more row, for ever, and a machine watching fifteen of them
- * pushes Work and Pillars off the bottom edge to show names that are only useful
- * to somebody already working in one of them. The rail was the wrong home for a
- * list whose length is not ours to choose.
- *
- * So the rows appear where they are the subject: on `/projects`, and inside a
- * workspace. That keeps the one thing they were promoted for — switching
- * projects without going back out to the list, which is what a day of work
- * actually consists of — and gives back the space everywhere else, where a
- * project name is a destination you reach through `All projects` like any other
- * page.
- *
- * `/projects/new` counts, deliberately: the wizard is in the area, and a rail
- * that emptied while somebody added a project would read as having lost them.
- *
- * Since 2026-09-05 the switcher above the scroll answers the same question from
- * anywhere, which is what lets this stay narrow rather than widening to "always".
- */
-function inProjects(pathname: string): boolean {
-  return pathname.split("/").filter((part) => part !== "")[0] === "projects";
+  return parts[0] === "projects" && parts.length >= 3 ? parts[1] : undefined;
 }
 
 /* --------------------------------------------------------------- switcher -- */
@@ -188,139 +118,345 @@ function projectPath(id: string): string {
   return `/projects/${id}/state`;
 }
 
-/**
- * One destination in the switcher: the núcleo, or a project.
- *
- * `note` is the small line under the name and is drawn **only for the selected
- * row**, never in the list. That split is this app's existing rule rather than
- * a new one — see `.nav-mode` in `app.css`: "A colour rather than a word because
- * it sits in a rail read at a glance; the word is on the workspace itself, where
- * it is read on purpose." The menu is the glance; the button is the workspace.
- */
-interface SwitcherRow {
-  label: string;
-  note: string;
-  path: string;
-  /** A project's autopilot mode, as a dot. Absent on the núcleo, which has none. */
-  mode?: AutopilotMode;
-  /**
-   * This row is the núcleo, and draws the mark where a project draws its dot.
-   *
-   * A separator alone cannot carry that difference: a project named `nucleos`
-   * would sit one line under `NucleOS` — same word, same weight, told apart only
-   * by which side of a hairline it fell on. The mark against a dot is a
-   * difference of KIND, and no project name can collide with it.
-   */
-  brand?: true;
+/** A mode in words, through the app's one state table rather than a second spelling of it. */
+function modeWord(mode: AutopilotMode): string {
+  return readState("autopilot", mode)?.label ?? mode;
 }
 
 /**
- * The project switcher, in the slot the wordmark used to hold alone.
+ * The chord that opens the switcher, as this machine spells it — the same test
+ * the palette's `shortcutHint` makes for its own chord.
+ */
+const SWITCH_HINT = /mac|iphone|ipad/i.test(typeof navigator === "undefined" ? "" : navigator.platform)
+  ? "⌘P"
+  : "Ctrl P";
+
+/**
+ * Whether a key press belongs to a field somebody is typing in.
  *
- * Why a switcher is what belongs there: the Projects group was promoted from a
- * single item precisely because reaching a project cost "a list to open and then
- * a choice, on every single entry" (`nav.ts`), and then the roster rows were made
- * conditional, which gave that cost back everywhere outside the projects area.
- * Pinned above the scroll, the switcher pays it once more without the roster's
- * length pushing Work and Pillars off the bottom.
+ * Ctrl+P is the browser's Print, so the switcher takes it everywhere — except
+ * from a field that is not its own, where an editor may have a meaning for it
+ * and taking it would be the switcher reaching into somebody else's control.
+ */
+function typingElsewhere(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.closest(".nav-switch") !== null) return false;
+  return (
+    target.isContentEditable ||
+    target.matches("input, textarea, select") ||
+    target.closest('[contenteditable=""], [contenteditable="true"]') !== null
+  );
+}
+
+/** One row of the list: the núcleo, or a project. */
+interface SwitchOption {
+  key: string;
+  label: string;
+  path: string;
+  /** Absent on the núcleo, which has no mode and draws the mark instead of a dot. */
+  mode?: AutopilotMode;
+  pending: number;
+  current: boolean;
+}
+
+/** The name with the typed text marked — first match, case-insensitive. */
+function withMatch(name: string, query: string): ReactNode {
+  if (query === "") return name;
+  const at = name.toLowerCase().indexOf(query);
+  if (at < 0) return name;
+  return (
+    <>
+      {name.slice(0, at)}
+      <mark>{name.slice(at, at + query.length)}</mark>
+      {name.slice(at + query.length)}
+    </>
+  );
+}
+
+/**
+ * The open panel, mounted only while it is open.
  *
- * A disclosure and not a `role="menu"`. Menu semantics come with a keyboard
- * contract — typeahead, roving tabindex, focus trapping — that is easy to
- * half-implement and worse half-implemented than not claimed at all. These are
- * links to pages, they are announced as links, and Escape puts focus back where
- * it came from.
+ * Mounting fresh is what resets it: every opening starts with an empty query and
+ * the first row highlighted, without an effect that has to remember to clear
+ * them.
+ *
+ * A combobox over a listbox, and not a `role="menu"`: the input keeps focus the
+ * whole time, the highlighted row is announced through `aria-activedescendant`,
+ * and the rows are still links — a middle click opens one, a hover shows where
+ * it goes. Hover and the arrow keys move ONE highlight, because two marks on two
+ * rows ("the pointer is here, the keyboard is there") leave Enter ambiguous.
+ */
+function SwitcherPanel({
+  id,
+  projects,
+  here,
+  onClose,
+}: {
+  id: string;
+  projects: ProjectNavEntry[] | undefined;
+  here: string | undefined;
+  /** `refocus` hands focus back to the button — Escape does, a navigation does not. */
+  onClose: (refocus: boolean) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [hot, setHot] = useState(0);
+  const input = useRef<HTMLInputElement>(null);
+  const navigate = useNavigate();
+  const base = useId();
+  const listId = `${base}-list`;
+  const labelId = `${base}-label`;
+
+  useEffect(() => {
+    input.current?.focus();
+  }, []);
+
+  const typed = query.trim().toLowerCase();
+  /*
+    Alphabetical, not the daemon's order: this is a list somebody scans for a
+    name they already know, and the daemon's order is a fact about its storage.
+  */
+  const matches = [...(projects ?? [])]
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .filter((project) => project.id.toLowerCase().includes(typed));
+
+  /*
+    The núcleo first, and only while nothing is typed: it is the way back out to
+    Home, not a project, and a query is a search among projects.
+  */
+  const options: SwitchOption[] = [
+    ...(typed === ""
+      ? [{ key: "nucleos", label: "NucleOS", path: "/", pending: 0, current: here === undefined }]
+      : []),
+    ...matches.map((project) => ({
+      key: `project:${project.id}`,
+      label: project.id,
+      path: projectPath(project.id),
+      mode: project.mode,
+      pending: project.pending,
+      current: project.id === here,
+    })),
+  ];
+
+  const active = options.length === 0 ? -1 : Math.min(hot, options.length - 1);
+  const optionId = (index: number) => `${base}-option-${index}`;
+
+  useEffect(() => {
+    if (active < 0) return;
+    document.getElementById(`${base}-option-${active}`)?.scrollIntoView({ block: "nearest" });
+  }, [active, base]);
+
+  function onInputKey(event: KeyboardEvent<HTMLInputElement>) {
+    const count = options.length;
+    let next: number | undefined;
+    if (event.key === "ArrowDown") next = count === 0 ? undefined : (active + 1) % count;
+    else if (event.key === "ArrowUp") next = count === 0 ? undefined : (active - 1 + count) % count;
+    else if (event.key === "Home") next = count === 0 ? undefined : 0;
+    else if (event.key === "End") next = count === 0 ? undefined : count - 1;
+    else if (event.key === "Enter") {
+      event.preventDefault();
+      if (active < 0) return;
+      void navigate({ to: options[active].path });
+      onClose(false);
+      return;
+    } else return;
+
+    event.preventDefault();
+    if (next !== undefined) setHot(next);
+  }
+
+  /*
+    Escape from anywhere in the panel — the input or a footer link reached by
+    Tab — and focus goes back to the button. A panel that closes and drops focus
+    on `document.body` leaves a keyboard reader at the top of the page.
+  */
+  function onPanelKey(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    onClose(true);
+  }
+
+  function option(entry: SwitchOption, index: number) {
+    const extras: string[] = [];
+    if (entry.mode !== undefined) extras.push(modeWord(entry.mode));
+    if (entry.pending > 0) extras.push(`${entry.pending} ${PROJECT_BADGE_NOUN}`);
+    return (
+      <Link
+        key={entry.key}
+        id={optionId(index)}
+        to={entry.path}
+        role="option"
+        aria-selected={index === active}
+        /*
+          Our own answer and not the router's: from `/projects/alpha/workflows`
+          the row points at `/state`, which the router does not consider current,
+          and the switcher does. `exact` keeps the router from adding a second
+          opinion — `/` would otherwise prefix-match every page there is.
+        */
+        aria-current={entry.current ? "page" : undefined}
+        activeOptions={{ exact: true }}
+        // The mode is a dot and the count a bare number on screen; both are words here.
+        aria-label={extras.length === 0 ? undefined : `${entry.label}, ${extras.join(", ")}`}
+        title={entry.mode === undefined ? undefined : modeWord(entry.mode)}
+        // Out of the tab order: the input owns focus, and these are reached by arrow.
+        tabIndex={-1}
+        className={index === active ? "nav-switch-item nav-switch-hot" : "nav-switch-item"}
+        onPointerMove={() => {
+          if (index !== active) setHot(index);
+        }}
+        onClick={() => onClose(false)}
+      >
+        <span className="nav-switch-slot">
+          {entry.mode === undefined ? (
+            <img className="nav-switch-mini" src={mark} alt="" />
+          ) : (
+            <span className="nav-switch-dot" data-mode={entry.mode} aria-hidden="true" />
+          )}
+        </span>
+        <span className="nav-switch-label">{withMatch(entry.label, typed)}</span>
+        {entry.pending > 0 ? (
+          <span className="nav-switch-count" aria-hidden="true">
+            {entry.pending}
+          </span>
+        ) : null}
+        {entry.current ? <Check className="nav-switch-tick" strokeWidth={2} aria-hidden="true" /> : null}
+      </Link>
+    );
+  }
+
+  const nucleo = typed === "" ? options[0] : undefined;
+  const offset = nucleo === undefined ? 0 : 1;
+
+  return (
+    <div className="nav-switch-menu" id={id} onKeyDown={onPanelKey}>
+      <div className="nav-switch-search">
+        <Search className="nav-switch-search-icon" strokeWidth={1.5} aria-hidden="true" />
+        <input
+          ref={input}
+          type="text"
+          className="nav-switch-input"
+          role="combobox"
+          aria-label="Find a project"
+          aria-expanded="true"
+          aria-controls={listId}
+          aria-autocomplete="list"
+          aria-activedescendant={active < 0 ? undefined : optionId(active)}
+          placeholder="Find a project…"
+          autoComplete="off"
+          spellCheck={false}
+          value={query}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setHot(0);
+          }}
+          onKeyDown={onInputKey}
+        />
+        <kbd className="nav-switch-kbd" aria-hidden="true">
+          {SWITCH_HINT}
+        </kbd>
+      </div>
+
+      <div className="nav-switch-scroll">
+        <div role="listbox" id={listId} aria-label="Switch to">
+          {nucleo === undefined ? null : option(nucleo, 0)}
+          {/*
+            Nothing about projects until the daemon has answered: no count and no
+            "no projects" line, because `undefined` is "it has not spoken", and a
+            sentence about what it did not say is a claim nobody measured.
+          */}
+          {projects === undefined ? null : (
+            <div role="group" aria-labelledby={labelId}>
+              <div className="nav-switch-section" id={labelId}>
+                <span>Projects</span>
+                <span className="nav-switch-total">{matches.length}</span>
+              </div>
+              {options.slice(offset).map((entry, index) => option(entry, index + offset))}
+            </div>
+          )}
+        </div>
+        {projects !== undefined && typed !== "" && matches.length === 0 ? (
+          <p className="nav-switch-empty">No project called “{query.trim()}”.</p>
+        ) : null}
+      </div>
+
+      <div className="nav-switch-foot">
+        <Link to="/projects" className="nav-switch-item" activeOptions={{ exact: true }} onClick={() => onClose(false)}>
+          <LayoutList className="nav-switch-foot-icon" strokeWidth={1.5} aria-hidden="true" />
+          <span className="nav-switch-label">All projects</span>
+        </Link>
+        <Link to="/projects/new" className="nav-switch-item" onClick={() => onClose(false)}>
+          <Plus className="nav-switch-foot-icon" strokeWidth={1.5} aria-hidden="true" />
+          <span className="nav-switch-label">New project</span>
+        </Link>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The project switcher, in the slot the wordmark used to hold alone — and since
+ * 2026-10-02 the one list of projects in the app's chrome.
+ *
+ * The rail used to carry the roster as rows of its own, shown or hidden by a
+ * disclosure. That put a list whose length belongs to the daemon inside a list
+ * of destinations whose length is ours: fifteen projects pushed Work and Pillars
+ * off the bottom. The rail now has one `Projects` row, and this is where a
+ * project is chosen — from anywhere, by pointer or by Ctrl+P and a few letters.
  */
 function ProjectSwitcher({
   projects,
   pathname,
   collapsed,
+  open,
+  onOpenChange,
   onExpand,
 }: {
   projects: ProjectNavEntry[] | undefined;
   pathname: string;
   collapsed: boolean;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   /**
-   * What the mark does at icon width, where it is not a switcher at all.
+   * What the button does at icon width, where it is not a switcher at all.
    *
    * A rail collapsed to 56px has no room for the name, the note or the chevron,
-   * and a menu opening out of a 56px strip is a panel with no anchor. So the
-   * mark stops being the switcher and becomes the way back out — which is also
-   * the only control the collapsed rail then needs, and one less arrow beside
-   * it. Switching project is a thing you do from the open rail.
+   * and a panel opening out of a 56px strip has no anchor. So the button becomes
+   * the way back out — which is also the only control the collapsed rail then
+   * needs. Ctrl+P still works there: it expands the rail first.
    */
   onExpand: () => void;
 }) {
-  const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const button = useRef<HTMLButtonElement>(null);
-
-  /*
-    The núcleo first and separated, because it is not a project: it is the way
-    back out to Home. The projects follow in the roster's own order, which is the
-    daemon's, so the switcher and the rail's rows never disagree about it.
-  */
-  const rows: SwitcherRow[] = [
-    { label: "NucleOS", note: "the núcleo", path: "/", brand: true },
-    ...(projects ?? []).map((project) => ({
-      label: project.id,
-      note: project.mode,
-      path: projectPath(project.id),
-      mode: project.mode,
-    })),
-  ];
+  const panelId = `${useId()}-switch`;
+  const showing = open && !collapsed;
 
   const here = projectOf(pathname);
-  const current = rows.find((row) => row.label === here) ?? rows[0];
+  const hereMode = projects?.find((project) => project.id === here)?.mode;
+  const name = here ?? "NucleOS";
+  // The mode in words where the menu only draws a dot — the button is the workspace's own line.
+  const note = here === undefined ? "the núcleo" : hereMode === undefined ? "project" : modeWord(hereMode);
 
   /*
-    Closing on a click anywhere else, without the paste's full-screen invisible
-    overlay. That overlay swallows the first click on whatever you were actually
-    reaching for, and it is invisible to the keyboard, so it solves the pointer
-    case by making the pointer worse and leaves Escape unimplemented.
+    Closing on a press anywhere else, without a full-screen invisible overlay.
+    That overlay swallows the first click on whatever you were actually reaching
+    for, and it is invisible to the keyboard.
   */
   useEffect(() => {
-    if (!open) return;
+    if (!showing) return;
 
     function onPointerDown(event: PointerEvent) {
       if (root.current?.contains(event.target as Node) === true) return;
-      setOpen(false);
+      onOpenChange(false);
     }
 
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
-  }, [open]);
+  }, [showing, onOpenChange]);
 
-  /**
-   * Arrows walk the list, Escape closes it and hands focus back.
-   *
-   * Handing focus back is the part that is not decoration: a menu that closes
-   * and drops focus on `document.body` leaves a keyboard reader at the top of
-   * the page, which is a worse place than the one they opened it from.
-   */
-  function onKeyDown(event: KeyboardEvent<HTMLUListElement>) {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      setOpen(false);
-      button.current?.focus();
-      return;
-    }
-
-    if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Home" && event.key !== "End") {
-      return;
-    }
-
-    const links = Array.from(event.currentTarget.querySelectorAll<HTMLElement>("a"));
-    const index = links.indexOf(event.target as HTMLElement);
-    if (links.length === 0 || index < 0) return;
-
-    let next: number;
-    if (event.key === "Home") next = 0;
-    else if (event.key === "End") next = links.length - 1;
-    else if (event.key === "ArrowDown") next = (index + 1) % links.length;
-    else next = (index - 1 + links.length) % links.length;
-
-    event.preventDefault();
-    links[next].focus();
+  function close(refocus: boolean) {
+    onOpenChange(false);
+    if (refocus) button.current?.focus();
   }
 
   return (
@@ -332,92 +468,46 @@ function ProjectSwitcher({
         /*
           Two controls in one box, and the attributes say which one it currently
           is. Collapsed it is not a disclosure at all, so it carries no
-          `aria-expanded` and no `aria-controls` — claiming to own a menu that
+          `aria-expanded` and no `aria-controls` — claiming to own a panel that
           cannot open is worse than claiming nothing.
         */
-        aria-expanded={collapsed ? undefined : open}
-        aria-controls={collapsed ? undefined : "nav-switch-menu"}
+        aria-expanded={collapsed ? undefined : showing}
+        aria-controls={collapsed || !showing ? undefined : panelId}
         /*
-          The name is spelled out rather than left to the button's text, which
-          would run the name into the note and announce the núcleo as "NucleOS
-          the núcleo". Collapsed there is no text at all, and a button whose
-          whole content is an `alt=""` image has no name to announce.
+          Spelled out rather than left to the button's text, which would run the
+          name into the note ("NucleOS the núcleo"). Collapsed there is no text at
+          all, and a button whose whole content is an `alt=""` image has no name.
         */
-        aria-label={collapsed ? "Expand the sidebar" : `${current.label} — switch project`}
+        aria-label={collapsed ? "Expand the sidebar" : `${name} — switch project`}
         title={collapsed ? "Expand the sidebar" : undefined}
-        onClick={collapsed ? onExpand : () => setOpen(!open)}
+        onClick={collapsed ? onExpand : () => onOpenChange(!showing)}
       >
         {/*
-          The one place in the rail the brand is allowed to appear. `tokens.css`
-          is explicit that `--accent` is "the one brand colour. Not a state;
-          never used to mean anything", so cyan here means NucleOS and may not
-          also mean "three things are waiting" — which is why the badges below
-          stay on the pending tone.
+          The lead box: the mark on the núcleo, the project's initial inside one.
+          The mark is the one place in the rail the brand appears, and `--accent`
+          is never spent on state — so the mode inside a project is a dot in the
+          corner, on its own tone, and never a cyan anything.
         */}
-        <img className="nav-switch-mark" src={mark} alt="" />
-        <span className="nav-switch-text">
-          <span className="nav-switch-name">{current.label}</span>
-          <span className="nav-switch-note">{current.note}</span>
+        <span className="nav-switch-lead">
+          {here === undefined ? (
+            <img className="nav-switch-mark" src={mark} alt="" />
+          ) : (
+            <>
+              <span className="nav-switch-initial">{here.charAt(0).toUpperCase()}</span>
+              {hereMode === undefined ? null : (
+                <span className="nav-switch-dot nav-switch-corner" data-mode={hereMode} />
+              )}
+            </>
+          )}
         </span>
-        <ChevronDown className="nav-switch-chevron" strokeWidth={1.5} aria-hidden="true" />
+        <span className="nav-switch-text">
+          <span className="nav-switch-name">{name}</span>
+          <span className="nav-switch-note">{note}</span>
+        </span>
+        <ChevronsUpDown className="nav-switch-chevron" strokeWidth={1.5} aria-hidden="true" />
       </button>
 
-      {open ? (
-        <ul className="nav-switch-menu" id="nav-switch-menu" onKeyDown={onKeyDown}>
-          {rows.map((row) => (
-            <li key={row.label} className={row.brand === true ? "nav-switch-brand" : undefined}>
-              <Link
-                to={row.path}
-                className="nav-switch-item"
-                /*
-                  `page`, and not the `true` a switcher would otherwise take:
-                  the router marks the link whose path it is on with `page` of
-                  its own accord, and two values for one meaning would make the
-                  same row announce differently depending on which of its three
-                  modes you happened to be reading. The prop still does work —
-                  from `/projects/alpha/workflows` the row points at `/state`,
-                  which the router does not consider current, and the switcher
-                  does.
-                */
-                aria-current={row === current ? "page" : undefined}
-                /*
-                  The mode is a dot on screen and a word in the accessible name.
-                  Not a contradiction of the rule above but the whole of it: the
-                  word costs no space in speech, and a state carried in colour
-                  alone is a state some readers never get. `title` gives the
-                  pointer the same word, for anyone who can see the dot and
-                  cannot tell the three tones apart.
-                */
-                aria-label={row.mode === undefined ? undefined : `${row.label}, ${row.mode}`}
-                title={row.mode}
-                onClick={() => setOpen(false)}
-              >
-                <span className="nav-switch-lead">
-                  {row.brand === true ? (
-                    <img className="nav-switch-mini" src={mark} alt="" />
-                  ) : (
-                    <span className="nav-mode" data-mode={row.mode} aria-hidden="true" />
-                  )}
-                </span>
-                <span className="nav-switch-label">{row.label}</span>
-              </Link>
-            </li>
-          ))}
-          <li>
-            {/*
-              `New project` and not the paste's `Create Workspace`: `/projects/new`
-              is a route this app has, so the row goes somewhere. The paste's label
-              could not.
-            */}
-            <Link to="/projects/new" className="nav-switch-item nav-switch-new" onClick={() => setOpen(false)}>
-              <span className="nav-switch-lead">
-                <Plus className="nav-switch-plus" strokeWidth={1.5} aria-hidden="true" />
-              </span>
-              <span className="nav-switch-label">New project</span>
-            </Link>
-          </li>
-        </ul>
-      ) : null}
+      {showing ? <SwitcherPanel id={panelId} projects={projects} here={here} onClose={close} /> : null}
     </div>
   );
 }
@@ -435,18 +525,16 @@ export interface SidebarProps {
    */
   badges?: Partial<Record<NavBadge, number>>;
   /**
-   * The project roster, for the one group whose items are not in the nav table.
+   * The project roster, for the switcher — the one list of projects.
    *
    * Passed in rather than fetched here, which is the same rule the badges follow
    * and for the same reason: this component needs a router and nothing else, and
    * that is what lets the entire rail be tested without a daemon.
    *
-   * `undefined` — the roster has not answered — draws no rows at all. Not an
-   * empty group and not a "no projects" line: the daemon has not spoken, and a
-   * sentence about what it did not say is a claim nobody measured. The switcher
-   * reads the same list and follows the same rule: with no answer it offers the
-   * núcleo and the way to make a first project, and says nothing about how many
-   * there are.
+   * `undefined` — the roster has not answered — offers the núcleo and the
+   * footer, and says nothing about how many projects there are: the daemon has
+   * not spoken, and a sentence about what it did not say is a claim nobody
+   * measured.
    */
   projects?: ProjectNavEntry[];
   /**
@@ -472,7 +560,7 @@ export interface SidebarProps {
 /**
  * The left rail: every page in the app, and the state of the machine under it.
  *
- * The switcher, then four groups, then a pinned footer. The pinning is the
+ * The switcher, then three groups, then a pinned footer. The pinning is the
  * load-bearing part: the kill switch has to be reachable without scrolling, from
  * every page, at any scroll position of the item list — so the scrolling region
  * is the groups alone and the footer is its sibling, not its last child.
@@ -513,7 +601,7 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
    * play: a transition needs a change, and there is none on the first paint.
    */
   const [iconsOnly, setIconsOnly] = useState(readCollapsed);
-  const [rosterOpen, setRosterOpen] = useState(readRosterOpen);
+  const [switcherOpen, setSwitcherOpen] = useState(false);
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   const navigate = useNavigate();
 
@@ -521,8 +609,35 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
     const next = !collapsed;
     setCollapsed(next);
     writeCollapsed(next);
-    if (!next) setIconsOnly(false);
+    if (next) setSwitcherOpen(false);
+    else setIconsOnly(false);
   }
+
+  /**
+   * Ctrl+P (Cmd+P) opens the switcher from anywhere in the window.
+   *
+   * `preventDefault` is not optional: unhandled, the chord is Print. A collapsed
+   * rail is expanded first — the panel hangs off the open rail's button — and
+   * the icons-only layout comes off on the same render, so the panel can mount
+   * at once. `defaultPrevented` lets anything that already answered the chord
+   * keep it, which is the same courtesy the palette's Ctrl+K extends.
+   */
+  useEffect(() => {
+    function onKey(event: globalThis.KeyboardEvent) {
+      if (event.defaultPrevented) return;
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+      if (event.key.toLowerCase() !== "p" || typingElsewhere(event.target)) return;
+      event.preventDefault();
+      if (collapsed) {
+        setCollapsed(false);
+        writeCollapsed(false);
+        setIconsOnly(false);
+      }
+      setSwitcherOpen(true);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [collapsed]);
 
   /**
    * The end of the slide, which is when the icons-only layout is allowed in.
@@ -558,15 +673,6 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
     const timer = setTimeout(() => setIconsOnly(collapsed), 400);
     return () => clearTimeout(timer);
   }, [collapsed, iconsOnly]);
-
-  /** The route's answer until somebody gives one of their own. */
-  const showRoster = rosterOpen ?? inProjects(pathname);
-
-  function toggleRoster() {
-    const next = !showRoster;
-    setRosterOpen(next);
-    writeRosterOpen(next);
-  }
 
   /**
    * Keyboard handling for the whole rail, in one place.
@@ -610,33 +716,12 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
     items[next].focus();
   }
 
-  /**
-   * One row.
-   *
-   * `monogram` is the roster's exception to the icon rule and the only one.
-   * Every compiled row has a mark of its own from `nav.ts`; a project's identity
-   * is its name, and twenty projects drawn with the same generic icon would be
-   * twenty identical rows in the collapsed rail. Two letters collide sometimes,
-   * which is accepted rather than solved — a generated monogram nobody
-   * recognises is worse, and the collapsed rail is a shortcut for a rail you
-   * already know.
-   *
-   * So `icon` is optional *here* and required in `nav.ts`: a roster row has
-   * nothing to put in the field and must not be made to invent one, while a
-   * compiled row still cannot reach the rail without a mark.
-   */
-  function item(
-    entry: Omit<NavItem, "icon"> & { icon?: LucideIcon },
-    options: { alert?: boolean; active?: boolean; mode?: AutopilotMode; monogram?: string } = {},
-  ) {
-    const { alert = false, active: activeOverride, mode, monogram } = options;
-    const active = activeOverride ?? isActive(pathname, entry.path);
-    const count =
-      entry.badge === undefined
-        ? projects?.find((project) => `project:${project.id}` === entry.id)?.pending
-        : badges?.[entry.badge];
-    // Roster counts are open proposals, the other arithmetic from the Waiting count.
-    const noun = entry.badge === undefined ? PROJECT_BADGE_NOUN : BADGE_NOUN[entry.badge];
+  /** One row. */
+  function item(entry: NavItem, options: { alert?: boolean } = {}) {
+    const { alert = false } = options;
+    const active = isActive(pathname, entry.path);
+    const count = entry.badge === undefined ? undefined : badges?.[entry.badge];
+    const noun = entry.badge === undefined ? "" : BADGE_NOUN[entry.badge];
     const counted = count !== undefined && count > 0;
     const classes = ["nav-item"];
     if (active) classes.push("nav-item-active");
@@ -654,15 +739,6 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
         className={classes.join(" ")}
         aria-current={active ? "page" : undefined}
         /*
-          `Link`'s OWN active detection is a prefix match with no way to turn it
-          off, and it appends its own `aria-current="page"` after ours whenever
-          `pathname` merely starts with `entry.path` — which is exactly the case
-          the roster-disclosing row's `active` override exists to defeat. `exact`
-          only when an override was given: every other row still wants the
-          router's default prefix rule, which already agrees with `isActive`.
-        */
-        activeOptions={activeOverride !== undefined ? { exact: true } : undefined}
-        /*
           Spelled out rather than left to the name computation over the
           children, which concatenates adjacent inline text with no separator
           and would announce this item as "Waiting7". A count that is on screen
@@ -671,21 +747,7 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
         aria-label={spokenName(entry.label, counted ? count : undefined, noun, alert)}
         title={entry.disabled ?? (iconsOnly ? entry.label : undefined)}
       >
-        {monogram !== undefined ? (
-          <span className="nav-glyph" aria-hidden="true">
-            {monogram}
-          </span>
-        ) : Icon === undefined ? null : (
-          <Icon className="nav-icon" strokeWidth={1.5} aria-hidden="true" />
-        )}
-        {/*
-          Off, shadow and active are three different things a project can be
-          doing, and the difference governs whether anything happens here without
-          being asked. A colour rather than a word because it sits in a rail read
-          at a glance; the word is on the workspace itself, where it is read on
-          purpose.
-        */}
-        {mode === undefined ? null : <span className="nav-mode" data-mode={mode} aria-hidden="true" />}
+        <Icon className="nav-icon" strokeWidth={1.5} aria-hidden="true" />
         <span className="nav-label">{entry.label}</span>
         {counted ? (
           <span className="nav-badge" aria-hidden="true">
@@ -716,6 +778,8 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
           projects={projects}
           pathname={pathname}
           collapsed={iconsOnly}
+          open={switcherOpen}
+          onOpenChange={setSwitcherOpen}
           onExpand={toggleCollapsed}
         />
         {/*
@@ -753,99 +817,9 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
               {group.label}
             </h2>
             <ul className="nav-list" aria-labelledby={`nav-group-${group.id}`}>
-              {group.items.map((entry, index) => {
-                /*
-                  The roster hangs off the LAST item of a roster group, which is
-                  the row that opens the same list in full. Written as a position
-                  rather than as `entry.id === "projects"` so that the rail keeps
-                  no private knowledge of which row that is — `nav.ts` decides the
-                  order, and this follows it.
-                */
-                const discloses = group.roster === true && index === group.items.length - 1;
-
-                if (!discloses) return <li key={entry.id}>{item(entry)}</li>;
-
-                return (
-                  <li key={entry.id}>
-                    {/*
-                      The link and its chevron in a box of their own, and the box
-                      is what the chevron is centred in. The `<li>` will not do:
-                      it is the row AND the list under it, so a chevron centred
-                      on it lands four rows down, on another project's badge —
-                      measured, at 70px below the row it belongs to. One element,
-                      and no magic number that a taller row would falsify.
-                    */}
-                    <div className="nav-rowhead">
-                      {/* Equality, not the prefix rule: this row owns the roster under it, so
-                          a prefix match lights it on every path any of its children own. See
-                          `isActive`. */}
-                      {item(entry, { active: pathname === entry.path })}
-                      {/*
-                        A link and a disclosure, side by side, and deliberately
-                        not one control doing both: `All projects` is a page —
-                        the fleet-wide reading no single workspace can give — and
-                        a row that opened a list instead of going there would
-                        have taken a destination away to add a toggle. The
-                        chevron is the toggle; the word is still the way in.
-
-                        Drawn only once the roster has answered. A disclosure
-                        that opens onto nothing is an affordance that lies, and
-                        `undefined` here means the daemon has not spoken yet
-                        rather than that there are no projects.
-                      */}
-                      {projects === undefined ? null : (
-                        <button
-                          type="button"
-                          className="nav-disclose"
-                          onClick={toggleRoster}
-                          aria-expanded={showRoster}
-                          aria-controls="nav-roster"
-                          aria-label={showRoster ? "Hide the project list" : "Show the project list"}
-                          title={showRoster ? "Hide the project list" : "Show the project list"}
-                        >
-                          <ChevronRight
-                            className={showRoster ? "nav-disclose-icon nav-disclose-open" : "nav-disclose-icon"}
-                            strokeWidth={1.5}
-                            aria-hidden="true"
-                          />
-                        </button>
-                      )}
-                    </div>
-                    {/*
-                      The list the chevron names, and it exists whether or not it
-                      is open: `aria-controls` has to resolve to something, and an
-                      empty `<ul>` adds no height. Closed it holds no rows at all
-                      rather than hidden ones — the rail's arrow walk reads the
-                      DOM, and `hidden` rows would still be in it, sending focus
-                      to places nobody can see.
-                    */}
-                    <ul className="nav-sub" id="nav-roster">
-                      {showRoster
-                        ? projects?.map((project) => (
-                            <li key={project.id}>
-                              {item(
-                                {
-                                  id: `project:${project.id}`,
-                                  label: project.id,
-                                  // Estado is where a project opens: it is the
-                                  // mode that answers the question somebody
-                                  // arrives with.
-                                  path: projectPath(project.id),
-                                  badge: undefined,
-                                },
-                                {
-                                  active: projectOf(pathname) === project.id,
-                                  mode: project.mode,
-                                  monogram: project.id.slice(0, 2),
-                                },
-                              )}
-                            </li>
-                          ))
-                        : null}
-                    </ul>
-                  </li>
-                );
-              })}
+              {group.items.map((entry) => (
+                <li key={entry.id}>{item(entry)}</li>
+              ))}
             </ul>
           </div>
         ))}
