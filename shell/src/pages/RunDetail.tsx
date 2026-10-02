@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import { routeTriple } from "../data/route";
@@ -32,6 +32,7 @@ import {
   RunPipeline,
 } from "../ui";
 import { JudgeOpinionsBlock } from "./AutopilotJudge";
+import { readRunStream, type RunEvent } from "../lib/run-stream";
 import "./runs.css";
 
 /**
@@ -640,8 +641,36 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
     setSince(chunk.next);
   }, [chunk]);
 
+  const [raw, setRaw] = useState(false);
+  const events = useMemo(() => readRunStream(text), [text]);
+
+  /**
+   * Follows the bottom while the reader is at the bottom, and stays put once they scroll up to
+   * read something: a well that yanks the page back down every poll cannot be read at all.
+   */
+  const well = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
+  useEffect(() => {
+    const element = well.current;
+    if (element !== null && pinned.current) element.scrollTop = element.scrollHeight;
+  }, [text, raw]);
+  const onScroll = () => {
+    const element = well.current;
+    if (element === null) return;
+    pinned.current = element.scrollHeight - element.scrollTop - element.clientHeight < 24;
+  };
+
   return (
-    <Panel title="Live output">
+    <Panel
+      title="Live output"
+      aside={
+        text !== "" && (
+          <Button aria-pressed={raw} onClick={() => setRaw(!raw)}>
+            {raw ? "Readable" : "Raw"}
+          </Button>
+        )
+      }
+    >
       {/* A read that failed says nothing about where the output is — unlike the
           204 below, which says exactly where it is. */}
       {tail.isError && <ErrorNote>the live tail is unreachable — the núcleo did not answer</ErrorNote>}
@@ -651,11 +680,77 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
           {recorded === null ? ", and the daemon kept none of it" : ""}.
         </p>
       )}
-      {text !== "" && <pre className="runs-pre runs-tail">{text}</pre>}
+      {text !== "" &&
+        (raw ? (
+          <div ref={well} onScroll={onScroll} className="runs-pre runs-tail">
+            {text}
+          </div>
+        ) : (
+          <div ref={well} onScroll={onScroll} className="runs-events-well">
+            {events.length === 0 ? (
+              <p className="runs-tail-note">nothing to read yet — the agent is working</p>
+            ) : (
+              <RunEventList events={events} />
+            )}
+          </div>
+        ))}
       {text === "" && chunk !== RECORDED && !tail.isError && (
         <p className="runs-tail-note">{alive ? "nothing written yet" : "no live output was captured"}</p>
       )}
     </Panel>
+  );
+}
+
+/** The small label in front of an event: who is speaking, or what kind of thing this is. */
+function eventLabel(event: RunEvent): string {
+  switch (event.kind) {
+    case "said":
+      return "agent";
+    case "thought":
+      return "thinking";
+    case "tool":
+      return event.name;
+    case "result":
+      return event.error ? "error" : "output";
+    case "done":
+      return "end";
+    case "meta":
+      return "run";
+    case "raw":
+      return "text";
+  }
+}
+
+function RunEventList({ events }: { events: RunEvent[] }) {
+  return (
+    <ol className="runs-events">
+      {events.map((event, at) => (
+        <RunEventRow key={at} event={event} />
+      ))}
+    </ol>
+  );
+}
+
+function RunEventRow({ event }: { event: RunEvent }) {
+  const tone = event.kind === "result" || event.kind === "done" ? (event.error ? " runs-event-error" : "") : "";
+  return (
+    <li className={`runs-event runs-event-${event.kind}${tone}`}>
+      <span className="runs-event-label">{eventLabel(event)}</span>
+      <div className="runs-event-body">
+        {event.kind === "tool" ? (
+          event.detail !== "" && <code className="runs-event-code">{event.detail}</code>
+        ) : event.kind === "result" || event.kind === "raw" ? (
+          <pre className="runs-event-pre">{event.text}</pre>
+        ) : (
+          <p className="runs-event-text">{event.text}</p>
+        )}
+        {event.kind === "result" && event.more > 0 && (
+          <span className="runs-event-more">
+            … {event.more} more {event.more === 1 ? "line" : "lines"} — Raw shows them
+          </span>
+        )}
+      </div>
+    </li>
   );
 }
 
@@ -667,19 +762,41 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
  */
 function StdStreams({ run }: { run: Run }) {
   const [open, setOpen] = useState(false);
+  const [raw, setRaw] = useState(false);
+  // The same reading the live tail gets: a finished run's stdout is the stream-json it streamed.
+  const events = useMemo(() => (run.stdout === null ? [] : readRunStream(run.stdout + "\n")), [run.stdout]);
   return (
     <Panel
       title="Stored output"
       aside={
-        <Button aria-expanded={open} onClick={() => setOpen(!open)}>
-          {open ? "Hide output" : "Show output"}
-        </Button>
+        <>
+          {open && run.stdout !== null && (
+            <Button aria-pressed={raw} onClick={() => setRaw(!raw)}>
+              {raw ? "Readable" : "Raw"}
+            </Button>
+          )}
+          <Button aria-expanded={open} onClick={() => setOpen(!open)}>
+            {open ? "Hide output" : "Show output"}
+          </Button>
+        </>
       }
     >
       {open ? (
         <>
           <h3 className="runs-stream-title">stdout</h3>
-          <pre className="runs-pre">{run.stdout ?? "nothing recorded"}</pre>
+          {run.stdout === null ? (
+            <pre className="runs-pre">nothing recorded</pre>
+          ) : raw ? (
+            <pre className="runs-pre">{run.stdout}</pre>
+          ) : (
+            <div className="runs-events-well">
+              {events.length === 0 ? (
+                <p className="runs-tail-note">nothing a person reads — Raw shows the wire</p>
+              ) : (
+                <RunEventList events={events} />
+              )}
+            </div>
+          )}
           <h3 className="runs-stream-title">stderr</h3>
           <pre className="runs-pre">{run.stderr ?? "nothing recorded"}</pre>
         </>

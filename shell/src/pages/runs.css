@@ -613,6 +613,117 @@
   color: var(--text);
 }
 
+/**
+ * The live tail read as events: a narrow label column (who is speaking, or which tool) and the
+ * body beside it. Prose in the body face, commands and tool output in mono — the line between
+ * what the agent SAID and what a program PRINTED is the thing the raw wire hides.
+ */
+.runs-events-well {
+  max-height: 32rem;
+  overflow: auto;
+  overscroll-behavior: none;
+  margin: var(--space-3) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.runs-events {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.runs-event {
+  display: grid;
+  grid-template-columns: 6.5rem minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: baseline;
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border);
+}
+
+.runs-event:first-child {
+  border-top: 0;
+}
+
+/* A tool's output belongs to the call above it: no rule between them, and less air. */
+.runs-event-tool + .runs-event-result {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.runs-event-label {
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runs-event-tool .runs-event-label {
+  color: var(--accent);
+}
+
+.runs-event-error .runs-event-label {
+  color: var(--tone-danger-fg);
+}
+
+.runs-event-body {
+  min-width: 0;
+}
+
+.runs-event-text {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.runs-event-thought .runs-event-text,
+.runs-event-meta .runs-event-text {
+  color: var(--text-faint);
+}
+
+.runs-event-thought .runs-event-text {
+  font-style: italic;
+}
+
+.runs-event-done .runs-event-text {
+  font-weight: var(--weight-medium);
+}
+
+.runs-event-code,
+.runs-event-pre {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.runs-event-code {
+  color: var(--text);
+}
+
+.runs-event-pre {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.runs-event-more {
+  display: block;
+  margin-top: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 .runs-tail-note {
   margin: var(--space-2) 0 0;
   font-size: var(--text-sm);

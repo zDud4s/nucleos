@@ -122,15 +122,16 @@ describe("RunPipeline", () => {
     const boxes = [...container.querySelectorAll("rect.ui-runpipe-box")];
 
     expect(boxes).toHaveLength(4);
+    const [, , viewW, viewH] = container.querySelector("svg")!.getAttribute("viewBox")!.split(" ").map(Number);
     for (const box of boxes) {
       const x = Number(box.getAttribute("x"));
       const width = Number(box.getAttribute("width"));
       const y = Number(box.getAttribute("y"));
       const height = Number(box.getAttribute("height"));
       expect(x).toBeGreaterThanOrEqual(0);
-      expect(x + width).toBeLessThanOrEqual(720);
+      expect(x + width).toBeLessThanOrEqual(viewW);
       expect(y).toBeGreaterThanOrEqual(0);
-      expect(y + height).toBeLessThanOrEqual(96);
+      expect(y + height).toBeLessThanOrEqual(viewH);
     }
   });
 
