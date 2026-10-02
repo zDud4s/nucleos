@@ -20,6 +20,8 @@ use std::path::PathBuf;
 
 use crate::config::{CouncilConfig, CouncilSeat, SeatAgent, SeatKind, SeatSpec};
 
+pub mod tally;
+
 /// The roster on this machine, or `None` when there is no home directory to hang it off.
 ///
 /// `~/.nucleos` and not the app's data directory, for the reason `workflows::library_root` argues
