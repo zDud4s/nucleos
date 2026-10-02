@@ -1898,6 +1898,10 @@ struct BulkAttachment {
     mime_type: Option<String>,
     size_bytes: i64,
     content_base64: String,
+    /// True when `content_base64` is only the first part of the file (`size_bytes` is the true
+    /// size). Absent from older sidecars, which means complete.
+    #[serde(default)]
+    truncated: bool,
 }
 
 /// Every attachment of one message, read in a single pass over the mailbox.
@@ -1964,6 +1968,11 @@ async fn post_email_attachments_save_all(
 ) -> Result<Json<SaveAllOutcome>, StatusCode> {
     let root = files_root(&state)?.to_path_buf();
     let attachments = fetch_all_attachments(&state, id).await?;
+    // A cut-off file would be filed as if it were whole. Refuse before anything is written, in the
+    // same spirit as the no-partial-success rule above.
+    if attachments.iter().any(|a| a.truncated) {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
 
     let decoded: Vec<(String, Vec<u8>)> = attachments
         .into_iter()
@@ -2043,6 +2052,9 @@ async fn fetch_attachment(
             // The stored description and the live message disagree: the mail was deleted or
             // replaced since it was read.
             StatusCode::NOT_FOUND
+        } else if response.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            // The attachment is over the sidecar's cap and it refused to hand over a cut-off file.
+            StatusCode::PAYLOAD_TOO_LARGE
         } else {
             StatusCode::BAD_GATEWAY
         });
@@ -17830,6 +17842,21 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    /// An older sidecar sends no `truncated`; that must read as complete, and a newer one's flag
+    /// must survive the parse, or save-all would file a cut-off file as whole.
+    #[test]
+    fn the_bulk_entry_reads_truncated_and_defaults_to_complete() {
+        let old: BulkAttachment =
+            serde_json::from_str(r#"{"position":0,"size_bytes":3,"content_base64":"YWJj"}"#)
+                .unwrap();
+        assert!(!old.truncated);
+        let cut: BulkAttachment = serde_json::from_str(
+            r#"{"position":1,"size_bytes":99,"content_base64":"YWJj","truncated":true}"#,
+        )
+        .unwrap();
+        assert!(cut.truncated);
     }
 
     /// The literal `save-all` must keep winning over `{position}`, or filing everything starts
