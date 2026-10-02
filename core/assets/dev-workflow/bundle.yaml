@@ -115,6 +115,8 @@ owns:
   # `.../scratchpad/f5-live-edits.md` for every tracked reference that names their old path.
   - .ai/scripts/evidence_gate.py
   - .ai/scripts/test-evidence-gate.py
+  - .ai/scripts/set_active_packet.py
+  - .ai/scripts/test-set-active-packet.py
   - .ai/scripts/review_gate.py
   - .ai/scripts/test-review-gate.py
   - .ai/scripts/usage_split.py
