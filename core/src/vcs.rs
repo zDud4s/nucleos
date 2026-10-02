@@ -2650,6 +2650,12 @@ pub async fn drain_once(
                 Some(&crate::feed::Subject::Vcs(id)),
             )
             .await;
+            // After the terminal write on purpose: cleanup is best-effort and detached, and
+            // nothing may be awaited between the executor and `finish` (see the doc on
+            // `drain_once`). Only a landing that really succeeded leaves a target dir to drop.
+            if matches!(outcome, Outcome::Succeeded { .. }) {
+                crate::land::clean_after_landing(pool, &claimed);
+            }
         }
         // Not a lost write: `finish` is scoped to `status = 'running'`, so this is the row being
         // taken out from under the operation — a restart's `reconcile_interrupted` already marked
