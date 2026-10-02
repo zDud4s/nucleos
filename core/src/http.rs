@@ -664,6 +664,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/proposals", get(get_proposals))
         // The sidebar's "waiting on you" number, read in one request instead of seven.
         .route("/waiting/count", get(get_waiting_count))
+        .route("/waiting/git", get(get_waiting_git))
         // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
         // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
         // that `/runs/awaiting-approval` raises does not arise here.
@@ -691,6 +692,7 @@ pub fn build_router(state: AppState) -> Router {
         // zero deadline, which `wait_for` answers from its first look at the row.
         .route("/vcs/requests/{id}", get(get_vcs_request))
         .route("/vcs/requests/{id}/wait", get(wait_vcs_request))
+        .route("/vcs/requests/{id}/dismiss", post(post_vcs_request_dismiss))
         // Admin-only by construction: absent from BOTH scope tables in `auth.rs`, for the
         // `POST /email/send` reason rather than the `POST /runs` one. It is not out of a scoped
         // key's reach because it is expensive; it is out of reach because it LEAVES THE MACHINE.
@@ -13549,9 +13551,6 @@ struct WaitingCount {
     git: Option<usize>,
 }
 
-/// The vcs statuses that need a person — the shell's `VCS_WANTS_A_PERSON`.
-const VCS_WANTS_A_PERSON: [&str; 2] = ["escalated", "blocked"];
-
 /// The badge every page of the shell draws, as one read.
 ///
 /// It used to be seven polls from every window, each shipping a whole list only for its length to
@@ -13566,7 +13565,7 @@ async fn get_waiting_count(State(state): State<AppState>) -> Json<WaitingCount> 
         crate::proposals::list_pending_recruits(pool, None),
         crate::contacts::pending_merges(pool),
         crate::exclusion::pending_requests(pool),
-        vcs::list(pool, None),
+        vcs::waiting_on_a_person(pool),
     );
     Json(WaitingCount {
         // The shell's `isWheelRequest`: an agent asked for the wheel and a proposal stands behind it.
@@ -13583,12 +13582,41 @@ async fn get_waiting_count(State(state): State<AppState>) -> Json<WaitingCount> 
         recruits: recruits.ok().map(|rows| rows.len()),
         merges: merges.ok().map(|rows| rows.len()),
         exclusions: exclusions.ok().map(|rows| rows.len()),
-        git: git.ok().map(|rows| {
-            rows.iter()
-                .filter(|row| VCS_WANTS_A_PERSON.contains(&row.status.as_str()))
-                .count()
-        }),
+        git: git.ok().map(|rows| rows.len()),
     })
+}
+
+/// The git requests that still want a person, uncapped: the same predicate the badge counts, so the
+/// Waiting page and its number cannot disagree. Admin-only by default-deny, like `/waiting/count`
+/// — no scope table entry.
+async fn get_waiting_git(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<vcs::RequestSummary>>, StatusCode> {
+    vcs::waiting_on_a_person(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing the git requests that want a person failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Puts an open git request away without touching its status: 204, 404 for an unknown id, 409 for
+/// one that is not open (succeeded, running, or already settled). Admin-only by default-deny, like
+/// `/waiting/count` — no scope table entry.
+async fn post_vcs_request_dismiss(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match vcs::dismiss(&state.pool, id).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(vcs::DismissError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(vcs::DismissError::NotOpen) => Err(StatusCode::CONFLICT),
+        Err(vcs::DismissError::Db(error)) => {
+            tracing::warn!(request_id = id, %error, "dismissing a git request failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 async fn get_skipped_items(
@@ -33861,6 +33889,153 @@ mod tests {
 
         let counted = read(app).await;
         assert_eq!(counted["approvals"], 1, "only the pending approval counts");
+    }
+
+    /// A git-queue row admitted through the real INSERT and moved to `status`.
+    async fn vcs_row_in(pool: &sqlx::SqlitePool, source: &str, status: &str) -> i64 {
+        let repo = vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj");
+        let op = vcs::Op::Merge {
+            source: source.into(),
+            target: "master".into(),
+        };
+        let id = vcs::submit(pool, &repo, &op, vcs::Origin::Shell)
+            .await
+            .expect("admit the merge");
+        sqlx::query("UPDATE vcs_requests SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("move it to its status");
+        id
+    }
+
+    /// One authenticated request, answered as `(status, body)`.
+    async fn waiting_call(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// The badge's `git` field reads the one uncapped predicate: a settled row stops counting, and
+    /// the 200-row window of the history listing no longer decides how many people are wanted.
+    #[tokio::test]
+    async fn the_waiting_count_git_field_skips_settled_rows_and_the_cap() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        for n in 0..205 {
+            vcs_row_in(&pool, &format!("feat/{n}"), "escalated").await;
+        }
+        let blocked = vcs_row_in(&pool, "feat/blocked", "blocked").await;
+        let settled = vcs_row_in(&pool, "feat/settled", "escalated").await;
+        vcs_row_in(&pool, "feat/done", "succeeded").await;
+        assert!(vcs::settle(&pool, settled, "merged").await.unwrap());
+        assert!(vcs::settle(&pool, blocked, "dismissed").await.unwrap());
+
+        let (status, counted) = waiting_call(&state, "GET", "/waiting/count").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            counted["git"], 205,
+            "205 open escalations; the settled pair is out and nothing is capped at 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_waiting_git_listing_returns_only_unsettled_rows() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let open_escalated = vcs_row_in(&pool, "feat/a", "escalated").await;
+        let open_blocked = vcs_row_in(&pool, "feat/b", "blocked").await;
+        let settled = vcs_row_in(&pool, "feat/c", "escalated").await;
+        vcs_row_in(&pool, "feat/d", "succeeded").await;
+        vcs_row_in(&pool, "feat/e", "queued").await;
+        assert!(vcs::settle(&pool, settled, "superseded").await.unwrap());
+
+        let (status, listing) = waiting_call(&state, "GET", "/waiting/git").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut ids: Vec<i64> = listing
+            .as_array()
+            .expect("a JSON array of request summaries")
+            .iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![open_escalated, open_blocked],
+            "no settled row and no other status"
+        );
+        for row in listing.as_array().unwrap() {
+            assert!(row["status"] == "escalated" || row["status"] == "blocked");
+        }
+    }
+
+    #[tokio::test]
+    async fn dismissing_a_vcs_request_settles_it_once() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let escalated = vcs_row_in(&pool, "feat/a", "escalated").await;
+        let succeeded = vcs_row_in(&pool, "feat/b", "succeeded").await;
+
+        let uri = format!("/vcs/requests/{escalated}/dismiss");
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT settled_reason FROM vcs_requests WHERE id = ?")
+                .bind(escalated)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some("dismissed"));
+
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a second dismissal is refused"
+        );
+        let (status, _) = waiting_call(
+            &state,
+            "POST",
+            &format!("/vcs/requests/{succeeded}/dismiss"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a succeeded row was never waiting"
+        );
+        let (status, _) = waiting_call(&state, "POST", "/vcs/requests/999999/dismiss").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Put away, not deleted: the history listing still holds the row, status untouched.
+        let (status, history) = waiting_call(&state, "GET", "/vcs/requests").await;
+        assert_eq!(status, StatusCode::OK);
+        let row = history
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"].as_i64() == Some(escalated))
+            .expect("the dismissed row is still in the history");
+        assert_eq!(row["status"], "escalated");
     }
 
     #[tokio::test]
