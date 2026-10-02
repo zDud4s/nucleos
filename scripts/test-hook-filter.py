@@ -30,11 +30,13 @@ Run:  python scripts/test-hook-filter.py
 
 import importlib.util
 import io
+import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
 from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -342,6 +344,393 @@ def one_source_cases():
     return cases
 
 
+class _Reply:
+    """A urlopen result: a context manager whose `.read()` returns the JSON bytes."""
+
+    def __init__(self, body):
+        self._body = json.dumps(body).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _http_404():
+    return urllib.error.HTTPError("http://x", 404, "not found", None, None)
+
+
+def _pending_file(tmp, session):
+    return os.path.join(tmp, f"{session}.json")
+
+
+def _seed(tmp, session, ids):
+    with open(_pending_file(tmp, session), "w", encoding="utf-8") as handle:
+        json.dump(ids, handle)
+
+
+def _tickets(table):
+    """A urlopen stand-in: `table` maps a request id to a body or an exception to raise.
+
+    Returns `(side_effect, calls)`; `calls` records every URL asked for.
+    """
+    calls = []
+
+    def urlopen(request, timeout=None):
+        url = request.full_url if hasattr(request, "full_url") else request
+        calls.append(url)
+        answer = table[int(url.rsplit("/", 1)[-1])]
+        if isinstance(answer, Exception):
+            raise answer
+        return _Reply(answer)
+
+    return urlopen, calls
+
+
+def _notice_with(tmp, session, table, token="tok"):
+    urlopen, calls = _tickets(table)
+    with mock.patch.dict(os.environ, {hook.PENDING_DIR_ENV: tmp}):
+        with mock.patch.object(hook, "read_control_token", return_value=(token, None)):
+            with mock.patch.object(hook.urllib.request, "urlopen", side_effect=urlopen):
+                text = hook.settled_notice({"session_id": session, "cwd": "/repo"})
+    return text, calls
+
+
+def _read_ids(tmp, session):
+    path = _pending_file(tmp, session)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        loaded = json.load(handle)
+    if isinstance(loaded, dict):
+        return [entry["id"] for entry in loaded["ids"]]
+    return loaded
+
+
+def _file_body(tmp, session):
+    with open(_pending_file(tmp, session), encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _notice_at(tmp, session, table, now, token="tok"):
+    """Like `_notice_with`, with the hook's clock fixed at `now`."""
+    with mock.patch.object(hook.time, "time", return_value=now):
+        return _notice_with(tmp, session, table, token)
+
+
+def _verdict(good, detail):
+    return "" if good else detail
+
+
+def pending_follow_up_cases():
+    """`settled_notice`: told once, silent on every error, no network when nothing is pending."""
+    cases = []
+    ok = {"id": 7, "status": "succeeded", "result_sha": "abc123", "failure_reason": None}
+    with tempfile.TemporaryDirectory() as tmp:
+        text, calls = _notice_with(tmp, "s1", {})
+        cases.append((
+            "settled_notice: nothing pending makes no urlopen call",
+            _verdict(text == "" and not calls, f"{text!r} {calls!r}"),
+        ))
+
+        _seed(tmp, "s2", [7])
+        text, calls = _notice_with(tmp, "s2", {7: ok})
+        good = (
+            "vcs request #7 has settled" in text
+            and "abc123" in text
+            and _read_ids(tmp, "s2") is None
+        )
+        cases.append((
+            "settled_notice: a settled request is told and the file cleared",
+            _verdict(good, f"{text!r} {_read_ids(tmp, 's2')!r}"),
+        ))
+        text, calls = _notice_with(tmp, "s2", {7: ok})
+        cases.append((
+            "settled_notice: told once, the second time is silent with no call",
+            _verdict(text == "" and not calls, f"{text!r} {calls!r}"),
+        ))
+
+        _seed(tmp, "s3", [8, 9])
+        text, _calls = _notice_with(
+            tmp, "s3", {8: {"id": 8, "status": "running"}, 9: {"id": 9, "status": "escalated"}}
+        )
+        good = "#9" in text and "#8" not in text and _read_ids(tmp, "s3") == [8]
+        cases.append((
+            "settled_notice: an unsettled request is kept, a settled one dropped",
+            _verdict(good, f"{text!r} {_read_ids(tmp, 's3')!r}"),
+        ))
+
+        _seed(tmp, "s4", [3])
+        text, _calls = _notice_with(tmp, "s4", {3: _http_404()})
+        cases.append((
+            "settled_notice: a 404 drops the id silently",
+            _verdict(text == "" and _read_ids(tmp, "s4") is None, f"{text!r}"),
+        ))
+
+        _seed(tmp, "s5", [4])
+        text, _calls = _notice_with(tmp, "s5", {4: OSError("down")})
+        cases.append((
+            "settled_notice: an unreachable daemon is silent and keeps the id",
+            _verdict(text == "" and _read_ids(tmp, "s5") == [4], f"{text!r}"),
+        ))
+
+        _seed(tmp, "s6", [5])
+        text, calls = _notice_with(tmp, "s6", {5: ok}, token=None)
+        cases.append((
+            "settled_notice: no token is silent with no call",
+            _verdict(
+                text == "" and not calls and _read_ids(tmp, "s6") == [5], f"{text!r} {calls!r}"
+            ),
+        ))
+    cases += pending_expiry_cases()
+    return cases
+
+
+def pending_expiry_cases():
+    """Old file format, TTL, throttle, and the settled-statuses tie to the Rust list."""
+    cases = []
+    running = {"id": 5, "status": "running"}
+    ttl, gap = hook.PENDING_TTL_SECONDS, hook.PENDING_RECHECK_SECONDS
+    with tempfile.TemporaryDirectory() as tmp:
+        # The old plain-int file is still read, and rewritten in the new format.
+        _seed(tmp, "old", [5])
+        text, calls = _notice_with(tmp, "old", {5: running})
+        body = _file_body(tmp, "old")
+        good = (
+            text == ""
+            and len(calls) == 1
+            and isinstance(body, dict)
+            and [e["id"] for e in body["ids"]] == [5]
+            and "since" in body["ids"][0]
+        )
+        cases.append((
+            "settled_notice: an old plain-int file is read and kept",
+            _verdict(good, f"{text!r} {body!r}"),
+        ))
+
+        _seed(tmp, "old2", [7])
+        text, _calls = _notice_with(
+            tmp, "old2", {7: {"id": 7, "status": "succeeded", "result_sha": "abc"}}
+        )
+        cases.append((
+            "settled_notice: an old plain-int file's settled id is told",
+            _verdict("#7" in text and _read_ids(tmp, "old2") is None, f"{text!r}"),
+        ))
+
+        # Throttle: a second call inside the window makes no request; after it, one.
+        _seed(tmp, "thr", [{"id": 5, "since": 1000}])
+        _text, calls1 = _notice_at(tmp, "thr", {5: running}, 1010)
+        _text, calls2 = _notice_at(tmp, "thr", {5: running}, 1010 + gap - 1)
+        _text, calls3 = _notice_at(tmp, "thr", {5: running}, 1010 + gap + 1)
+        cases.append((
+            "settled_notice: a burst inside the recheck window costs one check",
+            _verdict(
+                (len(calls1), len(calls2), len(calls3)) == (1, 0, 1),
+                f"{calls1} {calls2} {calls3}",
+            ),
+        ))
+
+        # TTL: an unsettled id past the TTL is dropped with a one-time notice.
+        _seed(tmp, "ttl", [{"id": 5, "since": 1000}])
+        text, _calls = _notice_at(tmp, "ttl", {5: running}, 1000 + ttl + 1)
+        good = "#5" in text and "not settled" in text and _read_ids(tmp, "ttl") is None
+        cases.append((
+            "settled_notice: an id past the TTL is dropped with a notice",
+            _verdict(good, f"{text!r}"),
+        ))
+        text, calls = _notice_at(tmp, "ttl", {5: running}, 1000 + ttl + 100)
+        cases.append((
+            "settled_notice: the expired id is not told twice",
+            _verdict(text == "" and not calls, f"{text!r} {calls!r}"),
+        ))
+
+        _seed(tmp, "young", [{"id": 5, "since": 1000}])
+        text, _calls = _notice_at(tmp, "young", {5: running}, 1000 + ttl - 1)
+        cases.append((
+            "settled_notice: an id inside the TTL is kept",
+            _verdict(text == "" and _read_ids(tmp, "young") == [5], f"{text!r}"),
+        ))
+
+        # The TTL holds with the daemon down and with no token, the cases that repeat forever.
+        _seed(tmp, "down", [{"id": 5, "since": 1000}])
+        text, _calls = _notice_at(tmp, "down", {5: OSError("down")}, 1000 + ttl + 1)
+        cases.append((
+            "settled_notice: an id past the TTL is dropped with the daemon down",
+            _verdict("#5" in text and _read_ids(tmp, "down") is None, f"{text!r}"),
+        ))
+        _seed(tmp, "notok", [{"id": 5, "since": 1000}])
+        text, calls = _notice_at(tmp, "notok", {5: running}, 1000 + ttl + 1, token=None)
+        cases.append((
+            "settled_notice: an id past the TTL is dropped with no token, no call",
+            _verdict(
+                "#5" in text and not calls and _read_ids(tmp, "notok") is None,
+                f"{text!r} {calls!r}",
+            ),
+        ))
+
+        # A token passed in is used and read_control_token is never reached.
+        _seed(tmp, "given", [5])
+        urlopen, calls = _tickets({5: running})
+        with mock.patch.dict(os.environ, {hook.PENDING_DIR_ENV: tmp}):
+            with mock.patch.object(hook, "read_control_token", side_effect=AssertionError("read")):
+                with mock.patch.object(hook.urllib.request, "urlopen", side_effect=urlopen):
+                    try:
+                        hook.settled_notice({"session_id": "given", "cwd": "/repo"}, "given-token")
+                        failure = _verdict(len(calls) == 1, f"{calls!r}")
+                    except AssertionError:
+                        failure = "settled_notice read the token despite being given one"
+        cases.append(("settled_notice: a token passed in is used, not re-read", failure))
+
+    # The Python list is the Rust one.
+    with open(os.path.join(ROOT, "core", "src", "vcs.rs"), encoding="utf-8") as handle:
+        source = handle.read()
+    found = re.search(r"TERMINAL_STATUSES:\s*\[&str;\s*\d+\]\s*=\s*\[(.*?)\]", source, re.S)
+    rust = set(re.findall(r'"([a-z_]+)"', found.group(1))) if found else None
+    cases.append((
+        "SETTLED_STATUSES equals vcs.rs TERMINAL_STATUSES",
+        _verdict(rust == set(hook.SETTLED_STATUSES), f"{rust!r} vs {hook.SETTLED_STATUSES!r}"),
+    ))
+    return cases
+
+
+def _run_interactive(tmp, payload, urlopen_side_effect, token="tok"):
+    """Runs `interactive_session`; returns `(exit_code, printed)`."""
+    captured = io.StringIO()
+    code = "no exit"
+    with mock.patch.dict(os.environ, {hook.PENDING_DIR_ENV: tmp}):
+        os.environ.pop("NUCLEOS_RUN_ID", None)
+        with mock.patch.object(hook, "read_control_token", return_value=(token, None)):
+            with mock.patch.object(hook, "control_token", return_value=token):
+                with mock.patch.object(
+                    hook.urllib.request, "urlopen", side_effect=urlopen_side_effect
+                ):
+                    with mock.patch("sys.stdout", captured):
+                        try:
+                            hook.interactive_session(payload)
+                        except SystemExit as exit_:
+                            code = exit_.code
+    return code, captured.getvalue()
+
+
+def interactive_follow_up_cases():
+    """The interactive branch: context only, never a permission decision; remembers unsettled ids."""
+    cases = []
+    with tempfile.TemporaryDirectory() as tmp:
+        _seed(tmp, "sess", [11])
+        urlopen, _calls = _tickets({11: {"id": 11, "status": "failed", "failure_reason": "boom"}})
+        payload = {"session_id": "sess", "tool_name": "Read", "tool_input": {}, "cwd": "/repo"}
+        code, printed = _run_interactive(tmp, payload, urlopen)
+        try:
+            out = json.loads(printed)
+            special = out["hookSpecificOutput"]
+            good = (
+                code in (0, None)
+                and set(out) == {"hookSpecificOutput"}
+                and "additionalContext" in special
+                and "permissionDecision" not in special
+                and "#11" in special["additionalContext"]
+            )
+            failure = _verdict(good, f"{code!r} {printed!r}")
+        except Exception as exc:  # noqa: BLE001 - the message names what was printed
+            failure = f"unparseable {printed!r}: {exc!r}"
+        cases.append(("a non-git call with a settled pending id only adds context", failure))
+
+        deny_body = {"decision": "deny", "reason": "queued", "request_id": 21, "settled": False}
+
+        def post(_request, timeout=None):
+            return _Reply(deny_body)
+
+        payload = {
+            "session_id": "sess2",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "cwd": "/repo",
+        }
+        code, printed = _run_interactive(tmp, payload, post)
+        good = code in (0, None) and '"block"' in printed and _read_ids(tmp, "sess2") == [21]
+        cases.append((
+            "a daemon deny with settled:false remembers its request id",
+            _verdict(good, f"{code!r} {printed!r} {_read_ids(tmp, 'sess2')!r}"),
+        ))
+
+        # A daemon deny with a settled notice appended: reason, blank line, notice.
+        _seed(tmp, "sess3", [11])
+        running_21 = {"id": 21, "status": "running"}
+        failed_11 = {"id": 11, "status": "failed", "failure_reason": "boom"}
+
+        def by_url(request, timeout=None):
+            url = request.full_url
+            if url.endswith("/hooks/session-git-decision"):
+                return _Reply(deny_body)
+            return _Reply(failed_11 if url.endswith("/11") else running_21)
+
+        payload3 = {
+            "session_id": "sess3",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "cwd": "/repo",
+        }
+        code, printed = _run_interactive(tmp, payload3, by_url)
+        try:
+            reason = json.loads(printed)["reason"]
+        except Exception:
+            reason = None
+        good = reason is not None and reason.startswith("queued\n\nvcs request #11 has settled")
+        cases.append((
+            "a deny carries the settled notice after the reason",
+            _verdict(good, f"{printed!r}"),
+        ))
+
+        # A daemon deny that is already settled records no id.
+        settled_body = {"decision": "deny", "reason": "done", "request_id": 31, "settled": True}
+        payload4 = dict(payload3, session_id="sess4")
+        code, printed = _run_interactive(
+            tmp, payload4, lambda r, timeout=None: _Reply(settled_body)
+        )
+        cases.append((
+            "a daemon deny with settled:true records no id",
+            _verdict('"block"' in printed and _read_ids(tmp, "sess4") is None, f"{printed!r}"),
+        ))
+
+        # The refusal path reads the token once.
+        _seed(tmp, "sess5", [11])
+        reads = []
+
+        def counted(*_args, **_kwargs):
+            reads.append(1)
+            return "t", None
+
+        payload5 = dict(payload3, session_id="sess5")
+        captured = io.StringIO()
+        with mock.patch.dict(os.environ, {hook.PENDING_DIR_ENV: tmp}):
+            with mock.patch.object(hook, "read_control_token", side_effect=counted):
+                with mock.patch.object(hook.urllib.request, "urlopen", side_effect=by_url):
+                    with mock.patch("sys.stdout", captured):
+                        try:
+                            hook.interactive_session(payload5)
+                        except SystemExit:
+                            pass
+        cases.append((
+            "the refusal path reads the token once",
+            _verdict(len(reads) == 1, f"{len(reads)} reads"),
+        ))
+
+        payload["session_id"] = "../evil"
+        before = sorted(os.listdir(tmp))
+        _run_interactive(tmp, payload, post)
+        after = sorted(os.listdir(tmp))
+        stray = os.path.exists(os.path.join(tmp, "..", "evil.json"))
+        cases.append((
+            "an unsafe session_id writes nothing",
+            _verdict(before == after and not stray, f"{before!r} {after!r}"),
+        ))
+    return cases
+
+
 def main() -> int:
     failures = 0
     for command, want in CASES:
@@ -371,7 +760,13 @@ def main() -> int:
             failures += 1
             print(f"FAIL report_outcome, {label}: {failure}")
 
-    for label, failure in binary_candidate_cases() + control_token_cases() + one_source_cases():
+    for label, failure in (
+        binary_candidate_cases()
+        + control_token_cases()
+        + pending_follow_up_cases()
+        + interactive_follow_up_cases()
+        + one_source_cases()
+    ):
         total += 1
         if failure:
             failures += 1

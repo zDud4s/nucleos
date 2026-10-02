@@ -14,6 +14,9 @@ VCS queue performs? If so it is queued and this call is refused; otherwise this 
 says nothing at all. **It can refuse but it can never approve** — that asymmetry is what
 makes it safe to speak here, where the old version had to stay silent. Registered
 repo-wide, an allow would auto-approve a person's own tools; a refusal grants nothing.
+This branch may also add context (`additionalContext`) telling the agent that a vcs request
+it was refused for has settled, once per request; that carries no permission decision either,
+and it is silent on every error.
 
 That silence was a real hole rather than a conservative default. The queue exists to
 order git operations between sessions, and the sessions doing most of the work are the
@@ -32,9 +35,24 @@ the one path where failing open would matter.
 
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.error
 import urllib.request
+
+# Statuses after which a vcs request will not change again.
+SETTLED_STATUSES = (
+    "succeeded", "failed", "blocked", "rejected", "cancelled", "interrupted", "escalated",
+)
+PENDING_DIR_ENV = "NUCLEOS_VCS_PENDING_DIR"
+# An id still unsettled this long is dropped, and the file is not re-checked more often than
+# the second figure, so a burst of tool calls costs one check rather than one per call.
+PENDING_TTL_SECONDS = 30 * 60
+PENDING_RECHECK_SECONDS = 15
+SESSION_ID_SHAPE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 # A deliberately over-broad local filter, and it must never be the authority. Its only job is
 # to keep the fast path free: this hook runs in front of every tool call in every editor
@@ -217,30 +235,232 @@ def control_token(cwd: str) -> str:
     configuration, saying nothing about why. `cargo_target_dirs` mirrors cargo's own
     precedence instead of guessing at one location.
     """
-    from_env = os.environ.get("NUCLEOS_DAEMON_TOKEN")
-    if from_env:
-        return from_env
-
-    common = subprocess.run(
-        ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if common.returncode != 0:
+    token, why = read_control_token(cwd)
+    if token:
+        return token
+    if why == "repo":
         deny("could not locate the repository to find the daemon binary - failing closed")
-    main_root = os.path.dirname(common.stdout.strip())
-
-    for binary in daemon_binary_candidates(cargo_target_dirs(main_root)):
-        if os.path.exists(binary):
-            printed = subprocess.run(
-                [binary, "--print-token"], capture_output=True, text=True, timeout=20
-            )
-            if printed.returncode == 0 and printed.stdout.strip():
-                return printed.stdout.strip()
     deny(
         "this is a git operation the queue performs, and the daemon token could not be "
         "read to queue it - failing closed. Run it from a terminal if you meant to act "
         "as yourself rather than through an agent."
     )
+
+
+def read_control_token(cwd: str, git_timeout=10, print_timeout=20):
+    """`(token, why)`: the token or None, and why none (`"repo"` or `"token"`).
+
+    Raises nothing and never denies, so a caller that must stay silent (the follow-up that
+    reports a settled request) can use it; `control_token` turns the failure into its denials.
+    """
+    from_env = os.environ.get("NUCLEOS_DAEMON_TOKEN")
+    if from_env:
+        return from_env, None
+
+    try:
+        common = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, timeout=git_timeout,
+        )
+        if common.returncode != 0:
+            return None, "repo"
+        main_root = os.path.dirname(common.stdout.strip())
+
+        for binary in daemon_binary_candidates(cargo_target_dirs(main_root)):
+            if os.path.exists(binary):
+                printed = subprocess.run(
+                    [binary, "--print-token"], capture_output=True, text=True,
+                    timeout=print_timeout,
+                )
+                if printed.returncode == 0 and printed.stdout.strip():
+                    return printed.stdout.strip(), None
+    except Exception:
+        return None, "token"
+    return None, "token"
+
+
+def pending_path(session_id):
+    """Where this session's unsettled vcs request ids are kept, or None for an unsafe id."""
+    try:
+        if not isinstance(session_id, str) or not SESSION_ID_SHAPE.fullmatch(session_id):
+            return None
+        base = os.environ.get(PENDING_DIR_ENV) or os.path.join(
+            tempfile.gettempdir(), "nucleos-vcs-pending"
+        )
+        return os.path.join(base, f"{session_id}.json")
+    except Exception:
+        return None
+
+
+def _load_pending(path):
+    """Reads the pending file as `(entries, checked)`.
+
+    `entries` is a list of `{"id": N, "since": epoch}`; `checked` is when the file was last
+    checked against the daemon (0 when never). The first version of the file was a plain list
+    of ints, and a session may still hold one: those ids count as remembered when the file was
+    last written.
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        loaded = json.load(handle)
+    try:
+        fallback = os.path.getmtime(path)
+    except Exception:
+        fallback = time.time()
+    checked = 0
+    items = loaded
+    if isinstance(loaded, dict):
+        raw_checked = loaded.get("checked")
+        if isinstance(raw_checked, (int, float)) and not isinstance(raw_checked, bool):
+            checked = raw_checked
+        items = loaded.get("ids")
+    if not isinstance(items, list):
+        return [], checked
+    entries = []
+    for item in items:
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            entries.append({"id": item, "since": fallback})
+        elif isinstance(item, dict):
+            rid, since = item.get("id"), item.get("since")
+            if isinstance(rid, int) and not isinstance(rid, bool):
+                if not isinstance(since, (int, float)) or isinstance(since, bool):
+                    since = fallback
+                entries.append({"id": rid, "since": since})
+    return entries, checked
+
+
+def _store_pending(path, entries, checked=0):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump({"checked": checked, "ids": entries}, handle)
+    os.replace(tmp, path)
+
+
+def remember_pending(session_id, request_id):
+    """Adds one request id to the session's pending list. Silent on every failure."""
+    try:
+        path = pending_path(session_id)
+        if path is None or not isinstance(request_id, int) or isinstance(request_id, bool):
+            return
+        try:
+            entries, checked = _load_pending(path)
+        except Exception:
+            entries, checked = [], 0
+        if request_id not in [e["id"] for e in entries]:
+            entries.append({"id": request_id, "since": time.time()})
+        _store_pending(path, entries, checked)
+    except Exception:
+        pass
+
+
+def notice_for(ticket):
+    """One sentence for a settled ticket, mirroring the daemon's own wording."""
+    try:
+        rid = ticket.get("id")
+        status = ticket.get("status")
+        sha = ticket.get("result_sha") or "an unrecorded commit"
+        reason = ticket.get("failure_reason") or "no reason recorded"
+        head = f"vcs request #{rid} has settled: "
+        if status == "succeeded":
+            return (
+                head + f"it succeeded and landed at {sha}. Re-read git status and git log "
+                "before going on."
+            )
+        if status == "escalated":
+            return (
+                head + "the conflict went to a person. Do not resolve it by hand."
+            )
+        if status == "blocked":
+            return (
+                head + f"it was refused before it started ({reason}). Nothing changed. "
+                "Clear the cause and run the command again."
+            )
+        if status in ("failed", "interrupted"):
+            return (
+                head + f"it {status} ({reason}). Check the repository state before "
+                "going on."
+            )
+        if status in ("cancelled", "rejected"):
+            return head + f"it was {status}. Nothing was performed."
+        return head + f"{status}."
+    except Exception:
+        return ""
+
+
+def settled_notice(payload, token=None):
+    """Text telling the agent which pending vcs requests have settled, or `""`.
+
+    Silent on every error and makes no network call when nothing is pending. A file checked
+    less than `PENDING_RECHECK_SECONDS` ago is left alone, so a burst of tool calls costs one
+    check; an id still unsettled after `PENDING_TTL_SECONDS` is dropped with one last notice.
+    `token` is an already-read daemon token, so the governed path does not read it twice.
+    """
+    try:
+        path = pending_path(payload.get("session_id"))
+        if path is None or not os.path.exists(path):
+            return ""
+        entries, checked = _load_pending(path)
+        if not entries:
+            return ""
+        now = time.time()
+        if 0 <= now - checked < PENDING_RECHECK_SECONDS:
+            return ""
+        if not token:
+            cwd = payload.get("cwd") or os.getcwd()
+            token, _why = read_control_token(cwd, 2, 3)
+        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
+        notices = []
+        remaining = []
+        for entry in entries:
+            rid = entry["id"]
+            keep = True
+            if token:
+                try:
+                    request = urllib.request.Request(
+                        f"{daemon_url}/vcs/requests/{rid}",
+                        headers={"Authorization": f"Bearer {token}"},
+                        method="GET",
+                    )
+                    with urllib.request.urlopen(request, timeout=2) as response:
+                        ticket = json.loads(response.read())
+                    if isinstance(ticket, dict) and ticket.get("status") in SETTLED_STATUSES:
+                        text = notice_for(ticket)
+                        if text:
+                            notices.append(text)
+                            keep = False
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 404:
+                        keep = False
+                except Exception:
+                    pass
+            if keep and now - entry["since"] > PENDING_TTL_SECONDS:
+                notices.append(
+                    f"vcs request #{rid} has not settled after "
+                    f"{PENDING_TTL_SECONDS // 60} minutes; it is still the queue's - do not "
+                    "run it again."
+                )
+                keep = False
+            if keep:
+                remaining.append(entry)
+        if remaining:
+            _store_pending(path, remaining, now)
+        else:
+            os.remove(path)
+        return "\n".join(notices)
+    except Exception:
+        return ""
+
+
+def tell(text: str) -> None:
+    """Adds context to the next turn. Carries no permission decision, so it grants nothing."""
+    print(
+        json.dumps(
+            {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}
+        )
+    )
+    sys.exit(0)
 
 
 def read_stdin_once():
@@ -318,14 +538,16 @@ def report_outcome(payload: dict) -> None:
 
 
 def interactive_session(payload: dict) -> None:
-    """A session a person opened. Refuses queue operations; says nothing about anything else."""
-    if payload.get("tool_name") not in ("Bash", "PowerShell"):
-        no_opinion()
+    """A session a person opened. Refuses queue operations; may add context, never approves."""
     command = (payload.get("tool_input") or {}).get("command")
-    if not isinstance(command, str):
-        no_opinion()
-
-    if not governed_git_verb(command):
+    if (
+        payload.get("tool_name") not in ("Bash", "PowerShell")
+        or not isinstance(command, str)
+        or not governed_git_verb(command)
+    ):
+        notice = settled_notice(payload)
+        if notice:
+            tell(notice)
         no_opinion()
 
     cwd = payload.get("cwd") or os.getcwd()
@@ -337,11 +559,12 @@ def interactive_session(payload: dict) -> None:
             "cwd": cwd,
         }
     ).encode()
+    token = control_token(cwd)
     request = urllib.request.Request(
         f"{daemon_url}/hooks/session-git-decision",
         data=body,
         headers={
-            "Authorization": f"Bearer {control_token(cwd)}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
         method="POST",
@@ -357,11 +580,22 @@ def interactive_session(payload: dict) -> None:
 
     if not isinstance(decision, dict):
         deny("daemon returned a non-object decision body - failing closed")
+    request_id = decision.get("request_id")
+    if (
+        decision.get("settled") is False
+        and isinstance(request_id, int)
+        and not isinstance(request_id, bool)
+    ):
+        remember_pending(payload.get("session_id"), request_id)
+    notice = settled_notice(payload, token)
     if decision.get("decision") == "allow":
         # Never re-emitted as an approval. The daemon means "not mine to govern", and the
         # session's ordinary permissions decide from here.
+        if notice:
+            tell(notice)
         no_opinion()
-    deny(decision.get("reason", "this git operation belongs to the queue"))
+    reason = decision.get("reason", "this git operation belongs to the queue")
+    deny(reason + ("\n\n" + notice if notice else ""))
 
 
 def main() -> None:
