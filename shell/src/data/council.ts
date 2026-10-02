@@ -238,6 +238,45 @@ export interface CouncilConfig {
   default_roster: { chairman: ConfiguredSeat; members: ConfiguredSeat[] } | null;
 }
 
+/**
+ * PURE: the config the wire delivered, or `null` when its shape is not one.
+ *
+ * `apiFetch` casts a `200` body without looking at it, so a daemon answering
+ * with the wrong shape would otherwise reach the composer as a config whose
+ * bounds are `undefined` — and a sentence built from them. Accepted only when
+ * every field is what `council::CouncilConfigView` promises: rounds positive
+ * integers with the default inside the ceiling, roles a list of strings, and a
+ * roster that is `null` or a chairman plus a list of members.
+ */
+export function readCouncilConfig(raw: unknown): CouncilConfig | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const config = raw as Record<string, unknown>;
+  if (typeof config.configured !== "boolean") return null;
+  const positive = (value: unknown): value is number =>
+    typeof value === "number" && Number.isInteger(value) && value > 0;
+  if (!positive(config.default_rounds) || !positive(config.max_rounds)) return null;
+  if (config.default_rounds > config.max_rounds) return null;
+  if (!Array.isArray(config.roles) || !config.roles.every((role) => typeof role === "string")) {
+    return null;
+  }
+  const roster = config.default_roster;
+  if (roster !== null) {
+    if (typeof roster !== "object" || roster === undefined) return null;
+    const { chairman, members } = roster as Record<string, unknown>;
+    if (typeof chairman !== "object" || chairman === null || !Array.isArray(members)) return null;
+  }
+  return raw as CouncilConfig;
+}
+
+/**
+ * The steps a council takes one after another: the answers, each round's
+ * critique, every revision but the last round's, and the synthesis. The calls
+ * inside one step run side by side, so this is the length of the wait.
+ */
+export function stepsInSequence(rounds: number): number {
+  return 2 * rounds + 1;
+}
+
 /* ---------------------------------------------------------------- helpers -- */
 
 /**

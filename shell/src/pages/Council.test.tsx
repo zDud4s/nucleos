@@ -223,6 +223,13 @@ async function panelFor(headingText: string): Promise<HTMLElement> {
   return panel as HTMLElement;
 }
 
+/** Convene waits for the config now: click it once it has lost `disabled`. */
+async function conveneWhenReady() {
+  const convene = await screen.findByRole("button", { name: "Convene" });
+  await waitFor(() => expect(convene.hasAttribute("disabled")).toBe(false));
+  fireEvent.click(convene);
+}
+
 /* --------------------------------------------------------- empty catalogue -- */
 
 describe("Council - the empty catalogue", () => {
@@ -548,7 +555,7 @@ describe("Council - refusals convening meets", () => {
 
     await renderCouncil("/council");
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
-    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+    await conveneWhenReady();
 
     // The whole sentence, path included. This page passes the daemon's prose through untouched,
     // so a refusal that names the wrong file is a refusal that sends somebody to the wrong file —
@@ -565,7 +572,7 @@ describe("Council - refusals convening meets", () => {
 
     // The convene form's own copy, not the daemon's. It is a second place the path is written,
     // and the two saying different things is worse than either being wrong alone.
-    const note = await screen.findByText(/One question, put to every seat in/);
+    const note = await screen.findByText(/Roster from ~\/\.nucleos\/council\.yaml/);
     expect(note.textContent).toContain("~/.nucleos/council.yaml");
     expect(note.textContent).not.toContain(".ai/");
   });
@@ -585,7 +592,7 @@ describe("Council - refusals convening meets", () => {
 
     await renderCouncil("/council");
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
-    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+    await conveneWhenReady();
 
     expect(await screen.findByText(/\$10\.00/)).toBeDefined();
     expect(screen.getByText(/already been spent/i)).toBeDefined();
@@ -602,7 +609,7 @@ describe("Council - refusals convening meets", () => {
 
     await renderCouncil("/council");
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
-    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+    await conveneWhenReady();
 
     expect(await screen.findByText(/must not be empty/i)).toBeDefined();
   });
@@ -738,7 +745,7 @@ function modelRow(overrides: Record<string, unknown> = {}) {
  * somebody made.
  */
 async function openTheRoster() {
-  fireEvent.click(await screen.findByLabelText("Put this question to a chosen panel"));
+  fireEvent.click(await screen.findByRole("button", { name: /^Chair:/ }));
   const chairman = await screen.findByLabelText("Chairman");
   await waitFor(() => expect(chairman.querySelectorAll("option").length).toBeGreaterThan(1));
   return chairman;
@@ -758,7 +765,7 @@ describe("Council - convening with the roster shut", () => {
 
     await renderCouncil("/council");
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
-    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+    await conveneWhenReady();
 
     // The property this whole packet is built around. `roster` is
     // `Option<RosterOverride>`, which reads an absent key and a `null` the
@@ -808,8 +815,8 @@ describe("Council - convening with a chosen panel", () => {
     expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(true);
 
     fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
-    fireEvent.change(screen.getByLabelText("Seat 0"), { target: { value: "model:qwen3.5:4b" } });
-    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:qwen3.5:4b" } });
+    await conveneWhenReady();
 
     // An agent seat carries only `agent`, and a model seat only `kind`/`ref`:
     // `resolve_seat` refuses a seat naming both, and `SeatSpec` is
@@ -896,17 +903,19 @@ describe("Council - convening with rounds, roles and an estimate", () => {
     );
 
     await renderCouncil("/council");
-    const rounds = (await screen.findByLabelText("Rounds")) as HTMLSelectElement;
+    const rounds = await screen.findByRole("group", { name: "Rounds" });
     // The config answers after the form mounts: the default is read, not assumed.
-    await waitFor(() => expect(rounds.value).toBe("2"));
-    expect(within(rounds).getAllByRole("option").map((option) => option.textContent)).toEqual([
+    await waitFor(() =>
+      expect(within(rounds).getByRole("button", { name: "2" }).getAttribute("aria-pressed")).toBe("true"),
+    );
+    expect(within(rounds).getAllByRole("button").map((button) => button.textContent)).toEqual([
       "1",
       "2",
       "3",
     ]);
 
     fireEvent.change(screen.getByLabelText("Question"), { target: { value: "well?" } });
-    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+    await conveneWhenReady();
 
     // Choosing nothing is not choosing the default: the key stays off the request.
     await waitFor(() => expect(sent).toEqual({ question: "well?" }));
@@ -925,12 +934,14 @@ describe("Council - convening with rounds, roles and an estimate", () => {
     );
 
     await renderCouncil("/council");
-    const rounds = (await screen.findByLabelText("Rounds")) as HTMLSelectElement;
-    await waitFor(() => expect(rounds.value).toBe("2"));
+    const rounds = await screen.findByRole("group", { name: "Rounds" });
+    await waitFor(() =>
+      expect(within(rounds).getByRole("button", { name: "2" }).getAttribute("aria-pressed")).toBe("true"),
+    );
 
-    fireEvent.change(rounds, { target: { value: "3" } });
+    fireEvent.click(within(rounds).getByRole("button", { name: "3" }));
     fireEvent.change(screen.getByLabelText("Question"), { target: { value: "well?" } });
-    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+    await conveneWhenReady();
 
     await waitFor(() => expect(sent).toEqual({ question: "well?", rounds: 3 }));
   });
@@ -954,7 +965,7 @@ describe("Council - convening with rounds, roles and an estimate", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add a seat" }));
 
     // "no role" first, then the config's roles in the daemon's declared order.
-    const second = (await screen.findByLabelText("Role for seat 1")) as HTMLSelectElement;
+    const second = (await screen.findByLabelText("Role for seat 2")) as HTMLSelectElement;
     expect(within(second).getAllByRole("option").map((option) => option.textContent)).toEqual([
       "no role",
       "skeptic",
@@ -963,11 +974,11 @@ describe("Council - convening with rounds, roles and an estimate", () => {
     expect(second.value).toBe("");
 
     fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
-    fireEvent.change(screen.getByLabelText("Seat 0"), { target: { value: "model:claude-opus-5" } });
-    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:qwen3.5:4b" } });
+    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:claude-opus-5" } });
+    fireEvent.change(screen.getByLabelText("Seat 2"), { target: { value: "model:qwen3.5:4b" } });
     // Only seat 1 is given a role; seat 0 keeps "no role" and must not appear.
     fireEvent.change(second, { target: { value: "skeptic" } });
-    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+    await conveneWhenReady();
 
     await waitFor(() =>
       expect(sent).toEqual({
@@ -1001,23 +1012,23 @@ describe("Council - convening with rounds, roles and an estimate", () => {
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
     await openTheRoster();
     fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
-    fireEvent.change(screen.getByLabelText("Seat 0"), { target: { value: "model:claude-opus-5" } });
-    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:claude-opus-5" } });
+    await conveneWhenReady();
 
     await waitFor(() => expect(sent).not.toBe("nothing was posted"));
     expect(Object.keys(sent as object)).toEqual(["question", "roster"]);
   });
 
-  it("shows up to X calls for the configured roster at the default rounds, and follows the rounds select", async () => {
+  it("shows up to X calls for the configured roster at the default rounds, and follows the rounds control", async () => {
     daemon.apiFetch.mockImplementation(councilFetch([], {}, { config: threeSeatConfig() }));
 
     await renderCouncil("/council");
     // N=3, R=2: 3 answers + 6 critiques + 3 revisions + 2 chairman = 14.
-    expect(await screen.findByText("up to 14 calls")).toBeDefined();
+    expect(await screen.findByText("≤ 14 calls · 5 steps in sequence")).toBeDefined();
 
     // N=3, R=3: 3 + 9 + 6 + 2 = 20.
-    fireEvent.change(screen.getByLabelText("Rounds"), { target: { value: "3" } });
-    expect(await screen.findByText("up to 20 calls")).toBeDefined();
+    fireEvent.click(within(screen.getByRole("group", { name: "Rounds" })).getByRole("button", { name: "3" }));
+    expect(await screen.findByText("≤ 20 calls · 7 steps in sequence")).toBeDefined();
   });
 
   it("counts the chosen members, not the configured roster, once a panel is chosen", async () => {
@@ -1030,16 +1041,152 @@ describe("Council - convening with rounds, roles and an estimate", () => {
     );
 
     await renderCouncil("/council");
-    expect(await screen.findByText("up to 14 calls")).toBeDefined();
+    expect(await screen.findByText("≤ 14 calls · 5 steps in sequence")).toBeDefined();
 
     await openTheRoster();
     fireEvent.click(screen.getByRole("button", { name: "Add a seat" }));
     fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
-    fireEvent.change(screen.getByLabelText("Seat 0"), { target: { value: "model:claude-opus-5" } });
     fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:claude-opus-5" } });
+    fireEvent.change(screen.getByLabelText("Seat 2"), { target: { value: "model:claude-opus-5" } });
 
     // N=2, R=2: 2 + 4 + 2 + 2 = 10.
-    expect(await screen.findByText("up to 10 calls")).toBeDefined();
+    expect(await screen.findByText("≤ 10 calls · 5 steps in sequence")).toBeDefined();
+  });
+});
+
+/* ------------------------------------------------------------ the composer -- */
+
+describe("Council - the composer", () => {
+  it("collapses the question to one line and grows it on focus", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}));
+
+    await renderCouncil("/council");
+    const question = (await screen.findByLabelText("Question")) as HTMLTextAreaElement;
+
+    expect(question.getAttribute("placeholder")).toBe("Ask the council…");
+    expect(question.getAttribute("rows")).toBe("1");
+    fireEvent.focus(question);
+    expect(question.getAttribute("rows")).toBe("4");
+    fireEvent.blur(question);
+    expect(question.getAttribute("rows")).toBe("1");
+    fireEvent.change(question, { target: { value: "well?" } });
+    expect(question.getAttribute("rows")).toBe("4");
+  });
+
+  it("convenes on ctrl+enter", async () => {
+    let sent: unknown = "nothing was posted";
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        onCreate: (body) => {
+          sent = body;
+          return { id: "new-1" };
+        },
+      }),
+    );
+
+    await renderCouncil("/council");
+    const question = await screen.findByLabelText("Question");
+    fireEvent.change(question, { target: { value: "well?" } });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(false),
+    );
+    fireEvent.keyDown(question, { key: "Enter", ctrlKey: true });
+
+    await waitFor(() => expect(sent).toEqual({ question: "well?" }));
+  });
+
+  it("shows the configured roster as chips with the rounds and the call ceiling", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}, { config: threeSeatConfig() }));
+
+    await renderCouncil("/council");
+
+    const chips = await screen.findByRole("button", { name: /^Chair:/ });
+    expect(chips.textContent).toBe("Chair: claude-opus-4 · Seats: claude-opus-4, claude-opus-5, qwen3.5:4b");
+    expect(chips.getAttribute("aria-expanded")).toBe("false");
+    const rounds = screen.getByRole("group", { name: "Rounds" });
+    await waitFor(() =>
+      expect(within(rounds).getByRole("button", { name: "2" }).getAttribute("aria-pressed")).toBe("true"),
+    );
+    expect(within(rounds).getByRole("button", { name: "1" }).getAttribute("aria-pressed")).toBe("false");
+    expect(await screen.findByText("≤ 14 calls · 5 steps in sequence")).toBeDefined();
+  });
+
+  it("opens the panel editor from the roster chips and offers no checkbox", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, { agents: [agentRow()], models: [modelRow()] }),
+    );
+
+    await renderCouncil("/council");
+    expect(await screen.findByRole("button", { name: /^Chair:/ })).toBeDefined();
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByLabelText("Chairman")).toBeNull();
+
+    await openTheRoster();
+
+    expect(screen.getByRole("button", { name: /^Chosen panel/ }).getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByLabelText("Chairman")).toBeDefined();
+    expect(screen.queryByRole("checkbox")).toBeNull();
+  });
+
+  it("disables convene with the reason when no roster is configured", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, { config: councilConfig({ configured: false }) }),
+    );
+
+    await renderCouncil("/council");
+    fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
+
+    const reason = await screen.findByText(
+      "No roster in ~/.nucleos/council.yaml — add one and restart the núcleo.",
+    );
+    const convene = screen.getByRole("button", { name: "Convene" });
+    expect(convene.hasAttribute("disabled")).toBe(true);
+    expect(reason.id).not.toBe("");
+    expect(convene.getAttribute("aria-describedby")).toBe(reason.id);
+  });
+
+  it("disables convene and draws no bounds sentence when the config is malformed", async () => {
+    // A daemon that answers 200 with a body of the wrong shape: cast, as the wire would deliver it.
+    const malformed = { configured: true, roles: [], default_roster: null } as unknown as CouncilConfig;
+    daemon.apiFetch.mockImplementation(councilFetch([], {}, { config: malformed }));
+
+    const { container } = await renderCouncil("/council");
+    fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
+
+    const reason = await screen.findByText("The council config could not be read.");
+    expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(true);
+    expect(reason).toBeDefined();
+    expect(container.textContent).not.toContain("at most");
+    expect(container.textContent).not.toContain("undefined");
+  });
+
+  it("hides the composer while a council is open", async () => {
+    const views: Record<string, CouncilView> = { "c-1": councilView({ id: "c-1" }) };
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], views));
+
+    await renderCouncil("/council/c-1");
+
+    await screen.findByRole("heading", { level: 1, name: "Council" });
+    await screen.findAllByText(/should we ship the frontend rewrite\?/);
+    expect(screen.queryByLabelText("Question")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Convene" })).toBeNull();
+  });
+
+  it("labels panel seats from 1", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, { agents: [agentRow()], models: [modelRow()] }),
+    );
+
+    await renderCouncil("/council");
+    await openTheRoster();
+    fireEvent.click(screen.getByRole("button", { name: "Add a seat" }));
+
+    expect(screen.getByLabelText("Seat 1")).toBeDefined();
+    expect(screen.getByLabelText("Seat 2")).toBeDefined();
+    expect(screen.getByRole("button", { name: "Remove seat 1" })).toBeDefined();
+    expect(screen.getByLabelText("Role for seat 1")).toBeDefined();
+    expect(screen.queryByLabelText("Seat 0")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Remove seat 0" })).toBeNull();
   });
 });
 

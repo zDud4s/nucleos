@@ -70,11 +70,45 @@
 
 /* =============================================================== convene == */
 
-.council-form {
+/* The ask bar sits on the page ground, not in a panel: the question is the
+   page's first act, and a card around it would rank it beside the list. */
+.council-ask {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+
+/* One wrapping row under the question: roster, rounds, ceiling, and Convene
+   pushed to the end. */
+.council-ask-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: var(--space-3);
+}
+
+.council-ask-bar > :last-child {
+  margin-left: auto;
+}
+
+.council-ask-helper {
+  margin: 0;
+}
+
+/* A chip is bare text, not a pill — a roster seat is a name, not a badge. */
+.council-chip {
+  color: var(--text);
+}
+
+/* The call ceiling is the daemon's arithmetic: mono, tabular, muted, the
+   `.ui-count` recipe. */
+.council-ceiling {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .council-field {
@@ -108,26 +142,20 @@
   outline-offset: 1px;
 }
 
-/* The roster control, which is shut on most visits and is laid out as part of
-   the form rather than as a panel of its own: a card inside a card is the
-   nesting this shell already has too much of, and the hairline says "still the
-   same form, one step further in" without spending a second surface on it. */
-
-.council-roster-open {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-size: var(--text-sm);
-  color: var(--text-muted);
+/* Opaque, because Firefox dims a placeholder by default and the faint rung
+   is already the dimmest that passes AA. */
+.council-field textarea::placeholder {
+  color: var(--text-faint);
+  opacity: 1;
 }
 
+/* The roster editor, shut on most visits. It opens under the bar as one
+   `.ui-panel-inset`, one rank down from the page — the bar itself is no card,
+   so this is never a card in a card. */
+
 .council-roster {
-  display: flex;
-  flex-direction: column;
   gap: var(--space-3);
   width: 100%;
-  padding-top: var(--space-3);
-  border-top: 1px solid var(--border);
 }
 
 .council-roster-seats {

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Fragment, useId, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { canTakeASeat, useAgents, type Agent } from "../data/agents";
 import { useAssistantModels, type ModelChoice } from "../data/chats";
@@ -10,9 +10,13 @@ import {
   useCreateCouncil,
   useCouncilConfig,
   ceilingCalls,
+  readCouncilConfig,
+  stepsInSequence,
   councilIsAlive,
   seatName,
   type BordaRow,
+  type ConfiguredSeat,
+  type CouncilConfig,
   type CouncilSummary,
   type CouncilView,
   type RosterOverride,
@@ -70,7 +74,7 @@ export function Council() {
     <>
       <PageHeader title="Council" headline={headlineFor(rows, councils.data !== undefined)} />
 
-      <ConveneForm />
+      {councilId === null && <Composer />}
 
       {stale && <StaleNote dataUpdatedAt={councils.dataUpdatedAt} />}
       {councils.isError && councils.data === undefined && <ListError error={councils.error} />}
@@ -208,8 +212,47 @@ function rosterFrom(
   return { chairman, members: chosen };
 }
 
-function ConveneForm() {
+/** The helper under the ask bar, when nothing is in the way of convening. */
+const COMPOSER_HELPER =
+  "Each seat answers on its own, ranks the others blind, and the chair writes one answer. Roster from ~/.nucleos/council.yaml.";
+
+/** PURE: how a configured seat reads in the roster chips. */
+function configuredSeatName(seat: ConfiguredSeat): string {
+  if ("agent" in seat) return seat.agent;
+  return seat.ref ?? seat.kind ?? "default";
+}
+
+/**
+ * PURE: why Convene cannot be pressed, or `null` when only the question can
+ * stop it. The order is the reason: a config not yet read says nothing about
+ * the roster, and a roster the daemon refuses makes a half-chosen panel moot —
+ * `council::start_with` refuses `NotConfigured` even with a panel chosen.
+ * An empty question disables the button without a sentence: the empty field
+ * already says so.
+ */
+function conveneBlocked(
+  pending: boolean,
+  failed: boolean,
+  config: CouncilConfig | null,
+  halfChosen: boolean,
+): string | null {
+  if (pending) return "Reading the council config…";
+  if (failed || config === null) return "The council config could not be read.";
+  if (!config.configured) {
+    return "No roster in ~/.nucleos/council.yaml — add one and restart the núcleo.";
+  }
+  if (halfChosen) return "Choose every seat, or close the panel.";
+  return null;
+}
+
+/**
+ * The ask bar: one line on the page ground, growing to four while it is being
+ * written in, with the roster, the rounds and the ceiling on one row beneath.
+ * Not a panel — the question is the page's first act, not a card among cards.
+ */
+function Composer() {
   const [question, setQuestion] = useState("");
+  const [focused, setFocused] = useState(false);
   /**
    * Shut, and shut is the whole point.
    *
@@ -225,10 +268,13 @@ function ConveneForm() {
   const [members, setMembers] = useState<(RosterSeat | null)[]>([null]);
   const create = useCreateCouncil();
   const navigate = useNavigate();
+  const reasonId = useId();
   // One cheap read on every visit, unlike the catalogues above: the bounds it
   // carries are what a council convened from here will run under, and saying
-  // so before the question is asked is the point of the endpoint.
-  const config = useCouncilConfig();
+  // so before the question is asked is the point of the endpoint. Read through
+  // the shape guard, because `apiFetch` casts whatever a `200` carried.
+  const configQuery = useCouncilConfig();
+  const config = configQuery.data === undefined ? null : readCouncilConfig(configQuery.data);
 
   /**
    * The rounds somebody picked, or `null` while they have picked none.
@@ -244,117 +290,159 @@ function ConveneForm() {
 
   const roster = rosterFrom(chairman, members);
   const halfChosen = choosing && roster === null;
-  const defaultRounds = config.data?.default_rounds;
+  const defaultRounds = config?.default_rounds;
   const rounds = pickedRounds ?? defaultRounds;
-  const estimate = estimateMembers(choosing, members, config.data?.default_roster?.members.length);
+  const estimate = estimateMembers(choosing, members, config?.default_roster?.members.length);
+  const reason = conveneBlocked(
+    configQuery.data === undefined && configQuery.isPending,
+    configQuery.isError,
+    config,
+    halfChosen,
+  );
+  const disabled = question.trim() === "" || create.isPending || reason !== null;
+
+  // The button and ctrl+enter share this path, so the keyboard can never send
+  // what the disabled button would have refused.
+  const submit = () => {
+    if (disabled) return;
+    create.mutate(
+      // `undefined` and not `null`: the key is left off the request
+      // entirely when nothing is being overridden. See `data/council.ts`.
+      {
+        question: question.trim(),
+        roster: choosing && roster !== null ? roster : undefined,
+        // Only a departure from the file's default travels; the default
+        // itself is the daemon's to apply, as it is for every request
+        // that never had this control.
+        rounds: rounds !== undefined && rounds !== defaultRounds ? rounds : undefined,
+        // Roles belong to the chosen panel's rows, so they travel with it
+        // and never on their own against a roster this form did not draw.
+        roles: choosing && roster !== null ? rolesBody(roles, members.length) : undefined,
+      },
+      {
+        onSuccess: (result) => {
+          setQuestion("");
+          void navigate({ to: `/council/${result.id}` });
+        },
+      },
+    );
+  };
 
   return (
-    <Panel title="Convene a council">
-      <p className="council-note">
-        One question, put to every seat in <code>~/.nucleos/council.yaml</code>. Each seat answers
-        on its own, ranks the others blind, and a chairman writes a synthesis. A panel chosen below
-        stands in for that roster for this one question, and never rewrites the file.
-      </p>
-      {config.data !== undefined && (
-        <p className="council-note">
-          {config.data.default_rounds} critique{" "}
-          {config.data.default_rounds === 1 ? "round" : "rounds"} by default, at most{" "}
-          {config.data.max_rounds}.
-        </p>
-      )}
-      <form
-        className="council-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (question.trim() === "" || create.isPending || halfChosen) return;
-          create.mutate(
-            // `undefined` and not `null`: the key is left off the request
-            // entirely when nothing is being overridden. See `data/council.ts`.
-            {
-              question: question.trim(),
-              roster: choosing && roster !== null ? roster : undefined,
-              // Only a departure from the file's default travels; the default
-              // itself is the daemon's to apply, as it is for every request
-              // that never had this control.
-              rounds: rounds !== undefined && rounds !== defaultRounds ? rounds : undefined,
-              // Roles belong to the chosen panel's rows, so they travel with it
-              // and never on their own against a roster this form did not draw.
-              roles: choosing && roster !== null ? rolesBody(roles, members.length) : undefined,
-            },
-            {
-              onSuccess: (result) => {
-                setQuestion("");
-                void navigate({ to: `/council/${result.id}` });
-              },
-            },
-          );
-        }}
-      >
-        <label className="council-field">
-          <span>Question</span>
-          <textarea
-            rows={3}
-            aria-label="Question"
-            value={question}
-            onChange={(event) => setQuestion(event.target.value)}
-          />
-        </label>
+    <form
+      className="council-ask"
+      onSubmit={(event) => {
+        event.preventDefault();
+        submit();
+      }}
+    >
+      <div className="council-field">
+        <textarea
+          rows={focused || question !== "" ? 4 : 1}
+          aria-label="Question"
+          placeholder="Ask the council…"
+          value={question}
+          onChange={(event) => setQuestion(event.target.value)}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+              event.preventDefault();
+              submit();
+            }
+          }}
+        />
+      </div>
 
-        <label className="council-roster-open">
-          <input
-            type="checkbox"
-            checked={choosing}
-            onChange={(event) => setChoosing(event.target.checked)}
-          />
-          <span>Put this question to a chosen panel</span>
-        </label>
+      <div className="council-ask-bar">
+        <Button aria-expanded={choosing} onClick={() => setChoosing(!choosing)}>
+          {choosing ? (
+            `Chosen panel · ${members.length} ${members.length === 1 ? "seat" : "seats"}`
+          ) : (
+            <RosterChips config={config} />
+          )}
+        </Button>
 
-        <label className="council-field">
-          <span>Rounds</span>
-          <select
-            className="council-select"
-            aria-label="Rounds"
-            value={rounds === undefined ? "" : String(rounds)}
-            disabled={config.data === undefined}
-            onChange={(event) => setPickedRounds(Number(event.target.value))}
-          >
-            {roundChoices(config.data?.max_rounds).map((choice) => (
-              <option key={choice} value={String(choice)}>
+        {config !== null && (
+          <div className="ui-switch" role="group" aria-label="Rounds">
+            {roundChoices(config.max_rounds).map((choice) => (
+              <button
+                key={choice}
+                type="button"
+                className="ui-switch-seg"
+                aria-pressed={choice === rounds}
+                onClick={() => setPickedRounds(choice)}
+              >
                 {choice}
-              </option>
+              </button>
             ))}
-          </select>
-        </label>
-
-        {choosing && (
-          <RosterPicker
-            chairman={chairman}
-            members={members}
-            roles={roles}
-            roleChoices={config.data?.roles ?? []}
-            onChairman={setChairman}
-            onMembers={setMembers}
-            onRoles={setRoles}
-          />
+          </div>
         )}
 
         {/* One template string, so the line is one text node a reader and a
             test both find whole. A ceiling, not a forecast: a council that
             stops early spends less. */}
         {estimate !== undefined && rounds !== undefined && (
-          <p className="council-note">{`up to ${ceilingCalls(estimate, rounds)} calls`}</p>
+          <span className="council-ceiling">
+            {`≤ ${ceilingCalls(estimate, rounds)} calls · ${stepsInSequence(rounds)} steps in sequence`}
+          </span>
         )}
 
         <Button
           type="submit"
           intent="go"
-          disabled={question.trim() === "" || create.isPending || halfChosen}
+          disabled={disabled}
+          aria-describedby={reason !== null ? reasonId : undefined}
         >
           Convene
         </Button>
-      </form>
+      </div>
+
+      {reason !== null ? (
+        <p className="ui-field-helper council-ask-helper" id={reasonId}>
+          {reason}
+        </p>
+      ) : (
+        <p className="ui-field-helper council-ask-helper">{COMPOSER_HELPER}</p>
+      )}
+
+      {choosing && (
+        <RosterPicker
+          chairman={chairman}
+          members={members}
+          roles={roles}
+          roleChoices={config?.roles ?? []}
+          onChairman={setChairman}
+          onMembers={setMembers}
+          onRoles={setRoles}
+        />
+      )}
+
       {create.isError && <ConveneRefusal error={create.error} />}
-    </Panel>
+    </form>
+  );
+}
+
+/**
+ * The configured roster as bare-text chips: "Chair: X · Seats: A, B, C". One
+ * run of text with spans inside, so the button's name is the whole sentence.
+ */
+function RosterChips({ config }: { config: CouncilConfig | null }) {
+  const roster = config?.default_roster ?? null;
+  const chair = roster === null ? "default" : configuredSeatName(roster.chairman);
+  const seats = roster === null ? ["default"] : roster.members.map(configuredSeatName);
+  return (
+    <>
+      {"Chair: "}
+      <span className="council-chip">{chair}</span>
+      {" · Seats: "}
+      {seats.map((seat, at) => (
+        <Fragment key={at}>
+          {at > 0 && ", "}
+          <span className="council-chip">{seat}</span>
+        </Fragment>
+      ))}
+    </>
   );
 }
 
@@ -448,7 +536,7 @@ function RosterPicker({
   const full = members.length >= MAX_COUNCIL_SEATS;
 
   return (
-    <div className="council-roster">
+    <div className="council-roster ui-panel-inset">
       <SeatPicker
         label="Chairman"
         seat={chairman}
@@ -463,7 +551,7 @@ function RosterPicker({
           // same seat.
           <li className="council-roster-seat" key={index}>
             <SeatPicker
-              label={`Seat ${index}`}
+              label={`Seat ${index + 1}`}
               seat={member}
               agents={seatable}
               models={choices}
@@ -474,7 +562,7 @@ function RosterPicker({
               <span>Role</span>
               <select
                 className="council-select"
-                aria-label={`Role for seat ${index}`}
+                aria-label={`Role for seat ${index + 1}`}
                 value={roles[index] ?? ""}
                 onChange={(event) => onRoles({ ...roles, [index]: event.target.value })}
               >
@@ -488,10 +576,10 @@ function RosterPicker({
             </label>
             {/* The last row does not come out: `council::start` refuses a roster
                 with no members, so an empty panel would be a refusal rather
-                than a way back to the file. Unticking the box is that. */}
+                than a way back to the file. Closing the panel is that. */}
             <Button
               variant="quiet"
-              aria-label={`Remove seat ${index}`}
+              aria-label={`Remove seat ${index + 1}`}
               disabled={members.length === 1}
               onClick={() => {
                 onMembers(members.filter((_, at) => at !== index));
@@ -508,9 +596,7 @@ function RosterPicker({
           Add a seat
         </Button>
         {full && (
-          <p className="council-note">
-            eight is the ceiling — a ninth seat is a refusal, not a larger council.
-          </p>
+          <p className="council-note">Eight seats at most.</p>
         )}
       </div>
     </div>
@@ -526,9 +612,10 @@ function RosterPicker({
  * an agent brings a prompt and a persona, a model is only a model — and a flat
  * list would present them as one menu of interchangeable names.
  *
- * The rows are labelled the way the daemon labels them in a refusal
- * (`config::seat_name`: the chairman, then seat 0 upward), so a `400` naming
- * "seat 2" names a row that is on the screen.
+ * The rows are labelled from 1, one ahead of the daemon: `config::seat_name`
+ * counts the chairman, then seat 0 upward, so a `400` naming "seat 2" names
+ * the row this page labels "Seat 3". The values and the `roles` keys stay
+ * 0-based — only the label a person reads is shifted.
  */
 function SeatPicker({
   label,
