@@ -58,6 +58,40 @@ pub struct Decision {
     pub reason: String,
 }
 
+/// The answer of the session-git route: a [`Decision`] plus, when the operation was queued, which
+/// request it became and whether that request had reached a final state by the time of the answer.
+/// Both extras are absent for every answer that did not queue anything, so those keep the exact
+/// two-field shape the hook script already reads.
+#[derive(Serialize, Deserialize)]
+pub struct SessionGitDecision {
+    pub decision: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled: Option<bool>,
+}
+
+impl From<Decision> for SessionGitDecision {
+    fn from(decision: Decision) -> Self {
+        Self {
+            decision: decision.decision,
+            reason: decision.reason,
+            request_id: None,
+            settled: None,
+        }
+    }
+}
+
+/// How long the session-git route waits for a queued request to settle before answering. The
+/// hook's `urlopen` gives the daemon 30s; an answer that over-runs that fails closed as "daemon
+/// unreachable", which is why this stays well under it.
+pub const SESSION_SETTLE_WAIT: Duration = Duration::from_secs(20);
+
+/// The ceiling for the whole decision, probes and submit included. The settle wait is cut down to
+/// whatever of this is left, so the answer still lands inside the hook's 30s timeout.
+const SESSION_DECISION_BUDGET: Duration = Duration::from_secs(25);
+
 #[derive(Deserialize)]
 pub struct SessionGitPayload {
     pub tool_name: String,
@@ -89,19 +123,29 @@ pub struct SessionGitPayload {
 /// declines (`git merge --squash`, `git branch -D`) must keep working directly, or it becomes
 /// impossible rather than governed.
 ///
-/// The refusal is not a redirect: the operation is admitted here, in the daemon, and the session is
-/// told the ticket. The alternative was to answer "ask the queue yourself", which would have meant
-/// telling every editor session how to obtain the control token — handing out the master key to
-/// avoid one round trip.
+/// The refusal is not a redirect: the operation is admitted here, in the daemon, the daemon waits a
+/// bounded time for the queue to settle it, and the session is told how it ended — or, if it is
+/// still running, that it will be told later. The alternative was to answer "ask the queue
+/// yourself", which would have meant telling every editor session how to obtain the control token —
+/// handing out the master key to avoid one round trip.
 pub async fn session_git_decision(
     State(state): State<AppState>,
     Json(payload): Json<SessionGitPayload>,
-) -> Json<Decision> {
+) -> Json<SessionGitDecision> {
+    session_git_decision_within(&state, payload, SESSION_SETTLE_WAIT).await
+}
+
+async fn session_git_decision_within(
+    state: &AppState,
+    payload: SessionGitPayload,
+    settle_wait: Duration,
+) -> Json<SessionGitDecision> {
+    let started = Instant::now();
     let no_opinion = || {
-        Json(Decision {
+        Json(SessionGitDecision::from(Decision {
             decision: "allow".to_owned(),
             reason: "not an operation this queue performs".to_owned(),
-        })
+        }))
     };
 
     if !matches!(payload.tool_name.as_str(), "Bash" | "PowerShell") {
@@ -150,7 +194,7 @@ pub async fn session_git_decision(
             .into_iter()
             .find_map(crate::vcs::unqueueable_but_shared)
         {
-            Some(reason) => Json(deny_with(&reason)),
+            Some(reason) => Json(deny_with(&reason).into()),
             None => no_opinion(),
         };
     };
@@ -163,10 +207,13 @@ pub async fn session_git_decision(
     let project_id = match crate::vcs::project_for_worktree(&state.pool, &root, deadline).await {
         Ok(project_id) => project_id,
         Err(reason) => {
-            return Json(deny_with(&format!(
-                "{} goes through the queue, and {reason}",
-                op.kind()
-            )));
+            return Json(
+                deny_with(&format!(
+                    "{} goes through the queue, and {reason}",
+                    op.kind()
+                ))
+                .into(),
+            );
         }
     };
     let repo = match crate::vcs::resolve_repo(&state.pool, &project_id).await {
@@ -177,33 +224,94 @@ pub async fn session_git_decision(
                 ?error,
                 "session-git: could not resolve the repository"
             );
-            return Json(deny_with(&format!(
-                "{} goes through the queue, and {project_id}'s repository could not be resolved",
-                op.kind()
-            )));
+            return Json(
+                deny_with(&format!(
+                    "{} goes through the queue, and {project_id}'s repository could not be resolved",
+                    op.kind()
+                ))
+                .into(),
+            );
         }
     };
 
     match crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await {
-        Ok(id) => Json(Decision {
-            decision: "deny".to_owned(),
-            reason: format!(
-                "queued as vcs request #{id} ({}) — this repository takes one git operation at a \
-                 time, across every session in every worktree, so it is performed by the queue \
-                 rather than here. Do not run it again and do not run it another way: watch \
-                 GET /vcs/requests/{id}/wait, and expect your worktree to be moved under you when \
-                 it lands.",
-                op.kind()
-            ),
-        }),
+        Ok(id) => {
+            let wait = settle_wait.min(SESSION_DECISION_BUDGET.saturating_sub(started.elapsed()));
+            let ticket = match crate::vcs::wait_for(&state.pool, id, wait).await {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    tracing::warn!(id, ?error, "session-git: could not read the request back");
+                    crate::vcs::Ticket {
+                        id,
+                        status: "queued".into(),
+                        result_sha: None,
+                        failure_reason: None,
+                    }
+                }
+            };
+            let settled = crate::vcs::TERMINAL_STATUSES.contains(&ticket.status.as_str());
+            Json(SessionGitDecision {
+                decision: "deny".to_owned(),
+                reason: session_git_reason(id, op.kind(), &ticket, settled),
+                request_id: Some(id),
+                settled: Some(settled),
+            })
+        }
         Err(error) => {
             tracing::error!(?error, "session-git: could not admit the request");
-            Json(deny_with(&format!(
-                "{} goes through the queue, and admitting it failed",
-                op.kind()
-            )))
+            Json(
+                deny_with(&format!(
+                    "{} goes through the queue, and admitting it failed",
+                    op.kind()
+                ))
+                .into(),
+            )
         }
     }
+}
+
+/// What the session is told about a request it caused, by where the request stands. Pure, so every
+/// outcome can be asserted without a queue. The sentence always opens the same way, and never names
+/// a route the session cannot read: an editor session holds no control token.
+fn session_git_reason(id: i64, kind: &str, ticket: &crate::vcs::Ticket, settled: bool) -> String {
+    let head = format!("queued as vcs request #{id} ({kind}) — ");
+    let why = ticket
+        .failure_reason
+        .as_deref()
+        .unwrap_or("no reason recorded");
+    let tail = match ticket.status.as_str() {
+        "succeeded" => format!(
+            "the queue performed it: landed at {}. Do not run it again; your worktree may have \
+             moved under you, so re-read `git status`/`git log` before going on.",
+            ticket.result_sha.as_deref().unwrap_or("an unrecorded sha")
+        ),
+        "escalated" => "it hit a conflict and was escalated to a person. Do not retry it or \
+                        resolve it by hand; the resolution arrives as a new request."
+            .to_owned(),
+        "blocked" => format!(
+            "the queue refused to start it: {why}. Nothing was changed. Clear what that names, \
+             then run the same command again to queue it anew."
+        ),
+        status @ ("failed" | "interrupted") => {
+            format!("it {status}: {why}. Check the repository state before asking again.")
+        }
+        status @ ("cancelled" | "rejected") => format!(
+            "it was {status} and nothing was performed. Run the command again only if you still \
+             want it."
+        ),
+        status => {
+            debug_assert!(
+                !settled,
+                "a settled status the reason does not know: {status}"
+            );
+            format!(
+                "still {status} after the wait. The queue will perform it; do not run it again and \
+                 do not run it another way. You will be told how it ended on a later action of \
+                 this session."
+            )
+        }
+    };
+    format!("{head}{tail}")
 }
 
 /// Spec A: the one call this hook puts to the judge, built once from what the hook already holds.
@@ -9109,14 +9217,15 @@ mod tests {
         dir
     }
 
-    async fn session_decision(state: &AppState, command: &str, cwd: &Path) -> Decision {
-        session_git_decision(
-            State(state.clone()),
-            Json(SessionGitPayload {
+    async fn session_decision(state: &AppState, command: &str, cwd: &Path) -> SessionGitDecision {
+        session_git_decision_within(
+            state,
+            SessionGitPayload {
                 tool_name: "Bash".to_owned(),
                 tool_input: serde_json::json!({ "command": command }),
                 cwd: cwd.to_string_lossy().into_owned(),
-            }),
+            },
+            Duration::ZERO,
         )
         .await
         .0
@@ -9430,11 +9539,139 @@ mod tests {
             "the refusal has to name the ticket, or the session has nothing to watch: {}",
             decision.reason
         );
+        assert_eq!(decision.settled, Some(false), "no queue worker runs here");
+        assert_eq!(decision.request_id, Some(1));
+        assert!(
+            !decision.reason.contains("/wait") && !decision.reason.contains("/vcs/requests"),
+            "a session holds no token to read those routes: {}",
+            decision.reason
+        );
         assert_eq!(
             queued_rows(&state).await,
             vec![("merge".to_owned(), "shell".to_owned())],
             "an editor session is `shell`: a person's agent redirected here, not a person acting"
         );
+    }
+
+    fn ticket(status: &str, sha: Option<&str>, reason: Option<&str>) -> crate::vcs::Ticket {
+        crate::vcs::Ticket {
+            id: 7,
+            status: status.to_owned(),
+            result_sha: sha.map(str::to_owned),
+            failure_reason: reason.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_settled_request_is_reported_with_its_outcome_and_next_step() {
+        let reason =
+            |status, sha, why| session_git_reason(7, "merge", &ticket(status, sha, why), true);
+
+        let landed = reason("succeeded", Some("abc1234"), None);
+        assert!(
+            landed.starts_with("queued as vcs request #7 (merge) — "),
+            "{landed}"
+        );
+        assert!(landed.contains("landed at abc1234"), "{landed}");
+        assert!(landed.contains("re-read `git status`"), "{landed}");
+
+        let escalated = reason("escalated", None, None);
+        assert!(escalated.contains("escalated to a person"), "{escalated}");
+
+        let blocked = reason("blocked", None, Some("uncommitted work in the way"));
+        assert!(blocked.contains("uncommitted work in the way"), "{blocked}");
+        assert!(blocked.contains("Nothing was changed"), "{blocked}");
+
+        let failed = reason("failed", None, Some("disk full"));
+        assert!(failed.contains("it failed: disk full"), "{failed}");
+        let interrupted = reason("interrupted", None, None);
+        assert!(interrupted.contains("no reason recorded"), "{interrupted}");
+
+        let cancelled = reason("cancelled", None, None);
+        assert!(cancelled.contains("it was cancelled and nothing was performed"));
+        let rejected = reason("rejected", None, None);
+        assert!(rejected.contains("it was rejected and nothing was performed"));
+
+        for text in [
+            landed,
+            escalated,
+            blocked,
+            failed,
+            interrupted,
+            cancelled,
+            rejected,
+        ] {
+            assert!(
+                !text.contains("/wait") && !text.contains("/vcs/requests"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsettled_request_names_its_id_and_no_route_the_session_cannot_read() {
+        let text = session_git_reason(7, "push", &ticket("queued", None, None), false);
+
+        assert!(text.contains("#7"), "{text}");
+        assert!(text.contains("later action"), "{text}");
+        assert!(text.contains("still queued after the wait"), "{text}");
+        assert!(
+            !text.contains("/wait") && !text.contains("/vcs/requests"),
+            "{text}"
+        );
+    }
+
+    /// The queue settling the request while the route waits: the answer carries the outcome, not a
+    /// ticket. The test state runs no queue worker, so the row is moved by hand and nothing races it.
+    #[tokio::test]
+    async fn a_session_merge_that_settles_inside_the_wait_says_how_it_ended() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-settles").await;
+
+        let pool = state.pool.clone();
+        let settler = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            sqlx::query(
+                "UPDATE vcs_requests SET status = 'blocked',                  failure_reason = 'uncommitted work in the way' WHERE id = 1",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        });
+
+        let decision = session_git_decision_within(
+            &state,
+            SessionGitPayload {
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({ "command": "git merge feature" }),
+                cwd: repo.path().to_string_lossy().into_owned(),
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .0;
+        settler.await.unwrap();
+
+        assert_eq!(decision.settled, Some(true), "{}", decision.reason);
+        assert_eq!(decision.request_id, Some(1));
+        assert!(
+            decision.reason.contains("uncommitted work in the way"),
+            "{}",
+            decision.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_answer_outside_the_queue_carries_no_ticket() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-no-ticket").await;
+
+        let decision = session_decision(&state, "git status", repo.path()).await;
+        let body = serde_json::to_value(&decision).unwrap();
+
+        assert_eq!(decision.decision, "allow");
+        assert!(body.get("request_id").is_none(), "{body}");
+        assert!(body.get("settled").is_none(), "{body}");
     }
 
     /// The asymmetry that makes it safe to speak at all. Nothing this function does may end in an
