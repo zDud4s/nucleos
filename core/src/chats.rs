@@ -124,7 +124,7 @@ impl PermissionMode {
 
 /// A conversation as the list shows it: the row, plus the two facts the list needs and the row
 /// cannot hold — what was first said, and when something last happened.
-#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct ChatSummary {
     pub chat_id: String,
     pub title: Option<String>,
@@ -235,6 +235,53 @@ pub struct ChatSummary {
     /// number cannot say two things, and "a department you set going has something to tell you" is
     /// not "your conversation answered you".
     pub notices_waiting: i64,
+    /// Whether a turn of this conversation is running or queued to run right now.
+    pub working: bool,
+    /// Whether the last settled turn ended by asking the person a question (`AskUserQuestion`).
+    pub asked_question: bool,
+    /// The user-defined group this conversation sits in, or `None`.
+    pub group_id: Option<i64>,
+    /// When this conversation was archived, or `None` while it is on the list.
+    pub archived_at: Option<String>,
+    /// Tool calls held for approval right now. Filled by `settle`, never read from the database.
+    #[sqlx(skip)]
+    pub pending_asks: i64,
+    /// The one word the list draws for this conversation. Filled by `settle`.
+    #[sqlx(skip)]
+    pub activity: Activity,
+}
+
+/// What a conversation is doing, as one word. Precedence is `activity_of`'s.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Activity {
+    NeedsInput,
+    Working,
+    Unread,
+    #[default]
+    Idle,
+}
+
+/// Needs input beats working beats unread beats idle: the person is the bottleneck first.
+pub fn activity_of(working: bool, needs_input: bool, unseen: bool) -> Activity {
+    if needs_input {
+        Activity::NeedsInput
+    } else if working {
+        Activity::Working
+    } else if unseen {
+        Activity::Unread
+    } else {
+        Activity::Idle
+    }
+}
+
+/// Fills the two derived fields, given how many tool approvals are pending for this chat.
+pub fn settle(mut c: ChatSummary, pending_asks: usize) -> ChatSummary {
+    let needs_input = pending_asks > 0 || c.asked_question;
+    let unseen = c.waiting > 0 || c.notices_waiting > 0;
+    c.pending_asks = pending_asks as i64;
+    c.activity = activity_of(c.working, needs_input, unseen);
+    c
 }
 
 /// Sends the `extra_dirs` column out as the list it holds, rather than as the JSON that holds it.
@@ -932,10 +979,34 @@ pub async fn opened_in(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<
 /// `get_assistant_chat` already gives: two turns of one conversation can share a timestamp to the
 /// second, and "the first message" must not depend on which of them SQLite happens to return.
 pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
-    sqlx::query_as::<_, ChatSummary>(
+    sqlx::query_as::<_, ChatSummary>(list_where(false))
+        .fetch_all(pool)
+        .await
+}
+
+/// Archived conversations, most recently archived first.
+pub async fn list_archived(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
+    sqlx::query_as::<_, ChatSummary>(list_where(true))
+        .fetch_all(pool)
+        .await
+}
+
+/// Puts an archived conversation back on the list. `false` when it was not archived.
+pub async fn restore(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<bool> {
+    let done =
+        sqlx::query("UPDATE chats SET archived_at = NULL WHERE chat_id = ? AND archived_at IS NOT NULL")
+            .bind(chat_id)
+            .execute(pool)
+            .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+macro_rules! list_select {
+    () => {
         "SELECT c.chat_id, c.title, c.brain, c.model, c.effort, c.fallback_model,
                 c.extra_dirs, c.turn_budget_usd, c.agents, c.system_prompt, c.denied_tools,
                 c.cleared_after_run_id, c.context_window, c.created_at, c.cwd, c.ide_session_id,
+                c.group_id, c.archived_at,
                 (SELECT r.prompt FROM runs r
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
                   ORDER BY r.id ASC LIMIT 1) AS first_message,
@@ -967,13 +1038,34 @@ pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> {
                 -- person is being called back for.
                 (SELECT COUNT(*) FROM chat_notices n
                   WHERE n.chat_id = c.chat_id
-                    AND n.id > COALESCE(c.last_seen_notice_id, 0)) AS notices_waiting
+                    AND n.id > COALESCE(c.last_seen_notice_id, 0)) AS notices_waiting,
+                EXISTS (SELECT 1 FROM runs r
+                         WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
+                           AND r.status IN ('running', 'pending')) AS working,
+                -- The newest turn, if it has settled and its tools include AskUserQuestion: the
+                -- model stopped to ask the person something.
+                COALESCE((SELECT r.status NOT IN ('running', 'pending')
+                                 AND json_valid(r.tools_used)
+                                 AND EXISTS (SELECT 1 FROM json_each(r.tools_used) j
+                                              WHERE json_extract(j.value, '$.name') = 'AskUserQuestion')
+                            FROM runs r
+                           WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
+                           ORDER BY r.id DESC LIMIT 1), 0) AS asked_question
            FROM chats c
-          WHERE c.archived_at IS NULL
-          ORDER BY COALESCE(last_activity, c.created_at) DESC",
-    )
-    .fetch_all(pool)
-    .await
+"
+    };
+}
+
+/// The list SELECT. Static text chosen by the bool; no input is interpolated.
+fn list_where(archived: bool) -> &'static str {
+    if archived {
+        concat!(list_select!(), " WHERE c.archived_at IS NOT NULL ORDER BY c.archived_at DESC")
+    } else {
+        concat!(
+            list_select!(),
+            " WHERE c.archived_at IS NULL ORDER BY COALESCE(last_activity, c.created_at) DESC"
+        )
+    }
 }
 
 /// One conversation, or `None` when it is not one of the app's — never opened here, or archived.
@@ -1210,6 +1302,78 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    async fn seed_run(pool: &SqlitePool, chat: &str, status: &str, tools: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at, tools_used)
+             VALUES ('q', ?, 'assistant', 's', ?, '2026-08-11T10:00:00+00:00', ?)",
+        )
+        .bind(status)
+        .bind(chat)
+        .bind(tools)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn activity_precedence_is_needs_input_working_unread_idle() {
+        assert_eq!(activity_of(true, true, true), Activity::NeedsInput);
+        assert_eq!(activity_of(true, false, true), Activity::Working);
+        assert_eq!(activity_of(false, false, true), Activity::Unread);
+        assert_eq!(activity_of(false, false, false), Activity::Idle);
+    }
+
+    #[tokio::test]
+    async fn list_reports_working_for_a_running_turn_in_any_chat() {
+        let pool = test_pool().await;
+        let busy = create(&pool, Brain::Cloud, None).await.unwrap();
+        let quiet = create(&pool, Brain::Cloud, None).await.unwrap();
+        seed_run(&pool, &busy, "running", None).await;
+        seed_run(&pool, &quiet, "completed", Some("[]")).await;
+
+        let listed = list(&pool).await.unwrap();
+
+        assert!(listed.iter().find(|c| c.chat_id == busy).unwrap().working);
+        assert!(!listed.iter().find(|c| c.chat_id == quiet).unwrap().working);
+    }
+
+    #[tokio::test]
+    async fn list_reports_a_question_when_the_last_settled_turn_asked_one() {
+        let pool = test_pool().await;
+        let asked = create(&pool, Brain::Cloud, None).await.unwrap();
+        let answered = create(&pool, Brain::Cloud, None).await.unwrap();
+        let none = create(&pool, Brain::Cloud, None).await.unwrap();
+        seed_run(&pool, &asked, "completed", Some(r#"[{"name":"AskUserQuestion","detail":"Which?"}]"#)).await;
+        seed_run(&pool, &answered, "completed", Some(r#"[{"name":"AskUserQuestion"}]"#)).await;
+        seed_run(&pool, &answered, "completed", Some("[]")).await;
+        seed_run(&pool, &none, "completed", None).await;
+
+        let listed = list(&pool).await.unwrap();
+        let asked_of = |id: &str| listed.iter().find(|c| c.chat_id == id).unwrap().asked_question;
+
+        assert!(asked_of(&asked));
+        assert!(!asked_of(&answered));
+        assert!(!asked_of(&none));
+        let settled = settle(listed.iter().find(|c| c.chat_id == asked).unwrap().clone(), 0);
+        assert_eq!(settled.activity, Activity::NeedsInput);
+    }
+
+    #[tokio::test]
+    async fn archived_chats_are_listed_apart_and_restorable() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+        archive(&pool, &id).await.unwrap();
+
+        assert!(list(&pool).await.unwrap().iter().all(|c| c.chat_id != id));
+        let archived = list_archived(&pool).await.unwrap();
+        assert!(archived.iter().any(|c| c.chat_id == id && c.archived_at.is_some()));
+
+        assert!(restore(&pool, &id).await.unwrap());
+        assert!(!restore(&pool, &id).await.unwrap());
+        assert!(list(&pool).await.unwrap().iter().any(|c| c.chat_id == id));
+        assert!(list_archived(&pool).await.unwrap().is_empty());
     }
 
     #[tokio::test]
