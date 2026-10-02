@@ -3732,6 +3732,8 @@ pub(crate) async fn resume_for_correction(
             item: None,
             resume: true,
         }),
+        // No job MCP: `after_gate_failed` only ever corrects a run outside jobs.
+        None,
     );
     Ok(correction)
 }
