@@ -664,6 +664,9 @@ pub struct SeatRow {
     pub revision_run_id: Option<i64>,
     pub revision_status: String,
     pub revision_error: Option<String>,
+    /// The role the seat was asked to play (`formats::Role`), or NULL for a plain seat. Text as
+    /// stored, so a role a later version adds still reads rather than failing the whole row.
+    pub role: Option<String>,
 }
 
 /// One council as it is stored and read back, without its seats.
@@ -686,6 +689,18 @@ pub struct CouncilRow {
     pub chairman_agent_id: Option<String>,
     pub chairman_run_id: Option<i64>,
     pub error: Option<String>,
+    /// Critique rounds that ran, and whether the council stopped before `rounds` because nothing
+    /// was left to change.
+    pub rounds_run: i64,
+    pub stopped_early: bool,
+    /// Where the council is: a round and a phase (`answer`, `critique`, `revise`, `chairman`,
+    /// `done`). Replaces `stage`, which could not count past one revision round.
+    pub current_round: i64,
+    pub current_phase: String,
+    /// The chairman's structured synthesis as stored, and how producing it ended. NULL on every
+    /// council recorded before it existed — its synthesis is the chairman run's transcript.
+    pub synthesis_json: Option<String>,
+    pub synthesis_status: Option<String>,
 }
 
 /// Writes a council and its seats in one transaction.
@@ -782,14 +797,76 @@ impl CouncilRow {
 /// since been pruned by `runs::prune_transcripts`, answers `None` rather than an empty string. A
 /// caller must treat that as "no advice", never as "the council advised nothing".
 pub async fn synthesis_of(pool: &sqlx::SqlitePool, row: &CouncilRow) -> Option<String> {
-    transcript_of(pool, row.chairman_run_id?).await
+    synthesis_text(pool, row).await.0
+}
+
+/// The synthesis as text and, when the chairman produced one, as the structure it was written in.
+///
+/// One reader for both, so the detail view and the internal consumers (`synthesis_of`) cannot
+/// disagree about what the council concluded. A `synthesis_json` that parses is composed into
+/// markdown with each seat's NAME — the agent's when an agent took the seat, the model's otherwise
+/// — because the struct refers to seats by index and an index means nothing to a reader. One that
+/// does not parse, or is absent (every council recorded before it existed), falls back to the
+/// chairman run's transcript, which is what the synthesis always was before; and with neither, the
+/// answer is `None`, never an empty string.
+pub async fn synthesis_text(
+    pool: &sqlx::SqlitePool,
+    row: &CouncilRow,
+) -> (Option<String>, Option<formats::Synthesis>) {
+    let structured = row
+        .synthesis_json
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<formats::Synthesis>(text).ok());
+    if let Some(synthesis) = structured {
+        let seats = get_seat_rows(pool, &row.id).await.unwrap_or_default();
+        let names = agent_names(pool).await;
+        let seat_names: BTreeMap<usize, String> = seats
+            .into_iter()
+            .map(|seat| {
+                let name = seat
+                    .agent_id
+                    .as_deref()
+                    .and_then(|id| names.get(id).cloned())
+                    .unwrap_or(seat.model_ref);
+                (seat.seat_idx as usize, name)
+            })
+            .collect();
+        // A seat index the roster does not have is printed as one rather than dropped: the chairman
+        // named it, and hiding that would make its position look unanimous.
+        let name_of = |seat: usize| {
+            seat_names
+                .get(&seat)
+                .cloned()
+                .unwrap_or_else(|| format!("seat {seat}"))
+        };
+        let text = formats::compose_markdown(&synthesis, &name_of);
+        return (Some(text), Some(synthesis));
+    }
+    let text = match row.chairman_run_id {
+        Some(run_id) => transcript_of(pool, run_id).await,
+        None => None,
+    };
+    (text, None)
+}
+
+/// Agent id to name, from the catalogue. One read of a table that holds a handful of rows, rather
+/// than one lookup per seat. An agent the roster named and somebody has since deleted is simply
+/// absent, and its seat shows the id it pointed at with no name beside it — which is the honest
+/// rendering of what the record actually says.
+async fn agent_names(pool: &sqlx::SqlitePool) -> BTreeMap<String, String> {
+    crate::agent::list(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|agent| (agent.id, agent.name))
+        .collect()
 }
 
 pub async fn get_seat_rows(pool: &sqlx::SqlitePool, id: &str) -> sqlx::Result<Vec<SeatRow>> {
     sqlx::query_as::<_, SeatRow>(
         "SELECT seat_idx, kind, model_ref, agent_id, stage1_run_id, stage1_status, stage1_error,
                 stage2_run_id, stage2_status, stage2_error, rankings,
-                revision_run_id, revision_status, revision_error
+                revision_run_id, revision_status, revision_error, role
          FROM council_seats WHERE council_id = ? ORDER BY seat_idx",
     )
     .bind(id)
@@ -2453,7 +2530,31 @@ pub struct CreateCouncilResponse {
     pub id: String,
 }
 
-/// One seat as a client sees it: the record, plus the answer read out of its run.
+/// One step of one seat as a client sees it: the record, plus what the step said.
+#[derive(Debug, Serialize)]
+pub struct StepView {
+    /// 0 for the answer, 1 and up for the critique rounds. Unsigned, as `tally` counts rounds: the
+    /// column is an INTEGER only because SQLite has no other kind.
+    pub round: u32,
+    /// `answer`, `critique` or `revise`.
+    pub phase: String,
+    pub run_id: Option<i64>,
+    pub status: String,
+    pub error: Option<String>,
+    /// The text an answer or a revision wrote: the payload's `answer` when the step carries one,
+    /// else the transcript of its run (every council recorded before payloads existed). `None`
+    /// on a critique, and `None` rather than `""` when there is nothing — "nothing yet" and "the
+    /// seat answered with nothing" are different things to a client, and only one is true here.
+    pub answer: Option<String>,
+    /// A critique's reviews and ballot. `None` on any other phase, and on a critique that left no
+    /// readable payload — which is also a critique that cast no ballot.
+    pub critique: Option<formats::Critique>,
+    /// A revision's own account of itself: whether it changed its answer, and why.
+    pub changed: Option<bool>,
+    pub why: Option<String>,
+}
+
+/// One seat as a client sees it: the record, plus every step it took, in the order they happen.
 #[derive(Serialize)]
 pub struct SeatView {
     pub seat_idx: i64,
@@ -2465,26 +2566,11 @@ pub struct SeatView {
     /// deleted. Not stored on the row: a name is editable, and a copy of one is a second version of
     /// the truth that looks authoritative because it is older.
     pub agent_name: Option<String>,
-    pub stage1_status: String,
-    pub stage1_error: Option<String>,
-    /// The text the seat wrote, read from the transcript of the run that produced it. The client is
-    /// never told a `runs` table exists.
-    pub answer: Option<String>,
-    pub stage2_status: String,
-    pub stage2_error: Option<String>,
-    pub rankings: Vec<Ranking>,
-    /// The second round. `pending` on every seat of a one-round council, which `stages_total` on
-    /// the council is what makes readable — a client that knows there are three phases knows this
-    /// column describes a phase that was never going to happen.
-    pub revision_status: String,
-    pub revision_error: Option<String>,
-    /// What the seat wrote the second time, read from its revision run's transcript. `None` until
-    /// there is one, and `None` forever on a council of one round.
-    ///
-    /// Beside `answer` rather than replacing it: the first answer is what the ranking was cast
-    /// over, so a client that showed only the revision would be showing a leaderboard of text it
-    /// never displayed.
-    pub revised_answer: Option<String>,
+    /// The role the seat was asked to play, or `None` for a plain seat.
+    pub role: Option<String>,
+    /// Answer, then each round's critique and revise. The client is never told a `runs` table
+    /// exists: the text is read out of it here.
+    pub steps: Vec<StepView>,
 }
 
 #[derive(Serialize)]
@@ -2493,20 +2579,33 @@ pub struct CouncilView {
     pub created_at: String,
     pub question: String,
     pub status: String,
-    pub stage: i64,
-    /// How many phases this council runs — 3, or 4 when a second round was configured. Served so a
-    /// client can say "phase n of N" instead of hardcoding a total that is no longer always 3.
-    pub stages_total: i64,
+    /// Critique rounds asked for, rounds that ran, and whether it stopped before the asked number
+    /// because nothing was left to change.
+    pub rounds: i64,
+    pub rounds_run: i64,
+    pub stopped_early: bool,
+    pub current_round: i64,
+    pub current_phase: String,
     pub error: Option<String>,
     pub chairman_kind: String,
     #[serde(rename = "chairman_ref")]
     pub chairman_ref: String,
     pub chairman_agent_id: Option<String>,
     pub chairman_agent_name: Option<String>,
-    /// The synthesis, once phase 3 has produced one.
+    /// How far the LAST critique round's ballots agree. `None` when no critique round exists.
+    pub agreement: Option<tally::Agreement>,
+    /// The last critique round's Borda leaderboard — THE leaderboard. Computed from the stored
+    /// ballots on every read, never read off the legacy `leaderboard` column, so it cannot drift
+    /// from the votes it claims to summarise.
+    pub leaderboard: Vec<tally::BordaRow>,
+    /// Every critique round's leaderboard, in round order, so a client can show how standings moved.
+    pub leaderboard_by_round: Vec<Vec<tally::BordaRow>>,
+    /// The synthesis as markdown, once the chairman has produced one. See [`synthesis_text`].
     pub synthesis: Option<String>,
+    /// The same synthesis as its structure, when the chairman wrote a structured one.
+    pub synthesis_structured: Option<formats::Synthesis>,
+    pub synthesis_status: Option<String>,
     pub anon_map: BTreeMap<String, usize>,
-    pub leaderboard: Vec<LeaderboardEntry>,
     pub seats: Vec<SeatView>,
 }
 
@@ -2517,11 +2616,12 @@ pub struct CouncilSummary {
     pub created_at: String,
     pub question: String,
     pub status: String,
-    pub stage: i64,
-    /// Beside `stage` here as well as on the detail, because the LIST is the other place a phase
-    /// number is drawn and a total is what makes one legible. A row that said `phase 3` with no
-    /// total would read as finished on a council that has a fourth phase still to run.
-    pub stages_total: i64,
+    /// Beside the position here as well as on the detail, because the LIST is the other place a
+    /// council's progress is drawn and a total is what makes a round number legible.
+    pub rounds: i64,
+    pub rounds_run: i64,
+    pub current_round: i64,
+    pub current_phase: String,
 }
 
 pub async fn post_council(
@@ -2563,57 +2663,51 @@ pub async fn get_council(
     axum::extract::State(state): axum::extract::State<crate::state::AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<axum::Json<CouncilView>, (axum::http::StatusCode, String)> {
-    let row = get_council_row(&state.pool, &id)
-        .await
-        .map_err(internal)?
-        .ok_or((
-            axum::http::StatusCode::NOT_FOUND,
-            "no such council".to_string(),
-        ))?;
-    let seats = get_seat_rows(&state.pool, &id).await.map_err(internal)?;
+    let pool = &state.pool;
+    let row = get_council_row(pool, &id).await.map_err(internal)?.ok_or((
+        axum::http::StatusCode::NOT_FOUND,
+        "no such council".to_string(),
+    ))?;
+    let seats = get_seat_rows(pool, &id).await.map_err(internal)?;
+    let steps = store::steps_of(pool, &id).await.map_err(internal)?;
+    let names = agent_names(pool).await;
 
-    // Both rounds' transcripts in one map, keyed by RUN id rather than by seat, because that is
-    // what the seat rows point at and a seat now points at two of them.
-    let mut answers = BTreeMap::new();
-    for run_id in seats
-        .iter()
-        .filter_map(|seat| seat.stage1_run_id)
-        .chain(seats.iter().filter_map(|seat| seat.revision_run_id))
-    {
-        if let Some(text) = transcript_of(&state.pool, run_id).await {
-            answers.insert(run_id, text);
-        }
+    // An `anon_map` that will not parse becomes an empty one rather than a 500. The record is worth
+    // reading even when one of its JSON columns is not.
+    let anon_map: BTreeMap<String, usize> = row
+        .anon_map
+        .as_deref()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_default();
+
+    // Each critique round's ballots, `voter seat -> ranking labels`, gathered while the steps are
+    // turned into views. Only a critique whose payload reads is a ballot: one that failed, or wrote
+    // something unreadable, abstains rather than voting for nothing.
+    let mut ballots_by_round: BTreeMap<i64, BTreeMap<usize, Vec<String>>> = BTreeMap::new();
+    let mut steps_by_seat: BTreeMap<i64, Vec<StepView>> = BTreeMap::new();
+    for step in steps {
+        let seat_idx = step.seat_idx;
+        let view = step_view(pool, step, &mut ballots_by_round).await;
+        steps_by_seat.entry(seat_idx).or_default().push(view);
     }
-    let synthesis = match row.chairman_run_id {
-        Some(run_id) => transcript_of(&state.pool, run_id).await,
-        None => None,
-    };
 
-    // One read of a table that holds a handful of rows, rather than one lookup per seat. An agent
-    // the roster named and somebody has since deleted is simply absent from the map, and its seat
-    // shows the id it pointed at with no name beside it — which is the honest rendering of what the
-    // record actually says.
-    let names: BTreeMap<String, String> = crate::agent::list(&state.pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|agent| (agent.id, agent.name))
+    let leaderboard_by_round: Vec<Vec<tally::BordaRow>> = ballots_by_round
+        .values()
+        .map(|ballots| tally::borda(ballots, &anon_map))
         .collect();
+    let leaderboard = leaderboard_by_round.last().cloned().unwrap_or_default();
+    let agreement = ballots_by_round
+        .values()
+        .last()
+        .map(|ballots| tally::agreement(ballots, &anon_map));
+
+    let (synthesis, synthesis_structured) = synthesis_text(pool, &row).await;
 
     Ok(axum::Json(CouncilView {
         seats: seats
             .into_iter()
             .map(|seat| SeatView {
-                answer: seat
-                    .stage1_run_id
-                    .and_then(|run_id| answers.get(&run_id).cloned()),
-                // A `rankings` column that will not parse becomes an empty vote rather than a 500.
-                // The record is worth reading even when one of its JSON columns is not.
-                rankings: seat
-                    .rankings
-                    .as_deref()
-                    .and_then(|text| serde_json::from_str(text).ok())
-                    .unwrap_or_default(),
+                steps: steps_by_seat.remove(&seat.seat_idx).unwrap_or_default(),
                 seat_idx: seat.seat_idx,
                 kind: seat.kind,
                 model_ref: seat.model_ref,
@@ -2622,34 +2716,25 @@ pub async fn get_council(
                     .as_deref()
                     .and_then(|id| names.get(id).cloned()),
                 agent_id: seat.agent_id,
-                stage1_status: seat.stage1_status,
-                stage1_error: seat.stage1_error,
-                stage2_status: seat.stage2_status,
-                stage2_error: seat.stage2_error,
-                revised_answer: seat
-                    .revision_run_id
-                    .and_then(|run_id| answers.get(&run_id).cloned()),
-                revision_status: seat.revision_status,
-                revision_error: seat.revision_error,
+                role: seat.role,
             })
             .collect(),
-        anon_map: row
-            .anon_map
-            .as_deref()
-            .and_then(|text| serde_json::from_str(text).ok())
-            .unwrap_or_default(),
-        leaderboard: row
-            .leaderboard
-            .as_deref()
-            .and_then(|text| serde_json::from_str(text).ok())
-            .unwrap_or_default(),
+        anon_map,
+        agreement,
+        leaderboard,
+        leaderboard_by_round,
         synthesis,
+        synthesis_structured,
+        synthesis_status: row.synthesis_status,
         id: row.id,
         created_at: row.created_at,
         question: row.question,
         status: row.status,
-        stage: row.stage,
-        stages_total: stages_total(row.rounds),
+        rounds: row.rounds,
+        rounds_run: row.rounds_run,
+        stopped_early: row.stopped_early,
+        current_round: row.current_round,
+        current_phase: row.current_phase,
         error: row.error,
         chairman_kind: row.chairman_kind,
         chairman_ref: row.chairman_ref,
@@ -2659,6 +2744,74 @@ pub async fn get_council(
             .and_then(|id| names.get(id).cloned()),
         chairman_agent_id: row.chairman_agent_id,
     }))
+}
+
+/// One stored step as the view serves it; a readable critique also lands in
+/// `ballots_by_round` as that seat's ballot for its round.
+///
+/// The payload is read loosely, field by field, rather than into the strict `formats` structs:
+/// an answer or a revision written by a later version with a field this one does not know, or
+/// missing one this one would require, still serves its text.
+async fn step_view(
+    pool: &sqlx::SqlitePool,
+    step: store::StepRow,
+    ballots_by_round: &mut BTreeMap<i64, BTreeMap<usize, Vec<String>>>,
+) -> StepView {
+    let seat_idx = step.seat_idx;
+    let payload: Option<serde_json::Value> = step
+        .payload
+        .as_deref()
+        .and_then(|text| serde_json::from_str(text).ok());
+    let mut view = StepView {
+        // A negative round is not a value this daemon writes; read as 0 rather than wrapped round.
+        round: u32::try_from(step.round).unwrap_or_default(),
+        phase: step.phase,
+        run_id: step.run_id,
+        status: step.status,
+        error: step.error,
+        answer: None,
+        critique: None,
+        changed: None,
+        why: None,
+    };
+    match view.phase.as_str() {
+        store::PHASE_CRITIQUE => {
+            view.critique =
+                payload.and_then(|value| serde_json::from_value::<formats::Critique>(value).ok());
+            if let Some(critique) = &view.critique {
+                ballots_by_round
+                    .entry(i64::from(view.round))
+                    .or_default()
+                    .insert(seat_idx as usize, critique.ranking.clone());
+            }
+        }
+        store::PHASE_ANSWER | store::PHASE_REVISE => {
+            let from_payload = payload
+                .as_ref()
+                .and_then(|value| value.get("answer"))
+                .and_then(|answer| answer.as_str())
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_string);
+            view.answer = match (from_payload, view.run_id) {
+                (Some(text), _) => Some(text),
+                (None, Some(run_id)) => transcript_of(pool, run_id).await,
+                (None, None) => None,
+            };
+            if view.phase == store::PHASE_REVISE {
+                view.changed = payload
+                    .as_ref()
+                    .and_then(|value| value.get("changed"))
+                    .and_then(|changed| changed.as_bool());
+                view.why = payload
+                    .as_ref()
+                    .and_then(|value| value.get("why"))
+                    .and_then(|why| why.as_str())
+                    .map(str::to_string);
+            }
+        }
+        _ => {}
+    }
+    view
 }
 
 #[derive(Deserialize)]
@@ -2687,8 +2840,10 @@ pub async fn list_councils(
                 created_at: row.created_at,
                 question: row.question,
                 status: row.status,
-                stage: row.stage,
-                stages_total: stages_total(row.rounds),
+                rounds: row.rounds,
+                rounds_run: row.rounds_run,
+                current_round: row.current_round,
+                current_phase: row.current_phase,
             })
             .collect(),
     ))
@@ -4135,8 +4290,13 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(view.stages_total, 3);
-        assert!(view.seats.iter().all(|seat| seat.revised_answer.is_none()));
+        assert_eq!(view.rounds, 1);
+        // No revise step on any seat: a council of one round never had one to record.
+        assert!(view.seats.iter().all(|seat| {
+            seat.steps
+                .iter()
+                .all(|step| step.phase != store::PHASE_REVISE)
+        }));
     }
 
     /// The point of the second round: what the chairman reads is what the seats wrote AFTER seeing
@@ -4196,15 +4356,23 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(view.stages_total, 4);
+        assert_eq!(view.rounds, 2);
         // Both are served. The first answer is what the leaderboard was cast over, so a client
         // shown only the revision would be shown a ranking of text it never displayed.
-        assert_eq!(view.seats[0].answer.as_deref(), Some("alpha at first"));
         assert_eq!(
-            view.seats[0].revised_answer.as_deref(),
+            step_answer(&view.seats[0], 0, store::PHASE_ANSWER).as_deref(),
+            Some("alpha at first")
+        );
+        assert_eq!(
+            step_answer(&view.seats[0], 1, store::PHASE_REVISE).as_deref(),
             Some("alpha on reflection")
         );
-        assert_eq!(view.seats[0].revision_status, SEAT_OK);
+        assert_eq!(
+            step_of(&view.seats[0], 1, store::PHASE_REVISE)
+                .unwrap()
+                .status,
+            SEAT_OK
+        );
     }
 
     /// A failed second attempt is not a reason to throw away a first one that worked. The chairman
@@ -4792,12 +4960,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(view.status, STATUS_RUNNING);
-        assert_eq!(view.stage, 1);
+        assert_eq!(view.current_round, 0);
+        assert_eq!(view.current_phase, store::PHASE_ANSWER);
         // The answer comes back as TEXT, read out of the run that produced it. Nothing in this
         // response tells the client a `runs` table exists.
-        assert_eq!(view.seats[0].answer.as_deref(), Some("the first"));
-        assert_eq!(view.seats[1].answer, None);
+        assert_eq!(
+            step_answer(&view.seats[0], 0, store::PHASE_ANSWER).as_deref(),
+            Some("the first")
+        );
+        assert_eq!(step_answer(&view.seats[1], 0, store::PHASE_ANSWER), None);
         assert!(view.leaderboard.is_empty());
+        assert!(view.leaderboard_by_round.is_empty());
+        assert_eq!(view.agreement, None);
         assert_eq!(view.synthesis, None);
 
         cancel(&state, &id).await.unwrap();
@@ -5868,5 +6042,633 @@ mod tests {
                 .is_some_and(|text| !text.trim().is_empty()),
             "a real model must answer the seat with prose, not with nothing: {answer:?}"
         );
+    }
+
+    // ---- P5: the view reads `council_rounds` ----
+
+    /// The step of `seat` at (`round`, `phase`), if the view served one.
+    fn step_of<'a>(seat: &'a SeatView, round: i64, phase: &str) -> Option<&'a StepView> {
+        seat.steps
+            .iter()
+            .find(|step| step.round as i64 == round && step.phase == phase)
+    }
+
+    /// The text served for one step, if any.
+    fn step_answer(seat: &SeatView, round: i64, phase: &str) -> Option<String> {
+        step_of(seat, round, phase).and_then(|step| step.answer.clone())
+    }
+
+    /// A finished run whose transcript is `stdout`, as a seat's or the chairman's would be.
+    async fn run_with_stdout(pool: &sqlx::SqlitePool, stdout: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, created_at, stdout)
+             VALUES ('p', 'done', ?, ?, ?, ?)",
+        )
+        .bind(COUNCIL_MODE)
+        .bind(crate::auth::generate_uuid_v4())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(stdout)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// A council of `members` plain-model seats (`model-0`, `model-1`, ...), with no steps yet.
+    async fn bare_council(pool: &sqlx::SqlitePool, id: &str, members: usize, rounds: i64) {
+        let roster: Vec<CouncilSeat> = (0..members)
+            .map(|index| seat(SeatKind::Cloud, &format!("model-{index}")))
+            .collect();
+        insert_council(
+            pool,
+            id,
+            "why?",
+            &seat(SeatKind::Cloud, "the-chairman"),
+            &roster,
+            rounds,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn critique_json(ranking: &[&str]) -> String {
+        serde_json::json!({ "reviews": [], "ranking": ranking }).to_string()
+    }
+
+    /// `voter seat -> ranking labels`, the shape `tally` reads a round's ballots in.
+    fn ballots(votes: &[(usize, &[&str])]) -> BTreeMap<usize, Vec<String>> {
+        votes
+            .iter()
+            .map(|(voter, labels)| (*voter, labels.iter().map(|l| l.to_string()).collect()))
+            .collect()
+    }
+
+    fn abc() -> BTreeMap<String, usize> {
+        [("A", 0), ("B", 1), ("C", 2)]
+            .into_iter()
+            .map(|(label, seat)| (label.to_string(), seat))
+            .collect()
+    }
+
+    async fn view_of(state: &crate::state::AppState, id: &str) -> CouncilView {
+        get_council(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(id.to_string()),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    /// Steps are served per seat, in the order they happen — answer, then each round's critique and
+    /// revise — whatever order they were written in, and the council's progress columns come with
+    /// them, on the detail and on the list.
+    #[tokio::test]
+    async fn view_serves_steps_per_seat_in_order() {
+        let state = council_state(std::sync::Arc::new(ScriptedRunner::default()), None).await;
+        let pool = &state.pool;
+        bare_council(pool, "c1", 2, 2).await;
+        sqlx::query(
+            "UPDATE council_seats SET role = 'devil' WHERE council_id = 'c1' AND seat_idx = 1",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // Written backwards on purpose: the order served must not be the order stored.
+        for seat_idx in [1, 0] {
+            store::upsert_step(
+                pool,
+                "c1",
+                2,
+                seat_idx,
+                store::PHASE_CRITIQUE,
+                None,
+                SEAT_OK,
+                None,
+                Some(&critique_json(&["A"])),
+            )
+            .await
+            .unwrap();
+            store::upsert_step(
+                pool,
+                "c1",
+                1,
+                seat_idx,
+                store::PHASE_REVISE,
+                None,
+                SEAT_ERROR,
+                Some("it broke"),
+                None,
+            )
+            .await
+            .unwrap();
+            store::upsert_step(
+                pool,
+                "c1",
+                1,
+                seat_idx,
+                store::PHASE_CRITIQUE,
+                Some(41),
+                SEAT_OK,
+                None,
+                Some(&critique_json(&["B", "A"])),
+            )
+            .await
+            .unwrap();
+            store::upsert_step(
+                pool,
+                "c1",
+                0,
+                seat_idx,
+                store::PHASE_ANSWER,
+                None,
+                SEAT_OK,
+                None,
+                Some(r#"{"answer":"hi"}"#),
+            )
+            .await
+            .unwrap();
+        }
+        store::set_position(pool, "c1", 2, store::PHASE_CRITIQUE)
+            .await
+            .unwrap();
+        store::set_progress(pool, "c1", 1, true).await.unwrap();
+
+        let row = get_council_row(pool, "c1").await.unwrap().unwrap();
+        assert_eq!(row.rounds_run, 1);
+        assert!(row.stopped_early);
+        assert_eq!(row.current_round, 2);
+        assert_eq!(row.current_phase, store::PHASE_CRITIQUE);
+        assert_eq!(row.synthesis_json, None);
+        assert_eq!(row.synthesis_status, None);
+
+        let view = view_of(&state, "c1").await;
+        assert_eq!(view.rounds, 2);
+        assert_eq!(view.rounds_run, 1);
+        assert!(view.stopped_early);
+        assert_eq!(view.current_round, 2);
+        assert_eq!(view.current_phase, store::PHASE_CRITIQUE);
+        assert_eq!(view.seats.len(), 2);
+        assert_eq!(view.seats[0].role, None);
+        assert_eq!(view.seats[1].role.as_deref(), Some("devil"));
+        assert_eq!(view.seats[1].model_ref, "model-1");
+        for seat in &view.seats {
+            let order: Vec<(i64, &str)> = seat
+                .steps
+                .iter()
+                .map(|step| (step.round as i64, step.phase.as_str()))
+                .collect();
+            assert_eq!(
+                order,
+                vec![
+                    (0, store::PHASE_ANSWER),
+                    (1, store::PHASE_CRITIQUE),
+                    (1, store::PHASE_REVISE),
+                    (2, store::PHASE_CRITIQUE),
+                ]
+            );
+            let critique = &seat.steps[1];
+            assert_eq!(critique.run_id, Some(41));
+            assert_eq!(critique.status, SEAT_OK);
+            assert_eq!(
+                critique.critique.as_ref().map(|c| c.ranking.clone()),
+                Some(vec!["B".to_string(), "A".to_string()])
+            );
+            assert_eq!(critique.answer, None);
+            let revise = &seat.steps[2];
+            assert_eq!(revise.status, SEAT_ERROR);
+            assert_eq!(revise.error.as_deref(), Some("it broke"));
+            assert_eq!(revise.critique, None);
+        }
+
+        let listed = list_councils(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].rounds, 2);
+        assert_eq!(listed[0].rounds_run, 1);
+        assert_eq!(listed[0].current_round, 2);
+        assert_eq!(listed[0].current_phase, store::PHASE_CRITIQUE);
+    }
+
+    /// The leaderboard and the agreement are computed from the stored ballots when the view is
+    /// read — per critique round, the last one being THE leaderboard — and never read off the
+    /// legacy `leaderboard` column. A critique that failed casts no ballot.
+    #[tokio::test]
+    async fn view_computes_borda_and_agreement_on_read() {
+        let state = council_state(std::sync::Arc::new(ScriptedRunner::default()), None).await;
+        let pool = &state.pool;
+        bare_council(pool, "c1", 3, 2).await;
+        set_anon_map(pool, "c1", &abc()).await.unwrap();
+        // A stale legacy leaderboard that contradicts the ballots: the view must not serve it.
+        sqlx::query(
+            "UPDATE council_runs SET leaderboard = '[{\"seat_idx\":2,\"avg_rank\":1.0,\"votes\":9}]'
+              WHERE id = 'c1'",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let round_one: &[(usize, &[&str])] = &[(0, &["C", "B"]), (1, &["C", "A"])];
+        let round_two: &[(usize, &[&str])] =
+            &[(0, &["B", "C"]), (1, &["A", "C"]), (2, &["A", "B"])];
+        for (voter, labels) in round_one {
+            store::upsert_step(
+                pool,
+                "c1",
+                1,
+                *voter as i64,
+                store::PHASE_CRITIQUE,
+                None,
+                SEAT_OK,
+                None,
+                Some(&critique_json(labels)),
+            )
+            .await
+            .unwrap();
+        }
+        // Seat 2's first critique failed: no payload, no ballot.
+        store::upsert_step(
+            pool,
+            "c1",
+            1,
+            2,
+            store::PHASE_CRITIQUE,
+            None,
+            SEAT_ERROR,
+            Some("boom"),
+            None,
+        )
+        .await
+        .unwrap();
+        for (voter, labels) in round_two {
+            store::upsert_step(
+                pool,
+                "c1",
+                2,
+                *voter as i64,
+                store::PHASE_CRITIQUE,
+                None,
+                SEAT_OK,
+                None,
+                Some(&critique_json(labels)),
+            )
+            .await
+            .unwrap();
+        }
+
+        let view = view_of(&state, "c1").await;
+        let expected_one = tally::borda(&ballots(round_one), &abc());
+        let expected_two = tally::borda(&ballots(round_two), &abc());
+        assert_eq!(
+            view.leaderboard_by_round,
+            vec![expected_one, expected_two.clone()]
+        );
+        assert_eq!(view.leaderboard, expected_two);
+        assert_eq!(
+            view.leaderboard[0].seat_idx, 0,
+            "every ballot put seat 0 first"
+        );
+        assert_eq!(
+            view.agreement,
+            Some(tally::agreement(&ballots(round_two), &abc()))
+        );
+        assert_eq!(view.agreement.as_ref().unwrap().ballots, 3);
+        assert_eq!(view.anon_map, abc());
+    }
+
+    /// A council recorded before rounds existed is read in the shape `0154` copied it into: answers
+    /// with no payload (the prose is in the transcript) and critiques that are a bare ballot with no
+    /// reviews. It still gets its text and a Borda leaderboard.
+    #[tokio::test]
+    async fn view_reads_a_migrated_council_with_borda() {
+        let state = council_state(std::sync::Arc::new(ScriptedRunner::default()), None).await;
+        let pool = &state.pool;
+        bare_council(pool, "old", 3, 1).await;
+        set_anon_map(pool, "old", &abc()).await.unwrap();
+        let votes: &[(usize, &[&str])] = &[(0, &["B", "C"]), (1, &["C", "A"]), (2, &["B", "A"])];
+        for seat_idx in 0..3i64 {
+            let run = run_with_stdout(pool, &format!("old answer {seat_idx}")).await;
+            store::upsert_step(
+                pool,
+                "old",
+                0,
+                seat_idx,
+                store::PHASE_ANSWER,
+                Some(run),
+                SEAT_OK,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        for (voter, labels) in votes {
+            // Byte for byte what the migration writes: `json_object('reviews', json('[]'), ...)`.
+            let payload = format!(
+                r#"{{"reviews":[],"ranking":[{}]}}"#,
+                labels
+                    .iter()
+                    .map(|l| format!("\"{l}\""))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            store::upsert_step(
+                pool,
+                "old",
+                1,
+                *voter as i64,
+                store::PHASE_CRITIQUE,
+                None,
+                SEAT_OK,
+                None,
+                Some(&payload),
+            )
+            .await
+            .unwrap();
+        }
+        finish(pool, "old", STATUS_DONE, None).await.unwrap();
+
+        let view = view_of(&state, "old").await;
+        for (index, seat) in view.seats.iter().enumerate() {
+            assert_eq!(
+                step_answer(seat, 0, store::PHASE_ANSWER),
+                Some(format!("old answer {index}"))
+            );
+            let critique = step_of(seat, 1, store::PHASE_CRITIQUE)
+                .and_then(|step| step.critique.clone())
+                .expect("a migrated ballot reads as a critique");
+            assert!(critique.reviews.is_empty());
+        }
+        let expected = tally::borda(&ballots(votes), &abc());
+        assert_eq!(view.leaderboard, expected);
+        assert_eq!(view.leaderboard_by_round, vec![expected]);
+        // B is first on two ballots and second on none.
+        assert_eq!(view.leaderboard[0].seat_idx, 1);
+        assert!(view.agreement.is_some());
+    }
+
+    /// An answer or revision's text is its payload's `answer` when the step carries one, and the
+    /// run's transcript only when it does not; a revision also serves whether it changed and why.
+    #[tokio::test]
+    async fn view_prefers_payload_text_and_falls_back_to_transcript() {
+        let state = council_state(std::sync::Arc::new(ScriptedRunner::default()), None).await;
+        let pool = &state.pool;
+        bare_council(pool, "c1", 3, 2).await;
+
+        let run0 = run_with_stdout(pool, "from the transcript, seat 0").await;
+        let run1 = run_with_stdout(pool, "from the transcript, seat 1").await;
+        // Seat 0: payload and transcript both present — the payload wins.
+        store::upsert_step(
+            pool,
+            "c1",
+            0,
+            0,
+            store::PHASE_ANSWER,
+            Some(run0),
+            SEAT_OK,
+            None,
+            Some(r#"{"answer":"from the payload"}"#),
+        )
+        .await
+        .unwrap();
+        // Seat 1: no payload — the transcript is read.
+        store::upsert_step(
+            pool,
+            "c1",
+            0,
+            1,
+            store::PHASE_ANSWER,
+            Some(run1),
+            SEAT_OK,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // Seat 2: neither — nothing, not an empty string.
+        store::upsert_step(
+            pool,
+            "c1",
+            0,
+            2,
+            store::PHASE_ANSWER,
+            None,
+            SEAT_PENDING,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rev0 = run_with_stdout(pool, "revision transcript, seat 0").await;
+        let rev1 = run_with_stdout(pool, "revision transcript, seat 1").await;
+        store::upsert_step(
+            pool,
+            "c1",
+            1,
+            0,
+            store::PHASE_REVISE,
+            Some(rev0),
+            SEAT_OK,
+            None,
+            Some(r#"{"answer":"revised in the payload","changed":true,"why":"seat B was right"}"#),
+        )
+        .await
+        .unwrap();
+        store::upsert_step(
+            pool,
+            "c1",
+            1,
+            1,
+            store::PHASE_REVISE,
+            Some(rev1),
+            SEAT_OK,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        store::upsert_step(
+            pool,
+            "c1",
+            1,
+            2,
+            store::PHASE_REVISE,
+            None,
+            SEAT_OK,
+            None,
+            Some(r#"{"changed":false,"why":"nothing moved me"}"#),
+        )
+        .await
+        .unwrap();
+
+        let view = view_of(&state, "c1").await;
+        let seats = &view.seats;
+        assert_eq!(
+            step_answer(&seats[0], 0, store::PHASE_ANSWER).as_deref(),
+            Some("from the payload")
+        );
+        assert_eq!(
+            step_answer(&seats[1], 0, store::PHASE_ANSWER).as_deref(),
+            Some("from the transcript, seat 1")
+        );
+        assert_eq!(step_answer(&seats[2], 0, store::PHASE_ANSWER), None);
+        // An answer is not a revision: it carries no `changed`/`why`.
+        let answer = step_of(&seats[0], 0, store::PHASE_ANSWER).unwrap();
+        assert_eq!(answer.changed, None);
+        assert_eq!(answer.why, None);
+        assert_eq!(answer.critique, None);
+
+        let revised = step_of(&seats[0], 1, store::PHASE_REVISE).unwrap();
+        assert_eq!(revised.answer.as_deref(), Some("revised in the payload"));
+        assert_eq!(revised.changed, Some(true));
+        assert_eq!(revised.why.as_deref(), Some("seat B was right"));
+        assert_eq!(
+            step_answer(&seats[1], 1, store::PHASE_REVISE).as_deref(),
+            Some("revision transcript, seat 1")
+        );
+        let kept = step_of(&seats[2], 1, store::PHASE_REVISE).unwrap();
+        assert_eq!(kept.changed, Some(false));
+        assert_eq!(kept.why.as_deref(), Some("nothing moved me"));
+
+        // No critique round at all: nothing to tally.
+        assert!(view.leaderboard.is_empty());
+        assert!(view.leaderboard_by_round.is_empty());
+        assert_eq!(view.agreement, None);
+    }
+
+    /// A structured synthesis is served twice: as the struct, and as markdown composed with each
+    /// seat's NAME — the agent's when an agent took the seat, the model's otherwise. The chairman's
+    /// raw transcript is not what is served once a structured one exists.
+    #[tokio::test]
+    async fn view_synthesis_is_composed_from_synthesis_json() {
+        let state = council_state(std::sync::Arc::new(ScriptedRunner::default()), None).await;
+        let pool = &state.pool;
+        bare_council(pool, "c1", 2, 1).await;
+        let agent_id = catalogue(pool, agent_request("Cetico")).await;
+        sqlx::query(
+            "UPDATE council_seats SET agent_id = ? WHERE council_id = 'c1' AND seat_idx = 0",
+        )
+        .bind(&agent_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let chairman = run_with_stdout(pool, "the chairman's raw transcript").await;
+        set_chairman_run(pool, "c1", chairman).await.unwrap();
+
+        let synthesis = formats::Synthesis {
+            answer: "Do the thing.".to_string(),
+            consensus: vec!["it is worth doing".to_string()],
+            disagreements: vec![formats::Disagreement {
+                topic: "when".to_string(),
+                positions: vec![
+                    formats::Position {
+                        seats: vec![0],
+                        view: "now".to_string(),
+                    },
+                    formats::Position {
+                        seats: vec![1],
+                        view: "later".to_string(),
+                    },
+                ],
+            }],
+            minority: None,
+            confidence: formats::Confidence {
+                level: "high".to_string(),
+                why: "they agree".to_string(),
+            },
+            open_questions: vec![],
+            degraded_reason: None,
+        };
+        let json = serde_json::to_string(&synthesis).unwrap();
+        store::set_synthesis(pool, "c1", Some(&json), "ok")
+            .await
+            .unwrap();
+        finish(pool, "c1", STATUS_DONE, None).await.unwrap();
+
+        let names = |seat: usize| match seat {
+            0 => "Cetico".to_string(),
+            _ => "model-1".to_string(),
+        };
+        let expected = formats::compose_markdown(&synthesis, &names);
+        assert!(expected.contains("Cetico") && expected.contains("model-1"));
+
+        let row = get_council_row(pool, "c1").await.unwrap().unwrap();
+        assert_eq!(row.synthesis_json.as_deref(), Some(json.as_str()));
+        assert_eq!(row.synthesis_status.as_deref(), Some("ok"));
+        let (text, structured) = synthesis_text(pool, &row).await;
+        assert_eq!(text.as_deref(), Some(expected.as_str()));
+        assert_eq!(structured.as_ref(), Some(&synthesis));
+        assert_eq!(
+            synthesis_of(pool, &row).await.as_deref(),
+            Some(expected.as_str())
+        );
+
+        let view = view_of(&state, "c1").await;
+        assert_eq!(view.synthesis.as_deref(), Some(expected.as_str()));
+        assert_eq!(view.synthesis_structured, Some(synthesis));
+        assert_eq!(view.synthesis_status.as_deref(), Some("ok"));
+    }
+
+    /// With no readable `synthesis_json` — a council recorded before it existed, or one whose
+    /// column will not parse — the synthesis is the chairman run's transcript, as it always was;
+    /// and with no chairman run, or one that wrote nothing, there is none at all.
+    #[tokio::test]
+    async fn view_synthesis_of_falls_back_to_the_transcript_and_then_none() {
+        let state = council_state(std::sync::Arc::new(ScriptedRunner::default()), None).await;
+        let pool = &state.pool;
+
+        bare_council(pool, "legacy", 1, 1).await;
+        let chairman = run_with_stdout(pool, "the old synthesis").await;
+        set_chairman_run(pool, "legacy", chairman).await.unwrap();
+        let row = get_council_row(pool, "legacy").await.unwrap().unwrap();
+        assert_eq!(
+            synthesis_text(pool, &row).await,
+            (Some("the old synthesis".to_string()), None)
+        );
+        assert_eq!(
+            synthesis_of(pool, &row).await.as_deref(),
+            Some("the old synthesis")
+        );
+        let view = view_of(&state, "legacy").await;
+        assert_eq!(view.synthesis.as_deref(), Some("the old synthesis"));
+        assert_eq!(view.synthesis_structured, None);
+        assert_eq!(view.synthesis_status, None);
+
+        // A column that will not parse is no synthesis; the transcript still is.
+        bare_council(pool, "garbled", 1, 1).await;
+        let chairman = run_with_stdout(pool, "the raw words").await;
+        set_chairman_run(pool, "garbled", chairman).await.unwrap();
+        store::set_synthesis(pool, "garbled", Some("not json at all"), "degraded")
+            .await
+            .unwrap();
+        let row = get_council_row(pool, "garbled").await.unwrap().unwrap();
+        assert_eq!(
+            synthesis_text(pool, &row).await,
+            (Some("the raw words".to_string()), None)
+        );
+
+        // No chairman run: no synthesis, and not an empty one.
+        bare_council(pool, "none", 1, 1).await;
+        let row = get_council_row(pool, "none").await.unwrap().unwrap();
+        assert_eq!(synthesis_text(pool, &row).await, (None, None));
+        assert_eq!(synthesis_of(pool, &row).await, None);
+
+        // A chairman run that wrote nothing reads as none too.
+        bare_council(pool, "silent", 1, 1).await;
+        let chairman = run_with_stdout(pool, "   ").await;
+        set_chairman_run(pool, "silent", chairman).await.unwrap();
+        let row = get_council_row(pool, "silent").await.unwrap().unwrap();
+        assert_eq!(synthesis_of(pool, &row).await, None);
+        assert_eq!(view_of(&state, "silent").await.synthesis, None);
     }
 }

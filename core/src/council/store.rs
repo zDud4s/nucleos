@@ -19,7 +19,6 @@ pub const PHASE_REVISE: &str = "revise";
 pub const STEP_INVALID: &str = "invalid";
 
 /// One step as stored.
-#[allow(dead_code)] // Read by the round driver and the routes, in later packets.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct StepRow {
     pub round: i64,
@@ -69,7 +68,6 @@ pub async fn upsert_step(
 
 /// Every step of a council, seat by seat, and within a seat in the order the steps happen. The
 /// phase order is spelled out because the alphabet would put `critique` before `answer`.
-#[allow(dead_code)] // Read by the round driver and the routes, in later packets.
 pub async fn steps_of(pool: &SqlitePool, id: &str) -> sqlx::Result<Vec<StepRow>> {
     sqlx::query_as::<_, StepRow>(
         "SELECT round, seat_idx, phase, run_id, status, error, payload
