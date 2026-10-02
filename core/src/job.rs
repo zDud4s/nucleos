@@ -13541,6 +13541,17 @@ mod tests {
         );
         let run_id = run_id.expect("the retried item has a node of its own attached to it");
 
+        // `interrupted` is what a restart writes, and a restarted daemon holds no task for the
+        // run. Drop this one's registration too, or `reconcile_nodes` reads the row as still
+        // inside its handoff window and leaves the item running.
+        if let Some(task) = state
+            .run_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id)
+        {
+            task.abort();
+        }
         sqlx::query("UPDATE runs SET status = 'interrupted', exit_code = NULL WHERE id = ?")
             .bind(run_id)
             .execute(&pool)
