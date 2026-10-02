@@ -17,6 +17,7 @@ const ALLOWED = new Map<string, { literals: number; tables?: string[]; reason: s
   ["calendar/DaySheet.tsx", { literals: 5, reason: "facts about a day — today, not a working day, a short or long one, a proposed occurrence. No núcleo state machine writes any of them." }],
   ["pages/Autopilot.tsx", { literals: 1, reason: "a shadow decision's action class is an identifier, not a domain state." }],
   ["pages/AutopilotJudge.tsx", { literals: 2, reason: "a verdict's action class is an identifier, and the judge's band is its opinion about one action (would allow, would refuse), not a lifecycle state of anything." }],
+  ["pages/AutopilotResolve.tsx", { literals: 1, reason: "the resolver's outcome for one queued block is its opinion about that block, read beside the owner's, not a lifecycle state of anything." }],
   ["pages/Browser.tsx", { literals: 3, reason: "a grant's kind and whether it submits forms are permissions the shell decides, and a write's HTTP method is an identifier." }],
   ["pages/Calendar.tsx", { literals: 1, reason: "busy or free right now is computed from the calendar in the browser; the daemon sends no such literal." }],
   ["pages/Contacts.tsx", { literals: 4, reason: "a contact's verdict, whether you write back, and a merge are facts about a person, not a lifecycle." }],

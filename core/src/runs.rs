@@ -3561,7 +3561,9 @@ pub(crate) async fn resume_for_correction(
     origin: i64,
     exit_code: i32,
 ) -> Result<i64, CorrectionRefusal> {
-    let row: Option<(Option<String>, Option<String>, Option<String>, i64, i64)> = sqlx::query_as(
+    // project_id, session_id, gate_output, lineage root, steerable.
+    type OriginRow = (Option<String>, Option<String>, Option<String>, i64, i64);
+    let row: Option<OriginRow> = sqlx::query_as(
         "SELECT project_id, session_id, gate_output, COALESCE(lineage_root_id, id), steerable
          FROM runs WHERE id = ?",
     )

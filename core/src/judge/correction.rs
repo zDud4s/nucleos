@@ -213,20 +213,23 @@ pub(crate) async fn refusal_before_the_transaction(
     }
 }
 
+/// mode, job_id, project_id, lineage root, gate_output, successor_run_id.
+type GateFailedRow = (
+    String,
+    Option<i64>,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<i64>,
+);
+
 /// Spec E4 (D6). Spawned by `spawn_run` after `observe_run`, only on the arm where the terminal
 /// write won with `completed` and the gate `failed` (not `errored`: that is the gate that did not
 /// run, not the code). Every way out is today's behaviour (the `worktree_gate_failed` line already
 /// out) plus, in enforce, one line of the resolver's own. Any failure falls back to the owner.
 pub(crate) async fn after_gate_failed(state: AppState, run_id: i64, exit_code: i32) {
     let pool = &state.pool;
-    let row: Option<(
-        String,
-        Option<i64>,
-        Option<String>,
-        i64,
-        Option<String>,
-        Option<i64>,
-    )> = sqlx::query_as(
+    let row: Option<GateFailedRow> = sqlx::query_as(
         "SELECT mode, job_id, project_id, COALESCE(lineage_root_id, id), gate_output, successor_run_id
          FROM runs WHERE id = ?",
     )
@@ -502,7 +505,7 @@ mod tests {
 
     async fn trace(pool: &SqlitePool, root: i64) -> Option<String> {
         lineage_trace_on(
-            &mut *pool.acquire().await.unwrap(),
+            &mut pool.acquire().await.unwrap(),
             root,
             Some("nucleos/run-1"),
         )
@@ -633,7 +636,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let count = corrections_in_last_day_on(&mut *pool.acquire().await.unwrap(), "p", now)
+        let count = corrections_in_last_day_on(&mut pool.acquire().await.unwrap(), "p", now)
             .await
             .unwrap();
         assert_eq!(count, 2);
