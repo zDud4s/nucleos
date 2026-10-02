@@ -2424,6 +2424,14 @@ pub struct CreateCouncilRequest {
     /// every later council inherit an answer nobody gave.
     #[serde(default)]
     pub roster: Option<RosterOverride>,
+    /// Critique rounds for this question; `None` is the file's. Validated by [`start_with`], so a
+    /// count outside the bounds is a 400 rather than a quiet clamp to something nobody asked for.
+    #[serde(default)]
+    pub rounds: Option<u32>,
+    /// A role per seat, keyed by the seat index as a string (`{"1": "skeptic"}`). `None` and an
+    /// empty map mean the same thing: every seat plays itself.
+    #[serde(default)]
+    pub roles: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2525,6 +2533,64 @@ pub struct CouncilSummary {
     pub current_phase: String,
 }
 
+/// What the shell's council form needs before anyone types a question: the bounds it may offer,
+/// the closed set of roles, and the roster it would be overriding.
+///
+/// Built by hand rather than derived, because the config types are deserialize-only on purpose —
+/// they describe a file — and a `Serialize` on them would invite echoing the whole file, consumers
+/// and timeout included, to a client that has no business with either.
+#[derive(Debug, Serialize)]
+pub struct CouncilConfigView {
+    /// `false` when there is no roster: the form says so instead of rendering an empty one.
+    pub configured: bool,
+    /// The file's rounds when configured, else [`crate::config::DEFAULT_COUNCIL_ROUNDS`], so the
+    /// form's control has a value either way.
+    pub default_rounds: u32,
+    pub max_rounds: u32,
+    /// `formats::Role::ALL`, in its declared order, so a new role reaches the form without a
+    /// second list to keep in step.
+    pub roles: Vec<&'static str>,
+    pub default_roster: Option<RosterView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RosterView {
+    pub chairman: serde_json::Value,
+    pub members: Vec<serde_json::Value>,
+}
+
+/// PURE: one declared seat in the form the file wrote it — `{ "agent" }` or `{ "kind", "ref" }`,
+/// never both. A loaded roster never holds both (the file is refused at load), so the agent form
+/// wins only as a tie-break that cannot occur.
+fn seat_spec_view(seat: &SeatSpec) -> serde_json::Value {
+    match &seat.agent {
+        Some(agent) => serde_json::json!({ "agent": agent }),
+        None => serde_json::json!({
+            "kind": seat.kind.map(SeatKind::as_db_str),
+            "ref": seat.model_ref,
+        }),
+    }
+}
+
+pub async fn get_council_config(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+) -> axum::Json<CouncilConfigView> {
+    let configured = state.council.config();
+    axum::Json(CouncilConfigView {
+        configured: configured.is_some(),
+        default_rounds: configured.map_or(crate::config::DEFAULT_COUNCIL_ROUNDS, |c| c.rounds),
+        max_rounds: crate::config::MAX_COUNCIL_ROUNDS,
+        roles: formats::Role::ALL
+            .iter()
+            .map(|role| role.as_str())
+            .collect(),
+        default_roster: configured.map(|config| RosterView {
+            chairman: seat_spec_view(&config.chairman),
+            members: config.members.iter().map(seat_spec_view).collect(),
+        }),
+    })
+}
+
 pub async fn post_council(
     axum::extract::State(state): axum::extract::State<crate::state::AppState>,
     axum::Json(request): axum::Json<CreateCouncilRequest>,
@@ -2532,7 +2598,15 @@ pub async fn post_council(
     (axum::http::StatusCode, axum::Json<CreateCouncilResponse>),
     (axum::http::StatusCode, String),
 > {
-    match start(&state, &request.question, request.roster).await {
+    match start_with(
+        &state,
+        &request.question,
+        request.roster,
+        request.rounds,
+        request.roles.unwrap_or_default(),
+    )
+    .await
+    {
         Ok(id) => Ok((
             // 202: the record exists and the deliberation has not happened yet. A 201 would claim a
             // finished resource, and a caller reading the body would find a council with no answers
@@ -3979,6 +4053,8 @@ mod tests {
             axum::Json(CreateCouncilRequest {
                 question: "  why?  ".to_string(),
                 roster: None,
+                rounds: None,
+                roles: None,
             }),
         )
         .await
@@ -4000,6 +4076,8 @@ mod tests {
                 axum::Json(CreateCouncilRequest {
                     question: "   ".to_string(),
                     roster: None,
+                    rounds: None,
+                    roles: None,
                 }),
             )
             .await,
@@ -4637,6 +4715,8 @@ mod tests {
             axum::Json(CreateCouncilRequest {
                 question: "why?".to_string(),
                 roster: None,
+                rounds: None,
+                roles: None,
             }),
         )
         .await
@@ -6938,5 +7018,157 @@ mod tests {
         assert_eq!(routed, launched, "a phase launched around the router");
         assert_eq!(launched, 13);
         assert_eq!(prompts_with(&runner, prompts::REVISE_MARKER).len(), 3);
+    }
+
+    // ── P8: the surface carries rounds and roles, and serves the form its defaults ───────────
+
+    /// A request that names rounds and roles gets a council run with exactly those — recorded on
+    /// the row and on the seat — rather than the file's, because the handler is the only way the
+    /// shell's form reaches `start_with`.
+    #[tokio::test]
+    async fn post_council_records_rounds_and_roles() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        let state = council_state(runner, Some(roster(2))).await;
+
+        let (status, body) = post_council(
+            axum::extract::State(state.clone()),
+            axum::Json(CreateCouncilRequest {
+                question: "why?".to_string(),
+                roster: None,
+                rounds: Some(2),
+                roles: Some(roles(&[("1", "skeptic")])),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+
+        let row = settled(&state, &body.id).await;
+        // Not the file's DEFAULT_COUNCIL_ROUNDS: the request's.
+        assert_eq!(row.rounds, 2);
+        let seats = get_seat_rows(&state.pool, &body.id).await.unwrap();
+        assert_eq!(seats[0].role, None);
+        assert_eq!(seats[1].role.as_deref(), Some("skeptic"));
+    }
+
+    /// The JSON body is what a client actually sends, so the fields are proven to deserialize under
+    /// these names and to be optional — an older client posting only a question must still work.
+    #[test]
+    fn post_council_request_takes_rounds_and_roles_from_json() {
+        let request: CreateCouncilRequest = serde_json::from_value(serde_json::json!({
+            "question": "why?",
+            "rounds": 3,
+            "roles": { "0": "fact_checker" },
+        }))
+        .unwrap();
+        assert_eq!(request.rounds, Some(3));
+        assert_eq!(request.roles, Some(roles(&[("0", "fact_checker")])));
+
+        let bare: CreateCouncilRequest =
+            serde_json::from_value(serde_json::json!({ "question": "why?" })).unwrap();
+        assert_eq!(bare.rounds, None);
+        assert_eq!(bare.roles, None);
+    }
+
+    /// A role outside the closed set is the client's mistake, said as a 400 — and nothing is
+    /// written or launched, because a typo that ran would bill a council nobody asked for.
+    #[tokio::test]
+    async fn post_council_refuses_an_unknown_role_with_400() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        let state = council_state(runner.clone(), Some(roster(2))).await;
+
+        for (rounds, roles) in [
+            (None, roles(&[("0", "Skeptic")])),
+            (None, roles(&[("0", "contrarian")])),
+            (None, roles(&[("7", "skeptic")])),
+            (Some(crate::config::MAX_COUNCIL_ROUNDS + 1), BTreeMap::new()),
+        ] {
+            let (status, message) = post_council(
+                axum::extract::State(state.clone()),
+                axum::Json(CreateCouncilRequest {
+                    question: "why?".to_string(),
+                    roster: None,
+                    rounds,
+                    roles: Some(roles.clone()),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{rounds:?} {roles:?}"
+            );
+            assert!(!message.trim().is_empty());
+        }
+        assert!(
+            list_council_rows(&state.pool, 10, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(runner.seen.lock().unwrap().is_empty());
+    }
+
+    /// The form's defaults, read from the file: the configured rounds, the ceiling, the closed role
+    /// set in its declared order, and the roster in the two seat forms the file allows.
+    #[tokio::test]
+    async fn council_config_serves_form_defaults() {
+        let mut config = roster(1);
+        config.rounds = 2;
+        config.members.push(agent_spec("agent-1"));
+        let state =
+            council_state(std::sync::Arc::new(ScriptedRunner::default()), Some(config)).await;
+
+        let response = get_council_config(axum::extract::State(state)).await;
+        let body = serde_json::to_value(&response.0).unwrap();
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "configured": true,
+                "default_rounds": 2,
+                "max_rounds": crate::config::MAX_COUNCIL_ROUNDS,
+                "roles": ["proposer", "skeptic", "devils_advocate", "fact_checker"],
+                "default_roster": {
+                    "chairman": { "kind": "cloud", "ref": "the-chairman" },
+                    "members": [
+                        { "kind": "cloud", "ref": "model-0" },
+                        { "agent": "agent-1" },
+                    ],
+                },
+            })
+        );
+        // The role list IS `Role::ALL`, so a fifth role reaches the form without a second edit.
+        let wire: Vec<&str> = formats::Role::ALL
+            .iter()
+            .map(|role| role.as_str())
+            .collect();
+        assert_eq!(body["roles"], serde_json::json!(wire));
+    }
+
+    /// No roster: the form still learns the bounds and the roles, and is told plainly there is no
+    /// council rather than handed an empty roster it would try to render.
+    #[tokio::test]
+    async fn council_config_without_a_roster_says_unconfigured() {
+        let state = council_state(std::sync::Arc::new(ScriptedRunner::default()), None).await;
+
+        let response = get_council_config(axum::extract::State(state)).await;
+        let body = serde_json::to_value(&response.0).unwrap();
+
+        assert_eq!(body["configured"], serde_json::json!(false));
+        assert!(body["default_roster"].is_null(), "{body}");
+        assert_eq!(
+            body["default_rounds"],
+            serde_json::json!(crate::config::DEFAULT_COUNCIL_ROUNDS)
+        );
+        assert_eq!(
+            body["max_rounds"],
+            serde_json::json!(crate::config::MAX_COUNCIL_ROUNDS)
+        );
+        assert_eq!(
+            body["roles"],
+            serde_json::json!(["proposer", "skeptic", "devils_advocate", "fact_checker"])
+        );
     }
 }

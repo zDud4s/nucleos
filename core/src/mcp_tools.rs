@@ -105,6 +105,15 @@ struct JobParams {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct CouncilAskParams {
     question: String,
+    /// How many critique rounds to run, 1 to 3: after the blind ranking each seat sees the
+    /// anonymised peer answers and revises its own. Omit it to use the owner's configured number;
+    /// more rounds cost more model invocations.
+    #[serde(default)]
+    rounds: Option<u32>,
+    /// A role per seat, keyed by the seat's index as a string, e.g. {"1": "skeptic"}. Roles:
+    /// proposer, skeptic, devils_advocate, fact_checker. Omit it and every seat answers plainly.
+    #[serde(default)]
+    roles: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// No roster field, and its absence is the decision.
@@ -627,7 +636,11 @@ impl NucleosTools {
     #[tool(
         description = "Convene a NucleOS council: put ONE question to every seat of the roster the \
                        owner configured, each answering independently, then ranking the others \
-                       blind, then a chairman writing one synthesis. Returns a council_id \
+                       blind, then, for each further critique round, revising its own answer \
+                       against the anonymised peers, then a chairman writing one synthesis. \
+                       Optional: rounds (1 to 3; omit for the owner's default) and roles, a role \
+                       per seat index such as {\"1\": \"skeptic\"} (proposer, skeptic, \
+                       devils_advocate, fact_checker). Returns a council_id \
                        IMMEDIATELY and the deliberation keeps running for minutes afterwards — it \
                        does NOT return an answer. Read the result with get_council on a later \
                        turn. Costs several model invocations, so use it for a hard, open question \
@@ -636,9 +649,13 @@ impl NucleosTools {
     )]
     async fn ask_council(
         &self,
-        Parameters(CouncilAskParams { question }): Parameters<CouncilAskParams>,
+        Parameters(CouncilAskParams {
+            question,
+            rounds,
+            roles,
+        }): Parameters<CouncilAskParams>,
     ) -> String {
-        match self.client.ask_council(&question).await {
+        match self.client.ask_council(&question, rounds, roles).await {
             Ok(id) => serde_json::json!({ "council_id": id }).to_string(),
             Err(msg) => error_json(msg),
         }
@@ -646,8 +663,11 @@ impl NucleosTools {
 
     #[tool(
         description = "Read a council convened earlier with ask_council: its status (running, \
-                       done, error, cancelled), which phase it is in, every seat's answer, the \
-                       average-rank leaderboard, and the chairman's synthesis once there is one. \
+                       done, error, cancelled), which round and phase it is in, every seat's \
+                       answer, critiques and revisions, the Borda leaderboard of each critique \
+                       round, how far the last round's ballots agree, and the chairman's \
+                       synthesis once there is one — as markdown, and as a structured synthesis \
+                       when the chairman wrote one. \
                        A council still running has no synthesis yet and is worth asking about \
                        again later rather than waiting on."
     )]
@@ -5717,5 +5737,45 @@ mod tests {
         let text = bounded[0]["text"].as_str().unwrap();
         assert!(text.len() <= MATCH_TEXT + 3, "{}", text.len());
         assert!(text.ends_with('…'));
+    }
+
+    /// The council tool's body carries rounds and roles only when the model gave them. A key sent
+    /// as `null` would be read by the daemon as an explicit choice, and an absent one is the
+    /// file's default — so "not given" must stay absent on the wire.
+    #[test]
+    fn ask_council_body_carries_rounds_and_roles_only_when_given() {
+        let roles: std::collections::BTreeMap<String, String> =
+            [("1".to_string(), "skeptic".to_string())].into();
+
+        assert_eq!(
+            crate::daemon_client::council_ask_body("why?", None, None),
+            serde_json::json!({ "question": "why?" })
+        );
+        assert_eq!(
+            crate::daemon_client::council_ask_body("why?", Some(2), None),
+            serde_json::json!({ "question": "why?", "rounds": 2 })
+        );
+        assert_eq!(
+            crate::daemon_client::council_ask_body("why?", None, Some(roles.clone())),
+            serde_json::json!({ "question": "why?", "roles": { "1": "skeptic" } })
+        );
+        assert_eq!(
+            crate::daemon_client::council_ask_body("why?", Some(3), Some(roles.clone())),
+            serde_json::json!({ "question": "why?", "rounds": 3, "roles": { "1": "skeptic" } })
+        );
+
+        // And the tool's parameters accept both, optional, under the names the body uses.
+        let params: CouncilAskParams = serde_json::from_value(serde_json::json!({
+            "question": "why?",
+            "rounds": 2,
+            "roles": { "1": "skeptic" },
+        }))
+        .unwrap();
+        assert_eq!(params.rounds, Some(2));
+        assert_eq!(params.roles, Some(roles));
+        let bare: CouncilAskParams =
+            serde_json::from_value(serde_json::json!({ "question": "why?" })).unwrap();
+        assert_eq!(bare.rounds, None);
+        assert_eq!(bare.roles, None);
     }
 }
