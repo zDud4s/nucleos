@@ -3795,6 +3795,7 @@ mod tests {
             )),
             run_tails: Default::default(),
             files_root: None,
+            files_trash: None,
             workflow_library: None,
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
