@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
-import { clampAlong, MIDDLE } from "./notch-place";
+import { clampAlong, isVertical, MIDDLE, type NotchEdge } from "./notch-place";
 
 /**
  * The line of the screen the floating quota notch is centred on, in this window's CSS pixels.
@@ -21,12 +21,20 @@ import { clampAlong, MIDDLE } from "./notch-place";
  * by `AppShell` alone, and reaches `QuotaNotch` as a prop (`NotchWindow.test.tsx` holds the notch
  * page's files to that).
  *
+ * On the top or bottom edge the answer is a column rather than a row — `along` of the way across the
+ * work area, measured from the left of this page — and `QuotaNotch` hangs the drawing's middle on
+ * that instead.
+ *
  * Asked again whenever the window moves or is resized. `undefined` — which leaves the notch centred
  * in the window — when there is nothing to ask: outside Tauri (the preview, the tests), or a call
  * refused. Every failure is swallowed on purpose: the fallback is a notch in the right place for a
  * maximised window, and there is nowhere in a notch to report more.
  */
-export function useScreenLine(enabled: boolean, along: number = MIDDLE): number | undefined {
+export function useScreenLine(
+  enabled: boolean,
+  along: number = MIDDLE,
+  edge: NotchEdge = "right",
+): number | undefined {
   const [geometry, setGeometry] = useState<Geometry | undefined>(undefined);
 
   useEffect(() => {
@@ -51,7 +59,15 @@ export function useScreenLine(enabled: boolean, along: number = MIDDLE): number 
           return;
         }
         const area = monitor.workArea;
-        setGeometry({ top: area.position.y, height: area.size.height, content: content.y, scale });
+        setGeometry({
+          top: area.position.y,
+          height: area.size.height,
+          content: content.y,
+          left: area.position.x,
+          width: area.size.width,
+          contentX: content.x,
+          scale,
+        });
       } catch {
         if (!gone) setGeometry(undefined);
       }
@@ -78,7 +94,14 @@ export function useScreenLine(enabled: boolean, along: number = MIDDLE): number 
   }, [enabled]);
 
   if (geometry === undefined) return undefined;
-  const { top, height, content, scale } = geometry;
+  const { scale } = geometry;
+  // A notch on the top or bottom edge hangs from a COLUMN of the screen rather than a row: the same
+  // arithmetic, across the work area's width and from where this page starts on the left.
+  if (!isVertical(edge)) {
+    const { left, width, contentX } = geometry;
+    return Math.round((left + width * clampAlong(along) - contentX) / scale);
+  }
+  const { top, height, content } = geometry;
   return Math.round((top + height * clampAlong(along) - content) / scale);
 }
 
@@ -91,5 +114,8 @@ interface Geometry {
   top: number;
   height: number;
   content: number;
+  left: number;
+  width: number;
+  contentX: number;
   scale: number;
 }

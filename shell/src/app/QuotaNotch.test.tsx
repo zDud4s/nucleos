@@ -562,15 +562,16 @@ describe("QuotaNotch", () => {
    */
   it("moves along the edge when its rail is dragged", async () => {
     answer({ providers: [claude()] });
-    const onAlong = vi.fn();
+    const onPlace = vi.fn();
     const frames: FrameRequestCallback[] = [];
     const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((step) => {
       frames.push(step);
       return frames.length;
     });
     Object.defineProperty(window.screen, "availHeight", { value: 1000, configurable: true });
+    Object.defineProperty(window.screen, "availWidth", { value: 1920, configurable: true });
     const { container, findByText, queryByText } = renderWithQuery(
-      <QuotaNotch along={0.5} onAlong={onAlong} />,
+      <QuotaNotch place={{ edge: "right", along: 0.5 }} onPlace={onPlace} />,
     );
     await findByText(/claude: 7d 46% /);
     const notch = container.querySelector(".quota-notch")!;
@@ -578,47 +579,102 @@ describe("QuotaNotch", () => {
     fireEvent.pointerEnter(notch);
     await findByText("Claude usage");
 
-    fireEvent.pointerDown(rail, { button: 0, screenY: 500, pointerId: 1 });
-    fireEvent.pointerMove(rail, { screenY: 400, pointerId: 1 });
+    fireEvent.pointerDown(rail, { button: 0, screenX: 1900, screenY: 500, pointerId: 1 });
+    fireEvent.pointerMove(rail, { screenX: 1900, screenY: 400, pointerId: 1 });
     // The bubble went the moment it became a drag, and the rail says it is being carried.
     await waitFor(() => expect(queryByText("Claude usage")).toBeNull());
     expect(rail.getAttribute("data-dragging")).toBe("true");
     // Steps go out once a frame, and as steps.
     frames.splice(0).forEach((step) => step(0));
-    expect(onAlong).toHaveBeenLastCalledWith(0.4, false);
+    expect(onPlace).toHaveBeenLastCalledWith({ edge: "right", along: 0.4 }, false);
 
-    fireEvent.pointerUp(rail, { screenY: 300, pointerId: 1 });
-    expect(onAlong).toHaveBeenLastCalledWith(0.3, true);
+    fireEvent.pointerUp(rail, { screenX: 1900, screenY: 300, pointerId: 1 });
+    expect(onPlace).toHaveBeenLastCalledWith({ edge: "right", along: 0.3 }, true);
     expect(rail.getAttribute("data-dragging")).toBe("false");
     raf.mockRestore();
+  });
+
+  /**
+   * Carried towards another edge of the screen, the notch goes there: the nearest edge to the
+   * pointer, with its middle under it. Near a corner it stays on the edge it was on until another
+   * is clearly nearer, so it does not flip between two edges on every pixel.
+   */
+  it("moves to another edge of the screen when its rail is dragged there", async () => {
+    answer({ providers: [claude()] });
+    const onPlace = vi.fn();
+    Object.defineProperty(window.screen, "availHeight", { value: 1000, configurable: true });
+    Object.defineProperty(window.screen, "availWidth", { value: 1920, configurable: true });
+    const { container, findByText } = renderWithQuery(
+      <QuotaNotch place={{ edge: "right", along: 0.5 }} onPlace={onPlace} />,
+    );
+    await findByText(/claude: 7d 46% /);
+    const rail = container.querySelector(".quota-notch-rail")!;
+
+    fireEvent.pointerDown(rail, { button: 0, screenX: 1900, screenY: 500, pointerId: 1 });
+    // Into the top-right corner: as near the top as the right, so still the right.
+    fireEvent.pointerMove(rail, { screenX: 1900, screenY: 20, pointerId: 1 });
+    fireEvent.pointerUp(rail, { screenX: 1900, screenY: 20, pointerId: 1 });
+    expect(onPlace).toHaveBeenLastCalledWith({ edge: "right", along: expect.closeTo(0.02, 6) }, true);
+
+    fireEvent.pointerDown(rail, { button: 0, screenX: 1900, screenY: 500, pointerId: 2 });
+    fireEvent.pointerMove(rail, { screenX: 480, screenY: 10, pointerId: 2 });
+    fireEvent.pointerUp(rail, { screenX: 480, screenY: 10, pointerId: 2 });
+    expect(onPlace).toHaveBeenLastCalledWith({ edge: "top", along: 0.25 }, true);
+  });
+
+  /** Each edge lays the notch out its own way, and the drawing says which. */
+  it("marks the edge it hangs from", async () => {
+    answer({ providers: [claude()] });
+    const { container, findByText } = renderWithQuery(
+      <QuotaNotch place={{ edge: "bottom", along: 0.5 }} onPlace={() => {}} />,
+    );
+    await findByText(/claude: 7d 46% /);
+    expect(container.querySelector(".quota-notch")!.getAttribute("data-edge")).toBe("bottom");
+  });
+
+  /** The update control asks for a new reading now, instead of waiting for the next poll. */
+  it("reads the quota again when asked to update", async () => {
+    answer({ providers: [claude()] });
+    const { getByRole, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/claude: 7d 46% /);
+    const before = daemon.apiFetch.mock.calls.length;
+
+    fireEvent.click(getByRole("button", { name: "Update the quota reading" }));
+
+    await waitFor(() => expect(daemon.apiFetch.mock.calls.length).toBe(before + 1));
+    expect(daemon.apiFetch).toHaveBeenLastCalledWith("/quota");
   });
 
   /** A press that barely moves is a click on the notch, not a drag of it. */
   it("does not take a press that barely moves for a drag", async () => {
     answer({ providers: [claude()] });
-    const onAlong = vi.fn();
-    const { container, findByText } = renderWithQuery(<QuotaNotch along={0.5} onAlong={onAlong} />);
+    const onPlace = vi.fn();
+    const { container, findByText } = renderWithQuery(
+      <QuotaNotch place={{ edge: "right", along: 0.5 }} onPlace={onPlace} />,
+    );
     await findByText(/claude: 7d 46% /);
     const rail = container.querySelector(".quota-notch-rail")!;
 
-    fireEvent.pointerDown(rail, { button: 0, screenY: 500, pointerId: 1 });
-    fireEvent.pointerMove(rail, { screenY: 502, pointerId: 1 });
-    fireEvent.pointerUp(rail, { screenY: 502, pointerId: 1 });
+    fireEvent.pointerDown(rail, { button: 0, screenX: 1000, screenY: 500, pointerId: 1 });
+    fireEvent.pointerMove(rail, { screenX: 1000, screenY: 502, pointerId: 1 });
+    fireEvent.pointerUp(rail, { screenX: 1000, screenY: 502, pointerId: 1 });
 
-    expect(onAlong).not.toHaveBeenCalled();
+    expect(onPlace).not.toHaveBeenCalled();
     expect(rail.getAttribute("data-dragging")).toBe("false");
   });
 
   /** A double click puts it back in the middle, where it hung before anybody moved it. */
   it("goes back to the middle of the edge on a double click", async () => {
     answer({ providers: [claude()] });
-    const onAlong = vi.fn();
-    const { container, findByText } = renderWithQuery(<QuotaNotch along={0.2} onAlong={onAlong} />);
+    const onPlace = vi.fn();
+    const { container, findByText } = renderWithQuery(
+      <QuotaNotch place={{ edge: "left", along: 0.2 }} onPlace={onPlace} />,
+    );
     await findByText(/claude: 7d 46% /);
 
     fireEvent.doubleClick(container.querySelector(".quota-notch-rail")!);
 
-    expect(onAlong).toHaveBeenCalledWith(0.5, true);
+    expect(onPlace).toHaveBeenCalledWith({ edge: "left", along: 0.5 }, true);
   });
 
   /** With nowhere to keep a position, the rail is not a handle at all. */
@@ -654,6 +710,8 @@ describe("QuotaNotch", () => {
   /** A notch with nowhere else to go offers nowhere else. */
   it("draws no move control when it is given none", async () => {
     const { container } = await folded();
-    expect(container.querySelector("button")).toBeNull();
+    // The update control is the only button left: it belongs to the reading, not to a host.
+    const buttons = [...container.querySelectorAll("button")].map((button) => button.getAttribute("aria-label"));
+    expect(buttons).toEqual(["Update the quota reading"]);
   });
 });

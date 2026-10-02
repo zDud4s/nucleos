@@ -56,8 +56,9 @@ describe("NotchWindow", () => {
         width: 0,
         height: 0,
         rest: 0,
-        // Nobody has moved it: the middle of the edge, where it has always hung.
+        // Nobody has moved it: the middle of the right edge, where it has always hung.
         along: 0.5,
+        edge: "right",
       }),
     );
   });
@@ -77,16 +78,30 @@ describe("NotchWindow", () => {
 
     const rail = container.querySelector(".quota-notch-rail")!;
     Object.defineProperty(window.screen, "availHeight", { value: 1000, configurable: true });
-    fireEvent.pointerDown(rail, { button: 0, screenY: 400, pointerId: 1 });
-    fireEvent.pointerMove(rail, { screenY: 650, pointerId: 1 });
-    fireEvent.pointerUp(rail, { screenY: 650, pointerId: 1 });
+    Object.defineProperty(window.screen, "availWidth", { value: 1920, configurable: true });
+    fireEvent.pointerDown(rail, { button: 0, screenX: 1900, screenY: 400, pointerId: 1 });
+    fireEvent.pointerMove(rail, { screenX: 1900, screenY: 650, pointerId: 1 });
+    fireEvent.pointerUp(rail, { screenX: 1900, screenY: 650, pointerId: 1 });
 
     // 250 screen pixels of a 1000-pixel work area is a quarter of the way further down.
     await waitFor(() =>
       expect(tauri.invoke).toHaveBeenCalledWith("notch_fit", expect.objectContaining({ along: 0.5 })),
     );
     expect(window.localStorage.getItem("nucleos.notch-along")).toBe("0.5");
+
+    // Carried to the bottom of the screen, it hangs from the bottom edge, and the fit says so.
+    fireEvent.pointerDown(rail, { button: 0, screenX: 1900, screenY: 650, pointerId: 2 });
+    fireEvent.pointerMove(rail, { screenX: 960, screenY: 995, pointerId: 2 });
+    fireEvent.pointerUp(rail, { screenX: 960, screenY: 995, pointerId: 2 });
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith(
+        "notch_fit",
+        expect.objectContaining({ along: 0.5, edge: "bottom" }),
+      ),
+    );
+    expect(window.localStorage.getItem("nucleos.notch-edge")).toBe("bottom");
     window.localStorage.removeItem("nucleos.notch-along");
+    window.localStorage.removeItem("nucleos.notch-edge");
   });
 
   it("docks the notch back inside the app from its own control", async () => {

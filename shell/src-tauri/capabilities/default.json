@@ -9,6 +9,14 @@
     {
       "identifier": "opener:allow-open-url",
       "allow": [{ "url": "vscode://file/*" }]
+    },
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        { "path": "$LOCALDATA/nucleos/NucleOS/data/files/**" },
+        { "path": "$LOCALDATA/dev.nucleos.NucleOS/files/**" },
+        { "path": "$LOCALDATA/nucleos/files/**" }
+      ]
     }
   ]
 }

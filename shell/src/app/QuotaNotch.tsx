@@ -1,9 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
-import { Pin, PinOff } from "lucide-react";
+import { AppWindow, PictureInPicture2, RefreshCw } from "lucide-react";
 import { useQuota, type QuotaProvider, type QuotaWindow } from "../data/quota";
 import { IconButton, ProviderMark, Ring, readState, relativeText, type RingTrack } from "../ui";
 import type { NotchMode } from "./notch-mode";
-import { MIDDLE } from "./notch-place";
+import { EDGES, isVertical, MIDDLE, type NotchEdge, type NotchPlace } from "./notch-place";
 
 /**
  * The two windows every provider is drawn with, outermost first.
@@ -42,28 +42,80 @@ const FOLD_MS = 140;
 const TAIL_AT = 26;
 
 /**
+ * The rings' outer diameter on the rail. `.app-main-notched` and the flare radii in `app.css` are
+ * measured off it (38 + `--space-3` either side = a 62px rail) and have to follow it.
+ */
+const RING_SIZE = 38;
+
+/**
  * How far a press has to move, in screen pixels, before it is a drag rather than a click. Four is
  * past the jitter of a hand settling on a touchpad and short of anything anybody would call a move.
  */
 const DRAG_SLOP = 4;
 
 /**
- * A drag of the rail: the screen height it started at, the fraction it started from, and whether
- * it has moved past `DRAG_SLOP` yet.
+ * How much nearer, in screen pixels, another edge has to be than the one the notch is on before a
+ * drag carries it over. Without it a pointer near a corner is equally near two edges, and the notch
+ * would flip between them on every pixel.
+ */
+const EDGE_STICK = 48;
+
+/**
+ * A drag of the rail: the screen point it started at, the place it started from, the edge it is on
+ * now, and whether it has moved past `DRAG_SLOP` yet.
  */
 interface Drag {
-  from: number;
-  start: number;
+  x: number;
+  y: number;
+  start: NotchPlace;
+  edge: NotchEdge;
   moved: boolean;
 }
 
 /**
- * The height a drag is measured against: the screen's work area, in CSS pixels — the same area the
- * fraction is a fraction of. The window's own height where the screen reports none (jsdom does).
+ * The box a drag is measured against: the screen's work area, in CSS pixels — the same area the
+ * fraction is a fraction of. The window's own size where the screen reports none (jsdom does).
+ * `availLeft`/`availTop` are Chromium's, which is what WebView2 is; absent, the area starts at 0.
  */
-function screenSpan(): number {
-  const available = window.screen?.availHeight ?? 0;
-  return available > 0 ? available : Math.max(1, window.innerHeight);
+function screenBox(): { left: number; top: number; width: number; height: number } {
+  const screen = window.screen as (Screen & { availLeft?: number; availTop?: number }) | undefined;
+  const width = screen?.availWidth ?? 0;
+  const height = screen?.availHeight ?? 0;
+  return {
+    left: screen?.availLeft ?? 0,
+    top: screen?.availTop ?? 0,
+    width: width > 0 ? width : Math.max(1, window.innerWidth),
+    height: height > 0 ? height : Math.max(1, window.innerHeight),
+  };
+}
+
+/**
+ * Where a drag that has reached this screen point puts the notch.
+ *
+ * The edge is the one nearest the pointer — kept until another is nearer by `EDGE_STICK`. On the
+ * edge the drag started from, the notch moves by as much as the pointer did, so the grip does not
+ * jump to the notch's middle; on any other edge there is no grip to keep, and the notch's middle
+ * follows the pointer.
+ */
+function follow(drag: Drag, screenX: number, screenY: number): NotchPlace {
+  const box = screenBox();
+  const x = screenX - box.left;
+  const y = screenY - box.top;
+  const distance: Record<NotchEdge, number> = {
+    left: x,
+    right: box.width - x,
+    top: y,
+    bottom: box.height - y,
+  };
+  const nearest = EDGES.reduce((best, edge) => (distance[edge] < distance[best] ? edge : best));
+  if (distance[nearest] + EDGE_STICK < distance[drag.edge]) drag.edge = nearest;
+  const edge = drag.edge;
+  const vertical = isVertical(edge);
+  if (edge === drag.start.edge) {
+    const moved = vertical ? (screenY - drag.y) / box.height : (screenX - drag.x) / box.width;
+    return { edge, along: drag.start.along + moved };
+  }
+  return { edge, along: vertical ? y / box.height : x / box.width };
 }
 
 /**
@@ -96,27 +148,27 @@ export interface QuotaNotchProps {
    */
   line?: number;
   /**
-   * How far down the edge the notch hangs, a fraction of the screen's work area (`notch-place.ts`).
-   * Used here only for the fallback when there is no `line` to hang from; the host that owns it is
-   * what turns it into a place.
+   * Which edge the notch hangs from and how far along it, a fraction of the screen's work area
+   * (`notch-place.ts`). The edge decides the drawing's axis; the fraction is used here only for the
+   * fallback when there is no `line` to hang from — the host that owns it turns it into a place.
+   * Absent, the right edge's middle.
    */
-  along?: number;
+  place?: NotchPlace;
   /**
-   * Moves the notch along the edge: `done` false for every step of a drag, true for the drop.
-   * Absent, the rail cannot be dragged — a test or a preview with nowhere to keep a position.
+   * Moves the notch: `done` false for every step of a drag, true for the drop. A drag carries it
+   * along its edge, or to whichever edge of the screen the pointer takes it nearest. Absent, the
+   * rail cannot be dragged — a test or a preview with nowhere to keep a position.
    */
-  onAlong?: (along: number, done: boolean) => void;
+  onPlace?: (place: NotchPlace, done: boolean) => void;
 }
 
 /**
  * How much of each assistant's usage window is gone, hanging off an edge.
  *
- * **A column against the right edge, and not a bar along the top.** The edge decides the axis:
- * left and right keep a vertical column, top and bottom would lay the readings out side by side.
- * The right edge is what this draws, because it is the edge with the most room to grow into — the
- * app's own page is centred with slack on both sides, and a screen has more width to spare than
- * height. The choice becomes a setting with the rest of the policy (design D9's phase), and the
- * shape here is what that setting will switch between rather than something it has to undo.
+ * **Any edge of the screen, and the edge decides the axis.** Left and right keep a vertical column;
+ * top and bottom lay the readings out side by side (`data-edge`, `app.css`). The right edge is where
+ * it starts, because it is the edge with the most room to grow into; dragging the rail to another
+ * edge moves it there (`follow`), and the bubble always opens away from the edge it hangs from.
  *
  * **Folded at rest, in both hosts, and that changed.** The contained host used to be drawn open
  * always, on the argument that a page has room to spare. A lateral column makes that argument
@@ -165,8 +217,10 @@ export interface QuotaNotchProps {
  * two windows would be a figure nobody can attribute. Everything else still waits for the pointer:
  * the second window, the resets, the fidelity and the way to the other host.
  */
-export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }: QuotaNotchProps) {
+export function QuotaNotch({ host = "contained", onMove, line, place, onPlace }: QuotaNotchProps) {
   const quota = useQuota();
+  const edge = place?.edge ?? "right";
+  const vertical = isVertical(edge);
   const [phase, setPhase] = useState<Phase>("folded");
   // Which provider the bubble is about: the ring the pointer last reached, or the first one when
   // the notch was opened some other way (focus, or the pointer arriving on the rail between rings).
@@ -174,19 +228,20 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
   const timer = useRef<number | undefined>(undefined);
   const drawing = useRef<HTMLDivElement>(null);
   const rail = useRef<HTMLDivElement>(null);
-  // The drawing's height folded, for the contained host to hang from (`app.css`,
-  // `.quota-notch-contained`). Measured rather than derived: it is two rings or three, the flares
+  // The drawing's length along its edge folded — its height on a side edge, its width on the top or
+  // bottom — for the contained host to hang from (`app.css`, `.quota-notch-contained`). Measured rather than derived: it is two rings or three, the flares
   // and some padding, and a sum of tokens written out here would be one more thing to keep equal.
   const [rest, setRest] = useState<number | undefined>(undefined);
-  // Where the bubble sits and where its tail points, both measured from the top of the drawing.
-  const [aim, setAim] = useState({ top: 0, tail: TAIL_AT });
+  // Where the bubble sits and where its tail points, both measured along the edge from the drawing's
+  // start — its top on a side edge, its left on the top or bottom.
+  const [aim, setAim] = useState({ at: 0, tail: TAIL_AT });
   const count = quota.data?.providers.length ?? 0;
   const reached = phase !== "folded";
   // A drag of the rail under way: where it started, and whether it has moved far enough to be one.
   const drag = useRef<Drag | null>(null);
   const [dragging, setDragging] = useState(false);
   // The latest position of a drag not yet handed over, coalesced to one per frame.
-  const pending = useRef<{ frame: number; along: number } | null>(null);
+  const pending = useRef<{ frame: number; place: NotchPlace } | null>(null);
 
   useEffect(
     () => () => {
@@ -199,8 +254,9 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
   // Before paint, so the first frame is already hung from the right place.
   useLayoutEffect(() => {
     if (phase !== "folded" || drawing.current === null) return;
-    setRest(drawing.current.getBoundingClientRect().height);
-  }, [phase, count]);
+    const box = drawing.current.getBoundingClientRect();
+    setRest(vertical ? box.height : box.width);
+  }, [phase, count, vertical]);
 
   // The tail points at the middle of the ring the bubble is about. Measured, because the ring's
   // place in the rail depends on how many providers sit above it; and the bubble moves down only as
@@ -211,12 +267,15 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
     const ring = rail.current.querySelectorAll(".ui-ring")[active];
     if (ring === undefined) return;
     const face = ring.getBoundingClientRect();
-    const centre = face.top + face.height / 2 - drawing.current.getBoundingClientRect().top;
-    const top = Math.max(0, centre - TAIL_AT);
+    const box = drawing.current.getBoundingClientRect();
+    const centre = vertical
+      ? face.top + face.height / 2 - box.top
+      : face.left + face.width / 2 - box.left;
+    const at = Math.max(0, centre - TAIL_AT);
     setAim((current) =>
-      current.top === top && current.tail === centre - top ? current : { top, tail: centre - top },
+      current.at === at && current.tail === centre - at ? current : { at, tail: centre - at },
     );
-  }, [reached, active, count]);
+  }, [reached, active, count, vertical]);
 
   // Nothing until the first answer. A notch drawn empty would say "nothing is burned", which is the
   // most misleading thing this feature could claim — and it would say it at exactly the moment
@@ -241,26 +300,26 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
   // Every step of a drag goes to the host once per frame at most. The floating host answers each
   // with a fit, which moves a window — sixty of those a second is the ceiling worth paying, and a
   // pointer reports far more often than that on a fast mouse.
-  const carry = (next: number) => {
-    if (onAlong === undefined) return;
+  const carry = (next: NotchPlace) => {
+    if (onPlace === undefined) return;
     if (pending.current !== null) {
-      pending.current.along = next;
+      pending.current.place = next;
       return;
     }
     const frame = window.requestAnimationFrame(() => {
       const last = pending.current;
       pending.current = null;
-      if (last !== null) onAlong(last.along, false);
+      if (last !== null) onPlace(last.place, false);
     });
-    pending.current = { frame, along: next };
+    pending.current = { frame, place: next };
   };
 
-  const drop = (next: number) => {
+  const drop = (next: NotchPlace) => {
     if (pending.current !== null) {
       window.cancelAnimationFrame(pending.current.frame);
       pending.current = null;
     }
-    onAlong?.(next, true);
+    onPlace?.(next, true);
   };
   // Every step checks where it is before it moves, so a leave that arrives with the notch already
   // folded plays nothing, and a pointer back inside before the linger is up folds nothing.
@@ -279,6 +338,7 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
     <div
       ref={drawing}
       className={`quota-notch quota-notch-${host}`}
+      data-edge={edge}
       data-unfolded={reached}
       data-folding={phase === "folding"}
       data-stored={source === "stored"}
@@ -288,7 +348,7 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
           ? undefined
           : ({
               "--quota-notch-rest": `${rest}px`,
-              "--quota-notch-along": `${along ?? MIDDLE}`,
+              "--quota-notch-along": `${place?.along ?? MIDDLE}`,
               ...(line === undefined ? {} : { "--quota-notch-line": `${line}px` }),
             } as CSSProperties)
       }
@@ -312,8 +372,8 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
         style={
           reached
             ? ({
-                "--quota-notch-pop-top": `${aim.top}px`,
-                "--quota-notch-tail-top": `${aim.tail}px`,
+                "--quota-notch-pop-at": `${aim.at}px`,
+                "--quota-notch-tail-at": `${aim.tail}px`,
               } as CSSProperties)
             : undefined
         }
@@ -388,34 +448,54 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
             hour-old one is normal and an hour-old `official` one is not.
           */}
           {reached && <span className="quota-notch-fidelity">{fidelityPhrase(shown, now)}</span>}
-          {onMove !== undefined && (
-            /*
-              Folded, the control is still THERE, inside the `.sr-only` bubble rather than left
-              unrendered. Rendered only when unfolded it could not be reached by a keyboard at all:
-              the wrapper's `onFocus` fires from a child, and the only focusable child is this
-              button, so focus would have nowhere to land and the notch would never unfold. Hidden
-              that way it is out of flow — it measures nothing, so neither the page nor the window
-              the Rust side fits round this drawing changes size — and it is a tab stop, which
-              unfolds the notch and brings itself into view. It stays the same element across the
-              unfold, because nothing above it in the tree changes shape.
+          {/*
+            Folded, the controls are still THERE, inside the `.sr-only` bubble rather than left
+            unrendered. Rendered only when unfolded they could not be reached by a keyboard at all:
+            the wrapper's `onFocus` fires from a child, and these buttons are its only focusable
+            children, so focus would have nowhere to land and the notch would never unfold. Hidden
+            that way they are out of flow — they measure nothing, so neither the page nor the window
+            the Rust side fits round this drawing changes size — and each is a tab stop, which
+            unfolds the notch and brings itself into view. They stay the same elements across the
+            unfold, because nothing above them in the tree changes shape.
 
-              What that does NOT buy in the floating host: reaching its window from the keyboard in
-              the first place. It is built `skip_taskbar(true)` (`notch.rs`), which on Windows means
-              WS_EX_TOOLWINDOW and no place in the Alt+Tab order, and `focused(false)`, so it never
-              takes focus by itself. Focus arrives when the owner clicks the notch, or through
-              assistive tech that can move it. So an owner working from the keyboard alone cannot
-              reach the way back at all, and the main window has no other: `AppShell` draws no notch
-              while the mode is `global`, by design, and the mode has no home in settings yet. That
-              gap is named here rather than implied away.
-            */
-            <span className={reached ? "quota-notch-control" : undefined}>
-              {host === "contained" ? (
-                <IconButton label="Keep the notch in front of every window" icon={Pin} onClick={onMove} />
-              ) : (
-                <IconButton label="Put the notch back inside NucleOS" icon={PinOff} onClick={onMove} />
-              )}
+            What that does NOT buy in the floating host: reaching its window from the keyboard in
+            the first place. It is built `skip_taskbar(true)` (`notch.rs`), which on Windows means
+            WS_EX_TOOLWINDOW and no place in the Alt+Tab order, and `focused(false)`, so it never
+            takes focus by itself. Focus arrives when the owner clicks the notch, or through
+            assistive tech that can move it. So an owner working from the keyboard alone cannot
+            reach the way back at all, and the main window has no other: `AppShell` draws no notch
+            while the mode is `global`, by design, and the mode has no home in settings yet. That
+            gap is named here rather than implied away.
+          */}
+          <span className={reached ? "quota-notch-control" : undefined}>
+            {/*
+              A new reading now rather than at the next poll. `GET /quota` asks the sidecar on every
+              request, so a refetch is a fresh figure. The glyph turns while the request is out, so
+              a click that changed no number still visibly did something.
+            */}
+            <span className="quota-notch-update" data-busy={quota.isFetching}>
+              <IconButton
+                label="Update the quota reading"
+                icon={RefreshCw}
+                aria-busy={quota.isFetching}
+                onClick={() => void quota.refetch()}
+              />
             </span>
-          )}
+            {/*
+              The way to the other host. Not a pin any more: a pin reads as "keep this here", and
+              the two moves are out into a window of its own and back into the app.
+            */}
+            {onMove !== undefined &&
+              (host === "contained" ? (
+                <IconButton
+                  label="Keep the notch in front of every window"
+                  icon={PictureInPicture2}
+                  onClick={onMove}
+                />
+              ) : (
+                <IconButton label="Put the notch back inside NucleOS" icon={AppWindow} onClick={onMove} />
+              ))}
+          </span>
         </span>
       </div>
       {/*
@@ -428,37 +508,38 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
         window, fitted to the drawing's measured box, has room for them.
       */}
       {/*
-        The rail is also the handle: pressed and moved up or down, it carries the notch along the
-        edge (`notch-place.ts` keeps where it was left). A press that moves less than `DRAG_SLOP`
-        is not a drag, so a click on a ring stays a click. Measured in SCREEN pixels against the
-        screen's work area, because in the floating host the window moves under the pointer on every
-        step — `clientY` would be measured from a window that is itself on the move — and because the
-        fraction it produces is a fraction of that same work area. Pointer capture keeps the moves
-        coming when the pointer outruns the notch. A double click puts it back in the middle.
+        The rail is also the handle: pressed and moved, it carries the notch along its edge, or to
+        whichever edge of the screen the pointer takes it nearest (`follow`; `notch-place.ts` keeps
+        where it was left). A press that moves less than `DRAG_SLOP` is not a drag, so a click on a
+        ring stays a click. Measured in SCREEN pixels against the screen's work area, because in the
+        floating host the window moves under the pointer on every step — `clientY` would be measured
+        from a window that is itself on the move — and because the fraction it produces is a
+        fraction of that same work area. Pointer capture keeps the moves coming when the pointer
+        outruns the notch. A double click puts it back in the middle of the edge it is on.
       */}
       <div
         className="quota-notch-rail"
         ref={rail}
-        data-draggable={onAlong !== undefined && along !== undefined}
+        data-draggable={onPlace !== undefined && place !== undefined}
         data-dragging={dragging}
         onPointerDown={(event) => {
-          if (onAlong === undefined || along === undefined || event.button !== 0) return;
-          drag.current = { from: event.screenY, start: along, moved: false };
+          if (onPlace === undefined || place === undefined || event.button !== 0) return;
+          drag.current = { x: event.screenX, y: event.screenY, start: place, edge: place.edge, moved: false };
           event.currentTarget.setPointerCapture?.(event.pointerId);
         }}
         onPointerMove={(event) => {
           const current = drag.current;
           if (current === null) return;
-          const moved = event.screenY - current.from;
           if (!current.moved) {
-            if (Math.abs(moved) < DRAG_SLOP) return;
+            const moved = Math.hypot(event.screenX - current.x, event.screenY - current.y);
+            if (moved < DRAG_SLOP) return;
             current.moved = true;
             setDragging(true);
             // The bubble goes at once rather than playing out: it points at a ring that is leaving.
             window.clearTimeout(timer.current);
             setPhase("folded");
           }
-          carry(current.start + moved / screenSpan());
+          carry(follow(current, event.screenX, event.screenY));
         }}
         onPointerUp={(event) => {
           const current = drag.current;
@@ -468,7 +549,7 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
           }
           if (current === null || !current.moved) return;
           setDragging(false);
-          drop(current.start + (event.screenY - current.from) / screenSpan());
+          drop(follow(current, event.screenX, event.screenY));
         }}
         onPointerCancel={() => {
           const current = drag.current;
@@ -477,10 +558,10 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
           // Cancelled by the system mid-drag: the notch stays where it was carried to, and that is
           // what is remembered — the last position it was actually drawn at.
           setDragging(false);
-          if (pending.current !== null) drop(pending.current.along);
-          else if (along !== undefined) drop(along);
+          if (pending.current !== null) drop(pending.current.place);
+          else if (place !== undefined) drop(place);
         }}
-        onDoubleClick={() => onAlong?.(MIDDLE, true)}
+        onDoubleClick={() => onPlace?.({ edge, along: MIDDLE }, true)}
       >
         <span className="quota-notch-flare quota-notch-flare-top" aria-hidden="true" />
         <div className="quota-notch-body">
@@ -496,10 +577,16 @@ export function QuotaNotch({ host = "contained", onMove, line, along, onAlong }:
                 title={titleOf(provider)}
                 onPointerEnter={() => setActive(index)}
               >
+                {/*
+                  Smaller than `Ring`'s default, on the owner's call: the notch was taking more of
+                  the edge than its reading is worth. At 38 the hole is 16px, so the mark drops to
+                  12 to keep air round it. `RING_SIZE` drives the rail's width in `app.css`.
+                */}
                 <Ring
                   label={provider.provider}
                   tracks={tracks}
-                  mark={<ProviderMark provider={provider.provider} />}
+                  size={RING_SIZE}
+                  mark={<ProviderMark provider={provider.provider} size={12} />}
                 />
                 {/*
                   The one figure the notch says at rest: the window with least left in it, named. A

@@ -103,6 +103,20 @@ describe("useScreenLine", () => {
     expect(tauri.currentMonitor.mock.calls.length).toBe(asked);
   });
 
+  /**
+   * On the top or bottom edge the line is a column: `along` of the way across the work area,
+   * measured from where this page starts on the left. A window 160 physical pixels in from the left
+   * sees the middle of 1920 at 960 - 160 = 800 physical pixels, 640 CSS pixels at 125%.
+   */
+  it("answers a column of the screen for a notch on the top or bottom edge", async () => {
+    tauri.currentMonitor.mockResolvedValue(monitor());
+    tauri.innerPosition.mockResolvedValue({ x: 160, y: 60 });
+    tauri.scaleFactor.mockResolvedValue(1.25);
+
+    const { result } = renderHook(() => useScreenLine(true, 0.5, "top"));
+    await waitFor(() => expect(result.current).toBe(640));
+  });
+
   /** With the notch floating there is nothing in this window to hang, so nothing is asked. */
   it("asks nothing while the notch is not contained", () => {
     const { result } = renderHook(() => useScreenLine(false));

@@ -17,7 +17,7 @@ import { PaletteTrigger } from "./PaletteTrigger";
 import { QuotaNotch } from "./QuotaNotch";
 import { useNotchMode, useSetNotchMode } from "./notch-mode";
 import { useScreenLine } from "./screen-line";
-import { useNotchAlong } from "./notch-place";
+import { useNotchPlace } from "./notch-place";
 import { Sidebar } from "./Sidebar";
 import { NAV_ITEMS } from "./nav";
 
@@ -200,17 +200,18 @@ function Frame() {
 function ContainedNotch() {
   const mode = useNotchMode();
   const setMode = useSetNotchMode();
-  // Where along the edge the owner dragged it, shared with the floating window through storage.
-  const [along, moveAlong] = useNotchAlong();
-  // The line the floating notch hangs from, so docking it here does not move it up or down.
-  const line = useScreenLine(mode === "contained", along);
+  // Which edge and where along it the owner dragged it, shared with the floating window through
+  // storage.
+  const [place, movePlace] = useNotchPlace();
+  // The line the floating notch hangs from, so docking it here does not move it along its edge.
+  const line = useScreenLine(mode === "contained", place.along, place.edge);
   if (mode !== "contained") return null;
   return (
     <QuotaNotch
       host="contained"
       line={line}
-      along={along}
-      onAlong={moveAlong}
+      place={place}
+      onPlace={movePlace}
       onMove={() => void setMode("global").catch(() => {})}
     />
   );

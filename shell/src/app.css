@@ -73,25 +73,39 @@
   --quota-notch-ground: var(--surface-sunken);
   /* The concave flare where each end of the rail meets the edge, and the convex corner it turns
      through on its way to the rail's long side. Together they are the S the reference draws, and
-     they are an S only while the two radii add up to the rail's width (68px, see
+     they are an S only while the two radii add up to the rail's width (62px, see
      `.app-main-notched`): any less leaves a flat step between the curves, which is what the first
      photograph of this shape had. Local rather than tokens because they are only right at this
      size. */
-  --quota-notch-flare: 34px;
-  --quota-notch-curve: 34px;
+  --quota-notch-flare: 31px;
+  --quota-notch-curve: 31px;
   z-index: 1;
   width: fit-content;
   display: flex;
-  /* The bubble and the rail both hang from the top of the drawing: the bubble's own offset is
+  /* The bubble and the rail both hang from the start of the drawing: the bubble's own offset is
      what lines its tail up with a ring (`QuotaNotch`, `aim`). */
   align-items: flex-start;
+}
+
+/* The bubble always opens away from the edge the rail hangs from. The DOM is bubble-then-rail, which
+   is the right edge's order; every other edge turns it round. */
+.quota-notch[data-edge="left"] {
+  flex-direction: row-reverse;
+}
+
+.quota-notch[data-edge="top"] {
+  flex-direction: column-reverse;
+}
+
+.quota-notch[data-edge="bottom"] {
+  flex-direction: column;
 }
 
 /**
  * The width the page gives back so the folded notch stands beside it rather than on top of it.
  *
  * Measured off the drawing rather than derived from it, because the drawing's width comes from its
- * content and CSS cannot ask: a 44px ring and `--space-3` of padding either side — 68px, rounded
+ * content and CSS cannot ask: a 38px ring and `--space-3` of padding either side — 62px, rounded
  * up to a whole rem with the slack `Ring`'s own arithmetic leaves. The rail never widens, so this
  * is also its width unfolded; the bubble covers the page for as long as somebody is reading it,
  * which is the right trade against a page that reflowed every time the pointer crossed the notch.
@@ -102,7 +116,7 @@
  * sideways the moment the notch floated out or docked back.
  */
 .app-main-notched {
-  padding-right: 5rem;
+  padding-right: 4.5rem;
 }
 
 /*
@@ -124,6 +138,21 @@
 }
 
 /* The rail is the notch's handle (`QuotaNotch`, the drag); the cursor is how that is found out. */
+/* Flush with the edge it hangs from, whichever that is; side by side on the top and bottom. */
+.quota-notch[data-edge="left"] .quota-notch-rail {
+  align-items: flex-start;
+}
+
+.quota-notch[data-edge="top"] .quota-notch-rail,
+.quota-notch[data-edge="bottom"] .quota-notch-rail {
+  flex-direction: row;
+  align-items: flex-start;
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-rail {
+  align-items: flex-end;
+}
+
 .quota-notch-rail[data-draggable="true"] {
   cursor: grab;
 }
@@ -160,6 +189,57 @@
   );
 }
 
+/* The same two flares on every other edge: the hollow is always centred on the corner away from
+   the edge and away from the body. `top`/`bottom` in the class names are the rail's start and end,
+   which on a top or bottom edge are its left and right. */
+.quota-notch[data-edge="left"] .quota-notch-flare-top {
+  background: radial-gradient(
+    circle at 100% 0,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+.quota-notch[data-edge="left"] .quota-notch-flare-bottom {
+  background: radial-gradient(
+    circle at 100% 100%,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+.quota-notch[data-edge="top"] .quota-notch-flare-top {
+  background: radial-gradient(
+    circle at 0 100%,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+.quota-notch[data-edge="top"] .quota-notch-flare-bottom {
+  background: radial-gradient(
+    circle at 100% 100%,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-flare-top {
+  background: radial-gradient(
+    circle at 0 0,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-flare-bottom {
+  background: radial-gradient(
+    circle at 100% 0,
+    transparent calc(var(--quota-notch-flare) - 0.5px),
+    var(--quota-notch-ground) var(--quota-notch-flare)
+  );
+}
+
 /* Round on the left, square against the edge and against both flares, which carry the outline on
    from its corners to the edge. */
 .quota-notch-body {
@@ -168,12 +248,31 @@
   align-items: center;
   /* Between two providers. A slot is two lines — the ring and its figure — so this has to beat the
      distance inside one, or the eye pairs each figure with the ring below it. */
-  gap: var(--space-5);
-  /* `--space-3` above and below, not less: at a 34px corner the curve is still 8px in from the
+  gap: var(--space-4);
+  /* `--space-3` above and below, not less: at a 31px corner the curve is still 8px in from the
      rail's side at that depth, which is what clears the first and last ring. */
   padding: var(--space-3);
   background: var(--quota-notch-ground);
   border-radius: var(--quota-notch-curve) 0 0 var(--quota-notch-curve);
+}
+
+/* Round on the side away from the edge, whichever edge that is; side by side on the top and
+   bottom, where the edge runs across. */
+.quota-notch[data-edge="left"] .quota-notch-body {
+  border-radius: 0 var(--quota-notch-curve) var(--quota-notch-curve) 0;
+}
+
+.quota-notch[data-edge="top"] .quota-notch-body,
+.quota-notch[data-edge="bottom"] .quota-notch-body {
+  flex-direction: row;
+}
+
+.quota-notch[data-edge="top"] .quota-notch-body {
+  border-radius: 0 0 var(--quota-notch-curve) var(--quota-notch-curve);
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-body {
+  border-radius: var(--quota-notch-curve) var(--quota-notch-curve) 0 0;
 }
 
 /*
@@ -253,6 +352,45 @@
   );
 }
 
+/* The other edges. Left is the window's left edge, over the rail of destinations: the notch is about
+   the screen, and the left edge of the screen is where the owner put it. On the top and bottom the
+   same clamp runs across the window instead of down it, and `--quota-notch-rest` is the folded
+   drawing's width (`QuotaNotch`). */
+.quota-notch-contained[data-edge="left"] {
+  right: auto;
+  left: 0;
+}
+
+.quota-notch-contained[data-edge="top"],
+.quota-notch-contained[data-edge="bottom"] {
+  right: auto;
+  left: clamp(
+    0px,
+    calc(var(--quota-notch-along, 0.5) * 100% - var(--quota-notch-rest, 0px) / 2),
+    calc(100% - var(--quota-notch-rest, 0px))
+  );
+}
+
+.quota-notch-contained[data-anchored="true"][data-edge="top"],
+.quota-notch-contained[data-anchored="true"][data-edge="bottom"] {
+  left: clamp(
+    0px,
+    calc(var(--quota-notch-line) - var(--quota-notch-rest, 0px) / 2),
+    calc(100% - var(--quota-notch-rest, 0px))
+  );
+}
+
+.quota-notch-contained[data-edge="top"],
+.quota-notch-contained[data-anchored="true"][data-edge="top"] {
+  top: 0;
+}
+
+.quota-notch-contained[data-edge="bottom"],
+.quota-notch-contained[data-anchored="true"][data-edge="bottom"] {
+  top: auto;
+  bottom: 0;
+}
+
 /* One provider on the rail: its ring, and the figure it adds up to. Centred on each other, so the
    percentage sits under the middle of the arcs whatever it is wide. */
 .quota-notch-slot {
@@ -281,7 +419,9 @@
 
 .quota-notch-headline-percent {
   font-family: var(--font-display);
-  font-size: var(--text-md);
+  /* `--text-sm`, down from `--text-md` on the owner's call: at the larger size the figure was the
+     widest thing on the rail and set its width, not the ring. */
+  font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   color: var(--text);
 }
@@ -306,7 +446,7 @@
  *
  * **Beside the rail, never inside it.** It is a flex item to the left of the rail, so the drawing
  * grows leftwards and the rail — rings, flares and all — stays exactly where it was. Its top is
- * pushed down by `--quota-notch-pop-top`, which `QuotaNotch` measures so the tail lands on the
+ * pushed along the edge by `--quota-notch-pop-at`, which `QuotaNotch` measures so the tail lands on the
  * middle of the ring the bubble is about.
  *
  * **Sized, not fitted.** `min-width`, because what is inside is mostly bars, and a bar takes its
@@ -317,8 +457,10 @@
  */
 .quota-notch-pop {
   position: relative;
-  margin-top: var(--quota-notch-pop-top, 0px);
+  margin-top: var(--quota-notch-pop-at, 0px);
   margin-right: var(--space-3);
+  /* Where the bubble arrives from: the rail, so towards the edge it hangs from. */
+  --quota-notch-from: translateX(4px);
   min-width: 15rem;
   padding: var(--space-3) var(--space-4) var(--space-3);
   background: var(--quota-notch-ground);
@@ -340,10 +482,34 @@
   animation: quota-notch-unfold var(--dur-quick) var(--ease);
 }
 
+/* Away from whichever edge the rail hangs from, and pushed along that edge. */
+.quota-notch[data-edge="left"] .quota-notch-pop {
+  margin-right: 0;
+  margin-left: var(--space-3);
+  --quota-notch-from: translateX(-4px);
+}
+
+.quota-notch[data-edge="top"] .quota-notch-pop,
+.quota-notch[data-edge="bottom"] .quota-notch-pop {
+  margin-top: 0;
+  margin-right: 0;
+  margin-left: var(--quota-notch-pop-at, 0px);
+}
+
+.quota-notch[data-edge="top"] .quota-notch-pop {
+  margin-top: var(--space-3);
+  --quota-notch-from: translateY(-4px);
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-pop {
+  margin-bottom: var(--space-3);
+  --quota-notch-from: translateY(4px);
+}
+
 @keyframes quota-notch-unfold {
   from {
     opacity: 0;
-    transform: translateX(4px);
+    transform: var(--quota-notch-from);
   }
 }
 
@@ -353,7 +519,7 @@
 @keyframes quota-notch-fold {
   to {
     opacity: 0;
-    transform: translateX(4px);
+    transform: var(--quota-notch-from);
   }
 }
 
@@ -364,12 +530,12 @@
 /*
   The tail: a square turned an eighth, with only the two edges that end up facing the ring carrying
   the hairline, so the seam with the bubble is invisible and the outline runs unbroken round both.
-  Its middle is `--quota-notch-tail-top` from the bubble's top edge — the ring's centre, measured.
+  Its middle is `--quota-notch-tail-at` from the bubble's start — the ring's centre, measured.
 */
 .quota-notch-pop::after {
   content: "";
   position: absolute;
-  top: calc(var(--quota-notch-tail-top, 26px) - 7px);
+  top: calc(var(--quota-notch-tail-at, 26px) - 7px);
   right: -8px;
   width: 14px;
   height: 14px;
@@ -378,6 +544,39 @@
   border-right: 1px solid var(--border);
   border-top-right-radius: var(--radius-sm);
   transform: rotate(45deg);
+}
+
+/* The tail on the other edges: on the bubble's side facing the rail, with the two edges that end up
+   facing the ring carrying the hairline. */
+.quota-notch[data-edge="left"] .quota-notch-pop::after {
+  right: auto;
+  left: -8px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+  border-radius: 0 0 0 var(--radius-sm);
+}
+
+.quota-notch[data-edge="top"] .quota-notch-pop::after,
+.quota-notch[data-edge="bottom"] .quota-notch-pop::after {
+  right: auto;
+  left: calc(var(--quota-notch-tail-at, 26px) - 7px);
+  border: 0;
+}
+
+.quota-notch[data-edge="top"] .quota-notch-pop::after {
+  top: -8px;
+  border-top: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+  border-radius: var(--radius-sm) 0 0 0;
+}
+
+.quota-notch[data-edge="bottom"] .quota-notch-pop::after {
+  top: auto;
+  bottom: -8px;
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  border-radius: 0 0 var(--radius-sm) 0;
 }
 
 /* The reading, in the face a person reads: names and phrases in the body face, figures in the
@@ -545,7 +744,24 @@
    `.sr-only` bubble, reachable by focus and drawn nowhere (`QuotaNotch.tsx`). */
 .quota-notch-control {
   display: flex;
+  gap: var(--space-1);
   margin-left: auto;
+}
+
+/* The update control's glyph turns while a reading is on its way. Under reduced motion the global
+   guard in `base.css` stops it, and `aria-busy` still says the same thing. */
+.quota-notch-update {
+  display: flex;
+}
+
+.quota-notch-update[data-busy="true"] .ui-icon-button-glyph {
+  animation: quota-notch-turn 0.9s linear infinite;
+}
+
+@keyframes quota-notch-turn {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /**

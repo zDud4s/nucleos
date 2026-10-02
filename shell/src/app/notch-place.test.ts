@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { act, renderHook } from "@testing-library/react";
-import { clampAlong, MIDDLE, readAlong, useNotchAlong, writeAlong } from "./notch-place";
+import { clampAlong, MIDDLE, readAlong, readEdge, useNotchPlace, writeAlong } from "./notch-place";
 
 const KEY = "nucleos.notch-along";
 
-afterEach(() => window.localStorage.removeItem(KEY));
+afterEach(() => {
+  window.localStorage.removeItem(KEY);
+  window.localStorage.removeItem("nucleos.notch-edge");
+});
 
 describe("notch-place", () => {
   /** Nobody has moved it: the middle of the edge, where the notch hung before this existed. */
@@ -32,14 +35,23 @@ describe("notch-place", () => {
    * the drop is what the next launch finds.
    */
   it("remembers the drop, and not the steps of the drag", () => {
-    const { result } = renderHook(() => useNotchAlong());
-    act(() => result.current[1](0.2, false));
-    expect(result.current[0]).toBe(0.2);
+    const { result } = renderHook(() => useNotchPlace());
+    act(() => result.current[1]({ edge: "right", along: 0.2 }, false));
+    expect(result.current[0]).toEqual({ edge: "right", along: 0.2 });
     expect(window.localStorage.getItem(KEY)).toBeNull();
 
-    act(() => result.current[1](0.7, true));
-    expect(result.current[0]).toBe(0.7);
+    act(() => result.current[1]({ edge: "top", along: 0.7 }, true));
+    expect(result.current[0]).toEqual({ edge: "top", along: 0.7 });
     expect(window.localStorage.getItem(KEY)).toBe("0.7");
+    expect(readEdge()).toBe("top");
+  });
+
+  /** An edge somebody typed into storage by hand is checked like the fraction: anything else is the right. */
+  it("reads an unknown edge as the right one", () => {
+    window.localStorage.setItem("nucleos.notch-edge", "diagonal");
+    expect(readEdge()).toBe("right");
+    window.localStorage.setItem("nucleos.notch-edge", "bottom");
+    expect(readEdge()).toBe("bottom");
   });
 
   /**
@@ -47,11 +59,12 @@ describe("notch-place", () => {
    * because the main window was listening to the storage the floating one wrote.
    */
   it("follows a position written by the other window", () => {
-    const { result } = renderHook(() => useNotchAlong());
+    const { result } = renderHook(() => useNotchPlace());
     act(() => {
       window.localStorage.setItem(KEY, "0.8");
+      window.localStorage.setItem("nucleos.notch-edge", "left");
       window.dispatchEvent(new StorageEvent("storage", { key: KEY }));
     });
-    expect(result.current[0]).toBe(0.8);
+    expect(result.current[0]).toEqual({ edge: "left", along: 0.8 });
   });
 });
