@@ -109,6 +109,18 @@ pub fn read(command: &str, shell: Shell) -> Reading<'_> {
         };
     }
 
+    // PowerShell evaluates a parenthesised expression in argument position before the command it
+    // sits in: `echo (Remove-Item -Recurse -Force $HOME)` is a delete, spelled as an `echo`. It is
+    // `$(...)` without the `$`, so it is refused for the same reason. Read outside quotes, because
+    // `'(x)'` and `"(x)"` are literal text; an unterminated quote cannot be proved either way and is
+    // refused with it. POSIX keeps its parens: there `(` opens a subshell only in command position,
+    // and `find . \( -name a \)` is one command the classifier must keep whole.
+    if shell == Shell::PowerShell
+        && without_quoted_text(command).is_none_or(|masked| masked.contains(['(', ')']))
+    {
+        return Reading::Unreadable("a PowerShell parenthesis runs a nested pipeline");
+    }
+
     let policy = Policy {
         parens: false,
         lone_ampersand_refuses: true,
@@ -380,13 +392,52 @@ fn assigns_a_loader_variable(command: &str) -> Option<&'static str> {
         "bash_env",
         "env",
         "ifs",
+        // git runs each of these as a program: a diff driver, the ssh transport, a pager, an
+        // editor, a credential prompt. `GIT_EXEC_PATH` decides where every `git-<sub>` resolves.
+        "git_external_diff",
+        "git_ssh",
+        "git_ssh_command",
+        "git_pager",
+        "pager",
+        "git_editor",
+        "git_sequence_editor",
+        "editor",
+        "visual",
+        "git_askpass",
+        "ssh_askpass",
+        "git_exec_path",
+        "git_proxy_command",
+        // `GIT_CONFIG_PARAMETERS` and the `GIT_CONFIG_COUNT`/`_KEY_<n>`/`_VALUE_<n>` family inject
+        // configuration, and configuration names programs: `core.pager`, `diff.external`,
+        // `core.fsmonitor`, an alias starting with `!`.
+        "git_config_parameters",
+        "git_config_count",
+        // cargo puts these in front of, or in place of, every rustc it runs.
+        "rustc",
+        "rustdoc",
+        "rustc_wrapper",
+        "rustc_workspace_wrapper",
+        "cargo_build_rustc",
+        "cargo_build_rustdoc",
+        "cargo_build_rustc_wrapper",
+        "cargo_build_rustc_workspace_wrapper",
     ];
+    // Names that are a family rather than one variable: the index is the caller's to choose.
+    const LOADER_PREFIXES: &[&str] = &["git_config_key_", "git_config_value_"];
     command.split_whitespace().find_map(|token| {
         let (name, _) = token.split_once('=')?;
         let name = name.trim_start_matches('$').to_ascii_lowercase();
+        // PowerShell spells an environment assignment `$env:NAME=...`; without this the `env:`
+        // prefix made every name above unrecognisable to the list.
+        let name = name.strip_prefix("env:").unwrap_or(&name);
         LOADER_VARIABLES
             .iter()
-            .find(|known| ***known == name)
+            .find(|known| **known == name)
+            .or_else(|| {
+                LOADER_PREFIXES
+                    .iter()
+                    .find(|prefix| name.starts_with(**prefix))
+            })
             .copied()
     })
 }
@@ -541,6 +592,65 @@ mod tests {
                 "{command} should not be readable"
             );
         }
+    }
+
+    /// The same refusal for the variables that name a program git or cargo will run, which the
+    /// first list did not know: `GIT_SSH_COMMAND=./x git fetch` runs `./x`, and so does a
+    /// `GIT_CONFIG_KEY_0=core.pager` with its value. PowerShell's `$env:` spelling counts too.
+    #[test]
+    fn an_assignment_that_names_a_program_git_or_cargo_runs_is_refused() {
+        for command in [
+            "GIT_SSH_COMMAND=./x git fetch",
+            "GIT_EXTERNAL_DIFF=./x git diff",
+            "GIT_PAGER=./x git log",
+            "PAGER=./x git log",
+            "GIT_EDITOR=./x git commit",
+            "EDITOR=./x git commit",
+            "VISUAL=./x git commit",
+            "GIT_CONFIG_COUNT=1 git log",
+            "GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=./x git log",
+            "GIT_CONFIG_VALUE_3=./x git diff",
+            "GIT_CONFIG_PARAMETERS='core.pager=./x' git log",
+            "RUSTC_WRAPPER=./x cargo build",
+            "RUSTC_WORKSPACE_WRAPPER=./x cargo build",
+            "CARGO_BUILD_RUSTC_WRAPPER=./x cargo build",
+            "export GIT_SSH=./x",
+        ] {
+            assert!(
+                matches!(posix(command), Reading::Unreadable(_)),
+                "{command} should not be readable"
+            );
+        }
+        assert!(matches!(
+            read("$env:GIT_SSH_COMMAND='./x'; git fetch", Shell::PowerShell),
+            Reading::Unreadable(_)
+        ));
+    }
+
+    /// `echo (Remove-Item -Recurse -Force $HOME)` runs the delete first and echoes what it
+    /// returned; the parenthesis is PowerShell's `$(...)` without the `$`. Quoted, it is text.
+    #[test]
+    fn a_powershell_parenthesis_is_a_nested_command_and_is_refused() {
+        for command in [
+            "echo (Remove-Item -Recurse -Force $HOME)",
+            "Write-Output (Get-Content x)",
+            "echo @(rm x)",
+            "echo \"unterminated (",
+        ] {
+            assert!(
+                matches!(read(command, Shell::PowerShell), Reading::Unreadable(_)),
+                "{command} should not be readable"
+            );
+        }
+        assert!(matches!(
+            read("echo '(not a command)' \"(nor this)\"", Shell::PowerShell),
+            Reading::Sequence(_)
+        ));
+        // POSIX keeps its reading: a `find` expression is one command there.
+        assert!(matches!(
+            posix(r"find . \( -name a -o -name b \)"),
+            Reading::Sequence(_)
+        ));
     }
 
     /// The other half of the same decision, and it is what keeps the check from closing the door
