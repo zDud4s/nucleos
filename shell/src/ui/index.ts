@@ -25,6 +25,7 @@ export { Inset, type InsetAs, type InsetProps } from "./Inset";
  */
 export { LimitChip, Meter, usd, type LimitChipProps, type MeterProps, type MeterTone } from "./Meter";
 export { Modal, type ModalProps, type ModalSize } from "./Modal";
+export { TimeField, type TimeFieldProps } from "./TimeField";
 export { ModeSwitch, type ModeSwitchProps, type SwitchMode } from "./ModeSwitch";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
 /**

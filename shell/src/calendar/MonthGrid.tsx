@@ -77,6 +77,13 @@ export interface MonthGridProps {
   config: CalendarConfigView | undefined;
   selected: Slot;
   onSelect: (slot: Slot) => void;
+  /**
+   * A click (or Enter) on a day or an hour — the gesture that opens the day sheet.
+   * Called after `onSelect`. Kept apart from it because the arrow keys select too,
+   * and a sheet that opened on every arrow press would take the grid away from the
+   * keyboard one key at a time.
+   */
+  onOpen?: (slot: Slot) => void;
   drag: DragHandlers;
 }
 
@@ -100,8 +107,13 @@ export function MonthGrid({
   config,
   selected,
   onSelect,
+  onOpen,
   drag,
 }: MonthGridProps) {
+  const choose = (slot: Slot) => {
+    onSelect(slot);
+    onOpen?.(slot);
+  };
   const weeks = monthMatrix(anchor);
   const days = weeks.flat();
   const byDay = groupByLocalDay(occurrences);
@@ -184,7 +196,7 @@ export function MonthGrid({
                 now={now}
                 working={isWorkingDay(day, config)}
                 selected={sameDay(day, selected.day)}
-                onSelect={onSelect}
+                onSelect={choose}
                 drag={drag}
                 maxChips={maxChips}
               />

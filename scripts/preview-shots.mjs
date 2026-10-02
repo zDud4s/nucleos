@@ -377,6 +377,9 @@ console.log("\npreview: " + origin + "\n");
 const SHOTS_TO_TAKE = [
   ["01-console-dark", { path: "/teams" }],
   ["02-console-light", { path: "/teams", theme: "light" }],
+  /* The create form, opened as a dialog over the console rather than pushed in above it. */
+  ["02a-console-new-team", { path: "/teams", press: "New team" }],
+  ["02b-console-new-team-light", { path: "/teams", press: "New team", theme: "light" }],
   ["03-bench-work", { path: "/teams/financas" }],
   ["04-bench-decisions", { path: "/teams/financas", tab: "Decisions" }],
   ["05-bench-routines", { path: "/teams/financas", tab: "Routines" }],
@@ -520,6 +523,15 @@ const SHOTS_TO_TAKE = [
   ["55a-calendar-month-laptop", { path: "/calendar?on=2026-08-24", viewport: { width: 1256, height: 760 } }],
   ["55b-calendar-week-laptop", { path: "/calendar?view=week&on=2026-08-25", viewport: { width: 1256, height: 760 } }],
   ["55-calendar-empty", { path: "/calendar?on=2027-02-15" }],
+  /* The day sheet, open over the month: Wednesday the 26th is the busiest day in the fixture —
+     five occurrences, so the sheet has to scroll its list and keep the draft reachable. The cell's
+     visible text starts with its date, which is what the press matches. */
+  ["55c-calendar-day-sheet", { path: "/calendar?on=2026-08-26", press: "26" }],
+  ["55d-calendar-day-sheet-light", { path: "/calendar?on=2026-08-26", press: "26", theme: "light" }],
+  /* One line opened onto its controls, and the draft's time wheels open. */
+  ["55e-calendar-day-sheet-row", { path: "/calendar?on=2026-08-26", press: "26|10:00" }],
+  ["55f-calendar-day-sheet-time", { path: "/calendar?on=2026-08-26", press: "26|09:00" }],
+  ["55g-calendar-day-sheet-time-light", { path: "/calendar?on=2026-08-26", press: "26|09:00", theme: "light" }],
   ["56-calendar-empty-light", { path: "/calendar?on=2027-02-15", theme: "light" }],
   /* Mid-drag, which is the only state where the drop targets exist at all —
      and the one thing about dragging no test can judge: whether the dashed

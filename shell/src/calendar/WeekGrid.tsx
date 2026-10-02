@@ -61,6 +61,13 @@ export interface WeekGridProps {
   config: CalendarConfigView | undefined;
   selected: Slot;
   onSelect: (slot: Slot) => void;
+  /**
+   * A click (or Enter) on a day or an hour — the gesture that opens the day sheet.
+   * Called after `onSelect`. The week has no arrow keys, so here the two always
+   * travel together; the split is the month grid's, kept the same shape so the
+   * page passes both grids the same props.
+   */
+  onOpen?: (slot: Slot) => void;
   drag: DragHandlers;
 }
 
@@ -71,8 +78,13 @@ export function WeekGrid({
   config,
   selected,
   onSelect,
+  onOpen,
   drag,
 }: WeekGridProps) {
+  const choose = (slot: Slot) => {
+    onSelect(slot);
+    onOpen?.(slot);
+  };
   const days = weekOf(anchor);
   const bodyRef = useRef<HTMLDivElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -102,7 +114,7 @@ export function WeekGrid({
             now={now}
             working={isWorkingDay(day, config)}
             selected={sameDay(day, selected.day)}
-            onSelect={onSelect}
+            onSelect={choose}
           />
         ))}
       </div>
@@ -129,7 +141,7 @@ export function WeekGrid({
               now={now}
               config={config}
               selected={selected}
-              onSelect={onSelect}
+              onSelect={choose}
               drag={drag}
             />
           ))}

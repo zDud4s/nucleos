@@ -1116,6 +1116,31 @@
   font-family: var(--font-mono);
 }
 
+/* A single-choice select dressed like `.teams-input` beside it. Without this it kept the
+   UA's light, text-sized control in the middle of a dark form — the Director and every
+   grant row. `color-scheme` themes the popup list and the arrow the browser draws. */
+.teams-select:not([multiple]) {
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-size: var(--text-sm);
+  text-transform: none;
+  letter-spacing: normal;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .teams-select:not([multiple]) {
+    color-scheme: light;
+  }
+}
+
+:root[data-theme="light"] .teams-select:not([multiple]) {
+  color-scheme: light;
+}
+
 .teams-act-payload {
   display: flex;
   flex-direction: column;
@@ -1381,4 +1406,33 @@
   fill: var(--text-muted);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+}
+
+/* ====================================================== charter in a dialog == */
+
+/* The Modal body scrolls and its footer holds the submit, so nothing here needs room for a bar. */
+.teams-charter-dialog {
+  gap: var(--space-5);
+  padding-bottom: 0;
+}
+
+/* A plain headed group where the Charter tab has a Panel; a hairline, not a card, between them. */
+.teams-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.teams-group:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.teams-group-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text);
 }

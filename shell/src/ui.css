@@ -2583,6 +2583,168 @@ ol.ui-well {
   }
 }
 
+/* ------------------------------------------------------------ time field -- */
+
+/* Closed, it is a field: the sunken ground and border a place you type into wears,
+   level with a `Button` beside it. */
+.ui-time-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0.34rem var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: 1.4;
+  cursor: pointer;
+  transition: border-color var(--dur-quick) var(--ease);
+}
+
+.ui-time-trigger:hover,
+.ui-time-trigger[data-state="open"] {
+  border-color: var(--border-strong);
+}
+
+.ui-time-trigger:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.ui-time-glyph {
+  width: 0.875rem;
+  height: 0.875rem;
+  color: var(--text-muted);
+}
+
+.ui-time-value {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.ui-time-popover {
+  z-index: var(--z-top);
+  padding: var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-md);
+  outline: none;
+}
+
+.ui-time-popover[data-state="open"] {
+  animation: ui-modal-fade var(--dur-quick) var(--ease);
+}
+
+/*
+  Two wheels and the colon between them. The band across the middle is the
+  centre line the columns snap a row to — drawn once, behind both, so the pair
+  reads as one time rather than two lists.
+*/
+.ui-time-columns {
+  --ui-time-row: 2rem;
+  --ui-time-rows: 5;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.ui-time-columns::before {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  top: 50%;
+  height: var(--ui-time-row);
+  translate: 0 -50%;
+  border-radius: var(--radius-sm);
+  /* Mixed from the ink, not a surface rung: in light the popover and the surface are
+     the same white, and a rung-coloured band vanished. */
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+  pointer-events: none;
+}
+
+.ui-time-column {
+  position: relative;
+  width: 3.5rem;
+  height: calc(var(--ui-time-row) * var(--ui-time-rows));
+  overflow-y: auto;
+  /* Room above the first row and below the last, so 00 and 23 can reach the centre line too. */
+  padding-block: calc(var(--ui-time-row) * (var(--ui-time-rows) - 1) / 2);
+  scroll-snap-type: y mandatory;
+  scrollbar-width: none;
+  border-radius: var(--radius-sm);
+  outline: none;
+  /* The rows fade toward the edges: the wheel turns away from you. */
+  mask-image: linear-gradient(to bottom, transparent, #000 35%, #000 65%, transparent);
+}
+
+.ui-time-column::-webkit-scrollbar {
+  display: none;
+}
+
+/* The ring goes on the band, not the column edge: the mask would fade an outline on
+   the column itself to nothing at the top and bottom. */
+.ui-time-column:focus-visible {
+  outline: none;
+}
+
+.ui-time-column:focus-visible .ui-time-cell[aria-selected="true"] {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+  border-radius: var(--radius-sm);
+}
+
+.ui-time-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--ui-time-row);
+  scroll-snap-align: center;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  user-select: none;
+  transition: color var(--dur-quick) var(--ease);
+}
+
+.ui-time-cell:hover {
+  color: var(--text);
+}
+
+/* Outside the span that matters: quieter, still pickable. */
+.ui-time-cell-outside {
+  color: var(--text-faint);
+}
+
+/* The chosen row sits on the band: full ink and weight, not a hue. */
+.ui-time-cell[aria-selected="true"] {
+  color: var(--text);
+  font-weight: var(--weight-semibold);
+}
+
+.ui-time-colon {
+  position: relative;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-time-trigger {
+    transition: none;
+  }
+
+  .ui-time-popover[data-state="open"],
+  .ui-time-cell {
+    animation: none;
+    transition: none;
+  }
+}
+
 /* ------------------------------------------------------------- run pipe -- */
 
 /**
