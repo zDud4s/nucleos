@@ -4,12 +4,14 @@ package fence
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -410,5 +412,115 @@ func TestARefusalReachesTheObserver(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the refusal never reached the observer, so no act could report it")
+	}
+}
+
+// fakeResolver answers every name from a table, the way an attacker's DNS would, and counts the
+// questions so a test can tell a vetted address from a second lookup.
+type fakeResolver struct {
+	answers map[string][]string
+	asked   int
+}
+
+func (f *fakeResolver) LookupIPAddr(_ context.Context, host string) ([]net.IPAddr, error) {
+	f.asked++
+	raw, ok := f.answers[host]
+	if !ok {
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+	out := make([]net.IPAddr, 0, len(raw))
+	for _, one := range raw {
+		out = append(out, net.IPAddr{IP: net.ParseIP(one)})
+	}
+	return out, nil
+}
+
+// TestANameThatResolvesToLoopbackIsRefused is the case the name check could not see:
+// `127.0.0.1.nip.io` is not spelled like loopback and is loopback, and a rebinding domain is the
+// same thing with a delay. Port 8791 is the núcleo's own API.
+func TestANameThatResolvesToLoopbackIsRefused(t *testing.T) {
+	proxy := startProxy(t, Policy{Profile: Ephemeral})
+	proxy.dialer.Resolver = &fakeResolver{answers: map[string][]string{
+		"127.0.0.1.nip.io": {"127.0.0.1"},
+		"rebind.example":   {"203.0.113.7", "127.0.0.1"},
+		"six.example":      {"::1"},
+		"zero.example":     {"0.0.0.0"},
+		"metadata.example": {"169.254.169.254"},
+	}}
+
+	for _, target := range []string{
+		"127.0.0.1.nip.io:8791", "rebind.example:443", "six.example:443", "zero.example:443",
+		"metadata.example:80", "169.254.169.254:80",
+	} {
+		response := connect(t, proxy, target)
+		if response.StatusCode != http.StatusForbidden {
+			t.Errorf("CONNECT %s answered %d, want 403", target, response.StatusCode)
+		}
+		_ = response.Body.Close()
+	}
+	for _, refusal := range proxy.Refusals() {
+		if refusal.Consequence != browser.ConsequenceLoopback {
+			t.Errorf("refusal %+v, want consequence %q", refusal, browser.ConsequenceLoopback)
+		}
+	}
+}
+
+// TestAPlainGetToANameThatResolvesToLoopbackIsRefused is the forward path, which dials through the
+// transport rather than the tunnel and so needed the same check in a second place.
+func TestAPlainGetToANameThatResolvesToLoopbackIsRefused(t *testing.T) {
+	var reached atomic.Bool
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Store(true)
+		_, _ = io.WriteString(w, "the daemon")
+	}))
+	defer origin.Close()
+	_, port, _ := net.SplitHostPort(strings.TrimPrefix(origin.URL, "http://"))
+
+	proxy := startProxy(t, Policy{Profile: Ephemeral})
+	proxy.dialer.Resolver = &fakeResolver{answers: map[string][]string{"127.0.0.1.nip.io": {"127.0.0.1"}}}
+
+	response, err := throughProxy(t, proxy).Get("http://127.0.0.1.nip.io:" + port + "/")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("answered %d, want 403", response.StatusCode)
+	}
+	if reached.Load() {
+		t.Fatal("the loopback server was reached through a public-looking name")
+	}
+}
+
+// TestAGuardedDialConnectsToTheAddressItVetted is the rebind half: the name is resolved once, and
+// the connection goes to that answer rather than back through the resolver, where a rebinding
+// domain would have its second chance. `localhost` is allowed here because it ASKED for this
+// machine by name — the policy's Loopback list is what judged that, upstream of the dial.
+func TestAGuardedDialConnectsToTheAddressItVetted(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		if conn, err := listener.Accept(); err == nil {
+			_ = conn.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(listener.Addr().String())
+
+	resolver := &fakeResolver{answers: map[string][]string{"localhost": {"127.0.0.1"}}}
+	dialer := &Dialer{Resolver: resolver, Timeout: 5 * time.Second}
+	conn, err := dialer.DialContext(context.Background(), "tcp", "localhost:"+port)
+	if err != nil {
+		t.Fatalf("an admitted loopback name was refused: %v", err)
+	}
+	_ = conn.Close()
+	if resolver.asked != 1 {
+		t.Fatalf("resolved %d times; the dial must use the vetted answer", resolver.asked)
+	}
+
+	if _, err := dialer.DialContext(context.Background(), "tcp", "[fe80::1]:80"); !IsDialRefused(err) {
+		t.Fatalf("a link-local literal was not refused: %v", err)
 	}
 }

@@ -124,6 +124,11 @@ type session struct {
 	// browser's network stack, so `networkAlmostIdle` fires while it is still on its way.
 	ferried  int
 	carrying int
+	// ferryEpoch names the document carrying counts against. forgetRefs zeroes carrying when the
+	// document changes while requests the old one asked for are still on their way; each of those
+	// counts itself down only if the epoch it counted up in is still current, or the count would go
+	// negative and a later page would be reported ready while its own requests were in flight.
+	ferryEpoch int
 	// dialogs are the questions THIS document put to a person and the answers it was given in their
 	// place. Per document and reset with the rest: "the page asked me to confirm something" is a fact
 	// about the page being read, not about the one before it.
@@ -450,15 +455,37 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 
 	stillLoading := d.awaitReady(ctx, ready, entry)
 	d.readTargetInfo(ctx, entry)
+	final, title := d.placeOf(entry)
 	return browser.Session{
 		ID:           id,
 		Mode:         entry.mode,
 		RequestedURL: entry.requested,
-		FinalURL:     entry.final,
-		Title:        entry.title,
+		FinalURL:     final,
+		Title:        title,
 		StillLoading: stillLoading,
 		Status:       d.statusOf(entry),
 	}, nil
+}
+
+// placeOf is where the page is and what it is called, under the lock: Snapshot and readTargetInfo
+// write them from whichever goroutine is serving that call.
+func (d *Driver) placeOf(entry *session) (final, title string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return entry.final, entry.title
+}
+
+// notePlace records a non-empty url and title under the lock and returns what is now held.
+func (d *Driver) notePlace(entry *session, final, title string) (string, string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if final != "" {
+		entry.final = final
+	}
+	if title != "" {
+		entry.title = title
+	}
+	return entry.final, entry.title
 }
 
 // statusOf is the page's HTTP status under the lock, or 0 when nothing said it.
@@ -617,11 +644,12 @@ func (d *Driver) Handoff(ctx context.Context, id browser.SessionID, reason strin
 	// the agent, and a stop that races the act it is stopping is not one.
 	d.mu.Lock()
 	entry.mode = browser.ModeHuman
+	final := entry.final
 	d.mu.Unlock()
 	return browser.HandoffTicket{
 		SessionID: id,
 		Mode:      browser.ModeHuman,
-		URL:       entry.final,
+		URL:       final,
 		Reason:    reason,
 	}, nil
 }
@@ -641,8 +669,30 @@ func (d *Driver) Close(ctx context.Context, id browser.SessionID) error {
 	d.forgetAttachments(entry)
 	d.mu.Lock()
 	delete(d.sessions, id)
-	delete(d.targets, entry.target)
-	delete(d.cdpToSession, entry.cdp)
+	// Everything that points at this session, not only the page's own entries: a frame Chromium ran
+	// out of process and a popup traced to its opener each left one, and so did every execution
+	// context the ferry placed. Left behind they are a map that only grows for the life of the
+	// browser.
+	for target, owner := range d.targets {
+		if owner == id {
+			delete(d.targets, target)
+		}
+	}
+	owned := map[cdp.SessionID]bool{entry.cdp: true}
+	for on, owner := range d.cdpToSession {
+		if owner == id {
+			owned[on] = true
+			delete(d.cdpToSession, on)
+		}
+	}
+	for on := range entry.frames {
+		owned[on] = true
+	}
+	for key := range d.contexts {
+		if owned[key.session] {
+			delete(d.contexts, key)
+		}
+	}
 	d.mu.Unlock()
 	return callErr
 }

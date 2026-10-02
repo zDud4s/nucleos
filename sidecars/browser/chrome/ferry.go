@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -18,6 +19,8 @@ import (
 	"nucleosbrowser/browser"
 	"nucleosbrowser/cdp"
 	"nucleosbrowser/fence"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // The ferry: how a page gets its own content without the fence opening a channel for it.
@@ -354,15 +357,10 @@ func (d *Driver) serveFerry(on cdp.SessionID, contextID int64, payload string) {
 	spent := 0
 	if live {
 		entry.ferried++
-		entry.carrying++
 		spent = entry.ferried
 		// Counted down however this returns, because a wait for the page waits on this and a leak
 		// here is a session that never reports itself finished.
-		defer func() {
-			d.mu.Lock()
-			entry.carrying--
-			d.mu.Unlock()
-		}()
+		defer d.carryingOne(entry)()
 	}
 	d.mu.Unlock()
 
@@ -456,6 +454,24 @@ func (d *Driver) serveFerry(on cdp.SessionID, contextID int64, payload string) {
 	})
 }
 
+// carryingOne counts one request in flight and returns what counts it out. Called with d.mu held;
+// the returned func takes it itself.
+//
+// The count-down applies only in the epoch the count-up happened in: a navigation in between has
+// already zeroed the count for the new document, and taking one off THAT would report it ready with
+// its own requests still out.
+func (d *Driver) carryingOne(entry *session) func() {
+	entry.carrying++
+	epoch := entry.ferryEpoch
+	return func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if entry.ferryEpoch == epoch && entry.carrying > 0 {
+			entry.carrying--
+		}
+	}
+}
+
 // context2 is context.WithTimeout, named apart because `context` is a variable in serveFerry.
 func context2(within time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), within)
@@ -511,11 +527,6 @@ func (d *Driver) carry(ctx context.Context, on cdp.SessionID, origin, target str
 		// then be ours reporting a rule the server was never asked to apply.
 		request.Header.Set("Origin", origin)
 	}
-	if credentialed {
-		if jar := d.cookiesFor(ctx, on, target); jar != "" {
-			request.Header.Set("Cookie", jar)
-		}
-	}
 
 	// A redirect that leaves the page's origin makes this a cross-origin read whatever it started
 	// as, so the check below applies from that point on. Written by CheckRedirect and read after Do
@@ -523,9 +534,15 @@ func (d *Driver) carry(ctx context.Context, on cdp.SessionID, origin, target str
 	strayed := false
 	client := &http.Client{
 		Timeout: ferryTimeout,
+		// The fence's own dialer and no environment proxy. The default transport dials by NAME and
+		// honours HTTP(S)_PROXY, so a name resolving to this machine reached the núcleo's API from
+		// here even where the proxy refused it — see [fence.Dialer].
+		Transport: ferryTransport,
+		// The profile's cookies, asked for and put back per hop at the url of THAT hop, and with
+		// SameSite applied against the page that asked. See [ferryJar].
+		Jar: &ferryJar{d: d, ctx: ctx, on: on, initiator: origin, credentialed: credentialed},
 		// A redirect is a new request and gets the same rule: the page's own origin, or a site this
-		// profile admits. Go strips the Cookie header on a cross-domain hop by itself, which is the
-		// behaviour we would otherwise have had to write.
+		// profile admits.
 		CheckRedirect: func(hop *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects")
@@ -584,8 +601,6 @@ func (d *Driver) carry(ctx context.Context, on cdp.SessionID, origin, target str
 		// replacement characters the page will parse as its data.
 		return 0, "", nil, fmt.Errorf("the answer is not text, and the fence carries text")
 	}
-
-	d.keepCookies(ctx, on, target, response.Cookies())
 
 	headers := make(map[string]string, len(response.Header))
 	for name := range response.Header {
@@ -648,30 +663,120 @@ func hostOf(origin string) string {
 	return origin
 }
 
+// ferryDialer and ferryTransport carry every ferried request. One transport for the process, so
+// connections are pooled the way a browser pools them; the dialer is a variable so a test can give it
+// a resolver that answers the way an attacker's DNS would.
+var (
+	ferryDialer    = &fence.Dialer{Timeout: 10 * time.Second}
+	ferryTransport = fence.NewTransport(ferryDialer)
+)
+
+// ferryJar is the profile's cookie jar as [http.Client] sees it, one per carried request.
+//
+// A jar rather than a Cookie header set once, because a redirect is a new request: the header set on
+// the first one says nothing about the cookies the NEXT url should get, and a Set-Cookie on a hop
+// belongs to that hop's url, not to the one the page asked for. The client calls Cookies and
+// SetCookies per hop, with that hop's url, which is the bookkeeping a browser does.
+//
+// Nothing is kept here. Every call goes to the browser, because the profile is the identity (spec
+// §4.2) and a second store would be a second identity that drifts from it.
+type ferryJar struct {
+	d            *Driver
+	ctx          context.Context
+	on           cdp.SessionID
+	initiator    string
+	credentialed bool
+}
+
+// Cookies is what the browser would have sent to u from this page. None when the call did not ask
+// for credentials, and on a cross-site request only those the server marked SameSite=None — a Lax or
+// Strict cookie, or one with no SameSite that Chromium treats as Lax, is precisely the cookie a site
+// said must not ride on a request another site started.
+func (j *ferryJar) Cookies(u *url.URL) []*http.Cookie {
+	if !j.credentialed {
+		return nil
+	}
+	crossSite := !sameSite(j.initiator, u)
+	held := j.d.cookiesFor(j.ctx, j.on, u.String())
+	out := make([]*http.Cookie, 0, len(held))
+	for _, cookie := range held {
+		if crossSite && !strings.EqualFold(cookie.SameSite, "None") {
+			continue
+		}
+		out = append(out, &http.Cookie{Name: cookie.Name, Value: cookie.Value})
+	}
+	return out
+}
+
+// SetCookies puts what u answered back into the profile, under u. A request that did not carry
+// credentials does not keep them either — fetch ignores Set-Cookie when credentials are omitted —
+// and a cross-site answer may only set a SameSite=None cookie, which is the rule Chromium applies
+// to a cross-site subresource response.
+func (j *ferryJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
+	if !j.credentialed || len(cookies) == 0 {
+		return
+	}
+	if !sameSite(j.initiator, u) {
+		kept := make([]*http.Cookie, 0, len(cookies))
+		for _, cookie := range cookies {
+			if cookie.SameSite == http.SameSiteNoneMode {
+				kept = append(kept, cookie)
+			}
+		}
+		cookies = kept
+	}
+	j.d.keepCookies(j.ctx, j.on, u.String(), cookies)
+}
+
+// sameSite is the schemeful same-site test: the same scheme and the same registrable domain. An
+// origin with no host — an opaque one, "null" — is the same site as nothing.
+func sameSite(initiator string, target *url.URL) bool {
+	from, err := url.Parse(initiator)
+	if err != nil || from.Hostname() == "" || target.Hostname() == "" {
+		return false
+	}
+	return strings.EqualFold(from.Scheme, target.Scheme) && siteOf(from.Hostname()) == siteOf(target.Hostname())
+}
+
+// siteOf is a host's registrable domain, or the host itself when it has none — an address, a
+// single-label name, or a public suffix on its own.
+func siteOf(host string) string {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if net.ParseIP(host) != nil {
+		// An address is its own site. The suffix list knows nothing of addresses and would call
+		// 10.0.0.1 and 192.168.0.1 the same site, "0.1".
+		return host
+	}
+	if site, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
+		return site
+	}
+	return host
+}
+
+// heldCookie is one cookie as Network.getCookies reports it, as much of it as the jar needs.
+type heldCookie struct {
+	Name     string `json:"name"`
+	Value    string `json:"value"`
+	SameSite string `json:"sameSite"`
+}
+
 // cookiesFor asks the BROWSER what it would have sent, which is the only place that knows.
 //
 // Through CDP rather than a jar of our own, because the profile is the identity (spec §4.2) and a
 // second store would be a second identity that drifts from it. httpOnly cookies come back here too,
 // which is what makes an authenticated API call work at all.
-func (d *Driver) cookiesFor(ctx context.Context, on cdp.SessionID, target string) string {
+func (d *Driver) cookiesFor(ctx context.Context, on cdp.SessionID, target string) []heldCookie {
 	result, err := d.conn.Call(ctx, on, "Network.getCookies", map[string]any{"urls": []string{target}})
 	if err != nil {
-		return ""
+		return nil
 	}
 	var payload struct {
-		Cookies []struct {
-			Name  string `json:"name"`
-			Value string `json:"value"`
-		} `json:"cookies"`
+		Cookies []heldCookie `json:"cookies"`
 	}
 	if err := json.Unmarshal(result, &payload); err != nil {
-		return ""
+		return nil
 	}
-	pairs := make([]string, 0, len(payload.Cookies))
-	for _, cookie := range payload.Cookies {
-		pairs = append(pairs, cookie.Name+"="+cookie.Value)
-	}
-	return strings.Join(pairs, "; ")
+	return payload.Cookies
 }
 
 // keepCookies puts what the server set back into the profile.
