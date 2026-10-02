@@ -1,4 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { localDataDir } from "@tauri-apps/api/path";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { apiBlob, apiFetch, apiText } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
@@ -153,10 +155,19 @@ export const MAX_UPLOAD_BYTES = 104_857_600;
 export function useFolder(path: string, enabled = true) {
   return useQuery({
     queryKey: keys.files.list(path),
-    queryFn: () => apiFetch<Entry[]>(`/files?path=${encodeURIComponent(path)}`),
+    queryFn: () => readFolder(path),
     refetchInterval: POLL.queue,
     enabled,
   });
+}
+
+/**
+ * One folder's listing, outside a hook — for the upload, which has to know what
+ * is already in a folder before it sends anything into it. Same request, same
+ * cache key through `queryClient.fetchQuery`, so it never reads twice.
+ */
+export function readFolder(path: string): Promise<Entry[]> {
+  return apiFetch<Entry[]>(`/files?path=${encodeURIComponent(path)}`);
 }
 
 /**
@@ -248,10 +259,29 @@ export function useMove() {
 }
 
 /**
- * Remove a path. `recursive` defaults false on the wire; a non-empty
- * directory without it is a 409, and only the recursive retry is ever wrapped
- * in a `ConfirmButton` — the plain delete cannot take more than the one entry
- * a person named.
+ * What a delete moved aside — `files.rs`'s `Trashed`, and also one row of
+ * `GET /files/trash`.
+ *
+ * A delete no longer destroys anything: the daemon moves the entry into its
+ * own trash beside the files root, and answers with this so the page can offer
+ * the undo straight away. `id` is the only handle a restore takes; `path` is
+ * where it came from and where a restore puts it back.
+ */
+export interface Trashed {
+  id: string;
+  path: string;
+  is_dir: boolean;
+  size_bytes: number;
+  deleted_at: string;
+}
+
+/** How long the daemon keeps a deleted entry before removing it for good — `files.rs`'s `TRASH_RETENTION`. */
+export const TRASH_RETENTION_DAYS = 30;
+
+/**
+ * Move a path to the trash. `recursive` defaults false on the wire; a
+ * non-empty directory without it is a 409, and the page answers that with its
+ * own named, one-more-step note rather than retrying on its own.
  */
 export function useDelete() {
   const queryClient = useQueryClient();
@@ -259,8 +289,35 @@ export function useDelete() {
     mutationFn: ({ path, recursive }: DeleteRequest) => {
       const params = new URLSearchParams({ path });
       if (recursive) params.set("recursive", "true");
-      return apiFetch<void>(`/files?${params.toString()}`, { method: "DELETE" });
+      return apiFetch<Trashed>(`/files?${params.toString()}`, { method: "DELETE" });
     },
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.files.all });
+    },
+  });
+}
+
+/** What is in the trash, newest first — `GET /files/trash`. */
+export function useTrash() {
+  return useQuery({
+    queryKey: keys.files.trash,
+    queryFn: () => apiFetch<Trashed[]>("/files/trash"),
+    refetchInterval: POLL.queue,
+  });
+}
+
+/**
+ * Put a trashed entry back where it came from — `POST /files/restore`.
+ *
+ * Held to the move rule: a taken original path is a 409 and a vanished parent
+ * folder a 404, never an overwrite and never a folder made up to hold it.
+ */
+export function useRestore() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) =>
+      apiFetch<{ path: string }>("/files/restore", { method: "POST", body: JSON.stringify({ id }) }),
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.files.all });
@@ -306,6 +363,72 @@ export async function downloadFile(path: string): Promise<void> {
   } finally {
     URL.revokeObjectURL(url);
   }
+}
+
+/* ------------------------------------------------------------ on disk -- */
+
+/**
+ * Where a root-relative path lives on this machine's disk, given the OS's
+ * local data directory.
+ *
+ * No route says where the root is, so this repeats the daemon's own rule:
+ * `directories::ProjectDirs::from("dev", "nucleos", "NucleOS").data_local_dir()`
+ * joined with `files` (`core/src/main.rs`, `files::root_for`). That directory
+ * is shaped differently on each platform, and the local data directory the
+ * host reports is enough to tell which one this is. A daemon started with
+ * `NUCLEOS_DATA_DIR` keeps its root somewhere this cannot know — a developer's
+ * second daemon, never the one the app starts — and there the open is refused
+ * by the opener's scope rather than landing on the wrong file.
+ */
+export function diskPathFor(localDataDir: string, relative: string): string {
+  const base = localDataDir.replace(/[\\/]+$/, "");
+  const parts = pathSegments(relative);
+  if (base.includes("\\")) return [base, "nucleos", "NucleOS", "data", "files", ...parts].join("\\");
+  const project = base.endsWith("/Library/Application Support") ? "dev.nucleos.NucleOS" : "nucleos";
+  return [base, project, "files", ...parts].join("/");
+}
+
+let localDataDirOnce: Promise<string> | undefined;
+
+/** The absolute path of a root-relative one, asked of the host once per window. */
+export async function diskPath(relative: string): Promise<string> {
+  localDataDirOnce ??= localDataDir();
+  try {
+    return diskPathFor(await localDataDirOnce, relative);
+  } catch (error) {
+    // A refusal is not remembered: the next ask gets to try again.
+    localDataDirOnce = undefined;
+    throw error;
+  }
+}
+
+/**
+ * Extensions Windows runs rather than opens. A double-click here hands the
+ * file to whatever the OS associates with it, and for these that is the file
+ * itself executing — from a folder that uploads, drops, filed mail and the
+ * agent all write into. Explorer asks first; this page does not open them at
+ * all, and a download stays the way to take one out.
+ */
+const RUNS_ON_OPEN = new Set([
+  "bat", "cmd", "com", "cpl", "exe", "hta", "jar", "js", "jse", "lnk", "msc", "msi", "msp", "pif",
+  "ps1", "psm1", "reg", "scr", "url", "vb", "vbe", "vbs", "wsf", "wsh",
+]);
+
+/** Whether opening this name would run it rather than show it. */
+export function runsOnOpen(name: string): boolean {
+  const dot = name.lastIndexOf(".");
+  return dot > 0 && RUNS_ON_OPEN.has(name.slice(dot + 1).toLowerCase());
+}
+
+/**
+ * Opens a file in the app the OS gives its kind, the way a double-click in
+ * Explorer does. Through the opener plugin, whose scope in
+ * `capabilities/default.json` admits only paths under the files root.
+ */
+export async function openFile(relative: string): Promise<void> {
+  // The page asks `runsOnOpen` first and says why; this is the floor under it.
+  if (runsOnOpen(relative)) throw new Error("a program is never run from the files folder");
+  await openPath(await diskPath(relative));
 }
 
 /* ---------------------------------------------------------------- helpers -- */
@@ -378,6 +501,30 @@ export function sortEntries(entries: Entry[], column: SortColumn, direction: Sor
     if (b.modified === null) return -1;
     return sign * a.modified.localeCompare(b.modified);
   });
+}
+
+/**
+ * Whole days a trashed entry has left before the daemon purges it — never below
+ * zero, since the purge runs on its own clock and a row can outlive its term by
+ * a sweep.
+ */
+export function trashDaysLeft(deletedAt: string, now: number = Date.now()): number {
+  const age = (now - new Date(deletedAt).getTime()) / 86_400_000;
+  return Math.max(0, Math.ceil(TRASH_RETENTION_DAYS - age));
+}
+
+/**
+ * A long name cut in the middle, so its end survives: two files that differ
+ * only in `…-v2.pdf` against `…-v3.pdf` stay two different things on screen.
+ * The extension and a few characters before it are kept whole.
+ */
+export function middleEllipsis(name: string, max: number): string {
+  if (name.length <= max) return name;
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 && name.length - dot <= 8 ? name.length - dot : 0;
+  const tail = Math.min(ext + 6, Math.floor(max / 2));
+  const head = max - tail - 1;
+  return `${name.slice(0, head)}…${name.slice(name.length - tail)}`;
 }
 
 /** Bytes, for a person — the same three-step scale `MailDetail.tsx` uses for attachments. */

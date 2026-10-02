@@ -27,9 +27,14 @@
   align-items: start;
 }
 
+/* The tree, and the trash folded under it. */
 .fi-side {
   position: sticky;
   top: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
 }
 
 .fi-main {
@@ -37,6 +42,30 @@
   flex-direction: column;
   gap: var(--space-3);
   min-width: 0;
+}
+
+/* The body too narrow for the tree beside the table — measured on the body by
+   `useNarrow` in `Files.tsx`, not on the window, because the app's rail takes
+   its share first. The tree goes on top and stops being sticky: a sticky block
+   above the content would cover it. A class and not a container query: the
+   page swaps the tree for a fold there too, and the two must agree. */
+.fi-body-narrow {
+  grid-template-columns: 1fr;
+}
+
+/* Both folds on one line, each opening to the full width beneath it: stacked,
+   "Folders" and "Recently deleted" cost two lines before the first row, and
+   at 800x600 that was a quarter of what the table had left. */
+.fi-body-narrow .fi-side {
+  position: static;
+  flex-flow: row wrap;
+  align-items: center;
+  column-gap: var(--space-5);
+}
+
+.fi-body-narrow .fi-side > .fi-fold[open],
+.fi-body-narrow .fi-side > .fi-crumbs {
+  flex-basis: 100%;
 }
 
 /**
@@ -151,6 +180,7 @@
  */
 .fi-tree {
   gap: var(--space-1);
+  overflow: hidden;
 }
 
 .fi-tree-node {
@@ -158,11 +188,48 @@
   flex-direction: column;
 }
 
+/* Keyboard focus sits on the treeitem, which wraps its whole branch: a ring
+   on it would box every folder below. The ring goes on its own row instead,
+   inset so the column's edge does not clip it. */
+.fi-tree-node:focus-visible {
+  outline: none;
+}
+
+.fi-tree-node:focus-visible > .fi-tree-row {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* The move form's source folder: said, not selected. */
+.fi-tree-here {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* Square, not rounded: `.ui-current`'s 2px inset rule on a rounded row was
+   bent by the corner into a stray "[" beside the name. The indent is one
+   `--space-3` step per level, the depth arriving as `--fi-depth`, after one
+   `--space-2` so the current-folder rule does not touch the root's name.
+
+   A deep path narrows the step: `--fi-deepest` steps share what the column
+   has once 8rem is kept for the arrow and a name, so the ladder still reads
+   and never pushes past the edge. (`100%` in padding is the node's width,
+   and every node is the column's width.) Sideways scrolling was tried and cut
+   every name at its start. */
 .fi-tree-row {
   display: flex;
   align-items: center;
   gap: var(--space-1);
-  border-radius: var(--radius-sm);
+  min-width: 0;
+  padding-left: calc(
+    var(--space-2) + var(--fi-depth, 0) * min(var(--space-3), (100% - 8rem) / var(--fi-deepest, 1))
+  );
+  white-space: nowrap;
+}
+
+/* The name's button gives way before the arrow does. */
+.fi-tree-row > .ui-button-link {
+  min-width: 0;
 }
 
 /* The open folder wears `.ui-current` and no class of its own — the row is a
@@ -176,8 +243,15 @@
    are not restated: the reset there is layered, so this unlayered rule would
    win and say the same thing twice — and its `border: 0` would set the STYLE
    to none, which is the trap that reset's own comment was written about. */
+/* 24px square: at 1.1rem wide and one glyph tall the arrow was the smallest
+   target on the page, and missing it selected the folder instead. */
 .fi-tree-toggle {
-  width: 1.1rem;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
   padding: 0;
   font-size: var(--text-xs);
   line-height: 1;
@@ -192,17 +266,32 @@
   outline-offset: 1px;
 }
 
-.fi-tree-toggle-spacer {
-  display: inline-block;
-  width: 1.1rem;
-}
-
 /* Text, and not the link colour it would inherit from the `Button` around it.
    Every row of this tree is a link, so a column of accent is a column with no
    hierarchy left in it — what is marked here is the current folder, not the
    fact that a folder can be clicked. */
 .fi-tree-label {
   color: var(--text);
+}
+
+/* A name wider than what its row leaves ends in an ellipsis and says itself
+   in full on hover. */
+.fi-tree-label {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A branch whose listing failed. Stale stays muted — what it shows was true a
+   moment ago; unread takes the danger tone, because there is nothing under it
+   the page can vouch for. A word and not a glyph, so it is read as well as seen. */
+.fi-tree-fault {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.fi-tree-fault-unread {
+  color: var(--tone-danger-fg);
 }
 
 /* The children of an open node sit at the tree's own density, not the inset's
@@ -216,48 +305,265 @@
 
 /* ============================================================ breadcrumbs == */
 
+/* The path, written out beside its folder glyph, on the page's own ground: it
+   sat in a sunken well, and at the root that well round one word read as a tab
+   or a disabled field. One line, always — a deep path folds its middle into
+   "…" (`Breadcrumbs` measures), and a folder whose own name is still too long
+   ends in an ellipsis. */
 .fi-crumbs {
   display: flex;
-  flex-wrap: wrap;
+  flex: 0 1 auto;
+  flex-wrap: nowrap;
   align-items: center;
+  align-self: stretch;
+  min-width: 0;
+  overflow: hidden;
   gap: var(--space-1);
+  white-space: nowrap;
+}
+
+.fi-crumbs > * {
+  flex: none;
+}
+
+.fi-crumbs > .fi-crumb-here {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A disclosure that folds a side block to one line: the tree at the degraded
+   width, and the trash always. The summary is a label-rank line, the same
+   rung as the table's column heads, so a folded block reads as a heading and
+   not as content. */
+.fi-fold-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.fi-fold-summary:hover {
+  color: var(--text);
+}
+
+/* The trash's count one rung up from the label beside it: after a mistake it
+   is the number that says whether the thing is still there. */
+.fi-fold-summary > .ui-count {
+  color: var(--text-muted);
+}
+
+/* `display: flex` drops the browser's own disclosure marker, and without it a
+   folded block reads as a label rather than something that opens. The tree's
+   own ▸/▾, so one page has one way of saying "folded". */
+.fi-fold-summary {
+  list-style: none;
+}
+
+.fi-fold-summary::-webkit-details-marker {
+  display: none;
+}
+
+.fi-fold-summary::before {
+  content: "▸";
+  width: 1.5rem;
+  text-align: center;
+  font-size: var(--text-xs);
+  letter-spacing: 0;
+}
+
+.fi-fold[open] > .fi-fold-summary::before {
+  content: "▾";
+}
+
+.fi-fold[open] > .fi-fold-summary {
+  margin-bottom: var(--space-2);
+}
+
+/* ================================================================ trash == */
+
+.fi-trash-note {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* A trashed entry is still a name off the disk: mono, wrapping, never
+   truncated — two items can differ only in their last folder. */
+/* Its own line, the term and Restore under it: beside them in a 14rem column
+   a path got a third of the width and broke every few characters. */
+.fi-trash-path {
+  flex: 1 1 100%;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.fi-trash-when {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* The folder you are in: text, not a link, so it reads as the end of the trail. */
+.fi-crumb-here {
+  color: var(--text);
 }
 
 /* =============================================================== toolbar == */
 
-.fi-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: var(--space-4);
+/* In the page header: the title left, the search in the middle of the page,
+   making on the right. Three columns of the header itself — the actions slot
+   and the toolbar step aside with `display: contents` — so the search is
+   centred on the page and not on whatever the title leaves. The side columns
+   are equal while both have room, and never narrower than what they hold: a
+   tight header moves the search off centre before it squeezes the title or
+   the buttons. The header is a container for its descendants' sake only. */
+.ui-page-header:has(> .ui-page-actions > .fi-toolbar) {
+  container: fi-head / inline-size;
+  display: grid;
+  grid-template-columns: minmax(max-content, 1fr) minmax(12rem, 22rem) minmax(max-content, 1fr);
+  align-items: start;
+  column-gap: var(--space-5);
+  row-gap: var(--space-3);
 }
 
+.ui-page-actions:has(> .fi-toolbar),
+.ui-page-actions > .fi-toolbar {
+  display: contents;
+}
+
+.ui-page-actions > .fi-toolbar > .fi-search {
+  grid-column: 2;
+  max-width: none;
+}
+
+.ui-page-actions > .fi-toolbar > .fi-make {
+  grid-column: 3;
+  justify-self: end;
+}
+
+/* Where the tree folds, the header is too narrow for three: the title and the
+   making share the first line, and the search takes the whole of the second.
+   Keyed to the body's own narrow class, its sibling below and exactly as
+   wide — a container query cannot restyle the container it measures. */
+.ui-page-header:has(> .ui-page-actions > .fi-toolbar):has(~ .fi-body-narrow) {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.ui-page-header:has(~ .fi-body-narrow) > .ui-page-actions > .fi-toolbar > .fi-make {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.ui-page-header:has(~ .fi-body-narrow) > .ui-page-actions > .fi-toolbar > .fi-search {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+
+/* Basis 10rem, grown to 15: a flex line breaks on the basis and not on the
+   min-width, so at 15 the field took a line of its own whenever the main
+   column was narrower than the whole toolbar. */
+.fi-search {
+  flex: 1 1 10rem;
+  min-width: 10rem;
+  max-width: 20rem;
+}
+
+/* The field fills its box and no more, at the buttons' height. `.ui-field`
+   gives every input a 14rem floor, which outranked the box's own 10rem: at
+   800px the input ran out of it and lay across New folder. */
+.fi-search input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding-block: 0.34rem;
+}
+
+/* New folder and Upload, together on the right and on one line: the column
+   they sit in is as wide as they are, never a wrap between them. */
+.fi-make {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Opened, the form is the field and its two buttons on one line, and the
+   refusal under them — beside the control that caused it. */
 .fi-new-folder {
   display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-2);
+}
+
+.fi-new-folder-row {
+  display: flex;
+  flex-wrap: wrap;
   align-items: flex-end;
   gap: var(--space-2);
 }
 
 /* ============================================================== upload == */
 
+/* The button, with the ceiling written beside it before anything is picked.
+   Beside and not under: hung below, it lifted the button off the toolbar's
+   bottom edge, and at 800px it fell onto the panel under the toolbar. */
 .fi-upload {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: var(--space-1);
+  align-items: center;
+  gap: var(--space-2);
 }
 
+.fi-upload-limit {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* When the header is too narrow for it beside the title, the ceiling moves
+   into the button's tooltip. The refusal after a too-large file still names
+   it. Measured on the header, not the window: the app's rail takes its share
+   first. */
+@container fi-head (max-width: 36rem) {
+  .fi-upload-limit {
+    display: none;
+  }
+}
+
+/* Drawn to `.ui-button`'s measure — its padding, radius, border and line
+   height — so it stands the same height as New folder beside it. It is a
+   label round a file input, which `Button` cannot be, so the measure is
+   restated here rather than inherited. */
 .fi-upload-label {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
+  padding: 0.34rem var(--space-3);
   font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  line-height: 1.4;
+  color: var(--text-muted);
+  background: none;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+/* The ghost button's recipe, as New folder beside it wears it: the raised fill
+   it had made Upload read as the page's primary, which the system has none of. */
+.fi-upload-label:hover {
   color: var(--text);
   background: var(--surface-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
 }
 
 /* `:focus-within` and not `:focus-visible`, so the global ring never applies
@@ -268,26 +574,210 @@
   outline-offset: 1px;
 }
 
-.fi-upload-chosen {
-  margin: 0;
-  max-width: 20rem;
-  font-size: var(--text-xs);
+/* Held while a batch is going up, and looking it: the input inside was off
+   while the label round it still lit up under the pointer. `.ui-button`'s
+   disabled paint, restated for the reason the measure is. */
+.fi-upload-label:has(input:disabled) {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+.fi-upload-label:has(input:disabled):hover {
   color: var(--text-muted);
+  background: none;
+}
+
+/* The upload under way, with the file it is on — "3 of 5" alone never said
+   which one was slow. Room is left above it for the limit line. */
+.fi-progress {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.fi-progress-name {
+  font-family: var(--font-mono);
+  color: var(--text);
   overflow-wrap: anywhere;
 }
 
-.fi-upload-note {
+/* A confirmation that needs no answer — a download handed over, a path copied.
+   Muted and small: it is said once and then gets out of the way. */
+.fi-flash {
   margin: 0;
-  max-width: 20rem;
-  font-size: var(--text-xs);
-  line-height: var(--leading-normal);
+  font-size: var(--text-sm);
   color: var(--text-muted);
-  text-align: right;
+}
+
+/* In the slot, the news takes the rest of the line and wraps inside it: a
+   copied path is read to its end, so it is not cut. */
+.fi-selection-bar > .fi-flash,
+.fi-selection-bar > .fi-progress {
+  flex: 1 1 12rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The undo beside a selection, at the far end of the bar from the verbs that
+   act on the selection. */
+.fi-slot-undo {
+  margin-left: auto;
+}
+
+/* The undo, standing in the slot: the slot is already its sunken rung. */
+.fi-selection-bar > .fi-undo {
+  padding: 0;
+  background: none;
 }
 
 /* ============================================================ selection == */
 
+/**
+ * The selection's slot, there whether anything is picked or not.
+ *
+ * It appeared on the first tick, and every row under the pointer moved down by
+ * its height. Now the height is held — a button's measure plus the bar's own
+ * padding — and only the fill and the contents change: empty at rest, beside
+ * the path, and the sunken bar with the count and the verbs once something is
+ * picked.
+ */
 .fi-selection-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 2.9375rem;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.fi-selection-live {
+  background: var(--surface-sunken);
+}
+
+/* Empty status span at rest: it stays mounted so the count is announced the
+   moment it appears, and takes no room while it says nothing. */
+.fi-selection-bar > [role="status"]:empty {
+  display: none;
+}
+
+/* One line, cut at the end rather than wrapped: at 800px it took two, and
+   the slot's height is held for the bar, not for the hint. */
+.fi-hint {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.fi-selection-hint {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/**
+ * The page asking one thing of a person: a folder that is not empty, about to
+ * go with its contents, or uploaded names that are already taken.
+ *
+ * The pending tone, not the danger one. Nothing has gone wrong, and since the
+ * trash nothing here is final either; the danger colour is kept for the
+ * button that deletes.
+ *
+ * Left as this page's own box rather than becoming `ConflictNote`, and the
+ * reason is structural: that primitive renders a `<p>`, and this note carries
+ * the buttons its sentence exists to introduce. Adopting it would mean a box
+ * around a note to hold them — the wrapper the primitives exist to remove.
+ */
+.fi-ask {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--tone-pending-border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+/* Focus arrives here programmatically, to be read; the ring would suggest the
+   box itself does something. Its buttons keep theirs. */
+.fi-ask:focus {
+  outline: none;
+}
+
+/* The pending tone is the edge alone: filled amber across the page's width, a
+   routine question about a name read as something gone wrong. The words are the
+   text colour, which the tone's foreground only reads well on its own fill. */
+.fi-ask p {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.fi-ask-where {
+  font-family: var(--font-mono);
+}
+
+.fi-ask-list {
+  margin: 0;
+  padding-left: var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* The count of the names not listed: prose, not one more name. */
+.fi-ask-list > .fi-ask-more {
+  font-family: var(--font-body);
+  color: var(--text-muted);
+  list-style: none;
+}
+
+/* The answer that loses nothing, filled: one rung up from the ghosts beside
+   it, so the default reads before focus lands on it. The fill is the raised
+   surface and not a tone — nothing here is approved or refused. */
+.fi-ask-actions > [data-safe] {
+  background: var(--surface-raised);
+  border-color: var(--text-faint);
+  color: var(--text);
+}
+
+.fi-ask .fi-ask-then {
+  color: var(--text-muted);
+}
+
+.fi-ask-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* A refusal with a way to put it away: the note grows, the button keeps to its
+   corner, on the note's first line. */
+.fi-dismissable {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.fi-dismissable-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/**
+ * What a delete just did, and the undo. The sunken rung the selection bar uses
+ * — it is that bar's sequel, standing where the bar stood — and no tone: a
+ * delete that went through is not news, and the undo is the only thing here
+ * worth reaching for.
+ */
+.fi-undo {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -296,40 +786,51 @@
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
   font-size: var(--text-sm);
-  color: var(--text);
+  color: var(--text-muted);
 }
 
-/**
- * A folder the daemon would not remove without saying so — §6.18's "delete
- * with contents", surfaced the moment a plain delete answers 409.
- *
- * Left as this page's own box rather than becoming `ConflictNote`, and the
- * reason is structural: that primitive renders a `<p>`, and this note carries
- * the two-button escalation the sentence exists to introduce. Adopting it
- * would mean a box around a note to hold the buttons — the wrapper the
- * primitives exist to remove. Recorded so the next reader knows it was looked
- * at.
- */
-.fi-not-empty {
+.fi-undo p {
+  margin: 0;
+}
+
+.fi-undo-name {
+  font-family: var(--font-mono);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* A restore the daemon refused, under the path it was for. */
+.fi-path-failure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* The rest of a long upload report, behind the line that counts it. */
+.fi-drop-more > summary {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+/* Several refusals from one batch, folded to the line that counts them. */
+.fi-failures-summary {
+  font-size: var(--text-sm);
+  color: var(--tone-danger-fg);
+  cursor: pointer;
+}
+
+.fi-failures-list {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--tone-danger-border);
-  border-radius: var(--radius-sm);
-  background: var(--tone-danger-bg);
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
 }
 
-.fi-not-empty p {
-  margin: 0;
-  font-size: var(--text-sm);
-  color: var(--tone-danger-fg);
-}
-
-.fi-not-empty-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
+.fi-path-failure > .fi-entry-name {
+  font-size: var(--text-xs);
 }
 
 /* ================================================================= move == */
@@ -340,18 +841,45 @@
  *
  * The box the old rule drew was `.ui-panel-inset` to the property — the same
  * fill, the same radius, the same border, the same `--space-3` of padding and
- * the same `--space-2` gap — and the only real difference was the flow: a
- * destination field, two buttons and whatever the daemon refused, on one line.
- * That is a fact about this box's contents rather than about the box, so it is
- * drift and not intent, exactly as `system.css` concluded for `.sy-kill`. None
- * of the four properties the copies disagreed about is restated below.
+ * the same `--space-2` gap. It now holds a heading, a folder picker, the
+ * resolved destination and two buttons, stacked — which is the recipe's own
+ * flow, so nothing about the box is restated below; only what is inside it.
  *
  * The `<form>` stays outside the `Inset`, for the reason the tree's `<nav>`
  * does: submit-on-Enter is behaviour, and `Inset` renders a `div` or an `li`.
  */
-.fi-move {
-  flex-flow: row wrap;
-  align-items: flex-end;
+.fi-move-form:focus {
+  outline: none;
+}
+
+.fi-move-head,
+.fi-move-target {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* The tree inside the form is the side column's, boxed a second time; capped
+   so a deep root cannot push Move off the screen, and narrowed so a handful of
+   short names is not a box a thousand pixels wide. 12rem, not 16: at 16 the
+   form pushed the rows being moved out of sight while their destination was
+   being picked. */
+.fi-move .fi-tree {
+  max-width: 32rem;
+  max-height: 12rem;
+  overflow-y: auto;
+}
+
+.fi-move-what {
+  font-family: var(--font-mono);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.fi-move-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
 }
 
 /* ================================================================ table == */
@@ -360,6 +888,13 @@
    already 2px `--focus-ring` at a 2px offset, which is what stood here. */
 .fi-table-wrap {
   border-radius: var(--radius-md);
+}
+
+/* The rows on the page's own ground, level with the toolbar above them: the
+   flat panel keeps its body's top and bottom padding, and that was a gap
+   between the slot and the column heads that belonged to neither. */
+.fi-main .ui-panel-flat > .ui-panel-body {
+  padding-block: 0;
 }
 
 .fi-table {
@@ -382,10 +917,19 @@
   width: auto;
 }
 
+/* Shrink-to-fit rather than a fixed 8rem each: at 800px two fixed columns left
+   the name a sliver, and "invoices/" broke across two lines. The name is what a
+   row is read by, so it takes whatever the numbers do not need. */
 .fi-col-num {
-  width: 8rem;
+  width: 1%;
+  white-space: nowrap;
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+/* `.fi-table th` sets every head left; a number's head sits over its numbers. */
+.fi-table th.fi-col-num {
+  text-align: right;
 }
 
 /* The label rank — 11px uppercase at `--tracking-wide` — and not the
@@ -403,6 +947,33 @@
 
 .fi-sort-button:hover {
   color: var(--text);
+}
+
+.fi-sort-mark {
+  margin-left: var(--space-1);
+  letter-spacing: 0;
+}
+
+/* On a number's head the mark leads, and the label ends on the figures' edge. */
+th.fi-col-num .fi-sort-mark {
+  margin-right: var(--space-1);
+  margin-left: 0;
+}
+
+/* The heads not sorting show their mark while the pointer is on the heads or
+   the keyboard is on one: always on, two faint arrows stood beside every visit's
+   one real mark. The label's hover colour already says a head is a control. */
+.fi-sort-idle {
+  opacity: 0;
+}
+
+.fi-table thead:hover .fi-sort-idle,
+.fi-sort-button:focus-visible .fi-sort-idle {
+  opacity: var(--opacity-quiet);
+}
+
+.fi-sort-button:hover .fi-sort-idle {
+  opacity: 1;
 }
 
 .fi-table td {
@@ -435,12 +1006,197 @@
  * It was an `--accent-quiet` background on the row: the brand colour marking
  * a selection, and a fill, which the light theme cannot show.
  */
-.fi-row-focus > td:first-child {
+/* Only while the keyboard has it: after a click the rule stood beside the
+   picked row as a second mark of the same thing. */
+.fi-row-focus:has(:focus-visible) > td:first-child {
   box-shadow: inset 2px 0 0 var(--text);
 }
 
+/**
+ * A picked row. The checkbox alone was the only mark, a cell's width from the
+ * name a person reads by — with ten rows picked, the eye had to scan a column of
+ * ticks to learn which. A neutral tint of the text colour, because it holds in
+ * both themes: `--surface-raised` is the same white as the panel in light, and
+ * the sunken rung is already the hover. At 9% it sat one step from the hover
+ * and a picked row read as the one under the pointer; 14% is clearly its own
+ * state. Stronger again under the pointer, so hover still says something.
+ */
+.fi-row-selected {
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+}
+
+.fi-row-selected:hover {
+  background: color-mix(in srgb, var(--text) 18%, transparent);
+}
+
+/* The light theme's text is near black, and 14% of it was a mid-grey band that
+   outweighed the names inside it. Lighter there, still clear of the hover. */
+@media (prefers-color-scheme: light) {
+  .fi-row-selected {
+    background: color-mix(in srgb, var(--text) 10%, transparent);
+  }
+
+  .fi-row-selected:hover {
+    background: color-mix(in srgb, var(--text) 14%, transparent);
+  }
+}
+
+/* Drawn from the tokens rather than left to the browser: the shell declares no
+   `color-scheme`, so the native box was a light-theme white square on the dark
+   page, the brightest thing on it, and ticked it differed from unticked only
+   by a hairline mark. Unticked sits sunken inside a strong hairline; ticked and
+   "some" fill with the text colour — not the brand accent, which is reserved,
+   and the same voice as the tint on the row it marks. */
+.fi-table input[type="checkbox"] {
+  appearance: none;
+  display: inline-grid;
+  place-content: center;
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  vertical-align: middle;
+  border: var(--hairline) solid var(--text-faint);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  cursor: pointer;
+}
+
+.fi-table input[type="checkbox"]:hover {
+  border-color: var(--text-muted);
+}
+
+/* A row's box stands hidden until it is wanted — under the pointer, on the row
+   the keyboard is on, or on every row once anything is picked. Hidden and not
+   removed: it keeps its column, so nothing moves when it arrives, and a screen
+   reader still finds it. The head's select-all is always there. */
+.fi-table:not(.fi-table-picking) tbody .fi-row:not(:hover):not(:has(:focus-visible)) input[type="checkbox"] {
+  opacity: 0;
+}
+
+/* Muted, not the full text colour: a column of black squares in the light
+   theme was the heaviest thing on the page, over the names it marks. The
+   faint edge unticked is the floor a control boundary needs — `--border-strong`
+   measured 1.9:1 on the light rows. */
+.fi-table input[type="checkbox"]:checked,
+.fi-table input[type="checkbox"]:indeterminate {
+  border-color: var(--text-muted);
+  background: var(--text-muted);
+}
+
+/* The tick: two sides of a box, turned. */
+.fi-table input[type="checkbox"]:checked::before {
+  content: "";
+  width: 0.55rem;
+  height: 0.3rem;
+  margin-top: -0.1rem;
+  border-bottom: 2px solid var(--bg);
+  border-left: 2px solid var(--bg);
+  transform: rotate(-45deg);
+}
+
+/* "Some but not all": a bar, as every checkbox that has the state draws it. */
+.fi-table input[type="checkbox"]:indeterminate::before {
+  content: "";
+  width: 0.5rem;
+  height: 2px;
+  background: var(--bg);
+}
+
+/* A row picks itself on a click, so the pointer is a pointer over all of it,
+   and a Shift-click extends the selection rather than painting text. */
+.fi-table tbody tr {
+  cursor: default;
+  user-select: none;
+}
+
+.fi-table .fi-rename input {
+  user-select: text;
+}
+
+/* The checkbox cell holds its box in the middle of the row whatever the name
+   beside it does. */
+.fi-table td.fi-col-select {
+  text-align: center;
+}
+
+/* A kind glyph before the name: the trailing slash was the only thing telling
+   a folder from a file, and it sits at the far end of a name of any length. */
+.fi-name-cell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.fi-kind {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  color: var(--text-faint);
+}
+
+.fi-kind-dir {
+  color: var(--text-muted);
+}
+
+/* No underline at rest. Every name is a control, so an underline on every one
+   said nothing and striped the column; it comes back under the pointer and on
+   focus, where it answers "this one". The same for the tree and the hits. */
+.fi-table .ui-button-link,
+.fi-tree .ui-button-link,
+.fi-crumbs .ui-button-link,
+.fi-main .ui-rows .ui-button-link {
+  text-decoration: none;
+  min-width: 0;
+}
+
+.fi-table .ui-button-link:has(.fi-entry-dir):hover,
+.fi-table .ui-button-link:focus-visible,
+.fi-tree .ui-button-link:hover,
+.fi-tree .ui-button-link:focus-visible,
+.fi-crumbs .ui-button-link:hover,
+.fi-crumbs .ui-button-link:focus-visible,
+.fi-main .ui-rows .ui-button-link:hover,
+.fi-main .ui-rows .ui-button-link:focus-visible {
+  text-decoration: underline;
+}
+
+/* A file's name is not a link — one click picks its row, two open it — so it
+   neither underlines under the pointer nor shows a hand. A folder's does both:
+   one click goes there. The glyph and the slash already say which is which;
+   the heavier weight folders also wore was a third mark of the same thing. */
+.fi-table .ui-button-link:not(:has(.fi-entry-dir)) {
+  cursor: default;
+}
+
+/* Text, for the reason the tree's labels are: a column in which every name is
+   accent is a column with no hierarchy left, and the link colour said only
+   that a name can be clicked, which every name can. */
 .fi-entry-name {
-  word-break: break-all;
+  display: block;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  text-align: start;
+}
+
+/* In the table a name stays on one line: a wrapped name made its row two
+   lines tall and pushed the checkbox off the name's baseline. The page cuts a
+   long one in the middle, full name in the tooltip and in what is spoken; this
+   end-ellipsis is only the fallback for a column narrower than that cut. */
+.fi-table .fi-entry-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.fi-table td.fi-col-name {
+  max-width: 0;
+}
+
+.fi-rename-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
 }
 
 .fi-rename {
@@ -461,6 +1217,35 @@
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
+}
+
+/* The keys, on screen under the rows. They were only ever in the wrapper's
+   `aria-label`, so the person who most needed them — the one with a keyboard
+   and a screen — never saw them. */
+/* Shown while the keyboard is in the listing, and only then: on screen at every
+   visit they were ten shortcuts for someone reaching for the mouse, and four
+   lines of them at 1000px. `:focus-visible` and not `:focus-within`, so a
+   click on a row does not bring them up. Hidden, they are still the listing's
+   description — `aria-describedby` reads a hidden element. */
+.fi-keys {
+  display: none;
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.fi-table-wrap:has(:focus-visible) .fi-keys,
+.fi-table-wrap:focus-visible .fi-keys {
+  display: block;
+}
+
+.fi-keys kbd {
+  padding: 0 var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
 }
 
 /* =============================================================== search == */
@@ -484,12 +1269,19 @@
   flex: 1 1 16rem;
   min-width: 0;
   color: var(--text-faint);
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 
-.fi-hit-size {
+.fi-hit-size,
+.fi-hit-when {
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
+}
+
+.fi-hit-when {
+  min-width: 5.5rem;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .fi-truncated {
@@ -517,7 +1309,49 @@
   box-shadow: var(--shadow-lg);
 }
 
+.fi-context-group {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Whose verbs the group below holds, when the menu was opened on a selection. */
+.fi-context-caption {
+  max-width: 16rem;
+  padding: var(--space-1) var(--space-2) 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.fi-context-sep {
+  height: 1px;
+  margin: var(--space-1) 0;
+  background: var(--border);
+}
+
+/* Ctrl+Z on the undo button: the key, one rung fainter than the verb. */
+.fi-undo-keys {
+  margin-left: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* The key that does the same from the listing, set to the right of the verb. */
+.fi-context-keys {
+  margin-left: auto;
+  padding-left: var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 .fi-context-item {
+  display: flex;
+  align-items: baseline;
   padding: var(--space-2) var(--space-2);
   text-align: left;
   font-size: var(--text-sm);
@@ -539,6 +1373,12 @@
 
 .fi-context-item-danger {
   color: var(--tone-danger-fg);
+}
+
+/* What Enter and a double-click on the name do, marked as the menu's default the way
+   Explorer marks it. */
+.fi-context-item-default {
+  font-weight: var(--weight-semibold);
 }
 
 /* ================================================================ os drop == */
@@ -563,4 +1403,73 @@
 .fi-drop-refusals {
   margin: 0;
   padding-left: var(--space-4);
+}
+
+/* The name a person sent, beside the one the daemon stored when they differ. */
+.fi-drop-renamed {
+  color: var(--tone-pending-fg);
+}
+
+/* ---------------------------------------------------------- drag, cut -- */
+
+/* The folder a drag would land in: the selection's own rung and a hairline,
+   no hue — nothing here is a signal, only a place. */
+.fi-drop-over {
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+  outline: var(--hairline) solid var(--border-strong);
+  outline-offset: calc(-1 * var(--hairline));
+  border-radius: var(--radius-sm);
+}
+
+/* What the drag carries, and where it would go, beside the pointer. */
+.fi-drag-ghost {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: var(--z-top);
+  max-width: 28rem;
+  overflow: hidden;
+  padding: var(--space-1) var(--space-2);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+body.fi-dragging,
+body.fi-dragging * {
+  cursor: grabbing;
+  user-select: none;
+}
+
+/* Held by a Ctrl+X, as Explorer draws it: there still, and faint. */
+.fi-row-cut {
+  opacity: var(--opacity-quiet);
+}
+
+.fi-cut {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.fi-cut-what {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.fi-move-again {
+  color: var(--text-faint);
 }
