@@ -46,6 +46,11 @@ run() {
   # were printed: rustfmt's diff goes to one and cargo's `error:` to the other. The daemon already
   # reads the two as one stream. The cost: a step that leaves a background process holding its
   # output now holds the gate until that process lets go, since `tee` waits for every writer.
+  # A heavy cargo subcommand takes a build slot (see `slot_run`). It is decided HERE and not written
+  # on each gate line, because the classifier test reads those lines as plain commands.
+  if [ "$1" = cargo ]; then
+    case "$2" in build|check|clippy|test|run|doc) set -- slot_run "$@" ;; esac
+  fi
   ( cd "$dir" && "$@" ) 2>&1 | tee "$capture"
   status="${PIPESTATUS[0]}"
   if [ "$status" -eq 0 ]; then
@@ -82,6 +87,118 @@ print_summary() {
     return 1
   fi
   printf '\nall gates green.\n'
+}
+
+# Build slots: at most NUCLEOS_BUILD_SLOTS (default 2) heavy cargo builds at once, machine-wide.
+# Every session builds nucleos-core in its own CARGO_TARGET_DIR, so nothing else serialises them: on
+# 2026-10-01 nine full builds ran together, saturating the CPU and filling the disk. `flock` is not
+# guaranteed under Git bash, so the lock is portable: one file per holder, `held/<pid>`, and a slot
+# whose pid no longer answers `kill -0` is reaped by the next acquirer (a SIGKILLed holder cannot
+# clean up after itself). A short-lived `mkdir` mutex makes reap-count-claim one atomic step.
+#
+# The logic lives HERE and not in a file this one sources, for the tamper-check reason below;
+# scripts/build-slot.sh is a thin wrapper that sources this file and calls `slot_run`.
+#
+#   NUCLEOS_BUILD_SLOTS_DIR      absolute; default $HOME/.nucleos/build-slots
+#   NUCLEOS_BUILD_SLOTS          integer; default 2; 0 = bypass (run the command directly)
+#   NUCLEOS_BUILD_SLOT_TIMEOUT   seconds to wait for a slot; default 1800; then exit 75
+#   NUCLEOS_BUILD_SLOT_HELD      set by a holder; a nested call under it takes no second slot
+_slot_file=""
+
+slot_release() {
+  [ -n "$_slot_file" ] && rm -f "$_slot_file"
+  _slot_file=""
+}
+
+_slot_holders() {
+  # One "<pid> <cwd>" per live holder, for the waiting message.
+  local f
+  for f in "$1"/held/*; do
+    [ -f "$f" ] || continue
+    printf ' %s %s' "$(basename "$f")" "$(sed -n 3p "$f")"
+  done
+}
+
+_slot_try() {
+  # _slot_try <dir> <n> <command...>: one attempt, under the mutex. 0 = slot claimed.
+  local dir="$1" n="$2" f pid count=0 got=1
+  shift 2
+  if ! mkdir "$dir/.mutex" 2>/dev/null; then
+    pid="$(cat "$dir/.mutex/pid" 2>/dev/null)"
+    if { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; } \
+      || [ -n "$(find "$dir/.mutex" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+      rm -rf "$dir/.mutex"
+      mkdir "$dir/.mutex" 2>/dev/null || return 1
+    else
+      return 1
+    fi
+  fi
+  printf '%s\n' "$BASHPID" > "$dir/.mutex/pid"
+  for f in "$dir"/held/*; do
+    [ -f "$f" ] || continue
+    pid="$(basename "$f")"
+    if kill -0 "$pid" 2>/dev/null; then
+      count=$((count + 1))
+    else
+      rm -f "$f"
+      echo "build-slot: reaped slot of dead pid $pid" >&2
+    fi
+  done
+  if [ "$count" -lt "$n" ]; then
+    printf '%s\n%s\n%s\n%s\n' "$BASHPID" "$(date +%s)" "$(pwd)" "$*" > "$dir/held/$BASHPID"
+    _slot_file="$dir/held/$BASHPID"
+    got=0
+  fi
+  rm -rf "$dir/.mutex"
+  return "$got"
+}
+
+slot_run() {
+  # slot_run <command...>: run it while holding one of N build slots. Never `exec`s: the holder pid
+  # must outlive the command, because that pid is what proves the slot is still in use.
+  local dir="${NUCLEOS_BUILD_SLOTS_DIR:-${HOME:-}/.nucleos/build-slots}"
+  local n="${NUCLEOS_BUILD_SLOTS:-2}" timeout="${NUCLEOS_BUILD_SLOT_TIMEOUT:-1800}"
+  local waited=0 child="" status
+  case "$n" in
+    ''|*[!0-9]*) echo "build-slot: NUCLEOS_BUILD_SLOTS must be a non-negative integer, got '$n'" >&2; return 2 ;;
+  esac
+  case "$timeout" in
+    ''|*[!0-9]*) echo "build-slot: NUCLEOS_BUILD_SLOT_TIMEOUT must be a non-negative integer, got '$timeout'" >&2; return 2 ;;
+  esac
+  case "$dir" in
+    /?*|[A-Za-z]:[/\\]?*) ;;
+    *) echo "build-slot: NUCLEOS_BUILD_SLOTS_DIR must be an absolute path, got '$dir'" >&2; return 2 ;;
+  esac
+  if [ "$n" -eq 0 ] || [ -n "${NUCLEOS_BUILD_SLOT_HELD:-}" ]; then
+    "$@"
+    return $?
+  fi
+  mkdir -p "$dir/held" || return 2
+  until _slot_try "$dir" "$n" "$@"; do
+    if [ "$waited" -ge "$timeout" ]; then
+      echo "build-slot: gave up after ${timeout}s; held by:$(_slot_holders "$dir")" >&2
+      return 75
+    fi
+    if [ $((waited % 60)) -eq 0 ]; then
+      echo "build-slot: waiting for a build slot ($n of $n held:$(_slot_holders "$dir"))" >&2
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  export NUCLEOS_BUILD_SLOT_HELD="$BASHPID"
+  trap slot_release EXIT
+  # The command runs in the background and is waited on: bash defers a trap until a FOREGROUND
+  # child ends, so a TERM would otherwise leave the slot held for as long as the build ran.
+  # `<&0` keeps stdin, which a bare `&` would replace with /dev/null.
+  trap 'kill "$child" 2>/dev/null; slot_release; exit 130' INT
+  trap 'kill "$child" 2>/dev/null; slot_release; exit 143' TERM
+  "$@" <&0 &
+  child=$!
+  wait "$child"
+  status=$?
+  slot_release
+  trap - EXIT INT TERM
+  return "$status"
 }
 
 # Sourced rather than run: stop here, with the functions above defined and no gate started. That is
@@ -219,6 +336,7 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     run "hooks: filter"   . "$py" scripts/test-hook-filter.py
     run "gates: summary"  . "$py" scripts/test-gates-summary.py
     run "gates: own target" . "$py" scripts/test-own-cargo-target.py
+    run "gates: build slot" . "$py" scripts/test-build-slot.py
     run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
     run "eval: promote"   . "$py" scripts/eval/test-promote.py
     run "eval: ingest"    . "$py" scripts/eval/test-ingest.py
