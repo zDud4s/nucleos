@@ -74,6 +74,13 @@ CASES = [
     (f"{G} -c user.name=x push origin master", "push"),
     (f"{G} --git-dir /r/.git fetch origin", "fetch"),
     (f"{G} --no-pager merge feature", "merge"),
+    # Quoted values with spaces, and the `=` spelling.
+    (f'{G} -C "C:/My Repo" push origin master', "push"),
+    (f'{G} -C "C:\\My Repo" push origin master', "push"),
+    (f"{G} -C 'C:/My Repo' -c user.name=x merge feature", "merge"),
+    (f'{G} --git-dir="C:/My Repo/.git" push', "push"),
+    (f'{G} -c "user.name=A B" fetch origin', "fetch"),
+    (f'sh -c "{G} push origin master"', "push"),
     # And the ordinary work of a session, which must stay untouched. A guard that refuses these is
     # a guard someone turns off.
     (f"{G} status", ""),

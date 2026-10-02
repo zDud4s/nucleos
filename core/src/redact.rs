@@ -53,6 +53,8 @@ pub(crate) fn scan_secrets(input: &str) -> Vec<Finding> {
     findings.extend(pem_blocks(input));
     findings.extend(prefixed_tokens(input));
     findings.extend(json_web_tokens(input));
+    findings.extend(bearer_tokens(input));
+    findings.extend(daemon_tokens(input));
     findings.extend(checksummed_numbers(input));
 
     // Earliest first; on a tie the longest wins, so an enclosing block swallows what is inside it.
@@ -88,6 +90,11 @@ fn pem_blocks(input: &str) -> Vec<Finding> {
         let Some(header_end) = input[start..]
             .find("-----\n")
             .or(input[start..].find("-----\r"))
+            // The same line break as JSON writes it: a literal backslash and `n`. A service-account
+            // file read as text carries its key as one line with escaped newlines, and the callers
+            // of this module pass exactly that kind of text.
+            .or(input[start..].find("-----\\n"))
+            .or(input[start..].find("-----\\r"))
         else {
             from = start + BEGIN.len();
             continue;
@@ -123,7 +130,11 @@ fn pem_blocks(input: &str) -> Vec<Finding> {
                 // Past the `-----` that closes the header, not just up to it, or the marker lands
                 // before the dashes and leaves them in the text.
                 let body_start = start + header_end + "-----".len();
-                body_start + base64_body_len(&input[body_start..])
+                if input[body_start..].starts_with('\\') {
+                    body_start + escaped_body_len(&input[body_start..])
+                } else {
+                    body_start + base64_body_len(&input[body_start..])
+                }
             }
         };
 
@@ -136,6 +147,25 @@ fn pem_blocks(input: &str) -> Vec<Finding> {
     }
 
     findings
+}
+
+/// How far an escaped-newline PEM body runs: base64 characters and the two-character escaped
+/// newline / carriage return, which is the shape of a key inside a JSON string. Stops at the first
+/// other character, so the closing quote of the string is left alone.
+fn escaped_body_len(input: &str) -> usize {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' && matches!(bytes.get(index + 1), Some(b'n' | b'r')) {
+            index += 2;
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=') {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    index
 }
 
 /// How far a PEM body runs: consecutive lines made only of base64 characters.
@@ -233,6 +263,8 @@ const PREFIXED: &[(&str, usize, &str)] = &[
     ("xoxa-", 10, "[SECRET:slack]"),
     ("xoxs-", 10, "[SECRET:slack]"),
     ("AIza", 35, "[SECRET:google]"),
+    ("sk_live_", 16, "[SECRET:stripe]"),
+    ("rk_live_", 16, "[SECRET:stripe]"),
 ];
 
 fn prefixed_tokens(input: &str) -> Vec<Finding> {
@@ -267,6 +299,78 @@ fn prefixed_tokens(input: &str) -> Vec<Finding> {
         }
     }
 
+    findings
+}
+
+/// The credential in an `Authorization: Bearer <token>` header. Only the token is replaced, so the
+/// reader still sees that a bearer credential was sent. The length floor keeps the English word
+/// ("bearer of bad news") out.
+fn bearer_tokens(input: &str) -> Vec<Finding> {
+    const MARK: &str = "bearer ";
+    let lower = input.to_ascii_lowercase();
+    let mut findings = Vec::new();
+    let mut from = 0;
+    while let Some(relative) = lower[from..].find(MARK) {
+        let start = from + relative;
+        let tail_start = start + MARK.len();
+        let tail_len = input[tail_start..]
+            .bytes()
+            .take_while(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(b, b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b'-')
+            })
+            .count();
+        let boundary = start == 0
+            || !lower[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_token_character);
+        if boundary && tail_len >= 16 {
+            findings.push(Finding {
+                start: tail_start,
+                end: tail_start + tail_len,
+                label: "[SECRET:bearer]",
+            });
+        }
+        from = tail_start;
+    }
+    findings
+}
+
+/// The daemon's own credentials, as `auth.rs` mints them: `api:<name>.<secret>`,
+/// `team:<id>.<secret>` and `chat:<id>.<secret>`, where the secret is 32 alphanumerics. Matched on
+/// the marker plus the secret's shape; a bare `<id>.<secret>` or `<service>.<secret>` has nothing
+/// recognisable besides the 32-character tail, so it is left to the generic rules.
+fn daemon_tokens(input: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for marker in ["api:", "team:", "chat:"] {
+        let mut from = 0;
+        while let Some(relative) = input[from..].find(marker) {
+            let start = from + relative;
+            let tail_start = start + marker.len();
+            let run: usize = input[tail_start..]
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
+                .count();
+            let candidate = input[tail_start..tail_start + run].trim_end_matches('.');
+            let boundary = start == 0
+                || !input[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_token_character);
+            let secret_ok = candidate.rsplit_once('.').is_some_and(|(_, secret)| {
+                secret.len() >= 32 && secret.bytes().all(|b| b.is_ascii_alphanumeric())
+            });
+            if boundary && secret_ok {
+                findings.push(Finding {
+                    start,
+                    end: tail_start + candidate.len(),
+                    label: "[SECRET:nucleos-token]",
+                });
+            }
+            from = tail_start;
+        }
+    }
     findings
 }
 
@@ -691,6 +795,49 @@ mod tests {
         assert!(redacted.contains("[SECRET:private-key]"), "{redacted:?}");
         assert!(!redacted.contains("MIIEow"), "{redacted:?}");
         assert!(redacted.ends_with("bye"), "{redacted:?}");
+    }
+
+    #[test]
+    fn a_private_key_with_escaped_newlines_is_redacted_whole() {
+        let input = r#"{"private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\nabcDEF123\n-----END PRIVATE KEY-----\n", "x": 1}"#;
+        let redacted = redact_secrets(input);
+        assert!(redacted.contains("[SECRET:private-key]"), "{redacted:?}");
+        assert!(!redacted.contains("MIIEvQ"), "{redacted:?}");
+        assert!(redacted.contains(r#""x": 1"#), "{redacted:?}");
+        let truncated =
+            r#"{"k": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\nabcDEF123", "x": 1}"#;
+        let redacted = redact_secrets(truncated);
+        assert!(!redacted.contains("MIIEvQ"), "{redacted:?}");
+        assert!(redacted.contains(r#"", "x": 1"#), "{redacted:?}");
+    }
+
+    #[test]
+    fn bearer_stripe_and_daemon_tokens_are_redacted() {
+        let r = redact_secrets("Authorization: Bearer abc123DEF456ghi789.jkl-mno");
+        assert_eq!(r, "Authorization: Bearer [SECRET:bearer]");
+        assert_eq!(
+            redact_secrets("the bearer of bad news"),
+            "the bearer of bad news"
+        );
+        let r = redact_secrets("key sk_live_51H8abcdefghijklmnop end");
+        assert_eq!(r, "key [SECRET:stripe] end");
+        assert_eq!(
+            redact_secrets("rk_live_51H8abcdefghijklmnop"),
+            "[SECRET:stripe]"
+        );
+        let secret = "A".repeat(32);
+        for token in [
+            format!("api:deploy-bot.{secret}"),
+            format!("team:12.{secret}"),
+            format!("chat:notes.{secret}"),
+        ] {
+            let r = redact_secrets(&format!("use {token} now"));
+            assert_eq!(r, "use [SECRET:nucleos-token] now", "{token}");
+        }
+        assert_eq!(
+            redact_secrets("api:deploy-bot is a name"),
+            "api:deploy-bot is a name"
+        );
     }
 
     #[test]
