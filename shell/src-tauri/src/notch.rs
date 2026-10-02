@@ -218,6 +218,9 @@ pub fn open(app: &AppHandle) -> tauri::Result<()> {
         .focused(false)
         .visible(false)
         .inner_size(1.0, 1.0)
+        // Same origin as the main window (`useHttpsScheme` in tauri.conf.json): the daemon's CORS
+        // allows `https://tauri.localhost` only, and Tauri 2 defaults to `http://` on Windows.
+        .use_https_scheme(true)
         .build()?;
     // No listener is registered here. The screen changing under this window — a new scale factor, a
     // new resolution, a taskbar that moved — is heard by the app-wide handler in `lib.rs`, which
