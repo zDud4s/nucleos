@@ -161,8 +161,14 @@ async fn derive_integration_branch(
     project_root: &Path,
     deadline: Instant,
 ) -> Result<String, String> {
+    // `origin/HEAD` names a branch on the REMOTE; the landing targets the local one. A clone that
+    // never checked that branch out locally has no `refs/heads/<name>`, and persisting the name
+    // anyway would make every later landing refuse on a branch that was never there — so it counts
+    // only when the local branch exists, and otherwise the local fallbacks below answer.
     if let Some(branch) = crate::git_exec::default_remote_branch(project_root, deadline).await? {
-        return Ok(branch);
+        if crate::git_exec::branch_exists(project_root, &branch, deadline).await? {
+            return Ok(branch);
+        }
     }
     for candidate in ["master", "main"] {
         if crate::git_exec::branch_exists(project_root, candidate, deadline).await? {
@@ -526,6 +532,24 @@ pub fn target_dir_names(branch: &str) -> Vec<String> {
     names
 }
 
+/// `target_dir_names(branch)`, less every name some OTHER local branch also derives.
+///
+/// The last-segment form is shared by construction — `feat/x` and `fix/x` both derive
+/// `.cargo-target-x` — and so is the full form between `feat/x` and a branch literally named
+/// `feat-x`. A directory two live branches could own is neither one's to delete on landing, so it
+/// is left for whoever owns it. `others` is every local branch except the landed one.
+pub fn landed_target_dir_names(branch: &str, others: &[String]) -> Vec<String> {
+    let claimed: std::collections::HashSet<String> = others
+        .iter()
+        .filter(|other| other.as_str() != branch)
+        .flat_map(|other| target_dir_names(other))
+        .collect();
+    target_dir_names(branch)
+        .into_iter()
+        .filter(|name| !claimed.contains(name))
+        .collect()
+}
+
 /// What happened to one candidate directory in `remove_landed_target_dirs`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TargetDirRemoval {
@@ -538,7 +562,8 @@ pub enum TargetDirRemoval {
     Failed(PathBuf, String),
 }
 
-/// Remove the target directories `target_dir_names(branch)` derives, directly under `parent`.
+/// Remove the target directories `landed_target_dir_names(branch, others)` derives, directly under
+/// `parent`.
 ///
 /// **Blocking, and it never panics.** Every candidate is checked before anything is deleted: it
 /// must exist, must not be a symlink or (on Windows) a reparse point such as a junction — so a link
@@ -546,8 +571,12 @@ pub enum TargetDirRemoval {
 /// once both it and `parent` are canonicalised it must be a direct child of `parent` carrying
 /// exactly the derived name. Anything else is `Skipped` with its reason, and a failed delete is
 /// `Failed`, never an error that propagates.
-pub fn remove_landed_target_dirs(parent: &Path, branch: &str) -> Vec<TargetDirRemoval> {
-    target_dir_names(branch)
+pub fn remove_landed_target_dirs(
+    parent: &Path,
+    branch: &str,
+    others: &[String],
+) -> Vec<TargetDirRemoval> {
+    landed_target_dir_names(branch, others)
         .into_iter()
         .map(|name| remove_one_target_dir(parent, &name))
         .collect()
@@ -595,6 +624,33 @@ fn remove_one_target_dir(parent: &Path, name: &str) -> TargetDirRemoval {
     }
 }
 
+/// PURE: whether a merge of `source` may clean up target directories at all, and if so every OTHER
+/// local branch, for `landed_target_dir_names`. `refs` is `git_exec::branch_refs`' answer.
+///
+/// `None` unless `source` is a local branch (`refs/heads/<source>`) that is not also a
+/// remote-tracking name: merging `origin/master` into `master` lands nobody's work-in-progress, and
+/// its last segment `master` would otherwise derive `.cargo-target-master`.
+pub fn cleanup_others(source: &str, refs: &[String]) -> Option<Vec<String>> {
+    let local: Vec<&str> = refs
+        .iter()
+        .filter_map(|reference| reference.strip_prefix("refs/heads/"))
+        .collect();
+    let remote_tracking = refs
+        .iter()
+        .filter_map(|reference| reference.strip_prefix("refs/remotes/"))
+        .any(|name| name == source);
+    if !local.contains(&source) || remote_tracking {
+        return None;
+    }
+    Some(
+        local
+            .into_iter()
+            .filter(|branch| *branch != source)
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
 /// After a landing succeeded, drop the landed branch's per-branch cargo target directory.
 ///
 /// **Best-effort and fully detached.** This returns at once: the whole body, including the
@@ -629,13 +685,28 @@ pub fn clean_after_landing(pool: &sqlx::SqlitePool, claimed: &crate::vcs::Claime
         if target.as_str() != integration.as_str() || source.as_str() == integration.as_str() {
             return;
         }
+        let refs = match crate::git_exec::branch_refs(
+            project_root,
+            Instant::now() + crate::git_exec::OPERATION_TIMEOUT,
+        )
+        .await
+        {
+            Ok(refs) => refs,
+            Err(reason) => {
+                tracing::warn!(%reason, "land: could not list the branches; no target directory cleanup");
+                return;
+            }
+        };
+        let Some(others) = cleanup_others(source.as_str(), &refs) else {
+            return;
+        };
         let Some(parent) = project_root.parent() else {
             return;
         };
         let parent = parent.to_path_buf();
         let branch = source.as_str().to_string();
         drop(tokio::task::spawn_blocking(move || {
-            for result in remove_landed_target_dirs(&parent, &branch) {
+            for result in remove_landed_target_dirs(&parent, &branch, &others) {
                 match result {
                     TargetDirRemoval::Removed(path) => {
                         tracing::info!(path = %path.display(), "land: removed the landed branch's target directory");
@@ -1472,6 +1543,90 @@ mod tests {
         assert!(summary.contains("nucleos/run-77"), "{summary}");
     }
 
+    /// `feat/x` and `fix/x` both derive `.cargo-target-x`; landing one must not take the other's.
+    #[test]
+    fn a_target_dir_name_another_branch_derives_is_not_the_landed_branchs_to_delete() {
+        assert_eq!(
+            landed_target_dir_names("feat/x", &[]),
+            vec![".cargo-target-feat-x", ".cargo-target-x"]
+        );
+        assert_eq!(
+            landed_target_dir_names("feat/x", &["fix/x".to_owned(), "master".to_owned()]),
+            vec![".cargo-target-feat-x"]
+        );
+        // The full form collides too, with a branch literally spelled with a dash.
+        assert_eq!(
+            landed_target_dir_names("feat/x", &["feat-x".to_owned()]),
+            vec![".cargo-target-x"]
+        );
+
+        let parent = tempfile::tempdir().expect("tempdir");
+        for name in [".cargo-target-feat-x", ".cargo-target-x"] {
+            std::fs::create_dir(parent.path().join(name)).expect("create target dir");
+        }
+        remove_landed_target_dirs(parent.path(), "feat/x", &["fix/x".to_owned()]);
+        assert!(!parent.path().join(".cargo-target-feat-x").exists());
+        assert!(
+            parent.path().join(".cargo-target-x").exists(),
+            "landing feat/x deleted the directory fix/x also derives"
+        );
+    }
+
+    /// Only a local branch that is not a remote-tracking name may trigger a cleanup: merging
+    /// `origin/master` would otherwise derive `.cargo-target-master`.
+    #[test]
+    fn a_merge_of_a_remote_tracking_branch_cleans_up_nothing() {
+        let refs: Vec<String> = [
+            "refs/heads/master",
+            "refs/heads/feat/x",
+            "refs/heads/fix/x",
+            "refs/remotes/origin/master",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(cleanup_others("origin/master", &refs), None);
+        assert_eq!(cleanup_others("gone/branch", &refs), None);
+        assert_eq!(
+            cleanup_others("feat/x", &refs),
+            Some(vec!["master".to_owned(), "fix/x".to_owned()])
+        );
+    }
+
+    /// `origin/HEAD` names a remote branch; one with no local counterpart must not be persisted as
+    /// the integration branch, or every landing refuses on a branch that never existed here.
+    #[tokio::test]
+    async fn an_origin_head_without_a_local_branch_falls_back_to_master() {
+        let container = crate::git_exec::tests::space_free_tempdir("nucleos-land-originhead-");
+        let repo = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&repo);
+        assert!(git_in(&repo, &["branch", "-M", "master"]));
+        assert!(git_in(
+            &repo,
+            &["update-ref", "refs/remotes/origin/trunk", "HEAD"]
+        ));
+        assert!(git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk"
+            ]
+        ));
+
+        assert_eq!(
+            derive_integration_branch(&repo, deadline()).await,
+            Ok("master".to_owned())
+        );
+
+        // The control: once the local branch exists, origin/HEAD wins as before.
+        assert!(git_in(&repo, &["branch", "trunk"]));
+        assert_eq!(
+            derive_integration_branch(&repo, deadline()).await,
+            Ok("trunk".to_owned())
+        );
+    }
+
     #[test]
     fn target_dir_names_follow_the_branch() {
         assert_eq!(
@@ -1532,7 +1687,7 @@ mod tests {
             std::fs::write(dir.join("sentinel"), "x").unwrap();
         }
 
-        let results = remove_landed_target_dirs(parent.path(), "feat/x");
+        let results = remove_landed_target_dirs(parent.path(), "feat/x", &[]);
 
         assert!(
             results
@@ -1549,7 +1704,7 @@ mod tests {
     #[test]
     fn an_absent_target_dir_is_a_quiet_no_op() {
         let parent = crate::git_exec::tests::space_free_tempdir("nucleos-target-absent-");
-        let results = remove_landed_target_dirs(parent.path(), "feat/x");
+        let results = remove_landed_target_dirs(parent.path(), "feat/x", &[]);
         assert_eq!(results.len(), 2);
         assert!(
             results
@@ -1560,7 +1715,7 @@ mod tests {
         // A plain file at the derived name is refused, not deleted.
         let file = parent.path().join(".cargo-target-feat-x");
         std::fs::write(&file, "not a directory").unwrap();
-        let results = remove_landed_target_dirs(parent.path(), "feat/x");
+        let results = remove_landed_target_dirs(parent.path(), "feat/x", &[]);
         assert!(
             results
                 .iter()
@@ -1591,7 +1746,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
 
-        let results = remove_landed_target_dirs(parent.path(), "feat/x");
+        let results = remove_landed_target_dirs(parent.path(), "feat/x", &[]);
 
         assert!(
             results
