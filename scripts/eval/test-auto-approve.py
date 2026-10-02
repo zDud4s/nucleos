@@ -27,6 +27,16 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
+# The approver is handed seconds of work and finishes in about one. This ceiling is not for slow
+# machines; it is for the approver never returning at all. Sandbox spike 0a hit exactly that: with
+# the stub's listener outside the permitted port range the connect was refused, nothing in the
+# approver treated that as an error, and the run sat silent until the runner's own 15-minute
+# ceiling killed it. The other 87 ephemeral-port sites in this repo fail with an exit code somebody
+# can read; this one printed nothing at all. A test that hangs instead of failing is a defect on
+# its own terms, whatever is decided about the port range. Raise it with the environment variable
+# when a machine genuinely needs longer.
+TIMEOUT_S = float(os.environ.get("NUCLEOS_APPROVE_TEST_TIMEOUT", "60"))
+
 # One of each thing the filter has to tell apart: the run we asked about, another run entirely, a
 # different KIND sharing the same table, one already decided, and one that cannot be decided at all.
 PROPOSALS = [
@@ -90,16 +100,33 @@ def main() -> int:
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     log = os.path.join(tempfile.mkdtemp(prefix="nucleos-approve-"), "approvals.jsonl")
-    result = subprocess.run(
-        [sys.executable, os.path.join(ROOT, "scripts/eval/auto-approve.py"),
-         "--run", "111", "--daemon-url", f"http://127.0.0.1:{port}",
-         "--until-idle", "1", "--interval", "0.1", "--log", log],
-        capture_output=True, text=True, cwd=ROOT,
-        # The stub never looks at the Authorization header, but the approver reads a token before
-        # it does anything at all, and reads it out of a built daemon. Handing it one here is what
-        # keeps this test hermetic — see control_token in auto-approve.py.
-        env={**os.environ, "NUCLEOS_DAEMON_TOKEN": "stub"},
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "scripts/eval/auto-approve.py"),
+             "--run", "111", "--daemon-url", f"http://127.0.0.1:{port}",
+             "--until-idle", "1", "--interval", "0.1", "--log", log],
+            capture_output=True, text=True, cwd=ROOT,
+            # The stub never looks at the Authorization header, but the approver reads a token
+            # before it does anything at all, and reads it out of a built daemon. Handing it one
+            # here is what keeps this test hermetic — see control_token in auto-approve.py.
+            env={**os.environ, "NUCLEOS_DAEMON_TOKEN": "stub"},
+            timeout=TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as expired:
+        server.shutdown()
+        # Print enough to tell the two causes apart. An approver stuck in its own poll loop and an
+        # approver that cannot reach the stub at all look identical from out here, and which one it
+        # is decides where to look next: whether any POST arrived is the discriminator.
+        print(f"FAIL the approver did not return within {TIMEOUT_S:g}s and was killed")
+        print(f"     stub was listening on 127.0.0.1:{port}; "
+              f"proposals it saw answered: {approved or 'none'}")
+        for name in ("stdout", "stderr"):
+            captured = getattr(expired, name) or ""
+            if isinstance(captured, bytes):
+                captured = captured.decode("utf-8", errors="replace")
+            if captured.strip():
+                print(f"     {name} tail: {captured.strip()[-400:]}")
+        return 1
     server.shutdown()
 
     print(result.stdout.strip())
