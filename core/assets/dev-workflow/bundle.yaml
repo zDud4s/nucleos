@@ -101,10 +101,12 @@ owns:
   - .ai/scripts/test_ledger_schema.py
   - .ai/scripts/test_resolve_speed.py
   - .ai/scripts/test_todos_parser.py
+  - .ai/scripts/test_wave_engine.py
   - .ai/scripts/test_wave_lease.py
   - .ai/scripts/todos_parser.py
   - .ai/scripts/triage_check.py
   - .ai/scripts/usage_audit.py
+  - .ai/scripts/wave_engine.py
   - .ai/scripts/wave_lease.py
   # The nine tools F5 relocates out of the product's own `scripts/` (workflow-only: packet gates,
   # cross-tool usage accounting, the context-ceiling status line, session-path auditing). Listed
