@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     http::{Method, StatusCode, header},
     middleware::Next,
     response::Response,
@@ -427,6 +427,32 @@ const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
 /// fail somewhere other than production.
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
+    grants(scope, method, path, Target::Path)
+}
+
+/// PURE: whether `scope` may perform `method` on the route TEMPLATE axum actually dispatched to.
+///
+/// This is what the middleware asks, and it is stricter than `permits`. A concrete path cannot
+/// tell `/assistant/chats` (a route of its own) from `/assistant/{turn_id}` called with the turn id
+/// `chats`: both are two segments, and a `{param}` in a table matched any non-empty one — so a key
+/// granted the read of one turn also reached every literal sibling of it (the conversation list,
+/// the search, the IDE sessions), and a council or team key holding `/runs/{id}` reached
+/// `/runs/awaiting-approval`. The template the router chose carries no such ambiguity: a `{param}`
+/// in a table matches only a `{param}` in the template, and a literal only the same literal.
+pub(crate) fn permits_route(scope: &Scope, method: &Method, route: &str) -> bool {
+    grants(scope, method, route, Target::Route)
+}
+
+/// What the string handed to `grants` is: a request path as a client sent it, or the template of
+/// the route the router matched it to.
+#[derive(Clone, Copy)]
+enum Target {
+    Path,
+    Route,
+}
+
+fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
+    let listed = |routes: &[(Method, &str)]| route_is_listed_as(routes, method, path, target);
     match scope {
         Scope::Control => true,
         Scope::Run(_) => {
@@ -436,25 +462,43 @@ pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
                     || path == POSTTOOLUSE_ROUTE
                     || path == FINDING_ROUTE)
         }
-        Scope::Service(Service::Email) => route_is_listed(EMAIL_ROUTES, method, path),
-        Scope::Service(Service::Council) => route_is_listed(COUNCIL_ROUTES, method, path),
-        Scope::TeamRun(_) => route_is_listed(TEAM_ROUTES, method, path),
-        Scope::ApiToken(ApiTokenLevel::ReadOnly) => route_is_listed(READ_ONLY_ROUTES, method, path),
+        Scope::Service(Service::Email) => listed(EMAIL_ROUTES),
+        Scope::Service(Service::Council) => listed(COUNCIL_ROUTES),
+        Scope::TeamRun(_) => listed(TEAM_ROUTES),
+        Scope::ApiToken(ApiTokenLevel::ReadOnly) => listed(READ_ONLY_ROUTES),
         Scope::ApiToken(ApiTokenLevel::RunCreating) => {
-            route_is_listed(READ_ONLY_ROUTES, method, path)
-                || route_is_listed(RUN_CREATING_ROUTES, method, path)
+            listed(READ_ONLY_ROUTES) || listed(RUN_CREATING_ROUTES)
         }
         Scope::ApiToken(ApiTokenLevel::Admin) => true,
     }
 }
 
+/// Whether a concrete path is listed. The tests' table assertions ask this, the loosest reading,
+/// so an absence they assert holds under the stricter template reading as well.
+#[cfg(test)]
 fn route_is_listed(routes: &[(Method, &str)], method: &Method, path: &str) -> bool {
-    routes
-        .iter()
-        .any(|(allowed, pattern)| allowed == method && path_matches(pattern, path))
+    route_is_listed_as(routes, method, path, Target::Path)
 }
 
-fn path_matches(pattern: &str, path: &str) -> bool {
+fn route_is_listed_as(
+    routes: &[(Method, &str)],
+    method: &Method,
+    path: &str,
+    target: Target,
+) -> bool {
+    routes
+        .iter()
+        .any(|(allowed, pattern)| allowed == method && path_matches(pattern, path, target))
+}
+
+fn is_param(segment: &str) -> bool {
+    segment.starts_with('{') && segment.ends_with('}')
+}
+
+/// Segment by segment. Against a concrete path a `{param}` takes any non-empty value; against a
+/// route template it takes only another `{param}`, so a literal sibling route never borrows the
+/// grant of the parameterised one.
+fn path_matches(pattern: &str, path: &str, target: Target) -> bool {
     let mut pattern = pattern.trim_matches('/').split('/');
     let mut actual = path.trim_matches('/').split('/');
 
@@ -463,9 +507,11 @@ fn path_matches(pattern: &str, path: &str) -> bool {
             (None, None) => return true,
             (Some(expected), Some(found))
                 if expected == found
-                    || (expected.starts_with('{')
-                        && expected.ends_with('}')
-                        && !found.is_empty()) => {}
+                    || (is_param(expected)
+                        && match target {
+                            Target::Path => !found.is_empty(),
+                            Target::Route => is_param(found),
+                        }) => {}
             _ => return false,
         }
     }
@@ -828,7 +874,14 @@ pub async fn require_token(
     // 403 rather than 401: the caller authenticated, it is simply not allowed here. Warned rather
     // than silently refused, because a run reaching for a control route is the exact signature of
     // the thing this scope exists to stop, and it should be visible when it happens.
-    if !permits(&scope, req.method(), req.uri().path()) {
+    // Graded against the route the router chose, not the path the client typed: see
+    // `permits_route` for the over-grant the raw path allowed. A request that matched no route has
+    // no template and falls back to its path — it is headed for a 404 either way.
+    let allowed = match req.extensions().get::<MatchedPath>() {
+        Some(matched) => permits_route(&scope, req.method(), matched.as_str()),
+        None => permits(&scope, req.method(), req.uri().path()),
+    };
+    if !allowed {
         tracing::warn!(
             ?scope,
             method = %req.method(),
@@ -946,6 +999,13 @@ mod tests {
             .route("/presets/{id}/run", post(|| async {}))
             .route("/assistant/message", post(|| async {}))
             .route("/assistant/{turn_id}", get(|| async {}))
+            // Literal siblings of `/assistant/{turn_id}` and `/runs/{id}`, mounted so the tests that
+            // they do NOT inherit the parameterised grant are answered by `require_token` rather
+            // than by the router not knowing the path.
+            .route("/assistant/chats", get(|| async {}))
+            .route("/assistant/search", get(|| async {}))
+            .route("/assistant/ide-sessions", get(|| async {}))
+            .route("/runs/awaiting-approval", get(|| async {}))
             .route("/proposals", get(|| async {}))
             // A stand-in for the real gate route: these tests are about who may reach it, and the
             // path is what `permits` matches on.
@@ -1622,6 +1682,96 @@ mod tests {
             status_of(&app, "POST", "/route/report", &token).await,
             StatusCode::FORBIDDEN
         );
+    }
+
+    /// Against a route template a `{param}` grant covers only the parameterised route, never a
+    /// literal sibling the router dispatches separately.
+    #[test]
+    fn a_param_grant_does_not_cover_a_literal_sibling_route() {
+        let reader = Scope::ApiToken(ApiTokenLevel::ReadOnly);
+        assert!(permits_route(&reader, &Method::GET, "/assistant/{turn_id}"));
+        for sibling in [
+            "/assistant/chats",
+            "/assistant/search",
+            "/assistant/ide-sessions",
+            "/assistant/local-model",
+            "/assistant/models",
+            "/assistant/tools",
+            "/assistant/commands",
+        ] {
+            assert!(
+                !permits_route(&reader, &Method::GET, sibling),
+                "GET {sibling} must not borrow the grant of /assistant/{{turn_id}}"
+            );
+        }
+
+        let council = Scope::Service(Service::Council);
+        let team = Scope::TeamRun("run-1".to_owned());
+        assert!(permits_route(&council, &Method::GET, "/runs/{id}"));
+        assert!(!permits_route(
+            &council,
+            &Method::GET,
+            "/runs/awaiting-approval"
+        ));
+        for scope in [&council, &team] {
+            assert!(permits_route(scope, &Method::GET, "/email/{id}"));
+            assert!(!permits_route(scope, &Method::GET, "/email/cursor"));
+        }
+        // The parameter's name is not part of the grant: only its position is.
+        assert!(permits_route(&reader, &Method::GET, "/runs/{run_id}"));
+    }
+
+    /// The same, through the real middleware: what reaches `require_token` is the template axum
+    /// chose, so the literal siblings are refused while the parameterised routes still answer.
+    #[tokio::test]
+    async fn a_param_grant_does_not_reach_a_literal_sibling_over_http() {
+        let state = test_state("control-token").await;
+        let reader = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let council = mint_service_token(&state.pool, Service::Council)
+            .await
+            .unwrap();
+        let team = live_team_run_with_token(&state, "run-1").await;
+        let app = protected_router(state);
+
+        assert_eq!(
+            status_of(&app, "GET", "/assistant/42", &reader).await,
+            StatusCode::OK
+        );
+        for sibling in [
+            "/assistant/chats",
+            "/assistant/search",
+            "/assistant/ide-sessions",
+        ] {
+            assert_eq!(
+                status_of(&app, "GET", sibling, &reader).await,
+                StatusCode::FORBIDDEN,
+                "{sibling} is not a turn"
+            );
+        }
+        // Listed in its own right for the read-only key, so that one still answers.
+        assert_eq!(
+            status_of(&app, "GET", "/runs/awaiting-approval", &reader).await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            status_of(&app, "GET", "/runs/7", &council).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(&app, "GET", "/runs/awaiting-approval", &council).await,
+            StatusCode::FORBIDDEN
+        );
+        for key in [&council, &team] {
+            assert_eq!(
+                status_of(&app, "GET", "/email/7", key).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                status_of(&app, "GET", "/email/cursor", key).await,
+                StatusCode::FORBIDDEN
+            );
+        }
     }
 
     /// §11 item 9, asked of a real token through the real middleware rather than of `permits`.

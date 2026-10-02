@@ -954,10 +954,12 @@ pub fn build_router(state: AppState) -> Router {
         // gives `Scope::Run` this route beside the two above for the same reason it gives it those:
         // one run, asking about one tool call of its own.
         .route("/hooks/posttooluse", post(posttooluse_outcome))
-        // The same gate for the sessions nobody launched. It is `Scope::Control` only, and by
-        // construction rather than by a list: `permits` gives `Control` everything and answers every
-        // other scope from an allowlist, so a route absent from all of them is reachable by the
-        // control token alone. `Scope::Run` must never arrive here — a run has its own route, whose
+        // The same gate for the sessions nobody launched. It is in no scope's table, by construction
+        // rather than by a list: `permits` gives `Control` and an Admin API key everything and
+        // answers every other scope from an allowlist, so a route absent from all of them is
+        // reachable by the control token and an Admin key only — the same reach every other
+        // unlisted route has (`an_admin_api_key_reaches_everything_control_reaches` holds Admin to
+        // exactly that). `Scope::Run` must never arrive here — a run has its own route, whose
         // handler checks the claimed run against the token, and this one has no run to check.
         .route(
             "/hooks/session-git-decision",
@@ -7320,11 +7322,12 @@ async fn post_project_command_run(
     // that disconnects mid-request drops this future, and a drop landing between the two would
     // leave a row saying `running` with nothing running.
     let claimed = uncancellable(async move {
-        if !crate::project_commands::mark_running(&pool, &project_id, command_id)
-            .await
-            .unwrap_or(false)
-        {
-            return false;
+        // A failed claim is a storage error, not a command already running: reporting it as
+        // `already_running` would send the owner looking for a second click that never happened.
+        match crate::project_commands::mark_running(&pool, &project_id, command_id).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(error) => return Err(error),
         }
         tokio::spawn(async move {
             // **The reference is the same directory the command runs in, on purpose.**
@@ -7334,14 +7337,26 @@ async fn post_project_command_run(
             // the same path makes the check a no-op by construction rather than by luck. Passing
             // the project root instead would compare a subdirectory's scripts against paths that
             // do not exist there and report a tamper that never happened.
-            let outcome = crate::gate::run_gate(
-                &cwd,
-                &cwd,
-                &text,
-                crate::project_commands::COMMAND_TIMEOUT,
-            )
+            //
+            // In a task of its own, awaited here, so a panic inside the measurement still reaches
+            // `finish` below. Without that the row would say `running` until the next restart,
+            // and the conditional claim above would refuse every later click as `already_running`.
+            let measured = tokio::spawn(async move {
+                crate::gate::run_gate(&cwd, &cwd, &text, crate::project_commands::COMMAND_TIMEOUT)
+                    .await
+            })
             .await;
-            let finished = crate::project_commands::verdict(pass, outcome);
+            let finished = match measured {
+                Ok(outcome) => crate::project_commands::verdict(pass, outcome),
+                Err(error) => {
+                    tracing::error!(%error, command_id, "a project command's task ended without a result");
+                    crate::project_commands::Finished {
+                        outcome: crate::project_commands::Outcome::Errored,
+                        exit_code: None,
+                        output: Some(format!("the command's task ended without a result: {error}")),
+                    }
+                }
+            };
             let said = match finished.outcome {
                 crate::project_commands::Outcome::Passed => format!("{name} passed"),
                 crate::project_commands::Outcome::Failed => match finished.exit_code {
@@ -7360,10 +7375,14 @@ async fn post_project_command_run(
             let _ = crate::feed::append(&pool, Some(&project_id), "command_finished", &said, None, None)
                 .await;
         });
-        true
+        Ok(true)
     })
     .await
-    .map_err(|status| refusal(status, "internal"))?;
+    .map_err(|status| refusal(status, "internal"))?
+    .map_err(|error: sqlx::Error| {
+        tracing::warn!(%error, command_id, "claiming a project command failed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
 
     if !claimed {
         return Err(refusal(StatusCode::CONFLICT, "already_running"));
@@ -11713,27 +11732,43 @@ async fn post_local_model_pull(
     };
 
     let model = body.model;
+    // The download in a task of its own, awaited by this one, so a panic inside it still closes
+    // the slot. A slot left with no outcome reads as `pull_in_flight` to every later request, and
+    // nothing short of a restart would ever clear it.
     tokio::spawn(async move {
-        let outcome = crate::capabilities::pull_local_model(
-            ollama_pull_client(),
-            crate::runner::OLLAMA_BASE_URL,
-            &model,
-            |frame| {
-                if let Ok(mut slot) = LOCAL_PULL.lock()
-                    && let Some(pull) = slot.as_mut()
-                {
-                    pull.status = frame.status;
-                    pull.completed = frame.completed;
-                    pull.total = frame.total;
-                }
-            },
-        )
-        .await;
-        if let Ok(mut slot) = LOCAL_PULL.lock()
-            && let Some(pull) = slot.as_mut()
-        {
+        let outcome = tokio::spawn(async move {
+            crate::capabilities::pull_local_model(
+                ollama_pull_client(),
+                crate::runner::OLLAMA_BASE_URL,
+                &model,
+                |frame| {
+                    if let Ok(mut slot) = LOCAL_PULL.lock()
+                        && let Some(pull) = slot.as_mut()
+                    {
+                        pull.status = frame.status;
+                        pull.completed = frame.completed;
+                        pull.total = frame.total;
+                    }
+                },
+            )
+            .await
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "the local model download's task ended without a result");
+            Err(format!("the download ended without a result: {error}"))
+        });
+        // A panic inside the progress callback poisons the lock while holding it; the slot it
+        // guards is still whole, so it is taken back and the poison cleared rather than leaving
+        // every later request on `pull_state_poisoned`.
+        let mut slot = LOCAL_PULL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pull) = slot.as_mut() {
             pull.outcome = Some(outcome);
         }
+        drop(slot);
+        LOCAL_PULL.clear_poison();
     });
 
     Ok((StatusCode::ACCEPTED, Json(pull_readout(&started))))
@@ -24234,6 +24269,34 @@ mod tests {
         let (status, refused) = run_command(state.clone(), "alpha", command_id).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(refused["refusal"], "already_running");
+    }
+
+    /// A claim the database could not make is a 500, not a `409 already_running`: nothing is
+    /// running, and saying so would send the owner looking for a second click.
+    #[tokio::test]
+    async fn a_claim_the_database_refuses_is_an_error_not_already_running() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let (_, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "version", "command": "git --version" }),
+        )
+        .await;
+        let command_id = body["id"].as_i64().unwrap();
+
+        // The read before the claim still works; only the claim's UPDATE fails.
+        sqlx::query(
+            "CREATE TRIGGER refuse_claim BEFORE UPDATE ON project_commands
+             BEGIN SELECT RAISE(ABORT, 'storage refused'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (status, refused) = run_command(state.clone(), "alpha", command_id).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(refused["refusal"], "internal");
     }
 
     /// Another project's id does not reach this project's command, and a command that is not there
