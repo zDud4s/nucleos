@@ -665,8 +665,9 @@
   white-space: nowrap;
 }
 
+/* A step brighter than the faint labels, not cyan: DESIGN.md keeps Signal Cyan for links. */
 .runs-event-tool .runs-event-label {
-  color: var(--accent);
+  color: var(--text-muted);
 }
 
 .runs-event-error .runs-event-label {
