@@ -377,6 +377,9 @@ console.log("\npreview: " + origin + "\n");
 const SHOTS_TO_TAKE = [
   ["01-console-dark", { path: "/teams" }],
   ["02-console-light", { path: "/teams", theme: "light" }],
+  /* The create form, opened as a dialog over the console rather than pushed in above it. */
+  ["02a-console-new-team", { path: "/teams", press: "New team" }],
+  ["02b-console-new-team-light", { path: "/teams", press: "New team", theme: "light" }],
   ["03-bench-work", { path: "/teams/financas" }],
   ["04-bench-decisions", { path: "/teams/financas", tab: "Decisions" }],
   ["05-bench-routines", { path: "/teams/financas", tab: "Routines" }],

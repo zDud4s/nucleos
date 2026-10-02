@@ -29,14 +29,6 @@ import {
   DropdownMenuTrigger,
 } from "../ui/vendor/dropdown-menu";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "../ui/vendor/dialog";
-import {
   ArrowUp,
   ChevronDown,
   ImagePlus,
@@ -136,6 +128,7 @@ import type { LocalPull, ModelChoice } from "../data/chats";
 import {
   Button,
   ConfirmButton,
+  Modal,
   CopyButton,
   CostLine,
   ErrorNote,
@@ -3050,17 +3043,31 @@ function ChatInstructions({
   }, [open, saved]);
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="chats-helpers">
-        <DialogHeader>
-          <DialogTitle>Standing instructions</DialogTitle>
-          <DialogDescription>
-            Added to what this conversation's model is already told — on every
-            turn, not just the first. Nothing here replaces the model's own
-            instructions.
-          </DialogDescription>
-        </DialogHeader>
-
+    <Modal
+      open={open}
+      onOpenChange={onOpenChange}
+      size="md"
+      title="Standing instructions"
+      description="Added to what this conversation's model is already told — on every turn, not just the first. Nothing here replaces the model's own instructions."
+      footer={
+        <Button
+          variant="approve"
+          disabled={patch.isPending}
+          onClick={() =>
+            patch.mutate(
+              // Blank goes as an explicit `null`. `undefined` would be dropped by
+              // `JSON.stringify` and read as "leave it alone", which is the one thing emptying
+              // the box is not.
+              { chatId, system_prompt: draft.trim() === "" ? null : draft },
+              { onSuccess: () => onOpenChange(false) },
+            )
+          }
+        >
+          Save
+        </Button>
+      }
+    >
+      <div className="chats-helpers">
         <label className="chats-helper-field">
           <span>Instructions</span>
           <textarea
@@ -3070,27 +3077,9 @@ function ChatInstructions({
             placeholder="Answer in European Portuguese. Prefer the smallest correct change."
           />
         </label>
-
-        <DialogFooter>
-          <Button
-            variant="approve"
-            disabled={patch.isPending}
-            onClick={() =>
-              patch.mutate(
-                // Blank goes as an explicit `null`. `undefined` would be dropped by
-                // `JSON.stringify` and read as "leave it alone", which is the one thing emptying
-                // the box is not.
-                { chatId, system_prompt: draft.trim() === "" ? null : draft },
-                { onSuccess: () => onOpenChange(false) },
-              )
-            }
-          >
-            Save
-          </Button>
-        </DialogFooter>
         {patch.isError && <HelperRefusal error={patch.error} />}
-      </DialogContent>
-    </Dialog>
+      </div>
+    </Modal>
   );
 }
 
@@ -3425,16 +3414,30 @@ function ChatHelpers({
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="chats-helpers">
-        <DialogHeader>
-          <DialogTitle>Helpers</DialogTitle>
-          <DialogDescription>
-            Work this conversation can hand off. These are added to any the
-            project already defines — they never hide them.
-          </DialogDescription>
-        </DialogHeader>
-
+    <Modal
+      open={open}
+      onOpenChange={onOpenChange}
+      size="md"
+      title="Helpers"
+      description="Work this conversation can hand off. These are added to any the project already defines — they never hide them."
+      footer={
+        <>
+          <Button
+            onClick={() => setDraft((current) => [...current, blankHelper()])}
+          >
+            Add a helper
+          </Button>
+          <Button
+            variant="approve"
+            disabled={!ready || patch.isPending}
+            onClick={save}
+          >
+            Save
+          </Button>
+        </>
+      }
+    >
+      <div className="chats-helpers">
         {draft.length === 0 && (
           <p className="chats-helpers-none">
             None yet. A helper is a name, what it is for, and the instructions
@@ -3553,23 +3556,9 @@ function ChatHelpers({
           ))}
         </ul>
 
-        <DialogFooter>
-          <Button
-            onClick={() => setDraft((current) => [...current, blankHelper()])}
-          >
-            Add a helper
-          </Button>
-          <Button
-            variant="approve"
-            disabled={!ready || patch.isPending}
-            onClick={save}
-          >
-            Save
-          </Button>
-        </DialogFooter>
         {patch.isError && <HelperRefusal error={patch.error} />}
-      </DialogContent>
-    </Dialog>
+      </div>
+    </Modal>
   );
 }
 

@@ -2055,11 +2055,6 @@
 .chats-helpers {
   display: grid;
   gap: var(--space-4);
-  width: min(42rem, calc(100vw - var(--space-6)));
-  /* The list scrolls, the header and the footer do not: Save has to stay
-     reachable with six helpers open, and a dialog taller than the window is one
-     whose only button is below the fold. */
-  max-height: min(46rem, calc(100vh - var(--space-7)));
 }
 
 .chats-helpers-none {
@@ -2073,8 +2068,6 @@
   gap: var(--space-4);
   margin: 0;
   padding: 0;
-  overflow-y: auto;
-  overscroll-behavior: none;
   list-style: none;
 }
 

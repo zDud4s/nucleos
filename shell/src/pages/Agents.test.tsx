@@ -127,18 +127,16 @@ async function afterDwell(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 350));
 }
 
-/** Open the create panel, which is closed until somebody asks for it. */
+/** Open the create dialog, which is closed until somebody asks for it. */
 async function openCreate(): Promise<HTMLElement> {
   fireEvent.click(await screen.findByRole("button", { name: "New agent" }));
-  return (await screen.findByRole("heading", { level: 2, name: "New agent" })).closest("section") as HTMLElement;
+  return screen.findByRole("dialog", { name: "New agent" });
 }
 
-/** Select a row, which is what opens the one editor on the page. */
+/** Select a row, which is what opens the one editor dialog on the page. */
 async function openEditor(name: string): Promise<HTMLElement> {
   fireEvent.click(await screen.findByRole("button", { name }));
-  return (await screen.findByRole("heading", { level: 2, name: `Editing ${name}` })).closest(
-    "section",
-  ) as HTMLElement;
+  return screen.findByRole("dialog", { name: `Editing ${name}` });
 }
 
 /* ------------------------------------------------------------ the shape -- */
@@ -150,7 +148,7 @@ describe("Agents - the shape of the page", () => {
 
     await screen.findByRole("button", { name: "copywriter" });
     expect(screen.queryByLabelText("Name")).toBeNull();
-    expect(screen.queryByRole("heading", { level: 2, name: "New agent" })).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
 
     const panel = await openCreate();
     expect(within(panel).getByLabelText("Name")).toBeDefined();
@@ -188,7 +186,7 @@ describe("Agents - the shape of the page", () => {
     expect(key.textContent).not.toContain("● has tools");
   });
 
-  it("keeps one editor, below the table, and swaps it rather than stacking a second", async () => {
+  it("keeps one editor dialog, and swaps it rather than stacking a second", async () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([agent({ id: "one", name: "one" }), agent({ id: "two", name: "two", speciality: "second" })]),
     );
@@ -197,9 +195,13 @@ describe("Agents - the shape of the page", () => {
     await openEditor("one");
     expect(screen.getAllByLabelText("Prompt")).toHaveLength(1);
 
+    // The modal holds the page inert, so the way to another agent is through Close.
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+
     await openEditor("two");
     expect(screen.getAllByLabelText("Prompt")).toHaveLength(1);
-    expect(screen.queryByRole("heading", { level: 2, name: "Editing one" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Editing one" })).toBeNull();
     // The draft reseeded from the newly chosen agent rather than carrying over.
     expect((screen.getByLabelText("Speciality") as HTMLInputElement).value).toBe("second");
   });
@@ -421,6 +423,30 @@ describe("Agents - the policy control and the local-engine model requirement", (
 });
 
 /* --------------------------------------------------------------- editor -- */
+
+describe("Agents - the dialogs close", () => {
+  it("closes the editor on Close, Cancel and Escape, and clears the selection", async () => {
+    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
+    renderWithQuery(<Agents />);
+
+    for (const close of [
+      (dialog: HTMLElement) => fireEvent.click(within(dialog).getByRole("button", { name: "Close" })),
+      (dialog: HTMLElement) => fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" })),
+      (dialog: HTMLElement) => fireEvent.keyDown(dialog, { key: "Escape" }),
+    ]) {
+      close(await openEditor("copywriter"));
+      expect(screen.queryByRole("dialog")).toBeNull();
+    }
+  });
+
+  it("closes the create dialog on Escape", async () => {
+    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
+    renderWithQuery(<Agents />);
+
+    fireEvent.keyDown(await openCreate(), { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
 
 describe("Agents - editing a row", () => {
   it("sends a PUT carrying every field including the unchanged ones, and the table shows the returned agent", async () => {

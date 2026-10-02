@@ -179,9 +179,20 @@ export function Charter({ team, runs }: CharterProps) {
   return <TeamForm existing={team} runs={runs} />;
 }
 
-/** The console's create panel — the same five sections, with nothing to drift from yet. */
-export function NewDepartment() {
-  return <TeamForm existing={null} runs={[]} />;
+/**
+ * What a hosting dialog needs to own the submit button: the form's id (the button sits outside the
+ * `<form>`, in the Modal footer, and points at it with `form=`) and a report of whether it may be
+ * pressed. Passing this also turns the five sections into plain headed groups and drops the save
+ * bar, because a card inside a modal card, with a bar that scrolls away, is the wrong dress there.
+ */
+export interface DialogHost {
+  formId: string;
+  onState: (state: { canSubmit: boolean; busy: boolean }) => void;
+}
+
+/** The console's create form — the same five sections, with nothing to drift from yet. */
+export function NewDepartment({ dialog }: { dialog?: DialogHost } = {}) {
+  return <TeamForm existing={null} runs={[]} dialog={dialog} />;
 }
 
 /** What the guard is holding while it waits for one of the three answers. */
@@ -190,7 +201,15 @@ interface Guard {
   fresh: TeamView;
 }
 
-function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun[] }) {
+function TeamForm({
+  existing,
+  runs,
+  dialog,
+}: {
+  existing: TeamView | null;
+  runs: TeamRun[];
+  dialog?: DialogHost;
+}) {
   const agents = useAgents();
   const teams = useTeams();
   const create = useCreateTeam();
@@ -216,6 +235,17 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
       setSeed(existing);
     }
   }, [existing, form]);
+
+  const reportState = dialog?.onState;
+  const canSubmit =
+    form !== null &&
+    form.name.trim() !== "" &&
+    form.mission.trim() !== "" &&
+    form.directorAgentId.trim() !== "";
+  const busy = create.isPending || update.isPending || checking;
+  useEffect(() => {
+    reportState?.({ canSubmit, busy });
+  }, [reportState, canSubmit, busy]);
 
   if (form === null) return <Quiet says="reading the team…" />;
 
@@ -294,13 +324,15 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
 
   return (
     <form
-      className="teams-charter"
+      id={dialog?.formId}
+      className={dialog === undefined ? "teams-charter" : "teams-charter teams-charter-dialog"}
       onSubmit={(event) => {
         event.preventDefault();
         void submit();
       }}
     >
       <Section
+        flat={dialog !== undefined}
         title="Identity"
         note="The id is slugged from the first name this team ever had, and renaming never changes it."
       >
@@ -322,6 +354,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
       </Section>
 
       <Section
+        flat={dialog !== undefined}
         title="Leadership"
         note="A director that has been deleted is why a task refuses to start — the daemon names it in the refusal."
       >
@@ -342,6 +375,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
       </Section>
 
       <Section
+        flat={dialog !== undefined}
         title="Staff"
         note="Sent whole on every save. A specialist can serve several teams — where else they serve is shown beside each one."
       >
@@ -385,6 +419,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
       </Section>
 
       <Section
+        flat={dialog !== undefined}
         title="Powers"
         note="What it may do without asking. The absence of a row IS the refusal — there is no deny."
       >
@@ -392,6 +427,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
       </Section>
 
       <Section
+        flat={dialog !== undefined}
         title="Limits"
         note="Two different kinds. One has something in it right now; the other applies to each task, from zero, every time."
       >
@@ -499,7 +535,7 @@ function TeamForm({ existing, runs }: { existing: TeamView | null; runs: TeamRun
 
       {/* Visible only when there is something to save: a bar that is always
           there stops being a signal that anything changed. */}
-      {dirty && (
+      {dirty && dialog === undefined && (
         <div className="teams-savebar">
           <p className="teams-savebar-said">
             {existing === null
@@ -570,7 +606,27 @@ function DriftGuard({
 
 /* ------------------------------------------------------------- pieces -- */
 
-function Section({ title, note, children }: { title: string; note: string; children: React.ReactNode }) {
+function Section({
+  title,
+  note,
+  flat = false,
+  children,
+}: {
+  title: string;
+  note: string;
+  /** In a dialog: a plain headed group instead of a `Panel`. */
+  flat?: boolean;
+  children: React.ReactNode;
+}) {
+  if (flat) {
+    return (
+      <section className="teams-group">
+        <h3 className="teams-group-title">{title}</h3>
+        <p className="teams-note">{note}</p>
+        <div className="teams-section-fields">{children}</div>
+      </section>
+    );
+  }
   return (
     <Panel title={title} variant="flat">
       <div className="teams-section">
