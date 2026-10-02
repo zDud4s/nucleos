@@ -14568,7 +14568,8 @@ async fn create_job(
                 // `MAX_ROUNDS_CEILING` and under the house budget, both applied on the way in.
                 max_rounds: request.max_rounds,
                 budget_usd: request.budget_usd,
-                gate_each: true,
+                // What a rule that said nothing gets: only the last item is gated.
+                gate_each: false,
                 review: true,
                 // The answer a rule that said nothing about retries gets, and for the same reason:
                 // nobody asked, and one more implement run told what the gate said is cheaper than
