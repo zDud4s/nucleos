@@ -667,11 +667,9 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
 
     await renderCockpit();
 
-    const card = await screen.findByRole("article", { name: "Acting on their own" });
     await waitFor(() => {
-      expect(card.querySelector(".ui-stat-detail")?.textContent).toContain("1 project on the roster");
+      expect(document.querySelector(".ap-headline")?.textContent).toContain("1 watching in shadow");
     });
-    expect(card.textContent).not.toContain("1 projects");
 
     // One project is the whole index: nothing to choose between, so no tablist is drawn.
     expect(screen.queryByRole("tablist")).toBeNull();
@@ -709,7 +707,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     });
   });
 
-  it("the page sheet holds the gate, the headline and the stat detail at two lines", () => {
+  it("the page sheet holds the gate, and the headline at two lines", () => {
     // Read the way `sheet-layout.test.ts` reads a page sheet: comments stripped, one rule's body.
     const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "autopilot.css"), "utf8").replace(
       /\/\*[\s\S]*?\*\//g,
@@ -721,7 +719,6 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     // as the fan turns from a short gate to a long one.
     expect(body(/\.ap-fan-gate\s*\{([^}]*)\}/)).toMatch(/min-height:\s*calc\(\s*2lh\s*\+/);
     expect(body(/\.ap-headline\s*\{([^}]*)\}/)).toMatch(/min-height:\s*2lh\b/);
-    expect(body(/\.ap-stats\s+\.ui-stat-detail\s*\{([^}]*)\}/)).toMatch(/min-height:\s*2lh\b/);
   });
 
   it("the budget period is a word and not a stem", async () => {
@@ -896,8 +893,8 @@ describe("Autopilot - the scoreboard is read-only and says what it is not", () =
 
 /* -------------------------------------------------------- the stat cards -- */
 
-describe("Autopilot - the stat cards name what they count", () => {
-  it("the card names proposals", async () => {
+describe("Autopilot - the ledger line names what it counts", () => {
+  it("the line names proposals", async () => {
     const world = cockpitWorld({
       projects: [
         project({ project_id: "alpha", mode: "active" }),
@@ -910,16 +907,14 @@ describe("Autopilot - the stat cards name what they count", () => {
     await renderCockpit();
 
     // "Waiting on you" is the one queue's phrase, and it belongs to Home and
-    // the rail. This card counts open proposals across the roster, which is a
+    // the rail. This line counts open proposals across the roster, which is a
     // different number from the queue's six decision lists, so it says which.
-    const card = await screen.findByRole("article", { name: "To review" });
-    expect(within(card).getByText("5")).toBeDefined();
-    expect(within(card).getByText("across the roster")).toBeDefined();
-    expect(screen.queryByRole("article", { name: "Waiting on you" })).toBeNull();
+    expect(await screen.findByRole("link", { name: "5 to review across the roster" })).toBeDefined();
+    expect(screen.queryByText("Waiting on you")).toBeNull();
+    expect(screen.queryByRole("article")).toBeNull();
 
-    // What changed is the card no longer promising to BE the queue; the link
-    // that actually goes there is untouched.
-    expect(await screen.findByRole("link", { name: "Go to the queue" })).toBeDefined();
+    // The line never promises to BE the queue; the link that actually goes there is untouched.
+    expect(screen.getAllByRole("link", { name: /Go to the queue|to review across the roster/ }).length).toBeGreaterThan(0);
   });
 });
 
