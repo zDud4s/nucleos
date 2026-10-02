@@ -1662,3 +1662,27 @@ mod tests {
         assert_eq!(redirects_in_lineage(&pool, root + 1000).await, 0);
     }
 }
+
+#[cfg(test)]
+mod regression {
+    use super::Event;
+
+    /// Plan B Task 10.1: the five questions of a shared park call, exactly as the núcleo sends them
+    /// (spec A's, then the resolver's), for the local regression script — no text is copied by hand.
+    #[test]
+    #[ignore = "writes into NUCLEOS_JUDGE_REGRESSION_DIR; run by hand for plan B Task 10.1"]
+    fn export_the_shared_questions() {
+        let dir = std::path::PathBuf::from(std::env::var("NUCLEOS_JUDGE_REGRESSION_DIR").unwrap());
+        let spec_a = crate::judge::JUDGE_QUESTIONS.iter().map(|q| (q, false));
+        let resolver = Event::Park.questions().iter().map(|q| (q, true));
+        let questions: Vec<serde_json::Value> = spec_a
+            .chain(resolver)
+            .map(|(q, resolver)| serde_json::json!({ "key": q.key, "instructions": q.instructions, "resolver": resolver }))
+            .collect();
+        std::fs::write(
+            dir.join("questions_shared.json"),
+            serde_json::to_string_pretty(&questions).unwrap(),
+        )
+        .unwrap();
+    }
+}
