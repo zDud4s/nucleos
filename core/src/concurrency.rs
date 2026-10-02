@@ -23,7 +23,7 @@
 //! `attention.rs` whether you are at the keyboard — and this one only how many at once.
 
 use crate::worktree::Owner;
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 
 /// Why there was no slot.
 ///
@@ -74,17 +74,21 @@ const UNREADABLE_CEILING: i64 = 1;
 /// switched off is a defensible configuration; a concurrency ceiling switched off is an unbounded
 /// number of cold Rust builds, and it is not a state worth being able to express.
 pub async fn slots_limit(pool: &SqlitePool, project_id: &str) -> sqlx::Result<i64> {
+    slots_limit_on(&mut *pool.acquire().await?, project_id).await
+}
+
+async fn slots_limit_on(conn: &mut SqliteConnection, project_id: &str) -> sqlx::Result<i64> {
     let project_override: Option<Option<i64>> =
         sqlx::query_scalar("SELECT max_concurrent_slots FROM autopilot_state WHERE project_id = ?")
             .bind(project_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
     if let Some(Some(limit)) = project_override {
         return Ok(limit.max(1));
     }
     let global: Option<Option<i64>> =
         sqlx::query_scalar("SELECT max_concurrent_slots FROM autopilot_global LIMIT 1")
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
     Ok(global.flatten().unwrap_or(UNREADABLE_CEILING).max(1))
 }
@@ -94,17 +98,26 @@ pub async fn slots_limit(pool: &SqlitePool, project_id: &str) -> sqlx::Result<i6
 /// Both numbers exist because they bound different resources: the per-project one stops a single
 /// project from monopolising the machine, this one stops N projects from saturating it together.
 pub async fn house_limit(pool: &SqlitePool) -> sqlx::Result<i64> {
+    house_limit_on(&mut *pool.acquire().await?).await
+}
+
+async fn house_limit_on(conn: &mut SqliteConnection) -> sqlx::Result<i64> {
     let global: Option<Option<i64>> =
         sqlx::query_scalar("SELECT max_concurrent_total FROM autopilot_global LIMIT 1")
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
     Ok(global.flatten().unwrap_or(UNREADABLE_CEILING).max(1))
 }
 
 /// How many slots are held right now, everywhere.
+#[cfg(test)]
 pub async fn slots_in_flight(pool: &SqlitePool) -> sqlx::Result<i64> {
+    slots_in_flight_on(&mut *pool.acquire().await?).await
+}
+
+async fn slots_in_flight_on(conn: &mut SqliteConnection) -> sqlx::Result<i64> {
     sqlx::query_scalar("SELECT COUNT(*) FROM project_slots")
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
 }
 
@@ -125,15 +138,34 @@ pub async fn claim(
     project_id: &str,
     owner: Owner,
 ) -> sqlx::Result<ClaimOutcome> {
-    if let Some(slot) = slot_of(pool, owner).await? {
+    claim_on(&mut *pool.acquire().await?, project_id, owner).await
+}
+
+/// `claim` on a connection the caller holds, in practice an open write transaction.
+///
+/// Spec autopilot-juiz-resolve-bloqueios D6 (S4): the correction's transaction asks for a slot only
+/// when the sweep already freed the one its origin held, and the whole creation (the correction
+/// row, the run, the slot, the tree) must be one atomic write. `claim` on the pool would ask for a
+/// second connection that waits on the first one's write lock until the busy timeout; claiming
+/// after the commit would need a compensation path that is easy to get wrong.
+///
+/// Everything `claim`'s own comment says still holds: idempotent per owner, the per-project number
+/// held by the primary key, the house number advisory. A unique violation inside a SQLite
+/// transaction aborts only the statement, so the next number is tried as before.
+pub async fn claim_on(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    owner: Owner,
+) -> sqlx::Result<ClaimOutcome> {
+    if let Some(slot) = slot_of_on(conn, owner).await? {
         return Ok(ClaimOutcome::Claimed(slot));
     }
 
-    if let Some(full) = room_for(pool, project_id).await? {
+    if let Some(full) = room_for_on(conn, project_id).await? {
         return Ok(ClaimOutcome::Full(full));
     }
 
-    let limit = slots_limit(pool, project_id).await?;
+    let limit = slots_limit_on(conn, project_id).await?;
     let claimed_at = chrono::Utc::now().to_rfc3339();
     for slot in 0..limit {
         let attempt = sqlx::query(
@@ -145,7 +177,7 @@ pub async fn claim(
         .bind(owner.kind())
         .bind(owner.id())
         .bind(&claimed_at)
-        .execute(pool)
+        .execute(&mut *conn)
         .await;
 
         match attempt {
@@ -170,14 +202,21 @@ pub async fn claim(
 /// `/jobs` would fill with jobs that never began. Asking first turns that into the rare case where
 /// two starts actually crossed.
 pub async fn room_for(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<NoRoom>> {
-    let house = house_limit(pool).await?;
-    if slots_in_flight(pool).await? >= house {
+    room_for_on(&mut *pool.acquire().await?, project_id).await
+}
+
+async fn room_for_on(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> sqlx::Result<Option<NoRoom>> {
+    let house = house_limit_on(conn).await?;
+    if slots_in_flight_on(conn).await? >= house {
         return Ok(Some(NoRoom::House { limit: house }));
     }
-    let limit = slots_limit(pool, project_id).await?;
+    let limit = slots_limit_on(conn, project_id).await?;
     let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_slots WHERE project_id = ?")
         .bind(project_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
     if held >= limit {
         return Ok(Some(NoRoom::Project { limit }));
@@ -197,11 +236,16 @@ pub async fn release(pool: &SqlitePool, owner: Owner) -> sqlx::Result<()> {
 }
 
 /// Which slot an owner holds, if any.
+#[cfg(test)]
 pub async fn slot_of(pool: &SqlitePool, owner: Owner) -> sqlx::Result<Option<i64>> {
+    slot_of_on(&mut *pool.acquire().await?, owner).await
+}
+
+async fn slot_of_on(conn: &mut SqliteConnection, owner: Owner) -> sqlx::Result<Option<i64>> {
     sqlx::query_scalar("SELECT slot FROM project_slots WHERE owner_kind = ? AND owner_id = ?")
         .bind(owner.kind())
         .bind(owner.id())
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
 }
 
@@ -526,6 +570,44 @@ mod tests {
         .await
         .unwrap()
         .last_insert_rowid()
+    }
+
+    /// Spec autopilot-juiz-resolve-bloqueios D6 (S4): a claim made inside the caller's transaction
+    /// is part of it. Rolled back, nothing is held; inside, it is the same claim (idempotent per
+    /// owner, refusing a full project) and never asks the pool for a second connection while the
+    /// first holds the lock. The test pool has one connection, so a second request would hang.
+    #[tokio::test]
+    async fn a_claim_on_a_transaction_is_undone_with_it() {
+        let pool = test_pool().await;
+        set_limits(&pool, 1, 4).await;
+        let run = seed_run(&pool, "project-a", "running").await;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            assert_eq!(
+                claim_on(&mut tx, "project-a", Owner::Run(run))
+                    .await
+                    .unwrap(),
+                ClaimOutcome::Claimed(0)
+            );
+            assert_eq!(
+                claim_on(&mut tx, "project-a", Owner::Run(run))
+                    .await
+                    .unwrap(),
+                ClaimOutcome::Claimed(0),
+                "idempotent per owner"
+            );
+            assert_eq!(
+                claim_on(&mut tx, "project-a", Owner::Run(run + 1))
+                    .await
+                    .unwrap(),
+                ClaimOutcome::Full(NoRoom::Project { limit: 1 })
+            );
+        }
+        assert_eq!(
+            slots_in_flight(&pool).await.unwrap(),
+            0,
+            "dropped, so rolled back"
+        );
     }
 
     async fn seed_job(pool: &SqlitePool, project_id: &str, status: &str) -> i64 {

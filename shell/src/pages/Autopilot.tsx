@@ -88,6 +88,7 @@ import {
 } from "../lib/mode";
 import { OnboardPanel } from "../project/Onboard";
 import { JudgeOpinionLine, JudgePanel, JudgeReviewPanel } from "./AutopilotJudge";
+import { ResolvePanel } from "./AutopilotResolve";
 import "./autopilot.css";
 
 /** The three periods the núcleo writes, as the noun each one is: `daily` becomes `day`, not `dai`. */
@@ -194,6 +195,7 @@ export function Autopilot() {
         <ScoreboardPanel projectId={selected} project={focused} />
         <JudgePanel projectId={selected} project={focused} />
         <JudgeReviewPanel projectId={selected} />
+        <ResolvePanel projectId={selected} project={focused} />
         <TriggerKills />
         <JobsPanel rows={rows} selected={selected} />
         <FeedEmbed />

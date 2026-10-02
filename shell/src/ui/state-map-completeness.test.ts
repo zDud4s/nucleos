@@ -12,11 +12,19 @@ const concurrencyRs = readFileSync(`${repoRoot}core/src/concurrency.rs`, "utf8")
 const runsRs = readFileSync(`${repoRoot}core/src/runs.rs`, "utf8");
 const quotaRs = readFileSync(`${repoRoot}core/src/quota.rs`, "utf8");
 
+/**
+ * Every `.rs` under `core/src`, subdirectories included. The judge's module (`core/src/judge/`)
+ * was the first directory there, and a top-level read would miss every feed kind it writes —
+ * the test would pass while the map could not read the kinds the núcleo writes there.
+ */
 function coreFiles(): { name: string; source: string }[] {
-  const dir = `${repoRoot}core/src`;
-  return readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".rs"))
-    .map((entry) => ({ name: entry.name, source: readFileSync(`${dir}/${entry.name}`, "utf8") }));
+  const walk = (dir: string, prefix: string): { name: string; source: string }[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      if (entry.isDirectory()) return walk(`${dir}/${entry.name}`, `${prefix}${entry.name}/`);
+      if (!entry.isFile() || !entry.name.endsWith(".rs")) return [];
+      return [{ name: `${prefix}${entry.name}`, source: readFileSync(`${dir}/${entry.name}`, "utf8") }];
+    });
+  return walk(`${repoRoot}core/src`, "");
 }
 
 function cutAtTestModule(source: string): number {

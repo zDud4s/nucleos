@@ -68,6 +68,10 @@ pub fn build_router(state: AppState) -> Router {
             get(get_autopilot_judge).post(post_autopilot_judge),
         )
         .route(
+            "/autopilot/judge-resolve",
+            get(get_autopilot_judge_resolve).post(post_autopilot_judge_resolve),
+        )
+        .route(
             "/autopilot/kill",
             get(get_autopilot_kill).post(post_autopilot_kill),
         )
@@ -740,6 +744,14 @@ pub fn build_router(state: AppState) -> Router {
             get(get_unreviewed_judge_verdicts),
         )
         .route("/judge-verdicts/{id}/verdict", post(post_judge_verdict))
+        .route(
+            "/judge-resolutions/unreviewed",
+            get(get_unreviewed_judge_resolutions),
+        )
+        .route(
+            "/judge-resolutions/{id}/outcome",
+            post(post_judge_resolution_outcome),
+        )
         .route(
             "/judge-verdicts/by-decision",
             get(get_judge_opinions_by_decision),
@@ -3190,6 +3202,79 @@ async fn post_autopilot_judge(
         }
         Err(autopilot::JudgeActivationError::Database(error)) => {
             tracing::warn!(%error, "setting a project's judge failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct JudgeResolveRequest {
+    project_id: String,
+    judge_resolve: String,
+}
+
+#[derive(Serialize)]
+struct JudgeResolveResponse {
+    project_id: String,
+    judge_resolve: crate::judge::JudgeMode,
+    readiness: crate::judge::resolve_review::ResolveReadiness,
+}
+
+/// Spec B D11: one project's resolver setting. Admin-only like `/autopilot/judge`, by appearing
+/// in no table in `auth.rs`.
+async fn get_autopilot_judge_resolve(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<JudgeResolveResponse>, StatusCode> {
+    let judge_resolve = autopilot::autopilot_judge_resolve_mode(&state.pool, &query.project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let readiness = crate::judge::resolve_review::readiness(&state.pool, &query.project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(JudgeResolveResponse {
+        project_id: query.project_id,
+        judge_resolve,
+        readiness,
+    }))
+}
+
+async fn post_autopilot_judge_resolve(
+    State(state): State<AppState>,
+    Json(body): Json<JudgeResolveRequest>,
+) -> Result<Json<JudgeResolveResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let mode = crate::judge::JudgeMode::from_db_str(&body.judge_resolve)
+        .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "invalid"))?;
+    // `enforce` is accepted now that the shell shows its residual risk (spec D11). The bar is
+    // enforced by `set_project_judge_resolve`, whatever door asks.
+    match autopilot::set_project_judge_resolve(&state.pool, &body.project_id, mode).await {
+        Ok(judge_resolve) => {
+            let readiness = crate::judge::resolve_review::readiness(&state.pool, &body.project_id)
+                .await
+                .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+            Ok(Json(JudgeResolveResponse {
+                project_id: body.project_id,
+                judge_resolve,
+                readiness,
+            }))
+        }
+        Err(autopilot::ResolveActivationError::UnknownProject) => {
+            Err(refusal(StatusCode::NOT_FOUND, "unknown_project"))
+        }
+        Err(autopilot::ResolveActivationError::NotActive) => {
+            Err(refusal(StatusCode::CONFLICT, "not_active"))
+        }
+        Err(autopilot::ResolveActivationError::NotReady(readiness)) => {
+            tracing::info!(
+                reviewed = readiness.reviewed,
+                agree = readiness.agree,
+                less_cautious = readiness.less_cautious,
+                "enforce refused: the resolver's bar is not met"
+            );
+            Err(refusal(StatusCode::CONFLICT, "not_ready"))
+        }
+        Err(autopilot::ResolveActivationError::Database(error)) => {
+            tracing::error!(%error, project_id = %body.project_id, "setting judge_resolve failed");
             Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
         }
     }
@@ -13500,7 +13585,7 @@ async fn post_proposal_approve(
     // people and touches no run at all. Reading the kind first is only a dispatch — the kind never
     // changes, and both paths below are compare-and-set on `status = 'pending'`, so a second
     // decision racing this one still loses there rather than here.
-    let kind = crate::proposals::get(&state.pool, id)
+    let proposal = crate::proposals::get(&state.pool, id)
         .await
         .map_err(|error| {
             tracing::warn!(proposal_id = id, %error, "reading a proposal to approve failed");
@@ -13509,8 +13594,8 @@ async fn post_proposal_approve(
                 "the proposal could not be read".to_owned(),
             )
         })?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("there is no proposal {id}")))?
-        .kind;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("there is no proposal {id}")))?;
+    let kind = proposal.kind.clone();
     if kind == "contact-merge" {
         // Uncancellable for the same reason the resume below is: the decision commits, and a
         // request dropped mid-flight must not leave the record disagreeing with what happened.
@@ -13771,11 +13856,24 @@ async fn post_proposal_approve(
 
     // Uncancellable: the approval commits a transaction and only then spawns the resumed run, so a
     // request dropped in between leaves a `running` run nothing will ever drive.
+    let pool = state.pool.clone();
     match uncancellable(async move { crate::runs::resume_approved_run(&state, id).await })
         .await
         .map_err(|status| (status, "the approval task did not finish".to_owned()))?
     {
-        Ok(resume_id) => Ok(Json(serde_json::json!({ "resume_run_id": resume_id }))),
+        Ok(resume_id) => {
+            // Spec B D12: a person's approval is the label of the park the resolver observed.
+            if let Some(run_id) = proposal.run_id {
+                crate::judge::resolve_review::label_from_decision(
+                    &pool,
+                    run_id,
+                    proposal.tool_input.as_deref(),
+                    crate::judge::resolve_review::PersonsDecision::Approve,
+                )
+                .await;
+            }
+            Ok(Json(serde_json::json!({ "resume_run_id": resume_id })))
+        }
         Err(crate::runs::ResumeError::ProposalNotFound) => {
             Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
         }
@@ -13919,11 +14017,34 @@ async fn post_proposal_decline_action(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let proposal = crate::proposals::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "reading a proposal to decline failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the proposal could not be read".to_owned(),
+            )
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("there is no proposal {id}")))?;
+    let pool = state.pool.clone();
     match uncancellable(async move { crate::runs::decline_action(&state, id).await })
         .await
         .map_err(|status| (status, "the decline task did not finish".to_owned()))?
     {
-        Ok(run_id) => Ok(Json(serde_json::json!({ "resume_run_id": run_id }))),
+        Ok(run_id) => {
+            // Spec B D12: declining only the action is the label `explain` of the park it answered.
+            if let Some(proposal_run_id) = proposal.run_id {
+                crate::judge::resolve_review::label_from_decision(
+                    &pool,
+                    proposal_run_id,
+                    proposal.tool_input.as_deref(),
+                    crate::judge::resolve_review::PersonsDecision::Decline,
+                )
+                .await;
+            }
+            Ok(Json(serde_json::json!({ "resume_run_id": run_id })))
+        }
         Err(crate::runs::ResumeError::ProposalNotFound) => {
             Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
         }
@@ -14844,6 +14965,54 @@ async fn post_judge_verdict(
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(error) => {
             tracing::warn!(%error, id, "could not record the judge verdict");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OutcomeRequest {
+    outcome: String,
+}
+
+/// Spec B D11: the resolver's review queue, one entry per unit.
+async fn get_unreviewed_judge_resolutions(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<Vec<crate::judge::resolve_review::ResolutionView>>, StatusCode> {
+    crate::judge::resolve_review::list_unreviewed(&state.pool, &query.project_id)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// 204 once; 404 for an unknown id, an outcome the event cannot have, or one already given.
+async fn post_judge_resolution_outcome(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<OutcomeRequest>,
+) -> Result<StatusCode, StatusCode> {
+    // The review and the demotion it may cause are ONE write: a review is what moves readiness, so
+    // it is where the bar is held, as `post_judge_verdict` does for spec A.
+    let recorded = async {
+        let mut tx = state.pool.begin().await?;
+        if !crate::judge::resolve_review::set_outcome(&mut tx, id, &body.outcome).await? {
+            return Ok(false);
+        }
+        if let Some(project_id) =
+            crate::judge::resolve_review::project_of_resolution(&mut tx, id).await?
+        {
+            autopilot::hold_judge_resolve_to_the_bar(&mut tx, &project_id).await?;
+        }
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(true)
+    }
+    .await;
+    match recorded {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, id, "could not record the resolver's review");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -17134,6 +17303,60 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// Spec B D12 at the human doors: approving a park the resolver observed labels it `park`,
+    /// declining labels it `explain`, rejecting labels nothing.
+    #[tokio::test]
+    async fn the_human_doors_label_the_park_and_a_reject_does_not() {
+        for (door, label) in [
+            ("approve", Some("park")),
+            ("decline-action", Some("explain")),
+            ("reject", None),
+        ] {
+            let (state, _runner) = crate::runs::tests::test_state_with_runner(
+                Some(std::time::Duration::from_secs(5)),
+                std::time::Duration::from_secs(600),
+            )
+            .await;
+            let (proposal_id, _branch, _container) =
+                crate::runs::tests::seed_real_worktree_approval(
+                    &state,
+                    "cargo test --workspace | tee t.log",
+                )
+                .await;
+            let (run_id, input): (i64, String) =
+                sqlx::query_as("SELECT run_id, tool_input FROM proposals WHERE id = ?")
+                    .bind(proposal_id)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            let digest = crate::judge::tool_input_digest(&serde_json::from_str(&input).unwrap());
+            sqlx::query(
+                "INSERT INTO judge_resolutions (run_id, lineage_root_id, event, tool_input_digest,
+                                                default_outcome, judge_outcome, final_outcome, created_at)
+                 VALUES (?1, ?1, 'park', ?2, 'park', 'stop', 'park', '2026-09-27T00:00:00Z')",
+            )
+            .bind(run_id)
+            .bind(&digest)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            let (status, _) = call(
+                state.clone(),
+                "POST",
+                &format!("/proposals/{proposal_id}/{door}"),
+                None,
+            )
+            .await;
+            assert!(status.is_success(), "{door}: {status}");
+            let human: Option<String> =
+                sqlx::query_scalar("SELECT human_outcome FROM judge_resolutions")
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(human.as_deref(), label, "{door}");
+        }
     }
 
     async fn call(
@@ -21861,6 +22084,48 @@ mod tests {
             "POST",
             "/autopilot/judge",
             Some(serde_json::json!({"project_id": "p", "judge": "enforce"})),
+        )
+        .await;
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::CONFLICT, Some("not_ready"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_projects_resolver_is_read_and_set_over_http() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/autopilot/judge-resolve",
+            Some(serde_json::json!({"project_id": "p", "judge_resolve": "observe"})),
+        )
+        .await;
+        assert_eq!(
+            (status, body["judge_resolve"].as_str()),
+            (StatusCode::OK, Some("observe"))
+        );
+        let (status, body) = workflow_call(
+            state.clone(),
+            "GET",
+            "/autopilot/judge-resolve?project_id=p",
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, body["judge_resolve"].as_str()),
+            (StatusCode::OK, Some("observe"))
+        );
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/autopilot/judge-resolve",
+            Some(serde_json::json!({"project_id": "p", "judge_resolve": "enforce"})),
         )
         .await;
         assert_eq!(

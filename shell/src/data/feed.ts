@@ -589,6 +589,7 @@ export const NOTIFY_FAMILIES: { selector: string; label: string }[] = [
   { selector: "job_", label: "jobs" },
   { selector: "run_", label: "runs" },
   { selector: "worktree_", label: "worktrees" },
+  { selector: "judge_", label: "judge" },
   { selector: "vcs_", label: "git queue" },
   { selector: "council_", label: "council" },
   { selector: "schedule_", label: "agenda" },

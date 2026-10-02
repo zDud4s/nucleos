@@ -2147,7 +2147,6 @@ impl AutopilotRules {
         thresholds
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Task 4.1
     pub fn resolve_thresholds(&self) -> crate::judge::resolve::ResolveThresholds {
         let c = &self.judge_resolve;
         let (thresholds, warnings) = crate::judge::resolve::ResolveThresholds::toward_caution(
