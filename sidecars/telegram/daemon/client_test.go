@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestClientSendAssistantMessageAndGetKill(t *testing.T) {
@@ -147,5 +148,33 @@ func TestARefusalWithNoNameIsStillARefusal(t *testing.T) {
 	}
 	if !strings.Contains(refused.Error(), "something went wrong") {
 		t.Errorf("Error() = %q, want the body it could not name", refused.Error())
+	}
+}
+
+func TestVoiceCaptureTimeoutIsAnErrorNotVoiceOff(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	client := New(server.URL, "token")
+	client.http.Timeout = 50 * time.Millisecond
+
+	_, configured, err := client.VoiceCapture([]byte("audio"), "ogg", 1000)
+	if err == nil || !configured {
+		t.Fatalf("VoiceCapture on a timeout = configured %v, err %v; want configured true and an error", configured, err)
+	}
+}
+
+func TestVoiceCaptureRefusedConnectionFallsBackToLocal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := server.URL
+	server.Close()
+
+	_, configured, err := New(url, "token").VoiceCapture([]byte("audio"), "ogg", 1000)
+	if err != nil || configured {
+		t.Fatalf("VoiceCapture with nothing listening = configured %v, err %v; want false, nil", configured, err)
 	}
 }

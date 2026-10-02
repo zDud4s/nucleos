@@ -13,6 +13,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"mime/quotedprintable"
 	"net/mail"
 	"regexp"
 	"strings"
@@ -118,7 +119,14 @@ func isBoundary(s string, i int) bool {
 }
 
 func decodeHeader(value string) string {
-	decoded, err := new(mime.WordDecoder).DecodeHeader(value)
+	decoder := &mime.WordDecoder{CharsetReader: func(charset string, input io.Reader) (io.Reader, error) {
+		raw, err := io.ReadAll(input)
+		if err != nil {
+			return nil, err
+		}
+		return strings.NewReader(toUTF8(raw, charset)), nil
+	}}
+	decoded, err := decoder.DecodeHeader(value)
 	if err != nil {
 		// An undecodable header is still worth showing raw: it is a subject line, not a decision.
 		return value
@@ -183,16 +191,15 @@ type collector struct {
 func bodyAndAttachments(msg *mail.Message) (string, []daemon.Attachment) {
 	mediaType, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
 	if err != nil {
-		body, _ := io.ReadAll(io.LimitReader(msg.Body, MaxBodyBytes*4))
-		return string(body), nil
+		return readText(msg.Body, msg.Header.Get("Content-Transfer-Encoding"), ""), nil
 	}
 
 	if !strings.HasPrefix(mediaType, "multipart/") {
-		body, _ := io.ReadAll(io.LimitReader(msg.Body, MaxBodyBytes*4))
+		body := readText(msg.Body, msg.Header.Get("Content-Transfer-Encoding"), params["charset"])
 		if mediaType == "text/html" {
-			return StripHTML(string(body)), nil
+			return StripHTML(body), nil
 		}
-		return string(body), nil
+		return body, nil
 	}
 
 	found := collector{want: wantNone}
@@ -225,7 +232,11 @@ func Attachment(raw []byte, position int) (daemon.Attachment, []byte, error) {
 	if position < 0 || position >= len(found.attachments) {
 		return daemon.Attachment{}, nil, ErrNoSuchAttachment
 	}
-	return found.attachments[position], found.contents[position], nil
+	described, content := found.attachments[position], found.contents[position]
+	if described.SizeBytes > int64(len(content)) {
+		return described, content, ErrAttachmentTruncated
+	}
+	return described, content, nil
 }
 
 // AllAttachments returns every attachment in one pass, described and with its bytes.
@@ -234,6 +245,9 @@ func Attachment(raw []byte, position int) (daemon.Attachment, []byte, error) {
 // WHOLE message from IMAP, so eight attachments meant eight downloads of the same eight files, and
 // eight TLS handshakes. Reading them together is one fetch, and the total is bounded anyway — every
 // attachment in a message weighs less than the message.
+//
+// An attachment past MaxAttachmentBytes comes back with its true `SizeBytes` and only the first
+// MaxAttachmentBytes of content, so `SizeBytes > len(content)` marks the truncation for the caller.
 func AllAttachments(raw []byte) ([]daemon.Attachment, map[int][]byte, error) {
 	parsed, err := mail.ReadMessage(strings.NewReader(string(raw)))
 	if err != nil {
@@ -256,14 +270,27 @@ func AllAttachments(raw []byte) ([]daemon.Attachment, map[int][]byte, error) {
 
 // readDecoded reads a part's real content, undoing base64 where multipart does not, and stops at
 // MaxAttachmentBytes so one hostile part cannot be answered with unbounded memory.
-func readDecoded(part *multipart.Part) []byte {
+//
+// `size` is the part's TRUE decoded size: past the cap the rest is counted and discarded rather than
+// kept, so a truncated read shows itself as `size > len(content)` instead of passing for a whole
+// file.
+func readDecoded(part *multipart.Part) (content []byte, size int64) {
 	var reader io.Reader = part
 	if strings.EqualFold(part.Header.Get("Content-Transfer-Encoding"), "base64") {
 		reader = base64.NewDecoder(base64.StdEncoding, part)
 	}
-	content, _ := io.ReadAll(io.LimitReader(reader, MaxAttachmentBytes))
-	return content
+	content, _ = io.ReadAll(io.LimitReader(reader, MaxAttachmentBytes))
+	size = int64(len(content))
+	if size == MaxAttachmentBytes {
+		rest, _ := io.Copy(io.Discard, reader)
+		size += rest
+	}
+	return content, size
 }
+
+// ErrAttachmentTruncated means the attachment is larger than MaxAttachmentBytes, so the bytes
+// returned beside it are only its beginning. A half file that looks whole is worse than none.
+var ErrAttachmentTruncated = errors.New("attachment exceeds the size cap and was truncated")
 
 // walk reads one multipart level, descending into nested multiparts and stopping at MaxMIMEDepth.
 func (c *collector) walk(body io.Reader, boundary string, depth int) {
@@ -288,12 +315,12 @@ func (c *collector) walk(body io.Reader, boundary string, depth int) {
 			position := len(c.attachments)
 			size := int64(0)
 			if c.want == wantEvery || position == c.want {
-				content := readDecoded(part)
+				content, trueSize := readDecoded(part)
 				if c.contents == nil {
 					c.contents = map[int][]byte{}
 				}
 				c.contents[position] = content
-				size = int64(len(content))
+				size = trueSize
 			} else {
 				size = partSize(part)
 			}
@@ -307,12 +334,14 @@ func (c *collector) walk(body io.Reader, boundary string, depth int) {
 			continue
 		}
 
-		content, _ := io.ReadAll(io.LimitReader(part, MaxBodyBytes*4))
+		// `multipart` already undid quoted-printable (and dropped the header when it did); base64 and
+		// the charset are still ours to handle.
+		content := readText(part, part.Header.Get("Content-Transfer-Encoding"), partParams["charset"])
 		switch {
 		case strings.HasPrefix(partType, "text/plain") && c.plain == "":
-			c.plain = string(content)
+			c.plain = content
 		case strings.HasPrefix(partType, "text/html") && c.htmlPart == "":
-			c.htmlPart = string(content)
+			c.htmlPart = content
 		}
 		part.Close()
 	}
@@ -355,4 +384,53 @@ func StripHTML(markup string) string {
 	text := tagPattern.ReplaceAllString(markup, " ")
 	text = html.UnescapeString(text)
 	return strings.TrimSpace(strings.Join(strings.Fields(text), " "))
+}
+
+// readText reads a text part's bytes, undoes a Content-Transfer-Encoding still on the stream
+// (base64, or quoted-printable on a top-level body that `multipart` never touched) and converts the
+// declared charset to UTF-8. Bounded like every other body read.
+func readText(source io.Reader, transferEncoding, charset string) string {
+	switch strings.ToLower(strings.TrimSpace(transferEncoding)) {
+	case "base64":
+		source = base64.NewDecoder(base64.StdEncoding, source)
+	case "quoted-printable":
+		source = quotedprintable.NewReader(source)
+	}
+	raw, _ := io.ReadAll(io.LimitReader(source, MaxBodyBytes*4))
+	return toUTF8(raw, charset)
+}
+
+// windows1252High maps 0x80-0x9F, the only range where windows-1252 differs from ISO-8859-1.
+// Undefined slots stay as the C1 control, as browsers do.
+var windows1252High = [32]rune{
+	0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+	0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x8D, 0x017D, 0x8F,
+	0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+	0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D, 0x017E, 0x0178,
+}
+
+// toUTF8 converts what the stdlib can without golang.org/x/text (not a dependency of this module):
+// UTF-8 and US-ASCII pass through, ISO-8859-1/latin1 and windows-1252 are mapped natively. Any other
+// charset is returned as-is, bytes unchanged, rather than guessed at; a dependency can be added if
+// those turn up in real mail.
+func toUTF8(raw []byte, charset string) string {
+	switch strings.ToLower(strings.TrimSpace(charset)) {
+	case "iso-8859-1", "iso8859-1", "latin1", "l1":
+		out := make([]rune, len(raw))
+		for i, b := range raw {
+			out[i] = rune(b)
+		}
+		return string(out)
+	case "windows-1252", "cp1252":
+		out := make([]rune, len(raw))
+		for i, b := range raw {
+			if b >= 0x80 && b <= 0x9F {
+				out[i] = windows1252High[b-0x80]
+			} else {
+				out[i] = rune(b)
+			}
+		}
+		return string(out)
+	}
+	return string(raw)
 }

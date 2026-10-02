@@ -3,8 +3,10 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -350,7 +352,7 @@ type VoiceTranscriber interface {
 // as a dictation does.
 //
 // The second return value is "the daemon can do this", NOT "it worked". It is false when the pillar is
-// off (503) or unreachable, which is the case the caller must be able to distinguish: those mean fall
+// off (503) or refusing connections, which is the case the caller must be able to distinguish: those mean fall
 // back to the local command, while a genuine failure means say so. A voice note is somebody talking to
 // you, and it must not stop arriving because an optional pillar is not configured.
 //
@@ -371,9 +373,16 @@ func (c *Client) VoiceCapture(audio []byte, format string, durationMs int64) (st
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		// Unreachable is indistinguishable from not-configured for our purposes: either way the local
-		// command is the only thing that can still answer.
-		return "", false, nil
+		// Only a failure to CONNECT means "nothing is listening", and only that lets the local command
+		// take over: no request reached the daemon, so no work was started. Any other transport error
+		// (the client timeout above all) is a daemon that accepted the recording and did not answer in
+		// time; reading it as "voice is off" would transcribe the note a second time and hide that the
+		// daemon is struggling. It comes back as an error with `true`, so the caller says so.
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Op == "dial" && !opErr.Timeout() {
+			return "", false, nil
+		}
+		return "", true, fmt.Errorf("voice capture: daemon did not answer: %w", err)
 	}
 	defer resp.Body.Close()
 
