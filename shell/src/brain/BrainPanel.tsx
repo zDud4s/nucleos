@@ -49,7 +49,9 @@ export function BrainPanel({ nodeId, graph, nodes, edges }: BrainPanelProps) {
   const node = nodes.find((n) => n.id === nodeId);
   if (node === undefined) return <Quiet says="That node is no longer in the graph." />;
   if (node.type === "note" && nodeId.startsWith("n:") && node.data.note !== null) {
-    return <NotePanel id={Number(nodeId.slice(2))} graph={graph} />;
+    // Keyed by the node, so a title typed or a "proposed" shown for one note never carries over
+    // to the next one selected.
+    return <NotePanel key={nodeId} id={Number(nodeId.slice(2))} graph={graph} />;
   }
   return <OtherPanel node={node} nodes={nodes} edges={edges} />;
 }

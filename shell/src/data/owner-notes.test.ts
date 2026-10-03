@@ -61,7 +61,7 @@ describe("owner notes hooks", () => {
     expect(daemon.apiFetch).toHaveBeenCalledWith("/owner-notes/links/42", { method: "DELETE" });
   });
 
-  it("teaching a note posts to its teach route and refreshes knowledge", async () => {
+  it("teaching a note posts to its teach route and refreshes knowledge and proposals", async () => {
     daemon.apiFetch.mockResolvedValue({ knowledge_id: 1, proposal_id: 2, link_id: 3 });
     const { client, wrapper } = setup();
     const invalidate = vi.spyOn(client, "invalidateQueries");
@@ -76,5 +76,6 @@ describe("owner notes hooks", () => {
     });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: keys.ownerNotes.all });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: keys.knowledge.all });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: keys.proposals.all });
   });
 });

@@ -163,7 +163,8 @@ export const TEACH_KINDS: readonly TeachKind[] = ["memory", "prompt", "skill", "
 /**
  * Teach a note to the agent: it becomes a pending knowledge proposal, answered in Learned.
  * Refusals come back as 409 `already_taught` / `archived` and 400 `unknown_kind`.
- * Invalidates the knowledge list too, since a new row now exists there.
+ * Invalidates the knowledge list and the proposals too, since a new row and a new pending
+ * approval now exist there.
  */
 export function useTeachNote() {
   const queryClient = useQueryClient();
@@ -177,6 +178,7 @@ export function useTeachNote() {
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.ownerNotes.all });
       void queryClient.invalidateQueries({ queryKey: keys.knowledge.all });
+      void queryClient.invalidateQueries({ queryKey: keys.proposals.all });
     },
   });
 }
