@@ -5534,3 +5534,33 @@ describe("Chats - conversations as tabs", () => {
     expect(screen.queryByRole("tablist", { name: "Open conversations" })).toBeNull();
   });
 });
+
+describe("Chats - the cache and agent chips", () => {
+  it("shows the cache time left and the working agents in the conversation header", async () => {
+    const done = new Date(Date.now() - 10 * 60_000).toISOString();
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({
+            id: 1,
+            created_at: done,
+            completed_at: done,
+            cache_ttl: "1h",
+            did: [
+              { id: "t1", name: "Task", detail: "explore", todos: [], started_at: done },
+              { id: "t2", name: "Grep", detail: "x", todos: [], parent: "t1" },
+              { id: "b1", name: "Bash", detail: "sleep", todos: [], background: true, status: "running" },
+            ],
+          }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    expect(await screen.findByText(/50m/)).toBeTruthy();
+    // The turn is settled, so a subagent is finished; the background task is still running.
+    expect(await screen.findByRole("button", { name: /1 agent$/ })).toBeTruthy();
+    // The subagent's own call is not listed in the transcript's "What it did".
+    expect(screen.queryByText("Grep")).toBeNull();
+  });
+});

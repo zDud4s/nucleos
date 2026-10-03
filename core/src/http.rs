@@ -621,7 +621,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
-        .route("/assistant/chats/{chat_id}/restore", post(post_chat_restore))
+        .route(
+            "/assistant/chats/{chat_id}/restore",
+            post(post_chat_restore),
+        )
         .route(
             "/assistant/chat-groups",
             get(list_chat_groups).post(create_chat_group),
@@ -630,7 +633,10 @@ pub fn build_router(state: AppState) -> Router {
             "/assistant/chat-groups/{group_id}",
             axum::routing::patch(rename_chat_group).delete(delete_chat_group),
         )
-        .route("/assistant/chats/{chat_id}/group", axum::routing::put(put_chat_group))
+        .route(
+            "/assistant/chats/{chat_id}/group",
+            axum::routing::put(put_chat_group),
+        )
         // The two context gestures. Separate routes rather than one with a flag, because they are
         // separate decisions and a caller that got the flag backwards would silently throw away a
         // conversation's memory.
@@ -10497,6 +10503,14 @@ struct AssistantTurn {
     /// what says so.
     session_id: Option<String>,
     created_at: String,
+    /// When the turn ended, in `created_at`'s format, or null while it runs. The Chats window
+    /// counts the prompt cache down from here.
+    completed_at: Option<String>,
+    /// The model the CLI reported answering with, or null when the stream never said and on
+    /// every turn from before it was recorded. Distinct from `answered_by`, which says WHO.
+    model: Option<String>,
+    /// How long this turn's prompt cache lives: `"5m"`, `"1h"`, or null when unknown.
+    cache_ttl: Option<String>,
     /// How much context this turn ran with, as an absolute token count. Null on a turn whose stream
     /// never reported one -- a turn that failed before the CLI said anything, and every turn from
     /// before the column existed.
@@ -11113,7 +11127,8 @@ async fn get_assistant_chat(
     // missing one; the id beside it always resolves.
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT r.id, r.prompt AS asked, r.stdout AS answer, r.stderr AS error, r.status,
-                r.cost_usd, r.answered_by, r.session_id, r.created_at, r.context_fill,
+                r.cost_usd, r.answered_by, r.session_id, r.created_at, r.completed_at,
+                r.model, r.cache_ttl, r.context_fill,
                 r.tools_used, r.thought, r.thought_tokens, r.prompt_images, r.compacted,
                 rel.from_chat_id AS relayed_from_chat_id,
                 src.title        AS relayed_from_title
@@ -11844,10 +11859,10 @@ async fn list_chats(
                 .collect(),
         )
     })
-        .map_err(|error| {
-            tracing::warn!(%error, "listing chats failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    .map_err(|error| {
+        tracing::warn!(%error, "listing chats failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -12849,10 +12864,17 @@ async fn chosen_brain_in(
     };
     let brain = if let Some(choice) = cheap_choices.into_iter().find(|choice| choice.id == id) {
         crate::chats::Brain::from_wire(&choice.brain)
-    } else if crate::model_catalog::cached_or_fallback().iter().any(|found| {
-        found.id == id
-            && crate::model_catalog::admits(config.active_runner(), rooted_of(asking), found.runner)
-    }) {
+    } else if crate::model_catalog::cached_or_fallback()
+        .iter()
+        .any(|found| {
+            found.id == id
+                && crate::model_catalog::admits(
+                    config.active_runner(),
+                    rooted_of(asking),
+                    found.runner,
+                )
+        })
+    {
         // A model the vendor lists (or the built-in catalogue names) that no config row does.
         // Looked up without the network, like the cheap catalogue above.
         crate::chats::Brain::Cloud
@@ -13709,7 +13731,8 @@ fn group_refusal(error: crate::chat_groups::GroupError) -> (StatusCode, Json<ser
 async fn create_chat_group(
     State(state): State<AppState>,
     Json(body): Json<ChatGroupName>,
-) -> Result<(StatusCode, Json<crate::chat_groups::ChatGroup>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<crate::chat_groups::ChatGroup>), (StatusCode, Json<serde_json::Value>)>
+{
     crate::chat_groups::create(&state.pool, &body.name)
         .await
         .map(|group| (StatusCode::CREATED, Json(group)))
@@ -26809,6 +26832,48 @@ mod tests {
         );
     }
 
+    /// What the Chats window's cache countdown and model label read: when the turn ended, which
+    /// model answered, and how long its cache lives — null on a turn that recorded none of them.
+    #[tokio::test]
+    async fn a_turn_carries_its_end_its_model_and_its_cache_ttl() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at, completed_at, model, cache_ttl)
+             VALUES ('hello', 'completed', 'assistant', 's', 'ttl-chat', '2026-10-03T10:00:00+00:00',
+                     '2026-10-03T10:00:09+00:00', 'claude-opus-4', '1h'),
+                    ('again', 'running', 'assistant', 's', 'ttl-chat', '2026-10-03T10:01:00+00:00',
+                     NULL, NULL, NULL)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/ttl-chat")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let done = &turns["turns"][0];
+        assert_eq!(done["completed_at"], "2026-10-03T10:00:09+00:00");
+        assert_eq!(done["model"], "claude-opus-4");
+        assert_eq!(done["cache_ttl"], "1h");
+        let live = &turns["turns"][1];
+        assert!(live["completed_at"].is_null());
+        assert!(live["model"].is_null());
+        assert!(live["cache_ttl"].is_null());
+    }
+
     /// A chat named like a number must not be read as a turn id. Static segments win in matchit,
     /// which is what keeps the two routes apart — asserted rather than assumed, because the failure
     /// would be a chat silently answering with one unrelated run.
@@ -28501,7 +28566,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["source"], "fallback");
-        assert_eq!(body["catalogue_version"], crate::model_catalog::CATALOGUE_VERSION);
+        assert_eq!(
+            body["catalogue_version"],
+            crate::model_catalog::CATALOGUE_VERSION
+        );
         assert!(body["fetched_at"].is_string());
         let groups = body["groups"].as_array().expect("groups is a list");
         assert!(!groups.is_empty());
@@ -29715,13 +29783,29 @@ mod tests {
 
         let (_, archived) =
             chats_request(&state, "GET", "/assistant/chats?archived=true", None).await;
-        assert!(archived.as_array().unwrap().iter().any(|c| c["chat_id"] == id.as_str()));
+        assert!(
+            archived
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["chat_id"] == id.as_str())
+        );
 
-        let (status, _) =
-            chats_request(&state, "POST", &format!("/assistant/chats/{id}/restore"), None).await;
+        let (status, _) = chats_request(
+            &state,
+            "POST",
+            &format!("/assistant/chats/{id}/restore"),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
-        assert!(live.as_array().unwrap().iter().any(|c| c["chat_id"] == id.as_str()));
+        assert!(
+            live.as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["chat_id"] == id.as_str())
+        );
 
         let (status, _) =
             chats_request(&state, "POST", "/assistant/chats/nope/restore", None).await;
@@ -29789,8 +29873,7 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
         assert_eq!(live[0]["group_id"], gid);
-        let (status, _) =
-            chats_request(&state, "PUT", &put_uri, Some(r#"{"group_id":999}"#)).await;
+        let (status, _) = chats_request(&state, "PUT", &put_uri, Some(r#"{"group_id":999}"#)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = chats_request(
             &state,
@@ -29815,8 +29898,13 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
         assert!(live[0]["group_id"].is_null());
-        let (status, _) =
-            chats_request(&state, "DELETE", &format!("/assistant/chat-groups/{gid}"), None).await;
+        let (status, _) = chats_request(
+            &state,
+            "DELETE",
+            &format!("/assistant/chat-groups/{gid}"),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 

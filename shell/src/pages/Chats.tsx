@@ -142,6 +142,7 @@ import {
 import { elapsedText } from "../lib/when";
 import { SessionColumn } from "../chats/SessionColumn";
 import { ChatTabs } from "../chats/ChatTabs";
+import { ChatChips } from "../chats/AgentMap";
 import { useChatTabs } from "../chats/tabs";
 
 import "./chats.css";
@@ -320,6 +321,7 @@ export function Chats() {
            just clicked a conversation already knew. */
         open={pickingUp === null && chatId !== null ? (summary ?? null) : null}
         openId={chatId}
+        turns={transcript.data?.turns}
         headline={headlineFor(rows, chats.data !== undefined)}
         actions={
           <>
@@ -457,7 +459,10 @@ function ChatsHeader({
   openId,
   headline,
   actions,
+  turns,
 }: {
+  /** What the conversation has said so far, for the cache and agent chips. */
+  turns?: Turn[];
   /** The conversation on screen, or `null` for the front door. */
   open: ChatSummary | null;
   /** Its id — separate, because the summary can be late while the route is not. */
@@ -481,6 +486,7 @@ function ChatsHeader({
         <ChatWhere chatId={openId} />
       </div>
       <div className="ui-page-actions">
+        <ChatChips turns={turns} chatTitle={open.title ?? "Conversation"} />
         {actions}
         <ChatMenu chatId={openId} />
       </div>
@@ -4741,10 +4747,13 @@ function WhatItDid({
   // same order either way — the daemon reads both from one column.
   const calls = tools.data?.did ?? did;
 
-  if (did.length === 0) return null;
+  // A call with a `parent` ran inside a subagent; the agent map shows it there, and listing it
+  // here as well would bury the main agent's own steps. `index` stays the position in `did`.
+  const mine = did.flatMap((call, index) => (call.parent ? [] : [{ call, index }]));
+  if (mine.length === 0) return null;
   return (
     <ul className="chats-turn-did" aria-label="What it did">
-      {did.map((call, index) => {
+      {mine.map(({ call, index }) => {
         // Keyed by position: this is a record of what happened, in order, and nothing reorders or
         // removes an entry. The same tool on the same file twice is two real calls, not a duplicate.
         const key = `${call.name}-${index}`;

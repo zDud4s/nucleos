@@ -57,6 +57,23 @@ export interface ToolCall {
   result_chars?: number | null;
   /** Whether the tool answered with an error rather than an answer. */
   result_failed?: boolean;
+  /** The tool_use id. Absent from a daemon older than the agent map. */
+  id?: string;
+  /** Id of the Task/Agent call this ran inside. Absent or null means the main agent. */
+  parent?: string | null;
+  /** The subagent kind, on a Task/Agent call. */
+  subagent_type?: string;
+  /** The model the subagent ran on. */
+  model?: string;
+  /** Whether a Bash call was started with run_in_background. */
+  background?: boolean;
+  /** RFC3339 start and end of the call. */
+  started_at?: string;
+  finished_at?: string;
+  /** Tokens the call spent, on a subagent. */
+  tokens?: number;
+  /** State of a background task. */
+  status?: "running" | "completed" | "failed" | "killed";
 }
 
 /** One line of a plan, as the daemon read it out of a `TodoWrite`. */
@@ -92,6 +109,12 @@ export interface AssistantTurnRow {
   answered_by: Brain | null;
   session_id: string | null;
   created_at: string;
+  /** When the turn settled. Absent from a daemon older than the cache chip; null while live. */
+  completed_at?: string | null;
+  /** The model the turn ran on, when the daemon says. */
+  model?: string | null;
+  /** The prompt-cache lifetime in force for the turn, when the daemon knows it. */
+  cache_ttl?: "5m" | "1h" | null;
   /**
    * How much context the turn ran with, an absolute token count. Null on a turn
    * whose stream never reported one, and on every turn from before the column.
@@ -222,6 +245,12 @@ export interface Turn {
    * nothing about which of the two happened first and only the clock does.
    */
   createdAt: string;
+  /** See `AssistantTurnRow.completed_at`. */
+  completedAt?: string | null;
+  /** See `AssistantTurnRow.model`. */
+  model?: string | null;
+  /** See `AssistantTurnRow.cache_ttl`. */
+  cacheTtl?: "5m" | "1h" | null;
   /** What the turn ran. See `AssistantTurnRow.did`. */
   did: ToolCall[];
   /** See `AssistantTurnRow.images`. */
@@ -295,6 +324,9 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     answeredBy: row.answered_by,
     sessionId: row.session_id,
     createdAt: row.created_at,
+    completedAt: row.completed_at ?? null,
+    model: row.model ?? null,
+    cacheTtl: row.cache_ttl ?? null,
     // Defaulted rather than trusted: a daemon older than the column sends no such key, and a
     // conversation losing one line is a better answer to that than a page that will not draw.
     did: row.did ?? [],
