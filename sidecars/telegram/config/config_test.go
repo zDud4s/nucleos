@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -267,5 +268,63 @@ func TestWithoutLocalAppDataLoadReadsTheConfigFromTheUserConfigDir(t *testing.T)
 	}
 	if cfg.AllowedChatID != 42 {
 		t.Errorf("AllowedChatID = %d, want 42 read from %s", cfg.AllowedChatID, path)
+	}
+}
+
+func TestProjectTopicsAreReadFromTheConfigFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "telegram-config.json")
+	contents := []byte(`{"allowed_chat_id":1234,"project_topics":{"proj-a":11,"proj-b":22}}`)
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("NUCLEOS_DAEMON_URL", "")
+	t.Setenv("NUCLEOS_DAEMON_TOKEN", "daemon-token")
+	t.Setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+	t.Setenv("NUCLEOS_TELEGRAM_CONFIG", path)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := map[string]int64{"proj-a": 11, "proj-b": 22}
+	if !reflect.DeepEqual(cfg.ProjectTopics, want) {
+		t.Errorf("ProjectTopics = %v, want %v", cfg.ProjectTopics, want)
+	}
+}
+
+func TestAProjectTopicThreadIDNotAboveZeroIsRejected(t *testing.T) {
+	for _, thread := range []string{"0", "-5"} {
+		path := filepath.Join(t.TempDir(), "telegram-config.json")
+		contents := []byte(`{"allowed_chat_id":1234,"project_topics":{"proj-bad":` + thread + `}}`)
+		if err := os.WriteFile(path, contents, 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		_, err := LoadFromFile(path)
+		if err == nil {
+			t.Fatalf("thread id %s: LoadFromFile() error = nil, want a rejection", thread)
+		}
+		if !strings.Contains(err.Error(), "proj-bad") {
+			t.Errorf("thread id %s: error = %q, want it to name the project", thread, err)
+		}
+	}
+}
+
+func TestWithoutProjectTopicsNoLineIsRouted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "telegram-config.json")
+	if err := os.WriteFile(path, []byte(`{"allowed_chat_id":1234}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("NUCLEOS_DAEMON_URL", "")
+	t.Setenv("NUCLEOS_DAEMON_TOKEN", "daemon-token")
+	t.Setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+	t.Setenv("NUCLEOS_TELEGRAM_CONFIG", path)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.ProjectTopics) != 0 {
+		t.Errorf("ProjectTopics = %v, want empty", cfg.ProjectTopics)
 	}
 }
