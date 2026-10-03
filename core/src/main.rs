@@ -14,6 +14,7 @@ mod browser_wheel;
 mod budget;
 mod calendar;
 mod capabilities;
+mod chat_groups;
 mod chat_notices;
 mod chats;
 mod classifier;
