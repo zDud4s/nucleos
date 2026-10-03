@@ -1305,6 +1305,7 @@ export function useStartConversation() {
       text,
       images,
       continueSession,
+      holdFirstMessage,
     }: {
       model?: string;
       effort?: string;
@@ -1329,6 +1330,14 @@ export function useStartConversation() {
        * late for `plan`, the rung people reach for BEFORE letting an agent near a codebase.
        */
       permissionMode?: PermissionMode;
+      /**
+       * Open the conversation and do NOT send the words yet.
+       *
+       * The front door's case: a conversation opened there has no project, and it must not start
+       * before it has one. The caller holds the words (see `chats/held.ts`) and the conversation's
+       * own composer sends them once a project is chosen.
+       */
+      holdFirstMessage?: boolean;
     }) => {
       // The model travels on the opening call rather than as a PATCH afterwards.
       // There is no conversation to PATCH until this returns, and correcting one a
@@ -1343,6 +1352,7 @@ export function useStartConversation() {
           continue_session: continueSession,
         }),
       });
+      if (holdFirstMessage === true) return opened;
       await apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
         method: "POST",
         body: JSON.stringify({

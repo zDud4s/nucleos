@@ -143,6 +143,8 @@ import { elapsedText } from "../lib/when";
 import { SessionColumn } from "../chats/SessionColumn";
 import { ChatTabs } from "../chats/ChatTabs";
 import { ChatChips } from "../chats/AgentMap";
+import { ProjectPicker } from "../chats/ProjectPicker";
+import { holdMessage, takeHeld, useHeldMessage } from "../chats/held";
 import { useChatTabs } from "../chats/tabs";
 
 import "./chats.css";
@@ -952,6 +954,11 @@ function ChatDetail({
   const [reuse, setReuse] = useState<{ text: string; at: number } | null>(null);
   // Stable, because it is handed to every turn and `TurnBlock` is memoised.
   const reuseQuestion = useCallback((text: string) => setReuse({ text, at: Date.now() }), []);
+  /**
+   * Whether the project picker is open. Held here because two siblings open it: the line that
+   * stands in for a missing project, and the composer when somebody speaks before choosing one.
+   */
+  const [picking, setPicking] = useState(false);
 
   // Once per chat opened, after the transcript has loaded — not on every poll
   // tick that follows. `markedSeen` is fresh per mount, and `ChatDetail` is
@@ -991,7 +998,7 @@ function ChatDetail({
         ref={box}
         onScroll={noteScroll}
       >
-        <Project chatId={chatId} />
+        <Project chatId={chatId} picking={picking} onPicking={setPicking} />
 
         {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
 
@@ -1032,7 +1039,12 @@ function ChatDetail({
         <Waiting queued={transcript.data?.queued ?? []} chatId={chatId} />
       </div>
 
-      <Composer chatId={chatId} chat={summary} reuse={reuse} />
+      <Composer
+        chatId={chatId}
+        chat={summary}
+        reuse={reuse}
+        onNeedsProject={() => setPicking(true)}
+      />
     </section>
   );
 }
@@ -1073,10 +1085,15 @@ function NothingOpen() {
                 permissionMode: mode,
                 text,
                 images,
+                // A conversation opened here has no project, and does not start until it has one:
+                // the words wait in the new conversation, which opens its project picker.
+                holdFirstMessage: true,
               },
               {
-                onSuccess: (opened) =>
-                  void navigate({ to: `/chats/${opened.chat_id}` }),
+                onSuccess: (opened) => {
+                  holdMessage(opened.chat_id, { text, images }, MAX_PICTURES);
+                  void navigate({ to: `/chats/${opened.chat_id}` });
+                },
               },
             )
           }
@@ -1591,7 +1608,15 @@ function ChatMenu({ chatId }: { chatId: string }) {
   );
 }
 
-function Project({ chatId }: { chatId: string }) {
+function Project({
+  chatId,
+  picking,
+  onPicking,
+}: {
+  chatId: string;
+  picking: boolean;
+  onPicking: (open: boolean) => void;
+}) {
   const project = useChatProject(chatId);
 
   // Nothing at all until it is known. A conversation is not "without a project" because the answer
@@ -1605,7 +1630,9 @@ function Project({ chatId }: { chatId: string }) {
           wired — is named by `ChatMeta`'s quiet line instead of by a sentence of its
           own, because "exceptions dominate, the normal disappears" and a conversation
           that is set up correctly is the normal case. */}
-      {cwd === null && <NoProject chatId={chatId} />}
+      {cwd === null && (
+        <NoProject chatId={chatId} picking={picking} onPicking={onPicking} />
+      )}
       {cwd !== null && !tools && (
         <ProjectWithoutTools chatId={chatId} cwd={cwd} />
       )}
@@ -1810,68 +1837,59 @@ function CarryOn({ cwd, session }: { cwd: string; session: string }) {
 }
 
 /**
- * What a conversation started here cannot do, and the way to change it.
+ * A conversation with no project yet, which does not start until it has one.
  *
  * A conversation's working directory used to be written once, at creation, out of the editor
  * session it was picked up from — so one started here had none, and `tool_policy_for` answered
- * `McpOnly` for as long as it existed. No Bash, no Read, no Write, and nothing said so: you would
- * ask it to fix a file, watch it not fix the file, and have nowhere to find out why.
+ * `McpOnly` for as long as it existed. No Bash, no Read, no Write. The fix used to be a banner with
+ * a free-text folder field beside the transcript, which a person could read past and start talking
+ * anyway — and the first turn then opened the session every later turn resumes, toolless.
  *
- * The suggestions are the folders the editor's own sessions were had in, which is where somebody
- * asking this question almost always means. Typed rather than picked from a dialog because a native
- * folder picker is a Tauri plugin this app does not carry, and the daemon refuses a path that is not
- * an absolute directory — so a typo comes back as a sentence instead of as a broken conversation.
+ * Now the choice comes first. The picker (`ProjectPicker`, in the app's own blurred-backdrop
+ * `Modal`) opens by itself when the conversation is opened, offers the NucleOS projects plus Root,
+ * and anything said meanwhile is held by the composer and sent once the project is set. Dismissing
+ * it leaves this one line, which opens it again.
  */
-function NoProject({ chatId }: { chatId: string }) {
+function NoProject({
+  chatId,
+  picking,
+  onPicking,
+}: {
+  chatId: string;
+  picking: boolean;
+  onPicking: (open: boolean) => void;
+}) {
   const point = useSetChatProject(chatId);
-  // Not watched: these are wanted as a list of folders, and a list of folders does not need
-  // re-reading every three seconds.
-  const sessions = useIdeSessions(true);
-  const [path, setPath] = useState("");
+  const held = useHeldMessage(chatId);
 
-  const folders = Array.from(
-    new Set((sessions.data ?? []).map((session) => session.cwd)),
-  );
+  // Once per opening of the conversation: `ChatDetail` is keyed on the chat, so this mount IS the
+  // opening. Not on every render, or "Not now" would be answered by the dialog coming straight back.
+  useEffect(() => {
+    onPicking(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className="chats-project">
       <p className="chats-new-warning" role="status">
-        this conversation has no project — it can talk about code and remember
-        what was said, but it{" "}
-        <b>cannot open a file, run a command, or change anything</b> on this
-        machine.
+        {held === null
+          ? "this conversation has no project yet — nothing is sent until one is chosen"
+          : "a message is held — it is sent as soon as this conversation has a project"}
       </p>
-      <form
-        className="chats-project-form"
-        onSubmit={(event) => {
-          event.preventDefault();
+      <Button type="button" intent="go" onClick={() => onPicking(true)}>
+        Choose a project
+      </Button>
+      <ProjectPicker
+        open={picking}
+        onOpenChange={onPicking}
+        pending={point.isPending}
+        holding={held !== null}
+        onChoose={(cwd) => {
           if (point.isPending) return;
-          point.mutate(path.trim());
+          point.mutate(cwd, { onSuccess: () => onPicking(false) });
         }}
-      >
-        <label htmlFor="chat-project">Project folder</label>
-        <input
-          id="chat-project"
-          list="chat-project-folders"
-          className="chats-project-path"
-          placeholder="C:/Projects/something"
-          value={path}
-          onChange={(event) => setPath(event.target.value)}
-        />
-        <datalist id="chat-project-folders">
-          {folders.map((folder) => (
-            <option key={folder} value={folder} />
-          ))}
-        </datalist>
-        <Button
-          type="submit"
-          intent="go"
-          disabled={point.isPending || path.trim() === ""}
-        >
-          Use this project
-        </Button>
-      </form>
-      {point.isError && <ProjectRefusal error={point.error} />}
+        refusal={point.isError ? <ProjectRefusal error={point.error} /> : undefined}
+      />
     </div>
   );
 }
@@ -1918,7 +1936,7 @@ function ProjectRefusal({ error }: { error: unknown }) {
       refusal={error}
       sentences={{
         bad_request:
-          "that has to be an absolute path to a folder that exists on this machine",
+          "that folder does not exist on this machine — choose another",
         conflict:
           "this conversation is answering — wait for the turn to end, then move it",
         not_found: "that conversation is no longer here",
@@ -5175,12 +5193,15 @@ function Composer({
   chatId,
   chat,
   reuse,
+  onNeedsProject,
 }: {
   chatId: string;
   /** The row, or undefined while the list is still being read. */
   chat: ChatSummary | undefined;
   /** A question lifted out of the transcript, or null. See `ChatDetail`. */
   reuse?: { text: string; at: number } | null;
+  /** Open the project picker: something was said to a conversation that has nowhere to run. */
+  onNeedsProject?: () => void;
 }) {
   const [text, setText] = useState("");
   const [caret, setCaret] = useState(0);
@@ -5192,6 +5213,11 @@ function Composer({
   const [attached, setAttached] = useState<Attachment[]>([]);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const send = useSendMessage(chatId);
+  const project = useChatProject(chatId);
+  // Sendable only once the conversation is KNOWN to have a directory. Unknown is not "none", but
+  // it is not "some" either, and what is said while it is being read waits the half-second.
+  const rooted = project.data !== undefined && project.data.cwd !== null;
+  const held = useHeldMessage(chatId);
   // Held here rather than inside the toggle, because the toggle and the line below the box are two
   // views of ONE microphone. Two `useDictation` calls would be two recordings.
   const dictation = useDictationInto(text, setText, setCaret, box);
@@ -5308,6 +5334,14 @@ function Composer({
     (text.trim() !== "" || attached.length > 0) && !send.isPending;
   const say = () => {
     if (!sayable) return;
+    if (!rooted) {
+      // Not sent: a conversation does not start before it knows where it runs. See `held.ts`.
+      holdMessage(chatId, { text: text.trim(), images: attached }, MAX_PICTURES);
+      setText("");
+      setAttached([]);
+      if (project.data !== undefined) onNeedsProject?.();
+      return;
+    }
     send.mutate(
       { text: text.trim(), images: attached },
       {
@@ -5319,6 +5353,36 @@ function Composer({
     );
   };
 
+  // The held message goes out the moment there is somewhere for it to run. Taken out of the store
+  // BEFORE the send, so a re-render mid-flight cannot send it twice; a send that fails puts the
+  // words back in the box rather than losing them.
+  useEffect(() => {
+    if (!rooted || held === null) return;
+    const message = takeHeld(chatId);
+    if (message === null) return;
+    send.mutate(message, {
+      onError: () => {
+        setText((was) => (was === "" ? message.text : `${message.text}
+
+${was}`));
+        setAttached((was) => [...message.images, ...was].slice(0, MAX_PICTURES));
+      },
+    });
+    // `send` is a fresh object every render; the trigger is the project arriving or a hold landing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rooted, held, chatId]);
+
+  // Back into the box, unsent: the way to change your mind about something held.
+  const unhold = () => {
+    const message = takeHeld(chatId);
+    if (message === null) return;
+    setText((was) => (was === "" ? message.text : `${message.text}
+
+${was}`));
+    setAttached((was) => [...message.images, ...was].slice(0, MAX_PICTURES));
+    requestAnimationFrame(() => box.current?.focus());
+  };
+
   return (
     <form
       className="chats-composer"
@@ -5327,6 +5391,26 @@ function Composer({
         say();
       }}
     >
+      {held !== null && (
+        <div className="chats-held" role="status" aria-label="Held message">
+          <p className="chats-held-text">
+            {held.text}
+            {held.images.length > 0 &&
+              ` (+${held.images.length} ${held.images.length === 1 ? "picture" : "pictures"})`}
+          </p>
+          <p className="chats-held-why">
+            held — not sent yet; it goes out as soon as this conversation has a project
+          </p>
+          <div className="chats-held-actions">
+            <Button type="button" intent="go" onClick={() => onNeedsProject?.()}>
+              Choose a project
+            </Button>
+            <Button type="button" variant="quiet" onClick={unhold}>
+              Edit
+            </Button>
+          </div>
+        </div>
+      )}
       {nowhere && (
         <p className="chats-mentions-none">
           this conversation has no directory, so there are no files to name here
