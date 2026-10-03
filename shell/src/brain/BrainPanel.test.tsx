@@ -145,4 +145,37 @@ describe("BrainPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Teach the agent" }));
     expect(await screen.findByText(/already taught/)).toBeTruthy();
   });
+
+  it("removing a link takes two presses, and only the second deletes", async () => {
+    const deleted: string[] = [];
+    serve(
+      detail({
+        links_out: [
+          {
+            id: 9,
+            note_id: 4,
+            link_type: "relates",
+            target_kind: "project",
+            target_ref: "12",
+            created_at: "2026-09-01T09:00:00+00:00",
+          },
+        ],
+      }),
+      (path, init) => {
+        if (init?.method !== "DELETE") return undefined;
+        deleted.push(path);
+        return Promise.resolve(undefined);
+      },
+    );
+    await panel({ ...graph, targets: [{ kind: "project", ref: "12", label: "repo", missing: false }] });
+
+    fireEvent.click(screen.getByRole("button", { name: /^Remove/ }));
+    expect(deleted).toHaveLength(0);
+    const armed = await screen.findByRole("button", { name: /Remove link/ });
+    // A real gap: clicks inside the interlock's 300ms dwell are ignored.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    fireEvent.click(armed);
+
+    await waitFor(() => expect(deleted).toEqual(["/owner-notes/links/9"]));
+  });
 });
