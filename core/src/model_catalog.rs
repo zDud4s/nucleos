@@ -49,7 +49,10 @@ pub const FALLBACK: &[(&str, &[&str])] = &[
     ("claude-sonnet-5", ALL),
     ("claude-haiku-4-5", &[]),
     ("gpt-5.6-sol", ALL),
-    ("gpt-5.6-terra", &["low", "medium", "high", "xhigh", "max", "ultra"]),
+    (
+        "gpt-5.6-terra",
+        &["low", "medium", "high", "xhigh", "max", "ultra"],
+    ),
     ("gpt-5.6-luna", ALL),
     ("gpt-5.5", &["low", "medium", "high", "xhigh"]),
 ];
@@ -105,7 +108,11 @@ pub fn display_name(id: &str) -> String {
     if tokens[0] == "claude" && tokens.len() > 1 {
         let rest = &tokens[1..];
         let family = rest.iter().find(|t| !starts_with_digit(t));
-        let version: Vec<&str> = rest.iter().copied().filter(|t| is_numeric_token(t)).collect();
+        let version: Vec<&str> = rest
+            .iter()
+            .copied()
+            .filter(|t| is_numeric_token(t))
+            .collect();
         let extra: Vec<String> = rest
             .iter()
             .filter(|t| !is_numeric_token(t))
@@ -138,7 +145,11 @@ pub fn display_name(id: &str) -> String {
         }
         return out;
     }
-    tokens.iter().map(|t| title(t)).collect::<Vec<_>>().join(" ")
+    tokens
+        .iter()
+        .map(|t| title(t))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `(provider, family)` an id belongs to.
@@ -257,7 +268,10 @@ fn version_of(id: &str) -> Vec<u64> {
     let s = normalise(id);
     let tokens: Vec<&str> = s.split('-').filter(|t| !t.is_empty()).collect();
     let numeric = |t: &str| -> Vec<u64> {
-        let digits: String = t.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        let digits: String = t
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
         digits.split('.').filter_map(|p| p.parse().ok()).collect()
     };
     match tokens.first().copied() {
@@ -354,7 +368,11 @@ pub fn fallback() -> Vec<Discovered> {
     FALLBACK
         .iter()
         .filter_map(|(id, efforts)| {
-            make(id, Some(efforts.iter().map(|e| e.to_string()).collect()), None)
+            make(
+                id,
+                Some(efforts.iter().map(|e| e.to_string()).collect()),
+                None,
+            )
         })
         .collect()
 }
@@ -410,7 +428,11 @@ const RETRY_AFTER_FAILURE: std::time::Duration = std::time::Duration::from_secs(
 impl Snapshot {
     /// How long this snapshot is trusted: a day when every fetch worked, minutes when one did not.
     pub fn ttl(&self) -> std::time::Duration {
-        if self.ok { FRESH_FOR } else { RETRY_AFTER_FAILURE }
+        if self.ok {
+            FRESH_FOR
+        } else {
+            RETRY_AFTER_FAILURE
+        }
     }
 
     fn is_fresh(&self) -> bool {
@@ -464,7 +486,12 @@ where
         if found.is_empty() {
             ok = false;
             if let Some(prev) = previous.filter(|p| p.source == "live") {
-                live.extend(prev.models.iter().filter(|d| d.provider == provider).cloned());
+                live.extend(
+                    prev.models
+                        .iter()
+                        .filter(|d| d.provider == provider)
+                        .cloned(),
+                );
             }
         } else {
             live.extend(found);
@@ -694,7 +721,11 @@ mod tests {
         assert_eq!(first.source, "live");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let second = ensure_with(&keys, &fetch, Some(&first)).await;
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "refetched");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "refetched"
+        );
         assert_eq!(second.fetched_at, first.fetched_at);
     }
 
@@ -752,7 +783,10 @@ mod tests {
 
     #[test]
     fn family_and_runner_are_derived_from_the_id() {
-        assert_eq!(family_of("claude-opus-4-6"), ("anthropic", "opus".to_string()));
+        assert_eq!(
+            family_of("claude-opus-4-6"),
+            ("anthropic", "opus".to_string())
+        );
         assert_eq!(
             family_of("claude-3-5-sonnet-20241022"),
             ("anthropic", "sonnet".to_string())
@@ -783,8 +817,14 @@ mod tests {
             default_efforts("anthropic", "fable"),
             vec!["low", "medium", "high"]
         );
-        assert_eq!(default_efforts("openai", "gpt"), vec!["low", "medium", "high"]);
-        assert_eq!(default_efforts("openai", "o"), vec!["low", "medium", "high"]);
+        assert_eq!(
+            default_efforts("openai", "gpt"),
+            vec!["low", "medium", "high"]
+        );
+        assert_eq!(
+            default_efforts("openai", "o"),
+            vec!["low", "medium", "high"]
+        );
     }
 
     #[test]
@@ -909,9 +949,15 @@ mod tests {
 
         // Alias first, then version descending; the dated duplicate of "Opus 4.1" folds into the
         // undated id.
-        assert_eq!(ids(&groups[0].models), vec!["opus", "claude-opus-4-6", "claude-opus-4-1"]);
+        assert_eq!(
+            ids(&groups[0].models),
+            vec!["opus", "claude-opus-4-6", "claude-opus-4-1"]
+        );
         // Same version: `created` descending.
-        assert_eq!(ids(&groups[3].models), vec!["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5"]);
+        assert_eq!(
+            ids(&groups[3].models),
+            vec!["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5"]
+        );
         assert!(
             groups.iter().all(|g| !g.models.is_empty()),
             "no empty group is ever returned"
@@ -964,7 +1010,11 @@ mod tests {
             .collect();
         let groups = group(choices, &HashMap::new());
         let grouped: usize = groups.iter().map(|g| g.models.len()).sum();
-        assert_eq!(grouped, found.len(), "every fallback model lands in a group");
+        assert_eq!(
+            grouped,
+            found.len(),
+            "every fallback model lands in a group"
+        );
         assert!(groups.iter().all(|g| !g.models.is_empty()));
         assert_eq!(groups[0].provider, "anthropic");
         assert_eq!(groups[0].family, "opus");
