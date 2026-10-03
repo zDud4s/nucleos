@@ -37,16 +37,20 @@ pub struct ModelGroup {
 const ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
 
 /// Bumped whenever `FALLBACK` is refreshed by hand.
-pub const CATALOGUE_VERSION: &str = "2026-10-02";
+pub const CATALOGUE_VERSION: &str = "2026-10-03";
 
 const ALL: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const THREE: &[&str] = &["low", "medium", "high"];
 
 /// What the picker shows when no vendor list is available. Ids already known to this repo.
 pub const FALLBACK: &[(&str, &[&str])] = &[
+    ("claude-opus-5-5", ALL),
+    ("claude-opus-5", ALL),
     ("claude-opus-4-6", ALL),
     ("claude-sonnet-5-5", ALL),
     ("claude-sonnet-5", ALL),
+    ("claude-fable-5-1", ALL),
+    ("claude-fable-5", ALL),
     ("claude-haiku-4-5", &[]),
     ("gpt-5.6-sol", ALL),
     (
@@ -980,8 +984,10 @@ mod tests {
         let found = fallback();
         assert_eq!(found.len(), FALLBACK.len());
         for want in [
+            "claude-opus-5-5",
             "claude-opus-4-6",
             "claude-sonnet-5-5",
+            "claude-fable-5-1",
             "claude-sonnet-5",
             "claude-haiku-4-5",
             "gpt-5.6-sol",
