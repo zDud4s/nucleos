@@ -1332,6 +1332,18 @@ pub async fn propose(
     pool: &SqlitePool,
     declaration: Declaration<'_>,
 ) -> Result<(i64, i64), ProposeError> {
+    let mut tx = pool.begin().await?;
+    let ids = propose_in(&mut tx, declaration).await?;
+    tx.commit().await?;
+    Ok(ids)
+}
+
+/// `propose`, inside a transaction the caller owns — for a caller whose own writes must land or
+/// vanish together with the lesson and its question. Nothing is committed here.
+pub async fn propose_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    declaration: Declaration<'_>,
+) -> Result<(i64, i64), ProposeError> {
     let Declaration {
         project_id,
         origin_run_id,
@@ -1354,7 +1366,7 @@ pub async fn propose(
         let owner: Option<(String, Option<String>)> =
             sqlx::query_as("SELECT scope_kind, scope_id FROM knowledge WHERE id = ?")
                 .bind(predecessor)
-                .fetch_optional(pool)
+                .fetch_optional(&mut **tx)
                 .await?;
         let owner = owner.ok_or(ProposeError::UnknownPredecessor(predecessor))?;
         if owner.0 != scope_kind || owner.1.as_deref() != scope_id.as_deref() {
@@ -1363,7 +1375,6 @@ pub async fn propose(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    let mut tx = pool.begin().await?;
 
     let knowledge_id = sqlx::query(
         "INSERT INTO knowledge
@@ -1388,17 +1399,22 @@ pub async fn propose(
     .bind(supersedes)
     .bind(origin_run_id)
     .bind(&now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .last_insert_rowid();
 
     sqlx::query(
         "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
-         VALUES (?, NULL, 'proposed', 'declared by a run', ?)",
+         VALUES (?, NULL, 'proposed', ?, ?)",
     )
     .bind(knowledge_id)
+    .bind(if origin_run_id.is_some() {
+        "declared by a run"
+    } else {
+        "declared by the owner"
+    })
     .bind(&now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     // `tool_input` carries the id and nothing a reader would have to join to understand the
@@ -1432,7 +1448,7 @@ pub async fn propose(
     .bind(reasoning)
     .bind(&tool_input)
     .bind(&now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .last_insert_rowid();
 
@@ -1442,16 +1458,15 @@ pub async fn propose(
     )
     .bind(proposal_id)
     .bind(&now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     sqlx::query("UPDATE knowledge SET proposal_id = ? WHERE id = ?")
         .bind(proposal_id)
         .bind(knowledge_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
-    tx.commit().await?;
     Ok((knowledge_id, proposal_id))
 }
 
@@ -2695,6 +2710,75 @@ mod tests {
         .await
         .unwrap();
         assert!(recalled.is_empty(), "recall answered a live row");
+    }
+
+    /// No run behind the request means the owner made it, and both the row and its first event say
+    /// so — an event note claiming a run nobody started would be a history that lies.
+    #[tokio::test]
+    async fn an_owner_declaration_is_recorded_as_the_owners() {
+        let pool = test_pool().await;
+        let (knowledge_id, _) = propose(
+            &pool,
+            Declaration {
+                project_id: None,
+                origin_run_id: None,
+                kind: Kind::Memory,
+                title: "Owner's lesson",
+                body: "Written by hand.",
+                reasoning: "the owner said so",
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let source: String = sqlx::query_scalar("SELECT source FROM knowledge WHERE id = ?")
+            .bind(knowledge_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(source, "owner");
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM knowledge_events WHERE knowledge_id = ? AND to_status = 'proposed'",
+        )
+        .bind(knowledge_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(note, "declared by the owner");
+    }
+
+    /// `propose_in` commits nothing itself: a caller that abandons its transaction leaves neither
+    /// the lesson nor the question about it behind.
+    #[tokio::test]
+    async fn propose_in_rolls_back_with_its_transaction() {
+        let pool = test_pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        propose_in(
+            &mut tx,
+            Declaration {
+                project_id: Some("mine"),
+                origin_run_id: None,
+                kind: Kind::Memory,
+                title: "Never landed",
+                body: "Rolled back.",
+                reasoning: "test",
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+
+        let knowledge: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((knowledge, proposals), (0, 0));
     }
 
     /// The whole mechanism, end to end and in the order it happens: a run declares, nothing reaches
