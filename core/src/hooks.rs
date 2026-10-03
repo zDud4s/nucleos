@@ -7033,15 +7033,25 @@ mod tests {
         // arbiter that decides this call owns the termination, and it runs before any recording work.
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         let mut terminated = false;
+        // The pause runs in its own task, so a yield can let it finish entirely (handle removed AND
+        // proposal recorded) before the next poll; the handler then completes, which is not a
+        // failure. Only completing while the run is still in flight is. Seen on a loaded Windows CI
+        // runner, where asserting on the poll first failed on the benign case.
+        let in_flight = || state.run_handles.lock().unwrap().contains_key(&run_id);
         for _ in 0..10_000 {
-            assert!(
-                handler.as_mut().poll(&mut context).is_pending(),
-                "the handler ran to completion before the request could be dropped"
-            );
-            if !state.run_handles.lock().unwrap().contains_key(&run_id) {
+            if !in_flight() {
                 terminated = true;
                 break;
             }
+            let ready = handler.as_mut().poll(&mut context).is_ready();
+            if !in_flight() {
+                terminated = true;
+                break;
+            }
+            assert!(
+                !ready,
+                "the handler ran to completion without terminating the run"
+            );
             tokio::task::yield_now().await;
         }
         assert!(terminated, "the handler never terminated the run");
