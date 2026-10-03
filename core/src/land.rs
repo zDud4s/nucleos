@@ -165,10 +165,10 @@ async fn derive_integration_branch(
     // never checked that branch out locally has no `refs/heads/<name>`, and persisting the name
     // anyway would make every later landing refuse on a branch that was never there — so it counts
     // only when the local branch exists, and otherwise the local fallbacks below answer.
-    if let Some(branch) = crate::git_exec::default_remote_branch(project_root, deadline).await? {
-        if crate::git_exec::branch_exists(project_root, &branch, deadline).await? {
-            return Ok(branch);
-        }
+    if let Some(branch) = crate::git_exec::default_remote_branch(project_root, deadline).await?
+        && crate::git_exec::branch_exists(project_root, &branch, deadline).await?
+    {
+        return Ok(branch);
     }
     for candidate in ["master", "main"] {
         if crate::git_exec::branch_exists(project_root, candidate, deadline).await? {

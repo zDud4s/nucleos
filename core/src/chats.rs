@@ -993,11 +993,12 @@ pub async fn list_archived(pool: &SqlitePool) -> sqlx::Result<Vec<ChatSummary>> 
 
 /// Puts an archived conversation back on the list. `false` when it was not archived.
 pub async fn restore(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<bool> {
-    let done =
-        sqlx::query("UPDATE chats SET archived_at = NULL WHERE chat_id = ? AND archived_at IS NOT NULL")
-            .bind(chat_id)
-            .execute(pool)
-            .await?;
+    let done = sqlx::query(
+        "UPDATE chats SET archived_at = NULL WHERE chat_id = ? AND archived_at IS NOT NULL",
+    )
+    .bind(chat_id)
+    .execute(pool)
+    .await?;
     Ok(done.rows_affected() > 0)
 }
 
@@ -1059,7 +1060,10 @@ macro_rules! list_select {
 /// The list SELECT. Static text chosen by the bool; no input is interpolated.
 fn list_where(archived: bool) -> &'static str {
     if archived {
-        concat!(list_select!(), " WHERE c.archived_at IS NOT NULL ORDER BY c.archived_at DESC")
+        concat!(
+            list_select!(),
+            " WHERE c.archived_at IS NOT NULL ORDER BY c.archived_at DESC"
+        )
     } else {
         concat!(
             list_select!(),
@@ -1345,18 +1349,39 @@ mod tests {
         let asked = create(&pool, Brain::Cloud, None).await.unwrap();
         let answered = create(&pool, Brain::Cloud, None).await.unwrap();
         let none = create(&pool, Brain::Cloud, None).await.unwrap();
-        seed_run(&pool, &asked, "completed", Some(r#"[{"name":"AskUserQuestion","detail":"Which?"}]"#)).await;
-        seed_run(&pool, &answered, "completed", Some(r#"[{"name":"AskUserQuestion"}]"#)).await;
+        seed_run(
+            &pool,
+            &asked,
+            "completed",
+            Some(r#"[{"name":"AskUserQuestion","detail":"Which?"}]"#),
+        )
+        .await;
+        seed_run(
+            &pool,
+            &answered,
+            "completed",
+            Some(r#"[{"name":"AskUserQuestion"}]"#),
+        )
+        .await;
         seed_run(&pool, &answered, "completed", Some("[]")).await;
         seed_run(&pool, &none, "completed", None).await;
 
         let listed = list(&pool).await.unwrap();
-        let asked_of = |id: &str| listed.iter().find(|c| c.chat_id == id).unwrap().asked_question;
+        let asked_of = |id: &str| {
+            listed
+                .iter()
+                .find(|c| c.chat_id == id)
+                .unwrap()
+                .asked_question
+        };
 
         assert!(asked_of(&asked));
         assert!(!asked_of(&answered));
         assert!(!asked_of(&none));
-        let settled = settle(listed.iter().find(|c| c.chat_id == asked).unwrap().clone(), 0);
+        let settled = settle(
+            listed.iter().find(|c| c.chat_id == asked).unwrap().clone(),
+            0,
+        );
         assert_eq!(settled.activity, Activity::NeedsInput);
     }
 
@@ -1368,7 +1393,11 @@ mod tests {
 
         assert!(list(&pool).await.unwrap().iter().all(|c| c.chat_id != id));
         let archived = list_archived(&pool).await.unwrap();
-        assert!(archived.iter().any(|c| c.chat_id == id && c.archived_at.is_some()));
+        assert!(
+            archived
+                .iter()
+                .any(|c| c.chat_id == id && c.archived_at.is_some())
+        );
 
         assert!(restore(&pool, &id).await.unwrap());
         assert!(!restore(&pool, &id).await.unwrap());

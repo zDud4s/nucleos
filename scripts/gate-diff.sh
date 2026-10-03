@@ -52,7 +52,7 @@ if mb="$(git merge-base HEAD "$base" 2>/dev/null)" && [ -n "$mb" ]; then
       shell/src-tauri/*) add tauri "$p" ;;
       shell/*) add shell "$p" ;;
       scripts/csp-gate.mjs) add shell "$p" ;;
-      .claude/hooks/*|scripts/test-*.py|scripts/eval/*|scripts/refresh-models.py|scripts/run-daemon.ps1)
+      .claude/hooks/*|scripts/test-*.py|scripts/refresh-models.py|scripts/run-daemon.ps1)
         add hooks "$p" ;;
     esac
   done <<< "$paths"

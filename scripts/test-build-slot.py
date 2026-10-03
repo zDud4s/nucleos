@@ -171,6 +171,10 @@ def test_a_killed_holder_is_reaped_and_a_terminated_one_releases() -> None:
             wait_for(a[1])
             (pid,) = held(slots)
             sh(f"kill -9 {pid}")
+            # Reap it. The holder is this process's own child, and on Linux a killed child stays a
+            # zombie until its parent waits on it; `kill -0` answers yes for a zombie, so the slot
+            # read as held for the whole timeout. MSYS has no zombies, which is why only CI saw it.
+            a[0].wait(timeout=10)
             time.sleep(1)
             # The dead holder's file is still there: nothing cleaned up after a SIGKILL.
             assert held(slots) == [pid], held(slots)

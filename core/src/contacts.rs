@@ -988,8 +988,8 @@ mod tests {
     #[tokio::test]
     async fn o_nome_sobrevive_ao_prune() {
         let pool = test_pool().await;
-        let address = "duarte@example.com";
-        let display_name = "Duarte Ferreira";
+        let address = "helena@example.com";
+        let display_name = "Helena Costa";
         let now = Utc.with_ymd_and_hms(2026, 7, 29, 12, 0, 0).unwrap();
         let received_at =
             (now - Duration::days(crate::triage::ROW_RETENTION_DAYS + 1)).to_rfc3339();
@@ -1036,20 +1036,20 @@ mod tests {
     #[tokio::test]
     async fn o_nome_segue_a_mensagem_mais_recente() {
         let pool = test_pool().await;
-        let address = "duarte@example.com";
+        let address = "helena@example.com";
         let earlier = "2026-07-20T09:00:00+00:00";
         let later = "2026-07-24T09:00:00+00:00";
         let latest = "2026-07-26T09:00:00+00:00";
         let unnamed_latest = "2026-07-27T09:00:00+00:00";
 
         let mut transaction = pool.begin().await.unwrap();
-        record_inbound(&mut transaction, address, Some("Duarte Ferreira"), later)
+        record_inbound(&mut transaction, address, Some("Helena Costa"), later)
             .await
             .unwrap();
         record_inbound(
             &mut transaction,
             address,
-            Some("duarte (old client)"),
+            Some("helena (old client)"),
             earlier,
         )
         .await
@@ -1062,11 +1062,11 @@ mod tests {
             .expect("the named inbound messages must create a profile");
         assert_eq!(
             after_out_of_order.display_name.as_deref(),
-            Some("Duarte Ferreira")
+            Some("Helena Costa")
         );
 
         let mut transaction = pool.begin().await.unwrap();
-        record_inbound(&mut transaction, address, Some("Duarte F."), latest)
+        record_inbound(&mut transaction, address, Some("Helena C."), latest)
             .await
             .unwrap();
         transaction.commit().await.unwrap();
@@ -1075,7 +1075,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the later named inbound message must preserve the profile");
-        assert_eq!(after_new_name.display_name.as_deref(), Some("Duarte F."));
+        assert_eq!(after_new_name.display_name.as_deref(), Some("Helena C."));
 
         let mut transaction = pool.begin().await.unwrap();
         record_inbound(&mut transaction, address, None, unnamed_latest)
@@ -1087,20 +1087,20 @@ mod tests {
             .await
             .unwrap()
             .expect("an unnamed inbound message must preserve the profile");
-        assert_eq!(after_unnamed.display_name.as_deref(), Some("Duarte F."));
+        assert_eq!(after_unnamed.display_name.as_deref(), Some("Helena C."));
     }
 
     #[tokio::test]
     async fn o_nome_escrito_por_uma_pessoa_ganha() {
         let pool = test_pool().await;
-        let address = "duarte@example.com";
+        let address = "helena@example.com";
         let received_at = "2026-07-24T09:00:00+00:00";
 
         let mut transaction = pool.begin().await.unwrap();
         record_inbound(
             &mut transaction,
             address,
-            Some("duarte (mail client)"),
+            Some("helena (mail client)"),
             received_at,
         )
         .await
@@ -1114,7 +1114,7 @@ mod tests {
                 .await
                 .unwrap();
         sqlx::query("UPDATE contacts SET display_name = ? WHERE id = ?")
-            .bind("Duarte Ferreira")
+            .bind("Helena Costa")
             .bind(contact_id)
             .execute(&pool)
             .await
@@ -1124,7 +1124,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the human-named contact must have a profile");
-        assert_eq!(profile.display_name.as_deref(), Some("Duarte Ferreira"));
+        assert_eq!(profile.display_name.as_deref(), Some("Helena Costa"));
     }
 
     #[tokio::test]
@@ -1865,8 +1865,8 @@ mod tests {
     #[tokio::test]
     async fn um_par_recusado_nao_volta() {
         let pool = test_pool().await;
-        let first_address = "duarte@example.com";
-        let second_address = "duarte@work.example";
+        let first_address = "helena@example.com";
+        let second_address = "helena@work.example";
         let received_at = "2026-07-20T09:00:00+00:00";
         let sent_at = "2026-07-21T09:00:00+00:00";
 
@@ -1874,7 +1874,7 @@ mod tests {
         record_inbound(
             &mut transaction,
             first_address,
-            Some("Duarte Ferreira"),
+            Some("Helena Costa"),
             received_at,
         )
         .await
@@ -1882,7 +1882,7 @@ mod tests {
         record_inbound(
             &mut transaction,
             second_address,
-            Some("duarte ferreira"),
+            Some("helena costa"),
             received_at,
         )
         .await

@@ -153,11 +153,17 @@ mod tests {
 
         let chat = chats::create(&pool, Brain::Cloud, None).await.unwrap();
         assign(&pool, &chat, Some(a.id)).await.unwrap();
-        assert_eq!(chats::get(&pool, &chat).await.unwrap().unwrap().group_id, Some(a.id));
+        assert_eq!(
+            chats::get(&pool, &chat).await.unwrap().unwrap().group_id,
+            Some(a.id)
+        );
 
         assert!(delete(&pool, a.id).await.unwrap());
         assert!(!delete(&pool, a.id).await.unwrap());
-        assert_eq!(chats::get(&pool, &chat).await.unwrap().unwrap().group_id, None);
+        assert_eq!(
+            chats::get(&pool, &chat).await.unwrap().unwrap().group_id,
+            None
+        );
         assert_eq!(list(&pool).await.unwrap().len(), 1);
     }
 
@@ -169,7 +175,10 @@ mod tests {
             create(&pool, &"x".repeat(81)).await,
             Err(GroupError::TooLong)
         ));
-        assert!(matches!(rename(&pool, 99, "x").await, Err(GroupError::NoGroup)));
+        assert!(matches!(
+            rename(&pool, 99, "x").await,
+            Err(GroupError::NoGroup)
+        ));
         let chat = chats::create(&pool, Brain::Cloud, None).await.unwrap();
         assert!(matches!(
             assign(&pool, &chat, Some(99)).await,
@@ -180,6 +189,9 @@ mod tests {
             Err(GroupError::NoChat)
         ));
         chats::archive(&pool, &chat).await.unwrap();
-        assert!(matches!(assign(&pool, &chat, None).await, Err(GroupError::NoChat)));
+        assert!(matches!(
+            assign(&pool, &chat, None).await,
+            Err(GroupError::NoChat)
+        ));
     }
 }

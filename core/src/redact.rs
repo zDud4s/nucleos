@@ -175,7 +175,7 @@ fn escaped_body_len(input: &str) -> usize {
 /// that is not base64 is what keeps a key with no footer from redacting the paragraph after it.
 fn base64_body_len(input: &str) -> usize {
     /// PEM wraps at 64 characters, so a body line is long. The bound is what stops a sign-off being
-    /// eaten: "Cumprimentos" and "Duarte" are punctuation-free single words and were being read as
+    /// eaten: "Cumprimentos" and "Helena" are punctuation-free single words and were being read as
     /// key material, which redacted the end of a message rather than the end of a key.
     const MIN_BODY_LINE: usize = 16;
 
@@ -1046,18 +1046,18 @@ mod tests {
         assert!(redacted.contains("and that is all"), "{redacted:?}");
     }
 
-    /// The bound has to survive a sign-off, not just a blank line. "Cumprimentos" and "Duarte" are
+    /// The bound has to survive a sign-off, not just a blank line. "Cumprimentos" and "Helena" are
     /// punctuation-free single words, which an earlier version read as key material — redacting the
     /// end of the message along with the end of the key.
     #[test]
     fn a_footerless_key_does_not_swallow_the_sign_off() {
         let input =
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0000\nObrigado\nCumprimentos\nDuarte";
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0000\nObrigado\nCumprimentos\nHelena";
         let redacted = redact_secrets(input);
 
         assert!(!redacted.contains("MIIEowIBAAKCAQEA"), "{redacted:?}");
         assert!(redacted.contains("Obrigado"), "{redacted:?}");
-        assert!(redacted.ends_with("Duarte"), "{redacted:?}");
+        assert!(redacted.ends_with("Helena"), "{redacted:?}");
     }
 
     /// A plural still names the number. Exact word matching was the first correction and it was too
