@@ -31,22 +31,20 @@ import {
 import {
   ArrowUp,
   ChevronDown,
-  ImagePlus,
   Mic,
   MicOff,
   MoreHorizontal,
-  PanelLeft,
-  PanelLeftClose,
+  PanelRight,
+  PanelRightClose,
   ChevronRight,
   LoaderCircle,
-  Plus,
-  SquareCode,
   SquarePen,
 } from "lucide-react";
 import { isApiRefusal } from "../data/client";
 import {
   useArchiveChat,
   useAssistantModels,
+  useModelGroups,
   useChatTranscript,
   useChats,
   useIdeConversation,
@@ -120,7 +118,9 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { commandAt, mentionAt, withCommand, withMention } from "../lib/mention";
 import { fetchFileBlob } from "../data/files";
 import { attachmentFrom, isPicture } from "../lib/picture";
-import { stillGoing } from "../lib/editor";
+import { PlusMenu } from "../chats/PlusMenu";
+import { Slider } from "../ui/Slider";
+import { displayName } from "../lib/modelName";
 import { diffLines } from "../lib/diff";
 import { useDictation, type DictationView } from "../data/dictation";
 import { revise, type Provisional } from "../lib/provisional";
@@ -136,11 +136,12 @@ import {
   Quiet,
   RefusalNote,
   RelativeTime,
-  relativeText,
   StaleNote,
-  Teach,
 } from "../ui";
-import { BAND_TITLE, elapsedText, inBands } from "../lib/when";
+import { elapsedText } from "../lib/when";
+import { SessionColumn } from "../chats/SessionColumn";
+import { ChatTabs } from "../chats/ChatTabs";
+import { useChatTabs } from "../chats/tabs";
 
 import "./chats.css";
 
@@ -229,6 +230,28 @@ export function Chats() {
     at: number;
   } | null>(null);
   const navigate = useNavigate();
+  /**
+   * The conversations held open as tabs. Whether a tab is open lives only here and in
+   * `localStorage`: the daemon knows nothing of it, so an archived or deleted chat is dropped
+   * against the list once that has loaded.
+   */
+  const tabs = useChatTabs();
+  const openTab = tabs.open;
+  const pruneTabs = tabs.prune;
+  useEffect(() => {
+    if (chatId !== null) openTab(chatId);
+  }, [chatId, openTab]);
+  useEffect(() => {
+    // The open conversation is always known, even when the list was fetched before it existed.
+    if (chats.data !== undefined)
+      pruneTabs([...chats.data.map((row) => row.chat_id), ...(chatId === null ? [] : [chatId])]);
+  }, [chats.data, chatId, pruneTabs]);
+  /** Closing the open tab moves to its neighbour, or back to the front door when it was alone. */
+  const closeTab = (id: string) => {
+    const next = tabs.close(id, chatId);
+    if (id !== chatId) return;
+    void navigate({ to: next === null ? "/chats" : `/chats/${next}` });
+  };
   const unseen = rows.reduce((total, row) => total + row.waiting, 0);
   const query = usePaletteQuery();
   const openPalette = usePaletteOpen();
@@ -320,9 +343,9 @@ export function Chats() {
                   part shared — the label stays words, because this button is in a header where
                   a lone icon would be the only unlabelled control on the page. */}
               {railOpen ? (
-                <PanelLeftClose className="chats-head-icon" aria-hidden="true" />
+                <PanelRightClose className="chats-head-icon" aria-hidden="true" />
               ) : (
-                <PanelLeft className="chats-head-icon" aria-hidden="true" />
+                <PanelRight className="chats-head-icon" aria-hidden="true" />
               )}
               {railOpen ? "Hide conversations" : "Conversations"}
               {/* Answers that landed while you were elsewhere. Shown on the button
@@ -350,27 +373,15 @@ export function Chats() {
           railOpen ? "chats-layout" : "chats-layout chats-layout-alone"
         }
       >
-        {railOpen && (
-          /* The ground that tells the list from the thread. See `.chats-rail`: this used to be a
-             bordered panel beside another bordered panel, which is a settings screen, not a chat. */
-          <div className="chats-rail">
-            <ChatListPanel
-              rows={rows}
-              answered={chats.data !== undefined}
-              selected={chatId}
-              selectedLive={selectedLive}
-              pickingUp={pickingUp}
-              onPickUp={setPickingUp}
-              onOpenChat={openingAChat}
-              onNew={() => {
-                setPickingUp(null);
-                void navigate({ to: "/chats" });
-              }}
-            />
-          </div>
-        )}
-
         <div className="chats-detail">
+          <ChatTabs
+            tabs={tabs.tabs}
+            rows={rows}
+            current={pickingUp === null ? chatId : null}
+            selectedLive={selectedLive}
+            onOpenChat={openingAChat}
+            onClose={closeTab}
+          />
           {/* An editor conversation opens in this column like any other, because to the person
               looking at the list it IS any other — see `EditorDetail`. */}
           {pickingUp !== null && (
@@ -396,6 +407,27 @@ export function Chats() {
             />
           )}
         </div>
+
+        {railOpen && (
+          /* The ground that tells the list from the thread. See `.chats-rail`: it sits on the
+             RIGHT, where a session manager keeps its sessions. */
+          <div className="chats-rail">
+            <SessionColumn
+              rows={rows}
+              answered={chats.data !== undefined}
+              selected={chatId}
+              selectedLive={selectedLive}
+              pickingUp={pickingUp}
+              onPickUp={setPickingUp}
+              onOpenChat={openingAChat}
+              onNew={() => {
+                setPickingUp(null);
+                void navigate({ to: "/chats" });
+              }}
+              openTabs={tabs.tabs}
+            />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -516,313 +548,9 @@ function SaidRow({ hit }: { hit: SaidHit }) {
   );
 }
 
-/**
- * One row of the sidebar, from either source.
- *
- * The list used to hold only conversations this app had opened; the ones still living in the editor
- * were behind a "From the editor" button, in a list of their own. Two lists of the same thing is
- * two places to look for a conversation you half remember — so they became one, and what tells them
- * apart is a mark on the row rather than which door you went through.
- */
-export type ListRow =
-  | { kind: "chat"; at: string | null; chat: ChatSummary }
-  | { kind: "editor"; at: string; session: IdeSession };
-
-/**
- * Both sources, newest first, with the editor sessions this app has ALREADY picked up left out —
- * those are conversations here now, and drawing them twice would offer to open a second copy of
- * something already open.
- */
-export function mergeRows(
-  chats: ChatSummary[],
-  sessions: IdeSession[],
-): ListRow[] {
-  const pickedUp = new Set(
-    chats
-      .map((chat) => chat.ide_session_id)
-      .filter((id): id is string => id !== null),
-  );
-  const rows: ListRow[] = [
-    ...chats.map((chat) => ({
-      kind: "chat" as const,
-      at: chat.last_activity,
-      chat,
-    })),
-    ...sessions
-      .filter((session) => !pickedUp.has(session.session_id))
-      .map((session) => ({
-        kind: "editor" as const,
-        at: session.last_activity,
-        session,
-      })),
-  ];
-  // ISO-8601 sorts correctly as text, which is why the daemon sends it. A conversation nobody has
-  // spoken in has no activity at all and goes last rather than pretending to be old.
-  return [...rows].sort((a, b) => (b.at ?? "").localeCompare(a.at ?? ""));
-}
-
-function ChatListPanel({
-  rows,
-  answered,
-  selected,
-  selectedLive,
-  pickingUp,
-  onPickUp,
-  onOpenChat,
-  onNew,
-}: {
-  rows: ChatSummary[];
-  answered: boolean;
-  selected: string | null;
-  selectedLive: boolean;
-  pickingUp: string | null;
-  onPickUp: (sessionId: string) => void;
-  /** Told before the `<Link>` navigates, so the editor preview does not outlive the press. */
-  onOpenChat: () => void;
-  onNew: () => void;
-}) {
-  // Watched, because one of these may be being typed into in the editor while it is on screen here.
-  const sessions = useIdeSessions(true, true);
-  const listed = mergeRows(rows, sessions.data ?? []);
-
-  return (
-    <>
-      <div className="chats-rail-actions">
-        {/* Opens an empty chat, and asks nothing. It used to unfold a form here — two radio buttons
-            for the model and a Start — which put a question before the only thing anybody came to
-            do. The model is a control in the box now, answerable while you type the first sentence
-            and changeable after it. */}
-        <button type="button" className="chats-rail-new" onClick={onNew}>
-          <Plus className="chats-rail-icon" aria-hidden="true" />
-          New conversation
-        </button>
-      </div>
-
-      <div className="chats-rail-scroll">
-        {!answered && (
-          <p className="chats-loading">reading your conversations…</p>
-        )}
-        {answered && listed.length === 0 && (
-          <Teach title="No conversations yet">
-            <p>
-              Telegram&apos;s own conversations do not show up here — nothing
-              has opened a row for them, because the only door into this list is
-              the button above. Start one to see it appear.
-            </p>
-          </Teach>
-        )}
-        {sessions.isError && (
-          <ErrorNote>your editor sessions could not be read</ErrorNote>
-        )}
-        {listed.length > 0 && (
-          /* One list, both kinds, cut into days.
-             See `mergeRows`: what tells the two kinds apart is the mark on the row. What the
-             cuts add is the one thing a column of titles could not say — twelve conversations
-             sorted newest first look identical whether the newest was four minutes ago or in
-             March, and the sort order is only readable by somebody who already knows it exists.
-             `inBands` never reorders; it only says where the list changes day. */
-          <ul className="chats-list" aria-label="Conversations">
-            {inBands(listed, (entry) => entry.at, Date.now()).map((cut) => (
-              <li key={cut.band} className="chats-band">
-                {/* A heading and a list of its own, so the cut is structure a screen reader can
-                    move by rather than a line of text sitting between two rows of one flat list. */}
-                <p className="chats-band-title">{BAND_TITLE[cut.band]}</p>
-                <ul className="chats-list" aria-label={BAND_TITLE[cut.band]}>
-                  {cut.rows.map((entry) =>
-                    entry.kind === "chat" ? (
-                      <ChatRow
-                        key={entry.chat.chat_id}
-                        row={entry.chat}
-                        active={entry.chat.chat_id === selected}
-                        live={entry.chat.chat_id === selected && selectedLive}
-                        onOpen={onOpenChat}
-                      />
-                    ) : (
-                      <EditorRow
-                        key={entry.session.session_id}
-                        session={entry.session}
-                        active={entry.session.session_id === pickingUp}
-                        onOpen={() => onPickUp(entry.session.session_id)}
-                      />
-                    ),
-                  )}
-                </ul>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-    </>
-  );
-}
-
-/**
- * A conversation still living in the editor, in the same list as the rest.
- *
- * Told apart by a mark and by what pressing it does, not by being somewhere else. It is not a link:
- * there is nothing at `/chats/...` to go to yet, and picking it up costs money and carries warnings
- * — so it opens the preview beside the list rather than doing anything.
- */
-function EditorRow({
-  session,
-  active,
-  onOpen,
-}: {
-  session: IdeSession;
-  active: boolean;
-  onOpen: () => void;
-}) {
-  const live = stillGoing(session.last_activity, Date.now());
-  return (
-    <li className={active ? "chats-row chats-row-active" : "chats-row"}>
-      <button
-        type="button"
-        className="chats-row-link chats-row-editor"
-        aria-pressed={active}
-        /* Spelled out: without it the mark, the name and "happening now" concatenate into one
-           run-on word, which is the same trap the nav items and the chat rows already document. */
-        aria-label={`In the editor: ${session.title ?? session.session_id}${
-          live ? ", happening now" : ""
-        }`}
-        onClick={onOpen}
-      >
-        <SquareCode className="chats-row-mark" aria-hidden="true" />
-        <span className="chats-row-title">
-          {session.title ?? session.session_id}
-        </span>
-        {live && (
-          <span className="chats-row-live" aria-hidden="true">
-            now
-          </span>
-        )}
-        {!live && (
-          <span className="chats-row-when" aria-hidden="true">
-            <RelativeTime at={session.last_activity} />
-          </span>
-        )}
-      </button>
-    </li>
-  );
-}
-
-/**
- * What this row is called out loud.
- *
- * Spelled out rather than left to the name computation over the children, for
- * the same reason the sidebar's own nav items are: adjacent inline text —
- * title, brain badge, "thinking…", the unread count — concatenates with no
- * separator, and a screen reader would announce "hello therecloud3" instead
- * of a sentence.
- */
-function chatRowLabel(row: ChatSummary, live: boolean): string {
-  const parts = [
-    row.title ?? row.first_message ?? "nothing said yet",
-    row.brain,
-  ];
-  if (live) parts.push("thinking");
-  // The same reading the row draws, in the same sentence as the rest of it rather than as a
-  // fourth run of text after it. See the `aria-hidden` on `.chats-row-when`.
-  if (row.last_activity !== null)
-    parts.push(relativeText(Date.parse(row.last_activity), Date.now()));
-  if (row.waiting > 0) parts.push(`${row.waiting} unread`);
-  // Said out loud rather than left to the mark beside the number, which is `aria-hidden`. Somebody
-  // listening to this list has the same reason to treat the two differently as somebody looking at
-  // it: one is their own conversation answering, the other is a different one pulling them in.
-  const relayed = row.relayed_waiting ?? 0;
-  if (relayed > 0) parts.push(`${relayed} from another conversation`);
-  // Said as its own clause and not added to the number above it, because it IS its own axis: a
-  // department speaking is not the conversation answering, and nothing ran for it.
-  const said = row.notices_waiting ?? 0;
-  if (said > 0) parts.push(`${said} from a team`);
-  return parts.join(", ");
-}
-
-function ChatRow({
-  row,
-  active,
-  live,
-  onOpen,
-}: {
-  row: ChatSummary;
-  active: boolean;
-  live: boolean;
-  /** See `openingAChat`. Pressing a row is one of the three ways a conversation gets opened. */
-  onOpen: () => void;
-}) {
-  // A conversation with no name AND nothing said in it has no name to show. Drawing "New
-  // conversation" made a dozen of them into a dozen identical rows; saying what is true of them
-  // instead makes them one visibly different kind of row you can skim past.
-  const said = row.title !== null || row.first_message !== null;
-  return (
-    <li className={active ? "chats-row chats-row-active" : "chats-row"}>
-      <Link
-        className="chats-row-link"
-        to={`/chats/${row.chat_id}`}
-        aria-label={chatRowLabel(row, live)}
-        aria-current={active ? "page" : undefined}
-        /* Beside the navigation and not instead of it: the `<Link>` still does the routing, this
-           only takes the editor preview down on the way. Pressing the row you are ALREADY on has
-           to work too — that is the case an effect watching the id would sleep through. */
-        onClick={onOpen}
-      >
-        {/* The name, and only the name.
-            The row used to carry the title, a coloured badge for the model, the working directory
-            and a count — four things per row, eleven rows, and the ones that never vary said
-            "cloud" and "c:\Projects\nucleos" over and over. A sidebar is for recognising a
-            conversation, and what you recognise it by is what it is called. The directory is on the
-            open conversation's own line and searchable in ⌘K; the model is on that line too. What
-            stays here is what CHANGES: it is thinking, or it is holding something for you. */}
-        <span
-          className={
-            said ? "chats-row-title" : "chats-row-title chats-row-unsaid"
-          }
-        >
-          {row.title ?? row.first_message ?? "nothing said yet"}
-        </span>
-        {live && <span className="chats-row-live">thinking…</span>}
-        {/* When it last moved. The band above says which day; this says where in it — which is
-            the difference between two rows under "Today" and two rows you can tell apart.
-            `aria-hidden`, because `chatRowLabel` already spells the row out and a screen reader
-            reading the title, then the time, then the count as three separate runs of text is
-            the exact concatenation that label exists to prevent. */}
-        {row.last_activity !== null && (
-          <span className="chats-row-when" aria-hidden="true">
-            <RelativeTime at={row.last_activity} />
-          </span>
-        )}
-        {(row.notices_waiting ?? 0) > 0 && (
-          <span
-            className="chats-row-said"
-            aria-hidden="true"
-            title={`${row.notices_waiting} said by a team you set going`}
-          >
-            {row.notices_waiting}
-          </span>
-        )}
-        {row.waiting > 0 && (
-          <span
-            className={
-              (row.relayed_waiting ?? 0) > 0
-                ? "chats-row-unread chats-row-unread-relayed"
-                : "chats-row-unread"
-            }
-            aria-hidden="true"
-            /* The count stays the total. A second number beside it would make a person add two
-               figures to learn one thing; the mark says "some of these came from elsewhere", and
-               the conversation itself says which. */
-            title={
-              (row.relayed_waiting ?? 0) > 0
-                ? `${row.relayed_waiting} handed over by another conversation`
-                : undefined
-            }
-          >
-            {row.waiting}
-          </span>
-        )}
-      </Link>
-    </li>
-  );
-}
+/* The column of sessions, its rows and the editor rows now live in `chats/SessionColumn`;
+   `mergeRows` is re-exported so existing imports keep working. */
+export { mergeRows, type ListRow } from "../chats/SessionColumn";
 
 /* ------------------------------------------------------ new conversation -- */
 
@@ -1461,6 +1189,21 @@ function StartBox({
     setAttached((was) => [...was, ...read].slice(0, MAX_PICTURES));
   };
 
+  // See the same function in `Composer`: the "+" menu's way of typing an `@`.
+  const mentionHere = () => {
+    const at = box.current?.selectionStart ?? text.length;
+    const lead = at > 0 && !/\s/.test(text[at - 1]) ? " " : "";
+    const next = `${text.slice(0, at)}${lead}@${text.slice(at)}`;
+    const place = at + lead.length + 1;
+    setText(next);
+    setDismissed(null);
+    requestAnimationFrame(() => {
+      box.current?.focus();
+      box.current?.setSelectionRange(place, place);
+      setCaret(place);
+    });
+  };
+
   const say = () => {
     if (!sayable) return;
     onSay(model, effort, mode, text.trim(), attached);
@@ -1556,25 +1299,18 @@ function StartBox({
           <DictateToggle dictation={dictation} />
         </div>
         <div className="chats-composer-actions">
-          <label className="chats-attach" title="Attach a picture">
-            <ImagePlus className="chats-tool-icon" aria-hidden="true" />
-            <span className="sr-only">Attach a picture</span>
-            <input
-              type="file"
-              accept="image/*"
-              multiple
-              className="sr-only"
-              aria-label="Attach a picture"
-              onChange={(event) => {
-                void attach(event.target.files);
-                event.target.value = "";
-              }}
-            />
-          </label>
+          <PlusMenu
+            chatId={null}
+            onPictures={(files) => void attach(files)}
+            onText={(context) =>
+              setText((was) => (was === "" ? context : `${was}\n${context}`))
+            }
+            onMention={mentionHere}
+          />
           {/* Held as state, not written anywhere: there is no conversation to write it to until the
             first message opens one, and it travels with that message. */}
           <ModelMenu model={model} disabled={pending} onPick={setModel} />
-          <EffortMenu
+          <EffortSlider
             model={model}
             effort={effort}
             disabled={pending}
@@ -2519,6 +2255,8 @@ function ModelMenu({
   chatId?: string;
 }) {
   const catalogue = useAssistantModels(chatId);
+  // The agent-CLI section is drawn from the daemon's discovered, grouped list when it has one.
+  const groups = useModelGroups(chatId).data?.groups;
   const localModel = useLocalModel();
   const localUnavailable = localModel.data?.available === false;
   const pull = useLocalPull();
@@ -2538,14 +2276,22 @@ function ModelMenu({
   const armedAt = useRef(0);
 
   const choices = catalogue.data?.choices ?? [];
-  const chosen = choices.find((choice) => choice.id === model);
-  // Unpinned shows the configured model's name, not a blank. Falling back to `model` covers the one
-  // case the catalogue cannot explain: a conversation pinned to a name since removed from the
-  // config. Showing the stale name is right — it is what the next turn will actually run.
+  const chosen =
+    choices.find((choice) => choice.id === model) ??
+    groups?.flatMap((group) => group.models).find((choice) => choice.id === model);
+  // Unpinned shows the configured model's name, not a blank. A pin the daemon never labelled (a
+  // name since removed from the config) is shown as a product name rather than as the raw id: it
+  // is still what the next turn will actually run.
   // "Model" and not "model": the last fallback is this app's own word for the setting —
-  // the three before it are proper names — and a setting named in lower case beside a
+  // the ones before it are proper names — and a setting named in lower case beside a
   // caret read as terminal output rather than as a control.
-  const shown = chosen?.label ?? model ?? catalogue.data?.configured ?? "Model";
+  const configured = catalogue.data?.configured;
+  const shown =
+    chosen?.label ??
+    (model ? displayName(model) : null) ??
+    catalogue.data?.configured_label ??
+    (configured ? displayName(configured) : null) ??
+    "Model";
 
   return (
     <DropdownMenu
@@ -2584,7 +2330,27 @@ function ModelMenu({
               </span>
             </DropdownMenuRadioItem>
           )}
+          {groups !== undefined &&
+            groups
+              .filter((group) => group.models.length > 0)
+              .map((group) => (
+                <DropdownMenuGroup
+                  key={`${group.provider}/${group.family}`}
+                  aria-label={group.label}
+                >
+                  <DropdownMenuLabel className="chats-meta-menu-section">
+                    {group.label}
+                  </DropdownMenuLabel>
+                  {group.models.map((choice) => (
+                    <DropdownMenuRadioItem key={choice.id} value={choice.id}>
+                      {choice.label}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuGroup>
+              ))}
           {MODEL_SECTIONS.map((section) => {
+            // Replaced by the groups above once the daemon has sent them.
+            if (section.key === "cli" && groups !== undefined) return null;
             const held = choices.filter(section.holds);
             /* An empty section is not drawn at all rather than drawn empty: three of the four are
                empty on an untouched install, and headings over nothing would make the menu look
@@ -2685,21 +2451,17 @@ function ModelMenu({
 }
 
 /**
- * How hard the model is asked to think.
+ * How hard the model is asked to think, as a slider over the chosen model's own levels.
  *
- * Its own control beside the model's rather than a submenu inside it. They are two decisions and a
- * person changes them separately — most often the effort, on a model they already chose — and a
- * dial buried one level down is one you have to remember is there.
+ * Position 0 is "default" and writes `null`; the rest are the CLI's own words for the levels.
  *
  * The levels are the CHOSEN model's own, which is why this reads the catalogue instead of taking a
  * list: they genuinely differ. `claude-haiku-4-5` takes no effort at all; Opus 4.6 takes `max` but
- * not `xhigh`. A shared list would offer levels that come back as an error.
- *
- * A model with no dial gets the button disabled rather than removed. Hiding it would make the row
- * jump as you switch models, and would read as a feature that is missing rather than one that does
- * not apply here.
+ * not `xhigh`. A shared list would offer levels that come back as an error. A model with no levels
+ * gets no slider at all, since a dial that turns nothing is only noise in a row that is already
+ * crowded; the discovered groups are asked first, then the config's own list.
  */
-function EffortMenu({
+function EffortSlider({
   model,
   effort,
   onPick,
@@ -2713,56 +2475,28 @@ function EffortMenu({
   chatId?: string;
 }) {
   const catalogue = useAssistantModels(chatId);
+  const groups = useModelGroups(chatId).data?.groups;
+  const fromGroups = groups
+    ?.flatMap((group) => group.models)
+    .find((choice) => choice.id === model)?.efforts;
   const chosen = catalogue.data?.choices.find((choice) => choice.id === model);
   // The union stands in only while nothing is pinned — the front door, where the model question is
-  // still open. Never empty merely because a fetch is slow: a control greyed out by latency reads
-  // as unavailable rather than as loading.
-  const levels = chosen?.efforts ?? catalogue.data?.efforts ?? [];
-  const hasDial = levels.length > 0;
+  // still open.
+  const levels = fromGroups ?? chosen?.efforts ?? catalogue.data?.efforts ?? [];
+  if (levels.length === 0) return null;
+  const at = effort === null ? 0 : Math.max(0, levels.indexOf(effort) + 1);
 
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        className="chats-tool"
-        /* Named for the setting and not for the behaviour. "Thinking at high…" was the first
-           wording and it collided with the transcript's own rule that a turn which did not think
-           offers no `thinking` control — two unrelated things answering to one word is how a
-           person clicks the wrong one. */
-        aria-label={
-          hasDial
-            ? `Effort: ${effort ?? "the model's own default"} — change it`
-            : `${chosen?.label ?? "this model"} has no effort setting`
-        }
-        disabled={disabled || !hasDial}
-      >
-        {/* The setting's name, and then the CLI's own word for the level — never a
-            prettified version of it. `xhigh` is not a word and `Xhigh` is not one either;
-            what makes the button read as a control rather than as terminal output is the
-            label in front of it. */}
-        {hasDial
-          ? effort === null
-            ? "Effort"
-            : `Effort: ${effort}`
-          : "No effort dial"}
-        <ChevronDown className="chats-tool-caret" aria-hidden="true" />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="chats-meta-menu">
-        <DropdownMenuLabel>How hard it thinks</DropdownMenuLabel>
-        <DropdownMenuRadioGroup
-          value={effort ?? ""}
-          onValueChange={(picked) => onPick(picked === "" ? null : picked)}
-        >
-          <DropdownMenuRadioItem value="">
-            the CLI's own default
-          </DropdownMenuRadioItem>
-          {levels.map((level) => (
-            <DropdownMenuRadioItem key={level} value={level}>
-              {level}
-            </DropdownMenuRadioItem>
-          ))}
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <div className="chats-effort">
+      <span className="chats-effort-name">Effort</span>
+      <Slider
+        steps={["default", ...levels]}
+        value={at}
+        label="Effort level"
+        disabled={disabled}
+        onChange={(index) => onPick(index === 0 ? null : levels[index - 1])}
+      />
+    </div>
   );
 }
 
@@ -2793,7 +2527,7 @@ function ChatModelControls({
       >
         {patch.isError && <ModelRefusal error={patch.error} />}
       </ModelMenu>
-      <EffortMenu
+      <EffortSlider
         model={model}
         effort={effort}
         disabled={patch.isPending}
@@ -5430,6 +5164,17 @@ function Composer({
     });
   };
 
+  // "Mention a file…" in the "+" menu is the `@` gesture without the keyboard: put one at the caret,
+  // after a space when the letter before it is not whitespace, and the completion opens by itself.
+  const mentionHere = () => {
+    const at = box.current?.selectionStart ?? text.length;
+    const lead = at > 0 && !/\s/.test(text[at - 1]) ? " " : "";
+    write({
+      text: `${text.slice(0, at)}${lead}@${text.slice(at)}`,
+      caret: at + lead.length + 1,
+    });
+  };
+
   const choices: Choice[] =
     command !== null && live(command) !== null
       ? (commands.data?.commands ?? []).map((hit: Command) => ({
@@ -5602,24 +5347,16 @@ function Composer({
             from the sentence those answers apply to is asking about the message somewhere the
             message is not. */}
         <div className="chats-composer-actions">
-          {/* The way in for anything not on the clipboard. Hidden behind its own label because a
-              bare file input is the one control on this page nobody can style into the others. */}
-          <label className="chats-attach" title="Attach a picture">
-            <ImagePlus className="chats-tool-icon" aria-hidden="true" />
-            <span className="sr-only">Attach a picture</span>
-            <input
-              type="file"
-              accept="image/*"
-              multiple
-              className="sr-only"
-              aria-label="Attach a picture"
-              onChange={(event) => {
-                void attach(event.target.files);
-                // Cleared so the same file chosen twice in a row is heard the second time.
-                event.target.value = "";
-              }}
-            />
-          </label>
+          {/* The way in for anything not on the clipboard: pictures, small text files, more folders,
+              the web. One "+" rather than a bare file input, which nobody can style into the others. */}
+          <PlusMenu
+            chatId={chatId}
+            onPictures={(files) => void attach(files)}
+            onText={(context) =>
+              setText((was) => (was === "" ? context : `${was}\n${context}`))
+            }
+            onMention={mentionHere}
+          />
           {chat !== undefined && (
             <ChatModelControls
               chatId={chatId}

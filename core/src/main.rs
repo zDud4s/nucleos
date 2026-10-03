@@ -61,6 +61,7 @@ mod map_store;
 mod map_triage;
 mod mcp_tools;
 mod mentions;
+mod model_catalog;
 mod notes;
 mod notify;
 mod notify_policy;
@@ -1605,6 +1606,28 @@ async fn main() {
         (None, Ok(None)) => (None, None),
         (None, Err(_)) => (None, None),
     };
+
+    // Model discovery keys: the credential store first, the environment second. Only whether each
+    // is present is ever logged. A key stored while the daemon runs takes effect after a restart.
+    {
+        let key = |name: &str, env: &str| {
+            secrets::load_secret(name)
+                .ok()
+                .flatten()
+                .or_else(|| std::env::var(env).ok())
+                .filter(|k| !k.trim().is_empty())
+        };
+        let keys = model_catalog::Keys {
+            anthropic: key("anthropic-api-key", "ANTHROPIC_API_KEY"),
+            openai: key("openai-api-key", "OPENAI_API_KEY"),
+        };
+        tracing::info!(
+            anthropic = keys.anthropic.is_some(),
+            openai = keys.openai.is_some(),
+            "model discovery keys"
+        );
+        model_catalog::install_keys(keys);
+    }
 
     // Read after the local model has been probed, because whether a `kind: local` seat is runnable
     // is not something a config file can assert — startup PROVES it, and a roster naming a local

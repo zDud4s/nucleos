@@ -1944,7 +1944,11 @@ pub(crate) fn answering_cli(
     pinned: Option<&str>,
 ) -> &'static str {
     pinned
-        .and_then(|id| config.runner_of(id))
+        .and_then(|id| {
+            config
+                .runner_of(id)
+                .or_else(|| crate::model_catalog::runner_by_id(id))
+        })
         .unwrap_or_else(|| {
             if config.active_runner() == "codex" {
                 "codex"
@@ -2954,6 +2958,25 @@ mod tests {
     /// What `FakeCommandRunner::default` answers, so a test can say "this went down the CLI path"
     /// without asserting on a string whose meaning is not obvious at the call site.
     const CLI_FAKE_REPLY: &str = "fake output";
+
+    /// A model only a vendor list (or the built-in catalogue) names has no config row, so its id
+    /// is what says which CLI answers it.
+    #[test]
+    fn a_discovered_gpt_model_is_answered_by_codex() {
+        let config = turn_config();
+        assert_eq!(answering_cli(&config, Some("gpt-9.9-nova")), "codex");
+        assert_eq!(answering_cli(&config, Some("o9-mini")), "codex");
+        assert_eq!(answering_cli(&config, Some("claude-opus-9-9")), "claude");
+        // An id that says nothing keeps the active runner.
+        assert_eq!(
+            answering_cli(&config, Some("llama3.2:3b")),
+            if config.active_runner() == "codex" {
+                "codex"
+            } else {
+                "claude"
+            }
+        );
+    }
 
     #[test]
     fn a_pinned_codex_model_is_answered_by_the_codex_runner() {
