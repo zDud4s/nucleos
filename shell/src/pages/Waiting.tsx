@@ -12,7 +12,6 @@ import {
 } from "../data/teams";
 import {
   VCS_LIST_LIMIT,
-  VCS_WANTS_A_PERSON,
   countWaitingDecisions,
   useActionApprovals,
   useApproveProposal,
@@ -20,6 +19,7 @@ import {
   useContactMerges,
   useDecideContactMerge,
   useDismissProposal,
+  useDismissVcsRequest,
   useExclusionRequests,
   useOpenTeamActions,
   useRecruitProposals,
@@ -29,6 +29,7 @@ import {
   useSkippedItems,
   useTeamActionProposals,
   useVcsRequests,
+  useVcsWaiting,
   useWheelRequests,
   type ApprovalOutcome,
   type AwaitingRun,
@@ -155,6 +156,7 @@ export function Waiting() {
   const skipped = onlyProject(reading(useSkippedItems()), project);
   const refused = onlyProject(reading(useRefusedActions()), project);
   const vcs = onlyProject(reading(useVcsRequests()), project);
+  const vcsWaiting = onlyProject(reading(useVcsWaiting()), project);
   const parked = onlyProject(reading(useAwaitingRuns()), project);
 
   const decisions = countWaitingDecisions({
@@ -164,7 +166,7 @@ export function Waiting() {
     recruits: recruits.rows,
     merges: merges.rows,
     exclusions: exclusions.rows,
-    git: vcs.rows,
+    git: vcsWaiting.rows,
   });
   const records = countOf(skipped.rows, refused.rows);
 
@@ -225,7 +227,10 @@ export function Waiting() {
       filled: has(refused.rows),
       node: <RefusedActionsPanel key="refused" view={refused} />,
     },
-    { filled: has(vcs.rows), node: <GitQueuePanel key="vcs" view={vcs} /> },
+    {
+      filled: has(vcs.rows) || has(vcsWaiting.rows),
+      node: <GitQueuePanel key="vcs" view={vcs} waiting={vcsWaiting} />,
+    },
     {
       filled: has(parked.rows),
       node: <ParkedRunsPanel key="parked" view={parked} />,
@@ -1907,10 +1912,19 @@ function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
 /** How much history to show behind the rows that want a person. */
 const VCS_RECENT = 5;
 
-function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
+function GitQueuePanel({
+  view,
+  waiting,
+}: {
+  view: Reading<VcsRequestSummary>;
+  waiting: Reading<VcsRequestSummary>;
+}) {
+  const dismiss = useDismissVcsRequest();
   const rows = view.rows ?? [];
-  const wanted = rows.filter((row) => VCS_WANTS_A_PERSON.includes(row.status));
-  const rest = rows.filter((row) => !VCS_WANTS_A_PERSON.includes(row.status));
+  // What wants a person comes from `/waiting/git`, never from filtering the history: that listing
+  // is capped at 200 and keeps every escalation that has since been settled.
+  const wanted = waiting.rows ?? [];
+  const rest = rows.filter((row) => !wanted.some((open) => open.id === row.id));
   const recent = rest.slice(0, VCS_RECENT);
 
   return (
@@ -1921,7 +1935,7 @@ function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
       // The queue is empty when it holds nothing at all. A queue that has been
       // through five pushes cleanly is not empty — nothing is waiting on a
       // person, and the corner says so with a zero while the history stays.
-      count={rows.length}
+      count={Math.max(rows.length, wanted.length)}
       aside={<Count n={wanted.length} />}
       says="nothing has been through the git queue"
       why={
@@ -1929,8 +1943,18 @@ function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
           Every push, merge and rebase the núcleo has been asked to make. Two of
           the states want a person — escalated, which means somebody owns a
           conflict now, and blocked, which the queue will not retry — and
-          neither is a failure.
+          neither is a failure. One stops waiting once it is settled: a later
+          identical request succeeded, a resolution took it, its branch is
+          already in the target or gone, or you put it away. It stays in the
+          history either way.
         </>
+      }
+      notes={
+        <DecisionNotes
+          outcome={undefined}
+          approveError={null}
+          refuseError={dismiss.isError ? dismiss.error : null}
+        />
       }
     >
       {wanted.length === 0 ? (
@@ -1938,7 +1962,18 @@ function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
       ) : (
         <Rows label="Git requests waiting on you" className={dense(wanted.length) ? "waiting-dense" : undefined}>
           {wanted.map((row) => (
-            <VcsRow key={row.id} row={row} count={wanted.length} />
+            <VcsRow key={row.id} row={row} count={wanted.length}>
+              <div className="waiting-actions">
+                <ConfirmButton
+                  label={`Put ${row.op} #${row.id} away`}
+                  confirmLabel="Nobody needs to act"
+                  subject={`#${row.id}`}
+                  variant="quiet"
+                  disabled={dismiss.isPending}
+                  onConfirm={() => dismiss.mutate(row.id)}
+                />
+              </div>
+            </VcsRow>
           ))}
         </Rows>
       )}
@@ -1967,7 +2002,15 @@ function GitQueuePanel({ view }: { view: Reading<VcsRequestSummary> }) {
   );
 }
 
-function VcsRow({ row, count }: { row: VcsRequestSummary; count: number }) {
+function VcsRow({
+  row,
+  count,
+  children,
+}: {
+  row: VcsRequestSummary;
+  count: number;
+  children?: ReactNode;
+}) {
   return (
     <Row dense={dense(count)}>
       <div className="waiting-card-head">
@@ -1987,6 +2030,7 @@ function VcsRow({ row, count }: { row: VcsRequestSummary; count: number }) {
       {row.status === "blocked" ? (
         <p className="waiting-hint">submit it again</p>
       ) : null}
+      {children}
     </Row>
   );
 }
