@@ -1,6 +1,10 @@
 package shortcuts
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
 
 type Kind int
 
@@ -64,11 +68,8 @@ func Route(text string) Intent {
 	if hasPrefixFold(trimmed, "/kill") {
 		return Intent{Kind: Help}
 	}
-	if lowered == "/note" {
-		return Intent{Kind: Note, Arg: ""}
-	}
-	if hasPrefixFold(trimmed, "/note ") {
-		return Intent{Kind: Note, Arg: strings.TrimSpace(trimmed[len("/note "):])}
+	if arg, ok := noteCommand(trimmed); ok {
+		return Intent{Kind: Note, Arg: arg}
 	}
 	if hasPrefixFold(trimmed, "/proj ") {
 		return Intent{Kind: Proj, Arg: strings.TrimSpace(trimmed[len("/proj "):])}
@@ -87,6 +88,31 @@ func RouteTranscript(text string) Intent {
 		return Intent{Kind: Refused, Text: text}
 	}
 	return Intent{Kind: SendToAgent, Text: text}
+}
+
+// noteCommand reads `/note` and `/note@SomeBot`, either one alone or followed by any whitespace —
+// a newline included, which is how a phone types a long note. What it misses falls through to the
+// agent as a message, and a note is the one text that must never go there.
+func noteCommand(trimmed string) (string, bool) {
+	const command = "/note"
+	if !hasPrefixFold(trimmed, command) {
+		return "", false
+	}
+	rest := trimmed[len(command):]
+	if strings.HasPrefix(rest, "@") {
+		end := strings.IndexFunc(rest, unicode.IsSpace)
+		if end == -1 {
+			return "", true
+		}
+		rest = rest[end:]
+	}
+	if rest == "" {
+		return "", true
+	}
+	if r, _ := utf8.DecodeRuneInString(rest); !unicode.IsSpace(r) {
+		return "", false
+	}
+	return strings.TrimSpace(rest), true
 }
 
 func hasPrefixFold(s, prefix string) bool {
