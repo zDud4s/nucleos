@@ -48,7 +48,7 @@ import "./web.css";
  * No address bar here (design §6.16): this tab is the archive, not a
  * browser — driving a real one is `pages/Browser.tsx`.
  */
-export function Web() {
+export function Web({ embedded = false }: { embedded?: boolean } = {}) {
   const params = useParams({ strict: false }) as { pageId?: string };
   const rawId = params.pageId;
   const parsedId = rawId === undefined ? null : Number(rawId);
@@ -58,10 +58,8 @@ export function Web() {
   const pages = useWebPages(q);
   const rows = pages.data;
 
-  return (
+  const body = (
     <>
-      <PageHeader title="Web" headline={headline(rows)} />
-
       <ReadForm />
       <WebSearchPanel />
 
@@ -79,6 +77,23 @@ export function Web() {
       </div>
     </>
   );
+
+  if (embedded) return body;
+
+  return (
+    <>
+      <PageHeader title="Web" headline={headline(rows)} />
+      {body}
+    </>
+  );
+}
+
+/**
+ * The archive tab's header, for `WebTabs`, which keeps the tab list outside both tabs.
+ * It reads the whole archive, so the count no longer follows the filter box.
+ */
+export function WebHeader() {
+  return <PageHeader title="Web" headline={headline(useWebPages(undefined).data)} />;
 }
 
 function headline(rows: Hit[] | undefined): string | undefined {

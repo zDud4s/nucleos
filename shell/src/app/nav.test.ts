@@ -77,7 +77,6 @@ describe("the nav table", () => {
       "Calendar",
       "Voice",
       "Web",
-      "Browser",
       "Files",
     ]);
   });
