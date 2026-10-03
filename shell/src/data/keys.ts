@@ -345,6 +345,19 @@ export const keys = {
   },
 
   /**
+   * The owner's own notes — `GET /owner-notes` and its graph. One root, so a
+   * write to a note or a link refetches the list, the open note and the graph
+   * together: a link edit changes all three.
+   */
+  ownerNotes: {
+    all: ["owner-notes"] as const,
+    list: (state: string) => ["owner-notes", "list", state] as const,
+    detail: (id: number) => ["owner-notes", "detail", id] as const,
+    search: (q: string) => ["owner-notes", "search", q] as const,
+    graph: (archived: boolean) => ["owner-notes", "graph", archived] as const,
+  },
+
+  /**
    * The Work namespace — chats, council, agents — landing together
    * ahead of the pages that read most of it, for the reason at the top of this
    * file: a namespace four pages edit in sequence is a namespace where the
