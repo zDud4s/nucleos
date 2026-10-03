@@ -6,18 +6,17 @@
 .agents/
 # <<< AI WORKFLOW MANAGED <<<
 
-# Two files under .claude/ are NucleOS, not the workflow footprint the block above excludes.
-# core/src/autopilot.rs reads settings.json and refuses to activate autopilot unless it registers
-# ask_daemon.py and that script is present on disk — the PreToolUse hook is the single point where
-# the safety gate meets a running tool. Excluding them made them tracked-but-uncommittable:
-# editable forever, and a fix to the security hook could never land.
+# One file under .claude/ is NucleOS, not the workflow footprint the block above excludes: the
+# classifier hook's tracked copy, which scripts/test-hook-filter.py holds byte-equal to its source,
+# core/hooks/ask_daemon.py. `.claude/settings.json` stays local: the daemon writes it into every
+# project it onboards (autopilot::wire_classifier_hook), and the one in this checkout also carries
+# the owner's own workflow hooks and permissions, which are no part of the product.
 #
 # Deliberately below the managed block so the template's installer can rewrite its own lines
 # without taking these with it. The directory has to be re-included before a file inside it can be:
-# git never descends into an excluded directory, so `!.claude/settings.json` alone does nothing.
+# git never descends into an excluded directory, so `!.claude/hooks/ask_daemon.py` alone does nothing.
 !.claude/
 .claude/*
-!.claude/settings.json
 !.claude/hooks/
 .claude/hooks/*
 !.claude/hooks/ask_daemon.py
@@ -144,8 +143,14 @@ shell/target-test/
 # cache appeared in a tracked directory — where the test selector, which refuses to answer
 # for any path no catalog group claims, stopped the gate over a build artefact. F5 moved
 # that test and its module to `.ai/scripts/`, itself gitignored wholesale, so this specific
-# case is moot — but `scripts/eval/` still imports across its own sibling modules (`ingest.py`
-# imports `promote`, `test-ingest.py` imports `ingest`, and so on) and is still tracked, so
-# the same failure mode reaches it and these two lines stay needed.
+# case is moot. The lines stay: any script in `scripts/` that imports a sibling module would
+# bring the same failure mode back.
 __pycache__/
 *.pyc
+
+# Owner-machine maintenance scripts. They name this machine's directories and are no part of using
+# NucleOS, so they live beside the checkout and never in the public tree.
+/scripts/free-disk.ps1
+# The owner's ablation harness for the AI workflow (it scores agent layers against historical fixes).
+# It measures the development workflow, not the product, and its results live in the local .ai/eval/.
+/scripts/eval/

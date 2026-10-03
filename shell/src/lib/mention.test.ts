@@ -28,9 +28,9 @@ describe("mentionAt", () => {
   });
 
   // An email address is the reason this cannot simply look for the last @: everybody types one
-  // eventually, and a file list over `duarte@gmail` is the feature getting in the way.
+  // eventually, and a file list over `helena@gmail` is the feature getting in the way.
   it("is nothing when the @ is inside a word", () => {
-    expect(mentionAt("manda para duarte@gmail", 23)).toBeNull();
+    expect(mentionAt("manda para helena@gmail", 23)).toBeNull();
   });
 
   it("reads the @ nearest the caret, not the first one in the box", () => {

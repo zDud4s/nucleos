@@ -423,8 +423,8 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     policyWrites: [],
     githubRepo: {
       state: "known",
-      repo: "duarte/nucleos",
-      remote: "git@github.com:duarte/nucleos.git",
+      repo: "helena/nucleos",
+      remote: "git@github.com:helena/nucleos.git",
     },
     githubListings: {
       pr_list: readOutcome("pr_list", "#41\tthe queue lands\tfeat/land\tabout 2 hours ago"),

@@ -30,7 +30,7 @@ export interface Written {
  * mention that matters is the nearest `@` behind it. Whitespace ends the scan, so a finished word
  * never re-opens a list somebody has moved past.
  *
- * The `@` must begin a word. That single rule is what keeps `duarte@gmail.com` from opening a file
+ * The `@` must begin a word. That single rule is what keeps `helena@gmail.com` from opening a file
  * picker over an email address, which everybody types eventually.
  */
 export function mentionAt(text: string, caret: number): Mentioning | null {

@@ -1213,9 +1213,11 @@ mod tests {
     #[test]
     fn the_gate_state_uses_the_judges_own_redaction() {
         let output = "DB_PASSWORD=hunter2horse\nAuthorization: Bearer zq9Xr7Lm2Kd8Vw4Tn6Bp\n";
-        // The weaker redactor lets both through, so what follows can only be the judge's.
+        // The weaker redactor lets the assignment through, so its removal below can only be the
+        // judge's. It catches bearer tokens itself since 3a56fe7, so the header is no longer
+        // evidence of anything here; it stays in the fixture so the judge is still held to it.
         let weak = crate::redact::redact_secrets(output);
-        assert!(weak.contains("hunter2horse") && weak.contains("zq9Xr7Lm2Kd8Vw4Tn6Bp"));
+        assert!(weak.contains("hunter2horse"), "{weak:?}");
         let state = render_gate_state("Fix the build", 1, output);
         assert!(!state.contains("hunter2horse"));
         assert!(!state.contains("zq9Xr7Lm2Kd8Vw4Tn6Bp"));

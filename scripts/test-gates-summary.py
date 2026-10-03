@@ -13,7 +13,7 @@ its `run` with fake steps, so nothing here compiles, formats or tests anything.
 
 **Under a POSIX bash, never the `bash` on PATH on Windows.** There that name is
 `C:\\Windows\\System32\\bash.exe`, WSL: another operating system, which would run the fake steps
-somewhere else entirely or not at all. `GIT_BASH` overrides the search, as in `scripts/eval/`.
+somewhere else entirely or not at all. `GIT_BASH` overrides the search.
 
 Run:  python scripts/test-gates-summary.py
 """

@@ -113,17 +113,17 @@ describe("AppShell - every destination", () => {
 
 /* ---------------------------------------------------- A5, A6: the way out and in -- */
 
-describe("AppShell - the rail's control", () => {
-  it("the rail's Go to control opens it without the key", async () => {
+describe("AppShell - the rail has no palette control", () => {
+  it("the rail carries no Go to control, and the chord still opens the palette", async () => {
     await renderApp({ initialPath: "/" });
     const nav = await screen.findByRole("navigation", { name: "Sections" });
 
-    // In the pinned footer, above the drawer and the stop — reachable at any
-    // scroll position of the rail, on every route.
-    const trigger = within(nav).getByRole("button", { name: GO_TO });
-    expect(trigger.closest(".nav-footer")).not.toBeNull();
+    // The owner's call: the palette is reached by its chord only, not from a
+    // row in the rail.
+    expect(within(nav).queryByRole("button", { name: GO_TO })).toBeNull();
+    expect(within(nav).queryByText("Go to…")).toBeNull();
 
-    fireEvent.click(trigger);
+    chord("ctrlKey");
     await screen.findByRole("dialog", PALETTE);
   });
 
@@ -131,9 +131,9 @@ describe("AppShell - the rail's control", () => {
     await renderApp({ initialPath: "/" });
     const nav = await screen.findByRole("navigation", { name: "Sections" });
 
-    const trigger = within(nav).getByRole("button", { name: GO_TO });
-    trigger.focus();
-    fireEvent.click(trigger);
+    const origin = within(nav).getAllByRole("link")[0];
+    origin.focus();
+    chord("ctrlKey");
     await screen.findByRole("dialog", PALETTE);
 
     // On the document: Radix's dismissable layer listens on the ownerDocument,
@@ -147,7 +147,7 @@ describe("AppShell - the rail's control", () => {
     // `waitFor` and not a bare assertion. A dialog that closes and leaves focus
     // on nothing strands anybody navigating by keyboard at the top of the page.
     await waitFor(() => {
-      expect(document.activeElement).toBe(trigger);
+      expect(document.activeElement).toBe(origin);
     });
   });
 });

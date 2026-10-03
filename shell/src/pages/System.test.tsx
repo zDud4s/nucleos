@@ -71,7 +71,7 @@ const DEFAULT_EMAIL_CONFIG: EmailConfig = {
   enabled: true,
   armed: true,
   host: "imap.example.com",
-  username: "duarte@example.com",
+  username: "helena@example.com",
   mailbox: "INBOX",
   sent_mailbox: null,
   poll_interval_secs: 300,

@@ -227,7 +227,7 @@ export const RUNS: TeamRun[] = [
     why: "the bank export was truncated at 500 rows and nobody noticed until round three",
     created_at: ago(4 * DAY),
   }),
-  run({ id: "r5", team_id: "financas", request: "Chase the Ferreira invoice", created_at: ago(5 * DAY) }),
+  run({ id: "r5", team_id: "financas", request: "Chase the Costa invoice", created_at: ago(5 * DAY) }),
   run({ id: "r6", team_id: "marketing", request: "Rewrite the pricing page", created_at: ago(DAY) }),
   run({ id: "r7", team_id: "marketing", request: "September newsletter", created_at: ago(3 * DAY) }),
   run({ id: "r8", team_id: "vendas", request: "Answer the four that came in overnight", created_at: ago(DAY) }),
@@ -2628,6 +2628,10 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/team-triggers") return TRIGGERS;
   if (path === "/team-actions") return ACTIONS;
   if (path === "/vcs/requests") return VCS_REQUESTS;
+  // The preview settles nothing, so every escalated or blocked row is still waiting.
+  if (path === "/waiting/git") {
+    return VCS_REQUESTS.filter((row) => row.status === "escalated" || row.status === "blocked");
+  }
   /* Matched on the route rather than the whole path: `useScoreboard` always sends
      `?project_id=`, so a `path ===` comparison would never fire. */
   if (splitQuery(path)[0] === "/scoreboard") {

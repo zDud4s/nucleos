@@ -3690,7 +3690,7 @@ describe("naming a file with @", () => {
     await withFiles([parser]);
 
     const box = await screen.findByLabelText("Message");
-    fireEvent.change(box, { target: { value: "manda para duarte@parser", selectionStart: 24 } });
+    fireEvent.change(box, { target: { value: "manda para helena@parser", selectionStart: 24 } });
 
     await screen.findByLabelText("Message");
     expect(screen.queryByRole("list", { name: "Files to mention" })).toBeNull();

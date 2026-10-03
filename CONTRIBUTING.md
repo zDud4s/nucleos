@@ -1,80 +1,142 @@
-# Working in this repository
+# Contributing to NucleOS
 
-This file exists because the rule it describes is enforced by a running daemon, and a rule
-you meet as a refusal is worse than one you meet as a sentence.
+Thank you for your interest in NucleOS. It is an early-stage project with one maintainer, so it
+helps to agree on direction before you put in the work.
 
-It is tracked deliberately. The instruction files an agent normally reads — `AGENTS.md`,
-`CLAUDE.md` — are local here and never enter git, so they cannot be where this lives: a
-fresh clone would have the enforcement and not the explanation.
+- [Before you start](#before-you-start)
+- [Development setup](#development-setup)
+- [Making a change](#making-a-change)
+- [Quality gates](#quality-gates)
+- [Conventions](#conventions)
+- [Security-sensitive areas](#security-sensitive-areas)
+- [Pull requests](#pull-requests)
+- [Working through NucleOS itself](#working-through-nucleos-itself)
+- [License](#license)
 
-## Git operations go through a queue
+## Before you start
 
-Several sessions work in this repository at once, each in its own worktree, all sharing one
-`.git`. The queue exists so their git operations happen **one at a time, in order**, rather
-than racing. It is not an approval gate — it is a scheduler.
+- **Bugs:** open an issue with steps to reproduce, what you expected and what happened. Include
+  your OS and the daemon's log lines if you have them.
+- **Features and larger changes:** open an issue first and describe the problem you want to solve.
+  A short discussion up front saves a rewrite later.
+- **Vulnerabilities:** do not open a public issue. See [Security](README.md#security).
 
-A `PreToolUse` hook (`.claude/hooks/ask_daemon.py`) asks the daemon about git commands. It
-can refuse and it can never approve, so it grants nothing that was not already yours.
+## Development setup
 
-**Six operations the queue performs.** Run them as you would anyway; the hook takes them
-over and hands you a ticket number instead of running them:
+Follow [Getting started](README.md#getting-started) in the README, then run:
 
-| | |
+```sh
+scripts/doctor.sh
+```
+
+It checks every toolchain the monorepo needs and tells you how to fix anything that is missing.
+
+## Making a change
+
+The repository has three parts, and each has its own rules:
+
+| Part | Read first |
 |---|---|
-| `git merge <ref>` | brings `<ref>` into the branch your worktree is on |
-| `git push <remote> [<branch>]` | |
-| `git tag <name> [<branch>]` | |
-| `git fetch <remote>` | |
-| `git branch -d <branch>` | `-d` only — git's own refusal is the safety |
-| `git rebase <onto>` | recognised, and always blocked from a session; see below |
+| `core/` (Rust daemon) | [`core/AGENTS.md`](core/AGENTS.md): architectural invariants and the module map |
+| `sidecars/` (Go) | The doc comment at the top of each sidecar's `main.go` |
+| `shell/` (Tauri + React) | The test file next to each page and component |
 
-**What it refuses outright**, because the same operation in a spelling it cannot order is
-worse than one it can: a forced push, a bare `git push`, `git pull`, and `git branch -D`.
-The refusal names the spelling to use instead.
+Rules that apply everywhere:
 
-**What it says nothing about**: everything else, including `git merge --squash`, `--abort`,
-and every read-only command. Those touch only your own worktree or index.
+- **Keep changes small and focused.** One concern per pull request.
+- **Add tests with the change.** A bug fix should come with a test that fails without it.
+- **Respect the invariants.** Only the daemon writes SQLite. Secrets go through the OS credential
+  store. The local API binds to localhost. Each integration runs as its own sidecar.
+- **Add new modules to the module map.** A new file in `core/src/` must be listed in the map in
+  `core/AGENTS.md`, and `core/tests/module_map.rs` fails until it is.
+- **Edit the classifier hook in one place.** `core/hooks/ask_daemon.py` is the source, and it is
+  compiled into the daemon. `.claude/hooks/ask_daemon.py` is a byte-for-byte copy, and
+  `scripts/test-hook-filter.py` keeps the two equal. Edit the source, then copy it over.
 
-## Delivering finished work
+## Quality gates
+
+`scripts/gates.sh` is the single definition of green, and CI runs the same script on Windows, Linux
+and macOS:
+
+```sh
+scripts/gates.sh                 # everything
+scripts/gates.sh core            # Rust: fmt, clippy, tests
+scripts/gates.sh sidecars        # Go: gofmt, vet, tests
+scripts/gates.sh shell           # TypeScript: typecheck, tests, CSP check
+scripts/gates.sh tauri           # the Tauri crate: fmt, clippy, tests
+scripts/gates.sh hooks           # the classifier hook and the repository scripts
+scripts/gates.sh security        # dependency audit and secret scanning
+```
+
+Run the targets your change touches before you open a pull request. On Windows, run it from Git Bash.
+
+**About `.gitleaksignore`:** test fixtures that look like secrets (fake keys used to test the
+redactor) are listed there by fingerprint. Add an entry only for a value you have read and
+confirmed is not a credential, and add a comment explaining why.
+
+## Conventions
+
+**Language.** Code comments, commit messages and UI strings are in English.
+
+**Comments explain why.** The code shows what it does. A comment is worth writing when it records
+a reason, a constraint, or a mistake that should not be repeated.
+
+**Commit messages** follow `type(scope): summary`:
 
 ```
-nucleos-core --land
+fix(shell): Waiting's git section lists /waiting/git and can put a row away
+feat(core): run the email triage loop
 ```
 
-Run it from inside your worktree. It asks the queue to merge your branch into the branch
-the project is on. There is no git command for this from inside a worktree — you would
-have to check out the integration branch, which is the isolation you must not break — so
-this is the door.
+- Types: `feat`, `fix`, `test`, `refactor`, `perf`, `docs`, `style`, `chore`.
+- Scopes: `core`, `shell`, `sidecars`, or a narrower area such as `classifier` or `gates`.
+- Write the summary as a sentence about the behaviour, not about which file changed.
 
-Asking is authorisation: your completion is the decision that the work is ready. What stays
-with the queue is *when*.
+**Formatting** is enforced by the gates: `cargo fmt`, `gofmt`, and the shell's TypeScript checks.
 
-## Conflicts are not yours to resolve
+## Security-sensitive areas
 
-The queue computes every merge in an integration worktree you do not have. If it conflicts,
-it aborts there, publishes nothing, and leaves **no conflicted state anywhere** — including
-in your copy. There is nothing for you to fix, and manufacturing something to fix is the
-one wrong response.
+Changes to these areas get closer review. Explain the threat you considered in the pull request,
+and update [`THREAT_MODEL.md`](THREAT_MODEL.md) if what the system defends against changes:
 
-The right one is the other direction: bring the target branch into yours (`git merge master`,
-an ordinary queue operation), resolve it in your own worktree on your own branch, and ask
-again.
+- the tool-call classifier and its hook (`core/src/classifier.rs`, `core/hooks/`)
+- secret redaction (`core/src/redact.rs`)
+- the git queue and worktree handling
+- the browser and web sidecars, and their fences
+- anything that opens a network connection or reads a credential
 
-You may not have to. The daemon picks a conflicting merge up by itself, creates a worktree
-on the target branch, stages the conflict there, and starts one session on it — once, never
-twice. If you are that session you will know: the conflict is **already in your files** when
-you arrive, with git's markers in them, and your instructions say so. Resolve, commit, and
-`nucleos-core --land`; do not merge, and do not reach for `-X ours`, `-X theirs` or
-`checkout --ours`. A resolution whose commit has one parent, or that still has markers in
-it, is refused before anything is published — without its content being read, because the
-content of a resolution that threw half the work away looks perfect.
+## Pull requests
 
-A rebase of your own branch is always blocked for the same reason in reverse. The queue
-publishes with a command that refuses rather than destroys; a rebase has no such command,
-and the branch it would rewrite is the one your session resumes onto.
+1. Fork the repository and create a branch from `master`.
+2. Make your change, with tests.
+3. Run the relevant gates until they are green.
+4. Open a pull request that describes the problem, the change, and how you verified it.
 
-## If you are blocked
+CI must pass before a pull request is merged. Keep the pull request up to date with `master` by
+merging, not rebasing, once review has started.
 
-Stop and say what the block said. Do not reword the command, do not reach for another
-spelling, and do not route around it with `-C` or a different tool. Every one of these
-refusals carries the reason and, where there is one, the thing to do instead.
+## Working through NucleOS itself
+
+This section applies only if you run NucleOS against this repository, so that agents work on it in
+worktrees managed by the daemon. If you don't, you can skip it.
+
+In that setup the classifier hook routes git operations through a **queue**, which runs them one at
+a time so that parallel sessions don't race on the shared `.git`:
+
+- `git merge`, `git push`, `git tag`, `git fetch` and `git branch -d` are taken over by the queue,
+  which returns a ticket number instead of running them directly.
+- Force pushes, a bare `git push`, `git pull` and `git branch -D` are refused. The refusal tells
+  you what to use instead.
+- Rebasing a session's own branch is always refused.
+- To deliver finished work, run `nucleos-core --land` from the worktree. It asks the queue to merge
+  the branch into the project's branch.
+- If that merge conflicts, nothing is published and no conflicted state is left behind. Merge the
+  target branch into yours, resolve the conflict there, and land again.
+
+When the hook blocks a command, it says why. Do not work around it with a different spelling of
+the same command.
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the
+[Apache License 2.0](LICENSE), the same license that covers the project.
