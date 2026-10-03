@@ -28,8 +28,9 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Five passes on one tick, and they are separate because they are about different rows at
 /// different moments: one stops a resolution nobody needs any more, one starts a resolution, one
 /// hands a finished resolution to the queue (`land_finished`), and one says what an
-/// already-published one cost. A fifth, `settle_moot`, stops counting rows that no longer want a
-/// person. Sharing a tick is all they share — the last runs even when the
+/// already-published one cost. A fifth, `settle_moot`, marks rows that no longer want a person,
+/// which both stops counting them and keeps `next_conflict` from launching on them. Sharing a tick
+/// is all they share — the last runs even when the
 /// others have been stopped, which is deliberate and argued at `record_discards`.
 ///
 /// Stopping comes before starting, and the order is the point rather than a preference: a tick that
@@ -116,6 +117,12 @@ struct Candidate {
 /// that difference where it is made: skipping is right for a resolution paused at
 /// `awaiting_approval`, and stopping one is not.
 ///
+/// **A row `settle_moot` or a person has settled is never launched either.** `settled_at` is set
+/// when git says the source is already in its target or is gone, or when somebody put the row away
+/// from the Waiting page; an agent started on any of those spends a run on nothing, and on a
+/// dismissed row it overrides a person's "nobody needs to act". The later-success subquery below
+/// stays: it covers the tick before `settle_moot` has run, which runs after this on the same tick.
+///
 /// Separated from `launch_once` so the filter can be tested against a pool alone. It is the part
 /// that decides which conflicts a person never has to look at, and it should not need an agent
 /// runner to prove.
@@ -127,6 +134,7 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
             AND op = 'merge'
             AND resolution_run_id IS NULL
             AND from_resolution = 0
+            AND settled_at IS NULL
             AND NOT EXISTS (
                 SELECT 1
                   FROM vcs_requests AS attempted
@@ -2108,10 +2116,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_settle_pass_does_not_change_which_conflict_is_launched() {
+    async fn a_conflict_the_settle_pass_settled_is_never_launched() {
         let (_container, repo) = moot_repo("nucleos-settle-launch-");
-        // Already merged into master, so the git arm WILL settle it — and the launcher must still
-        // see it exactly as before: this pass changes what is counted, not which agents start.
+        // Already merged into master, so the git arm settles it, and an agent started on it would
+        // spend a run resolving work that is already in.
         assert!(git_at(&repo, &["branch", "feat/x"]));
         commit_file(&repo, "ahead\n", "master moves on");
 
@@ -2120,7 +2128,11 @@ mod tests {
         rooted_at(&pool, escalated, &repo).await;
 
         let before = next_conflict(&pool).await.unwrap().map(|c| c.id);
-        assert_eq!(before, Some(escalated));
+        assert_eq!(
+            before,
+            Some(escalated),
+            "unsettled, it is launched as before"
+        );
 
         settle_moot(&pool).await;
         assert!(
@@ -2129,6 +2141,20 @@ mod tests {
         );
 
         let after = next_conflict(&pool).await.unwrap().map(|c| c.id);
-        assert_eq!(after, before, "the same escalated merge is still launched");
+        assert_eq!(after, None, "a settled conflict starts no agent");
+    }
+
+    #[tokio::test]
+    async fn a_conflict_a_person_put_away_is_never_launched() {
+        let pool = test_pool().await;
+        let dismissed = escalated_merge_of(&pool, "feat/put-away", false).await;
+        let open = escalated_merge_of(&pool, "feat/still-open", false).await;
+
+        crate::vcs::dismiss(&pool, dismissed).await.unwrap();
+
+        // "Nobody needs to act" is a person's answer; the loop must not act on it either. The row
+        // beside it, never put away, is still the one launched.
+        let next = next_conflict(&pool).await.unwrap().map(|c| c.id);
+        assert_eq!(next, Some(open));
     }
 }
