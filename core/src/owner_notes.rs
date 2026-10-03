@@ -368,6 +368,128 @@ pub async fn add_link(
     Ok(id)
 }
 
+#[derive(Debug)]
+pub enum TeachError {
+    NotFound,
+    /// Only an active note can be taught; an archived one was set aside on purpose.
+    Archived,
+    /// The note already points at a lesson that is still proposed or active.
+    AlreadyTaught,
+    Propose(crate::knowledge::ProposeError),
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for TeachError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<crate::knowledge::ProposeError> for TeachError {
+    fn from(error: crate::knowledge::ProposeError) -> Self {
+        Self::Propose(error)
+    }
+}
+
+impl std::fmt::Display for TeachError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("note not found"),
+            Self::Archived => formatter.write_str("an archived note cannot be taught"),
+            Self::AlreadyTaught => formatter.write_str("this note's lesson is already standing"),
+            Self::Propose(error) => write!(formatter, "could not propose: {error}"),
+            Self::Database(error) => write!(formatter, "database error: {error}"),
+        }
+    }
+}
+
+/// Maximum length, in characters, of a title derived from a note's first line.
+const TAUGHT_TITLE_MAX: usize = 80;
+
+/// The deliberate step that lets a note reach the agent: it becomes a `proposed` lesson owned by the
+/// owner (no run behind it), and nothing changes in any prompt until that proposal is approved.
+///
+/// The proposal, the `relates` link from the note to the lesson and the `taught` event are written
+/// in one transaction. Returns `(knowledge_id, proposal_id, link_id)`.
+pub async fn teach(
+    pool: &SqlitePool,
+    note_id: i64,
+    kind: crate::knowledge::Kind,
+    title: Option<&str>,
+    project_id: Option<&str>,
+) -> Result<(i64, i64, i64), TeachError> {
+    let mut tx = pool.begin().await?;
+    let note: Option<(String, String)> =
+        sqlx::query_as("SELECT note_text, state FROM owner_notes WHERE id = ?")
+            .bind(note_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let (text, state) = note.ok_or(TeachError::NotFound)?;
+    if state != "active" {
+        return Err(TeachError::Archived);
+    }
+    // A rejected or reverted lesson does not count: the owner may teach the note again.
+    let standing = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM owner_note_links l
+         JOIN knowledge k ON CAST(k.id AS TEXT) = l.target_ref
+         WHERE l.note_id = ? AND l.link_type = 'relates' AND l.target_kind = 'knowledge'
+           AND k.status IN ('proposed', 'active')
+         LIMIT 1",
+    )
+    .bind(note_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if standing.is_some() {
+        return Err(TeachError::AlreadyTaught);
+    }
+
+    let derived: String = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(TAUGHT_TITLE_MAX)
+        .collect();
+    let title = title
+        .map(str::trim)
+        .filter(|given| !given.is_empty())
+        .unwrap_or(&derived);
+    let reasoning = format!("taught from owner note #{note_id}");
+    let (knowledge_id, proposal_id) = crate::knowledge::propose_in(
+        &mut tx,
+        crate::knowledge::Declaration {
+            project_id,
+            origin_run_id: None,
+            kind,
+            title,
+            body: &text,
+            reasoning: &reasoning,
+            supersedes: None,
+        },
+    )
+    .await?;
+
+    let at = now();
+    let target_ref = knowledge_id.to_string();
+    let link_id = sqlx::query(
+        "INSERT INTO owner_note_links (note_id, link_type, target_kind, target_ref, created_at)
+         VALUES (?, 'relates', 'knowledge', ?, ?)",
+    )
+    .bind(note_id)
+    .bind(&target_ref)
+    .bind(&at)
+    .execute(&mut *tx)
+    .await?
+    .last_insert_rowid();
+    let linked = format!("relates knowledge:{target_ref}");
+    record_raw(&mut tx, note_id, "linked", Some(&linked), &at).await?;
+    let taught = format!("knowledge:{knowledge_id} proposal:{proposal_id}");
+    record_raw(&mut tx, note_id, "taught", Some(&taught), &at).await?;
+    tx.commit().await?;
+    Ok((knowledge_id, proposal_id, link_id))
+}
+
 /// Deletes a link and records `unlinked` on the note that owned it.
 pub async fn remove_link(pool: &SqlitePool, link_id: i64) -> Result<(), LinkError> {
     let mut tx = pool.begin().await?;
@@ -535,6 +657,108 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn teaching_creates_one_owner_proposal_and_links_it() {
+        let pool = test_pool().await;
+        let id = create(
+            &pool,
+            "Deploys go out on Tuesdays\nnever on Fridays",
+            "shell",
+        )
+        .await
+        .unwrap();
+
+        let (knowledge_id, proposal_id, link_id) = teach(
+            &pool,
+            id,
+            crate::knowledge::Kind::Memory,
+            None,
+            Some("mine"),
+        )
+        .await
+        .unwrap();
+
+        let (source, status, title, body, proposal): (String, String, String, String, i64) =
+            sqlx::query_as(
+                "SELECT source, status, title, body, proposal_id FROM knowledge WHERE id = ?",
+            )
+            .bind(knowledge_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(source, "owner");
+        assert_eq!(status, "proposed");
+        assert_eq!(
+            title, "Deploys go out on Tuesdays",
+            "the title is the first line"
+        );
+        assert_eq!(body, "Deploys go out on Tuesdays\nnever on Fridays");
+        assert_eq!(proposal, proposal_id);
+
+        let (status, run_id, reasoning): (String, Option<i64>, String) =
+            sqlx::query_as("SELECT status, run_id, reasoning FROM proposals WHERE id = ?")
+                .bind(proposal_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(run_id, None);
+        assert_eq!(reasoning, format!("taught from owner note #{id}"));
+        let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(proposals, 1);
+
+        let links = links_out(&pool, id).await.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].id, link_id);
+        assert_eq!(links[0].link_type, "relates");
+        assert_eq!(links[0].target_kind, "knowledge");
+        assert_eq!(links[0].target_ref, knowledge_id.to_string());
+
+        let kinds: Vec<String> = events(&pool, id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(kinds, ["created", "linked", "taught"]);
+    }
+
+    #[tokio::test]
+    async fn a_note_cannot_be_taught_twice_while_its_lesson_stands() {
+        let pool = test_pool().await;
+        let id = create(&pool, "one lesson", "shell").await.unwrap();
+        let (_, proposal_id, _) = teach(&pool, id, crate::knowledge::Kind::Memory, None, None)
+            .await
+            .unwrap();
+
+        let again = teach(&pool, id, crate::knowledge::Kind::Memory, None, None).await;
+        assert!(matches!(again, Err(TeachError::AlreadyTaught)), "{again:?}");
+
+        // Once the lesson is rejected it no longer stands, and the note may be taught again.
+        crate::knowledge::reject(&pool, proposal_id).await.unwrap();
+        teach(
+            &pool,
+            id,
+            crate::knowledge::Kind::Memory,
+            Some("retry"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let missing = teach(&pool, 9_999, crate::knowledge::Kind::Memory, None, None).await;
+        assert!(matches!(missing, Err(TeachError::NotFound)), "{missing:?}");
+        let archived = create(&pool, "set aside", "shell").await.unwrap();
+        update(&pool, archived, None, Some("archived"))
+            .await
+            .unwrap();
+        let refused = teach(&pool, archived, crate::knowledge::Kind::Memory, None, None).await;
+        assert!(matches!(refused, Err(TeachError::Archived)), "{refused:?}");
     }
 
     #[tokio::test]

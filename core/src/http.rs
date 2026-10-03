@@ -558,6 +558,7 @@ pub fn build_router(state: AppState) -> Router {
             get(get_owner_note).patch(patch_owner_note),
         )
         .route("/owner-notes/{id}/links", post(post_owner_note_link))
+        .route("/owner-notes/{id}/teach", post(post_owner_note_teach))
         .route(
             "/owner-notes/links/{link_id}",
             delete(delete_owner_note_link),
@@ -15020,6 +15021,15 @@ struct PostOwnerNoteLinkRequest {
     target_ref: String,
 }
 
+/// Body of `POST /owner-notes/{id}/teach`. Every field is optional: the kind defaults to `memory`
+/// and the title to the note's first line.
+#[derive(serde::Deserialize)]
+struct TeachOwnerNoteRequest {
+    kind: Option<String>,
+    title: Option<String>,
+    project_id: Option<String>,
+}
+
 /// The status a note failure answers with. Never logs the text: only the id and the database error.
 fn owner_note_status(error: &crate::owner_notes::NoteError, note_id: Option<i64>) -> StatusCode {
     use crate::owner_notes::NoteError;
@@ -15177,6 +15187,44 @@ async fn post_owner_note_link(
         Err(LinkError::NotFound) => Err((StatusCode::NOT_FOUND, "note not found".into())),
         Err(LinkError::Db(error)) => Err((owner_note_db_status(&error, Some(id)), String::new())),
         Err(other) => Err((StatusCode::BAD_REQUEST, other.to_string())),
+    }
+}
+
+/// Teaching a note: it becomes a `proposed` lesson owned by the owner, and reaches no prompt until
+/// the proposal is approved through `POST /proposals/{id}/approve`.
+async fn post_owner_note_teach(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<TeachOwnerNoteRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    use crate::owner_notes::TeachError;
+    let kind = crate::knowledge::Kind::parse(request.kind.as_deref().unwrap_or("memory"))
+        .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "unknown_kind"))?;
+    match crate::owner_notes::teach(
+        &state.pool,
+        id,
+        kind,
+        request.title.as_deref(),
+        request.project_id.as_deref(),
+    )
+    .await
+    {
+        Ok((knowledge_id, proposal_id, link_id)) => Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "knowledge_id": knowledge_id,
+                "proposal_id": proposal_id,
+                "link_id": link_id,
+            })),
+        )),
+        Err(TeachError::NotFound) => Err(refusal(StatusCode::NOT_FOUND, "not_found")),
+        Err(TeachError::Archived) => Err(refusal(StatusCode::CONFLICT, "archived")),
+        Err(TeachError::AlreadyTaught) => Err(refusal(StatusCode::CONFLICT, "already_taught")),
+        // Only the id and the error: the note's text never reaches a log line.
+        Err(error) => {
+            tracing::warn!(note_id = id, %error, "teaching an owner note failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
     }
 }
 
@@ -35930,6 +35978,65 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         body["id"].as_i64().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_taught_note_becomes_active_knowledge_only_after_approval() {
+        let state = test_state().await;
+        let id = file_owner_note(&state, "Release notes are written before the tag").await;
+        let uri = format!("/owner-notes/{id}/teach");
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &uri,
+            Some(serde_json::json!({ "kind": "nonsense" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, taught) = call(state.clone(), "POST", &uri, Some(serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{taught}");
+        let knowledge_id = taught["knowledge_id"].as_i64().unwrap();
+        let proposal_id = taught["proposal_id"].as_i64().unwrap();
+        assert!(taught["link_id"].as_i64().is_some());
+
+        let (status, source): (String, String) =
+            sqlx::query_as("SELECT status, source FROM knowledge WHERE id = ?")
+                .bind(knowledge_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!((status.as_str(), source.as_str()), ("proposed", "owner"));
+
+        let (status, again) = call(state.clone(), "POST", &uri, Some(serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(again["refusal"], "already_taught");
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/owner-notes/9999/teach",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{proposal_id}/approve"),
+            None,
+        )
+        .await;
+        assert!(status.is_success(), "approve answered {status}");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM knowledge WHERE id = ?")
+            .bind(knowledge_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "active");
     }
 
     #[tokio::test]
