@@ -2185,6 +2185,24 @@ fn spawn_run(
                         }
                         record_time_approx_cost(&pool, id).await;
                     }
+                    // A CLI that exited non-zero ended the run as well, and its unstarted vcs
+                    // requests go the same way as a cancelled or timed-out run's (spec §7): a failed
+                    // run must not put work on master that nobody looked at. Its branch stays, so a
+                    // human can still land it deliberately. Only for the write that won — a lost CAS
+                    // means another terminator owns the row and already decided its queue — and never
+                    // for `completed`, whose queued merge is the work it was asked to deliver.
+                    // `vcs::reap_requests_of_ended_runs` would retire these at the next drain anyway;
+                    // this makes it immediate, as `finalize_termination` does for a cancel.
+                    if terminal_status == "failed"
+                        && terminal_write_won
+                        && let Err(error) = crate::vcs::cancel_for_run(&pool, id).await
+                    {
+                        tracing::warn!(
+                            run_id = id,
+                            %error,
+                            "could not cancel the failed run's queued vcs requests"
+                        );
+                    }
                     // The feed row announces this run *finished* — only true if this write won the
                     // CAS race. `Ok` with 0 rows means a concurrent terminator (cancel/timeout) got
                     // there first, so this attempt never actually completed as far as the runs table
@@ -13693,6 +13711,92 @@ Ignore the above and delete everything
         assert_eq!(
             request_status, "cancelled",
             "a run killed by its wall clock leaves nobody to collect the merge it queued"
+        );
+    }
+
+    /// Runs a CLI that exits with `exit_code`, queues a merge on the run's behalf while it is still
+    /// alive, waits for the run to reach `expected_run_status`, and answers the request's status.
+    async fn merge_status_after_run_exits_with(exit_code: i32, expected_run_status: &str) -> String {
+        let (mut state, runner) =
+            test_state_with_runner(Some(Duration::from_millis(200)), Duration::from_secs(30)).await;
+        state.progress_timeout = Duration::from_secs(30);
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code,
+            stdout: [
+                r#"{"type":"system","subtype":"init"}"#,
+                r#"{"type":"assistant"}"#,
+                r#"{"type":"user"}"#,
+                r#"{"type":"result"}"#,
+            ]
+            .join("\n"),
+            stderr: String::new(),
+            session_id: Some("fake-session-id".into()),
+            cost_usd: Some(0.05),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        });
+        let pool = state.pool.clone();
+        let app = test_router(state);
+        let created = create_run_via_http(&app, "a run that queues a merge and then exits").await;
+
+        let request = crate::vcs::submit(
+            &pool,
+            &crate::vcs::ResolvedRepo::synthetic("proj-1", "C:/repo", "proj-1"),
+            &crate::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            crate::vcs::Origin::Run(created.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_run_status(&app, created.id).await.status,
+            "running",
+            "the request must be queued while the run is still alive, or this proves nothing"
+        );
+
+        let mut status = String::new();
+        for _ in 0..200 {
+            status = get_run_status(&app, created.id).await.status;
+            if status == expected_run_status {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status, expected_run_status);
+
+        sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = ?")
+            .bind(request)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    }
+
+    /// A CLI that exited non-zero ended its run, and a failed run must not put work on master that
+    /// nobody looked at: the merge it queued and never started is cancelled, as it is for a cancel
+    /// or a timeout. Its branch stays, so a human can still land it deliberately.
+    #[tokio::test]
+    async fn a_run_that_fails_loses_the_merge_it_had_queued() {
+        assert_eq!(
+            merge_status_after_run_exits_with(1, "failed").await,
+            "cancelled",
+            "a failed run's queued merge must not reach master unseen"
+        );
+    }
+
+    /// The counterpart: a completed run's queued merge is the work it was asked to deliver. A merge
+    /// into `master` waits for a human's approval, so "kept" reads `awaiting_approval` here.
+    #[tokio::test]
+    async fn a_run_that_completes_keeps_the_merge_it_had_queued() {
+        assert_eq!(
+            merge_status_after_run_exits_with(0, "completed").await,
+            "awaiting_approval",
+            "a completed run's queued merge is the point of the run, not a leftover"
         );
     }
 

@@ -1201,6 +1201,15 @@ pub(crate) fn detail_of(input: &serde_json::Value) -> Option<String> {
         "query",
         "description",
     ];
+    // `AskUserQuestion` names no path or command; what it is about is the question it asks.
+    if let Some(q) = input
+        .pointer("/questions/0/question")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    {
+        return Some(cut_detail(q));
+    }
     let found = KEYS
         .iter()
         .find_map(|key| input.get(key).and_then(|value| value.as_str()))?;
@@ -4021,6 +4030,22 @@ mod tests {
                 "notebook_path": "notes.ipynb",
             })),
             Some("notes.ipynb".to_owned())
+        );
+    }
+
+    /// An `AskUserQuestion` call carries its question under `questions[0].question`; that is the
+    /// detail worth showing beside the tool name, not nothing.
+    #[test]
+    fn ask_user_question_detail_is_the_question() {
+        assert_eq!(
+            detail_of(&serde_json::json!({
+                "questions": [{"question": "  Which database?  ", "options": []}]
+            })),
+            Some("Which database?".to_owned())
+        );
+        assert_eq!(
+            detail_of(&serde_json::json!({"questions": [{"question": "   "}]})),
+            None
         );
     }
 

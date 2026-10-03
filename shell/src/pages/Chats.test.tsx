@@ -994,11 +994,15 @@ async function openModelMenu(): Promise<void> {
   fireEvent.click(trigger);
 }
 
-/** The effort menu, its own control beside the model's rather than a submenu inside it. */
-async function openEffortMenu(): Promise<void> {
-  const trigger = await screen.findByRole("button", { name: /^effort:/i });
-  fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
-  fireEvent.click(trigger);
+/** The effort slider's thumb: its own control beside the model's, a keyboard-driven range. */
+async function effortThumb(): Promise<HTMLElement> {
+  return screen.findByRole("slider", { name: "Effort level" });
+}
+
+/** The "+" menu's hidden file input, which carries no label of its own. */
+async function pictureInput(): Promise<HTMLInputElement> {
+  await screen.findByRole("button", { name: "Add to message" });
+  return document.querySelector('input[type="file"]') as HTMLInputElement;
 }
 
 /** What the conversation may do without asking. Same Radix `pointerdown` rule as its neighbours. */
@@ -1150,12 +1154,11 @@ describe("Chats - choosing a model", () => {
 
   it("writes the effort on its own, without touching which model answers", async () => {
     daemon.apiFetch.mockImplementation(
-      chatsFetch([chatSummary({ chat_id: "c-1", model: "sonnet" })], { "c-1": [] }),
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "sonnet", effort: "high" })], { "c-1": [] }),
     );
 
     await renderChats("/chats/c-1");
-    await openEffortMenu();
-    fireEvent.click(await screen.findByRole("menuitemradio", { name: "xhigh" }));
+    fireEvent.keyDown(await effortThumb(), { key: "ArrowRight" });
 
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
@@ -1165,34 +1168,82 @@ describe("Chats - choosing a model", () => {
     });
   });
 
-  it("offers each model its own effort levels, not the union of everyone's", async () => {
+  it("the effort is a slider over the model's own levels and hidden without any", async () => {
     daemon.apiFetch.mockImplementation(
-      chatsFetch([chatSummary({ chat_id: "c-1", model: "fable" })], { "c-1": [] }),
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "fable", effort: "low" })], { "c-1": [] }),
     );
 
-    await renderChats("/chats/c-1");
-    await openEffortMenu();
+    const { unmount } = await renderChats("/chats/c-1");
+    const thumb = await effortThumb();
+    // Fable's list stops at `high` in the fixture: default + three levels, so the last index is 3.
+    // `xhigh` is on the union and on other models, and offering it here would be a level that dies
+    // at spawn.
+    expect(thumb.getAttribute("aria-valuemax")).toBe("3");
+    expect(thumb.getAttribute("aria-valuetext")).toBe("low");
+    expect(screen.queryByText("xhigh")).toBeNull();
 
-    // Fable's list stops at `high` in the fixture. `xhigh` is on the union and on other models, and
-    // offering it here would be a level that dies at spawn.
-    expect(await screen.findByRole("menuitemradio", { name: "high" })).toBeDefined();
-    expect(screen.queryByRole("menuitemradio", { name: "xhigh" })).toBeNull();
-    expect(screen.queryByRole("menuitemradio", { name: "max" })).toBeNull();
-  });
+    // The first position is the CLI's own default and is written as an explicit null.
+    fireEvent.keyDown(thumb, { key: "Home" });
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ effort: null }),
+      });
+    });
+    unmount();
 
-  it("closes the effort dial on a model that has none, rather than offering one that turns nothing", async () => {
+    // A model with no levels gets no slider at all, rather than one that turns nothing.
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1", model: "qwen3.5:4b", brain: "local" })], {
         "c-1": [],
       }),
     );
+    await renderChats("/chats/c-1");
+    await screen.findByRole("button", { name: /answered by qwen3.5:4b/i });
+    expect(screen.queryByRole("slider")).toBeNull();
+  });
+
+  it("the picker draws provider and family groups with product names", async () => {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1", model: "claude-opus-4-6" })], {
+      "c-1": [],
+    });
+    const opus: ModelChoice = {
+      id: "claude-opus-4-6",
+      label: "Opus 4.6",
+      brain: "cloud",
+      efforts: CLAUDE_EFFORTS,
+    };
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      if (String(path).startsWith("/assistant/models/groups")) {
+        return {
+          groups: [
+            { provider: "anthropic", family: "opus", label: "Claude · Opus", models: [opus] },
+            {
+              provider: "openai",
+              family: "gpt",
+              label: "OpenAI · GPT",
+              models: [{ id: "gpt-5.5", label: "GPT-5.5", brain: "cloud", efforts: ["low"] }],
+            },
+          ],
+          source: "fallback",
+          catalogue_version: "2026-10-02",
+          fetched_at: null,
+        };
+      }
+      return base(path, init);
+    });
 
     await renderChats("/chats/c-1");
+    // The trigger names the pinned model by its product name, never by its id.
+    expect(await screen.findByRole("button", { name: /answered by Opus 4.6/i })).toBeDefined();
+    await openModelMenu();
 
-    // Disabled and still there. Removing it would make the row jump as you switch models, and would
-    // read as a feature that is missing rather than one that does not apply to this model.
-    const dial = await screen.findByRole("button", { name: /has no effort setting/i });
-    expect((dial as HTMLButtonElement).disabled).toBe(true);
+    const claude = await screen.findByRole("group", { name: "Claude · Opus" });
+    expect(within(claude).getByRole("menuitemradio", { name: "Opus 4.6" })).toBeDefined();
+    const openai = await screen.findByRole("group", { name: "OpenAI · GPT" });
+    expect(within(openai).getByRole("menuitemradio", { name: "GPT-5.5" })).toBeDefined();
+    // The flat "On the agent CLI" section is replaced, not drawn beside them.
+    expect(screen.queryByRole("group", { name: "On the agent CLI" })).toBeNull();
   });
 
   it("keeps the model and the effort as two controls, not one inside the other", async () => {
@@ -1202,11 +1253,10 @@ describe("Chats - choosing a model", () => {
 
     await renderChats("/chats/c-1");
 
-    // Two triggers, side by side. They are two decisions and a person changes them separately —
-    // most often the effort, on a model they already chose — and a dial buried one level down is
-    // one you have to remember is there.
+    // Two controls, side by side. They are two decisions and a person changes them separately —
+    // most often the effort, on a model they already chose.
     expect(await screen.findByRole("button", { name: /answered by sonnet/i })).toBeDefined();
-    expect(await screen.findByRole("button", { name: /^effort: high/i })).toBeDefined();
+    expect((await effortThumb()).getAttribute("aria-valuetext")).toBe("high");
 
     // And opening the model menu offers models only.
     await openModelMenu();
@@ -3358,7 +3408,7 @@ describe("sending a picture", () => {
   it("attaches one and sends it inside the message", async () => {
     await open();
 
-    const input = await screen.findByLabelText("Attach a picture");
+    const input = await pictureInput();
     fireEvent.change(input, { target: { files: [picture()] } });
 
     // It is shown before it is sent: attaching and sending are two gestures, and a picture that
@@ -3389,7 +3439,7 @@ describe("sending a picture", () => {
 
     expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
 
-    const input = await screen.findByLabelText("Attach a picture");
+    const input = await pictureInput();
     fireEvent.change(input, { target: { files: [picture()] } });
 
     await waitFor(() => {
@@ -3402,7 +3452,7 @@ describe("sending a picture", () => {
   it("can be taken back off before it is sent", async () => {
     await open();
 
-    const input = await screen.findByLabelText("Attach a picture");
+    const input = await pictureInput();
     fireEvent.change(input, { target: { files: [picture()] } });
     await screen.findByRole("list", { name: "Attached pictures" });
 
@@ -3418,7 +3468,7 @@ describe("sending a picture", () => {
   it("ignores a file the API could not carry", async () => {
     await open();
 
-    const input = await screen.findByLabelText("Attach a picture");
+    const input = await pictureInput();
     fireEvent.change(input, {
       target: { files: [new File([""], "notes.pdf", { type: "application/pdf" })] },
     });
@@ -4201,7 +4251,7 @@ describe("Chats - what the header says without being asked", () => {
     // Named, not blank: a conversation that pinned nothing still runs on something, and the
     // trigger says which. An empty selection here would read as a broken control.
     expect(
-      await screen.findByRole("button", { name: /answered by claude-sonnet-5/i }),
+      await screen.findByRole("button", { name: /answered by sonnet 5/i }),
     ).toBeDefined();
     expect(await screen.findByRole("button", { name: /^Permissions: Plan/ })).toBeDefined();
 
@@ -5358,5 +5408,44 @@ describe("Chats - the microphone in an open conversation", () => {
     const notice = await screen.findByText("nothing was heard");
     const actions = container.querySelector(".chats-composer-actions") as HTMLElement;
     expect(actions.contains(notice)).toBe(true);
+  });
+});
+
+describe("Chats - conversations as tabs", () => {
+  it("opens two conversations as tabs and closes one", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({ chat_id: "c-1", title: "alpha" }),
+          chatSummary({ chat_id: "c-2", title: "beta" }),
+        ],
+        { "c-1": [], "c-2": [] },
+      ),
+    );
+
+    const { router } = await renderChats("/chats/c-1");
+    const strip = await screen.findByRole("tablist", { name: "Open conversations" });
+    expect(within(strip).getAllByRole("tab")).toHaveLength(1);
+
+    // Opening another one from the column adds a tab and keeps the first.
+    fireEvent.click(await screen.findByRole("link", { name: /^beta, cloud/ }));
+    await waitFor(() => expect(within(strip).getAllByRole("tab")).toHaveLength(2));
+    expect(router.state.location.pathname).toBe("/chats/c-2");
+    expect(JSON.parse(localStorage.getItem("chats.tabs") ?? "[]")).toEqual(["c-1", "c-2"]);
+
+    // Clicking a tab navigates back.
+    fireEvent.click(within(strip).getByRole("tab", { name: /alpha/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-1"));
+
+    // Closing the open one moves to its neighbour, and the tab is gone.
+    fireEvent.click(within(strip).getByRole("button", { name: "Close alpha" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-2"));
+    expect(within(strip).getAllByRole("tab")).toHaveLength(1);
+    expect(within(strip).queryByRole("tab", { name: /alpha/ })).toBeNull();
+
+    // Closing the last one goes back to the front door and the strip disappears.
+    fireEvent.click(within(strip).getByRole("button", { name: "Close beta" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/chats"));
+    expect(screen.queryByRole("tablist", { name: "Open conversations" })).toBeNull();
   });
 });

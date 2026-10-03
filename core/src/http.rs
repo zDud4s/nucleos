@@ -579,6 +579,7 @@ pub fn build_router(state: AppState) -> Router {
         // because it is the same answer for every chat and a per-chat copy would be fetched once
         // per row in the list.
         .route("/assistant/models", get(get_assistant_models))
+        .route("/assistant/models/groups", get(get_model_groups))
         .route("/assistant/tools", get(get_deniable_tools))
         .route("/assistant/commands", get(get_commands))
         .route("/assistant/chats", get(list_chats).post(create_chat))
@@ -620,6 +621,16 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
+        .route("/assistant/chats/{chat_id}/restore", post(post_chat_restore))
+        .route(
+            "/assistant/chat-groups",
+            get(list_chat_groups).post(create_chat_group),
+        )
+        .route(
+            "/assistant/chat-groups/{group_id}",
+            axum::routing::patch(rename_chat_group).delete(delete_chat_group),
+        )
+        .route("/assistant/chats/{chat_id}/group", axum::routing::put(put_chat_group))
         // The two context gestures. Separate routes rather than one with a flag, because they are
         // separate decisions and a caller that got the flag backwards would silently throw away a
         // conversation's memory.
@@ -11801,6 +11812,13 @@ async fn get_local_model_pull() -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(pull_readout(pull)))
 }
 
+#[derive(serde::Deserialize)]
+struct ListChatsQuery {
+    /// Archived conversations instead of the live list.
+    #[serde(default)]
+    archived: bool,
+}
+
 /// The conversations the app opened, most recently active first.
 ///
 /// The Telegram sidecar's chats are absent from this, and no line here says so. They are absent
@@ -11809,10 +11827,23 @@ async fn get_local_model_pull() -> Result<Json<serde_json::Value>, StatusCode> {
 /// maintenance.
 async fn list_chats(
     State(state): State<AppState>,
+    Query(query): Query<ListChatsQuery>,
 ) -> Result<Json<Vec<crate::chats::ChatSummary>>, StatusCode> {
-    crate::chats::list(&state.pool)
-        .await
-        .map(Json)
+    let rows = if query.archived {
+        crate::chats::list_archived(&state.pool).await
+    } else {
+        crate::chats::list(&state.pool).await
+    };
+    rows.map(|rows| {
+        Json(
+            rows.into_iter()
+                .map(|row| {
+                    let asks = crate::hooks::asks_for(&row.chat_id).len();
+                    crate::chats::settle(row, asks)
+                })
+                .collect(),
+        )
+    })
         .map_err(|error| {
             tracing::warn!(%error, "listing chats failed");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -12754,6 +12785,14 @@ enum Asking {
     Chat { rooted: bool },
 }
 
+/// Whether the asker is a rooted chat: `None` for the daemon's own menu.
+fn rooted_of(asking: Asking) -> Option<bool> {
+    match asking {
+        Asking::Daemon => None,
+        Asking::Chat { rooted } => Some(rooted),
+    }
+}
+
 /// Which route a choice id names and can actually run, or a refusal.
 ///
 /// One function because two routes ask — opening a conversation and re-pointing one — and sharing
@@ -12795,7 +12834,12 @@ async fn chosen_brain_in(
     id: &str,
     asking: Asking,
 ) -> Result<crate::chats::Brain, BrainRefusal> {
-    if matches!(asking, Asking::Chat { rooted: false }) && config.runner_of(id) == Some("codex") {
+    if matches!(asking, Asking::Chat { rooted: false })
+        && config
+            .runner_of(id)
+            .or_else(|| crate::model_catalog::runner_by_id(id))
+            == Some("codex")
+    {
         return Err(BrainRefusal::NeedsRoot);
     }
 
@@ -12805,6 +12849,13 @@ async fn chosen_brain_in(
     };
     let brain = if let Some(choice) = cheap_choices.into_iter().find(|choice| choice.id == id) {
         crate::chats::Brain::from_wire(&choice.brain)
+    } else if crate::model_catalog::cached_or_fallback().iter().any(|found| {
+        found.id == id
+            && crate::model_catalog::admits(config.active_runner(), rooted_of(asking), found.runner)
+    }) {
+        // A model the vendor lists (or the built-in catalogue names) that no config row does.
+        // Looked up without the network, like the cheap catalogue above.
+        crate::chats::Brain::Cloud
     } else {
         let (_, choices) = menu(asking).await;
         choices
@@ -12886,11 +12937,66 @@ async fn get_assistant_models(
         // What an unpinned conversation runs on, so the window can NAME that state rather than
         // showing an empty selection and letting a person guess.
         "configured": config.configured_model(),
+        // The same model as a person reads it, from the daemon's one naming function.
+        "configured_label": crate::model_catalog::display_name(config.configured_model()),
         // The union, for the one case with no model chosen yet — the front door before anybody
         // picks. Also what the door validates against. Unaffected by the installed merge: an
         // installed model carries no effort levels of its own, `effort_levels()` keeps calling the
         // sync `catalogue()`, and there is nothing for the network read to add here.
         "efforts": config.effort_levels(),
+    }))
+}
+
+/// The picker as groups: provider and family, newest first, named as a person reads them.
+///
+/// The config's cloud choices come first and win; the discovered models (live vendor lists, or the
+/// built-in catalogue when there is no key or the vendor does not answer) are appended when the
+/// runner may answer them. Never carries a key.
+async fn get_model_groups(
+    State(state): State<AppState>,
+    Query(query): Query<ModelsQuery>,
+) -> Json<serde_json::Value> {
+    let asking = match query.chat {
+        Some(chat_id) => Asking::Chat {
+            rooted: crate::assistant::may_answer_on_codex(
+                crate::chats::cwd_of(&state.pool, &chat_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            ),
+        },
+        None => Asking::Daemon,
+    };
+    let (config, choices) = menu(asking).await;
+    let mut cloud: Vec<crate::config::AssistantChoice> = choices
+        .into_iter()
+        .filter(|choice| choice.brain == "cloud")
+        .map(|mut choice| {
+            if choice.label == choice.id {
+                choice.label = crate::model_catalog::display_name(&choice.id);
+            }
+            choice
+        })
+        .collect();
+    let snapshot = crate::model_catalog::current().await;
+    let mut created = std::collections::HashMap::new();
+    for found in &snapshot.models {
+        if let Some(at) = found.created {
+            created.insert(found.id.clone(), at);
+        }
+        if cloud.iter().any(|choice| choice.id == found.id) {
+            continue;
+        }
+        if crate::model_catalog::admits(config.active_runner(), rooted_of(asking), found.runner) {
+            cloud.push(crate::model_catalog::as_choice(found));
+        }
+    }
+    Json(serde_json::json!({
+        "groups": crate::model_catalog::group(cloud, &created),
+        "source": snapshot.source,
+        "catalogue_version": crate::model_catalog::CATALOGUE_VERSION,
+        "fetched_at": snapshot.fetched_at,
     }))
 }
 
@@ -13546,6 +13652,97 @@ async fn post_chat_seen(
             tracing::warn!(%error, "marking a chat read failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+/// Puts an archived conversation back on the list: 204, or 404 when it was not archived.
+async fn post_chat_restore(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::chats::restore(&state.pool, &chat_id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, "restoring a chat failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Chat groups (P4): the list, create, rename, delete and assign handlers.
+async fn list_chat_groups(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::chat_groups::ChatGroup>>, StatusCode> {
+    crate::chat_groups::list(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(serde::Deserialize)]
+struct ChatGroupName {
+    name: String,
+}
+
+fn group_refusal(error: crate::chat_groups::GroupError) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::chat_groups::GroupError;
+    match error {
+        GroupError::Blank => refusal(StatusCode::BAD_REQUEST, "blank_name"),
+        GroupError::TooLong => refusal(StatusCode::BAD_REQUEST, "name_too_long"),
+        GroupError::NoGroup | GroupError::NoChat => refusal(StatusCode::NOT_FOUND, "not_found"),
+        GroupError::Db(error) => {
+            tracing::warn!(%error, "chat group operation failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
+
+async fn create_chat_group(
+    State(state): State<AppState>,
+    Json(body): Json<ChatGroupName>,
+) -> Result<(StatusCode, Json<crate::chat_groups::ChatGroup>), (StatusCode, Json<serde_json::Value>)> {
+    crate::chat_groups::create(&state.pool, &body.name)
+        .await
+        .map(|group| (StatusCode::CREATED, Json(group)))
+        .map_err(group_refusal)
+}
+
+async fn rename_chat_group(
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+    Json(body): Json<ChatGroupName>,
+) -> Result<Json<crate::chat_groups::ChatGroup>, (StatusCode, Json<serde_json::Value>)> {
+    crate::chat_groups::rename(&state.pool, group_id, &body.name)
+        .await
+        .map(Json)
+        .map_err(group_refusal)
+}
+
+async fn delete_chat_group(
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::chat_groups::delete(&state.pool, group_id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ChatGroupAssignment {
+    group_id: Option<i64>,
+}
+
+async fn put_chat_group(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Json(body): Json<ChatGroupAssignment>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    crate::chat_groups::assign(&state.pool, &chat_id, body.group_id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(group_refusal)
 }
 
 /// Takes a conversation off the list, and leaves every turn of it in place.
@@ -28285,6 +28482,64 @@ mod tests {
         assert!(body["configured"].is_string());
     }
 
+    /// The grouped picker: provider and family groups, product names for labels, the version of
+    /// the catalogue the fallback came from, and never a key.
+    #[tokio::test]
+    async fn model_groups_route_answers_groups_with_labels() {
+        let state = test_state().await;
+
+        let (status, body) = call(state, "GET", "/assistant/models/groups", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "fallback");
+        assert_eq!(body["catalogue_version"], crate::model_catalog::CATALOGUE_VERSION);
+        assert!(body["fetched_at"].is_string());
+        let groups = body["groups"].as_array().expect("groups is a list");
+        assert!(!groups.is_empty());
+        for group in groups {
+            assert!(group["provider"].is_string());
+            assert!(group["family"].is_string());
+            assert!(group["label"].as_str().unwrap().contains(" · "));
+            let models = group["models"].as_array().unwrap();
+            assert!(!models.is_empty(), "an empty group was served: {group}");
+            for model in models {
+                assert_ne!(
+                    model["label"], model["id"],
+                    "a raw id leaked into a label: {model}"
+                );
+            }
+        }
+        // The daemon's own menu follows the active runner, which is Claude here.
+        let all: Vec<&serde_json::Value> = groups
+            .iter()
+            .flat_map(|g| g["models"].as_array().unwrap())
+            .collect();
+        let ids: Vec<&str> = all.iter().filter_map(|m| m["id"].as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-5-5"), "{ids:?}");
+        assert!(!ids.contains(&"gpt-5.5"), "a Codex model on a Claude daemon: {ids:?}");
+        let sonnet = all.iter().find(|m| m["id"] == "claude-sonnet-5-5").unwrap();
+        assert_eq!(sonnet["label"], "Sonnet 5.5");
+    }
+
+    /// A catalogue model the config never listed can still be pinned, because the door validates
+    /// against what the picker offers.
+    #[tokio::test]
+    async fn a_fallback_catalogue_model_can_be_pinned_on_a_chat() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let status =
+            patch_chat_request(state.clone(), &id, r#"{"model":"claude-sonnet-5-5"}"#).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap().0,
+            Some("claude-sonnet-5-5".to_string())
+        );
+    }
+
     /// `installed` reaches the wire, and reads `null` wherever the question is meaningless.
     ///
     /// The other half — `true` for a model this machine has, `false` for one it does not — is
@@ -29381,6 +29636,169 @@ mod tests {
                 .unwrap(),
             Some("a-session".to_string())
         );
+    }
+
+    async fn chats_request(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.unwrap_or("").to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn list_chats_marks_a_pending_approval_ask_as_needs_input() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let ask = crate::hooks::ask_about(&id, 1, "Bash", Some("npm publish".into()));
+
+        let (status, body) = chats_request(&state, "GET", "/assistant/chats", None).await;
+        crate::hooks::answer_ask(&ask, false);
+
+        assert_eq!(status, StatusCode::OK);
+        let row = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["chat_id"] == id.as_str())
+            .unwrap();
+        assert_eq!(row["activity"], "needs_input");
+        assert_eq!(row["pending_asks"], 1);
+    }
+
+    #[tokio::test]
+    async fn restore_route_returns_a_chat_to_the_list_and_404s_unknown() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::archive(&state.pool, &id).await.unwrap();
+
+        let (_, archived) =
+            chats_request(&state, "GET", "/assistant/chats?archived=true", None).await;
+        assert!(archived.as_array().unwrap().iter().any(|c| c["chat_id"] == id.as_str()));
+
+        let (status, _) =
+            chats_request(&state, "POST", &format!("/assistant/chats/{id}/restore"), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
+        assert!(live.as_array().unwrap().iter().any(|c| c["chat_id"] == id.as_str()));
+
+        let (status, _) =
+            chats_request(&state, "POST", "/assistant/chats/nope/restore", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn chat_group_routes_round_trip() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let (status, group) = chats_request(
+            &state,
+            "POST",
+            "/assistant/chat-groups",
+            Some(r#"{"name":"Work"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let gid = group["id"].as_i64().unwrap();
+
+        let (status, blank) = chats_request(
+            &state,
+            "POST",
+            "/assistant/chat-groups",
+            Some(r#"{"name":"  "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(blank["refusal"], "blank_name");
+        let long = format!(r#"{{"name":"{}"}}"#, "x".repeat(81));
+        let (status, too_long) =
+            chats_request(&state, "POST", "/assistant/chat-groups", Some(&long)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(too_long["refusal"], "name_too_long");
+
+        let (status, renamed) = chats_request(
+            &state,
+            "PATCH",
+            &format!("/assistant/chat-groups/{gid}"),
+            Some(r#"{"name":"Job"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(renamed["name"], "Job");
+        let (status, _) = chats_request(
+            &state,
+            "PATCH",
+            "/assistant/chat-groups/999",
+            Some(r#"{"name":"x"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let put_uri = format!("/assistant/chats/{id}/group");
+        let (status, _) = chats_request(
+            &state,
+            "PUT",
+            &put_uri,
+            Some(&format!(r#"{{"group_id":{gid}}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
+        assert_eq!(live[0]["group_id"], gid);
+        let (status, _) =
+            chats_request(&state, "PUT", &put_uri, Some(r#"{"group_id":999}"#)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = chats_request(
+            &state,
+            "PUT",
+            "/assistant/chats/nope/group",
+            Some(r#"{"group_id":null}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, listed) = chats_request(&state, "GET", "/assistant/chat-groups", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        let (status, _) = chats_request(
+            &state,
+            "DELETE",
+            &format!("/assistant/chat-groups/{gid}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
+        assert!(live[0]["group_id"].is_null());
+        let (status, _) =
+            chats_request(&state, "DELETE", &format!("/assistant/chat-groups/{gid}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     async fn mark_seen_request(state: AppState, chat_id: &str) -> StatusCode {
