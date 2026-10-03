@@ -3164,6 +3164,7 @@ async fn spawn_agent(
         context_window: None,
         // The economy half of the boundary — see `mcp_tools::TEAM_TOOLS`.
         allowed_mcp_tools: Some(crate::mcp_tools::TEAM_TOOLS),
+        background_tasks: false,
     };
 
     let runner = state.runner.clone();

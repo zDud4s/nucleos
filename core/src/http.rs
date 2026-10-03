@@ -10503,6 +10503,14 @@ struct AssistantTurn {
     /// what says so.
     session_id: Option<String>,
     created_at: String,
+    /// When the turn ended, in `created_at`'s format, or null while it runs. The Chats window
+    /// counts the prompt cache down from here.
+    completed_at: Option<String>,
+    /// The model the CLI reported answering with, or null when the stream never said and on
+    /// every turn from before it was recorded. Distinct from `answered_by`, which says WHO.
+    model: Option<String>,
+    /// How long this turn's prompt cache lives: `"5m"`, `"1h"`, or null when unknown.
+    cache_ttl: Option<String>,
     /// How much context this turn ran with, as an absolute token count. Null on a turn whose stream
     /// never reported one -- a turn that failed before the CLI said anything, and every turn from
     /// before the column existed.
@@ -11119,7 +11127,8 @@ async fn get_assistant_chat(
     // missing one; the id beside it always resolves.
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT r.id, r.prompt AS asked, r.stdout AS answer, r.stderr AS error, r.status,
-                r.cost_usd, r.answered_by, r.session_id, r.created_at, r.context_fill,
+                r.cost_usd, r.answered_by, r.session_id, r.created_at, r.completed_at,
+                r.model, r.cache_ttl, r.context_fill,
                 r.tools_used, r.thought, r.thought_tokens, r.prompt_images, r.compacted,
                 rel.from_chat_id AS relayed_from_chat_id,
                 src.title        AS relayed_from_title
@@ -12994,6 +13003,9 @@ async fn get_model_groups(
         .collect();
     let snapshot = crate::model_catalog::current().await;
     let mut created = std::collections::HashMap::new();
+    // Codex models this caller may not pick are still listed, and named here, so the picker shows
+    // the whole vendor list and says why a row is closed instead of leaving the vendor out.
+    let mut needs_root: Vec<String> = Vec::new();
     for found in &snapshot.models {
         if let Some(at) = found.created {
             created.insert(found.id.clone(), at);
@@ -13003,10 +13015,16 @@ async fn get_model_groups(
         }
         if crate::model_catalog::admits(config.active_runner(), rooted_of(asking), found.runner) {
             cloud.push(crate::model_catalog::as_choice(found));
+        } else if found.runner == "codex"
+            && crate::model_catalog::admits(config.active_runner(), Some(true), found.runner)
+        {
+            needs_root.push(found.id.clone());
+            cloud.push(crate::model_catalog::as_choice(found));
         }
     }
     Json(serde_json::json!({
         "groups": crate::model_catalog::group(cloud, &created),
+        "needs_root": needs_root,
         "source": snapshot.source,
         "catalogue_version": crate::model_catalog::CATALOGUE_VERSION,
         "fetched_at": snapshot.fetched_at,
@@ -26814,6 +26832,48 @@ mod tests {
         );
     }
 
+    /// What the Chats window's cache countdown and model label read: when the turn ended, which
+    /// model answered, and how long its cache lives — null on a turn that recorded none of them.
+    #[tokio::test]
+    async fn a_turn_carries_its_end_its_model_and_its_cache_ttl() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at, completed_at, model, cache_ttl)
+             VALUES ('hello', 'completed', 'assistant', 's', 'ttl-chat', '2026-10-03T10:00:00+00:00',
+                     '2026-10-03T10:00:09+00:00', 'claude-opus-4', '1h'),
+                    ('again', 'running', 'assistant', 's', 'ttl-chat', '2026-10-03T10:01:00+00:00',
+                     NULL, NULL, NULL)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/ttl-chat")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let done = &turns["turns"][0];
+        assert_eq!(done["completed_at"], "2026-10-03T10:00:09+00:00");
+        assert_eq!(done["model"], "claude-opus-4");
+        assert_eq!(done["cache_ttl"], "1h");
+        let live = &turns["turns"][1];
+        assert!(live["completed_at"].is_null());
+        assert!(live["model"].is_null());
+        assert!(live["cache_ttl"].is_null());
+    }
+
     /// A chat named like a number must not be read as a turn id. Static segments win in matchit,
     /// which is what keeps the two routes apart — asserted rather than assumed, because the failure
     /// would be a chat silently answering with one unrelated run.
@@ -28533,10 +28593,17 @@ mod tests {
             .collect();
         let ids: Vec<&str> = all.iter().filter_map(|m| m["id"].as_str()).collect();
         assert!(ids.contains(&"claude-sonnet-5-5"), "{ids:?}");
-        assert!(
-            !ids.contains(&"gpt-5.5"),
-            "a Codex model on a Claude daemon: {ids:?}"
-        );
+        // A Codex model is listed, but named as needing a rooted conversation: the daemon's own
+        // menu cannot open one on Codex.
+        assert!(ids.contains(&"gpt-5.5"), "{ids:?}");
+        let needs_root: Vec<&str> = body["needs_root"]
+            .as_array()
+            .expect("needs_root is a list")
+            .iter()
+            .filter_map(|id| id.as_str())
+            .collect();
+        assert!(needs_root.contains(&"gpt-5.5"), "{needs_root:?}");
+        assert!(!needs_root.contains(&"claude-sonnet-5-5"), "{needs_root:?}");
         let sonnet = all.iter().find(|m| m["id"] == "claude-sonnet-5-5").unwrap();
         assert_eq!(sonnet["label"], "Sonnet 5.5");
     }

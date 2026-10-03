@@ -54,7 +54,8 @@ export function ChatTabs({
               className="chats-tab-link"
               onClick={onOpenChat}
             >
-              <StateDot dot={lit === undefined ? null : dotFor(lit, true)} />
+              {/* The same colour as this chat's row in the column, so tab and row correspond. */}
+              <StateDot dot={lit === undefined ? null : dotFor(lit, true)} chatId={id} />
               <span className="chats-tab-title">{name}</span>
             </Link>
             <button

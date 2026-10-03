@@ -36,6 +36,12 @@ pub(crate) async fn apply_migrations_after(pool: &sqlx::SqlitePool, version: i64
     apply_migrations(pool, |candidate| candidate > version).await;
 }
 
+/// Runs exactly one migration, for a test whose claim is about that file alone and must not see
+/// what later migrations add on top of it.
+pub(crate) async fn apply_migration(pool: &sqlx::SqlitePool, version: i64) {
+    apply_migrations(pool, |candidate| candidate == version).await;
+}
+
 async fn apply_migrations(pool: &sqlx::SqlitePool, wanted: impl Fn(i64) -> bool) {
     for migration in sqlx::migrate!("./migrations").iter() {
         if !wanted(migration.version) {

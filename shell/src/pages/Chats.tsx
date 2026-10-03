@@ -120,11 +120,12 @@ import { fetchFileBlob } from "../data/files";
 import { attachmentFrom, isPicture } from "../lib/picture";
 import { PlusMenu } from "../chats/PlusMenu";
 import { Slider } from "../ui/Slider";
+import { ProviderMark } from "../ui/ProviderMark";
 import { displayName } from "../lib/modelName";
 import { diffLines } from "../lib/diff";
 import { useDictation, type DictationView } from "../data/dictation";
 import { revise, type Provisional } from "../lib/provisional";
-import type { LocalPull, ModelChoice } from "../data/chats";
+import type { LocalPull, ModelChoice, ModelGroup } from "../data/chats";
 import {
   Button,
   ConfirmButton,
@@ -141,6 +142,7 @@ import {
 import { elapsedText } from "../lib/when";
 import { SessionColumn } from "../chats/SessionColumn";
 import { ChatTabs } from "../chats/ChatTabs";
+import { ChatChips } from "../chats/AgentMap";
 import { useChatTabs } from "../chats/tabs";
 
 import "./chats.css";
@@ -319,6 +321,7 @@ export function Chats() {
            just clicked a conversation already knew. */
         open={pickingUp === null && chatId !== null ? (summary ?? null) : null}
         openId={chatId}
+        turns={transcript.data?.turns}
         headline={headlineFor(rows, chats.data !== undefined)}
         actions={
           <>
@@ -456,7 +459,10 @@ function ChatsHeader({
   openId,
   headline,
   actions,
+  turns,
 }: {
+  /** What the conversation has said so far, for the cache and agent chips. */
+  turns?: Turn[];
   /** The conversation on screen, or `null` for the front door. */
   open: ChatSummary | null;
   /** Its id — separate, because the summary can be late while the route is not. */
@@ -480,6 +486,7 @@ function ChatsHeader({
         <ChatWhere chatId={openId} />
       </div>
       <div className="ui-page-actions">
+        <ChatChips turns={turns} chatTitle={open.title ?? "Conversation"} />
         {actions}
         <ChatMenu chatId={openId} />
       </div>
@@ -2241,6 +2248,31 @@ function MissingModelRow({
   );
 }
 
+/** The companies the model menu opens on, in order, and the mark each is drawn with. */
+const COMPANIES: { provider: string; label: string; mark: string }[] = [
+  { provider: "anthropic", label: "Claude", mark: "claude" },
+  { provider: "openai", label: "GPT", mark: "codex" },
+  { provider: "other", label: "Other", mark: "other" },
+];
+
+/** The daemon's provider word for a model id: from its group when listed, else from the id. */
+function providerOf(id: string, groups: ModelGroup[] | undefined): string {
+  const listed = groups?.find((group) => group.models.some((choice) => choice.id === id));
+  if (listed) return listed.provider;
+  const lower = id.toLowerCase();
+  if (lower.startsWith("gpt") || /^o\d/.test(lower)) return "openai";
+  if (lower.startsWith("claude") || ["opus", "sonnet", "haiku", "fable"].includes(lower))
+    return "anthropic";
+  return "other";
+}
+
+/** The mark drawn beside a model's name, or none for a provider without one. */
+function markOf(provider: string): string | null {
+  return provider === "other"
+    ? null
+    : (COMPANIES.find((company) => company.provider === provider)?.mark ?? null);
+}
+
 function ModelMenu({
   model,
   onPick,
@@ -2256,7 +2288,9 @@ function ModelMenu({
 }) {
   const catalogue = useAssistantModels(chatId);
   // The agent-CLI section is drawn from the daemon's discovered, grouped list when it has one.
-  const groups = useModelGroups(chatId).data?.groups;
+  const grouped = useModelGroups(chatId).data;
+  const groups = grouped?.groups;
+  const needsRoot = new Set(grouped?.needs_root ?? []);
   const localModel = useLocalModel();
   const localUnavailable = localModel.data?.available === false;
   const pull = useLocalPull();
@@ -2292,6 +2326,17 @@ function ModelMenu({
     catalogue.data?.configured_label ??
     (configured ? displayName(configured) : null) ??
     "Model";
+  const pick = (picked: string) => onPick(picked === "" ? null : picked);
+  const configuredProvider = configured ? providerOf(configured, groups) : null;
+  const shownProvider = markOf(providerOf(model ?? configured ?? "", groups));
+  const companies = COMPANIES.map((company) => ({
+    ...company,
+    groups: (groups ?? []).filter(
+      (group) => group.provider === company.provider && group.models.length > 0,
+    ),
+  })).filter(
+    (company) => company.groups.length > 0 || company.provider === configuredProvider,
+  );
 
   return (
     <DropdownMenu
@@ -2308,6 +2353,7 @@ function ModelMenu({
         aria-label={`Answered by ${shown} — change the model`}
         disabled={disabled}
       >
+        {shownProvider !== null && <ProviderMark provider={shownProvider} size={14} />}
         {shown}
         <ChevronDown className="chats-tool-caret" aria-hidden="true" />
       </DropdownMenuTrigger>
@@ -2318,38 +2364,65 @@ function ModelMenu({
             the núcleo did not say which models it has
           </DropdownMenuItem>
         )}
-        <DropdownMenuRadioGroup
-          value={model ?? ""}
-          onValueChange={(picked) => onPick(picked === "" ? null : picked)}
-        >
-          {catalogue.data !== undefined && (
-            <DropdownMenuRadioItem value="">
-              Whatever is configured
-              <span className="chats-tool-why">
-                {catalogue.data.configured}
-              </span>
-            </DropdownMenuRadioItem>
-          )}
-          {groups !== undefined &&
-            groups
-              .filter((group) => group.models.length > 0)
-              .map((group) => (
-                <DropdownMenuGroup
-                  key={`${group.provider}/${group.family}`}
-                  aria-label={group.label}
-                >
-                  <DropdownMenuLabel className="chats-meta-menu-section">
-                    {group.label}
-                  </DropdownMenuLabel>
-                  {group.models.map((choice) => (
-                    <DropdownMenuRadioItem key={choice.id} value={choice.id}>
-                      {choice.label}
+        {/* One row per company, and its models only on hover. The vendor is the first thing a
+            person decides, and a menu that opened on every family of every vendor was a wall of
+            names before anybody had chosen whose. Families stay inside a company's one list,
+            split by a rule, rather than as headings of their own. */}
+        {companies.map((company) => {
+          const defaultHere =
+            catalogue.data !== undefined && company.provider === configuredProvider;
+          return (
+            <DropdownMenuSub key={company.provider}>
+              <DropdownMenuSubTrigger className="chats-model-company">
+                <ProviderMark provider={company.mark} size={14} />
+                {company.label}
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="chats-meta-menu chats-model-list">
+                <DropdownMenuRadioGroup value={model ?? ""} onValueChange={pick}>
+                  {/* The unpinned state, under the company its configured model belongs to. */}
+                  {defaultHere && (
+                    <DropdownMenuRadioItem value="">
+                      Default
+                      <span className="chats-tool-why">
+                        {catalogue.data?.configured_label ?? catalogue.data?.configured}
+                      </span>
                     </DropdownMenuRadioItem>
+                  )}
+                  {company.groups.map((group, index) => (
+                    <DropdownMenuGroup
+                      key={`${group.provider}/${group.family}`}
+                      aria-label={group.label}
+                    >
+                      {(index > 0 || defaultHere) && <DropdownMenuSeparator />}
+                      {group.models.map((choice) => {
+                        const closed = needsRoot.has(choice.id);
+                        return (
+                          <DropdownMenuRadioItem
+                            key={choice.id}
+                            value={choice.id}
+                            disabled={closed}
+                          >
+                            {choice.label}
+                            {closed && (
+                              /* Listed and closed rather than left out: Codex answers only in a
+                                 conversation rooted in a project with the classifier hook wired,
+                                 and a vendor missing from the menu reads as a missing feature. */
+                              <span className="chats-tool-why">
+                                needs a project with the hook wired
+                              </span>
+                            )}
+                          </DropdownMenuRadioItem>
+                        );
+                      })}
+                    </DropdownMenuGroup>
                   ))}
-                </DropdownMenuGroup>
-              ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          );
+        })}
           {MODEL_SECTIONS.map((section) => {
-            // Replaced by the groups above once the daemon has sent them.
+            // Replaced by the companies above once the daemon has sent its groups.
             if (section.key === "cli" && groups !== undefined) return null;
             const held = choices.filter(section.holds);
             /* An empty section is not drawn at all rather than drawn empty: three of the four are
@@ -2357,10 +2430,12 @@ function ModelMenu({
                like it had lost its contents. */
             if (held.length === 0) return null;
             return (
-              <DropdownMenuGroup key={section.key} aria-label={section.label}>
-                <DropdownMenuLabel className="chats-meta-menu-section">
+              <DropdownMenuSub key={section.key}>
+                <DropdownMenuSubTrigger className="chats-model-company">
                   {section.label}
-                </DropdownMenuLabel>
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="chats-meta-menu chats-model-list">
+                <DropdownMenuRadioGroup value={model ?? ""} onValueChange={pick}>
                 {held.map((choice) => {
                   /* A model this machine does not have is not a choice of who answers — it is an
                      action, and it is drawn as one. A `DropdownMenuItem` inside the radio group
@@ -2440,10 +2515,11 @@ function ModelMenu({
                     </DropdownMenuRadioItem>
                   );
                 })}
-              </DropdownMenuGroup>
+                </DropdownMenuRadioGroup>
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
             );
           })}
-        </DropdownMenuRadioGroup>
         {children}
       </DropdownMenuContent>
     </DropdownMenu>
@@ -2486,17 +2562,33 @@ function EffortSlider({
   if (levels.length === 0) return null;
   const at = effort === null ? 0 : Math.max(0, levels.indexOf(effort) + 1);
 
+  /* A menu holding the slider, not the slider itself in the row: the row is read all day and the
+     effort is changed now and then, so the row carries only its current value. */
   return (
-    <div className="chats-effort">
-      <span className="chats-effort-name">Effort</span>
-      <Slider
-        steps={["default", ...levels]}
-        value={at}
-        label="Effort level"
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        className="chats-tool"
+        aria-label={`Effort ${effort ?? "default"} — change the effort`}
         disabled={disabled}
-        onChange={(index) => onPick(index === 0 ? null : levels[index - 1])}
-      />
-    </div>
+      >
+        <span className="chats-effort-name">Effort</span>
+        {effort ?? "default"}
+        <ChevronDown className="chats-tool-caret" aria-hidden="true" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="chats-meta-menu chats-effort-menu">
+        <DropdownMenuLabel>How hard it thinks</DropdownMenuLabel>
+        {/* The menu's own arrow-key navigation would take the keys the slider moves on. */}
+        <div className="chats-effort" onKeyDown={(event) => event.stopPropagation()}>
+          <Slider
+            steps={["default", ...levels]}
+            value={at}
+            label="Effort level"
+            disabled={disabled}
+            onChange={(index) => onPick(index === 0 ? null : levels[index - 1])}
+          />
+        </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -4655,10 +4747,13 @@ function WhatItDid({
   // same order either way — the daemon reads both from one column.
   const calls = tools.data?.did ?? did;
 
-  if (did.length === 0) return null;
+  // A call with a `parent` ran inside a subagent; the agent map shows it there, and listing it
+  // here as well would bury the main agent's own steps. `index` stays the position in `did`.
+  const mine = did.flatMap((call, index) => (call.parent ? [] : [{ call, index }]));
+  if (mine.length === 0) return null;
   return (
     <ul className="chats-turn-did" aria-label="What it did">
-      {did.map((call, index) => {
+      {mine.map(({ call, index }) => {
         // Keyed by position: this is a record of what happened, in order, and nothing reorders or
         // removes an entry. The same tool on the same file twice is two real calls, not a duplicate.
         const key = `${call.name}-${index}`;
