@@ -36,8 +36,8 @@ c9fb1541066017314be860777604b2b4f40c4051:core/src/redact.rs:jwt:648
 8e18efcb9cb302274a4f38703ef64513ed097b63:core/src/redact.rs:jwt:482
 
 # Two more redactor fixtures: a PEM header around `MIIEvQIBADANBgkq` / `abcDEF123` (no key material),
-# and `sk_live_51H8abcdefghijklmnop` / `rk_live_51H8abcdefghijklmnop`, alphabet runs shaped like a
-# Stripe key so the test can prove they come back as `[SECRET:stripe]`.
+# and two Stripe-shaped live keys whose body is the alphabet in order, so the test can prove they
+# come back as `[SECRET:stripe]`. Not quoted here: a comment carrying one is a finding of its own.
 3a56fe7046ad5edf97dc993709a48298b9437b4c:core/src/redact.rs:private-key:802
 3a56fe7046ad5edf97dc993709a48298b9437b4c:core/src/redact.rs:stripe-access-token:822
 3a56fe7046ad5edf97dc993709a48298b9437b4c:core/src/redact.rs:stripe-access-token:825
@@ -45,3 +45,7 @@ c9fb1541066017314be860777604b2b4f40c4051:core/src/redact.rs:jwt:648
 # The judge's redaction test: `Authorization: Basic YWJjOjEyMw==` is base64 of `abc:123`, written so
 # the test can assert neither half survives.
 3a2a1fe7ea6b4cfbbe12988ba75a4d32be18c7e7:core/src/judge.rs:curl-auth-header:657
+
+# The same two fixtures, quoted in this file's own comment by the commit that listed them above.
+# The comment no longer quotes them; this is that commit's copy, which history keeps.
+3896289d0e182663300f649639ea6466d2f939c0:.gitleaksignore:stripe-access-token:39
