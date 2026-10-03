@@ -2376,7 +2376,7 @@ mod tests {
     /// The person's own notes are in no route table, so default-deny leaves them to the two scopes
     /// that are not table-bound. Written against the paths, not the tables, so adding one of these
     /// routes to a table by mistake fails here. (Named without the module's own name on purpose:
-    /// a source scan in `owner_notes.rs` forbids any other file from mentioning it.)
+    /// a source scan in the notes module itself forbids any other file from mentioning it.)
     #[test]
     fn the_brain_routes_are_reachable_by_the_owner_alone() {
         let routes = [
