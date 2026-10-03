@@ -5699,8 +5699,9 @@ describe("Chats - the cache and agent chips", () => {
 
     await renderChats("/chats/c-1");
     expect(await screen.findByText(/50m/)).toBeTruthy();
-    // The turn is settled, so a subagent is finished; the background task is still running.
-    expect(await screen.findByRole("button", { name: /1 agent$/ })).toBeTruthy();
+    // The turn is settled, so nothing is working, whatever a stored status says: the chip counts
+    // both agents the turn had, muted, rather than one still running.
+    expect(await screen.findByRole("button", { name: /2 agents$/ })).toBeTruthy();
     // The subagent's own call is not listed in the transcript's "What it did".
     expect(screen.queryByText("Grep")).toBeNull();
   });
