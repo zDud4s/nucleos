@@ -48,6 +48,10 @@ def posix_bash() -> str:
 
 
 BASH = posix_bash()
+# A main checkout with no broker in it: the existing tests exercise the `slot_run` fallback, and
+# must not reach the real broker of whatever checkout this file lives in.
+NO_BROKER = tempfile.mkdtemp(prefix="no-broker-")
+NL = chr(10)
 HOLD = 'touch "$1"; while [ ! -e "$2" ]; do sleep 0.2; done'
 
 
@@ -55,6 +59,7 @@ def env_for(slots_dir: Path, **extra: str) -> dict:
     env = dict(os.environ)
     env.pop("NUCLEOS_BUILD_SLOT_HELD", None)
     env["NUCLEOS_BUILD_SLOTS_DIR"] = slots_dir.as_posix()
+    env["NUCLEOS_HEAVY_MAIN"] = Path(NO_BROKER).as_posix()
     env.update(extra)
     return env
 
@@ -280,16 +285,101 @@ def test_gates_wraps_only_the_building_steps() -> None:
     text = GATES.read_text(encoding="utf-8")
     lines = text.splitlines()
     # The classifier test reads every `run "core: ` line as a plain command, so no gate line may
-    # carry the prefix: the slot is taken inside `run` itself.
+    # carry the prefix: the broker is reached inside `run` itself.
     runs = [line.strip() for line in lines if line.strip().startswith("run ")]
-    assert not [r for r in runs if "slot_run" in r], runs
+    assert not [r for r in runs if "slot_run" in r or "heavy_run" in r], runs
+    assert "heavy_run()" in text, "gates.sh defines no heavy_run"
     assert '[ "$1" = cargo ]' in text
-    case = [l.strip() for l in lines if l.strip().startswith("case ") and "slot_run" in l]
-    assert len(case) == 1, case
+    case = [l.strip() for l in lines if l.strip().startswith("case ") and "heavy_run" in l]
+    assert len(case) >= 1, case
     subs = case[0].split(" in ", 1)[1].split(")", 1)[0].split("|")
     assert subs == ["build", "check", "clippy", "test", "run", "doc"], subs
+    for other in ("tsc", "npm", "go"):
+        assert other in text.split("run()", 1)[1].split("kept_lines()", 1)[0], other
     for label in ("core: fmt", "core: clippy", "core: test", "shell/src-tauri: clippy", "shell/src-tauri: test"):
         assert len([r for r in runs if r.startswith(f'run "{label}"')]) == 1, label
+
+
+def fake_main(work: Path, with_classify: bool = True) -> tuple[Path, Path]:
+    """A fake main checkout whose broker records its argv instead of running anything."""
+    main = work / "main"
+    (main / "scripts").mkdir(parents=True)
+    (main / ".ai" / "scripts").mkdir(parents=True)
+    record = work / "broker-argv"
+    (main / "scripts" / "heavy.py").write_text(
+        NL.join(["import sys", "open(%r, 'w').write(%r.join(sys.argv[1:]))" % (record.as_posix(), NL), ""]),
+        encoding="utf-8",
+    )
+    if with_classify:
+        (main / ".ai" / "scripts" / "heavy_classify.py").write_text("", encoding="utf-8")
+    return main, record
+
+
+def fake_cargo(work: Path) -> str:
+    bindir = work / "bin"
+    bindir.mkdir()
+    fake = bindir / "cargo"
+    fake.write_text(NL.join(["#!/bin/sh", 'echo "fake cargo $1"', "exit 0", ""]), encoding="utf-8", newline=NL)
+    fake.chmod(0o755)
+    return bindir.as_posix() + os.pathsep + os.environ["PATH"]
+
+
+def test_gates_delegates_to_broker_when_present() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        slots = work / "slots"
+        main, record = fake_main(work)
+        path = fake_cargo(work)
+        py = Path(sys.executable).as_posix()
+        extra = dict(NUCLEOS_HEAVY_MAIN=main.as_posix(), NUCLEOS_HEAVY_PYTHON=py, PATH=path)
+        # build-slot.sh goes through the broker...
+        result = slot_run(slots, "cargo", "test", "-p", "x", **extra)
+        assert result.returncode == 0, (result.returncode, result.stderr)
+        assert record.is_file(), ("the broker was not called", result.stdout, result.stderr)
+        assert record.read_text().split(NL) == ["--", "cargo", "test", "-p", "x"], record.read_text()
+        assert "fake cargo" not in result.stdout, "the command ran in-process instead of via the broker"
+        record.unlink()
+        # ...and so does a step of gates.sh's own `run`.
+        script = f'source "{GATES.as_posix()}" || exit 2; run "step" "{work.as_posix()}" cargo build'
+        result = subprocess.run(
+            [BASH, "-c", script], env=env_for(slots, **extra), capture_output=True, text=True, timeout=60
+        )
+        assert record.is_file(), ("gates.sh run did not call the broker", result.stdout, result.stderr)
+        assert record.read_text().split(NL) == ["--", "cargo", "build"], record.read_text()
+
+
+def test_gates_falls_back_when_broker_absent() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        slots = work / "slots"
+        path = fake_cargo(work)
+        py = Path(sys.executable).as_posix()
+        # No broker at all: the slot is taken as before.
+        a = start_holder(slots, work, "a", NUCLEOS_BUILD_SLOTS="1")
+        try:
+            wait_for(a[1])
+            result = slot_run(
+                slots, "cargo", "test", NUCLEOS_BUILD_SLOTS="1", NUCLEOS_BUILD_SLOT_TIMEOUT="2", PATH=path
+            )
+            assert result.returncode == 75, (result.returncode, result.stderr)
+            assert "gave up" in result.stderr, result.stderr
+        finally:
+            finish([a])
+        # heavy.py without heavy_classify.py (A7) is not a broker either: same fallback, and the
+        # command still runs.
+        main, record = fake_main(work, with_classify=False)
+        result = slot_run(
+            slots, "cargo", "test", NUCLEOS_HEAVY_MAIN=main.as_posix(), NUCLEOS_HEAVY_PYTHON=py, PATH=path
+        )
+        assert result.returncode == 0, (result.returncode, result.stderr)
+        assert "fake cargo test" in result.stdout, result.stdout
+        assert not record.exists(), "an incomplete broker was called"
+        # a non-cargo command goes through gates.sh's run untouched when the broker is absent
+        script = f'source "{GATES.as_posix()}" || exit 2; run "step" "{work.as_posix()}" echo plain'
+        result = subprocess.run(
+            [BASH, "-c", script], env=env_for(slots, PATH=path), capture_output=True, text=True, timeout=60
+        )
+        assert "plain" in result.stdout and "ok   step" in result.stdout, (result.stdout, result.stderr)
 
 
 test_a_third_holder_waits_until_a_slot_frees()
@@ -300,4 +390,6 @@ test_status_and_arguments_pass_through_and_the_slot_is_released()
 test_bypass_and_a_relative_dir()
 test_check_and_clippy_skip_the_slot_but_test_still_waits()
 test_gates_wraps_only_the_building_steps()
+test_gates_delegates_to_broker_when_present()
+test_gates_falls_back_when_broker_absent()
 print("build slot: ok")
