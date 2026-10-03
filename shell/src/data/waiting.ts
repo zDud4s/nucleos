@@ -22,7 +22,7 @@ import type { Proposal } from "./system";
  * | 7 | exclusion requests | `GET /fleet/exclusions/requests` |
  * | 8 | skipped items      | `GET /proposals/skipped-items`   |
  * | 9 | refused actions    | `GET /proposals/refused-actions` |
- * |10 | git queue          | `GET /vcs/requests`          |
+ * |10 | git queue          | `GET /waiting/git` (waiting), `GET /vcs/requests` (history) |
  * |11 | parked runs        | `GET /runs/awaiting-approval`|
  *
  * Section 6 has no hook and no route, and the page says so out loud instead of
@@ -274,6 +274,24 @@ export function useVcsRequests() {
   });
 }
 
+/**
+ * §10 — the git rows that still want a person, from `GET /waiting/git`.
+ *
+ * The daemon's `vcs::waiting_on_a_person`: escalated or blocked, and not settled. A row is settled
+ * when a later identical request succeeded, a resolution took it, its branch is already in the
+ * target, its branch is gone, or somebody put it away. This is the same predicate `/waiting/count`
+ * counts with, uncapped — the history listing above stops at 200 rows and never forgets, so
+ * filtering it here would count what nobody needs to look at and miss what fell off its end.
+ */
+export function useVcsWaiting() {
+  return useQuery({
+    queryKey: keys.waiting.vcsWaiting,
+    queryFn: () => apiFetch<VcsRequestSummary[]>("/waiting/git"),
+    refetchInterval: POLL.queue,
+    placeholderData: keepPreviousData,
+  });
+}
+
 /** How many rows `GET /vcs/requests` returns at most — `vcs::LIST_LIMIT`. */
 export const VCS_LIST_LIMIT = 200;
 
@@ -381,6 +399,19 @@ export function useDeclineAction() {
 export function useDismissProposal() {
   return useDecision((id: number) =>
     apiFetch<void>(`/proposals/${id}/dismiss`, { method: "POST" }),
+  );
+}
+
+/**
+ * Put a git row away that no machine could settle — the branch still exists and is still apart from
+ * its target, but nobody is going to act on it.
+ *
+ * The row stays in the history with its status; only `settled_at` is written. 204 on success, 409
+ * when it was already settled or never waiting, 404 for an unknown id.
+ */
+export function useDismissVcsRequest() {
+  return useDecision((id: number) =>
+    apiFetch<void>(`/vcs/requests/${id}/dismiss`, { method: "POST" }),
   );
 }
 
