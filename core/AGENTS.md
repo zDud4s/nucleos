@@ -230,9 +230,9 @@ Three rules, each with a worked example in the tree:
 
 ## Commands
 
-Set the space-free toolchain env first (see `.ai/memory.md` for why): `RUSTUP_HOME=C:\Projects\rustup`,
-`CARGO_HOME=C:\Projects\cargo`, PATH prepended with `C:\Projects\mingw64\bin;C:\Projects\cargo\bin`.
-Then, from the repo root:
+On Windows, keep the Rust toolchain on a path without spaces: a user profile with a space in its name
+breaks the GNU linker, so point `RUSTUP_HOME` and `CARGO_HOME` at a space-free directory and put its
+`bin` on PATH. Then, from the repo root:
 
 - Gate: `cargo test -p nucleos-core` (**NOT** `--lib` — this is a bin-only crate; `--lib` errors)
 - `cargo build` · `cargo fmt --all` (check: `cargo fmt --all -- --check`) · `cargo clippy --all-targets`
