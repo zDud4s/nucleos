@@ -751,18 +751,59 @@
   background: var(--tone-paused-bg);
 }
 
-.chats-project-form {
+/* The project picker's rows: the projects on the roster, then Root. A name to choose by and the
+   folder it stands for, so two projects with similar names are told apart by where they live. */
+.chats-picker {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
+  flex-direction: column;
+  gap: var(--space-1);
 }
 
-.chats-project-path {
-  flex: 1 1 18rem;
-  min-width: 0;
+.chats-picker-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  font-size: var(--text-sm);
+}
+
+.chats-picker-name {
+  color: var(--text);
+}
+
+.chats-picker-path,
+.chats-picker-none {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+/* A message said before the conversation had a project: on screen, and visibly not sent. */
+.chats-held {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border: 1px dashed var(--tone-paused-border);
+  border-radius: var(--radius-md);
+  background: var(--tone-paused-bg);
+}
+
+.chats-held-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chats-held-why {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-held-actions {
+  display: flex;
+  gap: var(--space-2);
 }
 
 /* `.chats-planning` was declared here, next to the project block it used to sit beside. The
