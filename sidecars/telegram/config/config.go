@@ -23,6 +23,9 @@ type Config struct {
 	AllowedUserIDs []int64
 	PollInterval   time.Duration
 	TranscribeCmd  string
+	// ProjectTopics maps a project id to the forum thread its feed lines go to. Empty means every
+	// line goes to the configured chat.
+	ProjectTopics map[string]int64
 }
 
 type fileSettings struct {
@@ -32,6 +35,8 @@ type fileSettings struct {
 	AllowedUserIDs      []int64 `json:"allowed_user_ids"`
 	PollIntervalSeconds int     `json:"poll_interval_seconds"`
 	TranscribeCmd       string  `json:"transcribe_cmd"`
+	// ProjectTopics: project id -> forum thread id. Optional.
+	ProjectTopics map[string]int64 `json:"project_topics"`
 }
 
 func Load() (Config, error) {
@@ -76,6 +81,7 @@ func Load() (Config, error) {
 		AllowedUserIDs: settings.AllowedUserIDs,
 		PollInterval:   pollInterval,
 		TranscribeCmd:  settings.TranscribeCmd,
+		ProjectTopics:  settings.ProjectTopics,
 	}, nil
 }
 
@@ -125,6 +131,12 @@ func LoadFromFile(path string) (fileSettings, error) {
 	var settings fileSettings
 	if err := json.Unmarshal(data, &settings); err != nil {
 		return fileSettings{}, fmt.Errorf("parse Telegram config %q: %w", path, err)
+	}
+
+	for id, thread := range settings.ProjectTopics {
+		if thread <= 0 {
+			return fileSettings{}, fmt.Errorf("Telegram config %q: project_topics[%q] = %d; a forum thread id must be positive", path, id, thread)
+		}
 	}
 
 	return settings, nil

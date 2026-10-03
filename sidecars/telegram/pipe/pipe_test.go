@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,10 +80,16 @@ type recordingBot struct {
 	// the connection is down and works again on the next attempt.
 	buttonErrOnce error
 	buttonCalls   int
+	// sendErrFor, when set, decides what a plain send to a given destination returns, after the
+	// attempt has been recorded — so a test can refuse a topic and accept the bare chat.
+	sendErrFor func(telegram.Destination) error
 }
 
 func (b *recordingBot) SendMessage(to telegram.Destination, text string) error {
 	b.messages = append(b.messages, sentMessage{to: to, text: text})
+	if b.sendErrFor != nil {
+		return b.sendErrFor(to)
+	}
 	return nil
 }
 
@@ -706,7 +713,7 @@ func TestTheNotifierNeverAnnouncesTheBacklogItFindsAtBoot(t *testing.T) {
 		feed: []map[string]any{{"id": float64(9), "kind": "run", "summary": "old news"}},
 	}
 
-	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, nil, time.Millisecond)
 
 	if len(bot.messages) != 0 {
 		t.Errorf("announcements = %v, want none for what was already there when the daemon came up", bot.messages)
@@ -728,7 +735,7 @@ func TestTheNotifierAnnouncesWhatArrivesAfterItIsSeeded(t *testing.T) {
 		arriving:        map[int][]map[string]any{4: {{"id": float64(1)}, {"id": float64(2), "tool_name": "git push"}}},
 	}
 
-	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, nil, time.Millisecond)
 
 	if len(bot.messages) != 1 || !strings.Contains(bot.messages[0].text, "git push") {
 		t.Errorf("announcements = %v, want exactly the proposal that arrived after seeding", bot.messages)
@@ -757,7 +764,7 @@ func TestEveryFeedLineGoesToTheConfiguredChat(t *testing.T) {
 		}},
 	}
 
-	RunNotifier(ctx, bot, dc, configured, time.Millisecond)
+	RunNotifier(ctx, bot, dc, configured, nil, time.Millisecond)
 
 	for _, needle := range []string{"first line", "second line"} {
 		found := false
@@ -791,7 +798,7 @@ func TestAProposalAnnouncementThatFailedToSendIsOfferedAgain(t *testing.T) {
 		arriving:        map[int][]map[string]any{3: waiting, 4: waiting, 5: waiting},
 	}
 
-	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, nil, time.Millisecond)
 
 	if bot.buttonCalls != 2 {
 		t.Fatalf("proposal announcements attempted = %d, want 2 (the lost one and its retry)", bot.buttonCalls)
@@ -1271,7 +1278,7 @@ func TestGovernanceIsNeverSilenced(t *testing.T) {
 		budgetPausedFrom: 5,
 	}
 
-	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, nil, time.Millisecond)
 
 	var texts []string
 	for _, m := range bot.messages {
@@ -1322,7 +1329,7 @@ func TestReenablingAFamilyReplaysNothing(t *testing.T) {
 		},
 	}
 
-	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, nil, time.Millisecond)
 
 	var joined string
 	for _, m := range bot.messages {
@@ -1362,7 +1369,7 @@ func TestPolicyReadFailsOpen(t *testing.T) {
 		feedArriving: map[int][]map[string]any{2: arriving, 3: arriving, 4: arriving, 5: arriving},
 	}
 
-	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, time.Millisecond)
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, nil, time.Millisecond)
 
 	var joined string
 	for _, m := range bot.messages {
@@ -1370,5 +1377,151 @@ func TestPolicyReadFailsOpen(t *testing.T) {
 	}
 	if !strings.Contains(joined, "still gets through") {
 		t.Errorf("an unreadable policy silenced the feed:\n%s", joined)
+	}
+}
+
+// topicRouting runs the notifier over feed rows that arrive on the given polls.
+func topicRouting(t *testing.T, bot *recordingBot, topics map[string]int64, arriving map[int][]map[string]any, policy notifier.Policy) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dc := &bootingDaemon{
+		recordingDaemon: &recordingDaemon{notifyPolicy: policy},
+		stopAfter:       7,
+		stop:            cancel,
+		feedArriving:    arriving,
+	}
+	RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, topics, time.Millisecond)
+}
+
+// sentFor returns the plain sends whose text contains needle.
+func sentFor(bot *recordingBot, needle string) []sentMessage {
+	var out []sentMessage
+	for _, m := range bot.messages {
+		if strings.Contains(m.text, needle) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// A feed line whose project has a topic goes to that topic of the configured chat.
+func TestAMappedProjectFeedLineGoesToItsTopic(t *testing.T) {
+	bot := &recordingBot{}
+	topicRouting(t, bot, map[string]int64{"proj-a": 77}, map[int][]map[string]any{
+		3: {{"id": float64(31), "kind": "run", "project_id": "proj-a", "summary": "mapped line"}},
+	}, notifier.Policy{})
+
+	got := sentFor(bot, "mapped line")
+	want := telegram.Destination{ChatID: 42, ThreadID: 77}
+	if len(got) != 1 || got[0].to != want {
+		t.Errorf("sends = %+v, want exactly one, to %+v", got, want)
+	}
+}
+
+// No project, a null project and an unmapped project all stay on the configured chat.
+func TestAnUnmappedOrMissingProjectGoesToTheConfiguredChat(t *testing.T) {
+	bot := &recordingBot{}
+	topicRouting(t, bot, map[string]int64{"proj-a": 77}, map[int][]map[string]any{
+		3: {
+			{"id": float64(31), "kind": "run", "summary": "no project line"},
+			{"id": float64(32), "kind": "run", "project_id": nil, "summary": "null project line"},
+			{"id": float64(33), "kind": "run", "project_id": "proj-z", "summary": "unmapped line"},
+		},
+	}, notifier.Policy{})
+
+	configured := telegram.Destination{ChatID: 42}
+	for _, needle := range []string{"no project line", "null project line", "unmapped line"} {
+		got := sentFor(bot, needle)
+		if len(got) != 1 || got[0].to != configured {
+			t.Errorf("%q: sends = %+v, want exactly one, to %+v", needle, got, configured)
+		}
+	}
+}
+
+// A topic Telegram refuses must not loop forever: the line is re-sent once to the configured chat
+// and is then done.
+func TestARefusedTopicSendFallsBackToTheConfiguredChatOnce(t *testing.T) {
+	topic := telegram.Destination{ChatID: 42, ThreadID: 77}
+	bot := &recordingBot{sendErrFor: func(to telegram.Destination) error {
+		if to == topic {
+			return &telegram.APIError{Method: "sendMessage", StatusCode: 400, Description: "message thread not found"}
+		}
+		return nil
+	}}
+	row := []map[string]any{{"id": float64(31), "kind": "run", "project_id": "proj-a", "summary": "refused line"}}
+	topicRouting(t, bot, map[string]int64{"proj-a": 77}, map[int][]map[string]any{3: row, 4: row, 5: row, 6: row}, notifier.Policy{})
+
+	var toTopic, toChat int
+	for _, m := range sentFor(bot, "refused line") {
+		switch m.to {
+		case topic:
+			toTopic++
+		case telegram.Destination{ChatID: 42}:
+			toChat++
+		}
+	}
+	if toTopic != 1 || toChat != 1 {
+		t.Errorf("topic attempts = %d, configured-chat sends = %d, want 1 and 1: %+v", toTopic, toChat, bot.messages)
+	}
+}
+
+// Throttling, a Telegram server error and an unreachable network say nothing about the topic, so the
+// line is not redirected: it is forgotten and offered again next round, as before.
+func TestAThrottledOrUnreachableTopicSendIsRetriedNotRedirected(t *testing.T) {
+	failures := map[string]error{
+		"throttled":                     &telegram.APIError{Method: "sendMessage", StatusCode: 429, RetryAfter: time.Second},
+		"throttled without retry_after": &telegram.APIError{Method: "sendMessage", StatusCode: 429, Description: "Too Many Requests"},
+		"server error":                  &telegram.APIError{Method: "sendMessage", StatusCode: 502, Description: "Bad Gateway"},
+		"unreachable":                   &url.Error{Op: "Post", URL: "x", Err: errors.New("reset")},
+	}
+	for name, failure := range failures {
+		t.Run(name, func(t *testing.T) {
+			topic := telegram.Destination{ChatID: 42, ThreadID: 77}
+			bot := &recordingBot{sendErrFor: func(to telegram.Destination) error {
+				if to == topic {
+					return failure
+				}
+				return nil
+			}}
+			row := []map[string]any{{"id": float64(31), "kind": "run", "project_id": "proj-a", "summary": "retried line"}}
+			topicRouting(t, bot, map[string]int64{"proj-a": 77}, map[int][]map[string]any{3: row, 4: row, 5: row}, notifier.Policy{})
+
+			var toTopic, toChat int
+			for _, m := range sentFor(bot, "retried line") {
+				switch m.to {
+				case topic:
+					toTopic++
+				case telegram.Destination{ChatID: 42}:
+					toChat++
+				}
+			}
+			if toChat != 0 {
+				t.Errorf("the line was redirected to the configured chat %d time(s): %+v", toChat, bot.messages)
+			}
+			if toTopic < 2 {
+				t.Errorf("topic attempts = %d, want the line offered again on a later round (>= 2)", toTopic)
+			}
+		})
+	}
+}
+
+// The policy still decides first: a suppressed line is not sent anywhere, topic included.
+func TestAPolicySuppressedLineIsNotSentToItsTopic(t *testing.T) {
+	bot := &recordingBot{}
+	topicRouting(t, bot, map[string]int64{"proj-a": 77}, map[int][]map[string]any{
+		3: {
+			{"id": float64(31), "kind": "job_failed", "project_id": "proj-a", "summary": "silenced line"},
+			{"id": float64(32), "kind": "run", "project_id": "proj-a", "summary": "allowed line"},
+		},
+	}, notifier.Policy{Families: []notifier.Rule{{Selector: "job_", Enabled: false}}})
+
+	if got := sentFor(bot, "silenced line"); len(got) != 0 {
+		t.Errorf("the suppressed line was sent: %+v", got)
+	}
+	// Without this the assertion above would also pass on a notifier that sends nothing.
+	if got := sentFor(bot, "allowed line"); len(got) != 1 || got[0].to.ThreadID != 77 {
+		t.Errorf("the allowed line = %+v, want one send to its topic", got)
 	}
 }
