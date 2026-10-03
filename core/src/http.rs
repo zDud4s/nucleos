@@ -15200,6 +15200,15 @@ async fn post_owner_note_teach(
     use crate::owner_notes::TeachError;
     let kind = crate::knowledge::Kind::parse(request.kind.as_deref().unwrap_or("memory"))
         .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "unknown_kind"))?;
+    // A lesson scoped to a project nobody has is one no run's scope chain ever reads.
+    if let Some(project_id) = request.project_id.as_deref() {
+        let known = owner_note_project_exists(&state, project_id)
+            .await
+            .map_err(|status| refusal(status, "internal"))?;
+        if !known {
+            return Err(refusal(StatusCode::BAD_REQUEST, "unknown_project"));
+        }
+    }
     match crate::owner_notes::teach(
         &state.pool,
         id,
@@ -15272,7 +15281,9 @@ async fn get_owner_notes_graph(
             wanted.push(pair);
         }
     }
-    let mut targets = crate::owner_notes::resolve_sql_labels(&state.pool, &wanted).await;
+    let mut targets = crate::owner_notes::resolve_sql_labels(&state.pool, &wanted)
+        .await
+        .map_err(|error| owner_note_db_status(&error, None))?;
 
     let roster = if targets.iter().any(|target| target.kind == "project") {
         crate::autopilot::project_roster(&state.pool)
@@ -35994,6 +36005,16 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, refused) = call(
+            state.clone(),
+            "POST",
+            &uri,
+            Some(serde_json::json!({ "project_id": "no-such-project" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused["refusal"], "unknown_project");
 
         let (status, taught) = call(state.clone(), "POST", &uri, Some(serde_json::json!({}))).await;
         assert_eq!(status, StatusCode::CREATED, "{taught}");

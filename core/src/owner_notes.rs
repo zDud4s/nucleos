@@ -8,10 +8,6 @@
 //! This module owns the `owner_notes*` SQL. The vocabularies below are checked here, before the
 //! write, because the migration carries no CHECK constraints (the house rule of 0143).
 
-// The routes, links and teaching that call these functions land in later packets of the same task;
-// until then only the tests do.
-#![allow(dead_code)]
-
 use sqlx::SqlitePool;
 
 /// Where a note was written from. Checked before the insert.
@@ -428,11 +424,13 @@ pub async fn teach(
     if state != "active" {
         return Err(TeachError::Archived);
     }
-    // A rejected or reverted lesson does not count: the owner may teach the note again.
+    // Read from the note's own `taught` events, not from its links: a `relates` link the owner
+    // drew by hand to some lesson has taught nothing, and unlinking a taught lesson does not
+    // unteach it. A rejected or reverted lesson does not count: the owner may teach again.
     let standing = sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM owner_note_links l
-         JOIN knowledge k ON CAST(k.id AS TEXT) = l.target_ref
-         WHERE l.note_id = ? AND l.link_type = 'relates' AND l.target_kind = 'knowledge'
+        "SELECT 1 FROM owner_note_events e
+         JOIN knowledge k ON e.detail LIKE 'knowledge:' || k.id || ' proposal:%'
+         WHERE e.note_id = ? AND e.kind = 'taught'
            AND k.status IN ('proposed', 'active')
          LIMIT 1",
     )
@@ -593,7 +591,13 @@ pub struct Target {
 /// Labels for the SQL kinds: a note's first line (at most 80 characters), a knowledge title, a
 /// contact's display name, a mail subject. Other kinds come back unlabelled and not missing, for the
 /// caller to resolve. The labels are never logged.
-pub async fn resolve_sql_labels(pool: &SqlitePool, wanted: &[(&str, &str)]) -> Vec<Target> {
+///
+/// A database error is returned, not read as "gone": a failed lookup would otherwise draw every
+/// target in the graph as missing.
+pub async fn resolve_sql_labels(
+    pool: &SqlitePool,
+    wanted: &[(&str, &str)],
+) -> sqlx::Result<Vec<Target>> {
     let mut targets = Vec::with_capacity(wanted.len());
     for (kind, target_ref) in wanted {
         let mut target = Target {
@@ -612,13 +616,14 @@ pub async fn resolve_sql_labels(pool: &SqlitePool, wanted: &[(&str, &str)]) -> V
         if let (Some(column), Some(table)) = (column, sql_table(kind)) {
             let row = match target_ref.trim().parse::<i64>() {
                 // `AssertSqlSafe`, audited: table and column come from the literals above.
-                Ok(id) => sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(format!(
-                    "SELECT {column} FROM {table} WHERE id = ?"
-                )))
-                .bind(id)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None),
+                Ok(id) => {
+                    sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(format!(
+                        "SELECT {column} FROM {table} WHERE id = ?"
+                    )))
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await?
+                }
                 Err(_) => None,
             };
             match row {
@@ -637,7 +642,7 @@ pub async fn resolve_sql_labels(pool: &SqlitePool, wanted: &[(&str, &str)]) -> V
         }
         targets.push(target);
     }
-    targets
+    Ok(targets)
 }
 
 #[cfg(test)]
@@ -726,6 +731,34 @@ mod tests {
             .map(|event| event.kind)
             .collect();
         assert_eq!(kinds, ["created", "linked", "taught"]);
+    }
+
+    #[tokio::test]
+    async fn only_the_notes_own_teaching_counts_as_taught_not_a_hand_made_link() {
+        let pool = test_pool().await;
+        let first = create(&pool, "the lesson someone else taught", "shell")
+            .await
+            .unwrap();
+        let (lesson, _, teach_link) =
+            teach(&pool, first, crate::knowledge::Kind::Memory, None, None)
+                .await
+                .unwrap();
+
+        // A note the owner merely relates to that lesson by hand has taught nothing.
+        let second = create(&pool, "a note about that lesson", "shell")
+            .await
+            .unwrap();
+        add_link(&pool, second, "relates", "knowledge", &lesson.to_string())
+            .await
+            .unwrap();
+        teach(&pool, second, crate::knowledge::Kind::Memory, None, None)
+            .await
+            .unwrap();
+
+        // And unlinking the taught lesson does not reopen the note while the lesson still stands.
+        remove_link(&pool, teach_link).await.unwrap();
+        let again = teach(&pool, first, crate::knowledge::Kind::Memory, None, None).await;
+        assert!(matches!(again, Err(TeachError::AlreadyTaught)), "{again:?}");
     }
 
     #[tokio::test]
@@ -1044,7 +1077,8 @@ mod tests {
                 ("project", "p"),
             ],
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(targets[0].label.as_deref(), Some("first line of the note"));
         assert!(!targets[0].missing);
         assert_eq!(targets[1].label.as_deref(), Some("Ada"));
@@ -1072,25 +1106,35 @@ mod tests {
         );
         let allowed = ["owner_notes.rs", "http.rs", "main.rs"];
         let needle = ["owner", "note"].join("_");
+        let src = running_in.join("src");
         let mut scanned = 0;
-        for entry in
-            std::fs::read_dir(running_in.join("src")).expect("core source must be readable")
-        {
-            let path = entry.expect("entry must be readable").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
+        // Recursive: a module directory (`council/`, `judge/`) is as much the agent's memory as
+        // a top-level file. Only the three top-level files are allowed, so a `http.rs` nested in
+        // some module directory is scanned like any other.
+        let mut pending = vec![src.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("core source must be readable") {
+                let path = entry.expect("entry must be readable").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                scanned += 1;
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if dir == src && allowed.contains(&name) {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("source file must be readable");
+                assert!(
+                    !source.contains(&needle),
+                    "{} mentions `{needle}`: the owner's notes are reachable from owner_notes.rs, \
+                     http.rs and main.rs only, so that nothing in the agent's memory can read them",
+                    path.display()
+                );
             }
-            scanned += 1;
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if allowed.contains(&name) {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path).expect("source file must be readable");
-            assert!(
-                !source.contains(&needle),
-                "{name} mentions `{needle}`: the owner's notes are reachable from owner_notes.rs, \
-                 http.rs and main.rs only, so that nothing in the agent's memory can read them"
-            );
         }
         assert!(scanned > 20, "the scan found only {scanned} source files");
     }
