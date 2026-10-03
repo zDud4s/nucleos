@@ -1,6 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
+import { BrainCanvas } from "../canvas/BrainCanvas";
+import { BrainPanel } from "../brain/BrainPanel";
+import { layout, toGraph, type BrainFilters } from "../data/brain-graph";
+import { useKnowledge } from "../data/knowledge";
 import {
+  LINK_TYPES,
+  TARGET_KINDS,
+  useNotesGraph,
   useCreateNote,
   useOwnerNotes,
   useSearchOwnerNotes,
@@ -76,7 +83,7 @@ export function Brain() {
       </div>
 
       {view === "graph" ? (
-        <BrainGraphPlaceholder />
+        <BrainGraphView />
       ) : (
         <>
           {shown.isError && (
@@ -191,7 +198,41 @@ function NoteRow({ note }: { note: OwnerNote }) {
   );
 }
 
-/** The Graph side of the switch. Replace this component with the real graph; nothing else here knows. */
-export function BrainGraphPlaceholder() {
-  return <Quiet says="The graph of your notes is not drawn yet." />;
+const EMPTY_KNOWLEDGE: never[] = [];
+
+/** The Graph side of the switch: filters and canvas on the left, the selected node on the right. */
+export function BrainGraphView() {
+  const [filters, setFilters] = useState<BrainFilters>({
+    knowledge: "linked",
+    linkTypes: new Set<string>(LINK_TYPES),
+    kinds: new Set<string>(TARGET_KINDS),
+    showArchived: false,
+  });
+  const [selected, setSelected] = useState<string | null>(null);
+  const graph = useNotesGraph(filters.showArchived);
+  const knowledge = useKnowledge();
+
+  const shaped = useMemo(() => {
+    if (graph.data === undefined) return null;
+    const g = toGraph(graph.data, knowledge.data ?? EMPTY_KNOWLEDGE, filters);
+    return { ...g, nodes: layout(g) };
+  }, [graph.data, knowledge.data, filters]);
+
+  if (graph.isError) return <ErrorNote>the núcleo did not answer — the graph is not known</ErrorNote>;
+  if (graph.data === undefined || shaped === null) return <Quiet says="Loading the graph…" />;
+
+  return (
+    <div className="brain-graph">
+      <BrainCanvas
+        nodes={shaped.nodes}
+        edges={shaped.edges}
+        meta={shaped.meta}
+        filters={filters}
+        onFilters={setFilters}
+        selectedId={selected}
+        onSelect={setSelected}
+      />
+      <BrainPanel nodeId={selected} graph={graph.data} nodes={shaped.nodes} edges={shaped.edges} />
+    </div>
+  );
 }

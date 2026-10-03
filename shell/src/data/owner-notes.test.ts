@@ -11,7 +11,7 @@ vi.mock("./client", async (original) => ({
 
 import { createAppQueryClient } from "../app/queryClient";
 import { keys } from "./keys";
-import { useCreateNote, useRemoveLink, useSearchOwnerNotes } from "./owner-notes";
+import { useCreateNote, useRemoveLink, useSearchOwnerNotes, useTeachNote } from "./owner-notes";
 
 function setup() {
   const client = createAppQueryClient();
@@ -59,5 +59,22 @@ describe("owner notes hooks", () => {
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(daemon.apiFetch).toHaveBeenCalledWith("/owner-notes/links/42", { method: "DELETE" });
+  });
+
+  it("teaching a note posts to its teach route and refreshes knowledge", async () => {
+    daemon.apiFetch.mockResolvedValue({ knowledge_id: 1, proposal_id: 2, link_id: 3 });
+    const { client, wrapper } = setup();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const { result } = renderHook(() => useTeachNote(), { wrapper });
+
+    result.current.mutate({ id: 5, kind: "memory", title: "T" });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/owner-notes/5/teach", {
+      method: "POST",
+      body: JSON.stringify({ kind: "memory", title: "T" }),
+    });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: keys.ownerNotes.all });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: keys.knowledge.all });
   });
 });

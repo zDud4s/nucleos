@@ -17,6 +17,7 @@ import { keys } from "./keys";
  * | add a link           | `POST /owner-notes/{id}/links`        |
  * | remove a link        | `DELETE /owner-notes/links/{link_id}` |
  * | the whole graph      | `GET /owner-notes/graph`              |
+ * | teach to the agent   | `POST /owner-notes/{id}/teach`        |
  */
 
 /* ----------------------------------------------------------------- shapes -- */
@@ -154,6 +155,30 @@ export function useAddLink() {
         body: JSON.stringify(link),
       }),
   );
+}
+
+export type TeachKind = "memory" | "prompt" | "skill" | "subagent";
+export const TEACH_KINDS: readonly TeachKind[] = ["memory", "prompt", "skill", "subagent"];
+
+/**
+ * Teach a note to the agent: it becomes a pending knowledge proposal, answered in Learned.
+ * Refusals come back as 409 `already_taught` / `archived` and 400 `unknown_kind`.
+ * Invalidates the knowledge list too, since a new row now exists there.
+ */
+export function useTeachNote() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: { id: number; kind: TeachKind; title?: string }) =>
+      apiFetch<{ knowledge_id: number; proposal_id: number; link_id: number }>(
+        `/owner-notes/${id}/teach`,
+        { method: "POST", body: JSON.stringify(body) },
+      ),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.ownerNotes.all });
+      void queryClient.invalidateQueries({ queryKey: keys.knowledge.all });
+    },
+  });
 }
 
 /** 204, so no body to read. */
