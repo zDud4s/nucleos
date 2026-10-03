@@ -2373,6 +2373,49 @@ mod tests {
         }
     }
 
+    /// The person's own notes are in no route table, so default-deny leaves them to the two scopes
+    /// that are not table-bound. Written against the paths, not the tables, so adding one of these
+    /// routes to a table by mistake fails here. (Named without the module's own name on purpose:
+    /// a source scan in `owner_notes.rs` forbids any other file from mentioning it.)
+    #[test]
+    fn the_brain_routes_are_reachable_by_the_owner_alone() {
+        let routes = [
+            (Method::GET, "/owner-notes"),
+            (Method::POST, "/owner-notes"),
+            (Method::GET, "/owner-notes/search"),
+            (Method::GET, "/owner-notes/graph"),
+            (Method::GET, "/owner-notes/7"),
+            (Method::PATCH, "/owner-notes/7"),
+            (Method::POST, "/owner-notes/7/links"),
+            (Method::DELETE, "/owner-notes/links/3"),
+            (Method::POST, "/owner-notes/7/teach"),
+        ];
+        let refused = [
+            Scope::Run(1),
+            Scope::Service(Service::Email),
+            Scope::Service(Service::Council),
+            Scope::TeamRun("t".to_owned()),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ];
+        for (method, path) in &routes {
+            for scope in &refused {
+                assert!(
+                    !permits(scope, method, path),
+                    "{scope:?} reached {method} {path}"
+                );
+            }
+            assert!(
+                permits(&Scope::Control, method, path),
+                "Control: {method} {path}"
+            );
+            assert!(
+                permits(&Scope::ApiToken(ApiTokenLevel::Admin), method, path),
+                "Admin: {method} {path}"
+            );
+        }
+    }
+
     #[test]
     fn a_run_key_reaches_the_findings_door_and_no_other_knowledge_route() {
         let run = Scope::Run(7);
