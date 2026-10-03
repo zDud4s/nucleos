@@ -88,3 +88,28 @@ func TestFormerErrandCommandsGoToTheAgent(t *testing.T) {
 		}
 	}
 }
+
+func TestRouteNote(t *testing.T) {
+	cases := []struct {
+		in   string
+		want Intent
+	}{
+		{"/note buy milk", Intent{Kind: Note, Arg: "buy milk"}},
+		{"/NOTE  Buy Milk  ", Intent{Kind: Note, Arg: "Buy Milk"}},
+		{"/Note a /kill b", Intent{Kind: Note, Arg: "a /kill b"}},
+		{"/note", Intent{Kind: Note, Arg: ""}},
+		{"  /Note  ", Intent{Kind: Note, Arg: ""}},
+	}
+	for _, c := range cases {
+		if got := Route(c.in); got != c.want {
+			t.Errorf("Route(%q) = %+v, want %+v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestRouteTranscriptRefusesNote(t *testing.T) {
+	got := RouteTranscript("/note buy milk")
+	if got.Kind != Refused {
+		t.Errorf("RouteTranscript(/note ...) kind = %v, want Refused", got.Kind)
+	}
+}

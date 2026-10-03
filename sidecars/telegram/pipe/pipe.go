@@ -47,6 +47,7 @@ const helpText = `Talk normally to reach the orchestrator.
 /proj [name] — list registered projects, optionally filtered by name
 /inbox — show what is waiting in the mailbox (free)
 /mail — read and classify what is waiting (costs a run)
+/note <text> — save a note to your Brain
 /help — show this help`
 
 type Bot interface {
@@ -58,6 +59,7 @@ type Bot interface {
 
 type Daemon interface {
 	SendAssistantMessage(chatKey, text string) (int64, error)
+	CreateNote(text string) (int64, error)
 	GetRun(id int64) (map[string]any, error)
 	GetProposals() ([]map[string]any, error)
 	// GetRefusedActions is what the injection barrier turned away. A separate route from the one
@@ -441,6 +443,19 @@ func handleIntent(bot Bot, dc Daemon, tr *Tracker, to telegram.Destination, inte
 		sendProjects(bot, dc, to, intent.Arg)
 	case shortcuts.Mail:
 		sendTriage(bot, dc, to)
+	case shortcuts.Note:
+		if intent.Arg == "" {
+			logSend("note usage", bot.SendMessage(to, "usage: /note <text>"))
+			return
+		}
+		id, err := dc.CreateNote(intent.Arg)
+		if err != nil {
+			// The note text is private writing: it goes nowhere but the daemon, so neither the
+			// reply nor the log line below ever carries it.
+			logSend("note error", bot.SendMessage(to, "couldn't save the note: "+err.Error()))
+			return
+		}
+		logSend("note saved", bot.SendMessage(to, fmt.Sprintf("noted (#%d)", id)))
 	case shortcuts.Inbox:
 		sendInbox(bot, dc, to)
 	default:

@@ -17,6 +17,8 @@ const (
 	// Inbox shows what the pillar knows without spending anything.
 	Inbox
 	Help
+	// Note saves the argument as an owner note; an empty Arg is a bare `/note` and gets the usage line.
+	Note
 	// Refused is a command that was recognised but must not run from where it came — today, one
 	// spoken into a voice note.
 	Refused
@@ -61,6 +63,12 @@ func Route(text string) Intent {
 	// byte length, and the argument is sliced out by index.
 	if hasPrefixFold(trimmed, "/kill") {
 		return Intent{Kind: Help}
+	}
+	if lowered == "/note" {
+		return Intent{Kind: Note, Arg: ""}
+	}
+	if hasPrefixFold(trimmed, "/note ") {
+		return Intent{Kind: Note, Arg: strings.TrimSpace(trimmed[len("/note "):])}
 	}
 	if hasPrefixFold(trimmed, "/proj ") {
 		return Intent{Kind: Proj, Arg: strings.TrimSpace(trimmed[len("/proj "):])}

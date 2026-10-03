@@ -149,3 +149,36 @@ func TestARefusalWithNoNameIsStillARefusal(t *testing.T) {
 		t.Errorf("Error() = %q, want the body it could not name", refused.Error())
 	}
 }
+
+func TestCreateNotePostsTextWithTelegramOrigin(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/owner-notes" {
+			t.Errorf("path = %q, want /owner-notes", r.URL.Path)
+		}
+		var request map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if request["text"] != "remember the milk" {
+			t.Errorf("text = %q, want %q", request["text"], "remember the milk")
+		}
+		if request["origin"] != "telegram" {
+			t.Errorf("origin = %q, want telegram", request["origin"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":17}`))
+	}))
+	defer server.Close()
+
+	id, err := New(server.URL, "tok").CreateNote("remember the milk")
+	if err != nil {
+		t.Fatalf("CreateNote() error = %v", err)
+	}
+	if id != 17 {
+		t.Errorf("id = %d, want 17", id)
+	}
+}

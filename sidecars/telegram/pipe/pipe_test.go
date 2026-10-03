@@ -1,9 +1,11 @@
 package pipe
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -108,6 +110,9 @@ func (b *recordingBot) AnswerCallbackQuery(callbackID, text string) error {
 type recordingDaemon struct {
 	sendAssistantErr   error
 	sendAssistantCalls int
+	// noteCalls records the text of every CreateNote call; noteErr is what the next one reports.
+	noteCalls []string
+	noteErr   error
 	// The notification policy this fake daemon serves, and the error it serves instead. The zero
 	// value is an empty policy, which allows everything — so every test written before the policy
 	// existed keeps the behaviour it was written against.
@@ -151,6 +156,14 @@ func (d *recordingDaemon) SendAssistantMessage(chatID, _ string) (int64, error) 
 	d.sendAssistantCalls++
 	d.lastChatID = chatID
 	return 0, d.sendAssistantErr
+}
+
+func (d *recordingDaemon) CreateNote(text string) (int64, error) {
+	d.noteCalls = append(d.noteCalls, text)
+	if d.noteErr != nil {
+		return 0, d.noteErr
+	}
+	return 17, nil
 }
 
 func (d *recordingDaemon) GetRun(int64) (map[string]any, error) {
@@ -1370,5 +1383,60 @@ func TestPolicyReadFailsOpen(t *testing.T) {
 	}
 	if !strings.Contains(joined, "still gets through") {
 		t.Errorf("an unreadable policy silenced the feed:\n%s", joined)
+	}
+}
+
+func TestNoteCommandCreatesANote(t *testing.T) {
+	bot := &recordingBot{}
+	dc := &recordingDaemon{}
+
+	HandleMessage(bot, dc, NewTracker(), telegram.Destination{ChatID: 42}, "/note buy milk")
+
+	if len(dc.noteCalls) != 1 || dc.noteCalls[0] != "buy milk" {
+		t.Fatalf("CreateNote calls = %v, want [buy milk]", dc.noteCalls)
+	}
+	if dc.sendAssistantCalls != 0 {
+		t.Errorf("SendAssistantMessage calls = %d, want 0", dc.sendAssistantCalls)
+	}
+	if len(bot.messages) != 1 || bot.messages[0].text != "noted (#17)" {
+		t.Errorf("messages = %v, want one reply %q", bot.messages, "noted (#17)")
+	}
+
+	bare := &recordingBot{}
+	HandleMessage(bare, dc, NewTracker(), telegram.Destination{ChatID: 42}, "/note")
+	if len(dc.noteCalls) != 1 {
+		t.Errorf("a bare /note called CreateNote: %v", dc.noteCalls)
+	}
+	if len(bare.messages) != 1 || bare.messages[0].text != "usage: /note <text>" {
+		t.Errorf("messages = %v, want the usage line", bare.messages)
+	}
+}
+
+func TestNoteFromAnUnauthorisedChatIsIgnored(t *testing.T) {
+	cfg := config.Config{AllowedChatID: 42}
+	bot := &recordingBot{}
+	dc := &recordingDaemon{}
+
+	HandleUpdate(bot, dc, fakeDownloader{}, cfg, NewTracker(), telegram.Update{
+		Message: &telegram.Message{Chat: telegram.Chat{ID: 99}, From: &telegram.User{ID: 99}, Text: "/note buy milk"},
+	})
+
+	if len(dc.noteCalls) != 0 {
+		t.Errorf("CreateNote calls = %v, want none", dc.noteCalls)
+	}
+}
+
+func TestNoteTextNeverReachesTheLog(t *testing.T) {
+	const secret = "the-secret-diary-entry"
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	HandleMessage(&recordingBot{}, &recordingDaemon{}, NewTracker(), telegram.Destination{ChatID: 42}, "/note "+secret)
+	HandleMessage(&recordingBot{}, &recordingDaemon{noteErr: errors.New("daemon unreachable")},
+		NewTracker(), telegram.Destination{ChatID: 42}, "/note "+secret)
+
+	if strings.Contains(buf.String(), secret) {
+		t.Errorf("log carries the note text: %q", buf.String())
 	}
 }
