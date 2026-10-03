@@ -29,7 +29,7 @@ describe("the nav table", () => {
     expect(byId.operate.items.map((item) => item.id)).toEqual([
       // `projects` is gone from here on purpose — it was promoted into the group
       // below, not copied into it. Everything else is exactly as it was.
-      "home", "fleet", "autopilot", "waiting", "runs", "feed", "learned",
+      "home", "fleet", "autopilot", "waiting", "runs", "feed", "learned", "brain",
     ]);
     expect(byId.work.items.map((item) => item.id)).toEqual([
       "chats", "teams", "agents", "council",
@@ -81,6 +81,8 @@ describe("the nav table", () => {
       // addition rather than folded in silently — the point of this file is
       // that the sidebar does not drift without somebody saying so.
       "Learned",
+      // The owner's own notes: an addition after the design, for the same reason as Learned.
+      "Brain",
     ]);
   });
 

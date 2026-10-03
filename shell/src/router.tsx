@@ -35,6 +35,7 @@ import { TeamRunDetail } from "./pages/TeamRunDetail";
 import { Teams } from "./pages/Teams";
 import { Bench } from "./team/Bench";
 import { Voice, validateVoiceSearch } from "./pages/Voice";
+import { Brain, validateBrainSearch } from "./pages/Brain";
 import { Waiting, validateWaitingSearch } from "./pages/Waiting";
 import { Web } from "./pages/Web";
 
@@ -77,6 +78,7 @@ export const PAGES: Record<string, () => ReactNode> = {
   "/contacts": Contacts,
   "/calendar": Calendar,
   "/voice": Voice,
+  "/brain": Brain,
   "/web": Web,
   "/browser": Browser,
   "/files": Files,
@@ -98,6 +100,7 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
   "/calendar": validateCalendarSearch,
   "/waiting": validateWaitingSearch,
   "/voice": validateVoiceSearch,
+  "/brain": validateBrainSearch,
 };
 
 /**

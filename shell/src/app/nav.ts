@@ -22,6 +22,7 @@ import {
   Activity,
   Bot,
   Boxes,
+  Brain,
   Calendar,
   Compass,
   Contact,
@@ -153,6 +154,12 @@ export const NAV: NavGroup[] = [
        * It sits after Projects because a lesson is scoped to one.
        */
       { id: "learned", label: "Learned", path: "/learned", icon: GraduationCap },
+      /**
+       * The owner's own thinking: notes typed or sent here, never read by agents.
+       * It follows Learned because the two are one question from opposite sides: what the
+       * agent has been told, and what only you know.
+       */
+      { id: "brain", label: "Brain", path: "/brain", icon: Brain },
     ],
   },
   /**
