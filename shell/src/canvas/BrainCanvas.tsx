@@ -54,7 +54,14 @@ function NoteNode({ data, selected }: NodeProps) {
     >
       <Handles />
       {note === null ? (
-        <span>note — gone</span>
+        missing ? (
+          <span>note — gone</span>
+        ) : (
+          <>
+            <p className="brain-node-text">{typeof data.label === "string" ? data.label : "note"}</p>
+            <span className="brain-node-tag">archived</span>
+          </>
+        )
       ) : (
         <>
           <p className="brain-node-text">{note.text}</p>

@@ -64,9 +64,13 @@ function OtherPanel({ node, nodes, edges }: { node: Node; nodes: Node[]; edges: 
     node.type === "knowledge"
       ? (known?.title ?? "knowledge")
       : node.type === "note"
-        ? "note"
+        ? typeof node.data.label === "string"
+          ? node.data.label
+          : "note"
         : `${String(node.data.kind)}: ${String(node.data.label)}`;
-  const missing = node.data.missing === true || (node.type === "note" && note === null);
+  const missing = node.data.missing === true;
+  // A note stub that is not gone is one hidden because it is archived.
+  const hidden = node.type === "note" && note === null && !missing;
   const from = edges
     .filter((edge) => edge.target === node.id)
     .map((edge) => ({
@@ -79,6 +83,7 @@ function OtherPanel({ node, nodes, edges }: { node: Node; nodes: Node[]; edges: 
       <h3>
         {label}
         {missing && <span className="brain-node-tag">gone</span>}
+        {hidden && <span className="brain-node-tag">archived</span>}
       </h3>
       <h4>Linked from</h4>
       {from.length === 0 ? (

@@ -60,6 +60,24 @@ describe("toGraph", () => {
     expect(withLink.meta.entities).toBe(1);
   });
 
+  it("a linked note that is hidden as archived is a stub, not a gone one", () => {
+    const hidden = toGraph(
+      {
+        notes: [note(1)],
+        links: [link(1, 1, { target_ref: "3" }), link(2, 1, { target_ref: "4" })],
+        targets: [
+          { kind: "note", ref: "3", label: "an archived thought", missing: false },
+          { kind: "note", ref: "4", label: null, missing: true },
+        ],
+      },
+      [],
+      FILTERS,
+    );
+    const archived = hidden.nodes.find((n) => n.id === "n:3");
+    expect(archived?.data).toMatchObject({ note: null, missing: false, label: "an archived thought" });
+    expect(hidden.nodes.find((n) => n.id === "n:4")?.data.missing).toBe(true);
+  });
+
   it("knowledge filter linked keeps only linked rows", () => {
     const g = graph([link(1, 1, { target_kind: "knowledge", target_ref: "10" })]);
     const rows = [known(10), known(11)];

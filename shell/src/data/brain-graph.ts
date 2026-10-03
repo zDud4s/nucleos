@@ -93,13 +93,15 @@ export function toGraph(graph: NotesGraph, knowledge: Known[], filters: BrainFil
       if (link.target_kind === "knowledge") {
         nodes.set(target, knowledgeNode(link.target_ref));
       } else if (link.target_kind === "note") {
-        // A note that is archived and hidden, or gone: kept as a missing stub
-        // so the link does not silently vanish.
+        // A note that is archived and hidden, or gone: kept as a stub so the
+        // link does not silently vanish. The núcleo resolved which of the two
+        // it is; with no answer, it is gone.
+        const info = targetInfo.get(`note:${link.target_ref}`);
         nodes.set(target, {
           id: target,
           type: "note",
           position: { x: 0, y: 0 },
-          data: { note: null, missing: true },
+          data: { note: null, missing: info?.missing ?? true, label: info?.label ?? null },
         });
       } else {
         const info = targetInfo.get(`${link.target_kind}:${link.target_ref}`);
