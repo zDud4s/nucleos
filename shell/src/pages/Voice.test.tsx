@@ -72,6 +72,7 @@ function voiceConfig(overrides: Partial<VoiceConfigView> = {}): VoiceConfigView 
     hotkey: "Ctrl+Alt+D",
     memo_hotkey: "Ctrl+Alt+M",
     conversation_hotkey: "Ctrl+Alt+C",
+    capture_hotkey: "Ctrl+Alt+N",
     speaks: true,
     max_capture_seconds: 1200,
     max_body_bytes: 38_401_024,

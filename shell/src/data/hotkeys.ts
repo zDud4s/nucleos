@@ -1,5 +1,5 @@
 /**
- * The three global chords, registered with the host once per launch — from the shell, not a page.
+ * The four global chords, registered with the host once per launch — from the shell, not a page.
  *
  * The host does not register them itself: they are configured in `~/.nucleos/voice.yaml`, which only the
  * daemon reads, so the webview reads `GET /voice/config` and hands them over
@@ -30,7 +30,7 @@ export interface HotkeyRegistration {
   failed: boolean;
 }
 
-async function register(dictation: string, memo: string, conversation: string): Promise<HotkeyRegistration> {
+async function register(dictation: string, memo: string, conversation: string, capture: string): Promise<HotkeyRegistration> {
   // Asked FIRST, and in the same call, because on Wayland the answer is a sentence and the
   // registration must not happen. Sequenced here, "there is a sentence" and "nothing was registered"
   // are the same decision rather than two that could disagree.
@@ -41,9 +41,9 @@ async function register(dictation: string, memo: string, conversation: string): 
   const unavailable = (await invoke<string | null>("voice_hotkeys_unavailable").catch(() => null)) ?? null;
   if (unavailable !== null) return { unavailable, conflicts: null, failed: false };
   try {
-    // All three in ONE call, because the host unregisters everything before it registers anything —
-    // a call naming only one chord would silently drop the other two.
-    const conflicts = await invoke<string[]>("voice_register_hotkeys", { dictation, memo, conversation });
+    // All four in ONE call, because the host unregisters everything before it registers anything —
+    // a call naming only one chord would silently drop the others.
+    const conflicts = await invoke<string[]>("voice_register_hotkeys", { dictation, memo, conversation, capture });
     return { unavailable: null, conflicts, failed: false };
   } catch {
     return { unavailable: null, conflicts: null, failed: true };
@@ -56,11 +56,12 @@ export function useHotkeyRegistration(): HotkeyRegistration | undefined {
   const dictation = config.data?.hotkey;
   const memo = config.data?.memo_hotkey;
   const conversation = config.data?.conversation_hotkey ?? "";
+  const capture = config.data?.capture_hotkey ?? "";
   const known = dictation !== undefined && memo !== undefined;
 
   const registration = useQuery({
-    queryKey: ["host", "hotkeys", dictation, memo, conversation] as const,
-    queryFn: () => register(dictation ?? "", memo ?? "", conversation),
+    queryKey: ["host", "hotkeys", dictation, memo, conversation, capture] as const,
+    queryFn: () => register(dictation ?? "", memo ?? "", conversation, capture),
     enabled: known,
     // Registered once per set of chords, and never again on a timer, a focus or a remount: every
     // call unregisters all three before registering them, so a refetch is a moment with no chords.

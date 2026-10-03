@@ -2373,6 +2373,7 @@ export function answer(path: string, init?: RequestInit): unknown {
       hotkey: "Ctrl+Shift+D",
       memo_hotkey: "Ctrl+Shift+M",
       conversation_hotkey: "",
+      capture_hotkey: "",
       /* Reads but does not speak: the half-configured machine is a real state
          and the one a single `armed` flag would hide. */
       speaks: false,

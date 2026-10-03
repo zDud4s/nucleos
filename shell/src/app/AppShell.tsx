@@ -9,6 +9,7 @@ import { unreadTotal } from "../lib/turns";
 import { PaletteProvider, usePaletteGroup, type PaletteGroup } from "../ui";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
 import { ConnectionGate } from "./ConnectionGate";
+import { CaptureChord } from "./CaptureChord";
 import { ConversationChord } from "./ConversationChord";
 import { DictationProvider } from "./Dictation";
 import { KillSwitchControl } from "./KillSwitchControl";
@@ -106,6 +107,7 @@ function Frame() {
       <div className="app-shell">
         <AttentionHeartbeat />
         <ConversationChord />
+        <CaptureChord />
         <Destinations />
         <Sidebar
           badges={{

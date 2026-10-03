@@ -15,7 +15,7 @@ vi.mock("./client", async (original) => ({
 import { createAppQueryClient } from "../app/queryClient";
 import { useHotkeyRegistration } from "./hotkeys";
 
-const CHORDS = { hotkey: "Ctrl+Alt+D", memo_hotkey: "Ctrl+Alt+M", conversation_hotkey: "Ctrl+Alt+C" };
+const CHORDS = { hotkey: "Ctrl+Alt+D", memo_hotkey: "Ctrl+Alt+M", conversation_hotkey: "Ctrl+Alt+C", capture_hotkey: "Ctrl+Alt+N" };
 
 function registrations(): unknown[] {
   return tauri.invoke.mock.calls.filter(([command]) => command === "voice_register_hotkeys").map((call) => call[1]);
@@ -38,14 +38,14 @@ beforeEach(() => {
 describe("useHotkeyRegistration", () => {
   /* The shell and the Voice page both ask, and the host must be asked once: every registration
      unregisters all three chords before it registers any, so a second one is a moment with none. */
-  it("registers the three chords once, however many ask", async () => {
+  it("all four chords go in one registration, once, however many ask", async () => {
     const { result } = renderHook(() => [useHotkeyRegistration(), useHotkeyRegistration()], {
       wrapper: wrapper(),
     });
 
     await waitFor(() => expect(result.current[0]).toEqual({ unavailable: null, conflicts: [], failed: false }));
     expect(result.current[1]).toEqual(result.current[0]);
-    expect(registrations()).toEqual([{ dictation: "Ctrl+Alt+D", memo: "Ctrl+Alt+M", conversation: "Ctrl+Alt+C" }]);
+    expect(registrations()).toEqual([{ dictation: "Ctrl+Alt+D", memo: "Ctrl+Alt+M", conversation: "Ctrl+Alt+C", capture: "Ctrl+Alt+N" }]);
   });
 
   it("registers nothing on a desktop that gives out no global hotkeys", async () => {
