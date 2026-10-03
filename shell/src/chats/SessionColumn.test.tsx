@@ -24,6 +24,7 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 import { SessionColumn } from "./SessionColumn";
+import { chatHue } from "./sessions";
 import { createAppQueryClient } from "../app/queryClient";
 import type { ChatGroup, ChatSummary } from "../data/chats";
 
@@ -135,6 +136,11 @@ describe("SessionColumn", () => {
     // The way in.
     fireEvent.click(await screen.findByRole("button", { name: "New session" }));
     expect(onNew).toHaveBeenCalledTimes(1);
+    // New group sits beside it, on the same row, and nowhere else.
+    expect(screen.getAllByRole("button", { name: "New group" })).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "New group" }).parentElement).toBe(
+      screen.getByRole("button", { name: "New session" }).parentElement,
+    );
 
     // The group holds its own row, the rest are ungrouped, and each heading carries a count.
     expect(await screen.findByText("Mail work (1)")).toBeDefined();
@@ -150,6 +156,16 @@ describe("SessionColumn", () => {
     expect(within(ungrouped).getByLabelText("Working").className).toContain("chats-dot-working");
     expect(within(ungrouped).getByLabelText("Unread").className).toContain("chats-dot-unread");
     expect(within(ungrouped).getByLabelText("Seen").className).toContain("chats-dot-seen");
+
+    // Every row carries its conversation's own colour, stable per chat_id — even a row whose state
+    // has nothing to report (a closed tab, idle), which used to show no dot at all.
+    const own = (title: string) =>
+      screen
+        .getByText(title)
+        .closest("a")
+        ?.querySelector<HTMLElement>(".chats-dot-chat")
+        ?.style.getPropertyValue("--chat-hue");
+    for (const row of ROWS) expect(own(row.title as string)).toBe(String(chatHue(row.chat_id)));
 
     // The filter menu: counts per status and per tab state.
     openMenu(screen.getByRole("button", { name: "Filter sessions" }));

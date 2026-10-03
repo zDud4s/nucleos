@@ -32,6 +32,23 @@ export function dotFor(chat: ChatSummary, tabOpen: boolean): Dot | null {
   return tabOpen ? "seen" : null;
 }
 
+/**
+ * The hues a conversation's own colour is drawn from. Eight, spread round the wheel with cyan
+ * (Signal Cyan, links only) and pure red (danger) left out; saturation and lightness come from the
+ * stylesheet so the same hue reads on both grounds.
+ */
+export const CHAT_HUES = [24, 45, 95, 140, 215, 250, 285, 325] as const;
+
+/** A conversation's colour, stable per `chat_id`: FNV-1a over the id, into `CHAT_HUES`. */
+export function chatHue(chatId: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < chatId.length; i += 1) {
+    hash ^= chatId.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return CHAT_HUES[(hash >>> 0) % CHAT_HUES.length];
+}
+
 export function statusOf(chat: ChatSummary): SessionStatus {
   const activity = chat.activity ?? "idle";
   return activity === "needs_input" || activity === "working" ? activity : "completed";

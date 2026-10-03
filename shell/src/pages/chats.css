@@ -421,11 +421,24 @@
  * thing that matters, and spending it on "start typing" is spending the loudest
  * control on the cheapest, most reversible action on the page.
  */
+/* New session and New group share one row, the session taking the larger share. */
 .chats-rail-actions {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
+  gap: var(--space-2);
   margin-bottom: var(--space-4);
+}
+
+.chats-rail-actions > .chats-rail-new {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  overflow: hidden;
+  padding-inline: var(--space-2);
+}
+
+.chats-rail-actions > .chats-rail-new-group {
+  flex: 0 1 auto;
+  color: var(--text-muted);
 }
 
 .chats-rail-new {
@@ -3281,17 +3294,27 @@
   white-space: nowrap;
 }
 
+/* The slider lives inside the effort menu; the composer row shows only the value. */
 .chats-effort {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  min-width: 9rem;
-  max-width: 16rem;
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  min-width: 16rem;
 }
 
 .chats-effort-name {
   color: var(--text-muted);
   font-size: var(--text-xs);
+}
+
+/* A company row in the model menu: its mark, then its name. */
+.chats-model-company {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.chats-model-list {
+  max-height: min(28rem, 70vh);
+  overflow-y: auto;
 }
 
 /* ================================================== session column and tabs == */
@@ -3326,6 +3349,34 @@
   color: var(--tone-off-fg);
 }
 
+/*
+ * A conversation's own colour (`chatHue`), on its row and its tab alike. The hue comes inline;
+ * saturation and lightness are set here per ground. The state, when there is one, becomes a ring
+ * in its tone around the fill, so identity and state never compete for the same pixels.
+ */
+.chats-app {
+  --chat-dot-s: 62%;
+  --chat-dot-l: 64%;
+}
+
+@media (prefers-color-scheme: light) {
+  .chats-app {
+    --chat-dot-s: 58%;
+    --chat-dot-l: 44%;
+  }
+}
+
+.chats-dot.chats-dot-chat {
+  width: 0.625rem;
+  height: 0.625rem;
+  background: hsl(var(--chat-hue) var(--chat-dot-s) var(--chat-dot-l));
+}
+
+.chats-dot-chat:not(.chats-dot-none, .chats-dot-seen) {
+  outline: 1.5px solid currentColor;
+  outline-offset: 1.5px;
+}
+
 @keyframes chats-dot-pulse {
   50% {
     opacity: 0.4;
@@ -3347,7 +3398,6 @@
 
 .chats-session-filter,
 .chats-session-chip,
-.chats-group-new,
 .chats-session-restore {
   display: inline-flex;
   align-items: center;
@@ -3365,7 +3415,6 @@
 
 .chats-session-filter:hover,
 .chats-session-chip:hover,
-.chats-group-new:hover,
 .chats-session-restore:hover {
   background: var(--surface);
   color: var(--text);

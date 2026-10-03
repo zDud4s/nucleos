@@ -12981,6 +12981,9 @@ async fn get_model_groups(
         .collect();
     let snapshot = crate::model_catalog::current().await;
     let mut created = std::collections::HashMap::new();
+    // Codex models this caller may not pick are still listed, and named here, so the picker shows
+    // the whole vendor list and says why a row is closed instead of leaving the vendor out.
+    let mut needs_root: Vec<String> = Vec::new();
     for found in &snapshot.models {
         if let Some(at) = found.created {
             created.insert(found.id.clone(), at);
@@ -12990,10 +12993,16 @@ async fn get_model_groups(
         }
         if crate::model_catalog::admits(config.active_runner(), rooted_of(asking), found.runner) {
             cloud.push(crate::model_catalog::as_choice(found));
+        } else if found.runner == "codex"
+            && crate::model_catalog::admits(config.active_runner(), Some(true), found.runner)
+        {
+            needs_root.push(found.id.clone());
+            cloud.push(crate::model_catalog::as_choice(found));
         }
     }
     Json(serde_json::json!({
         "groups": crate::model_catalog::group(cloud, &created),
+        "needs_root": needs_root,
         "source": snapshot.source,
         "catalogue_version": crate::model_catalog::CATALOGUE_VERSION,
         "fetched_at": snapshot.fetched_at,
@@ -28516,7 +28525,17 @@ mod tests {
             .collect();
         let ids: Vec<&str> = all.iter().filter_map(|m| m["id"].as_str()).collect();
         assert!(ids.contains(&"claude-sonnet-5-5"), "{ids:?}");
-        assert!(!ids.contains(&"gpt-5.5"), "a Codex model on a Claude daemon: {ids:?}");
+        // A Codex model is listed, but named as needing a rooted conversation: the daemon's own
+        // menu cannot open one on Codex.
+        assert!(ids.contains(&"gpt-5.5"), "{ids:?}");
+        let needs_root: Vec<&str> = body["needs_root"]
+            .as_array()
+            .expect("needs_root is a list")
+            .iter()
+            .filter_map(|id| id.as_str())
+            .collect();
+        assert!(needs_root.contains(&"gpt-5.5"), "{needs_root:?}");
+        assert!(!needs_root.contains(&"claude-sonnet-5-5"), "{needs_root:?}");
         let sonnet = all.iter().find(|m| m["id"] == "claude-sonnet-5-5").unwrap();
         assert_eq!(sonnet["label"], "Sonnet 5.5");
     }
