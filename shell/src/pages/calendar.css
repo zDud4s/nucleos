@@ -816,7 +816,8 @@
 
 .calendar-draft-repeats input {
   margin: 0;
-  accent-color: var(--accent);
+  /* Ink, as every other checkbox in the shell: cyan is reserved for links. */
+  accent-color: var(--text);
 }
 
 /*
