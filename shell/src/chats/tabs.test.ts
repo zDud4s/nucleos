@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { closeTab, openTab, pruneTabs, readTabs } from "./tabs";
+import { CHAT_HUES, chatHue } from "./sessions";
 
 describe("tabs", () => {
   it("opens, closes and picks the neighbour, and survives a bad store", () => {
@@ -22,5 +23,13 @@ describe("tabs", () => {
     expect(readTabs('{"a":1}')).toEqual([]);
     expect(readTabs('["a", 3, "b"]')).toEqual([]);
     expect(readTabs('["a","b","a"]')).toEqual(["a", "b"]);
+  });
+
+  it("gives each chat a stable colour from the palette", () => {
+    expect(chatHue("c-1")).toBe(chatHue("c-1"));
+    expect(CHAT_HUES).toContain(chatHue("c-1"));
+    // Not all one colour: a handful of ids spreads over more than one hue.
+    const hues = new Set(["c-1", "c-2", "c-3", "c-4", "c-5", "c-6"].map(chatHue));
+    expect(hues.size).toBeGreaterThan(2);
   });
 });

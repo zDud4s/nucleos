@@ -506,6 +506,7 @@ pub(crate) async fn ask_once(
         context_window: None,
         // Only ever read beside an `mcp_config`, and there is none.
         allowed_mcp_tools: None,
+        background_tasks: false,
     };
 
     // Throwaways: this reads neither. The receiver is bound rather than dropped on the spot, and

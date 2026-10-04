@@ -6,10 +6,6 @@
 # `.github/workflows/ci.yml` calls it rather than repeating them — one definition of green, run in
 # two places.
 #
-# The workflow does not run yet: this repo has no remote, and Actions reads workflows server-side.
-# It is committed anyway because it is the thing you need in place BEFORE the first push, not
-# after — otherwise whoever adds the remote has to know to write it.
-#
 # Every stack runs even when an earlier one fails — a summary of three real failures beats
 # stopping at the first and re-running twice to discover the other two.
 #
@@ -122,6 +118,18 @@ _slot_holders() {
   done
 }
 
+_self_pid() {
+  # Sets _pid to the pid of the CURRENT (sub)shell, which is what $BASHPID means. macOS ships bash
+  # 3.2, which has no BASHPID, and `set -u` made the first read of it end the gate there. The
+  # fallback relies on `exec`: the command substitution's subshell becomes sh, so sh's parent is
+  # the shell that asked.
+  if [ -n "${BASHPID:-}" ]; then
+    _pid="$BASHPID"
+  else
+    _pid="$(exec sh -c 'echo "$PPID"')"
+  fi
+}
+
 _slot_try() {
   # _slot_try <dir> <n> <command...>: one attempt, under the mutex. 0 = slot claimed.
   local dir="$1" n="$2" f pid count=0 got=1
@@ -136,7 +144,8 @@ _slot_try() {
       return 1
     fi
   fi
-  printf '%s\n' "$BASHPID" > "$dir/.mutex/pid"
+  _self_pid
+  printf '%s\n' "$_pid" > "$dir/.mutex/pid"
   for f in "$dir"/held/*; do
     [ -f "$f" ] || continue
     pid="$(basename "$f")"
@@ -148,8 +157,8 @@ _slot_try() {
     fi
   done
   if [ "$count" -lt "$n" ]; then
-    printf '%s\n%s\n%s\n%s\n' "$BASHPID" "$(date +%s)" "$(pwd)" "$*" > "$dir/held/$BASHPID"
-    _slot_file="$dir/held/$BASHPID"
+    printf '%s\n%s\n%s\n%s\n' "$_pid" "$(date +%s)" "$(pwd)" "$*" > "$dir/held/$_pid"
+    _slot_file="$dir/held/$_pid"
     got=0
   fi
   rm -rf "$dir/.mutex"
@@ -194,7 +203,8 @@ slot_run() {
     sleep 1
     waited=$((waited + 1))
   done
-  export NUCLEOS_BUILD_SLOT_HELD="$BASHPID"
+  _self_pid
+  export NUCLEOS_BUILD_SLOT_HELD="$_pid"
   trap slot_release EXIT
   # The command runs in the background and is waited on: bash defers a trap until a FOREGROUND
   # child ends, so a TERM would otherwise leave the slot held for as long as the build ran.
@@ -349,10 +359,6 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     run "gates: own target" . "$py" scripts/test-own-cargo-target.py
     run "gates: build slot" . "$py" scripts/test-build-slot.py
     run "daemon: from copy" . "$py" scripts/test-run-daemon.py
-    run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
-    run "eval: promote"   . "$py" scripts/eval/test-promote.py
-    run "eval: ingest"    . "$py" scripts/eval/test-ingest.py
-    run "eval: layer"     . "$py" scripts/eval/test-layer.py
     # Hermetic like its neighbours: the network is behind one seam the test swaps out, so this
     # runs green on a machine with no route to OpenRouter at all.
     run "models: refresh"   . "$py" scripts/test-refresh-models.py

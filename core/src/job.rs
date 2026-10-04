@@ -14707,7 +14707,7 @@ mod tests {
             .await
             .unwrap();
 
-        let note_id = crate::notes::leave(&pool, job_id, A_NOTE, "duarte")
+        let note_id = crate::notes::leave(&pool, job_id, A_NOTE, "helena")
             .await
             .expect("the owner leaves a note on a job already running");
 
@@ -14777,7 +14777,7 @@ mod tests {
         // caller last saw — matches nothing.
         seed_items(&pool, job_id, &["running"]).await;
 
-        let note_id = crate::notes::leave(&pool, job_id, A_NOTE, "duarte")
+        let note_id = crate::notes::leave(&pool, job_id, A_NOTE, "helena")
             .await
             .expect("the owner leaves a note on a job already running");
 

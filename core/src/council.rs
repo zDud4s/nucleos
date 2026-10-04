@@ -1794,6 +1794,7 @@ impl Driver {
             // The wildcard: a seat's `mcp_config` is written per council and already advertises
             // only `COUNCIL_TOOLS`, so there is nothing here left to narrow.
             allowed_mcp_tools: None,
+            background_tasks: false,
         };
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<SeatOutcome>();

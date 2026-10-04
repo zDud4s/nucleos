@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useState, type CSSProperties, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import {
   Archive,
@@ -43,6 +43,7 @@ import { BAND_TITLE, inBands } from "../lib/when";
 import {
   applyFilters,
   byGroup,
+  chatHue,
   countSessions,
   dotFor,
   type Dot,
@@ -119,16 +120,17 @@ function rowLabel(row: ChatSummary, live: boolean): string {
   return parts.join(", ");
 }
 
-/** The coloured state mark. Never the accent: see `reserved-cyan.test.ts`. */
-export function StateDot({ dot }: { dot: Dot | null }) {
-  if (dot === null) return <span className="chats-dot chats-dot-none" aria-hidden="true" />;
-  return (
-    <span
-      className={`chats-dot chats-dot-${dot}`}
-      role="img"
-      aria-label={DOT_NAME[dot]}
-    />
-  );
+/**
+ * The conversation's mark. Given `chatId`, it is filled with that chat's own colour (`chatHue`),
+ * the same on its row and on its tab, so the two can be matched at a glance; the state, when there
+ * is one, is then a ring around it. Never the accent: see `reserved-cyan.test.ts`.
+ */
+export function StateDot({ dot, chatId }: { dot: Dot | null; chatId?: string }) {
+  const own = chatId !== undefined;
+  const className = `chats-dot chats-dot-${dot ?? "none"}${own ? " chats-dot-chat" : ""}`;
+  const style = own ? ({ "--chat-hue": chatHue(chatId) } as CSSProperties) : undefined;
+  if (dot === null) return <span className={className} style={style} aria-hidden="true" />;
+  return <span className={className} style={style} role="img" aria-label={DOT_NAME[dot]} />;
 }
 
 export interface SessionColumnProps {
@@ -244,6 +246,15 @@ export function SessionColumn({
           <Plus className="chats-rail-icon" aria-hidden="true" />
           New session
         </button>
+        <button
+          type="button"
+          className="chats-rail-new chats-rail-new-group"
+          aria-expanded={naming}
+          onClick={() => setNaming(true)}
+        >
+          <Plus className="chats-rail-icon" aria-hidden="true" />
+          New group
+        </button>
       </div>
 
       <div className="chats-session-tools">
@@ -316,8 +327,9 @@ export function SessionColumn({
         </label>
       </div>
 
-      <div className="chats-session-groupbar">
-        {naming ? (
+      {/* Only while a group is being named; the button that opens it sits beside New session. */}
+      {naming && (
+        <div className="chats-session-groupbar">
           <input
             className="chats-group-name"
             aria-label="Group name"
@@ -333,13 +345,8 @@ export function SessionColumn({
               }
             }}
           />
-        ) : (
-          <button type="button" className="chats-group-new" onClick={() => setNaming(true)}>
-            <Plus className="chats-rail-icon" aria-hidden="true" />
-            New group
-          </button>
-        )}
-      </div>
+        </div>
+      )}
 
       <div className="chats-rail-scroll">
         {!answered && <p className="chats-loading">reading your conversations…</p>}
@@ -490,6 +497,7 @@ function ArchivedSection() {
         <ul className="chats-list" aria-label="Archived sessions">
           {list.map((chat) => (
             <li key={chat.chat_id} className="chats-row chats-session-archived">
+              <StateDot dot={null} chatId={chat.chat_id} />
               <span className="chats-row-title">{sessionTitle(chat)}</span>
               <button
                 type="button"
@@ -545,8 +553,8 @@ function SessionRow({
            to work too — that is the case an effect watching the id would sleep through. */
         onClick={onOpen}
       >
-        <StateDot dot={dot} />
-        <span className={said ? "chats-row-title" : "chats-row-title chats-row-unsaid"}>
+        <StateDot dot={dot} chatId={row.chat_id} />
+        <span className={said ?"chats-row-title" : "chats-row-title chats-row-unsaid"}>
           {name}
         </span>
         {row.last_activity !== null && (

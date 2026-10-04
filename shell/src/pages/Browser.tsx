@@ -59,19 +59,13 @@ import "./browser.css";
  * reachability was rejected; this page renders the one state the daemon
  * actually measures and says so, rather than inventing three.
  */
-export function Browser() {
+export function Browser({ embedded = false }: { embedded?: boolean } = {}) {
   const sessions = useBrowserSessions();
   const health = useBrowserHealth();
   const [chainDialogue, setChainDialogue] = useState<{ sessionId: number; chain: string[] } | null>(null);
 
-  return (
+  const body = (
     <>
-      <PageHeader
-        title="Browser"
-        headline={headline(sessions.data, health.data?.subsystem ?? null)}
-        actions={health.data?.subsystem == null ? undefined : <StateBadge domain="pillar" state={health.data.subsystem.status} />}
-      />
-
       <LiveSessions
         view={sessions}
         onReturned={(sessionId, chain) => setChainDialogue({ sessionId, chain })}
@@ -91,6 +85,32 @@ export function Browser() {
 
       <BrowserHealth health={health} />
     </>
+  );
+
+  if (embedded) return body;
+
+  return (
+    <>
+      <SessionsHeader />
+      {body}
+    </>
+  );
+}
+
+/**
+ * The sessions tab's header (headline plus the sidecar's badge), for `WebTabs`, which keeps the
+ * tab list outside both tabs. React Query dedups the queries it shares with the body.
+ */
+export function SessionsHeader() {
+  const sessions = useBrowserSessions();
+  const health = useBrowserHealth();
+
+  return (
+    <PageHeader
+      title="Web"
+      headline={headline(sessions.data, health.data?.subsystem ?? null)}
+      actions={health.data?.subsystem == null ? undefined : <StateBadge domain="pillar" state={health.data.subsystem.status} />}
+    />
   );
 }
 

@@ -13,7 +13,6 @@ import { ConversationChord } from "./ConversationChord";
 import { DictationProvider } from "./Dictation";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
-import { PaletteTrigger } from "./PaletteTrigger";
 import { QuotaNotch } from "./QuotaNotch";
 import { useNotchMode, useSetNotchMode } from "./notch-mode";
 import { useScreenLine } from "./screen-line";
@@ -144,13 +143,6 @@ function Frame() {
             people already know — the drawer is somewhere you choose to go, which
             is a lower claim on the footer than the emergency stop has.
           */}
-          {/*
-            First into the slot, and put here rather than in `Sidebar.tsx`: the
-            slot's own comment says that only whoever fills it knows where the
-            break falls, and the rail does not otherwise know a palette exists.
-            `Sidebar.tsx` stays untouched, and so does its twenty-five-case test.
-          */}
-          <PaletteTrigger />
           <NotificationsDrawer />
           <UpdateNotice />
           {/*

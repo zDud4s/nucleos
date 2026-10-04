@@ -132,6 +132,7 @@ export const keys = {
   waiting: {
     all: ["waiting"] as const,
     vcsRequests: ["waiting", "vcs-requests"] as const,
+    vcsWaiting: ["waiting", "vcs-waiting"] as const,
     count: ["waiting", "count"] as const,
     skippedItems: ["waiting", "skipped-items"] as const,
     refusedActions: ["waiting", "refused-actions"] as const,

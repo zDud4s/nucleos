@@ -35,10 +35,10 @@ jobs:
     steps:
       - id: pick
         env:
-          # THE switch. macOS minutes bill at a multiple on a private repository, so while this one is
-          # private macOS runs only where a merge decision is made: pull requests and master. The day
-          # the repository is public, set this to "true" and every push gets all three.
-          MACOS_ON_EVERY_PUSH: "false"
+          # THE switch. macOS minutes bill at a multiple on a private repository, which is why this was
+          # "false" (macOS only on pull requests and master) until the repository went public. Public
+          # minutes are free, so every push now gets all three. Set it back if the repository goes private.
+          MACOS_ON_EVERY_PUSH: "true"
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
         run: |

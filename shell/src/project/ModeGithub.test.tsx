@@ -992,14 +992,14 @@ describe("the remote", () => {
     const state = open();
 
     const section = await remote();
-    expect(section.textContent).toContain("duarte/nucleos");
+    expect(section.textContent).toContain("helena/nucleos");
     // The URL beside the slug, which is what somebody checks the slug against.
-    expect(section.textContent).toContain("git@github.com:duarte/nucleos.git");
+    expect(section.textContent).toContain("git@github.com:helena/nucleos.git");
 
     await waitFor(() => expect(state.githubReads).toHaveLength(2));
     expect([...state.githubReads].sort((a, b) => a.op.localeCompare(b.op))).toEqual([
-      { op: "pr_list", repo: "duarte/nucleos" },
-      { op: "run_list", repo: "duarte/nucleos" },
+      { op: "pr_list", repo: "helena/nucleos" },
+      { op: "run_list", repo: "helena/nucleos" },
     ]);
   });
 
@@ -1144,7 +1144,7 @@ describe("the remote", () => {
       githubListings: {
         pr_list: readOutcome("pr_list", "", {
           exit_code: 1,
-          output_tail: "could not resolve to a Repository with the name 'duarte/nucleos'",
+          output_tail: "could not resolve to a Repository with the name 'helena/nucleos'",
         }),
         run_list: readOutcome("run_list", "completed\tsuccess\tCI\tmaster\tpush\t9812345\t1m20s"),
       },
@@ -1167,7 +1167,7 @@ describe("the remote", () => {
     open({
       githubListings: {
         pr_list: readOutcome("pr_list", "", {
-          output_tail: "no open pull requests in duarte/nucleos",
+          output_tail: "no open pull requests in helena/nucleos",
         }),
         run_list: readOutcome("run_list", "completed\tsuccess\tCI\tmaster\tpush\t9812345\t1m20s"),
       },
@@ -1175,7 +1175,7 @@ describe("the remote", () => {
 
     const section = await remote();
     expect(section.textContent).toMatch(/answered and listed nothing/i);
-    expect(section.textContent).toContain("no open pull requests in duarte/nucleos");
+    expect(section.textContent).toContain("no open pull requests in helena/nucleos");
   });
 
   /** A project the roster has never heard of is the one refusal the mapping makes. */

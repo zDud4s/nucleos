@@ -2403,6 +2403,10 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // the chat and carries the control token, so narrowing what it is offered would
             // only take away tools it is entitled to call.
             allowed_mcp_tools: None,
+            // A person is watching, so a background task is worth launching even on the one-shot
+            // path where it dies with the turn. The live path (`start_live_chat`) keeps its process
+            // between turns and would have kept them anyway.
+            background_tasks: true,
         };
 
         // What this turn itself wrote into the model's prompt, priced off the request that is about
@@ -2497,11 +2501,15 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // answers, and this is a fact about ONE of them. `RunOutcome` is where the
                     // splitter already put the right turn's copy.
                     let compacted = o.compacted;
+                    // What the Chats window needs for its cache countdown and its model label,
+                    // read off the same stream.
+                    let cache_ttl = crate::runner::cache_ttl_from_stream(&o.stdout);
+                    let model = crate::runner::model_from_stream(&o.stdout);
                     // The tokens and the turn count too, which every other terminal write in the
                     // core already takes off the outcome and this one did not: a chat turn read back
                     // "none recorded" under numbers the runner had measured and handed it.
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, cache_ttl = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(o.exit_code)
                     .bind(&reply)
@@ -2518,6 +2526,8 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .bind(thought_tokens)
                     .bind(context_fill)
                     .bind(compacted)
+                    .bind(cache_ttl)
+                    .bind(&model)
                     .bind(&completed_at)
                     .bind(id)
                     .execute(&pool)
@@ -6671,6 +6681,7 @@ mod tests {
             session_name: None,
             context_window: None,
             allowed_mcp_tools: None,
+            background_tasks: false,
         }
     }
 
