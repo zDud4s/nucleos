@@ -2157,9 +2157,13 @@ fn heavy_wrapper_inner(segment: &str, cwd: Option<&Path>) -> Option<String> {
         if token == "--" {
             return (!after.is_empty()).then(|| after.to_owned());
         }
-        if matches!(token.as_str(), "--prio" | "--agent" | "--kind") {
+        if matches!(token.as_str(), "--prio" | "--agent" | "--kind" | "--wait-max") {
             let (_, after_value) = split_first_token(after)?;
             rest = after_value;
+            continue;
+        }
+        if ["--prio=", "--agent=", "--kind=", "--wait-max="].iter().any(|p| token.starts_with(p)) {
+            rest = after;
             continue;
         }
         if token.starts_with('-') {
@@ -7237,6 +7241,24 @@ mod tests {
             let got = classify_under(&policy, command);
             assert_eq!(got.decision.decision, "pending_approval", "{command}");
             assert_eq!(got.action_class, "unrecognized", "{command}");
+        }
+    }
+
+    /// The hook itself emits `--wait-max N` in every subagent rewrite, so the wrapper must see
+    /// through it (both spellings) exactly as it does `--prio`.
+    #[test]
+    fn heavy_wrapper_unwraps_wait_max() {
+        let workspace = Path::new(r"C:\work\repo");
+        let bare = classify_asked_for("cargo test -p nucleos-core foo", Some(workspace));
+        for command in [
+            "python C:/Projects/nucleos/scripts/heavy.py --prio 2 --wait-max 90 -- cargo test -p nucleos-core foo",
+            "python C:/Projects/nucleos/scripts/heavy.py --prio 2 --wait-max=90 -- cargo test -p nucleos-core foo",
+        ] {
+            let wrapped = classify_asked_for(command, Some(workspace));
+            assert_eq!(wrapped.decision.decision, "allow", "{command}");
+            assert_eq!(wrapped.decision.decision, bare.decision.decision, "{command}");
+            assert_eq!(wrapped.action_class, bare.action_class, "{command}");
+            assert_eq!(wrapped.action_class, "read-local", "{command}");
         }
     }
 

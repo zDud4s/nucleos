@@ -770,7 +770,36 @@ def _td_root() -> Path:
     return here.parent
 
 
-def injected_target_dir(argv: list[str], root: str) -> str | None:
+def _own_target_dir_config(argv: list[str], root: str, cwd: str | None) -> bool:
+    """The crate the child builds (its --manifest-path dir, else its cwd) has a `.cargo/config.toml`
+    setting a target-dir, in its own dir or an ancestor below the repo root."""
+    base = Path(cwd) if cwd else Path(root)
+    mp = _flag_values(_cargo_args(argv), "--manifest-path")
+    if mp:
+        m = Path(mp[-1])
+        m = m if m.is_absolute() else base / m
+        d = m.parent
+        # src-tauri owns its target dir (its own .cargo/config.toml), even where a checkout of it
+        # is not on disk to be read.
+        if "src-tauri" in Path(m.as_posix()).parts:
+            return True
+    else:
+        d = base
+    rootp = _real(root)
+    d = Path(_real(d))
+    while True:
+        if d == rootp:
+            return False
+        if _config_target_dir(d / ".cargo" / "config.toml"):
+            return True
+        if d.parent == d:
+            return False
+        d = d.parent
+        if rootp not in d.parents and d != rootp:
+            return False
+
+
+def injected_target_dir(argv: list[str], root: str, cwd: str | None = None) -> str | None:
     """The target dir the broker gives a cargo child that named none, or None."""
     if os.environ.get("NUCLEOS_HEAVY_TARGET") == "0" or not _is_cargo(argv):
         return None
@@ -778,12 +807,17 @@ def injected_target_dir(argv: list[str], root: str) -> str | None:
         return None
     if _flag_values(_cargo_args(argv), "--target-dir"):
         return None
+    if _own_target_dir_config(argv, root, cwd):
+        return None
     slug = ""
     try:
         out = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root,
                              capture_output=True, text=True, timeout=20)
         if out.returncode == 0:
-            slug = out.stdout.strip().replace("/", "-")
+            raw = out.stdout.strip()
+            if raw.startswith(("run/", "job/", "integration-")):
+                return None
+            slug = raw.replace("/", "-")
     except Exception:
         pass
     if slug in ("", "HEAD", "test", "gates", "gate"):
@@ -985,7 +1019,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
         inject = None
         if kind in ("cargo", "auto") and _is_cargo(argv):
             try:
-                inject = injected_target_dir(argv, root or worktree_root())
+                inject = injected_target_dir(argv, root or worktree_root(), os.getcwd())
             except Exception:
                 inject = None
         if not nested and not in_held and not held and kind in ("cargo", "auto"):
@@ -1235,7 +1269,7 @@ def _is_warm(argv: list[str], root: str, cwd: str, directory: Path) -> bool:
         if not found:
             return False
         crate = found[0]
-        inject = injected_target_dir(argv, root)
+        inject = injected_target_dir(argv, root, cwd)
         tdir = resolve_target_dir(argv, crate, root, cwd, inject)
         return registry_hit(directory, tdir, compute_fingerprint(argv, crate, root, tdir), root)
     except Exception:
