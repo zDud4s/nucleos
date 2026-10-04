@@ -2157,12 +2157,18 @@ fn heavy_wrapper_inner(segment: &str, cwd: Option<&Path>) -> Option<String> {
         if token == "--" {
             return (!after.is_empty()).then(|| after.to_owned());
         }
-        if matches!(token.as_str(), "--prio" | "--agent" | "--kind" | "--wait-max") {
+        if matches!(
+            token.as_str(),
+            "--prio" | "--agent" | "--kind" | "--wait-max"
+        ) {
             let (_, after_value) = split_first_token(after)?;
             rest = after_value;
             continue;
         }
-        if ["--prio=", "--agent=", "--kind=", "--wait-max="].iter().any(|p| token.starts_with(p)) {
+        if ["--prio=", "--agent=", "--kind=", "--wait-max="]
+            .iter()
+            .any(|p| token.starts_with(p))
+        {
             rest = after;
             continue;
         }
@@ -7256,7 +7262,10 @@ mod tests {
         ] {
             let wrapped = classify_asked_for(command, Some(workspace));
             assert_eq!(wrapped.decision.decision, "allow", "{command}");
-            assert_eq!(wrapped.decision.decision, bare.decision.decision, "{command}");
+            assert_eq!(
+                wrapped.decision.decision, bare.decision.decision,
+                "{command}"
+            );
             assert_eq!(wrapped.action_class, bare.action_class, "{command}");
             assert_eq!(wrapped.action_class, "read-local", "{command}");
         }
