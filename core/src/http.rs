@@ -1062,7 +1062,10 @@ struct Home {
 async fn get_home() -> Json<Home> {
     let dir = HOME.get().cloned().or_else(|| std::env::current_dir().ok());
     Json(Home {
-        root: dir.map(|dir| dir.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")),
+        root: dir.map(|dir| {
+            dir.to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        }),
     })
 }
 
