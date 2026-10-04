@@ -13,6 +13,7 @@ import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
 import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary, Proposal, QuotaBrakeView, SidecarState } from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
+import type { NoteDetail, NoteLink, NotesGraph, OwnerNote } from "../data/owner-notes";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
 import type { EmailConfigView, EmailDetail, QueuedEmail } from "../data/mail";
@@ -478,6 +479,46 @@ export const RECRUITS = [
     decided_at: null,
   },
 ];
+
+/*
+  The owner's notes. Enough of a graph to read: a note linked to a project and to a contact, two
+  notes linked to each other, one link whose mail target is gone (drawn as missing), and one
+  archived note that shows only when the page asks for archived ones.
+*/
+export const OWNER_NOTES: OwnerNote[] = [
+  { id: 1, text: "Alpha's release waits on the signing key, not on the tests.", origin: "shell", state: "active", created_at: ago(3 * DAY), updated_at: ago(3 * DAY) },
+  { id: 2, text: "Ask Rita whether the invoice run can move to Mondays.", origin: "telegram", state: "active", created_at: ago(2 * DAY), updated_at: ago(DAY) },
+  { id: 3, text: "The signing key sits with the accountant's backup, per the last call.", origin: "shell", state: "active", created_at: ago(DAY), updated_at: ago(DAY) },
+  { id: 4, text: "Old idea: a nightly digest by mail.", origin: "shell", state: "archived", created_at: ago(9 * DAY), updated_at: ago(5 * DAY) },
+];
+
+export const NOTE_LINKS: NoteLink[] = [
+  { id: 1, note_id: 1, link_type: "relates", target_kind: "project", target_ref: "alpha", created_at: ago(3 * DAY) },
+  { id: 2, note_id: 2, link_type: "relates", target_kind: "contact", target_ref: "rita@example.com", created_at: ago(2 * DAY) },
+  { id: 3, note_id: 3, link_type: "details", target_kind: "note", target_ref: "1", created_at: ago(DAY) },
+  { id: 4, note_id: 2, link_type: "supports", target_kind: "mail", target_ref: "48190", created_at: ago(DAY) },
+];
+
+export const NOTES_GRAPH: NotesGraph = {
+  notes: OWNER_NOTES.filter((note) => note.state === "active"),
+  links: NOTE_LINKS,
+  targets: [
+    { kind: "project", ref: "alpha", label: "alpha", missing: false },
+    { kind: "contact", ref: "rita@example.com", label: "Rita Matos", missing: false },
+    { kind: "mail", ref: "48190", label: null, missing: true },
+  ],
+};
+
+function noteDetail(id: number): NoteDetail | null {
+  const note = OWNER_NOTES.find((row) => row.id === id);
+  if (note === undefined) return null;
+  return {
+    note,
+    links_out: NOTE_LINKS.filter((link) => link.note_id === id),
+    links_in: NOTE_LINKS.filter((link) => link.target_kind === "note" && link.target_ref === String(id)),
+    events: [{ id: id * 10, note_id: id, kind: "created", detail: null, at: note.created_at }],
+  };
+}
 
 export const PROPOSALS: Proposal[] = [
   ...["alpha", "alpha", "alpha", "bravo", "bravo"].map((project_id, index) => ({
@@ -2389,6 +2430,7 @@ export function answer(path: string, init?: RequestInit): unknown {
       hotkey: "Ctrl+Shift+D",
       memo_hotkey: "Ctrl+Shift+M",
       conversation_hotkey: "",
+      capture_hotkey: "",
       /* Reads but does not speak: the half-configured machine is a real state
          and the one a single `armed` flag would hide. */
       speaks: false,
@@ -2657,6 +2699,21 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (splitQuery(path)[0] === "/judge-verdicts/unreviewed") {
     return JUDGE_VERDICTS[splitQuery(path)[1].get("project_id") ?? ""] ?? [];
   }
+  /* Matched on the route: every owner-notes read but the detail carries a query. */
+  if (splitQuery(path)[0] === "/owner-notes" && init?.method === undefined) {
+    const state = splitQuery(path)[1].get("state") ?? "active";
+    return state === "all" ? OWNER_NOTES : OWNER_NOTES.filter((note) => note.state === state);
+  }
+  if (splitQuery(path)[0] === "/owner-notes/search") {
+    const q = (splitQuery(path)[1].get("q") ?? "").toLowerCase();
+    return OWNER_NOTES.filter((note) => note.text.toLowerCase().includes(q));
+  }
+  if (splitQuery(path)[0] === "/owner-notes/graph") {
+    if (splitQuery(path)[1].get("include_archived") !== "true") return NOTES_GRAPH;
+    return { ...NOTES_GRAPH, notes: OWNER_NOTES } satisfies NotesGraph;
+  }
+  const ownerNote = /^\/owner-notes\/(\d+)$/.exec(path);
+  if (ownerNote !== null && init?.method === undefined) return noteDetail(Number(ownerNote[1]));
   if (path === "/proposals") return PROPOSALS;
   if (path === "/proposals/team-actions") return TEAM_ACTION_PROPOSALS;
   if (path === "/proposals/recruits") return RECRUITS;

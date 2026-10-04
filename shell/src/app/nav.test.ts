@@ -58,6 +58,8 @@ describe("the nav table", () => {
       // addition rather than folded in silently — the point of this file is
       // that the sidebar does not drift without somebody saying so.
       "Learned",
+      // The owner's own notes: an addition after the design, for the same reason as Learned.
+      "Brain",
     ]);
   });
 

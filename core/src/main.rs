@@ -67,6 +67,7 @@ mod notify;
 mod notify_policy;
 mod onboarding;
 mod openai_compatible;
+mod owner_notes;
 mod ownership;
 mod pii_shadow;
 mod presets;

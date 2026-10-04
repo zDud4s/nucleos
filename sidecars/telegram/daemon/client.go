@@ -87,6 +87,28 @@ func (c *Client) SendAssistantMessage(chatID, text string) (int64, error) {
 	return response.TurnID, nil
 }
 
+// CreateNote saves an owner note. Errors never carry text: a note is the owner's private writing.
+func (c *Client) CreateNote(text string) (int64, error) {
+	body, status, err := c.do(http.MethodPost, "/owner-notes", map[string]string{
+		"text":   text,
+		"origin": "telegram",
+	})
+	if err != nil {
+		return 0, fmt.Errorf("create note: %w", err)
+	}
+	if err := statusError("create note", status, body); err != nil {
+		return 0, err
+	}
+
+	var response struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return 0, fmt.Errorf("parse create note response: %w", err)
+	}
+	return response.ID, nil
+}
+
 func (c *Client) GetRun(id int64) (map[string]any, error) {
 	return c.getObject("get run", "/assistant/"+strconv.FormatInt(id, 10))
 }

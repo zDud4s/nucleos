@@ -1,0 +1,80 @@
+/**
+ * The Brain slice: the capture box, its filters and the note rows. `brain-` throughout.
+ * No class appears in the component that is not defined below.
+ */
+.brain-capture {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.brain-capture-label {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.brain-capture-input {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+}
+
+.brain-capture-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brain-filters {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.brain-search {
+  min-width: 220px;
+  font: inherit;
+}
+
+.brain-row {
+  display: block;
+}
+
+.brain-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.brain-meta {
+  display: flex;
+  gap: 12px;
+  margin-top: 4px;
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.brain-origin,
+.brain-state {
+  text-transform: lowercase;
+}
+
+/* The graph side: a bar above the canvas, the canvas, and the panel beside it. */
+.brain-graph { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 12px; }
+.brain-canvas-wrap { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.brain-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.brain-legend { display: flex; gap: 12px; margin: 0; padding: 0; list-style: none; font-size: 11px; }
+.brain-canvas { height: 560px; }
+.brain-node { width: 190px; padding: 4px 8px; border: 1px solid currentColor; border-radius: 4px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+.brain-node-note { width: 250px; min-height: 92px; }
+.brain-node-text { margin: 0; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.brain-node-selected { outline: 2px solid currentColor; }
+.brain-node-missing { opacity: 0.5; border-style: dashed; }
+.brain-node-tag { margin-left: 6px; font-size: 10px; text-transform: uppercase; }
+.brain-panel { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.brain-panel ul { margin: 0; padding-left: 16px; }
+.brain-panel-form { display: flex; flex-wrap: wrap; gap: 6px; }

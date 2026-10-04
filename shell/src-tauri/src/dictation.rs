@@ -52,6 +52,11 @@ const STOP_EVENT: &str = "voice://stop";
 /// window is not focused — and gets out of the way.
 const CONVERSATION_EVENT: &str = "voice://conversation-toggle";
 
+/// Emitted when the Brain capture chord is pressed. Like the conversation chord, the work happens in
+/// the webview (`shell/src/app/CaptureChord.tsx` opens the Brain and focuses its capture box); this
+/// process only brings the window forward, since the chord is global and the window may be hidden.
+const CAPTURE_EVENT: &str = "brain://capture";
+
 /// What the shell is doing right now, and which window it promised the text to.
 #[derive(Default)]
 pub struct Dictation {
@@ -785,8 +790,9 @@ pub fn voice_register_hotkeys(
     dictation: String,
     memo: String,
     conversation: String,
+    capture: String,
 ) -> Vec<String> {
-    register_hotkeys(&app, &dictation, &memo, &conversation)
+    register_hotkeys(&app, &dictation, &memo, &conversation, &capture)
 }
 
 fn poisoned() -> String {
@@ -863,6 +869,7 @@ fn register_hotkeys(
     dictation: &str,
     memo: &str,
     conversation: &str,
+    capture: &str,
 ) -> Vec<String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
@@ -875,6 +882,7 @@ fn register_hotkeys(
         (dictation, Chord::Dictation),
         (memo, Chord::Memo),
         (conversation, Chord::Conversation),
+        (capture, Chord::Capture),
     ] {
         if chord.trim().is_empty() {
             continue;
@@ -896,6 +904,16 @@ fn register_hotkeys(
                             eprintln!("[voice] could not toggle conversation: {error}");
                         }
                     }
+                    Chord::Capture => {
+                        // The default window label: `tauri.conf.json` names none.
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                        if let Err(error) = app.emit(CAPTURE_EVENT, ()) {
+                            eprintln!("[voice] could not open the brain capture: {error}");
+                        }
+                    }
                     Chord::Dictation | Chord::Memo => {
                         let state = app.state::<Dictation>();
                         let is_memo = chord_kind == Chord::Memo;
@@ -912,7 +930,7 @@ fn register_hotkeys(
     refused
 }
 
-/// Which of the three chords fired.
+/// Which of the four chords fired.
 ///
 /// A third enum rather than a third `Kind`, because these are not three of the same thing: two of
 /// them start a recording this process owns, and the third toggles a mode it does not. Folding them
@@ -923,6 +941,7 @@ enum Chord {
     Dictation,
     Memo,
     Conversation,
+    Capture,
 }
 
 #[cfg(test)]
