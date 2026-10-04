@@ -57,7 +57,10 @@ HOLD = 'touch "$1"; while [ ! -e "$2" ]; do sleep 0.2; done'
 
 def env_for(slots_dir: Path, **extra: str) -> dict:
     env = dict(os.environ)
-    env.pop("NUCLEOS_BUILD_SLOT_HELD", None)
+    # The machine's own tuning must not reach the tests: a user-level NUCLEOS_BUILD_SLOTS=4 let a
+    # third holder run beside two that were meant to fill every slot.
+    for name in ("NUCLEOS_BUILD_SLOT_HELD", "NUCLEOS_BUILD_SLOTS", "NUCLEOS_BUILD_SLOT_TIMEOUT"):
+        env.pop(name, None)
     env["NUCLEOS_BUILD_SLOTS_DIR"] = slots_dir.as_posix()
     env["NUCLEOS_HEAVY_MAIN"] = Path(NO_BROKER).as_posix()
     env.update(extra)
