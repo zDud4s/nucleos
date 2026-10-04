@@ -599,6 +599,7 @@ pub fn build_router(state: AppState) -> Router {
         // per row in the list.
         .route("/assistant/models", get(get_assistant_models))
         .route("/assistant/models/groups", get(get_model_groups))
+        .route("/models/latest", get(get_latest_models))
         .route("/assistant/tools", get(get_deniable_tools))
         .route("/assistant/commands", get(get_commands))
         .route("/assistant/chats", get(list_chats).post(create_chat))
@@ -13015,6 +13016,27 @@ async fn get_assistant_models(
         // sync `catalogue()`, and there is nothing for the network read to add here.
         "efforts": config.effort_levels(),
     }))
+}
+
+/// Query parameters for `GET /models/latest`.
+#[derive(serde::Deserialize)]
+struct LatestModelsQuery {
+    vendor: Option<String>,
+}
+
+/// The newest models per vendor, for the `latest_models` agent tool. The same snapshot the picker
+/// serves, so there is one list; `current()` only waits on the process's very first call.
+async fn get_latest_models(
+    Query(query): Query<LatestModelsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let snapshot = crate::model_catalog::current().await;
+    match crate::model_catalog::latest(&snapshot, query.vendor.as_deref()) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
 }
 
 /// The picker as groups: provider and family, newest first, named as a person reads them.
@@ -28936,6 +28958,27 @@ mod tests {
             crate::config::EFFORT_LEVELS.len()
         );
         assert!(body["configured"].is_string());
+    }
+
+    /// The agents' `latest_models` read: both vendors by default, one on request, a 400 naming the
+    /// valid vendors otherwise. No network in a test daemon, so it is the built-in catalogue.
+    #[tokio::test]
+    async fn latest_models_route_answers_per_vendor_and_refuses_an_unknown_vendor() {
+        let state = test_state().await;
+
+        let (status, body) = call(state.clone(), "GET", "/models/latest", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["vendors"].as_array().unwrap().len(), 2);
+        assert_eq!(body["vendors"][0]["source"], "fallback");
+
+        let (status, body) = call(state.clone(), "GET", "/models/latest?vendor=openai", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["vendors"].as_array().unwrap().len(), 1);
+        assert_eq!(body["vendors"][0]["vendor"], "openai");
+
+        let (status, body) = call(state, "GET", "/models/latest?vendor=google", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("anthropic"));
     }
 
     /// The grouped picker: provider and family groups, product names for labels, the version of

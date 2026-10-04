@@ -3151,7 +3151,12 @@ describe("Chats - the route and the sidebar badge", () => {
     // nothing about whether `/chats` is in the real tree.
     const { router } = await renderApp({ initialPath: "/chats" });
 
-    expect(await screen.findByRole("heading", { level: 1, name: "Chats" })).toBeDefined();
+    // The heading is for the outline only: the header band that drew "Chats" is gone, and so is
+    // the "Find a conversation" button that sat in it — Ctrl+K is the way to the finder now.
+    const pageHeading = await screen.findByRole("heading", { level: 1, name: "Chats" });
+    expect(pageHeading.className).toContain("sr-only");
+    expect(document.querySelector(".chats-app .ui-page-header")).toBeNull();
+    expect(screen.queryByRole("button", { name: /find a conversation/i })).toBeNull();
     expect(router.state.location.pathname).toBe("/chats");
     expect(screen.queryByText("Chats is not built yet")).toBeNull();
 
@@ -3182,19 +3187,15 @@ describe("Chats - the route and the sidebar badge", () => {
 
 describe("Chats - what the page is about", () => {
   /**
-   * The heading rank belongs to the page's SUBJECT.
+   * No header band: the tabs strip is the top row of the page.
    *
-   * Every conversation in this app answered to the heading "Chats", which is the one
-   * thing the person who has just clicked a conversation already knows. What tells this
-   * conversation from the twenty above it is its name, and that was a `--text-lg` line
-   * two ranks down, under a heading that never changed.
-   *
-   * The name stays a control, which is the reason this header is composed out of the
-   * shared `ui-page-*` classes rather than through `PageHeader`: that component takes a
-   * `string`, and clicking the title to rename it is the affordance this page was built
-   * with.
+   * The band said "Chats" over a page whose subject was the conversation on it, then said the
+   * conversation's name a second time beside the tab that already named it. What it carried that
+   * mattered — where the conversation runs, its chips and its `⋯` — rides at the end of the tabs
+   * strip now, and the rename it was is an item in that menu. The heading rank still belongs to the
+   * subject, said to the outline only.
    */
-  it("the open conversation is the page's heading", async () => {
+  it("starts the page with the tabs strip, not a header band", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1", title: "arranja o parser de datas" })], {
         "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
@@ -3206,18 +3207,28 @@ describe("Chats - what the page is about", () => {
       level: 1,
       name: "arranja o parser de datas",
     });
-    expect(heading.className).toContain("chats-head-title");
-    // The band is the shared one, so this page's top is the same object as every other
-    // page's — the composition is local, the rules are not.
-    expect(heading.closest(".ui-page-header")).not.toBeNull();
-    // And the words the heading used to spend itself on are the crumb back to the list.
-    const crumb = document.querySelector(".chats-crumb");
-    expect(within(crumb as HTMLElement).getByRole("link", { name: "Chats" })).toBeDefined();
+    expect(heading.className).toContain("sr-only");
+    expect(document.querySelector(".chats-app .ui-page-header")).toBeNull();
+    expect(screen.queryByRole("link", { name: "Chats" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /find a conversation/i })).toBeNull();
 
-    // Still a rename control, and the rename's own label has not become the heading's.
+    // The tabs are the first row of the conversation pane, and the open one is selected.
+    const strip = await screen.findByRole("tablist", { name: "Open conversations" });
+    expect(strip.parentElement?.className).toBe("chats-topbar");
     expect(
-      within(heading).getByRole("button", { name: /^Rename this conversation/ }),
-    ).toBeDefined();
+      within(strip).getByRole("tab", { name: /arranja o parser de datas/ }).getAttribute("aria-selected"),
+    ).toBe("true");
+    // The conversation's settings ride at the strip's end.
+    const more = await screen.findByRole("button", { name: "Conversation settings" });
+    expect(more.closest(".chats-topbar-actions")).not.toBeNull();
+
+    // And renaming is still possible, from the menu, seeded with the current name.
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Rename" }));
+    const dialog = await screen.findByRole("dialog", { name: "Rename conversation" });
+    expect(
+      (within(dialog).getByRole("textbox", { name: "Conversation title" }) as HTMLInputElement).value,
+    ).toBe("arranja o parser de datas");
   });
 });
 
@@ -3304,10 +3315,14 @@ describe("the editor's sessions, in the same list as the rest", () => {
       .find({ queryKey: keys.chats.ideSessions, exact: true });
     if (query === undefined) throw new Error("the editor's sessions were never asked for");
     // See the note in the transcript's own cadence test: `refetchInterval` lives on the observer's
-    // options, which is not what `Query.options` is typed as.
-    const interval = (query.options as { refetchInterval?: number | false }).refetchInterval;
+    // options, which is not what `Query.options` is typed as. Asked of every observer rather than of
+    // `Query.options`, which is only whichever observer mounted last — the list is first on the
+    // page, so a reader further down that does not poll would otherwise answer for it.
+    const intervals = query.observers.map(
+      (observer) => (observer.options as { refetchInterval?: number | false }).refetchInterval,
+    );
 
-    expect(interval).toBe(POLL.fast);
+    expect(intervals).toContain(POLL.fast);
   });
 
   // The list already carried the fact and nothing read it: a conversation somebody is typing into
@@ -4509,7 +4524,7 @@ describe("Chats - what the header says without being asked", () => {
 });
 
 describe("Chats - closing the list", () => {
-  it("hides the conversations and moves the unseen count onto the button that brings them back", async () => {
+  it("hides the conversations from the list's own header and brings them back from the tabs strip", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
         [chatSummary({ chat_id: "c-1", waiting: 3 }), chatSummary({ chat_id: "c-2", waiting: 2 })],
@@ -4520,11 +4535,21 @@ describe("Chats - closing the list", () => {
     await renderChats("/chats/c-1");
     await screen.findByRole("list", { name: "Conversations" });
 
-    fireEvent.click(screen.getByRole("button", { name: "Hide conversations" }));
+    // An icon in the list's own header row, beside New session, named and titled in words.
+    const hide = screen.getByRole("button", { name: "Hide conversations" });
+    expect(hide.getAttribute("title")).toBe("Hide conversations");
+    expect(hide.closest(".chats-rail-actions")).not.toBeNull();
+    fireEvent.click(hide);
 
     expect(screen.queryByRole("list", { name: "Conversations" })).toBeNull();
-    // Five answers landed across two conversations, and the list they are in is shut.
-    expect(await screen.findByRole("button", { name: "Conversations, 5 unseen" })).toBeDefined();
+    // Five answers landed across two conversations, and the list they are in is shut. The way
+    // back sits where the tabs strip starts, so a closed list is never a dead end.
+    const show = await screen.findByRole("button", { name: "Show conversations, 5 unseen" });
+    expect(show.closest(".chats-topbar")).not.toBeNull();
+    fireEvent.click(show);
+
+    expect(await screen.findByRole("list", { name: "Conversations" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: /^Show conversations/ })).toBeNull();
   });
 });
 

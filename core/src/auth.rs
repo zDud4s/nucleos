@@ -594,6 +594,9 @@ const COUNCIL_ROUTES: &[(Method, &str)] = &[
     // person convenes one to ask about.
     (Method::GET, "/autopilot/budget"),
     (Method::GET, "/autopilot/kill"),
+    // The public model catalogue, for `latest_models`: no owner data in it, and a seat asked which
+    // model to use should not answer from its training data.
+    (Method::GET, "/models/latest"),
     (Method::GET, "/email/queue"),
     (Method::GET, "/email/{id}"),
     (Method::GET, "/files"),
@@ -675,6 +678,9 @@ const TEAM_ROUTES: &[(Method, &str)] = &[
     // a DOING, which is the rule this table keeps: nothing runs, nothing is spent, and the daemon
     // chooses the destination from a column the department cannot read or set.
     (Method::POST, "/team-reports"),
+    // The public model catalogue (`latest_models`), so a director naming a model for a teammate
+    // does not guess from training data. Read-only and carries nothing of the owner's.
+    (Method::GET, "/models/latest"),
     (Method::GET, "/email/queue"),
     (Method::GET, "/email/{id}"),
     (Method::GET, "/files"),
@@ -1016,6 +1022,7 @@ mod tests {
             .route("/autopilot/state", get(|| async {}).post(|| async {}))
             .route("/autopilot/kill", get(|| async {}).post(|| async {}))
             .route("/autopilot/budget", get(|| async {}).post(|| async {}))
+            .route("/models/latest", get(|| async {}))
             .route("/projects", get(|| async {}))
             .route("/projects/{id}/cat", get(|| async {}))
             .route("/feed", get(|| async {}))
@@ -2179,6 +2186,7 @@ mod tests {
             "/email/queue",
             "/runs/7",
             "/files",
+            "/models/latest",
         ] {
             assert_ne!(
                 status_of(&app, "GET", path, &token).await,
@@ -2491,6 +2499,7 @@ mod tests {
         const TOOL_ROUTES: &[(&str, Method, &str)] = &[
             ("get_email", Method::GET, "/email/{id}"),
             ("get_email_queue", Method::GET, "/email/queue"),
+            ("latest_models", Method::GET, "/models/latest"),
             ("list_files", Method::GET, "/files"),
             ("propose_action", Method::POST, "/team-actions"),
             ("propose_teammate", Method::POST, "/team-recruits"),

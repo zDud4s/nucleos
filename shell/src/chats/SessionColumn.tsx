@@ -5,6 +5,7 @@ import {
   ArchiveRestore,
   ListFilter,
   MoreHorizontal,
+  PanelRightClose,
   Plus,
   Search,
   SquareCode,
@@ -37,7 +38,7 @@ import {
   type ChatSummary,
   type IdeSession,
 } from "../data/chats";
-import { ErrorNote, RelativeTime, Teach, relativeText } from "../ui";
+import { ErrorNote, IconButton, RelativeTime, Teach, relativeText } from "../ui";
 import { stillGoing } from "../lib/editor";
 import { BAND_TITLE, inBands } from "../lib/when";
 import {
@@ -144,6 +145,11 @@ export interface SessionColumnProps {
   /** Told before a `<Link>` navigates, so the editor preview does not outlive the press. */
   onOpenChat: () => void;
   onNew: () => void;
+  /**
+   * Folds the column away. Optional, because the column does not own whether it is shown: the page
+   * does, and draws the way back at the start of its tabs strip.
+   */
+  onHide?: () => void;
   openTabs: string[];
 }
 
@@ -156,6 +162,7 @@ export function SessionColumn({
   onPickUp,
   onOpenChat,
   onNew,
+  onHide,
   openTabs,
 }: SessionColumnProps) {
   // Watched, because one of these may be being typed into in the editor while it is on screen here.
@@ -255,6 +262,10 @@ export function SessionColumn({
           <Plus className="chats-rail-icon" aria-hidden="true" />
           New group
         </button>
+        {/* At the column's inner edge, beside the conversation it gives the width back to. */}
+        {onHide !== undefined && (
+          <IconButton label="Hide conversations" icon={PanelRightClose} onClick={onHide} />
+        )}
       </div>
 
       <div className="chats-session-tools">
