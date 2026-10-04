@@ -756,8 +756,8 @@ def _config_target_dir(path: Path) -> str | None:
 
 
 def _td_root() -> Path:
-    """Where the per-worktree target dirs live: NUCLEOS_HEAVY_TD_ROOT, else the parent of the
-    main checkout (where `--land` looks for `.cargo-target-<name>`)."""
+    """Where the pool's target dirs (`.cargo-target-pool-<k>`) live: NUCLEOS_HEAVY_TD_ROOT,
+    else the parent of the main checkout."""
     env = os.environ.get("NUCLEOS_HEAVY_TD_ROOT")
     if env:
         return Path(env)
@@ -803,7 +803,9 @@ def _own_target_dir_config(argv: list[str], root: str, cwd: str | None) -> bool:
 
 
 def injected_target_dir(argv: list[str], root: str, cwd: str | None = None) -> str | None:
-    """The target dir the broker gives a cargo child that named none, or None."""
+    """Whether a cargo child that named no target dir gets one from the broker's pool: the
+    root the pool dirs live in when it does, else None. WHICH pool dir is decided by a lease
+    (`lease_slot`), not here."""
     if os.environ.get("NUCLEOS_HEAVY_TARGET") == "0" or not _is_cargo(argv):
         return None
     if os.environ.get("CARGO_TARGET_DIR") or os.environ.get("CARGO_BUILD_TARGET_DIR"):
@@ -812,20 +814,190 @@ def injected_target_dir(argv: list[str], root: str, cwd: str | None = None) -> s
         return None
     if _own_target_dir_config(argv, root, cwd):
         return None
-    slug = ""
     try:
         out = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root,
                              capture_output=True, text=True, timeout=20)
-        if out.returncode == 0:
-            raw = out.stdout.strip()
-            if raw.startswith(("run/", "job/", "integration-")):
-                return None
-            slug = raw.replace("/", "-")
+        if out.returncode == 0 and out.stdout.strip().startswith(("run/", "job/", "integration-")):
+            return None  # daemon-owned branches keep the daemon's own target dir
     except Exception:
         pass
-    if slug in ("", "HEAD", "test", "gates", "gate"):
-        slug = os.path.basename(os.path.normpath(root))
-    return str(_td_root() / f".cargo-target-{slug}")
+    return str(_td_root())
+
+
+# ------------------------------------------------------------------ target-dir pool
+# WHY a pool: one `.cargo-target-<branch>` per branch grew without bound (a full debug tree
+# per branch ever built) and filled the disk. A FIXED set of N dirs bounds the disk at N
+# trees, and affinity keeps a worktree on the dir it built last so it stays warm.
+# A slot is leased EXCLUSIVELY (two checkouts building into one target dir at once rebuild
+# each other's artifacts and run binaries compiled from the other tree). Lease records live
+# in the broker's state dir, never under the td root.
+
+
+def target_slots() -> int:
+    try:
+        return max(1, int(os.environ.get("NUCLEOS_HEAVY_TARGET_SLOTS") or 3))
+    except ValueError:
+        return 3
+
+
+def slot_dir(k: int) -> Path:
+    return _td_root() / f".cargo-target-pool-{k}"
+
+
+def _slot_file(directory: Path, k: int) -> Path:
+    return directory / "target-slots" / f"{k}.json"
+
+
+def _read_slot(directory: Path, k: int) -> dict:
+    try:
+        rec = json.loads(_slot_file(directory, k).read_text(encoding="utf-8"))
+        return rec if isinstance(rec, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _slot_busy(rec: dict) -> bool:
+    pid = rec.get("pid")
+    return bool(pid) and is_alive(pid, rec.get("ctime"))
+
+
+def _same_wt(a, b) -> bool:
+    return bool(a) and bool(b) and _real(a) == _real(b)
+
+
+def affinity_slot(directory: Path, worktree: str) -> int | None:
+    """The slot this worktree used last (busy or not), or None: the only slot whose
+    registry entry can be a fingerprint hit for it."""
+    best = None
+    for k in range(1, target_slots() + 1):
+        rec = _read_slot(directory, k)
+        if _same_wt(rec.get("last_worktree"), worktree):
+            if best is None or float(rec.get("acquired") or 0) > best[1]:
+                best = (k, float(rec.get("acquired") or 0))
+    return best[0] if best else None
+
+
+def try_lease_slot(directory: Path, worktree: str, only: int | None = None):
+    """Lease a free slot (a dead holder's lease counts as free). Affinity: this worktree's
+    last slot, else a never-used one, else the least recently used. Returns
+    (k, path, previous last_worktree) or None when every candidate is busy."""
+    me = os.getpid()
+    _, ctime = proc_identity(me)
+    with Mutex(directory):
+        (directory / "target-slots").mkdir(parents=True, exist_ok=True)
+        free = []
+        for k in range(1, target_slots() + 1):
+            if only is not None and k != only:
+                continue
+            rec = _read_slot(directory, k)
+            if not _slot_busy(rec):
+                free.append((k, rec))
+        if not free:
+            return None
+
+        def rank(item):
+            k, rec = item
+            if _same_wt(rec.get("last_worktree"), worktree):
+                return (0, -float(rec.get("acquired") or 0), k)
+            if not rec.get("last_worktree"):
+                return (1, 0.0, k)
+            return (2, float(rec.get("acquired") or 0), k)
+
+        k, old = min(free, key=rank)
+        prev = old.get("last_worktree")
+        path = _slot_file(directory, k)
+        tmp = path.with_name(f"{path.name}.{me}.tmp")
+        tmp.write_text(json.dumps({
+            "pid": me, "ctime": ctime, "worktree": worktree, "acquired": time.time(),
+            "last_worktree": worktree, "prev_worktree": prev,
+        }), encoding="utf-8")
+        os.replace(tmp, path)
+    return k, str(slot_dir(k)), prev
+
+
+def any_slot_free(directory: Path) -> bool:
+    return any(not _slot_busy(_read_slot(directory, k)) for k in range(1, target_slots() + 1))
+
+
+def lease_slot_wait(directory: Path, worktree: str, cap: float):
+    """Blocking lease (for callers that hold no token): poll until a slot is free or `cap`
+    seconds pass. Returns the lease, or None on timeout."""
+    poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
+    t0 = last = time.time()
+    while True:
+        got = try_lease_slot(directory, worktree)
+        if got is not None:
+            return got
+        now = time.time()
+        if now - t0 >= cap:
+            sys.stderr.write(f"heavy: waited {int(now - t0)}s for a free cargo target slot; "
+                             "nothing was compiled - try again, re-run with the Bash tool "
+                             "timeout set to 600000\n")
+            return None
+        if now - last >= 30:
+            last = now
+            sys.stderr.write(f"heavy: waiting {int(now - t0)}s for a free cargo target slot\n")
+        time.sleep(poll)
+
+
+def release_slot(directory: Path, lease) -> None:
+    """Free the lease, keeping last_worktree for affinity. Never raises."""
+    if not lease:
+        return
+    try:
+        k = lease[0]
+        with Mutex(directory):
+            rec = _read_slot(directory, k)
+            if rec.get("pid") != os.getpid():
+                return
+            path = _slot_file(directory, k)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({
+                "pid": None, "last_worktree": rec.get("last_worktree"),
+                "acquired": rec.get("acquired"), "released": time.time(),
+            }), encoding="utf-8")
+            os.replace(tmp, path)
+    except Exception as exc:
+        sys.stderr.write(f"heavy: could not release the target slot: {exc}\n")
+
+
+def prepare_slot(directory: Path, lease, worktree: str, program: str, cwd: str) -> None:
+    """On an owner change, clean this workspace's own members out of the slot before the new
+    owner builds. WHY: cargo reuses a workspace member's artifact across checkouts when no
+    source is newer than it (mtime-based freshness; see scripts/test-own-cargo-target.py), so
+    worktree B could run a binary compiled from worktree A's sources. Dependencies are keyed
+    by content and stay. If the clean cannot be done, the whole slot dir goes."""
+    _, path, prev = lease
+    if not prev or _same_wt(prev, worktree):
+        return  # first use, or the same worktree coming back to its own slot
+    registry_forget(directory, path)
+    env = dict(os.environ)
+    env.pop("CARGO_BUILD_TARGET_DIR", None)
+    env["CARGO_TARGET_DIR"] = path
+    if not os.path.dirname(program):
+        program = shutil.which(program, path=env.get("PATH")) or program
+    ok = False
+    try:
+        md = subprocess.run([program, "metadata", "--no-deps", "--format-version", "1"],
+                            cwd=cwd, env=env, capture_output=True, timeout=300)
+        if md.returncode == 0:
+            data = json.loads(md.stdout.decode("utf-8", "replace"))
+            members = set(data.get("workspace_members") or [])
+            names = sorted({p.get("name") for p in data.get("packages") or []
+                            if p.get("id") in members and p.get("name")})
+            ok = bool(names)
+            for name in names:
+                r = subprocess.run([program, "clean", "-p", name], cwd=cwd, env=env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=600)
+                if r.returncode != 0:
+                    ok = False
+                    break
+    except Exception:
+        ok = False
+    if not ok:
+        sys.stderr.write(f"heavy: could not clean {path} for its new owner; removing it\n")
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def resolve_target_dir(argv: list[str], crate: Path, root: str, cwd: str,
@@ -979,6 +1151,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
     t_start = time.time()
     fp = None  # (crate dir, target dir, fingerprint) once computed
     hit = False
+    lease = None  # (k, slot dir, previous owner) of a leased target-dir pool slot
     root = None
     try:
         if held:
@@ -1020,11 +1193,23 @@ def broker_run(args: list[str], held: bool = False) -> int:
         # side, and expects them to share the machine budget rather than serialise).
         crate, named = None, False
         inject = None
-        if kind in ("cargo", "auto") and _is_cargo(argv):
+        pool = False  # eligible for a leased pool dir
+        try:
+            if kind in ("cargo", "auto") and _is_cargo(argv):
+                pool = injected_target_dir(argv, root or worktree_root(), os.getcwd()) is not None
+            elif held:
+                # hold-worktree leases one slot for the whole held run and exports it, so the
+                # nested cargo calls see CARGO_TARGET_DIR and take no second slot.
+                pool = injected_target_dir(["cargo"], root or worktree_root(),
+                                           os.getcwd()) is not None
+        except Exception:
+            pool = False
+        wt = None
+        if pool:
             try:
-                inject = injected_target_dir(argv, root or worktree_root(), os.getcwd())
+                wt = worktree_root()
             except Exception:
-                inject = None
+                pool = False
         if not nested and not in_held and not held and kind in ("cargo", "auto"):
             # A cargo build/test of a crate we can name shares that worktree's target dir
             # state, so it is serialised by the worktree lock as well.
@@ -1047,10 +1232,19 @@ def broker_run(args: list[str], held: bool = False) -> int:
                 lock_hash = None
                 _log_timeout(directory, agent, prio, kind, weight, wait_lock, argv)
                 return EXIT_QUEUE_TIMEOUT
-        if crate is not None and not nested and not held:
-            # Order: lock -> fingerprint -> token. Fail-open: no fingerprint, no hit.
+        cand = None
+        if pool and crate is not None and not nested and not held:
+            # A hit can only be in the slot this worktree used last.
             try:
-                tdir = resolve_target_dir(argv, crate, root, os.getcwd(), inject)
+                cand = affinity_slot(directory, wt)
+            except Exception:
+                cand = None
+        if crate is not None and not nested and not held and (cand is not None or not pool):
+            # Order: lock -> fingerprint -> token. Fail-open: no fingerprint, no hit. A pool run
+            # with no slot of its own yet gets its fingerprint once it has leased one.
+            try:
+                tdir = resolve_target_dir(argv, crate, root, os.getcwd(),
+                                          str(slot_dir(cand)) if cand is not None else None)
                 fp = (crate, tdir, compute_fingerprint(argv, crate, root, tdir))
                 hit = registry_hit(directory, tdir, fp[2], root)
                 if hit and lock_hash is None and not in_held:
@@ -1071,6 +1265,20 @@ def broker_run(args: list[str], held: bool = False) -> int:
                 fp = None
                 hit = False
                 sys.stderr.write(f"heavy: no fingerprint: {exc}\n")
+        if hit and pool:
+            # A hit still leases its slot (exclusive), and only counts while the slot is
+            # still this worktree's: if somebody else holds or took it, it is a miss.
+            try:
+                lease = try_lease_slot(directory, wt, only=cand)
+                if (lease is None or not _same_wt(lease[2], wt)
+                        or not registry_hit(directory, fp[1], fp[2], root)):
+                    release_slot(directory, lease)
+                    lease = None
+                    hit = False
+            except Exception:
+                release_slot(directory, lease)
+                lease = None
+                hit = False
         if hit:
             weight = 0
             # A weight-0 run never visits the queue, so it reaps dead entries itself.
@@ -1095,15 +1303,83 @@ def broker_run(args: list[str], held: bool = False) -> int:
             env = dict(os.environ)
             env.pop("NUCLEOS_HEAVY_TOKEN", None)
         else:
-            admitted, wait_token = acquire_token(directory, rec, cap, arrival)
-            if not admitted:
-                _release_all(directory, lock_hash, False)
-                lock_hash = None
-                _log_timeout(directory, agent, prio, kind, weight, wait_lock + wait_token, argv)
-                return EXIT_QUEUE_TIMEOUT
-            holding = True
+            # Token first, then a slot. When every slot is busy the token is handed back while
+            # waiting (a slot waiter must not hold machine budget a slot holder's nested call
+            # may need), then the request re-queues at its original arrival.
+            t_q = time.time()
+            arrival_q = arrival or time.time_ns()
+            poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
+            while True:
+                admitted, _ = acquire_token(directory, rec, max(0.0, cap - (time.time() - t_q)),
+                                            arrival_q)
+                if not admitted:
+                    _release_all(directory, lock_hash, False)
+                    lock_hash = None
+                    _log_timeout(directory, agent, prio, kind, weight,
+                                 wait_lock + time.time() - t_q, argv)
+                    return EXIT_QUEUE_TIMEOUT
+                holding = True
+                if not pool:
+                    break
+                try:
+                    lease = try_lease_slot(directory, wt)
+                except Exception as exc:
+                    pool = False  # fail-open: run without an injected dir
+                    sys.stderr.write(f"heavy: target slot lease failed: {exc}\n")
+                    break
+                if lease is not None:
+                    break
+                release_token(directory)
+                holding = False
+                while not any_slot_free(directory):
+                    if time.time() - t_q >= cap:
+                        sys.stderr.write(
+                            f"heavy: waited {int(time.time() - t_q)}s for a free cargo target "
+                            "slot; nothing was compiled - try again, re-run with the Bash tool "
+                            "timeout set to 600000\n")
+                        _release_all(directory, lock_hash, False)
+                        lock_hash = None
+                        _log_timeout(directory, agent, prio, kind, weight,
+                                     wait_lock + time.time() - t_q, argv)
+                        return EXIT_QUEUE_TIMEOUT
+                    time.sleep(poll)
+            wait_token = time.time() - t_q
             env = dict(os.environ)
             env["NUCLEOS_HEAVY_TOKEN"] = str(os.getpid())
+        if pool and lease is None and (held or nested):
+            # No token to give back here (held takes none; nested runs under its parent's).
+            try:
+                lease = lease_slot_wait(directory, wt, cap)
+            except Exception as exc:
+                lease = None
+                pool = False
+                sys.stderr.write(f"heavy: target slot lease failed: {exc}\n")
+            if pool and lease is None:
+                _release_all(directory, lock_hash, holding)
+                lock_hash = None
+                holding = False
+                _log_timeout(directory, agent, prio, kind, weight, wait_lock, argv)
+                return EXIT_QUEUE_TIMEOUT
+        if lease is not None:
+            try:
+                prepare_slot(directory, lease, wt, argv[0] if _is_cargo(argv) else "cargo",
+                             os.getcwd())
+                inject = lease[1]
+                if crate is not None and not nested and not held and (
+                        fp is None or fp[1] != _real(inject)):
+                    try:
+                        tdir = resolve_target_dir(argv, crate, root, os.getcwd(), inject)
+                        fp = (crate, tdir, compute_fingerprint(argv, crate, root, tdir))
+                    except Exception as exc:
+                        fp = None
+                        sys.stderr.write(f"heavy: no fingerprint: {exc}\n")
+            except Exception as exc:
+                sys.stderr.write(f"heavy: target slot setup failed: {exc}\n")
+                release_slot(directory, lease)
+                lease = None
+                inject = None
+        if fp is not None and cand is not None and lease is None:
+            fp = None  # computed for a slot this run did not get: never record it
         if inject and env is not None:
             env["CARGO_TARGET_DIR"] = inject
         eff_td = None
@@ -1125,7 +1401,9 @@ def broker_run(args: list[str], held: bool = False) -> int:
         if eff_td:
             row["target_dir"] = eff_td
     except Exception as exc:
-        _release_all(directory, lock_hash, holding)
+        if lease is not None and env is not None:
+            env.pop("CARGO_TARGET_DIR", None)  # the lease goes now: build without it
+        _release_all(directory, lock_hash, holding, lease)
         code, stats = run_child(argv, env, None)
         append_log({
             "v": LOG_VERSION, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -1145,7 +1423,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
         code, stats = 127, _new_stats()
         row["broker_error"] = f"spawn: {exc}"
     except BaseException:
-        _release_all(directory, lock_hash, holding)
+        _release_all(directory, lock_hash, holding, lease)
         raise
     row.update({
         "run_s": round(time.time() - t_run, 3), "compiled": stats["compiled"],
@@ -1157,7 +1435,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
     if fp is not None:
         _record_fingerprint(directory, fp, root, code, stats)
     append_log(row, directory)
-    _release_all(directory, lock_hash, holding)
+    _release_all(directory, lock_hash, holding, lease)
     return code
 
 
@@ -1186,9 +1464,11 @@ def _log_timeout(directory, agent, prio, kind, weight, waited, argv) -> None:
     }, directory)
 
 
-def _release_all(directory, lock_hash, holding: bool) -> None:
-    """Hand the worktree lock on, keep the token until its new owner is queued, then drop
-    the token. Never raises: release must not turn a finished run into a failure."""
+def _release_all(directory, lock_hash, holding: bool, lease=None) -> None:
+    """Free the target slot, hand the worktree lock on, keep the token until its new owner
+    is queued, then drop the token. Never raises: release must not turn a finished run into
+    a failure. The slot goes first so the lock's next owner can take it back by affinity."""
+    release_slot(directory, lease)
     try:
         succ = release_lock(directory, lock_hash) if lock_hash else None
         if holding:
@@ -1266,6 +1546,16 @@ def cmd_status() -> int:
                          f"waiters={len(waiting)}"))
         for f, wrec in waiting:
             print(_line(wrec, f"  waiting prio={_wkey(f)[0]} age={_age(f)}"))
+    try:
+        n = target_slots()
+        print(f"target slots: {n}  root: {_td_root()}")
+        for k in range(1, n + 1):
+            rec = _read_slot(d, k)
+            who = (f"pid={rec.get('pid')} worktree={rec.get('worktree')}" if _slot_busy(rec)
+                   else "free")
+            print(f"  slot {k}: {who} last={rec.get('last_worktree') or '-'}")
+    except Exception as exc:
+        print(f"target slots: unreadable ({exc})")
     return 0
 
 
@@ -1289,7 +1579,13 @@ def _is_warm(argv: list[str], root: str, cwd: str, directory: Path) -> bool:
         if not found:
             return False
         crate = found[0]
-        inject = injected_target_dir(argv, root, cwd)
+        inject = None
+        if injected_target_dir(argv, root, cwd) is not None:
+            # A pool run is warm only in the slot it would get back by affinity.
+            k = affinity_slot(directory, root)
+            if k is None:
+                return False
+            inject = str(slot_dir(k))
         tdir = resolve_target_dir(argv, crate, root, cwd, inject)
         return registry_hit(directory, tdir, compute_fingerprint(argv, crate, root, tdir), root)
     except Exception:
