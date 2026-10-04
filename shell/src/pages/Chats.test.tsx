@@ -305,6 +305,7 @@ function chatsFetch(
       return { commands: offered.filter((hit) => hit.name.toLowerCase().includes(query)) };
     }
     if (path === "/projects") return opts.roster ?? [];
+    if (path === "/home") return { root: "D:/Elsewhere" };
     const project = /^\/assistant\/chats\/([^/?]+)\/project$/.exec(path);
     if (project !== null) {
       const chatId = decodeURIComponent(project[1]);
@@ -2651,7 +2652,7 @@ describe("Chats - a conversation asking to be allowed something", () => {
 
 /* ---------------------------------------------- a conversation with no project -- */
 
-/** Two projects side by side, so Root is the folder they share. */
+/** Two projects side by side; Root is where the daemon lives, which `chatsFetch` serves at /home. */
 const ROSTER = [
   { project_id: "nucleos", project_root: "C:/Projects/nucleos" },
   { project_id: "site", project_root: "C:/Projects/site" },
@@ -2765,11 +2766,10 @@ describe("Chats - giving a conversation a project", () => {
 
     const dialog = await screen.findByRole("dialog", { name: /where this conversation runs/i });
     const root = await within(dialog).findByRole("radio", { name: /root/i });
-    expect(within(dialog).getByText("C:/Projects")).toBeTruthy();
     fireEvent.click(root);
     fireEvent.click(within(dialog).getByRole("button", { name: "Use this" }));
 
-    await waitFor(() => expect(patchedCwd()).toBe("C:/Projects"));
+    await waitFor(() => expect(patchedCwd()).toBe("D:/Elsewhere"));
   });
 
   // The conversation does not start before it knows where it runs: what is said first is held,

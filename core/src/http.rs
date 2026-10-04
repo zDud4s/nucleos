@@ -43,6 +43,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/status", get(status))
+        .route("/home", get(get_home))
         .route("/health/readout", get(health_readout))
         .route("/sidecars", get(get_sidecars))
         .route("/sidecars/{name}/restart", post(post_sidecar_restart))
@@ -1037,6 +1038,35 @@ async fn post_webhook_push(
 
 async fn status() -> impl IntoResponse {
     (StatusCode::OK, "daemon running")
+}
+
+/// The directory the daemon was started from, fixed by [`remember_home`] at startup.
+static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Records the daemon's own directory. Called once from `main`; later calls change nothing, so
+/// a `set_current_dir` somewhere never moves what the shell was told.
+pub fn remember_home() {
+    if let Ok(dir) = std::env::current_dir() {
+        let _ = HOME.set(std::path::absolute(&dir).unwrap_or(dir));
+    }
+}
+
+#[derive(Serialize)]
+struct Home {
+    /// Where NucleOS itself lives: the folder the daemon was started from. `None` when the
+    /// working directory was unreadable, never a guess.
+    root: Option<String>,
+}
+
+/// `GET /home` — the folder the chat picker calls Root.
+async fn get_home() -> Json<Home> {
+    let dir = HOME.get().cloned().or_else(|| std::env::current_dir().ok());
+    Json(Home {
+        root: dir.map(|dir| {
+            dir.to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        }),
+    })
 }
 
 #[derive(Deserialize)]
@@ -13026,6 +13056,7 @@ async fn get_model_groups(
         "groups": crate::model_catalog::group(cloud, &created),
         "needs_root": needs_root,
         "source": snapshot.source,
+        "sources": snapshot.sources,
         "catalogue_version": crate::model_catalog::CATALOGUE_VERSION,
         "fetched_at": snapshot.fetched_at,
     }))
@@ -31924,6 +31955,42 @@ mod tests {
         // drives depends on the exact pool it was written against. It still has to close it, or the
         // directory outlives the run for the same reason every other one did.
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn home_answers_with_the_directory_the_daemon_runs_in() {
+        remember_home();
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/home")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let home: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let running_in = std::env::current_dir().unwrap();
+        let expected = running_in
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        assert_eq!(home["root"], expected);
+    }
+
+    #[tokio::test]
+    async fn home_requires_the_bearer_token() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(Request::builder().uri("/home").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

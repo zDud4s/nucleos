@@ -539,8 +539,12 @@ export interface ModelGroups {
   /** Ids listed but not pickable here: Codex models, which need a conversation rooted in a
    * project with the classifier hook wired. Absent from an older daemon. */
   needs_root?: string[];
-  /** Where the list came from: the vendor APIs or the versioned fallback. */
+  /** Where the list came from: `live` (a vendor API, with a key), `keyless` (the Codex CLI's
+   * cache or models.dev) or `fallback` (the versioned built-in list). */
   source: string;
+  /** Per vendor (`anthropic`, `openai`): `api`, `codex-cache`, `models.dev` or `fallback`.
+   * Absent from an older daemon. */
+  sources?: Record<string, string>;
   catalogue_version: string;
   fetched_at: string | null;
 }
