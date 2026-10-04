@@ -1382,3 +1382,75 @@
   font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
 }
+
+/* A mark is something to point at: the card says what its line was. */
+.feed-trace-bars circle {
+  cursor: default;
+  pointer-events: all;
+}
+
+.feed-trace-bars circle:hover {
+  stroke: var(--text);
+  stroke-width: 2px;
+}
+
+.feed-mark-card {
+  position: fixed;
+  z-index: 50;
+  width: max-content;
+  max-width: 320px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.35);
+  color: var(--text);
+  font-size: var(--text-xs);
+  pointer-events: none;
+  transform: translate(-50%, -100%);
+}
+
+.feed-mark-card[data-below] {
+  transform: translate(-50%, 0);
+}
+
+.feed-mark-card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.feed-mark-card-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+}
+
+.feed-mark-card-kind {
+  font-weight: 600;
+}
+
+.feed-mark-card-at {
+  margin-left: auto;
+  padding-left: var(--space-2);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.feed-mark-card-summary {
+  display: -webkit-box;
+  margin: var(--space-1) 0 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+}
+
+.feed-mark-card-foot {
+  margin-top: var(--space-1);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  opacity: 0.8;
+}

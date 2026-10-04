@@ -1935,7 +1935,52 @@ pub async fn settle(pool: &sqlx::SqlitePool, id: i64, reason: &str) -> sqlx::Res
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() == 1)
+    let settled = result.rows_affected() == 1;
+    if settled {
+        say_settled(pool, id, reason).await;
+    }
+    Ok(settled)
+}
+
+/// The feed line that closes a request's sequence once it stops wanting a person.
+///
+/// **Without it the Feed never learns the request is over.** The last line written under
+/// `vcs:<id>` was `vcs_resolution_started`, which the trace reads as still going — and settling
+/// wrote nothing, so every escalated merge that was later merged by hand, superseded, dismissed or
+/// left without its branch drew as a resolution "still open" for days. Best-effort, like every
+/// other feed write: the settlement is the record, and this only tells the reader about it.
+async fn say_settled(pool: &sqlx::SqlitePool, id: i64, reason: &str) {
+    let project: Option<(String,)> =
+        sqlx::query_as("SELECT project_id FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let _ = crate::feed::append(
+        pool,
+        project.as_ref().map(|(project,)| project.as_str()),
+        "vcs_request_settled",
+        &format!(
+            "vcs request {id} no longer needs a person: {}",
+            settled_words(reason)
+        ),
+        None,
+        Some(&crate::feed::Subject::Vcs(id)),
+    )
+    .await;
+}
+
+/// PURE: a settlement reason, in the words the feed line says it with.
+fn settled_words(reason: &str) -> &str {
+    match reason {
+        "superseded" => "a later request on the same merge succeeded",
+        "resolved" => "a conflict resolution landed it under another request",
+        "merged" => "its source is already in its target",
+        "source-gone" => "its source branch is gone",
+        "dismissed" => "dismissed",
+        other => other,
+    }
 }
 
 /// Settles what the table itself already proves moot, with no git subprocess.
@@ -1945,7 +1990,7 @@ pub async fn settle(pool: &sqlx::SqlitePool, id: i64, reason: &str) -> sqlx::Res
 /// lands under another request. Returns how many rows were settled.
 pub async fn settle_by_record(pool: &sqlx::SqlitePool) -> sqlx::Result<u64> {
     let settled_at = chrono::Utc::now().to_rfc3339();
-    let superseded = sqlx::query(
+    let superseded: Vec<(i64,)> = sqlx::query_as(
         "UPDATE vcs_requests AS open SET settled_at = ?, settled_reason = 'superseded'
           WHERE open.status IN ('escalated','blocked') AND open.settled_at IS NULL
             AND EXISTS (
@@ -1954,22 +1999,28 @@ pub async fn settle_by_record(pool: &sqlx::SqlitePool) -> sqlx::Result<u64> {
                    AND settled.args = open.args
                    AND settled.status = 'succeeded'
                    AND settled.id > open.id
-            )",
+            )
+          RETURNING id",
     )
     .bind(&settled_at)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    let resolved = sqlx::query(
+    .fetch_all(pool)
+    .await?;
+    let resolved: Vec<(i64,)> = sqlx::query_as(
         "UPDATE vcs_requests SET settled_at = ?, settled_reason = 'resolved'
           WHERE status IN ('escalated','blocked') AND settled_at IS NULL
-            AND resolved_by IS NOT NULL",
+            AND resolved_by IS NOT NULL
+          RETURNING id",
     )
     .bind(&settled_at)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    Ok(superseded + resolved)
+    .fetch_all(pool)
+    .await?;
+    for (id,) in &superseded {
+        say_settled(pool, *id, "superseded").await;
+    }
+    for (id,) in &resolved {
+        say_settled(pool, *id, "resolved").await;
+    }
+    Ok((superseded.len() + resolved.len()) as u64)
 }
 
 /// Why `dismiss` did not dismiss.
@@ -6837,6 +6888,49 @@ mod tests {
             settlement_of(&pool, landing).await,
             (None, None),
             "the landing row itself is not escalated or blocked"
+        );
+    }
+
+    /// `(kind, summary)` of every feed line under one request's subject, oldest first.
+    async fn feed_of(pool: &sqlx::SqlitePool, id: i64) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT kind, summary FROM feed WHERE subject = ? ORDER BY id")
+            .bind(format!("vcs:{id}"))
+            .fetch_all(pool)
+            .await
+            .expect("read the feed")
+    }
+
+    #[tokio::test]
+    async fn settling_closes_the_requests_feed_sequence_once() {
+        let pool = test_pool().await;
+        let dismissed = row_in_status(&pool, "alpha", "feat/x", "escalated").await;
+        let superseded = row_in_status(&pool, "alpha", "feat/y", "escalated").await;
+        row_in_status(&pool, "alpha", "feat/y", "succeeded").await;
+
+        assert!(settle(&pool, dismissed, "dismissed").await.unwrap());
+        assert!(!settle(&pool, dismissed, "merged").await.unwrap());
+        settle_by_record(&pool).await.unwrap();
+        settle_by_record(&pool).await.unwrap();
+
+        let settled = |lines: Vec<(String, String)>| {
+            lines
+                .into_iter()
+                .filter(|(kind, _)| kind == "vcs_request_settled")
+                .map(|(_, summary)| summary)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            settled(feed_of(&pool, dismissed).await),
+            vec![format!(
+                "vcs request {dismissed} no longer needs a person: dismissed"
+            )],
+            "one line, from the first settlement only"
+        );
+        assert_eq!(
+            settled(feed_of(&pool, superseded).await),
+            vec![format!(
+                "vcs request {superseded} no longer needs a person: a later request on the same merge succeeded"
+            )]
         );
     }
 

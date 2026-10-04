@@ -1,5 +1,7 @@
 import { ChevronRight, Pause, Play } from "lucide-react";
-import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { readFeedKind, type FeedEntry } from "../data/feed";
 import {
   sequenceProgressAt,
   sequenceStateAt,
@@ -31,6 +33,19 @@ import { feedGravityOf, feedMarkTone, type FeedGravity, type FeedLane } from "..
  * quiet stretches are positioned through `style`, as the calendar's now-line is — the CSSOM, which
  * the production CSP allows, and never a style attribute in markup.
  */
+
+/**
+ * The mark under the pointer, and where on screen it sits — what the hover card reads.
+ *
+ * A context rather than a prop, because marks are drawn from three places (a sequence's row, a
+ * collapsed lane, a folded fold) and all of them report to the one card the trace owns.
+ */
+interface MarkTip {
+  line: FeedEntry;
+  x: number;
+  y: number;
+}
+const MarkHover = createContext<(tip: MarkTip | null) => void>(() => {});
 
 /** Roughly how long a replay of the whole window takes, whatever its length. */
 const REPLAY_MS = 12_000;
@@ -89,6 +104,7 @@ export function FeedTrace({ sequences, start, now, title, at, onAt, selected, on
   /* -------------------------------------------------------------- replay -- */
 
   const [playing, setPlaying] = useState(false);
+  const [tip, setTip] = useState<MarkTip | null>(null);
   const frame = useRef(0);
   const timeRef = useRef(time);
   timeRef.current = time;
@@ -246,6 +262,7 @@ export function FeedTrace({ sequences, start, now, title, at, onAt, selected, on
   }
 
   return (
+    <MarkHover.Provider value={setTip}>
     <section className="feed-trace" aria-labelledby={titleId}>
       <div className="feed-trace-frame">
         <div className="feed-trace-head">
@@ -352,6 +369,44 @@ export function FeedTrace({ sequences, start, now, title, at, onAt, selected, on
         </div>
       </div>
     </section>
+    {tip !== null && <MarkCard tip={tip} now={now} />}
+    </MarkHover.Provider>
+  );
+}
+
+/**
+ * What one mark says, on hover: the kind in the map's words, when, whose, and the line itself.
+ *
+ * Fixed to the viewport through a portal, because the rows clip and the card must not. It is a
+ * reading aid and nothing more — `aria-hidden`, like the marks it explains, since every line it
+ * shows is also in the list below the trace.
+ */
+function MarkCard({ tip, now }: { tip: MarkTip; now: number }) {
+  const { line } = tip;
+  const tone = feedMarkTone(line.kind);
+  const label = readFeedKind(line.kind)?.label ?? line.kind;
+  const half = 160;
+  const left = Math.min(Math.max(tip.x, half + 8), Math.max(window.innerWidth - half - 8, half + 8));
+  const below = tip.y < 140;
+  return createPortal(
+    <div className="feed-mark-card" data-below={below || undefined} aria-hidden="true" style={{ left, top: below ? tip.y + 12 : tip.y - 12 }}>
+      <div className="feed-mark-card-head">
+        <svg className="feed-mark-card-dot" viewBox="0 0 8 8">
+          <circle className={`ui-mark-${tone}`} cx="4" cy="4" r="4" />
+        </svg>
+        <span className="feed-mark-card-kind">{label}</span>
+        <span className="feed-mark-card-at">{stamp(Date.parse(line.created_at), now)}</span>
+      </div>
+      <p className="feed-mark-card-summary">{line.summary}</p>
+      {(line.project_id !== null || line.subject !== null || line.run_id !== null) && (
+        <div className="feed-mark-card-foot">
+          {[line.project_id, line.subject, line.run_id === null || line.subject === `run:${line.run_id}` ? null : `run:${line.run_id}`]
+            .filter((part): part is string => part !== null && part !== "")
+            .join(" · ")}
+        </div>
+      )}
+    </div>,
+    document.body,
   );
 }
 
@@ -457,6 +512,7 @@ function Marks({
   pct: (ms: number) => string;
   quiet?: boolean;
 }) {
+  const hover = useContext(MarkHover);
   const lines = sequences.flatMap((sequence) => sequence.lines);
   // Routine first, so an exception in the same place is drawn over it.
   const ordered = [...lines].sort((a, b) => Number(feedGravityOf(a.kind) !== "routine") - Number(feedGravityOf(b.kind) !== "routine"));
@@ -479,6 +535,11 @@ function Marks({
             cx={pct(at)}
             cy="50%"
             r={exception ? (quiet ? 4.5 : 5.5) : quiet ? 3 : 4}
+            onPointerEnter={(event) => {
+              const box = event.currentTarget.getBoundingClientRect();
+              hover({ line, x: box.left + box.width / 2, y: box.top });
+            }}
+            onPointerLeave={() => hover(null)}
           />
         );
       })}
