@@ -44,6 +44,9 @@ pub fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/status", get(status))
         .route("/home", get(get_home))
+        // Deliberately in NO auth.rs table: a route absent from every table is reachable by the
+        // control token and an Admin key only, which is exactly who may stop the daemon.
+        .route("/daemon/shutdown", post(post_daemon_shutdown))
         .route("/health/readout", get(health_readout))
         .route("/sidecars", get(get_sidecars))
         .route("/sidecars/{name}/restart", post(post_sidecar_restart))
@@ -1053,6 +1056,57 @@ async fn post_webhook_push(
         crate::webhook::DeliveryOutcome::Deferred { .. } => StatusCode::SERVICE_UNAVAILABLE,
     };
     Ok((status, Json(outcome)))
+}
+
+/// Process-wide shutdown signals. `notify_one` stores a permit, so a request that lands before
+/// anything awaits is not lost.
+static SHUTDOWN: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+/// The exit watchdog's one-shot signal. It is std-based on purpose: the watchdog runs on its own
+/// OS thread, and a tokio primitive would tie its wake-up to a runtime that is shutting down.
+static SHUTDOWN_FLAG: std::sync::LazyLock<(std::sync::Mutex<bool>, std::sync::Condvar)> =
+    std::sync::LazyLock::new(|| (std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+/// Resolves once someone asked the daemon to stop (graceful shutdown of the server).
+pub async fn shutdown_requested() {
+    SHUTDOWN.notified().await;
+}
+
+/// Asks the daemon to stop: wakes the server's graceful shutdown and releases the exit watchdog.
+pub fn request_shutdown() {
+    SHUTDOWN.notify_one();
+    let (flag, condvar) = &*SHUTDOWN_FLAG;
+    *flag.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    condvar.notify_all();
+}
+
+/// Starts the exit watchdog on its own OS thread, so it outlives the runtime that asked for
+/// shutdown. It waits for `request_shutdown`, sleeps `grace`, then calls `on_expire`.
+pub fn spawn_exit_watchdog(
+    grace: std::time::Duration,
+    on_expire: impl FnOnce() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("exit-watchdog".into())
+        .spawn(move || {
+            let (flag, condvar) = &*SHUTDOWN_FLAG;
+            let mut requested = flag.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*requested {
+                requested = condvar
+                    .wait(requested)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            drop(requested);
+            std::thread::sleep(grace);
+            on_expire();
+        })
+        .expect("the exit watchdog thread must start")
+}
+
+async fn post_daemon_shutdown() -> impl IntoResponse {
+    tracing::warn!("daemon shutdown requested over HTTP");
+    request_shutdown();
+    StatusCode::ACCEPTED
 }
 
 async fn status() -> impl IntoResponse {
@@ -37286,5 +37340,64 @@ mod tests {
         .await;
         assert_eq!(graph["notes"].as_array().unwrap().len(), 2);
         assert_eq!(graph["targets"].as_array().unwrap().len(), 2);
+    }
+
+    /// The updater stops the daemon through this route, so it must not be open to anyone without
+    /// the control token.
+    #[tokio::test]
+    async fn shutting_the_daemon_down_needs_the_control_token() {
+        for header in [None, Some("Bearer not-the-token")] {
+            let mut request = Request::builder().method("POST").uri("/daemon/shutdown");
+            if let Some(value) = header {
+                request = request.header("Authorization", value);
+            }
+            let response = build_router(test_state().await)
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{header:?}");
+        }
+    }
+
+    /// Only this test may await `shutdown_requested()`: the notifiers are process-wide.
+    #[tokio::test]
+    async fn the_control_token_can_ask_the_daemon_to_shut_down() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/daemon/shutdown")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_requested())
+            .await
+            .expect("the request must leave a stored shutdown permit");
+    }
+
+    /// The 10 s exit cap must live on its own OS thread: a tokio task dies with the runtime.
+    #[test]
+    fn the_exit_watchdog_outlives_the_runtime_that_asked_for_shutdown() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        rt.block_on(async {
+            spawn_exit_watchdog(std::time::Duration::from_millis(50), move || {
+                let _ = tx.send(());
+            });
+            request_shutdown();
+        });
+        drop(rt);
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "the exit watchdog died with the runtime that asked for shutdown"
+        );
     }
 }

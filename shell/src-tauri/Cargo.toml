@@ -57,11 +57,17 @@ tauri-plugin-global-shortcut = "2.3.2"
 # fallback there (see `WAYLAND_HELD` in `dictation.rs`).
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
-# No tauri-plugin-updater: it was registered with a placeholder signing key and an
-# example.invalid endpoint, held no updater capability and was imported by no frontend code,
-# so it could never run — yet it shipped in the binary and in the bundle config, advertising
-# an update channel that does not exist. Re-add it together with a real key, a real release
-# feed and the capability, as one change.
+# The updater is back, this time complete: a real release feed (tauri.conf.json), the
+# `updater:default` capability, and a public key that comes from the owner. It only does
+# anything in a release bundle (the `release-bundle` feature below).
+tauri-plugin-updater = "2"
+# `process:allow-restart`, so the shell can relaunch itself once an update is installed.
+tauri-plugin-process = "2"
+
+[features]
+# CI builds the release bundle with this on. Dev and update-shell builds leave it off, so
+# they never spawn a daemon nor offer updates.
+release-bundle = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The Linux webview, named so lib.rs can switch its media stream on and answer its microphone

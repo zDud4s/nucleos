@@ -45,6 +45,15 @@
       }
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "REPLACE_WITH_THE_PUBLIC_KEY_FROM_tauri_signer_generate",
+      "endpoints": [
+        "https://github.com/zDud4s/nucleos/releases/latest/download/latest.json"
+      ],
+      "windows": { "installMode": "passive" }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
