@@ -35,6 +35,11 @@ import {
   MoreHorizontal,
   PanelRightOpen,
   ChevronRight,
+  FileMinus,
+  FilePen,
+  FilePlus,
+  FileSymlink,
+  GitCompareArrows,
   LoaderCircle,
   SquarePen,
 } from "lucide-react";
@@ -119,7 +124,9 @@ import { PlusMenu } from "../chats/PlusMenu";
 import { Slider } from "../ui/Slider";
 import { ProviderMark } from "../ui/ProviderMark";
 import { displayName } from "../lib/modelName";
-import { diffLines } from "../lib/diff";
+import { diffFiles, type DiffFile, type FileChange } from "../lib/diff";
+import { Diff } from "../ui/Diff";
+import { Popover as PopoverPrimitive } from "radix-ui";
 import { useDictation, type DictationView } from "../data/dictation";
 import { revise, type Provisional } from "../lib/provisional";
 import type { LocalPull, ModelChoice, ModelGroup } from "../data/chats";
@@ -441,6 +448,9 @@ export function Chats() {
  * is a state that needs teaching, `Project` in the transcript says so in full — a
  * one-line slot is the wrong place to explain something.
  *
+ * The "what is different" chip (`ProjectChanges`) rides beside it, and needs only a folder to
+ * compare: it shows whenever there is one, settled or not.
+ *
  * A second reader of `useChatProject` and never a second source: react-query answers both
  * this and the menu below out of one cache entry, so the line and the settings cannot
  * disagree about which folder a conversation is in.
@@ -449,11 +459,16 @@ function ChatWhere({ chatId }: { chatId: string }) {
   const project = useChatProject(chatId);
   const cwd = project.data?.cwd ?? null;
   const tools = project.data?.tools ?? false;
-  if (cwd === null || !tools) return null;
+  if (cwd === null) return null;
   return (
-    <p className="chats-where" title={cwd}>
-      {cwd}
-    </p>
+    <>
+      {tools && (
+        <p className="chats-where" title={cwd}>
+          {cwd}
+        </p>
+      )}
+      <ProjectChanges chatId={chatId} />
+    </>
   );
 }
 
@@ -961,7 +976,6 @@ function ChatDetail({
             a turn is held while a question stands, and the queue behind it cannot move until it is
             answered. */}
         <Asking asks={transcript.data?.asks ?? []} chatId={chatId} />
-        <Changed chatId={chatId} />
         <Waiting queued={transcript.data?.queued ?? []} chatId={chatId} />
       </div>
 
@@ -3577,55 +3591,204 @@ function HowItContinued({
  * with the name of a tool and a path. To see what those did you had to go somewhere else, which is
  * the opposite of what a conversation about code is for.
  *
+ * **Beside the folder, not under the transcript.** It is a fact about the project, and the
+ * project's folder is already on the tabs row, so the question sits next to the thing it is about,
+ * as a chip, rather than as a line of underlined text at the foot of a conversation where it read
+ * like a footnote to the last answer. It opens a panel over the page and not a modal: this is a
+ * place to look while the conversation stays where it is.
+ *
+ * **Files first, lines second.** What a person scans for is WHICH files and how much; the panel
+ * leads with a count per kind of change and a row per file, and a file's lines open under its row.
+ *
  * **It says what it is, and what it is not.** The daemon takes no snapshot before a turn, so this is
  * what is different NOW — the same thing after one turn, and not after three. Labelling it as what
  * the turn did would be the kind of note that reads like a fact and stops being one.
  *
- * Closed until asked. Opening it walks a working tree, and a panel that did that on arrival would do
- * it for every conversation somebody clicked past.
+ * Closed until asked. Opening it walks a working tree, and a chip that did that on arrival would do
+ * it for every conversation somebody clicked past — so the chip says "Changes" until it has been
+ * opened once, and then carries the counts it last read.
  */
-function Changed({ chatId }: { chatId: string }) {
+function ProjectChanges({ chatId }: { chatId: string }) {
   const [open, setOpen] = useState(false);
   const diff = useChatDiff(chatId, open);
+  const files = diff.data === undefined ? null : diffFiles(diff.data);
+  const added = files?.reduce((sum, file) => sum + file.added, 0) ?? 0;
+  const removed = files?.reduce((sum, file) => sum + file.removed, 0) ?? 0;
+
+  const named =
+    files === null
+      ? "What is different in this project"
+      : files.length === 0
+        ? "What is different in this project, nothing changed"
+        : `What is different in this project, ${plural(files.length, "file")} changed`;
 
   return (
-    <div className="chats-changed">
-      <button
-        type="button"
-        className="chats-changed-toggle"
-        aria-expanded={open}
-        onClick={() => setOpen((was) => !was)}
-      >
-        {open ? "hide what is different" : "what is different in this project"}
-      </button>
-      {open && diff.isError && <ChangedRefusal error={diff.error} />}
-      {open && diff.data === undefined && !diff.isError && (
-        <p className="chats-loading">reading the project…</p>
-      )}
-      {open && diff.data !== undefined && <DiffView diff={diff.data} />}
+    <PopoverPrimitive.Root open={open} onOpenChange={setOpen}>
+      <PopoverPrimitive.Trigger className="chats-changes-chip" aria-label={named} title={named}>
+        <GitCompareArrows className="chats-changes-glyph" strokeWidth={1.5} aria-hidden="true" />
+        {files === null && <span>Changes</span>}
+        {files !== null && files.length === 0 && <span>No changes</span>}
+        {files !== null && files.length > 0 && (
+          <>
+            <span>{plural(files.length, "file")}</span>
+            <LineCounts added={added} removed={removed} />
+          </>
+        )}
+      </PopoverPrimitive.Trigger>
+      <PopoverPrimitive.Portal>
+        <PopoverPrimitive.Content
+          className="chats-changes"
+          aria-label="What is different"
+          align="end"
+          sideOffset={6}
+          collisionPadding={12}
+        >
+          <div className="chats-changes-head">
+            <p className="chats-changes-title">What is different in this project</p>
+            <p className="chats-changes-note">
+              The working tree against its last commit, as it is now — not only what this
+              conversation did.
+            </p>
+          </div>
+          {diff.isError && <ChangedRefusal error={diff.error} />}
+          {files === null && !diff.isError && (
+            <p className="chats-loading">reading the project…</p>
+          )}
+          {files !== null && files.length === 0 && (
+            <p className="chats-changes-clean">nothing in this project has changed</p>
+          )}
+          {files !== null && files.length > 0 && (
+            <ChangedFiles files={files} added={added} removed={removed} />
+          )}
+        </PopoverPrimitive.Content>
+      </PopoverPrimitive.Portal>
+    </PopoverPrimitive.Root>
+  );
+}
+
+const CHANGE_GLYPH: Record<FileChange, typeof FilePen> = {
+  modified: FilePen,
+  added: FilePlus,
+  deleted: FileMinus,
+  renamed: FileSymlink,
+};
+
+/** The order the kinds are counted in: the common case first. */
+const CHANGE_ORDER: FileChange[] = ["modified", "added", "deleted", "renamed"];
+
+/**
+ * `+12 −4`: the sign carries the meaning and the tone only reinforces it. A side with nothing on it
+ * is left out — `−0` is a number to read that says nothing — and a file with no lines either way
+ * (a binary, a bare rename) draws no count at all.
+ */
+function LineCounts({ added, removed }: { added: number; removed: number }) {
+  if (added === 0 && removed === 0) return null;
+  return (
+    <span className="chats-changes-counts">
+      {added > 0 && <span className="chats-changes-added">+{added}</span>}
+      {removed > 0 && <span className="chats-changes-removed">−{removed}</span>}
+    </span>
+  );
+}
+
+/**
+ * A file's slice of the diff from its first hunk on. The row above it already names the file and
+ * what happened to it, so git's header lines would only say it a second time; a slice with no
+ * hunk at all (a binary, a bare rename) keeps them, because then they are all there is.
+ */
+function fromFirstHunk(text: string): string {
+  const at = text.search(/^@@ /m);
+  return at < 0 ? text : text.slice(at);
+}
+
+/**
+ * A count per kind of change, then a row per file whose lines open beneath it.
+ *
+ * A handful of files open together, because then the whole diff is the quickest read; past three
+ * they start closed, and the rows are the overview.
+ */
+function ChangedFiles({
+  files,
+  added,
+  removed,
+}: {
+  files: DiffFile[];
+  added: number;
+  removed: number;
+}) {
+  const [shown, setShown] = useState<ReadonlySet<number>>(
+    () => new Set(files.length <= 3 ? files.map((_, at) => at) : []),
+  );
+  const toggle = (at: number) =>
+    setShown((was) => {
+      const next = new Set(was);
+      if (next.has(at)) next.delete(at);
+      else next.add(at);
+      return next;
+    });
+
+  return (
+    <div className="chats-changes-body">
+      <div className="chats-changes-summary">
+        <ul className="chats-changes-kinds" aria-label="Kinds of change">
+          {CHANGE_ORDER.map((change) => {
+            const count = files.filter((file) => file.change === change).length;
+            if (count === 0) return null;
+            const Glyph = CHANGE_GLYPH[change];
+            return (
+              <li key={change} className="chats-changes-kind">
+                <Glyph className="chats-changes-glyph" strokeWidth={1.5} aria-hidden="true" />
+                {count} {change}
+              </li>
+            );
+          })}
+        </ul>
+        <LineCounts added={added} removed={removed} />
+      </div>
+      <ul className="chats-changes-files" aria-label="Changed files">
+        {files.map((file, at) => {
+          const Glyph = CHANGE_GLYPH[file.change];
+          const cut = file.path.lastIndexOf("/");
+          const open = shown.has(at);
+          return (
+            // Keyed by position: one reading of one diff, drawn whole and never reordered.
+            <li key={`file-${at}`} className="chats-changes-file">
+              <button
+                type="button"
+                className="chats-changes-row"
+                aria-expanded={open}
+                onClick={() => toggle(at)}
+              >
+                <ChevronRight
+                  className="chats-changes-chevron"
+                  strokeWidth={1.5}
+                  aria-hidden="true"
+                />
+                <Glyph
+                  className="chats-changes-glyph"
+                  strokeWidth={1.5}
+                  aria-hidden="true"
+                />
+                <span className="sr-only">{file.change}</span>
+                <span className="chats-changes-path" title={file.path}>
+                  {cut >= 0 && (
+                    <span className="chats-changes-dir">{file.path.slice(0, cut + 1)}</span>
+                  )}
+                  <span className="chats-changes-name">{file.path.slice(cut + 1)}</span>
+                </span>
+                <LineCounts added={file.added} removed={file.removed} />
+              </button>
+              {open && <Diff text={fromFirstHunk(file.text)} label={`Changes to ${file.path}`} />}
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
 
-/** One `git diff`, coloured. A clean tree is said in words rather than drawn as an empty box. */
-function DiffView({ diff }: { diff: string }) {
-  const lines = diffLines(diff);
-  if (lines.length === 0) {
-    return (
-      <p className="chats-changed-clean">nothing in this project has changed</p>
-    );
-  }
-  return (
-    <pre className="chats-diff" aria-label="What is different">
-      {lines.map((line, at) => (
-        // Keyed by position: a diff is read whole and redrawn whole, and nothing reorders inside it.
-        <span key={`diff-${at}`} className={`chats-diff-${line.kind}`}>
-          {line.text}
-          {"\n"}
-        </span>
-      ))}
-    </pre>
-  );
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
 function ChangedRefusal({ error }: { error: unknown }) {
