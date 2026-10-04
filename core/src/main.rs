@@ -2086,12 +2086,9 @@ async fn main() {
     }
 
     // A held long-poll (`/hooks/ask-wait`) would keep graceful shutdown waiting forever, and the
-    // old binary alive under the installer; after the deadline the process just leaves.
-    tokio::spawn(async {
-        http::shutdown_deadline().await;
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        std::process::exit(0);
-    });
+    // old binary alive under the installer; after the deadline the process just leaves. The
+    // watchdog runs on its own OS thread, so it outlives the runtime.
+    http::spawn_exit_watchdog(std::time::Duration::from_secs(10), || std::process::exit(0));
     axum::serve(listener, app)
         .with_graceful_shutdown(http::shutdown_requested())
         .await
