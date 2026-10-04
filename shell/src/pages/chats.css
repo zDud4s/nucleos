@@ -47,23 +47,15 @@
 }
 
 /**
- * The notch's strip, handed to the conversation list instead of kept as an empty margin.
+ * No notch strip on this route.
  *
- * `.app-main-notched` reserves 4.5rem on the right of every page so the folded quota notch stands
- * beside the page rather than on it. Here that reservation left a band of bare ground between the
- * list and the window's edge, and the list read as floating. So this route gives the strip back,
- * the list runs to the edge, and the SAME 4.5rem comes back as the list's own right padding
- * (`--chats-notch`): the notch now hangs off the edge of the list's ground, which is what a notch
- * is, and nothing the list draws can sit under it wherever it is dragged along the edge. With the
- * list closed, the conversation keeps the reservation instead (`.chats-layout-alone`).
+ * `.app-main-notched` reserves 4.5rem on the right of every page for the folded quota notch. Here
+ * that strip left a band of bare ground between the list and the window's edge, and the notch is
+ * dragged along the edge and floats over whatever is there anyway, so reserving a fixed band for
+ * it bought nothing. The list runs to the edge with an ordinary step of padding, like its left.
  */
 .app-main-notched:has(> .app-page > .chats-app) {
   padding-right: 0;
-}
-
-.chats-app {
-  /* Must stay equal to `.app-main-notched`'s padding in `app.css`. */
-  --chats-notch: 4.5rem;
 }
 
 /**
@@ -94,8 +86,8 @@
 .chats-layout {
   display: grid;
   /* The session column is on the RIGHT, where a session manager keeps its sessions. */
-  /* 19rem of list, plus the notch's strip it now carries as padding (`.chats-rail`). */
-  grid-template-columns: minmax(0, 1fr) calc(19rem + var(--chats-notch));
+  /* 19rem of list, plus the right padding it carries now that it meets the edge (`.chats-rail`). */
+  grid-template-columns: minmax(0, 1fr) calc(19rem + var(--space-4));
   gap: var(--space-5);
   flex: 1;
   min-height: 0;
@@ -123,9 +115,9 @@
  * about 60rem when the rail is shut, which is the app's own breakpoint arriving on
  * its own.
  */
-/* 57.5rem: the 53rem fold reasoned above, plus the notch's 4.5rem strip, which this container
+/* 54rem: the 53rem fold reasoned above, plus the list's 1rem of right padding, which this container
    now spans since the list runs to the window's edge — the same transcript width at the fold. */
-@container chats (max-width: 57.5rem) {
+@container chats (max-width: 54rem) {
   .chats-layout {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -167,10 +159,9 @@
   grid-template-columns: minmax(0, 1fr);
 }
 
-/* Nothing on the right edge now, so the conversation keeps the notch's strip and the small step
-   the page used to leave. */
+/* Nothing on the right edge now, so the conversation keeps the small step the page used to leave. */
 .chats-layout-alone > .chats-detail {
-  padding-right: calc(var(--chats-notch) + var(--space-3));
+  padding-right: var(--space-3);
 }
 
 /**
@@ -189,9 +180,9 @@
   min-height: 0;
   /* Flush to the window's right edge and its full height (see `.app-page:has(> .chats-app)`):
      the divider on the left runs top to bottom, and the padding is what keeps the list off the
-     edges — the top as the conversation's own, the right the notch's strip. */
+     edges — the top as the conversation's own, the right the same step as the left. */
   padding-top: var(--space-3);
-  padding-right: var(--chats-notch);
+  padding-right: var(--space-4);
   padding-left: var(--space-4);
   border-left: 1px solid var(--border);
 }
