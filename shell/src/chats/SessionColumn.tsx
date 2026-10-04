@@ -5,7 +5,7 @@ import {
   ArchiveRestore,
   ListFilter,
   MoreHorizontal,
-  PanelLeftClose,
+  PanelRightClose,
   Plus,
   Search,
   SquareCode,
@@ -264,7 +264,7 @@ export function SessionColumn({
         </button>
         {/* At the column's inner edge, beside the conversation it gives the width back to. */}
         {onHide !== undefined && (
-          <IconButton label="Hide conversations" icon={PanelLeftClose} onClick={onHide} />
+          <IconButton label="Hide conversations" icon={PanelRightClose} onClick={onHide} />
         )}
       </div>
 

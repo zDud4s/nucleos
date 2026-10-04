@@ -34,12 +34,12 @@
   height: 100%;
   min-height: 0;
   /* An application, not a measure: the 78rem cap and the auto margins that centre every other page
-     left a wide window with a band of empty ground between the app's navigation and the
-     conversation list. The list starts beside the navigation instead, a small step off it. The top
-     is as tight, because no header band sits there any more — the tabs strip is the first row. */
+     left a wide window with bands of empty ground on both sides. The page spans the window and the
+     conversation list sits a small step off its right edge. The top is as tight, because no header
+     band sits there any more — the tabs strip is the first row. */
   max-width: none;
   padding-top: var(--space-3);
-  padding-left: var(--space-3);
+  padding-right: var(--space-3);
   padding-bottom: 0;
 }
 
@@ -70,8 +70,8 @@
    and both columns grow the page instead of scrolling inside themselves. */
 .chats-layout {
   display: grid;
-  /* The session column is on the LEFT, beside the app's own navigation. */
-  grid-template-columns: 19rem minmax(0, 1fr);
+  /* The session column is on the RIGHT, where a session manager keeps its sessions. */
+  grid-template-columns: minmax(0, 1fr) 19rem;
   gap: var(--space-5);
   flex: 1;
   min-height: 0;
@@ -102,12 +102,6 @@
 @container chats (max-width: 53rem) {
   .chats-layout {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  /* One column, and the conversation comes first in it: the list is first in the DOM because it
-     is first on a wide screen, and folded it would otherwise push the thread off the top. */
-  .chats-rail {
-    order: 1;
   }
 }
 
@@ -161,8 +155,8 @@
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  padding-right: var(--space-4);
-  border-right: 1px solid var(--border);
+  padding-left: var(--space-4);
+  border-left: 1px solid var(--border);
 }
 
 /* The names scroll; the button that makes a new one does not. */
@@ -3550,6 +3544,15 @@
   align-items: center;
   gap: var(--space-2);
   padding-bottom: var(--space-1);
+}
+
+.chats-topbar-show {
+  margin-left: auto;
+}
+
+/* After the actions, which already took the free room. */
+.chats-topbar-actions + .chats-topbar-show {
+  margin-left: 0;
 }
 
 .chats-topbar-show .chats-unseen {

@@ -33,7 +33,7 @@ import {
   Mic,
   MicOff,
   MoreHorizontal,
-  PanelLeftOpen,
+  PanelRightOpen,
   ChevronRight,
   LoaderCircle,
   SquarePen,
@@ -333,56 +333,10 @@ export function Chats() {
           railOpen ? "chats-layout" : "chats-layout chats-layout-alone"
         }
       >
-        {railOpen && (
-          /* The ground that tells the list from the thread. See `.chats-rail`: it sits on the
-             LEFT, beside the app's own navigation. */
-          <div className="chats-rail">
-            <SessionColumn
-              rows={rows}
-              answered={chats.data !== undefined}
-              selected={chatId}
-              selectedLive={selectedLive}
-              pickingUp={pickingUp}
-              onPickUp={setPickingUp}
-              onOpenChat={openingAChat}
-              onNew={() => {
-                setPickingUp(null);
-                void navigate({ to: "/chats" });
-              }}
-              onHide={() => setRailOpen(false)}
-              openTabs={tabs.tabs}
-            />
-          </div>
-        )}
-
         <div className="chats-detail">
           {/* The top row of the conversation pane. Empty — no tabs, the list open, nothing
               chosen — it draws nothing at all: see `.chats-topbar:empty`. */}
           <div className="chats-topbar">
-            {!railOpen && (
-              /* The way back to the list, where the list's own edge was. Never only a shortcut:
-                 a closed list with no visible way to reopen it is a dead end. */
-              <span className="chats-topbar-show">
-                <IconButton
-                  /* The count is in the name, because the badge beside the glyph is drawn for
-                     the eye only — "Show conversations" and "5" would otherwise read as one word. */
-                  label={
-                    unseen > 0
-                      ? `Show conversations, ${unseen} unseen`
-                      : "Show conversations"
-                  }
-                  icon={PanelLeftOpen}
-                  onClick={() => setRailOpen(true)}
-                />
-                {/* Answers that landed while you were elsewhere. Shown here precisely because the
-                    list they are in is closed. */}
-                {unseen > 0 && (
-                  <span className="chats-unseen" aria-hidden="true">
-                    {unseen}
-                  </span>
-                )}
-              </span>
-            )}
             <ChatTabs
               tabs={tabs.tabs}
               rows={rows}
@@ -402,6 +356,30 @@ export function Chats() {
                 />
                 <ChatMenu chatId={chatId} />
               </div>
+            )}
+            {!railOpen && (
+              /* The way back to the list, at the end of the row, where the list's own edge was. Never only a shortcut:
+                 a closed list with no visible way to reopen it is a dead end. */
+              <span className="chats-topbar-show">
+                <IconButton
+                  /* The count is in the name, because the badge beside the glyph is drawn for
+                     the eye only — "Show conversations" and "5" would otherwise read as one word. */
+                  label={
+                    unseen > 0
+                      ? `Show conversations, ${unseen} unseen`
+                      : "Show conversations"
+                  }
+                  icon={PanelRightOpen}
+                  onClick={() => setRailOpen(true)}
+                />
+                {/* Answers that landed while you were elsewhere. Shown here precisely because the
+                    list they are in is closed. */}
+                {unseen > 0 && (
+                  <span className="chats-unseen" aria-hidden="true">
+                    {unseen}
+                  </span>
+                )}
+              </span>
             )}
           </div>
           {/* An editor conversation opens in this column like any other, because to the person
@@ -429,6 +407,28 @@ export function Chats() {
             />
           )}
         </div>
+
+        {railOpen && (
+          /* The ground that tells the list from the thread. See `.chats-rail`: it sits on the
+             RIGHT, after the conversation. */
+          <div className="chats-rail">
+            <SessionColumn
+              rows={rows}
+              answered={chats.data !== undefined}
+              selected={chatId}
+              selectedLive={selectedLive}
+              pickingUp={pickingUp}
+              onPickUp={setPickingUp}
+              onOpenChat={openingAChat}
+              onNew={() => {
+                setPickingUp(null);
+                void navigate({ to: "/chats" });
+              }}
+              onHide={() => setRailOpen(false)}
+              openTabs={tabs.tabs}
+            />
+          </div>
+        )}
       </div>
     </div>
   );
