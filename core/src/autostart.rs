@@ -5,7 +5,20 @@ use std::process::Command;
 #[cfg(windows)]
 const TASK_NAME: &str = "NucleOS Daemon";
 
+/// PURE: an AppImage runs from a temporary mount, so registering that path would leave a dead
+/// entry after the next launch.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn skip_registration(appimage: Option<&std::ffi::OsStr>) -> bool {
+    appimage.is_some_and(|value| !value.is_empty())
+}
+
 pub fn ensure_registered(exe_path: &Path) -> std::io::Result<()> {
+    if cfg!(all(unix, not(target_os = "macos")))
+        && skip_registration(std::env::var_os("APPIMAGE").as_deref())
+    {
+        tracing::warn!("running from an AppImage: autostart is not registered");
+        return Ok(());
+    }
     if is_registered(exe_path) {
         return Ok(());
     }
@@ -79,21 +92,32 @@ fn register(exe_path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The dev build layout is `<repo_root>/core/target/debug/nucleos-core.exe` — the repo root is
-/// four directory levels up from the exe file (debug -> target -> core -> repo root). Falls back
-/// to the exe's own directory if the path is shallower than that (e.g. a future packaged layout),
-/// which is still a reasonable working directory even if not exactly right for every possible
-/// layout. It no longer decides where this machine's settings are read from (`~/.nucleos/` does
-/// that), but it is still where the one-time copy of an old `.ai/` looks, and still what the
-/// daemon's remaining relative paths resolve against — better than omitting `<WorkingDirectory>`
-/// altogether, which Task Scheduler does NOT default to the exe's own directory on its own.
+/// The directory the daemon runs from. A dev build lives at `<repo_root>/target/{debug,release}/`
+/// or `<repo_root>/core/target/{debug,release}/`, and there the repo root is the answer. Every
+/// other layout uses the exe's own directory: installed ones (`%LOCALAPPDATA%\NucleOS\`,
+/// `/usr/bin`, `NucleOS.app/Contents/MacOS`), and also the shared `.cargo-target-*` directories
+/// and `.nucleos-run`, which are not inside a repo. The daemon reads nothing repo-relative except
+/// the one-time copy of a legacy `.ai/`, so the exe's directory is a sound default — and better
+/// than omitting `<WorkingDirectory>`, which Task Scheduler does NOT default to the exe's own
+/// directory on its own.
 fn working_directory_for(exe_path: &Path) -> PathBuf {
-    exe_path
-        .parent()
+    let name_is = |p: &Path, names: &[&str]| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| names.contains(&n))
+    };
+    let own_dir = exe_path.parent();
+    let dev_root = own_dir
+        .filter(|profile| name_is(profile, &["debug", "release"]))
         .and_then(Path::parent)
+        .filter(|target| name_is(target, &["target"]))
         .and_then(Path::parent)
-        .and_then(Path::parent)
-        .or_else(|| exe_path.parent())
+        .map(|up| match up.parent() {
+            Some(parent) if name_is(up, &["core"]) => parent,
+            _ => up,
+        });
+    dev_root
+        .or(own_dir)
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
 }
@@ -703,5 +727,56 @@ mod tests {
                 .status();
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_installed_daemon_works_from_its_own_directory() {
+        for (exe, dir) in [
+            (
+                "C:/Users/me/AppData/Local/NucleOS/nucleos-core.exe",
+                "C:/Users/me/AppData/Local/NucleOS",
+            ),
+            ("/usr/bin/nucleos-core", "/usr/bin"),
+            (
+                "/Applications/NucleOS.app/Contents/MacOS/nucleos-core",
+                "/Applications/NucleOS.app/Contents/MacOS",
+            ),
+            (
+                "C:/Projects/.cargo-target-x/debug/nucleos-core.exe",
+                "C:/Projects/.cargo-target-x/debug",
+            ),
+            (
+                "C:/Projects/.nucleos-run/nucleos-core.exe",
+                "C:/Projects/.nucleos-run",
+            ),
+        ] {
+            assert_eq!(
+                working_directory_for(Path::new(exe)),
+                Path::new(dir),
+                "{exe}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dev_build_still_works_from_the_repo_root() {
+        for exe in [
+            "C:/Projects/nucleos/core/target/debug/nucleos-core.exe",
+            "C:/Projects/nucleos/target/release/nucleos-core.exe",
+        ] {
+            assert_eq!(
+                working_directory_for(Path::new(exe)),
+                Path::new("C:/Projects/nucleos"),
+                "{exe}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_appimage_mount_is_never_registered() {
+        use std::ffi::OsStr;
+        assert!(skip_registration(Some(OsStr::new("/tmp/NucleOS.AppImage"))));
+        assert!(!skip_registration(Some(OsStr::new(""))));
+        assert!(!skip_registration(None));
     }
 }

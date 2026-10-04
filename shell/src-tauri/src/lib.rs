@@ -1,6 +1,7 @@
 //! §spec agenticos-foundation-and-autopilot
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+pub mod daemon;
 /// The OS calls that carry those decisions out, and nothing else. Holds no rules.
 pub mod dictation;
 /// What a drop onto the window means, and the only paths this process will read because of one.
@@ -106,6 +107,8 @@ fn get_daemon_token() -> Result<String, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
@@ -117,6 +120,8 @@ pub fn run() {
         .manage(dictation::Dictation::default())
         .manage(drop::Allowed::default())
         .setup(|app| {
+            // Release bundles start the daemon that ships beside the shell, if none answers.
+            daemon::ensure_running();
             // Shell-GUI autostart convenience only — the daemon owns its OWN persistence via a
             // Windows Scheduled Task (Part A), independent of this.
             //
@@ -185,8 +190,9 @@ pub fn run() {
             match event {
                 WindowEvent::CloseRequested { api, .. } => match close_action_for(window.label()) {
                     // Hide instead of quit: the app stays alive in the tray. "Quit" there is the
-                    // shell's own process exit; there is NO child daemon process to kill (the
-                    // daemon's lifecycle is entirely independent now, Part A).
+                    // shell's own process exit. The shell may START the bundled daemon (release
+                    // bundles only) but never owns it: it is detached, so there is NO child
+                    // process to kill and the daemon's lifecycle stays independent (Part A).
                     Some(CloseAction::Hide) => {
                         api.prevent_close();
                         let _ = window.hide();
@@ -237,6 +243,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_daemon_token,
+            daemon::updates_enabled,
             dictation::voice_hotkey,
             dictation::voice_phase,
             dictation::voice_paste,
@@ -398,5 +405,90 @@ mod tests {
             conf["bundle"]["macOS"]["entitlements"],
             "./Entitlements.plist"
         );
+    }
+
+    /// Criterion 6: the updater reads the GitHub release feed, and carries a key to verify it with.
+    #[test]
+    fn the_updater_reads_the_github_release_feed() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json parses");
+        let updater = &conf["plugins"]["updater"];
+        assert_eq!(
+            updater["endpoints"],
+            serde_json::json!([
+                "https://github.com/zDud4s/nucleos/releases/latest/download/latest.json"
+            ])
+        );
+        assert!(
+            updater.get("pubkey").is_some_and(|k| k.is_string()),
+            "the updater needs a pubkey field: {updater}"
+        );
+    }
+
+    /// Criterion 6: the release bundle ships the core and one binary per sidecar directory.
+    #[test]
+    fn the_release_bundle_carries_the_core_and_every_sidecar() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let conf: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("tauri.release.conf.json"))
+                .expect("tauri.release.conf.json exists"),
+        )
+        .expect("tauri.release.conf.json parses");
+        let mut expected = vec!["binaries/nucleos-core".to_string()];
+        for entry in std::fs::read_dir(root.join("../../sidecars")).expect("sidecars dir") {
+            let dir = entry.expect("entry").path();
+            if dir.join("go.mod").is_file() {
+                let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+                expected.push(format!("binaries/{name}-sidecar"));
+            }
+        }
+        expected.sort();
+        let mut found: Vec<String> = conf["bundle"]["externalBin"]
+            .as_array()
+            .expect("bundle.externalBin is a list")
+            .iter()
+            .map(|v| v.as_str().expect("a string").to_string())
+            .collect();
+        found.sort();
+        assert_eq!(found, expected);
+        assert_eq!(conf["bundle"]["createUpdaterArtifacts"], true);
+        assert_eq!(
+            conf["bundle"]["windows"]["nsis"]["installerHooks"],
+            "./windows/hooks.nsh"
+        );
+    }
+
+    /// Criterion 7: the installer ends the daemon and every sidecar before it writes or removes.
+    #[test]
+    fn the_installer_stops_the_daemon_before_it_writes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let hooks = std::fs::read_to_string(root.join("windows/hooks.nsh"))
+            .expect("windows/hooks.nsh exists");
+        assert!(hooks.contains("NSIS_HOOK_PREINSTALL"), "{hooks}");
+        assert!(hooks.contains("NSIS_HOOK_PREUNINSTALL"), "{hooks}");
+        assert!(hooks.contains("/End /TN \"NucleOS Daemon\""), "{hooks}");
+        assert!(hooks.contains("nucleos-core.exe"), "{hooks}");
+        assert!(
+            !hooks.contains('\t'),
+            "hooks.nsh holds a TAB character, so an escape like \\t was written literally"
+        );
+        assert!(
+            hooks.contains("\"$SYSDIR\\taskkill.exe\" /F /T /IM nucleos-core.exe"),
+            "hooks.nsh never runs taskkill on nucleos-core.exe: {hooks}"
+        );
+        assert!(
+            hooks.contains("\"$SYSDIR\\schtasks.exe\" /End /TN \"NucleOS Daemon\""),
+            "hooks.nsh never runs schtasks /End: {hooks}"
+        );
+        for entry in std::fs::read_dir(root.join("../../sidecars")).expect("sidecars dir") {
+            let dir = entry.expect("entry").path();
+            if dir.join("go.mod").is_file() {
+                let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+                let exe = format!("{name}-sidecar.exe");
+                assert!(hooks.contains(&exe), "hooks.nsh never stops {exe}");
+                let kill = format!("\"$SYSDIR\\taskkill.exe\" /F /T /IM {exe}");
+                assert!(hooks.contains(&kill), "hooks.nsh never runs: {kill}");
+            }
+        }
     }
 }

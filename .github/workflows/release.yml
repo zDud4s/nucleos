@@ -1,0 +1,104 @@
+# Release: build, sign and publish the three-platform installers plus latest.json from a v* tag.
+#
+# Owner's steps, once:
+#   1. npm run tauri signer generate -- -w ~/.tauri/nucleos.key
+#   2. Paste the printed .pub into `plugins.updater.pubkey` in shell/src-tauri/tauri.conf.json.
+#   3. Create the repository secrets TAURI_SIGNING_PRIVATE_KEY (the key file's content) and
+#      TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
+# Per release:
+#   4. Bump `version` in shell/src-tauri/tauri.conf.json.
+#   5. Push the tag `v<version>` (it must equal that version).
+# The repository's releases must be public: the updater feed (latest.json) is fetched anonymously.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: --bundles nsis
+          - os: macos-latest
+            bundles: --bundles app,dmg
+          - os: ubuntu-22.04
+            bundles: --bundles appimage,deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: shell/package-lock.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.x
+
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libssl-dev pkg-config patchelf
+
+      # Read from rust-toolchain.toml and passed as an argument, so the version lives in one place.
+      # Windows runners default to the MSVC host; this repository's Windows builds use GNU (see
+      # rust-toolchain.toml), so that leg sets the host first — the same line a Windows developer runs.
+      - name: Install the pinned toolchain
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then rustup set default-host x86_64-pc-windows-gnu; fi
+          toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --component clippy --component rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install shell dependencies
+        working-directory: shell
+        run: npm ci
+
+      - name: Guard the release config
+        shell: bash
+        run: |
+          conf=shell/src-tauri/tauri.conf.json
+          if grep -q 'REPLACE_WITH_' "$conf"; then
+            echo "::error::$conf still contains REPLACE_WITH_ (the updater pubkey is not set)"; exit 1
+          fi
+          version="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$conf" | head -n 1)"
+          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::tauri.conf.json version '$version' does not match tag '$GITHUB_REF_NAME'"; exit 1
+          fi
+
+      - name: Stage the núcleo and the sidecars
+        shell: bash
+        run: bash scripts/stage-bundle-bins.sh
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: shell
+          tagName: ${{ github.ref_name }}
+          releaseName: NucleOS ${{ github.ref_name }}
+          releaseDraft: true
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: --config src-tauri/tauri.release.conf.json --features release-bundle ${{ matrix.bundles }}
+
+  # Publishes the draft only once every leg has uploaded, so latest.json never goes live half-filled.
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

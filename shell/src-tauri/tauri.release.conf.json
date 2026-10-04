@@ -1,0 +1,19 @@
+{
+  "bundle": {
+    "createUpdaterArtifacts": true,
+    "externalBin": [
+      "binaries/nucleos-core",
+      "binaries/browser-sidecar",
+      "binaries/echo-sidecar",
+      "binaries/email-sidecar",
+      "binaries/quota-sidecar",
+      "binaries/telegram-sidecar",
+      "binaries/web-sidecar"
+    ],
+    "windows": {
+      "nsis": {
+        "installerHooks": "./windows/hooks.nsh"
+      }
+    }
+  }
+}

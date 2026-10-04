@@ -27,6 +27,8 @@ export const keys = {
   health: ["health"] as const,
   /** The first authenticated call of a round, and so the proof the token still works. */
   status: ["status"] as const,
+  /** The release feed's answer: an update to offer, or null. */
+  update: ["update"] as const,
 
   /**
    * How much work fits and what is inside it — `GET /concurrency`.

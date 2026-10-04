@@ -19,6 +19,7 @@ import { useNotchMode, useSetNotchMode } from "./notch-mode";
 import { useScreenLine } from "./screen-line";
 import { useNotchPlace } from "./notch-place";
 import { Sidebar } from "./Sidebar";
+import { UpdateNotice } from "./UpdateNotice";
 import { NAV_ITEMS } from "./nav";
 
 /**
@@ -151,6 +152,7 @@ function Frame() {
           */}
           <PaletteTrigger />
           <NotificationsDrawer />
+          <UpdateNotice />
           {/*
             The break this footer actually has. Everything above it is somewhere to
             go or something to read; below it is the one control that stops the

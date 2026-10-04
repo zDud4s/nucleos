@@ -43,6 +43,9 @@ pub fn build_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/status", get(status))
+        // Deliberately in NO auth.rs table: a route absent from every table is reachable by the
+        // control token and an Admin key only, which is exactly who may stop the daemon.
+        .route("/daemon/shutdown", post(post_daemon_shutdown))
         .route("/health/readout", get(health_readout))
         .route("/sidecars", get(get_sidecars))
         .route("/sidecars/{name}/restart", post(post_sidecar_restart))
@@ -621,7 +624,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
-        .route("/assistant/chats/{chat_id}/restore", post(post_chat_restore))
+        .route(
+            "/assistant/chats/{chat_id}/restore",
+            post(post_chat_restore),
+        )
         .route(
             "/assistant/chat-groups",
             get(list_chat_groups).post(create_chat_group),
@@ -630,7 +636,10 @@ pub fn build_router(state: AppState) -> Router {
             "/assistant/chat-groups/{group_id}",
             axum::routing::patch(rename_chat_group).delete(delete_chat_group),
         )
-        .route("/assistant/chats/{chat_id}/group", axum::routing::put(put_chat_group))
+        .route(
+            "/assistant/chats/{chat_id}/group",
+            axum::routing::put(put_chat_group),
+        )
         // The two context gestures. Separate routes rather than one with a flag, because they are
         // separate decisions and a caller that got the flag backwards would silently throw away a
         // conversation's memory.
@@ -1027,6 +1036,30 @@ async fn post_webhook_push(
         crate::webhook::DeliveryOutcome::Deferred { .. } => StatusCode::SERVICE_UNAVAILABLE,
     };
     Ok((status, Json(outcome)))
+}
+
+/// Process-wide shutdown signals. `notify_one` stores a permit, so a request that lands before
+/// anything awaits is not lost.
+static SHUTDOWN: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+static SHUTDOWN_DEADLINE: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// Resolves once someone asked the daemon to stop (graceful shutdown of the server).
+pub async fn shutdown_requested() {
+    SHUTDOWN.notified().await;
+}
+
+/// Resolves at the same moment; the watchdog in `main` starts its countdown from here.
+pub async fn shutdown_deadline() {
+    SHUTDOWN_DEADLINE.notified().await;
+}
+
+async fn post_daemon_shutdown() -> impl IntoResponse {
+    tracing::warn!("daemon shutdown requested over HTTP");
+    SHUTDOWN.notify_one();
+    SHUTDOWN_DEADLINE.notify_one();
+    StatusCode::ACCEPTED
 }
 
 async fn status() -> impl IntoResponse {
@@ -11844,10 +11877,10 @@ async fn list_chats(
                 .collect(),
         )
     })
-        .map_err(|error| {
-            tracing::warn!(%error, "listing chats failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    .map_err(|error| {
+        tracing::warn!(%error, "listing chats failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -12849,10 +12882,17 @@ async fn chosen_brain_in(
     };
     let brain = if let Some(choice) = cheap_choices.into_iter().find(|choice| choice.id == id) {
         crate::chats::Brain::from_wire(&choice.brain)
-    } else if crate::model_catalog::cached_or_fallback().iter().any(|found| {
-        found.id == id
-            && crate::model_catalog::admits(config.active_runner(), rooted_of(asking), found.runner)
-    }) {
+    } else if crate::model_catalog::cached_or_fallback()
+        .iter()
+        .any(|found| {
+            found.id == id
+                && crate::model_catalog::admits(
+                    config.active_runner(),
+                    rooted_of(asking),
+                    found.runner,
+                )
+        })
+    {
         // A model the vendor lists (or the built-in catalogue names) that no config row does.
         // Looked up without the network, like the cheap catalogue above.
         crate::chats::Brain::Cloud
@@ -13700,7 +13740,8 @@ fn group_refusal(error: crate::chat_groups::GroupError) -> (StatusCode, Json<ser
 async fn create_chat_group(
     State(state): State<AppState>,
     Json(body): Json<ChatGroupName>,
-) -> Result<(StatusCode, Json<crate::chat_groups::ChatGroup>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<crate::chat_groups::ChatGroup>), (StatusCode, Json<serde_json::Value>)>
+{
     crate::chat_groups::create(&state.pool, &body.name)
         .await
         .map(|group| (StatusCode::CREATED, Json(group)))
@@ -28492,7 +28533,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["source"], "fallback");
-        assert_eq!(body["catalogue_version"], crate::model_catalog::CATALOGUE_VERSION);
+        assert_eq!(
+            body["catalogue_version"],
+            crate::model_catalog::CATALOGUE_VERSION
+        );
         assert!(body["fetched_at"].is_string());
         let groups = body["groups"].as_array().expect("groups is a list");
         assert!(!groups.is_empty());
@@ -28516,7 +28560,10 @@ mod tests {
             .collect();
         let ids: Vec<&str> = all.iter().filter_map(|m| m["id"].as_str()).collect();
         assert!(ids.contains(&"claude-sonnet-5-5"), "{ids:?}");
-        assert!(!ids.contains(&"gpt-5.5"), "a Codex model on a Claude daemon: {ids:?}");
+        assert!(
+            !ids.contains(&"gpt-5.5"),
+            "a Codex model on a Claude daemon: {ids:?}"
+        );
         let sonnet = all.iter().find(|m| m["id"] == "claude-sonnet-5-5").unwrap();
         assert_eq!(sonnet["label"], "Sonnet 5.5");
     }
@@ -29696,13 +29743,29 @@ mod tests {
 
         let (_, archived) =
             chats_request(&state, "GET", "/assistant/chats?archived=true", None).await;
-        assert!(archived.as_array().unwrap().iter().any(|c| c["chat_id"] == id.as_str()));
+        assert!(
+            archived
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["chat_id"] == id.as_str())
+        );
 
-        let (status, _) =
-            chats_request(&state, "POST", &format!("/assistant/chats/{id}/restore"), None).await;
+        let (status, _) = chats_request(
+            &state,
+            "POST",
+            &format!("/assistant/chats/{id}/restore"),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
-        assert!(live.as_array().unwrap().iter().any(|c| c["chat_id"] == id.as_str()));
+        assert!(
+            live.as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["chat_id"] == id.as_str())
+        );
 
         let (status, _) =
             chats_request(&state, "POST", "/assistant/chats/nope/restore", None).await;
@@ -29770,8 +29833,7 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
         assert_eq!(live[0]["group_id"], gid);
-        let (status, _) =
-            chats_request(&state, "PUT", &put_uri, Some(r#"{"group_id":999}"#)).await;
+        let (status, _) = chats_request(&state, "PUT", &put_uri, Some(r#"{"group_id":999}"#)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = chats_request(
             &state,
@@ -29796,8 +29858,13 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
         assert!(live[0]["group_id"].is_null());
-        let (status, _) =
-            chats_request(&state, "DELETE", &format!("/assistant/chat-groups/{gid}"), None).await;
+        let (status, _) = chats_request(
+            &state,
+            "DELETE",
+            &format!("/assistant/chat-groups/{gid}"),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -36310,5 +36377,43 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(judge, "enforce");
+    }
+
+    /// The updater stops the daemon through this route, so it must not be open to anyone without
+    /// the control token.
+    #[tokio::test]
+    async fn shutting_the_daemon_down_needs_the_control_token() {
+        for header in [None, Some("Bearer not-the-token")] {
+            let mut request = Request::builder().method("POST").uri("/daemon/shutdown");
+            if let Some(value) = header {
+                request = request.header("Authorization", value);
+            }
+            let response = build_router(test_state().await)
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{header:?}");
+        }
+    }
+
+    /// Only this test may await `shutdown_requested()`: the notifiers are process-wide.
+    #[tokio::test]
+    async fn the_control_token_can_ask_the_daemon_to_shut_down() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/daemon/shutdown")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_requested())
+            .await
+            .expect("the request must leave a stored shutdown permit");
     }
 }
