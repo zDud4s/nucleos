@@ -33,6 +33,13 @@
 .app-page:has(> .chats-app) {
   height: 100%;
   min-height: 0;
+  /* An application, not a measure: the 78rem cap and the auto margins that centre every other page
+     left a wide window with a band of empty ground between the app's navigation and the
+     conversation list. The list starts beside the navigation instead, a small step off it. The top
+     is as tight, because no header band sits there any more — the tabs strip is the first row. */
+  max-width: none;
+  padding-top: var(--space-3);
+  padding-left: var(--space-3);
   padding-bottom: 0;
 }
 
@@ -63,8 +70,8 @@
    and both columns grow the page instead of scrolling inside themselves. */
 .chats-layout {
   display: grid;
-  /* The session column is on the RIGHT, where a session manager keeps its sessions. */
-  grid-template-columns: minmax(0, 1fr) 19rem;
+  /* The session column is on the LEFT, beside the app's own navigation. */
+  grid-template-columns: 19rem minmax(0, 1fr);
   gap: var(--space-5);
   flex: 1;
   min-height: 0;
@@ -95,6 +102,12 @@
 @container chats (max-width: 53rem) {
   .chats-layout {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* One column, and the conversation comes first in it: the list is first in the DOM because it
+     is first on a wide screen, and folded it would otherwise push the thread off the top. */
+  .chats-rail {
+    order: 1;
   }
 }
 
@@ -148,8 +161,8 @@
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  padding-left: var(--space-4);
-  border-left: 1px solid var(--border);
+  padding-right: var(--space-4);
+  border-right: 1px solid var(--border);
 }
 
 /* The names scroll; the button that makes a new one does not. */
@@ -166,7 +179,7 @@
   -webkit-mask-image: var(--scroll-fade);
 }
 
-/* Answers that landed while you were elsewhere, on the button that opens the
+/* Answers that landed while you were elsewhere, beside the button that opens the
    list — a count inside a closed list is a count nobody can act on. */
 .chats-unseen {
   display: inline-flex;
@@ -181,17 +194,6 @@
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
-}
-
-.chats-kbd {
-  margin-left: var(--space-2);
-  padding: 0 var(--space-1);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text-faint);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
 }
 
 /* ------------------------------------------------------------- the palette -- */
@@ -424,6 +426,7 @@
 /* New session and New group share one row, the session taking the larger share. */
 .chats-rail-actions {
   display: flex;
+  align-items: center;
   gap: var(--space-2);
   margin-bottom: var(--space-4);
 }
@@ -860,72 +863,20 @@
   margin-bottom: var(--space-3);
 }
 
-/* ------------------------------------------------ the open conversation's head -- */
+/* ------------------------------------------------ the open conversation's top -- */
 
-/**
- * The way back to the list, above the conversation's name.
- *
- * Muted and unlined against the app's accent-coloured links, because a crumb is
- * orientation rather than an invitation: it is read once, on arrival, by somebody
- * checking they are where they meant to be. `a:hover` in `base.css` is unlayered, so the
- * hover is turned off by a selector of its own weight rather than by a utility.
- */
-.chats-crumb {
-  margin: 0;
-  font-size: var(--text-xs);
-}
-
-.chats-crumb a,
-.chats-crumb a:hover,
-.chats-crumb a:focus-visible {
-  color: var(--text-muted);
-  text-decoration: none;
-}
-
-.chats-crumb a:hover {
-  color: var(--text);
-}
-
-/**
- * The conversation's name, at the rank of a page title, and still a rename control.
- *
- * It is an `h1` carrying `.chats-title-name`'s button, so the two facts the design wants
- * are both true: the largest words on the screen are what this page is about, and
- * clicking them is how the conversation gets a better name. The size is stated here
- * rather than on `.chats-title-name`, because the editor door's fixed title uses that
- * class too and is a heading inside a column, not the page's own.
- */
-.chats-head-title {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  min-width: 0;
-  margin: 0;
-}
-
-.chats-head-title .chats-title-name,
-.chats-head-title .chats-title-input {
-  font-size: var(--text-2xl);
-  font-weight: var(--weight-bold);
-  letter-spacing: -0.015em;
-}
-
-/* Where it runs, in the header's headline slot. Mono because a path is a machine's word,
-   and truncated because a deep path must not push the `⋯` off the row. */
+/* Where it runs, at the end of the tabs strip. Mono because a path is a machine's word, and
+   truncated because a deep path must not push the `⋯` off the row. */
 .chats-where {
+  min-width: 0;
+  max-width: 24rem;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-/* An icon travelling with a word in the page header. Smaller than the composer's
-   (`.chats-tool-icon`, 1rem): those sit alone in a dense row, these sit beside type. */
-.chats-head-icon {
-  width: 0.875rem;
-  height: 0.875rem;
 }
 
 /* ------------------------------------------------------------- the meta line -- */
@@ -3573,13 +3524,50 @@
   font-size: var(--text-sm);
 }
 
-.chats-tabs {
+/**
+ * The conversation pane's top row: the way back to a closed list, the tabs, and the open
+ * conversation's own controls at the end. It took the place of the page's header band, so it
+ * carries the rule under it that the tabs used to draw on their own.
+ */
+.chats-topbar {
   display: flex;
-  gap: var(--space-1);
+  align-items: flex-end;
+  gap: var(--space-2);
   min-width: 0;
   margin-bottom: var(--space-3);
-  overflow-x: auto;
   border-bottom: 1px solid var(--border);
+}
+
+/* No tabs, the list open, nothing chosen: no row, and above all no stray rule. */
+.chats-topbar:empty {
+  display: none;
+}
+
+.chats-topbar-show,
+.chats-topbar-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+  padding-bottom: var(--space-1);
+}
+
+.chats-topbar-show .chats-unseen {
+  margin-left: 0;
+}
+
+.chats-topbar-actions {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
+}
+
+.chats-tabs {
+  display: flex;
+  flex: 0 1 auto;
+  gap: var(--space-1);
+  min-width: 0;
+  overflow-x: auto;
 }
 
 .chats-tab {

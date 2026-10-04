@@ -7,7 +7,6 @@ import {
   useRef,
   useState,
   type Dispatch,
-  type ReactNode,
   type RefObject,
   type SetStateAction,
 } from "react";
@@ -34,8 +33,7 @@ import {
   Mic,
   MicOff,
   MoreHorizontal,
-  PanelRight,
-  PanelRightClose,
+  PanelLeftOpen,
   ChevronRight,
   LoaderCircle,
   SquarePen,
@@ -95,13 +93,12 @@ import {
 } from "../data/chats";
 import { type RelaySent } from "../lib/turns";
 import { type ChatNotice } from "../data/chats";
-import { SHORTCUT_HINT, usePaletteGroup, usePaletteOpen, usePaletteQuery } from "../ui";
+import { usePaletteGroup, usePaletteQuery } from "../ui";
 import {
   anyTurnLive,
   marksBetween,
   planOf,
   turnIsLive,
-  unreadTotal,
   type Mark,
   type RelayedFrom,
   type Todo,
@@ -133,7 +130,7 @@ import {
   CopyButton,
   CostLine,
   ErrorNote,
-  PageHeader,
+  IconButton,
   Quiet,
   RefusalNote,
   RelativeTime,
@@ -258,7 +255,6 @@ export function Chats() {
   };
   const unseen = rows.reduce((total, row) => total + row.waiting, 0);
   const query = usePaletteQuery();
-  const openPalette = usePaletteOpen();
   const said = useSaid(query);
   const needle = query.trim().toLowerCase();
 
@@ -313,60 +309,19 @@ export function Chats() {
         },
   );
 
+  /** The conversation the page is about, when there is one; `null` on the front door. */
+  const open = pickingUp === null && chatId !== null ? (summary ?? null) : null;
+
   return (
     /* The class that turns this route from a document into an application: see `.chats-app`, which
        stops the shell scrolling the whole page and hands the height to the two columns below. */
     <div className="chats-app">
-      <ChatsHeader
-        /* The subject of this page is the conversation on it, when there is one. Every
-           chat answered to the heading "Chats", which is the one thing the person who
-           just clicked a conversation already knew. */
-        open={pickingUp === null && chatId !== null ? (summary ?? null) : null}
-        openId={chatId}
-        turns={transcript.data?.turns}
-        headline={headlineFor(rows, chats.data !== undefined)}
-        actions={
-          <>
-            <Button
-              variant="ghost"
-              aria-pressed={railOpen}
-              /* Spelled out rather than left to the name computation over the
-                 children, for the same reason the nav items and the chat rows are:
-                 "Conversations" and a count in an adjacent span concatenate with no
-                 separator, and a screen reader would announce "Conversations5". */
-              aria-label={
-                railOpen
-                  ? "Hide conversations"
-                  : unseen > 0
-                    ? `Conversations, ${unseen} unseen`
-                    : "Conversations"
-              }
-              onClick={() => setRailOpen((open) => !open)}
-            >
-              {/* The same gesture the shell's own rail offers, so it reads as the same kind of
-                  thing: a panel that folds away, not a page that opens. The glyph is the only
-                  part shared — the label stays words, because this button is in a header where
-                  a lone icon would be the only unlabelled control on the page. */}
-              {railOpen ? (
-                <PanelRightClose className="chats-head-icon" aria-hidden="true" />
-              ) : (
-                <PanelRight className="chats-head-icon" aria-hidden="true" />
-              )}
-              {railOpen ? "Hide conversations" : "Conversations"}
-              {/* Answers that landed while you were elsewhere. Shown on the button
-                  precisely because the list they are in may be closed — a count that
-                  only appears once the list is open tells you what you already see. */}
-              {!railOpen && unseen > 0 && (
-                <span className="chats-unseen">{unseen}</span>
-              )}
-            </Button>
-            <Button variant="ghost" onClick={openPalette}>
-              Find a conversation
-              <kbd className="chats-kbd">{SHORTCUT_HINT}</kbd>
-            </Button>
-          </>
-        }
-      />
+      {/* No header band. The page's top row is the tabs strip, and the conversation's own controls
+          ride at its end — so the heading the outline needs is said to a screen reader only. The
+          subject is the conversation on screen when there is one, and "Chats" when there is not. */}
+      <h1 className="sr-only">
+        {open === null ? "Chats" : (open.title ?? "New conversation")}
+      </h1>
 
       {stale && <StaleNote dataUpdatedAt={chats.dataUpdatedAt} />}
       {chats.isError && chats.data === undefined && (
@@ -378,15 +333,77 @@ export function Chats() {
           railOpen ? "chats-layout" : "chats-layout chats-layout-alone"
         }
       >
+        {railOpen && (
+          /* The ground that tells the list from the thread. See `.chats-rail`: it sits on the
+             LEFT, beside the app's own navigation. */
+          <div className="chats-rail">
+            <SessionColumn
+              rows={rows}
+              answered={chats.data !== undefined}
+              selected={chatId}
+              selectedLive={selectedLive}
+              pickingUp={pickingUp}
+              onPickUp={setPickingUp}
+              onOpenChat={openingAChat}
+              onNew={() => {
+                setPickingUp(null);
+                void navigate({ to: "/chats" });
+              }}
+              onHide={() => setRailOpen(false)}
+              openTabs={tabs.tabs}
+            />
+          </div>
+        )}
+
         <div className="chats-detail">
-          <ChatTabs
-            tabs={tabs.tabs}
-            rows={rows}
-            current={pickingUp === null ? chatId : null}
-            selectedLive={selectedLive}
-            onOpenChat={openingAChat}
-            onClose={closeTab}
-          />
+          {/* The top row of the conversation pane. Empty — no tabs, the list open, nothing
+              chosen — it draws nothing at all: see `.chats-topbar:empty`. */}
+          <div className="chats-topbar">
+            {!railOpen && (
+              /* The way back to the list, where the list's own edge was. Never only a shortcut:
+                 a closed list with no visible way to reopen it is a dead end. */
+              <span className="chats-topbar-show">
+                <IconButton
+                  /* The count is in the name, because the badge beside the glyph is drawn for
+                     the eye only — "Show conversations" and "5" would otherwise read as one word. */
+                  label={
+                    unseen > 0
+                      ? `Show conversations, ${unseen} unseen`
+                      : "Show conversations"
+                  }
+                  icon={PanelLeftOpen}
+                  onClick={() => setRailOpen(true)}
+                />
+                {/* Answers that landed while you were elsewhere. Shown here precisely because the
+                    list they are in is closed. */}
+                {unseen > 0 && (
+                  <span className="chats-unseen" aria-hidden="true">
+                    {unseen}
+                  </span>
+                )}
+              </span>
+            )}
+            <ChatTabs
+              tabs={tabs.tabs}
+              rows={rows}
+              current={pickingUp === null ? chatId : null}
+              selectedLive={selectedLive}
+              onOpenChat={openingAChat}
+              onClose={closeTab}
+            />
+            {open !== null && chatId !== null && (
+              /* What the header band used to carry beside the conversation's name: where it runs,
+                 the cache and agent chips, and the `⋯` — rename included now, see `ChatMenu`. */
+              <div className="chats-topbar-actions">
+                <ChatWhere chatId={chatId} />
+                <ChatChips
+                  turns={transcript.data?.turns}
+                  chatTitle={open.title ?? "Conversation"}
+                />
+                <ChatMenu chatId={chatId} />
+              </div>
+            )}
+          </div>
           {/* An editor conversation opens in this column like any other, because to the person
               looking at the list it IS any other — see `EditorDetail`. */}
           {pickingUp !== null && (
@@ -412,96 +429,17 @@ export function Chats() {
             />
           )}
         </div>
-
-        {railOpen && (
-          /* The ground that tells the list from the thread. See `.chats-rail`: it sits on the
-             RIGHT, where a session manager keeps its sessions. */
-          <div className="chats-rail">
-            <SessionColumn
-              rows={rows}
-              answered={chats.data !== undefined}
-              selected={chatId}
-              selectedLive={selectedLive}
-              pickingUp={pickingUp}
-              onPickUp={setPickingUp}
-              onOpenChat={openingAChat}
-              onNew={() => {
-                setPickingUp(null);
-                void navigate({ to: "/chats" });
-              }}
-              openTabs={tabs.tabs}
-            />
-          </div>
-        )}
       </div>
     </div>
   );
 }
 
 /**
- * The top of the page, which says a different thing depending on whether a conversation
- * is open.
- *
- * **Nothing open** — `PageHeader`, exactly as every other page has it: the word "Chats"
- * and one line about the list.
- *
- * **A conversation open** — the same band, composed here rather than through
- * `PageHeader`, because its `title` is a `string` and this heading has to stay the
- * editable name it has always been. Clicking the title to rename it is the affordance
- * this page was built with; turning it into a plain string and putting "Rename" behind a
- * menu would have been a capability traded for a component. So the shared classes are
- * used directly — `ui-page-header`, `ui-page-header-text`, `ui-page-actions` — which is
- * the same header, drawn by the same rules, holding a control.
- *
- * The `⋯` comes up here with it. It is the conversation's settings, and a conversation's
- * settings belong beside the conversation's name.
- */
-function ChatsHeader({
-  open,
-  openId,
-  headline,
-  actions,
-  turns,
-}: {
-  /** What the conversation has said so far, for the cache and agent chips. */
-  turns?: Turn[];
-  /** The conversation on screen, or `null` for the front door. */
-  open: ChatSummary | null;
-  /** Its id — separate, because the summary can be late while the route is not. */
-  openId: string | null;
-  headline: string | undefined;
-  actions: ReactNode;
-}) {
-  if (open === null || openId === null) {
-    return <PageHeader title="Chats" headline={headline} actions={actions} />;
-  }
-
-  return (
-    <header className="ui-page-header">
-      <div className="ui-page-header-text">
-        {/* The way back to the list of all of them, and the word the heading used to
-            spend itself on. Muted and unlined: a crumb is read once, on arrival. */}
-        <p className="chats-crumb">
-          <Link to="/chats">Chats</Link>
-        </p>
-        <TitleEditor chatId={openId} title={open.title} />
-        <ChatWhere chatId={openId} />
-      </div>
-      <div className="ui-page-actions">
-        <ChatChips turns={turns} chatTitle={open.title ?? "Conversation"} />
-        {actions}
-        <ChatMenu chatId={openId} />
-      </div>
-    </header>
-  );
-}
-
-/**
- * Where this conversation runs, as the header's one derived line.
+ * Where this conversation runs, as one line at the end of the tabs strip.
  *
  * The directory is named here only when it is settled. While it is unknown, or while it
  * is a state that needs teaching, `Project` in the transcript says so in full — a
- * headline is the wrong place to explain something.
+ * one-line slot is the wrong place to explain something.
  *
  * A second reader of `useChatProject` and never a second source: react-query answers both
  * this and the menu below out of one cache entry, so the line and the settings cannot
@@ -512,22 +450,11 @@ function ChatWhere({ chatId }: { chatId: string }) {
   const cwd = project.data?.cwd ?? null;
   const tools = project.data?.tools ?? false;
   if (cwd === null || !tools) return null;
-  return <p className="ui-page-headline chats-where">{cwd}</p>;
-}
-
-/** One derived sentence about the whole list. */
-function headlineFor(
-  rows: ChatSummary[],
-  answered: boolean,
-): string | undefined {
-  if (!answered) return undefined;
-  if (rows.length === 0)
-    return "no conversation has been opened from this window";
-  const noun = rows.length === 1 ? "conversation" : "conversations";
-  const unread = unreadTotal(rows);
-  return unread === 0
-    ? `${rows.length} ${noun}, nothing unread`
-    : `${rows.length} ${noun}, ${unread} unread`;
+  return (
+    <p className="chats-where" title={cwd}>
+      {cwd}
+    </p>
+  );
 }
 
 function ListError({ error }: { error: unknown }) {
@@ -982,13 +909,12 @@ function ChatDetail({
   const stale = transcript.isError && transcript.data !== undefined;
 
   return (
-    /* No frame and no title. The page header already says Chats, and the conversation says its own
-       name two lines below — a panel captioned "Conversation" around a conversation was a third
-       label for a thing nobody was confused about, plus a border down both sides of the reading. */
+    /* No frame and no title. The tab above already names the conversation — a panel captioned
+       "Conversation" around a conversation was a label for a thing nobody was confused about, plus
+       a border down both sides of the reading. */
     <section className="chats-detail-inner">
-      {/* The head that was here — the name and the `⋯` — is the page's own header now: the
-          conversation is what this page is about, so its name is the `h1` and not a line
-          under one. `ChatsHeader` draws both. */}
+      {/* The head that was here — the name and the `⋯` — lives in the tabs strip above: the tab
+          carries the name, and the strip's end carries the `⋯` (see `chats-topbar-actions`). */}
 
       {/* Everything that is a RECORD of the conversation scrolls; the header above and the box
           below do not. One scrollbar used to move all three, so reading the middle of a long
@@ -1532,6 +1458,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
   // item lives in the menu; the dialog is its sibling.
   const [helpers, setHelpers] = useState(false);
   const [instructions, setInstructions] = useState(false);
+  const [renaming, setRenaming] = useState(false);
   const row = useChatRow(chatId);
   const helperCount = row?.agents.length ?? 0;
   const instructed = (row?.system_prompt ?? "") !== "";
@@ -1558,6 +1485,10 @@ function ChatMenu({ chatId }: { chatId: string }) {
           {/* Settings, not gestures. The model and the effort sit in the box because they are
               changed while writing the message they govern; these three are decided once and left
               alone, so they belong behind the ⋯ rather than in a row you look at all day. */}
+          {/* The name was a click on the page's heading; with the header gone it is asked for
+              here, beside the conversation's other settings. A dialog for `ChatHelpers`' reason:
+              a field inside a menu closes the menu on the first keystroke. */}
+          <DropdownMenuItem onSelect={() => setRenaming(true)}>Rename</DropdownMenuItem>
           <ChatReach chatId={chatId} />
           <ChatCeiling chatId={chatId} />
           <ChatFallback chatId={chatId} />
@@ -1599,6 +1530,12 @@ function ChatMenu({ chatId }: { chatId: string }) {
       </DropdownMenu>
 
       <ChatHelpers chatId={chatId} open={helpers} onOpenChange={setHelpers} />
+      <ChatRename
+        chatId={chatId}
+        title={row?.title ?? null}
+        open={renaming}
+        onOpenChange={setRenaming}
+      />
       <ChatInstructions
         chatId={chatId}
         open={instructions}
@@ -1963,102 +1900,92 @@ function TranscriptError({ error }: { error: unknown }) {
 /* ----------------------------------------------------------------- title -- */
 
 /**
- * The conversation's name, and the way to change it.
+ * The conversation's name, and the way to change it — a dialog opened from the `⋯`.
  *
- * A name at rest; a field once you ask for one. It was a permanent input and two buttons before,
- * open on every visit whether anybody was renaming anything or not — a form standing on top of the
- * thing you came to read, costing a row of height every time.
+ * It was the page's heading, clickable, until the header band went: the tabs strip is the top of
+ * the page now and the tab already shows the name, so the rename moved in beside the other things
+ * decided about a conversation once and left alone.
  *
- * The draft is seeded when the editor opens rather than held from the first render. A conversation
+ * The draft is seeded when the dialog opens rather than held from the first render. A conversation
  * can be renamed from elsewhere — the daemon names one by itself — and a draft that was set once at
- * mount would quietly write a stale name back over it.
+ * mount would quietly write a stale name back over it. Seeded once per opening, guarded by the ref
+ * for `ChatInstructions`' reason: the row behind it is polled.
  */
-function TitleEditor({
+function ChatRename({
   chatId,
   title,
+  open,
+  onOpenChange,
 }: {
   chatId: string;
   title: string | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
 }) {
-  const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const patch = usePatchChat();
   const auto = usePostChatTitle();
 
-  const close = () => setEditing(false);
+  const seeded = useRef(false);
+  useEffect(() => {
+    if (!open) {
+      seeded.current = false;
+      return;
+    }
+    if (seeded.current) return;
+    seeded.current = true;
+    setDraft(title ?? "");
+  }, [open, title]);
+
+  const close = () => onOpenChange(false);
   const rename = () => {
     if (draft.trim() === "") return;
     patch.mutate({ chatId, title: draft.trim() }, { onSuccess: close });
   };
 
-  if (!editing) {
-    return (
-      /*
-        The page's heading, and still the rename control.
-
-        `aria-label` on the `h1` and not only on the button, because a heading takes its
-        name from its descendants — and the button's own label, which has to say what
-        pressing it does, would have become the heading's. Named here, the outline says
-        the conversation's name and the control inside it says it is a rename.
-      */
-      <h1 className="chats-head-title" aria-label={title ?? "New conversation"}>
-        <button
-          type="button"
-          className="chats-title-name"
-          /* Spelled out, because the visible text is the NAME and a button whose whole accessible
-             name is the conversation's title announces nothing about what pressing it does. */
-          aria-label={`Rename this conversation — currently ${title ?? "unnamed"}`}
-          onClick={() => {
-            setDraft(title ?? "");
-            setEditing(true);
-          }}
-        >
-          {title ?? "New conversation"}
-        </button>
-      </h1>
-    );
-  }
-
   return (
-    <div className="chats-head-title">
-      <input
-        className="chats-title-input"
-        aria-label="Conversation title"
-        autoFocus
-        value={draft}
-        onChange={(event) => setDraft(event.target.value)}
-        /* Enter commits and Escape abandons, which is what an in-place rename does everywhere.
-           Without them the only way out of the field would be the mouse. */
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
-            event.preventDefault();
-            rename();
-          }
-          if (event.key === "Escape") {
-            event.preventDefault();
-            close();
-          }
-        }}
-      />
-      <Button
-        disabled={draft.trim() === "" || patch.isPending}
-        onClick={rename}
-      >
-        Rename
-      </Button>
-      <Button
-        variant="ghost"
-        disabled={auto.isPending}
-        onClick={() => auto.mutate(chatId, { onSuccess: close })}
-      >
-        Name it locally
-      </Button>
-      <Button variant="ghost" onClick={close}>
-        Cancel
-      </Button>
-      {patch.isError && <TitleRefusal error={patch.error} />}
-      {auto.isError && <AutoTitleRefusal error={auto.error} />}
-    </div>
+    <Modal
+      open={open}
+      onOpenChange={onOpenChange}
+      title="Rename conversation"
+      footer={
+        <>
+          <Button
+            variant="ghost"
+            disabled={auto.isPending}
+            onClick={() => auto.mutate(chatId, { onSuccess: close })}
+          >
+            Name it locally
+          </Button>
+          <Button
+            variant="approve"
+            disabled={draft.trim() === "" || patch.isPending}
+            onClick={rename}
+          >
+            Rename
+          </Button>
+        </>
+      }
+    >
+      <div className="chats-helpers">
+        <input
+          className="chats-title-input"
+          aria-label="Conversation title"
+          autoFocus
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          /* Enter commits; Escape is the dialog's own way out. */
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              rename();
+            }
+          }}
+        />
+        {patch.isError && <TitleRefusal error={patch.error} />}
+        {auto.isError && <AutoTitleRefusal error={auto.error} />}
+      </div>
+    </Modal>
   );
 }
 
