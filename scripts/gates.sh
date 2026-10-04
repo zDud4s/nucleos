@@ -45,8 +45,16 @@ run() {
   # A heavy cargo subcommand takes a build slot (see `slot_run`; check|clippy pass through it
   # without one). It is decided HERE and not written on each gate line, because the classifier
   # test reads those lines as plain commands.
+  # The same goes for the other heavy steps (tsc, npm test, go test/vet): they reach the machine-wide
+  # broker through `heavy_run`, which falls back to today's behaviour when no broker is present.
   if [ "$1" = cargo ]; then
-    case "$2" in build|check|clippy|test|run|doc) set -- slot_run "$@" ;; esac
+    case "$2" in build|check|clippy|test|run|doc) set -- heavy_run "$@" ;; esac
+  elif [ "$1" = npx ] && [ "$2" = tsc ]; then
+    set -- heavy_run "$@"
+  elif [ "$1" = npm ] && [ "$2" = test ]; then
+    set -- heavy_run "$@"
+  elif [ "$1" = go ]; then
+    case "$2" in test|vet) set -- heavy_run "$@" ;; esac
   fi
   ( cd "$dir" && "$@" ) 2>&1 | tee "$capture"
   status="${PIPESTATUS[0]}"
@@ -163,6 +171,24 @@ _slot_try() {
   fi
   rm -rf "$dir/.mutex"
   return "$got"
+}
+
+heavy_run() {
+  # heavy_run <command...>: hand the command to the machine-wide broker (<main>/scripts/heavy.py)
+  # when the main checkout has one; otherwise fall back to the build slot (cargo) or run it plainly.
+  # NUCLEOS_HEAVY_MAIN overrides the main checkout, NUCLEOS_HEAVY_PYTHON the interpreter. Both
+  # broker files must exist, so a CI run or a fresh clone keeps the old behaviour.
+  local main py
+  main="${NUCLEOS_HEAVY_MAIN:-$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")}"
+  if [ "${OS:-}" = Windows_NT ]; then py="${NUCLEOS_HEAVY_PYTHON:-python}"; else py="${NUCLEOS_HEAVY_PYTHON:-python3}"; fi
+  if [ -f "$main/scripts/heavy.py" ] && [ -f "$main/.ai/scripts/heavy_classify.py" ]; then
+    "$py" "$main/scripts/heavy.py" -- "$@"
+  elif [ "$1" = cargo ] || [ -n "${heavy_slot_any:-}" ]; then
+    # build-slot.sh sets heavy_slot_any: whatever it is asked to run takes a slot, as before.
+    slot_run "$@"
+  else
+    "$@"
+  fi
 }
 
 slot_run() {

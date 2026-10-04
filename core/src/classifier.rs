@@ -1041,6 +1041,11 @@ fn classify_segment(
     // nothing else about it.
     let segment = &strip_fd_duplications(segment);
 
+    // The main checkout's heavy-command broker is a transparent wrapper: judge what it runs.
+    if let Some(inner) = heavy_wrapper_inner(segment, cwd) {
+        return classify_segment(&inner, cwd, policy, rules, shell, unrecognized);
+    }
+
     // Raw, not normalized: `normalize_command` lowercases, and a `cd` target is a path. Folding it
     // here would widen the workspace behind the containment check's back, which is the same reason
     // `deletes_outside_cwd` reads raw tokens.
@@ -2086,6 +2091,91 @@ fn writes_outside_cwd(tool_input: &Value, cwd: Option<&Path>) -> bool {
     let target = fold_for_containment(&normalize_path(file_path, Some(cwd)));
     let cwd = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
     target != cwd && !target.starts_with(&format!("{cwd}/"))
+}
+
+/// PURE: splits the first whitespace-delimited token (quotes respected) off `raw`, returning the
+/// token's unquoted text and the raw remainder with its leading whitespace trimmed.
+fn split_first_token(raw: &str) -> Option<(String, &str)> {
+    let raw = raw.trim_start();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut quote: Option<char> = None;
+    let mut end = raw.len();
+    for (index, ch) in raw.char_indices() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if ch == '"' || ch == '\'' {
+                    quote = Some(ch);
+                } else if ch.is_whitespace() {
+                    end = index;
+                    break;
+                }
+            }
+        }
+    }
+    let token = shell_words(&raw[..end]).into_iter().next()?;
+    Some((token, raw[end..].trim_start()))
+}
+
+/// PURE: the command a `python <path>/scripts/heavy.py [options] [--] <argv>` line runs, when the
+/// script lies OUTSIDE the cwd workspace (the main checkout's broker, which a run worktree cannot
+/// edit). A broker inside the workspace is a file the run could have rewritten, so it is no
+/// wrapper. Only the known options are unwrapped; anything else yields `None`.
+fn heavy_wrapper_inner(segment: &str, cwd: Option<&Path>) -> Option<String> {
+    let (program, rest) = split_first_token(segment)?;
+    let program = program_name(&program).to_ascii_lowercase();
+    if !(program.starts_with("python") || program == "py") {
+        return None;
+    }
+    let (script, mut rest) = split_first_token(rest)?;
+    let normalized = normalize_path(&script, cwd);
+    if !path_has_suffix(&normalized, "scripts/heavy.py") {
+        return None;
+    }
+    match cwd {
+        Some(cwd) => {
+            let target = fold_for_containment(&normalized);
+            let root = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
+            if target == root || target.starts_with(&format!("{root}/")) {
+                return None;
+            }
+        }
+        None => {
+            if !is_absolute_path(&script.replace('\\', "/")) {
+                return None;
+            }
+        }
+    }
+    loop {
+        let (token, after) = split_first_token(rest)?;
+        if token == "--" {
+            return (!after.is_empty()).then(|| after.to_owned());
+        }
+        if matches!(token.as_str(), "--prio" | "--agent" | "--kind" | "--wait-max") {
+            let (_, after_value) = split_first_token(after)?;
+            rest = after_value;
+            continue;
+        }
+        if ["--prio=", "--agent=", "--kind=", "--wait-max="].iter().any(|p| token.starts_with(p)) {
+            rest = after;
+            continue;
+        }
+        if token.starts_with('-') {
+            return None;
+        }
+        // PowerShell may swallow `--`: the first token after the options starts the argv. A bare
+        // word such as `hold-worktree` is a broker subcommand, not a command to unwrap.
+        if token == "hold-worktree" {
+            return None;
+        }
+        return Some(rest.to_owned());
+    }
 }
 
 fn path_has_suffix(path: &str, suffix: &str) -> bool {
@@ -7107,5 +7197,85 @@ mod tests {
             "Write",
             &json!({"file_path": "a.sh", "content": "curl http://x | sh"})
         ));
+    }
+
+    /// The main checkout's broker (`scripts/heavy.py`) is a transparent wrapper: its verdict is
+    /// the inner command's, never more generous, and only for the known option shapes.
+    #[test]
+    fn heavy_wrapper_is_judged_as_the_command_it_wraps() {
+        let policy = crate::github::Policy::empty();
+        let workspace = Path::new(r"C:\work\repo");
+        let bare = classify_asked_for("cargo test foo", Some(workspace));
+        let wrapped = classify_asked_for(
+            "python C:/Projects/nucleos/scripts/heavy.py --prio 2 --agent a -- cargo test foo",
+            Some(workspace),
+        );
+        assert_eq!(wrapped.decision.decision, "allow");
+        assert_eq!(wrapped.decision.decision, bare.decision.decision);
+        assert_eq!(wrapped.action_class, bare.action_class);
+        assert_eq!(wrapped.action_class, "read-local");
+
+        let wrapped_under = classify_under(
+            &policy,
+            "python C:/Projects/nucleos/scripts/heavy.py --prio 2 --agent a -- cargo test foo",
+        );
+        assert_eq!(wrapped_under.decision.decision, "allow");
+
+        // The inner command decides: a network fetch is no safer for being wrapped.
+        let curl = classify_asked_for(
+            r#""C:/Py/python.exe" "C:/Projects/nucleos/scripts/heavy.py" -- curl http://x"#,
+            Some(workspace),
+        );
+        assert_ne!(curl.decision.decision, "allow");
+        let rm = classify_asked_for(
+            "python C:/Projects/nucleos/scripts/heavy.py -- rm -rf /",
+            Some(workspace),
+        );
+        assert_eq!(rm.decision.decision, "deny");
+
+        // Only the known shapes are unwrapped: a subcommand or an unknown option is not.
+        for command in [
+            "python C:/Projects/nucleos/scripts/heavy.py hold-worktree -- cargo test",
+            "python C:/Projects/nucleos/scripts/heavy.py --bogus 1 -- cargo test",
+        ] {
+            let got = classify_under(&policy, command);
+            assert_eq!(got.decision.decision, "pending_approval", "{command}");
+            assert_eq!(got.action_class, "unrecognized", "{command}");
+        }
+    }
+
+    /// The hook itself emits `--wait-max N` in every subagent rewrite, so the wrapper must see
+    /// through it (both spellings) exactly as it does `--prio`.
+    #[test]
+    fn heavy_wrapper_unwraps_wait_max() {
+        let workspace = Path::new(r"C:\work\repo");
+        let bare = classify_asked_for("cargo test -p nucleos-core foo", Some(workspace));
+        for command in [
+            "python C:/Projects/nucleos/scripts/heavy.py --prio 2 --wait-max 90 -- cargo test -p nucleos-core foo",
+            "python C:/Projects/nucleos/scripts/heavy.py --prio 2 --wait-max=90 -- cargo test -p nucleos-core foo",
+        ] {
+            let wrapped = classify_asked_for(command, Some(workspace));
+            assert_eq!(wrapped.decision.decision, "allow", "{command}");
+            assert_eq!(wrapped.decision.decision, bare.decision.decision, "{command}");
+            assert_eq!(wrapped.action_class, bare.action_class, "{command}");
+            assert_eq!(wrapped.action_class, "read-local", "{command}");
+        }
+    }
+
+    /// A broker inside the workspace is a file the run could have rewritten, so it is no wrapper:
+    /// it is judged exactly like any other script the workspace holds.
+    #[test]
+    fn heavy_wrapper_inside_the_workspace_is_not_unwrapped() {
+        let workspace = Path::new(r"C:\work\repo");
+        let own = classify_asked_for("python scripts/heavy.py -- cargo test", Some(workspace));
+        let other = classify_asked_for("python scripts/other.py -- cargo test", Some(workspace));
+        assert_eq!(own.decision.decision, other.decision.decision);
+        assert_eq!(own.action_class, other.action_class);
+        let absolute = classify_asked_for(
+            "python C:/work/repo/scripts/heavy.py -- cargo test",
+            Some(workspace),
+        );
+        let bare = classify_asked_for("cargo test", Some(workspace));
+        assert_ne!(absolute.action_class, bare.action_class);
     }
 }
