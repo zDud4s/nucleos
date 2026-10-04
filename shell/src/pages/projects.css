@@ -1167,10 +1167,12 @@
  * never a tint: the tones belong to the reasons, and a card that went amber on
  * hover would be saying something about the project that is not true.
  */
+/* A full step more between groups than inside one, so a group's label reads as
+   opening what is under it rather than closing what came before. */
 .rs-groups {
   display: flex;
   flex-direction: column;
-  gap: var(--space-6);
+  gap: var(--space-7);
 }
 
 .rs-group {
@@ -1279,11 +1281,15 @@
   background: var(--tone-active-fg);
 }
 
+/* Pinned to the card's foot. The grid stretches every card in a row to the tallest one, and
+   with the verb sitting straight under the reasons, a card with two reasons put it a line
+   higher than its neighbour with three — the one thing on the card you act on, moving. */
 .rs-card-act {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
-  margin-top: 0.125rem;
+  margin-top: auto;
+  padding-top: 0.125rem;
   font-size: var(--text-sm);
   color: var(--text);
 }
@@ -1307,11 +1313,17 @@
   box-shadow: inset 0 0 0 1.5px var(--tone-off-fg);
 }
 
+/*
+  Tiles, not ruled rows. The ruled grid — a hairline under every name, five columns of them —
+  read as a spreadsheet: rows that promised columns of figures beside them and had none. A
+  quiet project is a name you look up, so each one is a small box of its own on the card's
+  ladder, one rung lighter (no fill until hovered), and the gap between them does the work
+  the rules were doing.
+*/
 .rs-quiet {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
-  column-gap: var(--space-4);
-  border-top: 1px solid var(--border);
+  grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
+  gap: var(--space-2);
 }
 
 .rs-quiet-item {
@@ -1319,19 +1331,22 @@
   align-items: center;
   gap: 0.625rem;
   min-width: 0;
-  min-height: 38px;
-  padding: 0 var(--space-2);
-  border-bottom: 1px solid var(--border);
+  min-height: 2.5rem;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   font-size: var(--text-sm);
   color: var(--text-muted);
   text-decoration: none;
   transition:
     background-color var(--dur-quick) var(--ease),
+    border-color var(--dur-quick) var(--ease),
     color var(--dur-quick) var(--ease);
 }
 
 .rs-quiet-item:hover {
   background: var(--surface);
+  border-color: var(--border-strong);
   color: var(--text);
   text-decoration: none;
 }
@@ -1349,7 +1364,29 @@
   white-space: nowrap;
 }
 
-.rs-quiet-off {
-  font-size: var(--text-xs);
-  color: var(--text-faint);
+/*
+  *Quiet*, split by state. Each state is a small label — the mode's dot, its name, its count —
+  over its own grid of tiles, so the dot is said once per state rather than once per tile and
+  the eye finds "everything switched off" as a block rather than as a pattern of hollow dots.
+*/
+.rs-quiet-states {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.rs-quiet-state {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.rs-quiet-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text-muted);
 }
