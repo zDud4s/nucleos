@@ -1628,6 +1628,13 @@ async fn main() {
             "model discovery keys"
         );
         model_catalog::install_keys(keys);
+        // Without a key a vendor is still discovered: Codex from the CLI's own cache, Anthropic
+        // from the public models.dev catalogue. A newly shipped model shows without a code edit.
+        model_catalog::enable_keyless();
+        // Warm the snapshot off the request path: the first picker open then finds it ready.
+        tokio::spawn(async {
+            model_catalog::current().await;
+        });
     }
 
     // Read after the local model has been probed, because whether a `kind: local` seat is runnable

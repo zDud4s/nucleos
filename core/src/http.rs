@@ -13053,6 +13053,7 @@ async fn get_model_groups(
         "groups": crate::model_catalog::group(cloud, &created),
         "needs_root": needs_root,
         "source": snapshot.source,
+        "sources": snapshot.sources,
         "catalogue_version": crate::model_catalog::CATALOGUE_VERSION,
         "fetched_at": snapshot.fetched_at,
     }))
