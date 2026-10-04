@@ -495,13 +495,15 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float
                 holder = _read_lock(lock)
                 if holder is not None and holder.get("pid") == me:
                     # Handed over by the previous holder on its release.
-                    lock.write_text(json.dumps(rec), encoding="utf-8")
+                    lock.write_text(json.dumps(dict(rec, acquired=time.time())),
+                                    encoding="utf-8")
                     return True, time.time() - t0, arrival
                 if holder is None:
                     ahead = [f for f, _ in _entries(wdir)
                              if f.name != wfile.name and _wkey(f) < mine]
                     if not ahead:
-                        lock.write_text(json.dumps(rec), encoding="utf-8")
+                        lock.write_text(json.dumps(dict(rec, acquired=time.time())),
+                                        encoding="utf-8")
                         return True, time.time() - t0, arrival
                 if not queued or not wfile.exists():
                     wfile.write_text(json.dumps(rec), encoding="utf-8")
@@ -543,7 +545,8 @@ def release_lock(directory: Path, h: str):
         if not waiting:
             return None
         f, wrec = waiting[0]
-        wrec = dict(wrec, start=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        wrec = dict(wrec, start=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    acquired=time.time())
         lock.write_text(json.dumps(wrec), encoding="utf-8")
         try:
             f.unlink()
@@ -1050,8 +1053,23 @@ def broker_run(args: list[str], held: bool = False) -> int:
                 tdir = resolve_target_dir(argv, crate, root, os.getcwd(), inject)
                 fp = (crate, tdir, compute_fingerprint(argv, crate, root, tdir))
                 hit = registry_hit(directory, tdir, fp[2], root)
+                if hit and lock_hash is None and not in_held:
+                    # A hit runs at weight 0, but it still touches the worktree's target dir:
+                    # it waits for the worktree lock like any other cargo run, then re-checks
+                    # the registry, since the holder it waited for may have rebuilt it.
+                    root = root or worktree_root()
+                    lock_hash = worktree_hash(root)
+                    lrec = dict(rec, worktree=root, hold=False,
+                                start=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+                    got, wait_lock, arrival = acquire_lock(directory, lock_hash, lrec, cap)
+                    if not got:
+                        lock_hash = None
+                        _log_timeout(directory, agent, prio, kind, weight, wait_lock, argv)
+                        return EXIT_QUEUE_TIMEOUT
+                    hit = registry_hit(directory, tdir, fp[2], root)
             except Exception as exc:
                 fp = None
+                hit = False
                 sys.stderr.write(f"heavy: no fingerprint: {exc}\n")
         if hit:
             weight = 0
@@ -1208,8 +1226,10 @@ def _read_log(since: str | None) -> list[dict]:
     return rows
 
 
-def _age(rec_path: Path) -> str:
+def _age(rec_path: Path, rec: dict | None = None) -> str:
     try:
+        if rec and isinstance(rec.get("acquired"), (int, float)):
+            return f"{max(0, int(time.time() - rec['acquired']))}s"
         return f"{int(time.time() - rec_path.stat().st_mtime)}s"
     except OSError:
         return "?"
@@ -1242,7 +1262,7 @@ def cmd_status() -> int:
             continue
         wdir = wt / (lock.name[: -len(".lock")] + ".waiters")
         waiting = sorted(_entries(wdir, reap=False), key=lambda it: _wkey(it[0]))
-        print(_line(rec, f"lock={lock.name[: -len('.lock')]} age={_age(lock)} "
+        print(_line(rec, f"lock={lock.name[: -len('.lock')]} age={_age(lock, rec)}"
                          f"waiters={len(waiting)}"))
         for f, wrec in waiting:
             print(_line(wrec, f"  waiting prio={_wkey(f)[0]} age={_age(f)}"))
