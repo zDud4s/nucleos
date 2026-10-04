@@ -56,3 +56,23 @@ async fn apply_migrations(pool: &sqlx::SqlitePool, wanted: impl Fn(i64) -> bool)
             .unwrap_or_else(|error| panic!("migration {} failed: {error}", migration.version));
     }
 }
+
+/// Two migrations with one version number break every database, fresh or not. sqlx keys a
+/// migration by its number alone: on an empty database the second insert into `_sqlx_migrations`
+/// hits the primary key and the run fails; on one that already applied either file, the other's
+/// checksum disagrees and startup stops with `VersionMismatch`. Git sees nothing wrong — the file
+/// names differ — so two branches cut from the same tip can each take "the next number" and both
+/// land. That is how `0159_owner_notes` and `0159_vcs_settled_feed` reached master on 2026-10-04.
+#[test]
+fn no_two_migrations_share_a_version() {
+    let mut seen = std::collections::BTreeMap::new();
+    for migration in sqlx::migrate!("./migrations").iter() {
+        if let Some(first) = seen.insert(migration.version, migration.description.clone()) {
+            panic!(
+                "migrations '{first}' and '{}' both carry version {} — renumber the one the \
+                 live database has not applied yet",
+                migration.description, migration.version
+            );
+        }
+    }
+}
