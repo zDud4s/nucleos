@@ -21,6 +21,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"nucleosbrowser/browser"
@@ -57,6 +58,11 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 	// a profile a person put logins into.
 	profiles, _ := driver.(browser.Profiles)
 	mux.HandleFunc("/forget", authorized(cfg.DaemonToken, forgetHandler(profiles)))
+
+	// Spec browser-ao-vivo: a person watching a session. Not an agent verb either, and a driver that
+	// cannot stream does not implement Watcher, so this answers 501 for it.
+	watcher, _ := driver.(browser.Watcher)
+	mux.HandleFunc("/watch", authorized(cfg.DaemonToken, watchHandler(watcher)))
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
@@ -415,6 +421,88 @@ func decode(w http.ResponseWriter, r *http.Request, into any) bool {
 		return false
 	}
 	return true
+}
+
+// WatchWriteDeadline bounds every write of a /watch record. A client that stops reading is dropped
+// within this long of its first blocked write, whoever ends the watch.
+const WatchWriteDeadline = time.Second
+
+// watchHandler streams a session as records (records.go) until the watch ends.
+//
+// The status line is committed on the FIRST frame, not before: until then the route has not promised a
+// stream, so a refusal (404, 409) is an ordinary status. Frame bytes are never logged.
+func watchHandler(watcher browser.Watcher) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var request SessionRequest
+		if !decode(w, r, &request) {
+			return
+		}
+		if watcher == nil {
+			http.Error(w, "this driver cannot stream a session", http.StatusNotImplemented)
+			return
+		}
+		if strings.TrimSpace(request.SessionID) == "" {
+			http.Error(w, "session_id is required", http.StatusBadRequest)
+			return
+		}
+
+		rc := http.NewResponseController(w)
+		// The driver may call the sink from a goroutine of its own and keep calling it after Watch has
+		// returned, so every touch of w is under mu, and `finished` makes the late ones no-ops.
+		var (
+			mu       sync.Mutex
+			started  bool
+			failed   bool
+			finished bool
+		)
+		// write sends one record under a fresh deadline. mu is held.
+		write := func(kind byte, body []byte) {
+			if failed || finished {
+				return
+			}
+			if !started {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.WriteHeader(http.StatusOK)
+				started = true
+			}
+			_ = rc.SetWriteDeadline(time.Now().Add(WatchWriteDeadline))
+			if err := WriteRecord(w, kind, body); err != nil {
+				failed = true
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				failed = true
+			}
+		}
+		sink := func(f browser.Frame) {
+			mu.Lock()
+			defer mu.Unlock()
+			write(RecordFrame, f.JPEG)
+		}
+
+		err := watcher.Watch(r.Context(), browser.SessionID(request.SessionID), sink)
+
+		mu.Lock()
+		defer mu.Unlock()
+		defer func() { finished = true }()
+		var ended browser.WatchEnded
+		isEnd := errors.As(err, &ended)
+		if !started && err != nil && !isEnd {
+			writeDriverError(w, "watch", err)
+			return
+		}
+		if r.Context().Err() != nil {
+			return
+		}
+		reason := browser.EndGone
+		if isEnd {
+			reason = ended.Reason
+		}
+		body, _ := json.Marshal(struct {
+			Reason browser.EndReason `json:"reason"`
+		}{reason})
+		write(RecordEnd, body)
+	}
 }
 
 // writeDriverError maps the driver's named failures onto status codes the núcleo can act on.

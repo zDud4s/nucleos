@@ -105,6 +105,8 @@ type Pool struct {
 	// the ceiling is checked against a number that is always out of date by exactly the duration of a
 	// navigation, and two concurrent opens both pass a limit of one.
 	pending int
+	// watchers are the open Watch calls, so a session that ends can end its viewers (watch.go).
+	watchers map[browser.SessionID]map[*viewer]struct{}
 }
 
 // placed is one session: the browser it lives in, and the id THAT browser knows it by.
@@ -240,7 +242,11 @@ func (p *Pool) Handoff(ctx context.Context, id browser.SessionID, reason string)
 	if err != nil {
 		return browser.HandoffTicket{}, err
 	}
+	// The page a viewer is looking at is about to be a person's. Ended before the driver moves, and
+	// once more after, which catches a Watch that registered in between.
+	p.endWatchers(browser.EndWheel, id)
 	ticket, err := session.holder.driver.Handoff(ctx, session.inner, reason)
+	p.endWatchers(browser.EndWheel, id)
 	if err != nil {
 		return browser.HandoffTicket{}, err
 	}
@@ -254,6 +260,7 @@ func (p *Pool) Close(ctx context.Context, id browser.SessionID) error {
 	if err != nil {
 		return err
 	}
+	p.endWatchers(browser.EndClosed, id)
 	closeErr := session.holder.driver.Close(ctx, session.inner)
 	p.release(ctx, session.holder, id)
 	return closeErr
@@ -270,10 +277,15 @@ func (p *Pool) Shutdown(ctx context.Context) {
 	for _, holder := range p.running {
 		holders = append(holders, holder)
 	}
+	gone := make([]browser.SessionID, 0, len(p.sessions))
+	for id := range p.sessions {
+		gone = append(gone, id)
+	}
 	p.running = map[profile.Ref]*entry{}
 	p.sessions = map[browser.SessionID]placed{}
 	p.mu.Unlock()
 
+	p.endWatchers(browser.EndGone, gone...)
 	for _, holder := range holders {
 		<-holder.ready
 		if holder.driver != nil {
