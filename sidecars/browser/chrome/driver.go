@@ -49,6 +49,11 @@ type Driver struct {
 	// ferry's same-origin rule reads it from here and never from the page — a restriction the
 	// restricted thing gets to describe is not one.
 	contexts map[contextKey]executionContext
+	// casts are the live screencasts, by the page session they run on, guarded by mu. castCtl
+	// serialises starting and stopping them, so a stop that follows the last viewer leaving cannot
+	// land on the stream a new viewer has just started.
+	casts   map[cdp.SessionID]*screencast
+	castCtl sync.Mutex
 
 	refusals     []recordedRefusal
 	refusalTotal int
@@ -228,6 +233,7 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 		targets:      map[string]browser.SessionID{},
 		cdpToSession: map[cdp.SessionID]browser.SessionID{},
 		contexts:     map[contextKey]executionContext{},
+		casts:        map[cdp.SessionID]*screencast{},
 		swept:        make(chan struct{}),
 		readyWithin:  readyDeadline,
 		idleGrace:    idleGrace,
@@ -242,6 +248,7 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 	// listening leaves the renderer frozen for the life of the session, and there is no later moment
 	// from which that can be recovered.
 	conn.OnEvent(driver.onDialog)
+	conn.OnEvent(driver.onScreencastFrame)
 	driver.startSweep()
 	return driver, nil
 }
@@ -669,6 +676,11 @@ func (d *Driver) Close(ctx context.Context, id browser.SessionID) error {
 	d.forgetAttachments(entry)
 	d.mu.Lock()
 	delete(d.sessions, id)
+	// Viewers of this session's screencast return ErrNoSuchSession.
+	if cast, ok := d.casts[entry.cdp]; ok {
+		cast.end()
+		delete(d.casts, entry.cdp)
+	}
 	// Everything that points at this session, not only the page's own entries: a frame Chromium ran
 	// out of process and a popup traced to its opener each left one, and so did every execution
 	// context the ferry placed. Left behind they are a map that only grows for the life of the
