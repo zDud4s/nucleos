@@ -386,6 +386,22 @@ describe("Voice — the spoken conversation", () => {
     expect(meter.getAttribute("aria-valuetext")).toBe("level 30%, a turn opens at 85%");
   });
 
+  /* The orb is the same reading as the meter, drawn for the eye. Exposed to a screen reader it would
+     be an unnamed graphic announced beside the meter that already says everything it shows. */
+  it("draws the orb as decoration beside the meter that carries the reading", async () => {
+    daemon.apiFetch.mockImplementation(withChats(voiceConfig(), []));
+    conversation.useVoiceConversation.mockImplementation(() =>
+      aConversation({ phase: "hearing", level: 0.9, threshold: 0.85 }),
+    );
+
+    const { container } = await renderVoice();
+
+    await screen.findByRole("meter", { name: "microphone level" });
+    const orb = container.querySelector("canvas.voice-orb");
+    expect(orb?.getAttribute("aria-hidden")).toBe("true");
+    expect(orb?.hasAttribute("data-hearing")).toBe(true);
+  });
+
   /* A segment dropped in silence looks exactly like a microphone that failed. Saying it was the
      assistant's own voice is the difference between a working guard and an apparent fault. */
   it("says when it heard its own answer and refused to treat it as a turn", async () => {

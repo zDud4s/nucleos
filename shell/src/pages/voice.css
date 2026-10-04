@@ -291,3 +291,21 @@
   height: calc(100% + 2px);
   background: var(--border-strong);
 }
+
+/* The conversation's orb. Its strokes take the canvas's own `color`, so the theme and the hearing
+   colour are decided here, and the colour change between them is a transition the canvas reads back
+   every frame. */
+.voice-orb {
+  display: block;
+  width: min(16rem, 100%);
+  aspect-ratio: 1;
+  margin: 0 auto var(--space-3);
+  color: var(--text);
+  transition: color 300ms ease;
+}
+
+/* The badge's own `pending` tone, so the orb and "hearing you" say it in one colour. Not cyan:
+   DESIGN.md reserves that for links, and `reserved-cyan.test.ts` holds it. */
+.voice-orb[data-hearing] {
+  color: var(--tone-pending-fg);
+}
