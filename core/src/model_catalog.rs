@@ -882,6 +882,65 @@ pub fn admits(active_runner: &str, rooted: Option<bool>, runner: &str) -> bool {
     }
 }
 
+/// The vendors `latest` answers for, in the order it lists them.
+pub const LATEST_VENDORS: [&str; 2] = VENDORS;
+
+/// What the agents' `latest_models` tool answers: per vendor, its models newest first, and where
+/// that vendor's list came from. Pure over a snapshot, so no network and no waiting; the caller
+/// hands it `current()`, which only ever blocks on the process's very first call.
+///
+/// `vendor` narrows to one of `LATEST_VENDORS`, case-insensitively; anything else is an error that
+/// names the valid ones, so an agent asking for `google` learns what it may ask for instead of
+/// receiving an empty list it could read as "no such models exist".
+///
+/// Newest first is by the vendor's own `created` stamp; a model with none sorts after every
+/// stamped one, and ties keep the catalogue's order, so a source that stamps nothing (the fallback)
+/// still comes back in the order the catalogue lists it.
+pub fn latest(snapshot: &Snapshot, vendor: Option<&str>) -> Result<serde_json::Value, String> {
+    let wanted = vendor.map(str::trim).filter(|v| !v.is_empty());
+    let wanted = match wanted {
+        None => None,
+        Some(v) => match LATEST_VENDORS.iter().find(|k| k.eq_ignore_ascii_case(v)) {
+            Some(k) => Some(*k),
+            None => {
+                return Err(format!(
+                    "unknown vendor {v:?}; use one of: {}",
+                    LATEST_VENDORS.join(", ")
+                ));
+            }
+        },
+    };
+    let vendors: Vec<serde_json::Value> = LATEST_VENDORS
+        .iter()
+        .filter(|k| wanted.is_none_or(|w| w == **k))
+        .map(|k| {
+            let mut models: Vec<&Discovered> = snapshot
+                .models
+                .iter()
+                .filter(|m| m.provider == *k)
+                .collect();
+            // Stable, so equal stamps keep the catalogue's order.
+            models.sort_by_key(|m| std::cmp::Reverse(m.created));
+            serde_json::json!({
+                "vendor": k,
+                "source": snapshot.sources.get(k).copied().unwrap_or("fallback"),
+                "models": models.iter().map(|m| serde_json::json!({
+                    "id": m.id,
+                    "name": if m.label.is_empty() { display_name(&m.id) } else { m.label.clone() },
+                    "family": m.family,
+                    "efforts": m.efforts,
+                    "created": m.created,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "vendors": vendors,
+        "fetched_at": snapshot.fetched_at,
+        "catalogue_version": CATALOGUE_VERSION,
+    }))
+}
+
 /// A discovered model as a picker row.
 pub fn as_choice(d: &Discovered) -> AssistantChoice {
     AssistantChoice {
@@ -915,6 +974,92 @@ mod tests {
 
     fn ids(models: &[AssistantChoice]) -> Vec<&str> {
         models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    fn found(id: &str, provider: &'static str, created: Option<i64>) -> Discovered {
+        let (_, family) = family_of(id);
+        Discovered {
+            id: id.to_string(),
+            label: display_name(id),
+            provider,
+            family,
+            runner: if provider == "anthropic" {
+                "claude"
+            } else {
+                "codex"
+            },
+            efforts: vec!["low".to_string(), "high".to_string()],
+            created,
+        }
+    }
+
+    #[test]
+    fn latest_lists_each_vendor_newest_first_with_its_source() {
+        let mut snap = fallback_snapshot(true);
+        snap.models = vec![
+            found("claude-opus-4-1", "anthropic", Some(100)),
+            found("claude-opus-4-7", "anthropic", Some(300)),
+            found("claude-sonnet-4-5", "anthropic", None),
+            found("gpt-5", "openai", Some(200)),
+        ];
+        snap.sources.insert("anthropic", "models.dev");
+
+        let body = latest(&snap, None).unwrap();
+
+        let vendors = body["vendors"].as_array().unwrap();
+        assert_eq!(vendors.len(), 2);
+        assert_eq!(vendors[0]["vendor"], "anthropic");
+        assert_eq!(vendors[0]["source"], "models.dev");
+        let ids: Vec<&str> = vendors[0]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        // Stamped newest first, the unstamped one after every stamped one.
+        assert_eq!(
+            ids,
+            ["claude-opus-4-7", "claude-opus-4-1", "claude-sonnet-4-5"]
+        );
+        let first = &vendors[0]["models"][0];
+        assert_eq!(first["name"], display_name("claude-opus-4-7"));
+        assert_eq!(first["family"], "opus");
+        assert_eq!(first["efforts"], serde_json::json!(["low", "high"]));
+        assert_eq!(vendors[1]["vendor"], "openai");
+        assert_eq!(vendors[1]["source"], "fallback");
+        assert_eq!(body["fetched_at"], snap.fetched_at);
+    }
+
+    #[test]
+    fn latest_filters_by_vendor_and_refuses_an_unknown_one() {
+        let snap = fallback_snapshot(true);
+
+        let body = latest(&snap, Some(" OpenAI ")).unwrap();
+        let vendors = body["vendors"].as_array().unwrap();
+        assert_eq!(vendors.len(), 1);
+        assert_eq!(vendors[0]["vendor"], "openai");
+        assert!(!vendors[0]["models"].as_array().unwrap().is_empty());
+
+        // An empty filter is no filter.
+        let all = latest(&snap, Some("")).unwrap();
+        assert_eq!(all["vendors"].as_array().unwrap().len(), 2);
+
+        let err = latest(&snap, Some("google")).unwrap_err();
+        assert!(err.contains("anthropic") && err.contains("openai"), "{err}");
+    }
+
+    #[test]
+    fn latest_over_the_fallback_serves_the_one_catalogue_and_nothing_else() {
+        let snap = fallback_snapshot(true);
+        let body = latest(&snap, None).unwrap();
+        let served: usize = body["vendors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["models"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(served, fallback().len());
+        assert_eq!(body["catalogue_version"], CATALOGUE_VERSION);
     }
 
     const FAKE_KEY: &str = "sk-test-secret-key-0123456789";

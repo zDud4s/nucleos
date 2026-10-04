@@ -386,6 +386,12 @@ struct ProposeTeammateParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct LatestModelsParams {
+    /// `anthropic` or `openai`. Absent means both.
+    vendor: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 struct SuggestModelParams {
     /// One line: what the candidate is for.
     speciality: String,
@@ -1020,6 +1026,23 @@ impl NucleosTools {
                 }))
                 .await,
         )
+    }
+
+    #[tool(
+        description = "List the newest AI models per vendor (anthropic, openai), newest first: \
+                       each one's `id` (what to pass as a model), display `name`, `family`, \
+                       supported `efforts` and `created` (unix seconds, when the vendor said), \
+                       plus the vendor's `source` (`api`, `codex-cache`, `models.dev` or \
+                       `fallback`) and when the list was fetched (`fetched_at`). Call this BEFORE \
+                       you recommend, name or choose a model: your own idea of what is current \
+                       comes from training data and is out of date, this list is kept current by \
+                       the daemon. Pass `vendor` to see one vendor only. Read-only."
+    )]
+    async fn latest_models(
+        &self,
+        Parameters(LatestModelsParams { vendor }): Parameters<LatestModelsParams>,
+    ) -> String {
+        json_result(self.client.latest_models(vendor.as_deref()).await)
     }
 
     #[tool(
@@ -1843,6 +1866,7 @@ pub const LOCAL_TOOLS: &[&str] = &[
     "get_job",
     "get_kill",
     "get_run",
+    "latest_models",
     "list_jobs",
     "list_projects",
     "list_proposals",
@@ -1892,6 +1916,7 @@ pub const COUNCIL_TOOLS: &[&str] = &[
     "get_email_queue",
     "get_kill",
     "get_run",
+    "latest_models",
     "list_files",
     "list_projects",
     "list_proposals",
@@ -1938,6 +1963,7 @@ pub const COUNCIL_TOOLS: &[&str] = &[
 pub const TEAM_TOOLS: &[&str] = &[
     "get_email",
     "get_email_queue",
+    "latest_models",
     "list_files",
     "propose_action",
     // Offered to every team agent and answered only for the director. The narrowing happens in the
@@ -2178,6 +2204,9 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // chat, and nothing there has a repository in mind.
     ("github_act", ToolEffect::Acts),
     ("github_read", ToolEffect::ReadsOwn),
+    // The daemon's own model catalogue: vendor lists the daemon fetched itself (a vendor API, the
+    // Codex CLI's cache, models.dev), carrying only ids, names and effort levels.
+    ("latest_models", ToolEffect::ReadsOwn),
     ("list_files", ToolEffect::ReadsUntrusted),
     ("list_jobs", ToolEffect::ReadsOwn),
     ("list_projects", ToolEffect::ReadsOwn),
@@ -2489,6 +2518,11 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             "list_projects" => self.tools.list_projects().await,
             "list_proposals" => self.tools.list_proposals().await,
             "list_teams" => self.tools.list_teams().await,
+            "latest_models" => {
+                self.tools
+                    .latest_models(Parameters(parsed!(LatestModelsParams)))
+                    .await
+            }
             "get_budget" => self.tools.get_budget().await,
             "get_kill" => self.tools.get_kill().await,
             "get_run" => self.tools.get_run(Parameters(parsed!(IdParams))).await,
@@ -3527,6 +3561,7 @@ mod tests {
                 // stranger's PR body could then have written to GitHub.
                 "github_act",
                 "github_read",
+                "latest_models",
                 "list_files",
                 "list_jobs",
                 "list_projects",

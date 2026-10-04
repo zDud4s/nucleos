@@ -501,6 +501,43 @@ impl DaemonClient {
         json_or_null(response).await
     }
 
+    /// The newest models per vendor, as the daemon's catalogue serves them. A refused vendor comes
+    /// back as the daemon's own message, which names the valid ones.
+    pub async fn latest_models(&self, vendor: Option<&str>) -> Result<Value, String> {
+        // Encoded by hand: this reqwest is built without its `query` feature, and the value is an
+        // agent's own string.
+        let path = match vendor {
+            Some(vendor) => {
+                let mut encoded = String::new();
+                for byte in vendor.bytes() {
+                    match byte {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                            encoded.push(byte as char)
+                        }
+                        other => encoded.push_str(&format!("%{other:02X}")),
+                    }
+                }
+                format!("/models/latest?vendor={encoded}")
+            }
+            None => "/models/latest".to_string(),
+        };
+        let response = self
+            .request(reqwest::Method::GET, &path)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let ok = response.status().is_success();
+        let body: Value = response.json().await.map_err(|e| e.to_string())?;
+        if ok {
+            Ok(body)
+        } else {
+            Err(body["error"]
+                .as_str()
+                .unwrap_or("the daemon refused the request")
+                .to_string())
+        }
+    }
+
     pub async fn get_budget(&self) -> Result<Value, String> {
         self.request(reqwest::Method::GET, "/autopilot/budget")
             .send()
