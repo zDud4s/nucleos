@@ -2138,19 +2138,18 @@ fn heavy_wrapper_inner(segment: &str, cwd: Option<&Path>) -> Option<String> {
     if !path_has_suffix(&normalized, "scripts/heavy.py") {
         return None;
     }
-    match cwd {
-        Some(cwd) => {
-            let target = fold_for_containment(&normalized);
-            let root = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
-            if target == root || target.starts_with(&format!("{root}/")) {
-                return None;
-            }
-        }
-        None => {
-            if !is_absolute_path(&script.replace('\\', "/")) {
-                return None;
-            }
-        }
+    // Only the project's own main checkout holds the trusted broker; a heavy.py anywhere else is
+    // arbitrary code. Unresolved main checkout (or no cwd) fails safe: no unwrap.
+    let cwd = cwd?;
+    let target = fold_for_containment(&normalized);
+    let root = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
+    if target == root || target.starts_with(&format!("{root}/")) {
+        return None;
+    }
+    let main = main_checkout_of(cwd)?;
+    let broker = fold_for_containment(&normalize_path(&format!("{main}/scripts/heavy.py"), None));
+    if target != broker {
+        return None;
     }
     loop {
         let (token, after) = split_first_token(rest)?;
@@ -2182,6 +2181,26 @@ fn heavy_wrapper_inner(segment: &str, cwd: Option<&Path>) -> Option<String> {
         }
         return Some(rest.to_owned());
     }
+}
+
+/// Best-effort: the main checkout of the repository `cwd` lies in. Walks up to the first ancestor
+/// with a `.git` entry; a directory means that ancestor is the main checkout, a file reading
+/// `gitdir: <main>/.git/worktrees/<name>` means `<main>`. Any failure is `None`.
+fn main_checkout_of(cwd: &Path) -> Option<String> {
+    let dir = cwd.ancestors().find(|a| a.join(".git").exists())?;
+    let dot_git = dir.join(".git");
+    if dot_git.is_dir() {
+        return Some(normalize_path(&dir.to_string_lossy(), None));
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+        .trim()
+        .replace('\\', "/");
+    let index = gitdir.rfind("/.git/")?;
+    let main = &gitdir[..index];
+    (!main.is_empty()).then(|| normalize_path(main, None))
 }
 
 fn path_has_suffix(path: &str, suffix: &str) -> bool {
@@ -7207,13 +7226,33 @@ mod tests {
 
     /// The main checkout's broker (`scripts/heavy.py`) is a transparent wrapper: its verdict is
     /// the inner command's, never more generous, and only for the known option shapes.
+    /// A real temp linked-worktree layout: returns (base, main checkout slash path, worktree).
+    fn heavy_fixture(tag: &str) -> (std::path::PathBuf, String, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("nucleos-heavy-{tag}-{}", std::process::id()));
+        let main = base.join("main");
+        let wt = base.join("wt");
+        let gitdir = main.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::create_dir_all(main.join("scripts")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+        let main_slash = main.to_string_lossy().replace('\\', "/");
+        (base, main_slash, wt)
+    }
+
     #[test]
     fn heavy_wrapper_is_judged_as_the_command_it_wraps() {
         let policy = crate::github::Policy::empty();
-        let workspace = Path::new(r"C:\work\repo");
+        let (base, main, wt) = heavy_fixture("judged");
+        let workspace = wt.as_path();
+        let heavy = format!("{main}/scripts/heavy.py");
         let bare = classify_asked_for("cargo test foo", Some(workspace));
         let wrapped = classify_asked_for(
-            "python C:/Projects/nucleos/scripts/heavy.py --prio 2 --agent a -- cargo test foo",
+            &format!("python {heavy} --prio 2 --agent a -- cargo test foo"),
             Some(workspace),
         );
         assert_eq!(wrapped.decision.decision, "allow");
@@ -7221,23 +7260,27 @@ mod tests {
         assert_eq!(wrapped.action_class, bare.action_class);
         assert_eq!(wrapped.action_class, "read-local");
 
-        let wrapped_under = classify_under(
+        // The broker is pinned to the main checkout derived from the cwd, so this variant also
+        // runs inside the worktree (the bare helper has no cwd).
+        let wrapped_under = super::classify(
+            "Bash",
+            &json!({ "command": format!("python {heavy} --prio 2 --agent a -- cargo test foo") }),
+            Some(workspace),
             &policy,
-            "python C:/Projects/nucleos/scripts/heavy.py --prio 2 --agent a -- cargo test foo",
+            &crate::project_policy::ShellRules::default(),
+            Unrecognized::AsksAPerson,
         );
         assert_eq!(wrapped_under.decision.decision, "allow");
 
         // The inner command decides: a network fetch is no safer for being wrapped.
         let curl = classify_asked_for(
-            r#""C:/Py/python.exe" "C:/Projects/nucleos/scripts/heavy.py" -- curl http://x"#,
+            &format!(r#""C:/Py/python.exe" "{heavy}" -- curl http://x"#),
             Some(workspace),
         );
         assert_ne!(curl.decision.decision, "allow");
-        let rm = classify_asked_for(
-            "python C:/Projects/nucleos/scripts/heavy.py -- rm -rf /",
-            Some(workspace),
-        );
+        let rm = classify_asked_for(&format!("python {heavy} -- rm -rf /"), Some(workspace));
         assert_eq!(rm.decision.decision, "deny");
+        let _ = std::fs::remove_dir_all(&base);
 
         // Only the known shapes are unwrapped: a subcommand or an unknown option is not.
         for command in [
@@ -7254,12 +7297,18 @@ mod tests {
     /// through it (both spellings) exactly as it does `--prio`.
     #[test]
     fn heavy_wrapper_unwraps_wait_max() {
-        let workspace = Path::new(r"C:\work\repo");
+        let (base, main, wt) = heavy_fixture("waitmax");
+        let workspace = wt.as_path();
         let bare = classify_asked_for("cargo test -p nucleos-core foo", Some(workspace));
         for command in [
-            "python C:/Projects/nucleos/scripts/heavy.py --prio 2 --wait-max 90 -- cargo test -p nucleos-core foo",
-            "python C:/Projects/nucleos/scripts/heavy.py --prio 2 --wait-max=90 -- cargo test -p nucleos-core foo",
+            format!(
+                "python {main}/scripts/heavy.py --prio 2 --wait-max 90 -- cargo test -p nucleos-core foo"
+            ),
+            format!(
+                "python {main}/scripts/heavy.py --prio 2 --wait-max=90 -- cargo test -p nucleos-core foo"
+            ),
         ] {
+            let command = command.as_str();
             let wrapped = classify_asked_for(command, Some(workspace));
             assert_eq!(wrapped.decision.decision, "allow", "{command}");
             assert_eq!(
@@ -7269,6 +7318,7 @@ mod tests {
             assert_eq!(wrapped.action_class, bare.action_class, "{command}");
             assert_eq!(wrapped.action_class, "read-local", "{command}");
         }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A broker inside the workspace is a file the run could have rewritten, so it is no wrapper:
@@ -7286,5 +7336,61 @@ mod tests {
         );
         let bare = classify_asked_for("cargo test", Some(workspace));
         assert_ne!(absolute.action_class, bare.action_class);
+    }
+
+    /// Only `<main checkout>/scripts/heavy.py` is the trusted broker. A heavy.py at some other
+    /// absolute path outside the workspace is arbitrary code and is judged as an ordinary script.
+    #[test]
+    fn heavy_wrapper_elsewhere_than_the_main_checkout_is_not_unwrapped() {
+        let workspace = Path::new(r"C:\work\repo");
+        let bare = classify_asked_for("cargo test -p nucleos-core foo", Some(workspace));
+        assert_eq!(bare.decision.decision, "allow");
+        let evil = classify_asked_for(
+            "python C:/tmp/evil/scripts/heavy.py -- cargo test -p nucleos-core foo",
+            Some(workspace),
+        );
+        assert_ne!(evil.decision.decision, "allow");
+        assert_ne!(evil.action_class, "read-local");
+        assert_ne!(evil.action_class, bare.action_class);
+    }
+
+    /// CONTRACT chosen for "main checkout": derived from the cwd's git layout. A linked worktree
+    /// has a `.git` FILE reading `gitdir: <main>/.git/worktrees/<name>`; the main checkout is the
+    /// parent of that common `.git` directory. Its `scripts/heavy.py` is unwrapped, a sibling
+    /// directory's is not.
+    #[test]
+    fn heavy_wrapper_main_checkout_of_a_worktree_is_still_unwrapped() {
+        let base = std::env::temp_dir().join(format!("nucleos-heavy-main-{}", std::process::id()));
+        let main = base.join("main");
+        let wt = base.join("wt");
+        let gitdir = main.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::create_dir_all(main.join("scripts")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+        let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        let bare = classify_asked_for("cargo test -p nucleos-core foo", Some(&wt));
+        let ours = classify_asked_for(
+            &format!(
+                "python {}/scripts/heavy.py -- cargo test -p nucleos-core foo",
+                slash(&main)
+            ),
+            Some(&wt),
+        );
+        let other = classify_asked_for(
+            &format!(
+                "python {}/other/scripts/heavy.py -- cargo test -p nucleos-core foo",
+                slash(&base)
+            ),
+            Some(&wt),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(ours.decision.decision, bare.decision.decision);
+        assert_eq!(ours.action_class, bare.action_class);
+        assert_ne!(other.action_class, bare.action_class);
     }
 }
