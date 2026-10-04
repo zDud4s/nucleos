@@ -25,6 +25,14 @@ pub struct ModelsConfig {
     /// Where a job's `review` stage runs, on the same absent-means-unrouted posture as `plan_model`.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub review_model: Option<String>,
+    /// Where the queue's conflict resolution runs (`resolver.rs`), on the same absent-means-unrouted
+    /// posture as `plan_model`: absent keeps it on `claude_model`.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub resolve_model: Option<String>,
+    /// The reasoning effort a conflict resolution is launched with. Absent sends no `--effort`, so
+    /// the CLI keeps its own default — exactly what every resolution got before this key existed.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub resolve_effort: Option<String>,
     /// Absent leaves chat turns from the Telegram sidecar answered by the cloud CLI, exactly as they
     /// are today. Naming a model here is what moves them onto this machine.
     ///
@@ -679,6 +687,8 @@ impl Default for ModelsConfig {
             primary_runner: None,
             plan_model: None,
             review_model: None,
+            resolve_model: None,
+            resolve_effort: None,
             local_assistant_model: None,
             hosted_assistant_model: None,
             local_engine: None,
@@ -3766,6 +3776,57 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         assert_eq!(blank.plan_model, None, "a blanked key means off, not empty");
         assert_eq!(
             blank.review_model, None,
+            "a blanked key means off, not empty"
+        );
+    }
+
+    /// The conflict resolver's model and effort are the same posture as the per-role keys above:
+    /// named is honoured, absent or blank changes nothing about what a resolution runs on.
+    #[test]
+    fn models_config_reads_the_resolve_keys_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-sonnet-5
+codex_model: gpt-5.6-sol
+resolve_model: opus
+resolve_effort: high
+",
+        )
+        .unwrap();
+        let named = load_models_config(&path).unwrap();
+        assert_eq!(named.resolve_model, Some("opus".to_string()));
+        assert_eq!(named.resolve_effort, Some("high".to_string()));
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-sonnet-5
+codex_model: gpt-5.6-sol
+",
+        )
+        .unwrap();
+        let absent = load_models_config(&path).unwrap();
+        assert_eq!(absent.resolve_model, None, "an older file routes nothing");
+        assert_eq!(absent.resolve_effort, None, "an older file sends no effort");
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-sonnet-5
+codex_model: gpt-5.6-sol
+resolve_model: \"\"
+resolve_effort: \"  \"
+",
+        )
+        .unwrap();
+        let blank = load_models_config(&path).unwrap();
+        assert_eq!(
+            blank.resolve_model, None,
+            "a blanked key means off, not empty"
+        );
+        assert_eq!(
+            blank.resolve_effort, None,
             "a blanked key means off, not empty"
         );
     }

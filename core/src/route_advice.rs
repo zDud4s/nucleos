@@ -914,6 +914,8 @@ pub fn front(
                 model: models.claude_model.clone(),
                 plan_model: models.plan_model.clone(),
                 review_model: models.review_model.clone(),
+                resolve_model: models.resolve_model.clone(),
+                resolve_effort: models.resolve_effort.clone(),
             }),
             RunnerKind::Codex => Arc::new(crate::runner::CodexCliRunner {
                 model: models.codex_model.clone(),
@@ -1039,6 +1041,10 @@ impl CommandRunner for RoutedRunner {
 
     fn model_for_stage(&self, stage: Option<&str>) -> Option<String> {
         self.inner.model_for_stage(stage)
+    }
+
+    fn effort_for_stage(&self, stage: Option<&str>) -> Option<String> {
+        self.inner.effort_for_stage(stage)
     }
 
     fn authored_prompt(
