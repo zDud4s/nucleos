@@ -64,6 +64,8 @@ import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
 import type { AssistantTurnRow, ToolCall } from "../lib/turns";
 import { daemonFetch, daemonState, renderApp } from "../test/harness";
+import { resetHeld } from "../chats/held";
+import type { ProjectSummary } from "../data/system";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -77,6 +79,7 @@ beforeEach(() => {
   opener.openUrl.mockResolvedValue(undefined);
   dictation.trouble = null;
   localStorage.clear();
+  resetHeld();
 });
 
 /* ------------------------------------------------------------ fixtures -- */
@@ -105,7 +108,9 @@ function chatSummary(overrides: Partial<ChatSummary> = {}): ChatSummary {
     cleared_after_run_id: null,
     context_window: 140000,
     created_at: "2026-08-18T09:00:00Z",
-    cwd: null,
+    // A project by default. A conversation without one does not start — it opens the project
+    // picker over the page — so only the tests ABOUT that say `cwd: null`.
+    cwd: "C:/Projects/demo",
     ide_session_id: null,
     first_message: "hello there",
     last_activity: "2026-08-18T09:05:00Z",
@@ -200,6 +205,8 @@ function chatsFetch(
      * distinction and says so.
      */
     projects?: Record<string, ChatProject>;
+    /** The daemon's project roster, which the project picker offers. */
+    roster?: Array<Pick<ProjectSummary, "project_id" | "project_root">>;
     /** What each turn's tools answered, by turn id. The transcript never carries these. */
     turnTools?: Record<number, ToolCall[]>;
     /**
@@ -297,6 +304,7 @@ function chatsFetch(
       const query = decodeURIComponent(commands[2]).toLowerCase();
       return { commands: offered.filter((hit) => hit.name.toLowerCase().includes(query)) };
     }
+    if (path === "/projects") return opts.roster ?? [];
     const project = /^\/assistant\/chats\/([^/?]+)\/project$/.exec(path);
     if (project !== null) {
       const chatId = decodeURIComponent(project[1]);
@@ -2643,6 +2651,47 @@ describe("Chats - a conversation asking to be allowed something", () => {
 
 /* ---------------------------------------------- a conversation with no project -- */
 
+/** Two projects side by side, so Root is the folder they share. */
+const ROSTER = [
+  { project_id: "nucleos", project_root: "C:/Projects/nucleos" },
+  { project_id: "site", project_root: "C:/Projects/site" },
+];
+
+/** `chatsFetch` with the roster, where a PATCH of `cwd` moves the row, as the daemon does. */
+function gatedFetch(rows: ChatSummary[], transcripts: Record<string, AssistantTurnRow[]>) {
+  const base = chatsFetch(rows, transcripts, { roster: ROSTER });
+  return async (path: string, init?: RequestInit) => {
+    const patch = /^\/assistant\/chats\/([^/?]+)$/.exec(path);
+    if (patch !== null && init?.method === "PATCH") {
+      const body = JSON.parse(String(init.body)) as { cwd?: string };
+      const row = rows.find((chat) => chat.chat_id === decodeURIComponent(patch[1]));
+      if (row !== undefined && typeof body.cwd === "string") row.cwd = body.cwd;
+    }
+    return base(path, init);
+  };
+}
+
+/** The folder the last PATCH pointed the conversation at. */
+function patchedCwd(): string | undefined {
+  const sent = daemon.apiFetch.mock.calls.filter(
+    (call) => /^\/assistant\/chats\/[^/?]+$/.test(String(call[0])) && call[1]?.method === "PATCH",
+  );
+  const last = sent[sent.length - 1];
+  return last === undefined
+    ? undefined
+    : (JSON.parse(String((last[1] as RequestInit).body)) as { cwd?: string }).cwd;
+}
+
+/** Every message the window actually sent to the daemon. */
+function sentMessages(): Array<{ chat_id: string; text: string }> {
+  return daemon.apiFetch.mock.calls
+    .filter((call) => String(call[0]) === "/assistant/message" && call[1]?.method === "POST")
+    .map((call) => {
+      const body = JSON.parse(String((call[1] as RequestInit).body)) as { chat_id: string; text: string };
+      return { chat_id: body.chat_id, text: body.text };
+    });
+}
+
 describe("Chats - what a conversation without a project can do", () => {
   // A conversation gets its working directory from the session it was picked up from, and there is
   // no other way to get one — `cwd` is written once, at creation, from a pick-up. So a conversation
@@ -2652,16 +2701,22 @@ describe("Chats - what a conversation without a project can do", () => {
   // Nothing said so. You would ask it to fix a file, watch it not fix the file, and have nowhere to
   // find out why — which is the same silence `NoTools` was written to end on the other side of the
   // pick-up.
-  it("says what one started here cannot do, rather than letting somebody find out", async () => {
+  it("opens the project picker over it, in the app's dialog, saying what it cannot do", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1", cwd: null })], {
         "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
-      }),
+      }, { roster: ROSTER }),
     );
 
     await renderChats("/chats/c-1");
 
-    expect(await screen.findByText(/cannot open a file/i)).toBeTruthy();
+    const dialog = await screen.findByRole("dialog", { name: /where this conversation runs/i });
+    expect(within(dialog).getByText(/cannot open a file/i)).toBeTruthy();
+    // The roster's projects and Root, never a free-text folder.
+    expect(await within(dialog).findByRole("radio", { name: /nucleos/i })).toBeTruthy();
+    expect(within(dialog).getByRole("radio", { name: /site/i })).toBeTruthy();
+    expect(within(dialog).getByRole("radio", { name: /root/i })).toBeTruthy();
+    expect(within(dialog).queryByRole("textbox")).toBeNull();
   });
 
   it("says nothing of the sort about one that has a project", async () => {
@@ -2683,27 +2738,113 @@ describe("Chats - what a conversation without a project can do", () => {
 describe("Chats - giving a conversation a project", () => {
   // The other half of saying it. A conversation started here had no directory and no way to be
   // given one, so the note was a diagnosis with no treatment.
-  it("offers a way to say which project it is about, and sends it", async () => {
+  it("offers the roster's projects, and sends the chosen one's folder", async () => {
     daemon.apiFetch.mockImplementation(
-      chatsFetch([chatSummary({ chat_id: "c-1", cwd: null })], {
+      gatedFetch([chatSummary({ chat_id: "c-1", cwd: null })], {
         "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
       }),
     );
     await renderChats("/chats/c-1");
 
-    const field = await screen.findByLabelText(/project/i);
-    fireEvent.change(field, { target: { value: "C:/Projects/nucleos" } });
-    fireEvent.click(screen.getByRole("button", { name: /use this project/i }));
+    const dialog = await screen.findByRole("dialog", { name: /where this conversation runs/i });
+    fireEvent.click(await within(dialog).findByRole("radio", { name: /nucleos/i }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Use this" }));
 
     await waitFor(() => {
-      const sent = daemon.apiFetch.mock.calls.find(
-        (call) => String(call[0]) === "/assistant/chats/c-1" && call[1]?.method === "PATCH",
-      );
-      expect(sent).toBeDefined();
-      expect(JSON.parse(String((sent?.[1] as RequestInit).body))).toEqual({
-        cwd: "C:/Projects/nucleos",
-      });
+      expect(patchedCwd()).toBe("C:/Projects/nucleos");
     });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  // Root is the folder the projects sit in, side by side, and not one more project.
+  it("offers Root as the folder that holds every project", async () => {
+    daemon.apiFetch.mockImplementation(
+      gatedFetch([chatSummary({ chat_id: "c-1", cwd: null })], { "c-1": [] }),
+    );
+    await renderChats("/chats/c-1");
+
+    const dialog = await screen.findByRole("dialog", { name: /where this conversation runs/i });
+    const root = await within(dialog).findByRole("radio", { name: /root/i });
+    expect(within(dialog).getByText("C:/Projects")).toBeTruthy();
+    fireEvent.click(root);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Use this" }));
+
+    await waitFor(() => expect(patchedCwd()).toBe("C:/Projects"));
+  });
+
+  // The conversation does not start before it knows where it runs: what is said first is held,
+  // visibly, and goes out by itself once the project is set.
+  it("holds a message said before a project is chosen, and sends it once one is", async () => {
+    daemon.apiFetch.mockImplementation(
+      gatedFetch([chatSummary({ chat_id: "c-1", cwd: null })], { "c-1": [] }),
+    );
+    await renderChats("/chats/c-1");
+
+    // Dismissed first: speaking before choosing is exactly the case.
+    const dialog = await screen.findByRole("dialog", { name: /where this conversation runs/i });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Not now" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "fix the parser" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    // Saying it opened the picker again, and nothing went to the daemon.
+    const again = await screen.findByRole("dialog", { name: /where this conversation runs/i });
+    expect(sentMessages()).toHaveLength(0);
+
+    fireEvent.click(await within(again).findByRole("radio", { name: /site/i }));
+    fireEvent.click(within(again).getByRole("button", { name: "Use this" }));
+
+    await waitFor(() => expect(sentMessages()).toEqual([{ chat_id: "c-1", text: "fix the parser" }]));
+    await waitFor(() => expect(screen.queryByRole("status", { name: "Held message" })).toBeNull());
+  });
+
+  it("keeps a held message held when the picker is dismissed, and opens it again on asking", async () => {
+    daemon.apiFetch.mockImplementation(
+      gatedFetch([chatSummary({ chat_id: "c-1", cwd: null })], { "c-1": [] }),
+    );
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Not now" }),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Not now" }),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    const held = screen.getByRole("status", { name: "Held message" });
+    expect(within(held).getByText("hello")).toBeTruthy();
+    expect(sentMessages()).toHaveLength(0);
+
+    fireEvent.click(within(held).getByRole("button", { name: "Choose a project" }));
+    expect(await screen.findByRole("dialog", { name: /where this conversation runs/i })).toBeTruthy();
+  });
+
+  // The front door opens a conversation with no project, so its first words wait there too.
+  it("holds the front door's first message in the conversation it opens", async () => {
+    const rows: ChatSummary[] = [];
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/assistant/chats" && init?.method === "POST") {
+        rows.push(chatSummary({ chat_id: "new-1", cwd: null }));
+      }
+      return gatedFetch(rows, { "new-1": [] })(path, init);
+    });
+    await renderChats("/chats");
+
+    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "start here" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    const dialog = await screen.findByRole("dialog", { name: /where this conversation runs/i });
+    expect(within(dialog).getByText(/your message is held/i)).toBeTruthy();
+    expect(sentMessages()).toHaveLength(0);
+
+    fireEvent.click(await within(dialog).findByRole("radio", { name: /nucleos/i }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Use this" }));
+    await waitFor(() => expect(sentMessages()).toEqual([{ chat_id: "new-1", text: "start here" }]));
   });
 
   // A directory is not the whole of it: the daemon grants tools on a directory whose classifier
@@ -2830,15 +2971,15 @@ describe("Chats - giving a conversation a project", () => {
       }
       return chatsFetch([chatSummary({ chat_id: "c-1", cwd: null })], {
         "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
-      })(path, init);
+      }, { roster: ROSTER })(path, init);
     });
     await renderChats("/chats/c-1");
 
-    const field = await screen.findByLabelText(/project/i);
-    fireEvent.change(field, { target: { value: "not a real folder" } });
-    fireEvent.click(screen.getByRole("button", { name: /use this project/i }));
+    const dialog = await screen.findByRole("dialog", { name: /where this conversation runs/i });
+    fireEvent.click(await within(dialog).findByRole("radio", { name: /nucleos/i }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Use this" }));
 
-    expect(await screen.findByText(/absolute path to a folder/i)).toBeTruthy();
+    expect(await within(dialog).findByText(/does not exist on this machine/i)).toBeTruthy();
   });
 });
 
@@ -5558,8 +5699,9 @@ describe("Chats - the cache and agent chips", () => {
 
     await renderChats("/chats/c-1");
     expect(await screen.findByText(/50m/)).toBeTruthy();
-    // The turn is settled, so a subagent is finished; the background task is still running.
-    expect(await screen.findByRole("button", { name: /1 agent$/ })).toBeTruthy();
+    // The turn is settled, so nothing is working, whatever a stored status says: the chip counts
+    // both agents the turn had, muted, rather than one still running.
+    expect(await screen.findByRole("button", { name: /2 agents$/ })).toBeTruthy();
     // The subagent's own call is not listed in the transcript's "What it did".
     expect(screen.queryByText("Grep")).toBeNull();
   });
