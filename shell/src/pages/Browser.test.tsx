@@ -3,7 +3,7 @@ import { fireEvent, screen, waitFor } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
+const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn(), openStream: vi.fn() }));
 vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),
   ...daemon,
@@ -18,6 +18,7 @@ beforeEach(() => {
   daemon.apiFetch.mockReset();
   daemon.apiText.mockReset();
   daemon.probeHealth.mockReset();
+  daemon.openStream.mockReset();
 });
 
 /* ------------------------------------------------------------- fixtures -- */
@@ -182,6 +183,43 @@ describe("Browser - live sessions", () => {
       .filter(([, init]) => (init as RequestInit | undefined)?.method === "POST")
       .map(([path]) => String(path));
     expect(posted).toEqual([]);
+  });
+
+  it("offers Watch on agent rows, one open at a time", async () => {
+    const world = browserWorld({
+      sessions: [
+        session({ id: 1, mode: "agent" }),
+        session({ id: 2, mode: "agent" }),
+        session({ id: 3, mode: "human" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+    // A stream that never speaks: the view stays open and nothing else happens.
+    daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+    await renderBrowser();
+
+    // Two agent rows, two buttons; the human row has none.
+    const watch = await screen.findAllByRole("button", { name: "Watch" });
+    expect(watch).toHaveLength(2);
+    expect(watch[0].getAttribute("aria-pressed")).toBe("false");
+
+    fireEvent.click(watch[0]);
+    expect(await screen.findByRole("button", { name: "Stop watching" })).toBeDefined();
+    await waitFor(() => expect(daemon.openStream).toHaveBeenCalledTimes(1));
+    expect(daemon.openStream.mock.calls[0][0]).toBe("/browser/sessions/1/live");
+
+    // Opening the other closes the first: still exactly one "Stop watching".
+    fireEvent.click(screen.getByRole("button", { name: "Watch" }));
+    await waitFor(() => expect(daemon.openStream).toHaveBeenCalledTimes(2));
+    expect(daemon.openStream.mock.calls[1][0]).toBe("/browser/sessions/2/live");
+    expect(screen.getAllByRole("button", { name: "Stop watching" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Watch" })).toHaveLength(1);
+    expect(screen.queryByAltText("live view of session 1")).toBeNull();
+
+    // And stopping leaves none open.
+    fireEvent.click(screen.getByRole("button", { name: "Stop watching" }));
+    expect(await screen.findAllByRole("button", { name: "Watch" })).toHaveLength(2);
   });
 });
 

@@ -222,6 +222,16 @@ async function request(path: string, init: RequestInit | undefined): Promise<Res
 }
 
 /**
+ * An authenticated streaming GET: the body, unread. Refusals arrive as
+ * {@link ApiRefusal} through `request`, exactly as for a JSON call.
+ */
+export async function openStream(path: string, signal: AbortSignal): Promise<ReadableStream<Uint8Array>> {
+  const res = await request(path, { signal });
+  if (res.body === null) throw new Error(`the daemon answered ${path} with no body`);
+  return res.body;
+}
+
+/**
  * One authenticated JSON call.
  *
  * There are no automatic retries anywhere below this line, on reads or on
