@@ -961,7 +961,8 @@ def release_slot(directory: Path, lease) -> None:
         sys.stderr.write(f"heavy: could not release the target slot: {exc}\n")
 
 
-def prepare_slot(directory: Path, lease, worktree: str, program: str, cwd: str) -> None:
+def prepare_slot(directory: Path, lease, worktree: str, program: str, cwd: str,
+                 argv: list[str] | None = None) -> None:
     """On an owner change, clean this workspace's own members out of the slot before the new
     owner builds. WHY: cargo reuses a workspace member's artifact across checkouts when no
     source is newer than it (mtime-based freshness; see scripts/test-own-cargo-target.py), so
@@ -970,7 +971,15 @@ def prepare_slot(directory: Path, lease, worktree: str, program: str, cwd: str) 
     _, path, prev = lease
     if not prev or _same_wt(prev, worktree):
         return  # first use, or the same worktree coming back to its own slot
-    registry_forget(directory, path)
+    registry_forget(directory, _real(path))
+    cargs = _cargo_args(argv or [])
+    prof: list[str] = []
+    if "--release" in cargs:
+        prof = ["--release"]
+    else:
+        pv = _flag_values(cargs, "--profile")
+        if pv:
+            prof = ["--profile", pv[-1]]
     env = dict(os.environ)
     env.pop("CARGO_BUILD_TARGET_DIR", None)
     env["CARGO_TARGET_DIR"] = path
@@ -987,7 +996,7 @@ def prepare_slot(directory: Path, lease, worktree: str, program: str, cwd: str) 
                             if p.get("id") in members and p.get("name")})
             ok = bool(names)
             for name in names:
-                r = subprocess.run([program, "clean", "-p", name], cwd=cwd, env=env,
+                r = subprocess.run([program, "clean", "-p", name, *prof], cwd=cwd, env=env,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    timeout=600)
                 if r.returncode != 0:
@@ -1196,12 +1205,9 @@ def broker_run(args: list[str], held: bool = False) -> int:
         pool = False  # eligible for a leased pool dir
         try:
             if kind in ("cargo", "auto") and _is_cargo(argv):
-                pool = injected_target_dir(argv, root or worktree_root(), os.getcwd()) is not None
-            elif held:
-                # hold-worktree leases one slot for the whole held run and exports it, so the
-                # nested cargo calls see CARGO_TARGET_DIR and take no second slot.
-                pool = injected_target_dir(["cargo"], root or worktree_root(),
-                                           os.getcwd()) is not None
+                # hold-worktree itself leases no slot: nested cargo calls lease their own.
+                pool = (not held and injected_target_dir(
+                    argv, root or worktree_root(), os.getcwd()) is not None)
         except Exception:
             pool = False
         wt = None
@@ -1346,8 +1352,8 @@ def broker_run(args: list[str], held: bool = False) -> int:
             wait_token = time.time() - t_q
             env = dict(os.environ)
             env["NUCLEOS_HEAVY_TOKEN"] = str(os.getpid())
-        if pool and lease is None and (held or nested):
-            # No token to give back here (held takes none; nested runs under its parent's).
+        if pool and lease is None and nested:
+            # No token to give back here (nested runs under its parent's token).
             try:
                 lease = lease_slot_wait(directory, wt, cap)
             except Exception as exc:
@@ -1363,7 +1369,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
         if lease is not None:
             try:
                 prepare_slot(directory, lease, wt, argv[0] if _is_cargo(argv) else "cargo",
-                             os.getcwd())
+                             os.getcwd(), argv)
                 inject = lease[1]
                 if crate is not None and not nested and not held and (
                         fp is None or fp[1] != _real(inject)):
@@ -1542,7 +1548,7 @@ def cmd_status() -> int:
             continue
         wdir = wt / (lock.name[: -len(".lock")] + ".waiters")
         waiting = sorted(_entries(wdir, reap=False), key=lambda it: _wkey(it[0]))
-        print(_line(rec, f"lock={lock.name[: -len('.lock')]} age={_age(lock, rec)}"
+        print(_line(rec, f"lock={lock.name[: -len('.lock')]} age={_age(lock, rec)} "
                          f"waiters={len(waiting)}"))
         for f, wrec in waiting:
             print(_line(wrec, f"  waiting prio={_wkey(f)[0]} age={_age(f)}"))
