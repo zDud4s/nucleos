@@ -343,6 +343,20 @@ export interface SidecarState {
   last_line_at: string | null;
 }
 
+/**
+ * Where NucleOS itself lives — `GET /home`, the folder the daemon was started from.
+ *
+ * Asked once and kept: it cannot change while the daemon runs, and a new daemon is a new
+ * connection. `root` is null when the daemon could not read its own directory.
+ */
+export function useHome() {
+  return useQuery({
+    queryKey: keys.system.home,
+    queryFn: () => apiFetch<{ root: string | null }>("/home"),
+    staleTime: Infinity,
+  });
+}
+
 /** One subsystem's readiness — `health::SubsystemReadout`, inside `GET /health/readout`. */
 export interface SubsystemReadout {
   name: string;

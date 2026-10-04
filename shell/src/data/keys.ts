@@ -568,6 +568,8 @@ export const keys = {
     all: ["system"] as const,
     /** `GET /health/readout` (+ `/sidecars`) — the ONE health query in the app. */
     health: ["system", "health"] as const,
+    /** `GET /home` — the folder the daemon runs in; fixed for the daemon's life. */
+    home: ["system", "home"] as const,
     sidecars: ["system", "sidecars"] as const,
     backups: ["system", "backups"] as const,
     tokens: ["system", "tokens"] as const,

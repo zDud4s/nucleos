@@ -587,6 +587,7 @@ fn workflow_package_args(
 
 #[tokio::main]
 async fn main() {
+    http::remember_home();
     if std::env::args().any(|a| a == "--print-token") {
         match secrets::load_secret(TOKEN_KEY) {
             Ok(Some(t)) => println!("{t}"),
