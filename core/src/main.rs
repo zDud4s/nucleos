@@ -1406,6 +1406,8 @@ async fn main() {
         model: models_config.claude_model.clone(),
         plan_model: models_config.plan_model.clone(),
         review_model: models_config.review_model.clone(),
+        resolve_model: models_config.resolve_model.clone(),
+        resolve_effort: models_config.resolve_effort.clone(),
     };
     let configured_runner = models_config.primary_runner.as_deref();
     let primary_runner: Arc<dyn runner::CommandRunner> = match configured_runner {
