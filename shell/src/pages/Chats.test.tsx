@@ -2545,28 +2545,86 @@ describe("Chats - what it may do without asking", () => {
 });
 
 describe("Chats - what is different in the project", () => {
+  const TWO_FILES = [
+    "diff --git a/x.rs b/x.rs",
+    "--- a/x.rs",
+    "+++ b/x.rs",
+    "@@ -1 +1 @@",
+    "-let velho = 1;",
+    "+let novo = 2;",
+    "diff --git a/src/novo.ts b/src/novo.ts",
+    "new file mode 100644",
+    "--- /dev/null",
+    "+++ b/src/novo.ts",
+    "@@ -0,0 +1,2 @@",
+    "+export const a = 1;",
+    "+export const b = 2;",
+    "",
+  ].join("\n");
+
   // The question a person has after a coding turn. The transcript answers it with the name of a
-  // tool and a path, and to see what those did you had to leave the app.
-  it("shows the project's diff when asked, and not before", async () => {
+  // tool and a path, and to see what those did you had to leave the app. It is asked from a chip
+  // beside the folder on the tabs row, not from a line of text under the transcript.
+  it("opens from a chip beside the folder, files first, and not before it is asked", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], {
         "c-1": [turnRow({ id: 1, asked: "arranja isso", answer: "feito" })],
       }),
     );
-    daemon.apiText.mockResolvedValue(
-      "diff --git a/x.rs b/x.rs\n@@ -1 +1 @@\n-let velho = 1;\n+let novo = 2;\n",
-    );
+    daemon.apiText.mockResolvedValue(TWO_FILES);
     await renderChats("/chats/c-1");
     await screen.findByRole("list", { name: "Transcript" });
 
-    // Walking a working tree is not something a panel does on arrival.
+    const chip = await screen.findByRole("button", { name: /what is different in this project/i });
+    expect(chip.closest(".chats-topbar-actions")).not.toBeNull();
+    // Walking a working tree is not something the page does on arrival.
+    expect(daemon.apiText).not.toHaveBeenCalled();
     expect(screen.queryByLabelText("What is different")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: /what is different in this project/i }));
+    fireEvent.click(chip);
 
     const shown = await screen.findByLabelText("What is different");
+    // Counted per kind and per file before any line is read.
+    const kinds = await within(shown).findByRole("list", { name: "Kinds of change" });
+    expect(within(kinds).getByText(/1 modified/)).toBeTruthy();
+    expect(within(kinds).getByText(/1 added/)).toBeTruthy();
+    const files = within(shown).getByRole("list", { name: "Changed files" });
+    expect(within(files).getByText("x.rs")).toBeTruthy();
+    expect(within(files).getByText("novo.ts")).toBeTruthy();
+    // Two files is few enough to read whole: their lines are already open under their rows.
     expect(within(shown).getByText(/let novo = 2;/)).toBeTruthy();
     expect(within(shown).getByText(/let velho = 1;/)).toBeTruthy();
+
+    // And the chip keeps what it read, so the row now says how much without being opened again.
+    expect(
+      screen.getByRole("button", { name: /what is different in this project, 2 files changed/i }),
+    ).toBeTruthy();
+  });
+
+  // Past three files the rows are the overview, and a file's lines open under its own row.
+  it("starts a long list closed and opens one file at a time", async () => {
+    const many = ["a", "b", "c", "d"]
+      .map((name) => `diff --git a/${name}.rs b/${name}.rs\n@@ -1 +1 @@\n-old ${name}\n+new ${name}\n`)
+      .join("");
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })], {
+        "c-1": [turnRow({ id: 1, asked: "arranja", answer: "feito" })],
+      }),
+    );
+    daemon.apiText.mockResolvedValue(many);
+    await renderChats("/chats/c-1");
+    fireEvent.click(await screen.findByRole("button", { name: /what is different in this project/i }));
+
+    const shown = await screen.findByLabelText("What is different");
+    expect(await within(shown).findByText(/4 modified/)).toBeTruthy();
+    expect(within(shown).queryByText(/new c/)).toBeNull();
+
+    const row = within(shown).getByRole("button", { name: /c\.rs/ });
+    expect(row.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(row);
+    expect(row.getAttribute("aria-expanded")).toBe("true");
+    expect(within(shown).getByRole("region", { name: "Changes to c.rs" })).toBeTruthy();
+    expect(within(shown).queryByText(/new d/)).toBeNull();
   });
 
   // A clean tree is a real answer and not an empty box.
@@ -2580,9 +2638,31 @@ describe("Chats - what is different in the project", () => {
     await renderChats("/chats/c-1");
     await screen.findByRole("list", { name: "Transcript" });
 
-    fireEvent.click(screen.getByRole("button", { name: /what is different in this project/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /what is different in this project/i }));
 
     expect(await screen.findByText(/nothing in this project has changed/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /nothing changed/i })).toBeTruthy();
+  });
+
+  // No folder, nothing to compare: the chip is not offered at all, rather than offered and refused.
+  it("offers nothing to a conversation with no project", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", cwd: null })], {
+        "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+    // The project has been read, and said there is none.
+    await waitFor(() =>
+      expect(
+        daemon.apiFetch.mock.calls.some(([path]) => String(path).endsWith("/c-1/project")),
+      ).toBe(true),
+    );
+    // ...and the transcript's own Project block has drawn that answer, so the same cache entry the
+    // chip would read from is settled.
+    await waitFor(() => expect(document.querySelector(".chats-project")).not.toBeNull());
+
+    expect(screen.queryByRole("button", { name: /what is different in this project/i })).toBeNull();
   });
 });
 

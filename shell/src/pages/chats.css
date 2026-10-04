@@ -38,9 +38,32 @@
      conversation list sits a small step off its right edge. The top is as tight, because no header
      band sits there any more — the tabs strip is the first row. */
   max-width: none;
-  padding-top: var(--space-3);
-  padding-right: var(--space-3);
+  /* No top or right padding: the conversation list is a side panel glued to the window's right
+     edge and running its full height, so the page stops short of neither. Each column takes the
+     room it needs itself — see `.chats-detail` and `.chats-rail` below. */
+  padding-top: 0;
+  padding-right: 0;
   padding-bottom: 0;
+}
+
+/**
+ * The notch's strip, handed to the conversation list instead of kept as an empty margin.
+ *
+ * `.app-main-notched` reserves 4.5rem on the right of every page so the folded quota notch stands
+ * beside the page rather than on it. Here that reservation left a band of bare ground between the
+ * list and the window's edge, and the list read as floating. So this route gives the strip back,
+ * the list runs to the edge, and the SAME 4.5rem comes back as the list's own right padding
+ * (`--chats-notch`): the notch now hangs off the edge of the list's ground, which is what a notch
+ * is, and nothing the list draws can sit under it wherever it is dragged along the edge. With the
+ * list closed, the conversation keeps the reservation instead (`.chats-layout-alone`).
+ */
+.app-main-notched:has(> .app-page > .chats-app) {
+  padding-right: 0;
+}
+
+.chats-app {
+  /* Must stay equal to `.app-main-notched`'s padding in `app.css`. */
+  --chats-notch: 4.5rem;
 }
 
 /**
@@ -71,7 +94,8 @@
 .chats-layout {
   display: grid;
   /* The session column is on the RIGHT, where a session manager keeps its sessions. */
-  grid-template-columns: minmax(0, 1fr) 19rem;
+  /* 19rem of list, plus the notch's strip it now carries as padding (`.chats-rail`). */
+  grid-template-columns: minmax(0, 1fr) calc(19rem + var(--chats-notch));
   gap: var(--space-5);
   flex: 1;
   min-height: 0;
@@ -99,7 +123,9 @@
  * about 60rem when the rail is shut, which is the app's own breakpoint arriving on
  * its own.
  */
-@container chats (max-width: 53rem) {
+/* 57.5rem: the 53rem fold reasoned above, plus the notch's 4.5rem strip, which this container
+   now spans since the list runs to the window's edge — the same transcript width at the fold. */
+@container chats (max-width: 57.5rem) {
   .chats-layout {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -141,6 +167,12 @@
   grid-template-columns: minmax(0, 1fr);
 }
 
+/* Nothing on the right edge now, so the conversation keeps the notch's strip and the small step
+   the page used to leave. */
+.chats-layout-alone > .chats-detail {
+  padding-right: calc(var(--chats-notch) + var(--space-3));
+}
+
 /**
  * The conversation list, told apart by its ground rather than by a frame.
  *
@@ -155,6 +187,11 @@
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  /* Flush to the window's right edge and its full height (see `.app-page:has(> .chats-app)`):
+     the divider on the left runs top to bottom, and the padding is what keeps the list off the
+     edges — the top as the conversation's own, the right the notch's strip. */
+  padding-top: var(--space-3);
+  padding-right: var(--chats-notch);
   padding-left: var(--space-4);
   border-left: 1px solid var(--border);
 }
@@ -286,6 +323,8 @@
  * layout — and it grew with the type when the type grew.
  */
 .chats-detail {
+  /* The page's top padding, moved here so the conversation list beside it can reach the top. */
+  padding-top: var(--space-3);
   --measure: 100ch;
   /**
    * What you type into, which is no longer the width of the record above it.
@@ -638,60 +677,244 @@
  * `paused` and not `danger`: nothing is broken and nothing is about to go wrong. It is a session
  * that will continue with less than you would expect, and the button beside it is the fix.
  */
-/* What is different in this conversation's project, closed until asked. */
-.chats-changed {
+/**
+ * What is different in this conversation's project: a chip beside the folder on the tabs row, and
+ * the panel it opens. See `ProjectChanges`.
+ *
+ * The chip is the time field's trigger in the tabs row's size (`.ui-time-trigger`): the sunken
+ * rung, a hairline, an icon and a reading. It is a control that reports, so it looks like the
+ * other controls on that row and not like a badge.
+ */
+.chats-changes-chip {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0.2rem var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-quick) var(--ease),
+    color var(--dur-quick) var(--ease);
+}
+
+.chats-changes-chip:hover,
+.chats-changes-chip[data-state="open"] {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.chats-changes-chip:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.chats-changes-glyph {
+  flex: none;
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+/* `+12 −4`. A tinted fill under full-strength text, as the diff's own rows do (`ui/Diff.tsx`):
+   Acting Green as a FOREGROUND means work happening now, and a count of added lines is not that.
+   The sign carries the fact; the tint only says which side. */
+.chats-changes-counts {
+  display: inline-flex;
+  gap: 0.2rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+}
+
+.chats-changes-added,
+.chats-changes-removed {
+  padding: 0 0.3rem;
+  border-radius: var(--radius-sm);
+  color: var(--text);
+}
+
+.chats-changes-added {
+  background: var(--tone-active-bg);
+}
+
+.chats-changes-removed {
+  background: var(--tone-danger-bg);
+}
+
+/* The panel: the time field's popover (`.ui-time-popover`), wide enough for a diff, and with a
+   ceiling of its own so a long one scrolls inside it rather than off the window. */
+.chats-changes {
+  z-index: var(--z-top);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: min(42rem, calc(100vw - 2 * var(--space-4)));
+  max-height: min(36rem, calc(100vh - 6rem));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-md);
+  outline: none;
+}
+
+.chats-changes[data-state="open"] {
+  animation: ui-modal-fade var(--dur-quick) var(--ease);
+}
+
+.chats-changes-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.chats-changes-title {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.chats-changes-note,
+.chats-changes-clean {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.chats-changes-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* A count per kind of change, and the whole diff's lines at the end of the same row. */
+.chats-changes-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.chats-changes-kinds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chats-changes-kind {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0.15rem var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.chats-changes-files {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--border);
+  list-style: none;
+}
+
+.chats-changes-file {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  margin: var(--space-2) 0;
+  border-bottom: 1px solid var(--border);
 }
 
-.chats-changed-toggle {
-  align-self: flex-start;
-  padding: 0;
+.chats-changes-file:has(> [role="region"]) {
+  padding-bottom: var(--space-3);
+}
+
+.chats-changes-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-1);
   border: 0;
+  border-radius: var(--radius-sm);
   background: none;
-  color: var(--text-faint);
-  font-size: var(--text-xs);
-  text-decoration: underline;
+  color: var(--text-muted);
+  font-family: inherit;
+  text-align: left;
   cursor: pointer;
 }
 
-.chats-changed-clean {
-  font-size: var(--text-xs);
-  color: var(--text-faint);
+.chats-changes-row:hover {
+  background: var(--surface);
+  color: var(--text);
 }
 
-.chats-diff {
-  max-height: 24rem;
-  overflow: auto;
-  overscroll-behavior: none;
-  padding: var(--space-2);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
+.chats-changes-row:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.chats-changes-chevron {
+  flex: none;
+  width: 0.875rem;
+  height: 0.875rem;
+  color: var(--text-faint);
+  transition: transform var(--dur-quick) var(--ease);
+}
+
+.chats-changes-row[aria-expanded="true"] .chats-changes-chevron {
+  transform: rotate(90deg);
+}
+
+/* The folder faint and the file's own name at full strength, so a column of paths reads as a
+   column of names. Ellipsised from the folder's end, never the name's. */
+.chats-changes-path {
+  display: flex;
+  flex: 1;
+  min-width: 0;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  line-height: 1.45;
-  white-space: pre;
+  white-space: nowrap;
 }
 
-/* Added and removed, in the two tones that already mean it. These read
-   `var(--tone-go-text, #2f7d43)` and `var(--tone-stop-text, #a33a3a)`, and
-   neither token has ever existed anywhere in this app — so the fallback won
-   every time, and a hex literal does not answer `prefers-color-scheme`. Two
-   near-black greens on a white ground was the visible half of the bug. */
-.chats-diff-added {
-  color: var(--tone-active-fg);
-}
-
-.chats-diff-removed {
-  color: var(--tone-danger-fg);
-}
-
-/* The lines that say WHERE rather than WHAT: file names and hunk headers, faint so the eye goes to
-   the content between them. */
-.chats-diff-meta {
+.chats-changes-dir {
+  min-width: 0;
+  overflow: hidden;
   color: var(--text-faint);
+  text-overflow: ellipsis;
+}
+
+.chats-changes-name {
+  flex: none;
+  color: var(--text);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chats-changes[data-state="open"] {
+    animation: none;
+  }
+
+  .chats-changes-chevron {
+    transition: none;
+  }
 }
 
 /* A tool call this conversation is being held on. Drawn where the next thing would have
