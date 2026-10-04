@@ -550,6 +550,7 @@ describe("Chats - a turn already in flight", () => {
     // The model picker is a different mutation and was never touched by the
     // composer's failure — it still takes a click and still writes.
     await openModelMenu();
+    await openModelSubmenu("On the agent CLI");
     fireEvent.click(await screen.findByRole("menuitemradio", { name: /^Opus/ }));
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
@@ -994,11 +995,34 @@ async function openModelMenu(): Promise<void> {
   fireEvent.click(trigger);
 }
 
-/** The effort menu, its own control beside the model's rather than a submenu inside it. */
-async function openEffortMenu(): Promise<void> {
-  const trigger = await screen.findByRole("button", { name: /^effort:/i });
+/**
+ * Open one submenu of the model menu (a company such as "Claude", or a section such as
+ * "Through OpenRouter"). A Radix sub-trigger opens on click or on ArrowRight.
+ */
+async function openModelSubmenu(name: string | RegExp): Promise<HTMLElement> {
+  const sub = await screen.findByRole("menuitem", { name });
+  fireEvent.keyDown(sub, { key: "ArrowRight" });
+  // The sub content is labelled by its trigger, so its accessible name is the trigger's text.
+  return screen.findByRole("menu", { name });
+}
+
+/**
+ * The effort slider's thumb: its own control beside the model's, a keyboard-driven range.
+ * The slider lives in a menu now, so this opens that menu first (once).
+ */
+async function effortThumb(): Promise<HTMLElement> {
+  const existing = screen.queryByRole("slider", { name: "Effort level" });
+  if (existing) return existing;
+  const trigger = await screen.findByRole("button", { name: /change the effort/i });
   fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
   fireEvent.click(trigger);
+  return screen.findByRole("slider", { name: "Effort level" });
+}
+
+/** The "+" menu's hidden file input, which carries no label of its own. */
+async function pictureInput(): Promise<HTMLInputElement> {
+  await screen.findByRole("button", { name: "Add to message" });
+  return document.querySelector('input[type="file"]') as HTMLInputElement;
 }
 
 /** What the conversation may do without asking. Same Radix `pointerdown` rule as its neighbours. */
@@ -1102,6 +1126,8 @@ describe("Chats - choosing a model", () => {
 
     await renderChats("/chats/c-1");
     await openModelMenu();
+    // No groups from the daemon in this fixture, so the CLI's models sit in the flat section.
+    await openModelSubmenu("On the agent CLI");
 
     expect(await screen.findByRole("menuitemradio", { name: /^GPT-5.5/ })).toBeDefined();
   });
@@ -1114,9 +1140,12 @@ describe("Chats - choosing a model", () => {
 
     // Every name here came over the wire. The agent CLI cannot enumerate its own models, so a list
     // written into the window would be an assertion going stale where nobody who can fix it looks.
-    for (const label of ["Opus", "Sonnet", "Fable", "qwen3.5:4b"]) {
-      expect(await screen.findByRole("menuitemradio", { name: new RegExp(`^${label}`) })).toBeDefined();
+    const cli = await openModelSubmenu("On the agent CLI");
+    for (const label of ["Opus", "Sonnet", "Fable"]) {
+      expect(await within(cli).findByRole("menuitemradio", { name: new RegExp(`^${label}`) })).toBeDefined();
     }
+    const here = await openModelSubmenu("On this machine");
+    expect(await within(here).findByRole("menuitemradio", { name: /^qwen3\.5:4b/ })).toBeDefined();
   });
 
   it("names the unpinned state instead of leaving nothing selected", async () => {
@@ -1125,7 +1154,9 @@ describe("Chats - choosing a model", () => {
     await renderChats("/chats/c-1");
     await openModelMenu();
 
-    const following = await screen.findByRole("menuitemradio", { name: /whatever is configured/i });
+    // Under the company of the configured model (Claude), named after what it would run.
+    await openModelSubmenu("Claude");
+    const following = await screen.findByRole("menuitemradio", { name: /^Default/ });
     expect(following.getAttribute("aria-checked")).toBe("true");
   });
 
@@ -1136,7 +1167,8 @@ describe("Chats - choosing a model", () => {
 
     await renderChats("/chats/c-1");
     await openModelMenu();
-    fireEvent.click(await screen.findByRole("menuitemradio", { name: /whatever is configured/i }));
+    await openModelSubmenu("Claude");
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^Default/ }));
 
     // `undefined` would be dropped by JSON.stringify and read by the daemon as "leave it alone" —
     // the one thing an unpin is not.
@@ -1150,12 +1182,11 @@ describe("Chats - choosing a model", () => {
 
   it("writes the effort on its own, without touching which model answers", async () => {
     daemon.apiFetch.mockImplementation(
-      chatsFetch([chatSummary({ chat_id: "c-1", model: "sonnet" })], { "c-1": [] }),
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "sonnet", effort: "high" })], { "c-1": [] }),
     );
 
     await renderChats("/chats/c-1");
-    await openEffortMenu();
-    fireEvent.click(await screen.findByRole("menuitemradio", { name: "xhigh" }));
+    fireEvent.keyDown(await effortThumb(), { key: "ArrowRight" });
 
     await waitFor(() => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
@@ -1165,34 +1196,125 @@ describe("Chats - choosing a model", () => {
     });
   });
 
-  it("offers each model its own effort levels, not the union of everyone's", async () => {
+  it("the effort is a slider over the model's own levels and hidden without any", async () => {
     daemon.apiFetch.mockImplementation(
-      chatsFetch([chatSummary({ chat_id: "c-1", model: "fable" })], { "c-1": [] }),
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "fable", effort: "low" })], { "c-1": [] }),
     );
 
-    await renderChats("/chats/c-1");
-    await openEffortMenu();
+    const { unmount } = await renderChats("/chats/c-1");
+    const thumb = await effortThumb();
+    // Fable's list stops at `high` in the fixture: default + three levels, so the last index is 3.
+    // `xhigh` is on the union and on other models, and offering it here would be a level that dies
+    // at spawn.
+    expect(thumb.getAttribute("aria-valuemax")).toBe("3");
+    expect(thumb.getAttribute("aria-valuetext")).toBe("low");
+    expect(screen.queryByText("xhigh")).toBeNull();
 
-    // Fable's list stops at `high` in the fixture. `xhigh` is on the union and on other models, and
-    // offering it here would be a level that dies at spawn.
-    expect(await screen.findByRole("menuitemradio", { name: "high" })).toBeDefined();
-    expect(screen.queryByRole("menuitemradio", { name: "xhigh" })).toBeNull();
-    expect(screen.queryByRole("menuitemradio", { name: "max" })).toBeNull();
-  });
+    // The first position is the CLI's own default and is written as an explicit null.
+    fireEvent.keyDown(thumb, { key: "Home" });
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ effort: null }),
+      });
+    });
+    unmount();
 
-  it("closes the effort dial on a model that has none, rather than offering one that turns nothing", async () => {
+    // A model with no levels gets no slider at all, rather than one that turns nothing.
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1", model: "qwen3.5:4b", brain: "local" })], {
         "c-1": [],
       }),
     );
+    await renderChats("/chats/c-1");
+    await screen.findByRole("button", { name: /answered by qwen3.5:4b/i });
+    expect(screen.queryByRole("slider")).toBeNull();
+  });
+
+  it("the picker draws provider and family groups with product names", async () => {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1", model: "claude-opus-4-6" })], {
+      "c-1": [],
+    });
+    const opus: ModelChoice = {
+      id: "claude-opus-4-6",
+      label: "Opus 4.6",
+      brain: "cloud",
+      efforts: CLAUDE_EFFORTS,
+    };
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      if (String(path).startsWith("/assistant/models/groups")) {
+        return {
+          groups: [
+            { provider: "anthropic", family: "opus", label: "Claude · Opus", models: [opus] },
+            {
+              provider: "openai",
+              family: "gpt",
+              label: "OpenAI · GPT",
+              models: [{ id: "gpt-5.5", label: "GPT-5.5", brain: "cloud", efforts: ["low"] }],
+            },
+          ],
+          source: "fallback",
+          catalogue_version: "2026-10-02",
+          fetched_at: null,
+        };
+      }
+      return base(path, init);
+    });
 
     await renderChats("/chats/c-1");
+    // The trigger names the pinned model by its product name, never by its id.
+    expect(await screen.findByRole("button", { name: /answered by Opus 4.6/i })).toBeDefined();
+    await openModelMenu();
 
-    // Disabled and still there. Removing it would make the row jump as you switch models, and would
-    // read as a feature that is missing rather than one that does not apply to this model.
-    const dial = await screen.findByRole("button", { name: /has no effort setting/i });
-    expect((dial as HTMLButtonElement).disabled).toBe(true);
+    // The top level is one row per company, and the families live inside each one's submenu.
+    const claudeMenu = await openModelSubmenu("Claude");
+    const claude = within(claudeMenu).getByRole("group", { name: "Claude · Opus" });
+    expect(within(claude).getByRole("menuitemradio", { name: "Opus 4.6" })).toBeDefined();
+    const gptMenu = await openModelSubmenu("GPT");
+    const openai = within(gptMenu).getByRole("group", { name: "OpenAI · GPT" });
+    expect(within(openai).getByRole("menuitemradio", { name: "GPT-5.5" })).toBeDefined();
+    // The flat "On the agent CLI" section is replaced, not drawn beside them.
+    expect(screen.queryByRole("menuitem", { name: "On the agent CLI" })).toBeNull();
+  });
+
+  it("shows a Codex model that needs a project with the hook wired as disabled, and says why", async () => {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      if (String(path).startsWith("/assistant/models/groups")) {
+        return {
+          groups: [
+            {
+              provider: "openai",
+              family: "gpt",
+              label: "OpenAI · GPT",
+              models: [
+                { id: "gpt-5.5", label: "GPT-5.5", brain: "cloud", efforts: ["low"] },
+                { id: "gpt-5.4", label: "GPT-5.4", brain: "cloud", efforts: ["low"] },
+              ],
+            },
+          ],
+          source: "fallback",
+          catalogue_version: "2026-10-02",
+          fetched_at: null,
+          needs_root: ["gpt-5.5"],
+        };
+      }
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+    const gptMenu = await openModelSubmenu("GPT");
+
+    // Listed and closed rather than left out, and the reason is on the row itself.
+    const closed = await within(gptMenu).findByRole("menuitemradio", { name: /^GPT-5\.5/ });
+    expect(
+      closed.getAttribute("aria-disabled") === "true" || closed.getAttribute("data-disabled") !== null,
+    ).toBe(true);
+    expect(within(closed).getByText("needs a project with the hook wired")).toBeDefined();
+    // A sibling the daemon did not list under `needs_root` stays pickable.
+    const open = within(gptMenu).getByRole("menuitemradio", { name: /^GPT-5\.4/ });
+    expect(open.getAttribute("aria-disabled")).toBeNull();
   });
 
   it("keeps the model and the effort as two controls, not one inside the other", async () => {
@@ -1202,13 +1324,14 @@ describe("Chats - choosing a model", () => {
 
     await renderChats("/chats/c-1");
 
-    // Two triggers, side by side. They are two decisions and a person changes them separately —
-    // most often the effort, on a model they already chose — and a dial buried one level down is
-    // one you have to remember is there.
+    // Two controls, side by side. They are two decisions and a person changes them separately —
+    // most often the effort, on a model they already chose.
     expect(await screen.findByRole("button", { name: /answered by sonnet/i })).toBeDefined();
-    expect(await screen.findByRole("button", { name: /^effort: high/i })).toBeDefined();
+    // The effort control is a trigger of its own and names the level without being opened.
+    expect(await screen.findByRole("button", { name: /^Effort high/ })).toBeDefined();
 
-    // And opening the model menu offers models only.
+    // And opening the model menu offers models only. (Opened before the effort menu: an open
+    // menu is modal and hides the other trigger from the accessibility tree.)
     await openModelMenu();
     expect(screen.queryByRole("menuitemradio", { name: "xhigh" })).toBeNull();
   });
@@ -1218,6 +1341,7 @@ describe("Chats - choosing a model", () => {
 
     await renderChats("/chats");
     await openModelMenu();
+    await openModelSubmenu("On the agent CLI");
     fireEvent.click(await screen.findByRole("menuitemradio", { name: /^Fable/ }));
 
     const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
@@ -1293,7 +1417,8 @@ describe("Chats - a model that cannot work tools", () => {
     await renderChats("/chats/c-1");
     await openModelMenu();
 
-    const toolless = await screen.findByRole("menuitemradio", {
+    const here = await openModelSubmenu("On this machine");
+    const toolless = await within(here).findByRole("menuitemradio", {
       name: /^gemma3:1b/,
     });
     // Said BEFORE the pick. Afterwards it is a turn that answers without doing any of what it
@@ -1306,7 +1431,8 @@ describe("Chats - a model that cannot work tools", () => {
 
     // A choice nobody has probed carries no mark at all. `tools` absent is "nobody asked", and
     // reading that as "cannot" would put a warning on almost every model on the menu.
-    const unprobed = await screen.findByRole("menuitemradio", { name: /^Sonnet/ });
+    const cli = await openModelSubmenu("On the agent CLI");
+    const unprobed = await within(cli).findByRole("menuitemradio", { name: /^Sonnet/ });
     expect(within(unprobed).queryByText(/cannot use tools/i)).toBeNull();
   });
 });
@@ -1327,6 +1453,7 @@ describe("Chats - a model reached over OpenRouter", () => {
     await renderChats("/chats/c-1");
     await openModelMenu();
 
+    await openModelSubmenu("Through OpenRouter");
     const hosted = await screen.findByRole("menuitemradio", { name: /^GPT via OpenRouter/ });
     expect(hosted.getAttribute("aria-disabled")).toBeNull();
     // The mark is not decoration — it is the one place a person can tell, before picking it, that
@@ -1357,16 +1484,17 @@ describe("Chats - a model reached over OpenRouter", () => {
     // a flat list made a person read the note at the end of each line to find out. Queried as
     // ROLES rather than by reading the DOM order: a group a screen reader announces is the same
     // fact this test is about, and asserting on order would pass for a menu nobody can navigate.
-    const cli = await screen.findByRole("group", { name: /agent cli/i });
-    const hosted = screen.getByRole("group", { name: /openrouter/i });
-    const here = screen.getByRole("group", { name: /on this machine/i });
-    const missing = screen.getByRole("group", { name: /not downloaded/i });
+    // Each route is a submenu of its own now, and a submenu's content is named by its trigger.
+    const cli = await openModelSubmenu("On the agent CLI");
 
     expect(within(cli).getByRole("menuitemradio", { name: /^Sonnet/ })).toBeDefined();
+    const hosted = await openModelSubmenu("Through OpenRouter");
     expect(
       within(hosted).getByRole("menuitemradio", { name: /^GPT via OpenRouter/ }),
     ).toBeDefined();
+    const here = await openModelSubmenu("On this machine");
     expect(within(here).getByRole("menuitemradio", { name: /^qwen3\.5:4b/ })).toBeDefined();
+    const missing = await openModelSubmenu("Not downloaded yet");
 
     // A model the daemon offers and this machine does not have. SHOWN, because seeing it is how
     // somebody learns it can be had at all — Ollama publishes no list of what is pullable, so if
@@ -1391,7 +1519,7 @@ describe("Chats - a model reached over OpenRouter", () => {
     await renderChats("/chats/c-1");
     await openModelMenu();
 
-    const missing = await screen.findByRole("group", { name: /not downloaded/i });
+    const missing = await openModelSubmenu("Not downloaded yet");
     const row = () => within(missing).getByRole("menuitem", { name: /^Llama 3\.2 3B/ });
     const started = () =>
       daemon.apiFetch.mock.calls.filter(
@@ -1445,7 +1573,7 @@ describe("Chats - a model reached over OpenRouter", () => {
     await renderChats("/chats/c-1");
     await openModelMenu();
 
-    const missing = await screen.findByRole("group", { name: /not downloaded/i });
+    const missing = await openModelSubmenu("Not downloaded yet");
     const row = () => within(missing).getByRole("menuitem", { name: /^Llama 3\.2 3B/ });
 
     // BOTH numbers, not just the verdict. "42.5 GB, and this machine has 15.8" is something a
@@ -1481,7 +1609,7 @@ describe("Chats - a model reached over OpenRouter", () => {
     await renderChats("/chats/c-1");
     await openModelMenu();
 
-    const missing = await screen.findByRole("group", { name: /not downloaded/i });
+    const missing = await openModelSubmenu("Not downloaded yet");
     const row = () => within(missing).getByRole("menuitem", { name: /^Llama 3\.2 3B/ });
 
     await waitFor(() => {
@@ -3358,7 +3486,7 @@ describe("sending a picture", () => {
   it("attaches one and sends it inside the message", async () => {
     await open();
 
-    const input = await screen.findByLabelText("Attach a picture");
+    const input = await pictureInput();
     fireEvent.change(input, { target: { files: [picture()] } });
 
     // It is shown before it is sent: attaching and sending are two gestures, and a picture that
@@ -3389,7 +3517,7 @@ describe("sending a picture", () => {
 
     expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
 
-    const input = await screen.findByLabelText("Attach a picture");
+    const input = await pictureInput();
     fireEvent.change(input, { target: { files: [picture()] } });
 
     await waitFor(() => {
@@ -3402,7 +3530,7 @@ describe("sending a picture", () => {
   it("can be taken back off before it is sent", async () => {
     await open();
 
-    const input = await screen.findByLabelText("Attach a picture");
+    const input = await pictureInput();
     fireEvent.change(input, { target: { files: [picture()] } });
     await screen.findByRole("list", { name: "Attached pictures" });
 
@@ -3418,7 +3546,7 @@ describe("sending a picture", () => {
   it("ignores a file the API could not carry", async () => {
     await open();
 
-    const input = await screen.findByLabelText("Attach a picture");
+    const input = await pictureInput();
     fireEvent.change(input, {
       target: { files: [new File([""], "notes.pdf", { type: "application/pdf" })] },
     });
@@ -3562,7 +3690,7 @@ describe("naming a file with @", () => {
     await withFiles([parser]);
 
     const box = await screen.findByLabelText("Message");
-    fireEvent.change(box, { target: { value: "manda para duarte@parser", selectionStart: 24 } });
+    fireEvent.change(box, { target: { value: "manda para helena@parser", selectionStart: 24 } });
 
     await screen.findByLabelText("Message");
     expect(screen.queryByRole("list", { name: "Files to mention" })).toBeNull();
@@ -4201,7 +4329,7 @@ describe("Chats - what the header says without being asked", () => {
     // Named, not blank: a conversation that pinned nothing still runs on something, and the
     // trigger says which. An empty selection here would read as a broken control.
     expect(
-      await screen.findByRole("button", { name: /answered by claude-sonnet-5/i }),
+      await screen.findByRole("button", { name: /answered by sonnet 5/i }),
     ).toBeDefined();
     expect(await screen.findByRole("button", { name: /^Permissions: Plan/ })).toBeDefined();
 
@@ -5358,5 +5486,81 @@ describe("Chats - the microphone in an open conversation", () => {
     const notice = await screen.findByText("nothing was heard");
     const actions = container.querySelector(".chats-composer-actions") as HTMLElement;
     expect(actions.contains(notice)).toBe(true);
+  });
+});
+
+describe("Chats - conversations as tabs", () => {
+  it("opens two conversations as tabs and closes one", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({ chat_id: "c-1", title: "alpha" }),
+          chatSummary({ chat_id: "c-2", title: "beta" }),
+        ],
+        { "c-1": [], "c-2": [] },
+      ),
+    );
+
+    const { router } = await renderChats("/chats/c-1");
+    const strip = await screen.findByRole("tablist", { name: "Open conversations" });
+    expect(within(strip).getAllByRole("tab")).toHaveLength(1);
+
+    // Opening another one from the column adds a tab and keeps the first.
+    fireEvent.click(await screen.findByRole("link", { name: /^beta, cloud/ }));
+    await waitFor(() => expect(within(strip).getAllByRole("tab")).toHaveLength(2));
+    expect(router.state.location.pathname).toBe("/chats/c-2");
+    expect(JSON.parse(localStorage.getItem("chats.tabs") ?? "[]")).toEqual(["c-1", "c-2"]);
+
+    // A tab wears the same colour as its row in the column.
+    const hueOf = (el: Element | null | undefined) =>
+      el?.querySelector<HTMLElement>(".chats-dot-chat")?.style.getPropertyValue("--chat-hue");
+    const tabHue = hueOf(within(strip).getByRole("tab", { name: /beta/ }));
+    expect(tabHue).toBeTruthy();
+    expect(hueOf(screen.getByRole("link", { name: /^beta, cloud/ }))).toBe(tabHue);
+
+    // Clicking a tab navigates back.
+    fireEvent.click(within(strip).getByRole("tab", { name: /alpha/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-1"));
+
+    // Closing the open one moves to its neighbour, and the tab is gone.
+    fireEvent.click(within(strip).getByRole("button", { name: "Close alpha" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-2"));
+    expect(within(strip).getAllByRole("tab")).toHaveLength(1);
+    expect(within(strip).queryByRole("tab", { name: /alpha/ })).toBeNull();
+
+    // Closing the last one goes back to the front door and the strip disappears.
+    fireEvent.click(within(strip).getByRole("button", { name: "Close beta" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/chats"));
+    expect(screen.queryByRole("tablist", { name: "Open conversations" })).toBeNull();
+  });
+});
+
+describe("Chats - the cache and agent chips", () => {
+  it("shows the cache time left and the working agents in the conversation header", async () => {
+    const done = new Date(Date.now() - 10 * 60_000).toISOString();
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({
+            id: 1,
+            created_at: done,
+            completed_at: done,
+            cache_ttl: "1h",
+            did: [
+              { id: "t1", name: "Task", detail: "explore", todos: [], started_at: done },
+              { id: "t2", name: "Grep", detail: "x", todos: [], parent: "t1" },
+              { id: "b1", name: "Bash", detail: "sleep", todos: [], background: true, status: "running" },
+            ],
+          }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    expect(await screen.findByText(/50m/)).toBeTruthy();
+    // The turn is settled, so a subagent is finished; the background task is still running.
+    expect(await screen.findByRole("button", { name: /1 agent$/ })).toBeTruthy();
+    // The subagent's own call is not listed in the transcript's "What it did".
+    expect(screen.queryByText("Grep")).toBeNull();
   });
 });

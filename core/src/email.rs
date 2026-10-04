@@ -334,7 +334,7 @@ impl EntryClass {
 /// PURE: whether this message was written by the account whose mailbox is being read.
 ///
 /// Compared through `contacts::normalize_address` so both sides are reduced the same way a stored
-/// correspondent is — `Duarte <D@Example.COM>` and `d@example.com` are one person, and a comparison
+/// correspondent is — `Helena <H@Example.COM>` and `h@example.com` are one person, and a comparison
 /// that said otherwise would withhold the owner's own sent mail rather than a stranger's.
 ///
 /// An empty `owner` answers `false`, not `true`. With no address to compare against there is no

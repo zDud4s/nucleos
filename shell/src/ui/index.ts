@@ -25,6 +25,7 @@ export { Inset, type InsetAs, type InsetProps } from "./Inset";
  */
 export { LimitChip, Meter, usd, type LimitChipProps, type MeterProps, type MeterTone } from "./Meter";
 export { Modal, type ModalProps, type ModalSize } from "./Modal";
+export { TimeField, type TimeFieldProps } from "./TimeField";
 export { ModeSwitch, type ModeSwitchProps, type SwitchMode } from "./ModeSwitch";
 export { PageHeader, type PageHeaderProps } from "./PageHeader";
 /**
@@ -112,4 +113,5 @@ export {
  * repeated here because a vendored component is the case most likely to be
  * imported by its own path out of habit.
  */
+export { Slider, type SliderProps } from "./Slider";
 export { Tabs, TabsContent, TabsList, TabsTrigger } from "./vendor/tabs";

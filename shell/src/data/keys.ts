@@ -130,6 +130,7 @@ export const keys = {
   waiting: {
     all: ["waiting"] as const,
     vcsRequests: ["waiting", "vcs-requests"] as const,
+    vcsWaiting: ["waiting", "vcs-waiting"] as const,
     count: ["waiting", "count"] as const,
     skippedItems: ["waiting", "skipped-items"] as const,
     refusedActions: ["waiting", "refused-actions"] as const,
@@ -404,6 +405,13 @@ export const keys = {
      */
     models: ["chats", "models"] as const,
     modelsFor: (chatId: string) => ["chats", "models", chatId] as const,
+    /** Archived conversations — `GET /assistant/chats?archived=true`. */
+    archived: ["chats", "archived"] as const,
+    /** The user's session groups — `GET /assistant/chat-groups`. */
+    groups: ["chats", "groups"] as const,
+    /** Models grouped by provider and family — `GET /assistant/models/groups`. */
+    modelGroups: ["chats", "model-groups"] as const,
+    modelGroupsFor: (chatId: string) => ["chats", "model-groups", chatId] as const,
     /**
      * The tools a conversation may be told not to reach for — `GET /assistant/tools`.
      *

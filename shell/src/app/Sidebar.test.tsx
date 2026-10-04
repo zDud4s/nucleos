@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { Sidebar } from "./Sidebar";
 import { NAV_ITEMS } from "./nav";
 import { renderWithRouter } from "../test/harness";
@@ -19,97 +19,59 @@ describe("Sidebar", () => {
     const rendered = Array.from(container.querySelectorAll<HTMLElement>("[data-nav-path]")).map(
       (link) => link.dataset.navPath,
     );
-    // No `projects` prop, so the roster contributes nothing and the rail is
-    // exactly the table. The roster's own rendering is four tests above.
+    // The rail is exactly the table: projects live in the switcher, not here.
     expect(rendered).toEqual(NAV_ITEMS.map((item) => item.path));
   });
 
   /**
-   * The roster group is the one part of the rail that is not in the nav table,
-   * so it is the one part a table test cannot defend. These four are its
-   * replacement.
+   * The rail is a fixed list of destinations; the switcher is the one list of
+   * projects. A project row creeping back into the rail — under a group, a
+   * disclosure, or anything else — is what these two hold off.
    */
-  it("lists the projects it is given, under the group that declares the position", async () => {
-    await renderWithRouter(
-      <Sidebar projects={[{ id: "nucleos", mode: "active", pending: 0 }, { id: "sidecar", mode: "shadow", pending: 2 }]} />,
-      { initialPath: "/projects" },
-    );
-
-    expect(screen.getByRole("link", { name: "nucleos" }).getAttribute("href")).toContain(
-      "/projects/nucleos/state",
-    );
-    // The roster page keeps its place at the head of the group: it answers a
-    // fleet-wide question no single workspace can.
-    expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
+  it("draws no project rows in the rail, whatever the roster and the route", async () => {
+    const roster = [
+      { id: "alpha", mode: "active" as const, pending: 3 },
+      { id: "bravo", mode: "shadow" as const, pending: 0 },
+    ];
+    for (const initialPath of ["/feed", "/projects", "/projects/alpha/state", "/projects/new"]) {
+      const { container, unmount } = await renderWithRouter(<Sidebar projects={roster} />, { initialPath });
+      const rendered = Array.from(container.querySelectorAll<HTMLElement>("[data-nav-path]")).map(
+        (link) => link.dataset.navPath,
+      );
+      expect(rendered).toEqual(NAV_ITEMS.map((item) => item.path));
+      expect(container.querySelector(".nav-scroll a[href^='/projects/']")).toBeNull();
+      unmount();
+    }
   });
 
-  it("draws no roster rows when the roster has not answered yet", async () => {
-    await renderWithRouter(<Sidebar />);
+  it("draws Projects as a plain row in Operate, right after Fleet", async () => {
+    const { container } = await renderWithRouter(<Sidebar />);
 
-    // Not an empty group with a heading and nothing under it, and not a
-    // "no projects" line either: the daemon has not spoken, and inventing a
-    // sentence about what it did not say is the failure mode this guards.
-    expect(screen.queryByRole("link", { name: "nucleos" })).toBeNull();
-    expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
-  });
-
-  it("says a project's open-proposal count out loud, since the badge is only drawn", async () => {
-    await renderWithRouter(<Sidebar projects={[{ id: "sidecar", mode: "shadow", pending: 2 }]} />, {
-      initialPath: "/projects",
-    });
-
-    // A roster badge is open proposals, not the Waiting queue's arithmetic.
-    expect(screen.getByRole("link", { name: "sidecar, 2 items to review" })).toBeTruthy();
+    const operate = screen.getByRole("list", { name: "Operate" });
+    const labels = Array.from(operate.querySelectorAll<HTMLElement>("[data-nav-path]")).map(
+      (link) => link.textContent,
+    );
+    expect(labels.slice(0, 3)).toEqual(["Home", "Fleet", "Projects"]);
+    expect(screen.getByRole("link", { name: "Projects" }).getAttribute("href")).toBe("/projects");
+    // No group of its own any more, and no disclosure beside it.
+    expect(container.querySelector("#nav-group-projects")).toBeNull();
+    expect(screen.queryByRole("button", { name: /project list/ })).toBeNull();
   });
 
   /**
-   * **The rail is destinations; the roster is content.** Every other row in the
-   * sidebar is one of a fixed list; this group's length belongs to the daemon,
-   * and fifteen projects would push Work and Pillars off the bottom edge to show
-   * names nobody reading the Feed is looking for. So the rows are drawn where
-   * they are the subject and nowhere else.
-   *
-   * The group is NOT conditional — heading and `All projects` stay put on every
-   * page — because a group that came and went would move everything under it.
+   * The ordinary prefix rule, and on purpose: with no project rows in the rail,
+   * the one row about projects is the right "you are here" anywhere under it.
    */
-  it("draws the roster only inside the projects area, and keeps the group everywhere", async () => {
-    const roster = [{ id: "nucleos", mode: "active" as const, pending: 0 }];
-
-    const away = await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
-    expect(screen.queryByRole("link", { name: "nucleos" })).toBeNull();
-    // The way in is still there, in the place it has always been.
-    expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
-    away.unmount();
-
-    await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects" });
-    expect(screen.getByRole("link", { name: "nucleos" })).toBeTruthy();
-  });
-
-  /**
-   * Inside a workspace as much as on the list, because switching projects without
-   * going back out to the list is the whole of what the rows are for — and the
-   * wizard counts too: a rail that emptied while somebody was adding a project
-   * would read as having lost the ones they had.
-   */
-  it("keeps the roster while you are in a workspace or adding one", async () => {
-    const roster = [{ id: "nucleos", mode: "active" as const, pending: 0 }];
-
-    const inside = await renderWithRouter(<Sidebar projects={roster} />, {
-      initialPath: "/projects/sidecar/code",
-    });
-    expect(screen.getByRole("link", { name: "nucleos" })).toBeTruthy();
-    inside.unmount();
-
-    await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects/new" });
-    expect(screen.getByRole("link", { name: "nucleos" })).toBeTruthy();
-  });
-
-  it("keeps a project lit while you are in any of its three modes", async () => {
-    await renderWithRouter(<Sidebar projects={[{ id: "nucleos", mode: "active", pending: 0 }]} />, {
-      initialPath: "/projects/nucleos/workflows",
+  it("keeps Projects lit inside a workspace, and says you are here once", async () => {
+    await renderWithRouter(<Sidebar projects={[{ id: "alpha", mode: "active", pending: 0 }]} />, {
+      initialPath: "/projects/alpha/state",
     });
 
-    expect(screen.getByRole("link", { name: "nucleos" }).getAttribute("aria-current")).toBe("page");
+    const here = screen
+      .getAllByRole("link")
+      .filter((link) => link.getAttribute("aria-current") === "page");
+    expect(here).toHaveLength(1);
+    expect(here[0].textContent).toBe("Projects");
   });
 
   it("marks the page you are on, and only that one", async () => {
@@ -120,41 +82,6 @@ describe("Sidebar", () => {
     // `/` is exempt from the prefix rule: every path starts with it, and Home
     // lighting up on every page would say "you are nowhere in particular".
     expect(screen.getByRole("link", { name: "Home" }).getAttribute("aria-current")).toBeNull();
-  });
-
-  /**
-   * Two rows said it, on every project screen there is.
-   *
-   * `isActive` prefix-matches so that `/runs/412` keeps Runs lit, and the row that owns the
-   * roster is the one place that is wrong: inside `/projects/alpha/state` both `All projects`
-   * and `alpha` matched, and both got the fill, the `--text` label, the glyph, the bar and
-   * `aria-current="page"`. "You are here" twice is "you are here" nowhere.
-   */
-  it("says you are here once, even where a row owns the rows under it", async () => {
-    await renderWithRouter(<Sidebar projects={[{ id: "alpha", mode: "active", pending: 0 }]} />, {
-      initialPath: "/projects/alpha/state",
-    });
-
-    const here = screen
-      .getAllByRole("link")
-      .filter((link) => link.getAttribute("aria-current") === "page");
-    expect(here).toHaveLength(1);
-    expect(here[0].getAttribute("aria-label") ?? here[0].textContent).toContain("alpha");
-  });
-
-  /** And the group's own row is not given up — it is lit on the page it actually is. */
-  it("and on the list itself it is All projects", async () => {
-    await renderWithRouter(<Sidebar projects={[{ id: "alpha", mode: "active", pending: 0 }]} />, {
-      initialPath: "/projects",
-    });
-
-    expect(
-      screen.getByRole("link", { name: "All projects" }).getAttribute("aria-current"),
-    ).toBe("page");
-    const here = screen
-      .getAllByRole("link")
-      .filter((link) => link.getAttribute("aria-current") === "page");
-    expect(here).toHaveLength(1);
   });
 
   it("navigates on Enter from the keyboard", async () => {
@@ -246,18 +173,23 @@ describe("Sidebar", () => {
   });
 
   /**
-   * The switcher above the scroll.
-   *
-   * It exists because reaching a project from anywhere else costs a list and a
-   * choice — the cost that promoted Projects to a group, and that the
-   * conditional roster gave back everywhere outside the projects area. These
-   * six are what stops it becoming decoration.
+   * The switcher above the scroll — since 2026-10-02 the one list of projects.
    */
   describe("project switcher", () => {
     const roster = [
-      { id: "alpha", mode: "shadow" as const, pending: 0 },
       { id: "bravo", mode: "active" as const, pending: 0 },
+      { id: "alpha", mode: "shadow" as const, pending: 2 },
+      { id: "charlie", mode: "off" as const, pending: 0 },
     ];
+
+    function openSwitcher() {
+      fireEvent.click(screen.getByRole("button", { name: /switch project/i }));
+      return screen.getByRole("combobox", { name: "Find a project" }) as HTMLInputElement;
+    }
+
+    function highlighted() {
+      return screen.getAllByRole("option").find((option) => option.getAttribute("aria-selected") === "true");
+    }
 
     it("names the núcleo away from a project, and the project inside one", async () => {
       const away = await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
@@ -267,168 +199,183 @@ describe("Sidebar", () => {
       await renderWithRouter(<Sidebar projects={roster} />, {
         initialPath: "/projects/bravo/workflows",
       });
-      // Any of the three modes, like the rail's own rows: somebody reading
-      // Workflows has not left the project.
-      expect(screen.getByRole("button", { name: /^bravo/ })).toBeTruthy();
+      // Any of the three modes: somebody reading Workflows has not left the project.
+      const button = screen.getByRole("button", { name: /^bravo/ });
+      // The mode in words under the name, and the initial in the lead box.
+      expect(button.textContent).toContain("active");
+      expect(button.querySelector(".nav-switch-initial")?.textContent).toBe("B");
     });
 
-    it("offers the núcleo, every project, and the way to a new one", async () => {
+    it("does not take the wizard for a project called new", async () => {
+      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects/new" });
+      expect(screen.getByRole("button", { name: /^NucleOS/ })).toBeTruthy();
+    });
+
+    it("opens onto the search, then the núcleo, then the projects alphabetically", async () => {
       await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
 
       const button = screen.getByRole("button", { name: /switch project/i });
       expect(button.getAttribute("aria-expanded")).toBe("false");
-      fireEvent.click(button);
+      const input = openSwitcher();
       expect(button.getAttribute("aria-expanded")).toBe("true");
+      expect(document.activeElement).toBe(input);
+      expect(input.getAttribute("aria-controls")).toBe(screen.getByRole("listbox").id);
 
-      // Home, and it is reached by name rather than by "go back": the núcleo is
-      // not a project, so it is not one of the choices being compared.
-      expect(screen.getByRole("link", { name: "NucleOS" }).getAttribute("href")).toBe("/");
-      expect(screen.getByRole("link", { name: "alpha, shadow" }).getAttribute("href")).toContain(
-        "/projects/alpha/state",
-      );
-      expect(screen.getByRole("link", { name: "New project" }).getAttribute("href")).toContain(
-        "/projects/new",
-      );
+      const options = screen.getAllByRole("option");
+      // The mode is a dot and the count a bare number on screen; both are words to the ear.
+      expect(options.map((option) => option.getAttribute("aria-label") ?? option.textContent)).toEqual([
+        "NucleOS",
+        "alpha, shadow, 2 items to review",
+        "bravo, active",
+        "charlie, off",
+      ]);
+      expect(options[0].getAttribute("href")).toBe("/");
+      expect(options[1].getAttribute("href")).toBe("/projects/alpha/state");
+      // Off any project, the núcleo is where you are.
+      expect(options[0].getAttribute("aria-current")).toBe("page");
+      expect(screen.getByRole("group", { name: /Projects/ }).textContent).toContain("3");
+
+      expect(screen.getByRole("link", { name: "All projects" }).getAttribute("href")).toBe("/projects");
+      expect(screen.getByRole("link", { name: "New project" }).getAttribute("href")).toBe("/projects/new");
     });
 
-    it("says each project's mode out loud, since the menu only draws a dot", async () => {
+    it("marks the project you are in, from any of its modes", async () => {
+      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects/alpha/workflows" });
+      openSwitcher();
+
+      const current = screen
+        .getAllByRole("option")
+        .filter((option) => option.getAttribute("aria-current") === "page");
+      expect(current.map((option) => option.getAttribute("aria-label"))).toEqual([
+        "alpha, shadow, 2 items to review",
+      ]);
+    });
+
+    it("filters as you type, marks the match, and moves one highlight with keys and pointer", async () => {
       await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
-      fireEvent.click(screen.getByRole("button", { name: /switch project/i }));
+      const input = openSwitcher();
+      expect(highlighted()?.textContent).toBe("NucleOS");
 
-      // The owner asked for the state not to take space on screen, and a colour
-      // that nobody can hear is a state only some readers get. The word costs
-      // nothing in speech.
-      expect(screen.getByRole("link", { name: "bravo, active" })).toBeTruthy();
+      fireEvent.change(input, { target: { value: "AR" } });
+      // The núcleo is not a project, so a search among projects leaves it out.
+      const options = screen.getAllByRole("option");
+      expect(options.map((option) => option.getAttribute("aria-label"))).toEqual(["charlie, off"]);
+      expect(options[0].querySelector("mark")?.textContent).toBe("ar");
+      expect(input.getAttribute("aria-activedescendant")).toBe(options[0].id);
+
+      fireEvent.change(input, { target: { value: "" } });
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+      expect(highlighted()?.getAttribute("aria-label")).toBe("alpha, shadow, 2 items to review");
+      // Wraps at both ends.
+      fireEvent.keyDown(input, { key: "ArrowUp" });
+      fireEvent.keyDown(input, { key: "ArrowUp" });
+      expect(highlighted()?.getAttribute("aria-label")).toBe("charlie, off");
+      fireEvent.keyDown(input, { key: "Home" });
+      expect(highlighted()?.textContent).toBe("NucleOS");
+      fireEvent.keyDown(input, { key: "End" });
+      expect(highlighted()?.getAttribute("aria-label")).toBe("charlie, off");
+
+      // The pointer moves the same highlight rather than drawing a second one.
+      const bravo = screen.getByRole("option", { name: "bravo, active" });
+      fireEvent.pointerMove(bravo);
+      expect(highlighted()).toBe(bravo);
+      expect(input.getAttribute("aria-activedescendant")).toBe(bravo.id);
     });
 
-    it("marks the destination you are already on", async () => {
-      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects/alpha/state" });
-      fireEvent.click(screen.getByRole("button", { name: /switch project/i }));
+    it("says so quietly when nothing matches", async () => {
+      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
+      const input = openSwitcher();
+      fireEvent.change(input, { target: { value: "zulu" } });
 
-      // `page`, the same word the rail's own rows use: the router marks the
-      // link whose path it is on with that value anyway, and a switcher that
-      // said `true` would announce the same row differently depending on which
-      // of a project's three modes you were reading.
-      expect(screen.getByRole("link", { name: "alpha, shadow" }).getAttribute("aria-current")).toBe(
-        "page",
-      );
-      expect(screen.getByRole("link", { name: "bravo, active" }).getAttribute("aria-current")).toBeNull();
+      expect(screen.queryAllByRole("option")).toHaveLength(0);
+      expect(screen.getByText("No project called “zulu”.")).toBeTruthy();
+      expect(input.getAttribute("aria-activedescendant")).toBeNull();
+    });
+
+    it("navigates to the highlighted row on Enter, and closes", async () => {
+      const { router } = await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
+      const input = openSwitcher();
+      fireEvent.change(input, { target: { value: "bra" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+
+      await waitFor(() => {
+        expect(router.state.location.pathname).toBe("/projects/bravo/state");
+      });
+      expect(screen.queryByRole("combobox")).toBeNull();
     });
 
     it("closes on Escape and hands focus back to the button", async () => {
       await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
-
       const button = screen.getByRole("button", { name: /switch project/i });
-      fireEvent.click(button);
-      const first = screen.getByRole("link", { name: "NucleOS" });
-      first.focus();
-      fireEvent.keyDown(first, { key: "Escape" });
+      const input = openSwitcher();
+      fireEvent.keyDown(input, { key: "Escape" });
 
-      // A menu that closes and drops focus on the body leaves a keyboard reader
+      // A panel that closes and drops focus on the body leaves a keyboard reader
       // at the top of the page, which is worse than where they opened it from.
-      expect(screen.queryByRole("link", { name: "NucleOS" })).toBeNull();
+      expect(screen.queryByRole("combobox")).toBeNull();
       expect(document.activeElement).toBe(button);
     });
 
-    it("keeps its rows out of the rail's own arrow-key walk", async () => {
-      const { container } = await renderWithRouter(<Sidebar projects={roster} />, {
-        initialPath: "/feed",
-      });
-      const before = container.querySelectorAll("[data-nav-path]").length;
-
-      fireEvent.click(screen.getByRole("button", { name: /switch project/i }));
-
-      // An open menu has its own up-and-down. Rows that also walked the rail
-      // behind it would leave focus somewhere the reader cannot see.
-      expect(container.querySelectorAll("[data-nav-path]").length).toBe(before);
-
-      const alpha = screen.getByRole("link", { name: "alpha, shadow" });
-      alpha.focus();
-      fireEvent.keyDown(alpha, { key: "ArrowDown" });
-      expect(document.activeElement).toBe(screen.getByRole("link", { name: "bravo, active" }));
-    });
-  });
-
-  /**
-   * The dropdown on `All projects`.
-   *
-   * The route used to decide the roster on its own, which meant somebody working
-   * out of the Feed could not see their projects at all and somebody who never
-   * wanted them had to. The chevron makes that answer theirs — and these five
-   * are what keep it from taking the destination away in exchange.
-   */
-  describe("the projects dropdown", () => {
-    const roster = [
-      { id: "alpha", mode: "shadow" as const, pending: 0 },
-      { id: "bravo", mode: "active" as const, pending: 0 },
-    ];
-
-    it("opens the roster from a page that would not have shown it", async () => {
+    it("closes on a press outside it", async () => {
       await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
-      // The rail's own rows are named by the word on them — the switcher's
-      // "alpha, shadow" is the menu's naming, and these are not those rows.
-      expect(screen.queryByRole("link", { name: "alpha" })).toBeNull();
-
-      fireEvent.click(screen.getByRole("button", { name: "Show the project list" }));
-
-      expect(screen.getByRole("link", { name: "alpha" })).toBeTruthy();
+      openSwitcher();
+      fireEvent.pointerDown(document.body);
+      expect(screen.queryByRole("combobox")).toBeNull();
     });
 
-    it("shuts it inside the projects area, where the route had opened it", async () => {
-      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects" });
-      expect(screen.getByRole("link", { name: "alpha" })).toBeTruthy();
-
-      fireEvent.click(screen.getByRole("button", { name: "Hide the project list" }));
-
-      expect(screen.queryByRole("link", { name: "alpha" })).toBeNull();
+    it("keeps its rows out of the rail's own arrow-key walk", async () => {
+      const { container } = await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
+      const before = container.querySelectorAll("[data-nav-path]").length;
+      openSwitcher();
+      expect(container.querySelectorAll("[data-nav-path]").length).toBe(before);
     });
 
-    /**
-     * The answer is the reader's from then on, on every page. A dropdown that
-     * re-decided itself the moment you navigated would not be a control, it
-     * would be a hint.
-     */
-    it("keeps the answer it was given, and stops following the route", async () => {
-      const first = await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects" });
-      fireEvent.click(screen.getByRole("button", { name: "Hide the project list" }));
-      first.unmount();
+    it("offers the núcleo and the footer alone before the roster answers", async () => {
+      await renderWithRouter(<Sidebar />, { initialPath: "/feed" });
+      openSwitcher();
 
-      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/projects" });
-
-      // The route says open. The reader said shut, and the reader was last.
-      expect(screen.queryByRole("link", { name: "alpha" })).toBeNull();
-      expect(screen.getByRole("button", { name: "Show the project list" }).getAttribute("aria-expanded")).toBe(
-        "false",
-      );
-    });
-
-    /**
-     * The word is still a page. The chevron was added to open a list, not to
-     * spend the one row that answers a question no single workspace can.
-     */
-    it("leaves All projects a link, and offers nothing to open before the roster answers", async () => {
-      const { unmount } = await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
-      expect(screen.getByRole("link", { name: "All projects" }).getAttribute("href")).toBe("/projects");
-      unmount();
-
-      await renderWithRouter(<Sidebar />, { initialPath: "/projects" });
-      // `undefined` is "the daemon has not spoken", and a disclosure that opens
-      // onto nothing is an affordance that lies.
-      expect(screen.queryByRole("button", { name: /project list/ })).toBeNull();
+      expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual(["NucleOS"]);
+      // No count and no sentence: `undefined` is "the daemon has not spoken".
+      expect(screen.queryByRole("group")).toBeNull();
+      expect(screen.queryByText(/No project/)).toBeNull();
       expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
+      expect(screen.getByRole("link", { name: "New project" })).toBeTruthy();
     });
 
-    it("takes the shut rows out of the rail's arrow walk, rather than hiding them in it", async () => {
-      const { container } = await renderWithRouter(<Sidebar projects={roster} />, {
-        initialPath: "/projects",
+    it("opens on Ctrl+P from anywhere, and takes the chord from Print", async () => {
+      await renderWithRouter(<Sidebar projects={roster} />, { initialPath: "/feed" });
+
+      const event = new KeyboardEvent("keydown", { key: "p", ctrlKey: true, bubbles: true, cancelable: true });
+      act(() => {
+        document.body.dispatchEvent(event);
       });
-      const open = container.querySelectorAll("[data-nav-path]").length;
+      expect(event.defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(screen.getByRole("combobox", { name: "Find a project" }));
+    });
 
-      fireEvent.click(screen.getByRole("button", { name: "Hide the project list" }));
+    it("expands a collapsed rail first, and leaves other people's fields alone", async () => {
+      window.localStorage.setItem("nucleos.sidebar.collapsed", "1");
+      const { container } = await renderWithRouter(
+        <>
+          <Sidebar projects={roster} />
+          <input aria-label="somebody else's field" />
+        </>,
+        { initialPath: "/feed" },
+      );
 
-      // Two rows fewer in the DOM, not two rows hidden in it: the walk reads the
-      // document, and `hidden` rows would send focus somewhere invisible.
-      expect(container.querySelectorAll("[data-nav-path]").length).toBe(open - roster.length);
+      const field = screen.getByRole("textbox", { name: "somebody else's field" });
+      const typed = new KeyboardEvent("keydown", { key: "p", ctrlKey: true, bubbles: true, cancelable: true });
+      act(() => {
+        field.dispatchEvent(typed);
+      });
+      expect(typed.defaultPrevented).toBe(false);
+      expect(screen.queryByRole("combobox")).toBeNull();
+
+      act(() => {
+        document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "P", metaKey: true, bubbles: true }));
+      });
+      expect(container.querySelector(".nav")?.className).not.toContain("nav-narrow");
+      expect(screen.getByRole("combobox", { name: "Find a project" })).toBeTruthy();
     });
   });
 

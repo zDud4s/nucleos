@@ -70,11 +70,45 @@
 
 /* =============================================================== convene == */
 
-.council-form {
+/* The ask bar sits on the page ground, not in a panel: the question is the
+   page's first act, and a card around it would rank it beside the list. */
+.council-ask {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+
+/* One wrapping row under the question: roster, rounds, ceiling, and Convene
+   pushed to the end. */
+.council-ask-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: var(--space-3);
+}
+
+.council-ask-bar > :last-child {
+  margin-left: auto;
+}
+
+.council-ask-helper {
+  margin: 0;
+}
+
+/* A chip is bare text, not a pill — a roster seat is a name, not a badge. */
+.council-chip {
+  color: var(--text);
+}
+
+/* The call ceiling is the daemon's arithmetic: mono, tabular, muted, the
+   `.ui-count` recipe. */
+.council-ceiling {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .council-field {
@@ -108,26 +142,20 @@
   outline-offset: 1px;
 }
 
-/* The roster control, which is shut on most visits and is laid out as part of
-   the form rather than as a panel of its own: a card inside a card is the
-   nesting this shell already has too much of, and the hairline says "still the
-   same form, one step further in" without spending a second surface on it. */
-
-.council-roster-open {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-size: var(--text-sm);
-  color: var(--text-muted);
+/* Opaque, because Firefox dims a placeholder by default and the faint rung
+   is already the dimmest that passes AA. */
+.council-field textarea::placeholder {
+  color: var(--text-faint);
+  opacity: 1;
 }
 
+/* The roster editor, shut on most visits. It opens under the bar as one
+   `.ui-panel-inset`, one rank down from the page — the bar itself is no card,
+   so this is never a card in a card. */
+
 .council-roster {
-  display: flex;
-  flex-direction: column;
   gap: var(--space-3);
   width: 100%;
-  padding-top: var(--space-3);
-  border-top: 1px solid var(--border);
 }
 
 .council-roster-seats {
@@ -178,19 +206,17 @@
 /* =================================================================== list == */
 
 /**
- * One council, as a link across its whole `Row`: the question, then state,
- * phase and age in tracks that line up down the column. The row draws the
- * hairline and the padding, so the link adds neither.
+ * One council, as a link across its whole `Row`: the question, then state and
+ * age in tracks that line up down the column, and under them one line of how
+ * it is going or how it ended. The row draws the hairline and the padding, so
+ * the link adds neither.
  *
- * The current row is marked by `Row current` in `Council.tsx` — `.ui-current`, a
- * 2px rule on the leading edge and nothing else. It was `--accent` plus
- * `--accent-quiet` here: the brand colour doing a job it is not allowed to do,
- * over a fill that disappears in the light theme, where `--surface` and
- * `--surface-raised` are both white. See the comment on `.ui-current`.
+ * No row is ever marked current: the list is only drawn while no council is
+ * open, since an open council replaces the list.
  */
 .council-row-link {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: baseline;
   gap: var(--space-2) var(--space-3);
   padding: 0;
@@ -199,10 +225,25 @@
 }
 
 .council-row-question {
-  flex: 1 1 14rem;
   min-width: 0;
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow-wrap: anywhere;
+}
+
+/* The second line spans every track: the round and phase while running, the
+   failure reason, or the confidence and agreement. Muted, never red — the
+   badge already carries the state's colour. */
+.council-row-outcome {
+  grid-column: 1 / -1;
+  min-width: 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -210,10 +251,13 @@
 
 /* ================================================================= detail == */
 
+/* The question heads the detail: the one sentence the whole page answers. */
 .council-question {
   margin: 0 0 var(--space-2);
-  font-size: var(--text-base);
-  font-weight: var(--weight-medium);
+  max-width: var(--measure-prose);
+  font-family: var(--font-body);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
   line-height: var(--leading-snug);
   overflow-wrap: anywhere;
 }
@@ -234,17 +278,30 @@
 
 /* =================================================================== seats == */
 
-/* A seat's row stacks its head, answers and phases a step further apart than the
-   row's own default. */
-.council-seat {
-  gap: var(--space-2);
+/**
+ * One round across every seat, side by side: the comparison a reader actually
+ * makes. Columns of at least `16rem`, as many as fit — four at ~1200px — and
+ * they wrap rather than shrink past what an answer can be read at.
+ */
+.council-seats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: var(--space-4);
+  margin: 0;
+  padding: var(--space-3) 0 0;
+  list-style: none;
 }
 
-.council-seat-head {
+/* A seat's column: identity first, then that round's steps. A hairline on the
+   leading edge, not a box — this is inside a `Panel`, and a card per seat would
+   be the boxes-in-boxes the system forbids. */
+.council-seat {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
+  flex-direction: column;
   gap: var(--space-2);
+  min-width: 0;
+  padding-left: var(--space-3);
+  border-left: 1px solid var(--border);
 }
 
 .council-seat-name {
@@ -265,8 +322,8 @@
   overflow-wrap: anywhere;
 }
 
-/* Pulled up against the head: the ref names what the line above it ran, and the
-   inset's own column gap would read as a break between two separate facts. */
+/* Pulled up against the name: the ref names what the line above it ran, and the
+   column's own gap would read as a break between two separate facts. */
 .council-seat-ref {
   margin: calc(var(--space-2) * -1) 0 0;
   overflow-wrap: anywhere;
@@ -309,8 +366,9 @@
  *
  * Not `ErrorNote`, and the reason is one declaration: every string this page
  * shows from the daemon carries `overflow-wrap: anywhere`, and `.ui-note` has
- * no such rule. A seat sits in a `16rem` grid column, so one unbroken token in
- * a stage error — a path, a URL, a model id — pushes the whole grid sideways.
+ * no such rule. A seat is one column of `.council-seats`, a `16rem` auto-fill
+ * grid, so one unbroken token in a stage error — a path, a URL, a model id —
+ * would widen its column and push every column beside it sideways.
  * The primitive is right about everything else here; when `.ui-note` can wrap,
  * this rule and `.council-chairman-failed` below both go.
  */
@@ -365,11 +423,9 @@
   color: var(--text-faint);
 }
 
-/* The role a seat was asked to play, and a revision's own account of itself
-   (kept its answer, and why). Both are said about the seat, not by it, so they
-   sit at the metadata size beside the answer rather than inside it. */
-.council-seat-role,
-.council-seat-note {
+/* The role a seat was asked to play. Said about the seat, not by it, so it
+   sits at the metadata size beside the answer rather than inside it. */
+.council-seat-role {
   margin: 0;
   font-size: var(--text-xs);
   color: var(--text-muted);
@@ -479,12 +535,29 @@
  * `Row layout="line"`.
  *
  * The sizes stay here because `.ui-rows-row` deliberately sets none: a row
- * inherits the body size, and these three parts are metadata about a seat
- * rather than the reading matter of the page.
+ * inherits the body size, and the name, the score and the ballot count are
+ * metadata about a seat rather than the reading matter of the page. The fourth
+ * part, the bar, draws a length and carries no type to size.
  */
 .council-leaderboard-seat {
+  min-width: 0;
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
+  overflow-wrap: anywhere;
+}
+
+/* Four columns that line up down the board: name | bar | score | ballots. A
+   grid on the row rather than the line layout's wrap, so every bar starts at
+   the same x and two scores can be compared by length alone. */
+.council-leaderboard-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 14rem) minmax(6rem, 1fr) auto auto;
+  align-items: center;
+  column-gap: var(--space-3);
+}
+
+.council-leaderboard-bar {
+  min-width: 0;
 }
 
 .council-leaderboard-rank {
@@ -500,7 +573,7 @@
   margin: 0;
   max-width: var(--measure-prose);
   font-size: var(--text-base);
-  line-height: var(--leading-normal);
+  line-height: var(--leading-relaxed);
   color: var(--text);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -533,34 +606,7 @@
 /* The round the council stopped at. Its own line, apart from the facts row in
    the header: the header says THAT it stopped, this says WHERE. */
 .council-stopped {
-  margin-bottom: var(--space-2);
-}
-
-.council-round {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  padding-top: var(--space-2);
-}
-
-.council-round-seat {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding-bottom: var(--space-3);
-  border-bottom: 1px solid var(--border);
-}
-
-.council-round-seat:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
-}
-
-.council-round-seat-name {
-  margin: 0;
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  color: var(--text);
+  margin-top: var(--space-2);
 }
 
 /* A ballot is read top-down as a ranking, so the browser's own numbering is
@@ -691,22 +737,36 @@
 
 /* ===================================================== structured synthesis == */
 
-/* The chairman's confidence and the ballots' agreement. Neutral on purpose:
-   neither is a lifecycle state, so neither borrows a state tone — the word is
-   the whole message. */
-.council-synthesis-badges {
+/* The verdict under the answer: the chairman's confidence and its reason, then
+   the ballots' agreement. Neutral on purpose — neither is a lifecycle state, so
+   neither borrows a state tone; the words are the whole message. */
+.council-synthesis-verdict {
   display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-  margin-bottom: var(--space-2);
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-3) 0 0;
+  max-width: var(--measure-prose);
 }
 
-.council-synthesis-badge {
-  padding: 0 var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+.council-synthesis-confidence {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+.council-synthesis-why {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* τ and the ballot count are the daemon's figures, so they are mono. */
+.council-synthesis-agreement {
+  font-family: var(--font-mono);
   font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
+  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
 }
 

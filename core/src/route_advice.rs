@@ -1204,6 +1204,7 @@ mod tests {
             context_window: None,
             messages: None,
             allowed_mcp_tools: None,
+            background_tasks: false,
         }
     }
 
@@ -2421,7 +2422,10 @@ mod outcome_tests {
         let started = std::time::Instant::now();
         report_detached(router_at(&slow), "rt_1".into(), Outcome::Pass);
         report_detached(router_at(&dead), "rt_1".into(), Outcome::Error);
-        assert!(started.elapsed() < Duration::from_millis(100));
+        // A second, against a router that takes five: waiting on it could not come in under. It was
+        // 100ms, and a loaded CI runner went over that while spawning two tasks (2026-10-02).
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     }
 
     async fn seed_item(pool: &SqlitePool, decision: Option<&str>) -> i64 {

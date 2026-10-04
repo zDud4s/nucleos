@@ -377,6 +377,9 @@ console.log("\npreview: " + origin + "\n");
 const SHOTS_TO_TAKE = [
   ["01-console-dark", { path: "/teams" }],
   ["02-console-light", { path: "/teams", theme: "light" }],
+  /* The create form, opened as a dialog over the console rather than pushed in above it. */
+  ["02a-console-new-team", { path: "/teams", press: "New team" }],
+  ["02b-console-new-team-light", { path: "/teams", press: "New team", theme: "light" }],
   ["03-bench-work", { path: "/teams/financas" }],
   ["04-bench-decisions", { path: "/teams/financas", tab: "Decisions" }],
   ["05-bench-routines", { path: "/teams/financas", tab: "Routines" }],
@@ -474,13 +477,18 @@ const SHOTS_TO_TAKE = [
      reached from and the one surface of this pillar nothing had photographed. */
   ["37-roster", { path: "/projects" }],
   ["38-roster-light", { path: "/projects", theme: "light" }],
-  /* The way out, open. The press lands on the FIRST `remove` in the table, and
-     the ordering puts `bravo` there — which is the fixture with a record and
-     nothing in flight, so the shot carries the ordinary case: the folder
-     reassurance, the counts, and the checkbox left unticked. */
-  ["39-roster-remove", { path: "/projects", press: "remove" }],
-  /* The other exit, which is not on that page at all: the folder delete, at
-     the foot of a project's own State mode. `alpha` because it is the fixture
+  /* The two other ways into a project: the switcher at the top of the rail, open,
+     and the rail's own project rows, which the route opens inside a workspace. */
+  ["37a-switcher-open", { path: "/fleet", press: "NucleOS" }],
+  ["37b-rail-in-project", { path: "/projects/alpha/state" }],
+  /* The way out, open — inside the project now, in State's Leaving section, since
+     the roster's cards are one link each and carry no control. `bravo` because
+     it is the fixture with a record and nothing in flight, so the shot carries
+     the ordinary case: the folder reassurance, the counts, and the checkbox left
+     unticked. The name is kept so the before/after pair stays comparable. */
+  ["39-roster-remove", { path: "/projects/bravo/state", press: "remove from NucleOS…" }],
+  /* The other exit, just below it: the folder delete, at the foot of the same
+     State mode. `alpha` because it is the fixture
      with work in flight AND uncommitted work — the panel says what would be
      lost and why the button is off, which is the pair worth a picture. */
   [
@@ -520,6 +528,15 @@ const SHOTS_TO_TAKE = [
   ["55a-calendar-month-laptop", { path: "/calendar?on=2026-08-24", viewport: { width: 1256, height: 760 } }],
   ["55b-calendar-week-laptop", { path: "/calendar?view=week&on=2026-08-25", viewport: { width: 1256, height: 760 } }],
   ["55-calendar-empty", { path: "/calendar?on=2027-02-15" }],
+  /* The day sheet, open over the month: Wednesday the 26th is the busiest day in the fixture —
+     five occurrences, so the sheet has to scroll its list and keep the draft reachable. The cell's
+     visible text starts with its date, which is what the press matches. */
+  ["55c-calendar-day-sheet", { path: "/calendar?on=2026-08-26", press: "26" }],
+  ["55d-calendar-day-sheet-light", { path: "/calendar?on=2026-08-26", press: "26", theme: "light" }],
+  /* One line opened onto its controls, and the draft's time wheels open. */
+  ["55e-calendar-day-sheet-row", { path: "/calendar?on=2026-08-26", press: "26|10:00" }],
+  ["55f-calendar-day-sheet-time", { path: "/calendar?on=2026-08-26", press: "26|09:00" }],
+  ["55g-calendar-day-sheet-time-light", { path: "/calendar?on=2026-08-26", press: "26|09:00", theme: "light" }],
   ["56-calendar-empty-light", { path: "/calendar?on=2027-02-15", theme: "light" }],
   /* Mid-drag, which is the only state where the drop targets exist at all —
      and the one thing about dragging no test can judge: whether the dashed
@@ -567,6 +584,12 @@ const SHOTS_TO_TAKE = [
      arriving and retention keeps pruning — so the header is the only thing that can say it, and
      this is the shot that proves it does. `?disarmed` is read by `preview/daemon.ts`. */
   ["76-mail-disarmed", { path: "/mail?disarmed=1" }],
+  /* Contacts as profile cards, from `daemon.ts`'s `CONTACTS`, whose cards carry deliberately
+     unequal content: every card must still be one height, across rows too. The narrow shot is
+     the wrap to fewer columns. */
+  ["80-contacts", { path: "/contacts" }],
+  ["81-contacts-light", { path: "/contacts", theme: "light" }],
+  ["82-contacts-narrow", { path: "/contacts", viewport: { width: 800, height: 600 } }],
   /* Files, filled from `daemon.ts`'s `FILES`: folders, a name long enough to wrap, a file with
      no modified time, and `scans`, whose listing refuses — the tree's unread mark shows once it
      is expanded, which a still shot cannot do, so it is the test that holds that half. The

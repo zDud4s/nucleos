@@ -54,6 +54,9 @@ type Proxy struct {
 	listener  net.Listener
 	server    *http.Server
 	transport *http.Transport
+	// dialer is where every upstream connection is opened, the tunnel's and the transport's alike,
+	// so the address a name resolved to is vetted on both paths. See [Dialer].
+	dialer *Dialer
 
 	mu       sync.Mutex
 	refusals []ProxyRefusal
@@ -84,17 +87,15 @@ func NewProxy(policy Policy) (*Proxy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fence: listening on loopback: %w", err)
 	}
+	dialer := &Dialer{Timeout: 10 * time.Second}
 	proxy := &Proxy{
 		policy:   policy,
 		listener: listener,
-		transport: &http.Transport{
-			// Explicitly nil: a transport that honoured the environment's proxy settings would send
-			// the fence's own traffic back through whatever HTTP_PROXY happens to say, which is both
-			// a loop and a way out of the fence that nobody wrote down.
-			Proxy:               nil,
-			DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-			TLSHandshakeTimeout: 10 * time.Second,
-		},
+		dialer:   dialer,
+		// NewTransport sets Proxy to nil explicitly: a transport that honoured the environment's
+		// proxy settings would send the fence's own traffic back through whatever HTTP_PROXY happens
+		// to say, which is both a loop and a way out of the fence that nobody wrote down.
+		transport: NewTransport(dialer),
 	}
 	proxy.server = &http.Server{
 		Handler:           http.HandlerFunc(proxy.handle),
@@ -170,8 +171,12 @@ func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstream, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	upstream, err := p.dialer.DialContext(r.Context(), "tcp", r.Host)
 	if err != nil {
+		if IsDialRefused(err) {
+			p.refuse(w, r.Host, refusedDial())
+			return
+		}
 		http.Error(w, "upstream unreachable", http.StatusBadGateway)
 		return
 	}
@@ -208,6 +213,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 
 	response, err := p.transport.RoundTrip(outbound)
 	if err != nil {
+		if IsDialRefused(err) {
+			p.refuse(w, r.URL.String(), refusedDial())
+			return
+		}
 		http.Error(w, "upstream unreachable", http.StatusBadGateway)
 		return
 	}
@@ -228,6 +237,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(response.StatusCode)
 	_, _ = io.Copy(w, response.Body)
+}
+
+// refusedDial is the verdict for a name the policy admitted that resolved to an address it does not:
+// the same consequence as asking for loopback by name, because it is the same destination.
+func refusedDial() Verdict {
+	return refuse(browser.ConsequenceLoopback, "that name resolves to an address on this machine or its link, which a page may not reach")
 }
 
 func (p *Proxy) refuse(w http.ResponseWriter, target string, verdict Verdict) {

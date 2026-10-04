@@ -12,9 +12,9 @@ import { RefusalNote } from "../ui/RefusalNote";
  * **The only irreversible thing this app does, and everything about where it sits says so.** It is
  * not on the roster: that page compares projects, and a control that destroys one has no business
  * sitting in a column beside three that describe it. It is at the foot of the project's own State
- * page, reached only by somebody who is already inside the project they mean — which is the same
- * argument the roster's `remove` makes in reverse, and the reason the two are not one control with
- * a checkbox.
+ * page, reached only by somebody who is already inside the project they mean. `LeaveRoster`, the
+ * reversible exit, sits just above it for the same reason, and the two are not one control with a
+ * checkbox because only one of them can be undone.
  *
  * **Typing the name is the interlock, and it is the only one.** `ConfirmButton`'s arm-then-confirm
  * is the app's interlock for actions whose two labels are all there is to read; this has a path, a
@@ -138,7 +138,7 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
       )}
 
       {/*
-        The same checkbox the roster's remove control offers, and the same default. Deleting the
+        The same checkbox the remove control above offers, and the same default. Deleting the
         folder does not imply forgetting what the project did: the two are separate losses, and the
         owner's standing decision is that history stays unless somebody says otherwise.
       */}

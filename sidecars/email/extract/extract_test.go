@@ -1,6 +1,8 @@
 package extract
 
 import (
+	"encoding/base64"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +14,54 @@ func at(t string) time.Time {
 		panic(err)
 	}
 	return parsed
+}
+
+func TestBase64Latin1PartDecodesToUTF8(t *testing.T) {
+	// "Olá, não" in ISO-8859-1, then base64.
+	body := base64.StdEncoding.EncodeToString([]byte{'O', 'l', 0xE1, ',', ' ', 'n', 0xE3, 'o'})
+	raw := []byte("From: a@example.test\r\nSubject: =?iso-8859-1?Q?Aten=E7=E3o?=\r\n" +
+		"Content-Type: multipart/alternative; boundary=XX\r\n\r\n" +
+		"--XX\r\nContent-Type: text/plain; charset=ISO-8859-1\r\nContent-Transfer-Encoding: base64\r\n\r\n" +
+		body + "\r\n--XX--\r\n")
+	got, err := Message(raw, 1, at("2026-01-01T00:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BodyText != "Olá, não" {
+		t.Errorf("BodyText = %q, want %q", got.BodyText, "Olá, não")
+	}
+	if got.Subject != "Atenção" {
+		t.Errorf("Subject = %q, want Atenção", got.Subject)
+	}
+}
+
+func TestTopLevelQuotedPrintableWindows1252Decodes(t *testing.T) {
+	raw := []byte("From: a@example.test\r\nContent-Type: text/plain; charset=windows-1252\r\n" +
+		"Content-Transfer-Encoding: quoted-printable\r\n\r\ncaf=E9 =93quoted=94 =80\r\n")
+	got, err := Message(raw, 1, at("2026-01-01T00:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "café “quoted” €"
+	if strings.TrimSpace(got.BodyText) != want {
+		t.Errorf("BodyText = %q, want %q", got.BodyText, want)
+	}
+}
+
+func TestOversizedAttachmentIsReportedTruncated(t *testing.T) {
+	big := make([]byte, MaxAttachmentBytes+1000)
+	raw := []byte("From: a@example.test\r\nContent-Type: multipart/mixed; boundary=XX\r\n\r\n" +
+		"--XX\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=big.bin\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\n" +
+		base64.StdEncoding.EncodeToString(big) + "\r\n--XX--\r\n")
+
+	described, content, err := Attachment(raw, 0)
+	if !errors.Is(err, ErrAttachmentTruncated) {
+		t.Fatalf("err = %v, want ErrAttachmentTruncated", err)
+	}
+	if described.SizeBytes != int64(len(big)) || int64(len(content)) != MaxAttachmentBytes {
+		t.Errorf("size = %d, len(content) = %d; want the true size and the capped content", described.SizeBytes, len(content))
+	}
 }
 
 func TestSentMessageForwardsRecipients(t *testing.T) {

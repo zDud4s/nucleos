@@ -1,8 +1,15 @@
 package fetch
 
 import (
+	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"nucleosemail/daemon"
+	"nucleosemail/extract"
 )
 
 func request_(authorization string) *http.Request {
@@ -55,5 +62,64 @@ func TestRequestRejectsWhatCannotAddressAnAttachment(t *testing.T) {
 	uid, position, err := request(r)
 	if err != nil || uid != 8239 || position != 2 {
 		t.Fatalf("got uid=%d position=%d err=%v, want 8239/2/nil", uid, position, err)
+	}
+}
+
+func TestATruncatedAttachmentIsA413NamingTheTrueSize(t *testing.T) {
+	w := httptest.NewRecorder()
+	serveAttachment(w, 1, 0, attachment{Filename: "big.bin", SizeBytes: 40 << 20}, make([]byte, 10), extract.ErrAttachmentTruncated)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", w.Code)
+	}
+	var body tooLarge
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error != "attachment_too_large" || body.SizeBytes != 40<<20 || body.MaxBytes != extract.MaxAttachmentBytes {
+		t.Errorf("body = %+v", body)
+	}
+	if w.Body.Len() > 200 {
+		t.Errorf("the capped bytes leaked into the answer (%d bytes)", w.Body.Len())
+	}
+}
+
+func TestOtherAttachmentOutcomesAreUnchanged(t *testing.T) {
+	w := httptest.NewRecorder()
+	serveAttachment(w, 1, 0, attachment{Filename: "a.txt", SizeBytes: 3}, []byte("abc"), nil)
+	if w.Code != http.StatusOK || w.Body.String() != "abc" {
+		t.Errorf("ok: %d %q", w.Code, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
+	serveAttachment(w, 1, 0, attachment{}, nil, extract.ErrNoSuchAttachment)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("missing: %d", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	serveAttachment(w, 1, 0, attachment{}, nil, errors.New("imap down"))
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("other: %d", w.Code)
+	}
+}
+
+func TestBulkMarksOnlyTheCutAttachmentsTruncated(t *testing.T) {
+	described := []daemon.Attachment{
+		{Position: 0, Filename: "small.txt", SizeBytes: 3},
+		{Position: 1, Filename: "big.bin", SizeBytes: 40 << 20},
+	}
+	contents := map[int][]byte{0: []byte("abc"), 1: make([]byte, 5)}
+
+	payload := bulkPayload(described, contents)
+	if payload[0].Truncated {
+		t.Error("a complete attachment was marked truncated")
+	}
+	if !payload[1].Truncated || payload[1].SizeBytes != 40<<20 {
+		t.Errorf("cut attachment = %+v, want truncated with the true size", payload[1])
+	}
+	raw, _ := json.Marshal(payload[1])
+	if !strings.Contains(string(raw), `"truncated":true`) {
+		t.Errorf("wire form lacks the flag: %s", raw)
 	}
 }

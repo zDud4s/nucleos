@@ -53,6 +53,9 @@ pub(crate) fn scan_secrets(input: &str) -> Vec<Finding> {
     findings.extend(pem_blocks(input));
     findings.extend(prefixed_tokens(input));
     findings.extend(json_web_tokens(input));
+    findings.extend(bearer_tokens(input));
+    findings.extend(daemon_tokens(input));
+    findings.extend(nucleos_secrets(input));
     findings.extend(checksummed_numbers(input));
 
     // Earliest first; on a tie the longest wins, so an enclosing block swallows what is inside it.
@@ -88,6 +91,11 @@ fn pem_blocks(input: &str) -> Vec<Finding> {
         let Some(header_end) = input[start..]
             .find("-----\n")
             .or(input[start..].find("-----\r"))
+            // The same line break as JSON writes it: a literal backslash and `n`. A service-account
+            // file read as text carries its key as one line with escaped newlines, and the callers
+            // of this module pass exactly that kind of text.
+            .or(input[start..].find("-----\\n"))
+            .or(input[start..].find("-----\\r"))
         else {
             from = start + BEGIN.len();
             continue;
@@ -123,7 +131,11 @@ fn pem_blocks(input: &str) -> Vec<Finding> {
                 // Past the `-----` that closes the header, not just up to it, or the marker lands
                 // before the dashes and leaves them in the text.
                 let body_start = start + header_end + "-----".len();
-                body_start + base64_body_len(&input[body_start..])
+                if input[body_start..].starts_with('\\') {
+                    body_start + escaped_body_len(&input[body_start..])
+                } else {
+                    body_start + base64_body_len(&input[body_start..])
+                }
             }
         };
 
@@ -138,13 +150,32 @@ fn pem_blocks(input: &str) -> Vec<Finding> {
     findings
 }
 
+/// How far an escaped-newline PEM body runs: base64 characters and the two-character escaped
+/// newline / carriage return, which is the shape of a key inside a JSON string. Stops at the first
+/// other character, so the closing quote of the string is left alone.
+fn escaped_body_len(input: &str) -> usize {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' && matches!(bytes.get(index + 1), Some(b'n' | b'r')) {
+            index += 2;
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=') {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    index
+}
+
 /// How far a PEM body runs: consecutive lines made only of base64 characters.
 ///
 /// Used only when the END line is missing, to bound a truncated block. Stopping at the first line
 /// that is not base64 is what keeps a key with no footer from redacting the paragraph after it.
 fn base64_body_len(input: &str) -> usize {
     /// PEM wraps at 64 characters, so a body line is long. The bound is what stops a sign-off being
-    /// eaten: "Cumprimentos" and "Duarte" are punctuation-free single words and were being read as
+    /// eaten: "Cumprimentos" and "Helena" are punctuation-free single words and were being read as
     /// key material, which redacted the end of a message rather than the end of a key.
     const MIN_BODY_LINE: usize = 16;
 
@@ -233,6 +264,8 @@ const PREFIXED: &[(&str, usize, &str)] = &[
     ("xoxa-", 10, "[SECRET:slack]"),
     ("xoxs-", 10, "[SECRET:slack]"),
     ("AIza", 35, "[SECRET:google]"),
+    ("sk_live_", 16, "[SECRET:stripe]"),
+    ("rk_live_", 16, "[SECRET:stripe]"),
 ];
 
 fn prefixed_tokens(input: &str) -> Vec<Finding> {
@@ -268,6 +301,131 @@ fn prefixed_tokens(input: &str) -> Vec<Finding> {
     }
 
     findings
+}
+
+/// The credential in an `Authorization: Bearer <token>` header. Only the token is replaced, so the
+/// reader still sees that a bearer credential was sent. The length floor keeps the English word
+/// ("bearer of bad news") out.
+fn bearer_tokens(input: &str) -> Vec<Finding> {
+    const MARK: &str = "bearer ";
+    let lower = input.to_ascii_lowercase();
+    let mut findings = Vec::new();
+    let mut from = 0;
+    while let Some(relative) = lower[from..].find(MARK) {
+        let start = from + relative;
+        let tail_start = start + MARK.len();
+        let tail_len = input[tail_start..]
+            .bytes()
+            .take_while(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(b, b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b'-')
+            })
+            .count();
+        let boundary = start == 0
+            || !lower[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_token_character);
+        if boundary && tail_len >= 16 {
+            findings.push(Finding {
+                start: tail_start,
+                end: tail_start + tail_len,
+                label: "[SECRET:bearer]",
+            });
+        }
+        from = tail_start;
+    }
+    findings
+}
+
+/// The daemon's own credentials, as `auth.rs` mints them: `api:<name>.<secret>`,
+/// `team:<id>.<secret>` and `chat:<id>.<secret>`, where the secret is 32 alphanumerics (minted
+/// before the `nos_` prefix) or `nos_<kind>_<32 alnum>` (since). Matched on the marker plus the
+/// secret's shape, so the whole key goes, name and all. Every other family — a run's
+/// `<id>.<secret>`, a sidecar's `<service>.<secret>`, the control token — is caught by
+/// [`nucleos_secrets`] on its prefix alone.
+fn daemon_tokens(input: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for marker in ["api:", "team:", "chat:"] {
+        let mut from = 0;
+        while let Some(relative) = input[from..].find(marker) {
+            let start = from + relative;
+            let tail_start = start + marker.len();
+            let run: usize = input[tail_start..]
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
+                .count();
+            let candidate = input[tail_start..tail_start + run].trim_end_matches('.');
+            let boundary = start == 0
+                || !input[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_token_character);
+            let secret_ok = candidate.rsplit_once('.').is_some_and(|(_, secret)| {
+                let legacy =
+                    secret.len() >= 32 && secret.bytes().all(|b| b.is_ascii_alphanumeric());
+                legacy || nucleos_secret_len(secret) == Some(secret.len())
+            });
+            if boundary && secret_ok {
+                findings.push(Finding {
+                    start,
+                    end: tail_start + candidate.len(),
+                    label: "[SECRET:nucleos-token]",
+                });
+            }
+            from = tail_start;
+        }
+    }
+    findings
+}
+
+/// Every secret `auth::mint_secret` produces: `nos_<kind>_<random>`, with `kind` 2 to 8 lowercase
+/// letters and at least 32 alphanumerics of random after it. High-confidence on its own, like
+/// `ghp_`: nothing ordinary has that shape, so no trigger word is needed and none of `file.rs`,
+/// `v1.2` or a `nos_` identifier in code with a short tail can match.
+///
+/// **Deliberately no rule for the bare legacy forms.** A run key minted before the prefix was
+/// `<id>.<32 alnum>` and a sidecar key `<service>.<32 alnum>` — indistinguishable from a dotted
+/// name with a long random-looking tail, and a pattern for them would redact ordinary text far
+/// more often than it caught a key. They are not worth that: run keys die with their run, and
+/// sidecar and conversation keys are re-minted (now prefixed) on the next start or turn, so the
+/// bare ones rotate out on their own. The one long-lived exception is a control token or API key
+/// created before the prefix; re-minting it is the owner's call, not this file's.
+fn nucleos_secrets(input: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut from = 0;
+    while let Some(relative) = input[from..].find(crate::auth::SECRET_PREFIX) {
+        let start = from + relative;
+        let boundary = start == 0
+            || !input[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_token_character);
+        if boundary && let Some(len) = nucleos_secret_len(&input[start..]) {
+            findings.push(Finding {
+                start,
+                end: start + len,
+                label: "[SECRET:nucleos-token]",
+            });
+        }
+        from = start + crate::auth::SECRET_PREFIX.len();
+    }
+    findings
+}
+
+/// How many bytes of `text`, from its start, are a `nos_<kind>_<32+ alnum>` secret, if it opens
+/// with one.
+fn nucleos_secret_len(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix(crate::auth::SECRET_PREFIX)?;
+    let kind = rest.bytes().take_while(u8::is_ascii_lowercase).count();
+    if !(2..=8).contains(&kind) || rest.as_bytes().get(kind) != Some(&b'_') {
+        return None;
+    }
+    let random = rest[kind + 1..]
+        .bytes()
+        .take_while(u8::is_ascii_alphanumeric)
+        .count();
+    (random >= 32).then_some(crate::auth::SECRET_PREFIX.len() + kind + 1 + random)
 }
 
 fn is_token_character(character: char) -> bool {
@@ -694,6 +852,109 @@ mod tests {
     }
 
     #[test]
+    fn a_private_key_with_escaped_newlines_is_redacted_whole() {
+        let input = r#"{"private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\nabcDEF123\n-----END PRIVATE KEY-----\n", "x": 1}"#;
+        let redacted = redact_secrets(input);
+        assert!(redacted.contains("[SECRET:private-key]"), "{redacted:?}");
+        assert!(!redacted.contains("MIIEvQ"), "{redacted:?}");
+        assert!(redacted.contains(r#""x": 1"#), "{redacted:?}");
+        let truncated =
+            r#"{"k": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\nabcDEF123", "x": 1}"#;
+        let redacted = redact_secrets(truncated);
+        assert!(!redacted.contains("MIIEvQ"), "{redacted:?}");
+        assert!(redacted.contains(r#"", "x": 1"#), "{redacted:?}");
+    }
+
+    #[test]
+    fn bearer_stripe_and_daemon_tokens_are_redacted() {
+        let r = redact_secrets("Authorization: Bearer abc123DEF456ghi789.jkl-mno");
+        assert_eq!(r, "Authorization: Bearer [SECRET:bearer]");
+        assert_eq!(
+            redact_secrets("the bearer of bad news"),
+            "the bearer of bad news"
+        );
+        let r = redact_secrets("key sk_live_51H8abcdefghijklmnop end");
+        assert_eq!(r, "key [SECRET:stripe] end");
+        assert_eq!(
+            redact_secrets("rk_live_51H8abcdefghijklmnop"),
+            "[SECRET:stripe]"
+        );
+        let secret = "A".repeat(32);
+        for token in [
+            format!("api:deploy-bot.{secret}"),
+            format!("team:12.{secret}"),
+            format!("chat:notes.{secret}"),
+        ] {
+            let r = redact_secrets(&format!("use {token} now"));
+            assert_eq!(r, "use [SECRET:nucleos-token] now", "{token}");
+        }
+        assert_eq!(
+            redact_secrets("api:deploy-bot is a name"),
+            "api:deploy-bot is a name"
+        );
+    }
+
+    /// `auth::mint_secret`'s `nos_<kind>_<32 alnum>`, found on its prefix alone wherever it sits:
+    /// in prose, as a JSON value, in a header, behind a run id's `<id>.`, and inside the marker
+    /// families, where the whole key goes rather than just its tail.
+    #[test]
+    fn prefixed_nucleos_secrets_are_redacted_wherever_they_appear() {
+        let random = "Zq9".repeat(11);
+        let secret = format!("nos_run_{random}");
+        for (input, expected) in [
+            (
+                format!("the key is {secret}, keep it"),
+                "the key is [SECRET:nucleos-token], keep it".to_owned(),
+            ),
+            (
+                format!(r#"{{"token":"{secret}","n":1}}"#),
+                r#"{"token":"[SECRET:nucleos-token]","n":1}"#.to_owned(),
+            ),
+            (
+                format!("NUCLEOS_DAEMON_TOKEN=42.{secret}"),
+                "NUCLEOS_DAEMON_TOKEN=42.[SECRET:nucleos-token]".to_owned(),
+            ),
+            (
+                format!("x-api-key: nos_ctl_{random}"),
+                "x-api-key: [SECRET:nucleos-token]".to_owned(),
+            ),
+            (
+                format!("use api:deploy-bot.nos_api_{random} now"),
+                "use [SECRET:nucleos-token] now".to_owned(),
+            ),
+            (
+                format!("use chat:c-1.nos_chat_{random} now"),
+                "use [SECRET:nucleos-token] now".to_owned(),
+            ),
+        ] {
+            assert_eq!(redact_secrets(&input), expected, "{input}");
+        }
+        let r = redact_secrets(&format!("Authorization: Bearer {secret}"));
+        assert!(!r.contains(&random), "{r}");
+    }
+
+    /// The shape is what makes the prefix safe without a trigger word, so everything short of it
+    /// is ordinary text: filenames and versions, a `nos_` identifier with a short tail, a kind
+    /// that is not lowercase letters, the prefix inside a longer word, and - deliberately - a
+    /// legacy bare run key, which has no marker to find.
+    #[test]
+    fn text_that_only_resembles_a_nucleos_secret_is_left_alone() {
+        let long = "a".repeat(40);
+        for input in [
+            "see file.rs and v1.2 for details".to_owned(),
+            "nos_run_short".to_owned(),
+            "call nos_helper_fn() here".to_owned(),
+            format!("nos_x_{long}"),
+            format!("nos_toolongkind_{long}"),
+            format!("nos__{long}"),
+            format!("casinos_run_{long}"),
+            "42.abcdefghijklmnopqrstuvwxyzABCDEF is a legacy run key".to_owned(),
+        ] {
+            assert_eq!(redact_secrets(&input), input);
+        }
+    }
+
+    #[test]
     fn a_json_web_token_is_redacted_and_three_dotted_words_are_not() {
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r";
         assert!(redact_secrets(jwt).contains("[SECRET:jwt]"));
@@ -785,18 +1046,18 @@ mod tests {
         assert!(redacted.contains("and that is all"), "{redacted:?}");
     }
 
-    /// The bound has to survive a sign-off, not just a blank line. "Cumprimentos" and "Duarte" are
+    /// The bound has to survive a sign-off, not just a blank line. "Cumprimentos" and "Helena" are
     /// punctuation-free single words, which an earlier version read as key material — redacting the
     /// end of the message along with the end of the key.
     #[test]
     fn a_footerless_key_does_not_swallow_the_sign_off() {
         let input =
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0000\nObrigado\nCumprimentos\nDuarte";
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0000\nObrigado\nCumprimentos\nHelena";
         let redacted = redact_secrets(input);
 
         assert!(!redacted.contains("MIIEowIBAAKCAQEA"), "{redacted:?}");
         assert!(redacted.contains("Obrigado"), "{redacted:?}");
-        assert!(redacted.ends_with("Duarte"), "{redacted:?}");
+        assert!(redacted.ends_with("Helena"), "{redacted:?}");
     }
 
     /// A plural still names the number. Exact word matching was the first correction and it was too

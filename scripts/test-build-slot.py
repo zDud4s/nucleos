@@ -171,6 +171,10 @@ def test_a_killed_holder_is_reaped_and_a_terminated_one_releases() -> None:
             wait_for(a[1])
             (pid,) = held(slots)
             sh(f"kill -9 {pid}")
+            # Reap it. The holder is this process's own child, and on Linux a killed child stays a
+            # zombie until its parent waits on it; `kill -0` answers yes for a zombie, so the slot
+            # read as held for the whole timeout. MSYS has no zombies, which is why only CI saw it.
+            a[0].wait(timeout=10)
             time.sleep(1)
             # The dead holder's file is still there: nothing cleaned up after a SIGKILL.
             assert held(slots) == [pid], held(slots)
@@ -245,6 +249,37 @@ def test_bypass_and_a_relative_dir() -> None:
         assert not marker.exists()
 
 
+def test_check_and_clippy_skip_the_slot_but_test_still_waits() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        slots = work / "slots"
+        bindir = work / "bin"
+        bindir.mkdir()
+        fake = bindir / "cargo"
+        fake.write_text('#!/bin/sh\necho "fake cargo $1"\nexit 0\n', encoding="utf-8", newline="\n")
+        fake.chmod(0o755)
+        path = bindir.as_posix() + os.pathsep + os.environ["PATH"]
+        a = start_holder(slots, work, "a", NUCLEOS_BUILD_SLOTS="1")
+        try:
+            wait_for(a[1])
+            for sub in ("check", "clippy"):
+                start = time.time()
+                result = slot_run(
+                    slots, "cargo", sub, NUCLEOS_BUILD_SLOTS="1", NUCLEOS_BUILD_SLOT_TIMEOUT="30", PATH=path
+                )
+                assert result.returncode == 0, (sub, result.returncode, result.stderr)
+                assert f"fake cargo {sub}" in result.stdout, result.stdout
+                assert "waiting for a build slot" not in result.stderr, result.stderr
+                assert time.time() - start < 15, f"cargo {sub} waited for a slot"
+            result = slot_run(
+                slots, "cargo", "test", NUCLEOS_BUILD_SLOTS="1", NUCLEOS_BUILD_SLOT_TIMEOUT="2", PATH=path
+            )
+            assert result.returncode == 75, (result.returncode, result.stderr)
+            assert "fake cargo" not in result.stdout, result.stdout
+        finally:
+            finish([a])
+
+
 def test_gates_wraps_only_the_building_steps() -> None:
     text = GATES.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -267,5 +302,6 @@ test_a_killed_holder_is_reaped_and_a_terminated_one_releases()
 test_a_nested_call_does_not_take_a_second_slot()
 test_status_and_arguments_pass_through_and_the_slot_is_released()
 test_bypass_and_a_relative_dir()
+test_check_and_clippy_skip_the_slot_but_test_still_waits()
 test_gates_wraps_only_the_building_steps()
 print("build slot: ok")

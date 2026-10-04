@@ -228,7 +228,7 @@ export const RUNS: TeamRun[] = [
     why: "the bank export was truncated at 500 rows and nobody noticed until round three",
     created_at: ago(4 * DAY),
   }),
-  run({ id: "r5", team_id: "financas", request: "Chase the Ferreira invoice", created_at: ago(5 * DAY) }),
+  run({ id: "r5", team_id: "financas", request: "Chase the Costa invoice", created_at: ago(5 * DAY) }),
   run({ id: "r6", team_id: "marketing", request: "Rewrite the pricing page", created_at: ago(DAY) }),
   run({ id: "r7", team_id: "marketing", request: "September newsletter", created_at: ago(3 * DAY) }),
   run({ id: "r8", team_id: "vendas", request: "Answer the four that came in overnight", created_at: ago(DAY) }),
@@ -2027,6 +2027,22 @@ const EMAIL_DETAIL = {
 } satisfies EmailDetail;
 
 /**
+ * The contacts roster, drawn so its cards hold deliberately unequal content: every badge plus
+ * the human-linked unmerge button on one, nothing at all and no name on another, a name and an
+ * address long enough to wrap. The cards must still come out one height — the shot `80-contacts`
+ * exists to show it. `contact_id` 3 appears twice, which is what a merge IS on this wire.
+ */
+const CONTACTS = [
+  { address: "mira.chen@example.com", contact_id: 1, linked_by: "implicit", display_name: "Mira Chen", messages_in: 42, outbound_ever: 1, first_seen: ago(120 * DAY), last_seen: ago(18 * MINUTE), verdict: "pin" },
+  { address: "noreply@notifications.example.net", contact_id: 2, linked_by: "implicit", display_name: null, messages_in: 3, outbound_ever: 0, first_seen: ago(9 * DAY), last_seen: ago(DAY), verdict: null },
+  { address: "ana.silva@example.com", contact_id: 3, linked_by: "human", display_name: "Ana Silva", messages_in: 17, outbound_ever: 1, first_seen: ago(60 * DAY), last_seen: ago(3 * HOUR), verdict: "pin" },
+  { address: "ana@silva-arquitectos.example.pt", contact_id: 3, linked_by: "implicit", display_name: "Ana Silva", messages_in: 5, outbound_ever: 0, first_seen: ago(30 * DAY), last_seen: ago(4 * DAY), verdict: null },
+  { address: "accounts.receivable.department@contabilidade-silva-e-associados.example.pt", contact_id: 4, linked_by: "implicit", display_name: "Contabilidade Silva e Associados, Departamento de Contas a Receber", messages_in: 8, outbound_ever: 1, first_seen: ago(200 * DAY), last_seen: ago(2 * HOUR), verdict: null },
+  { address: "deals@shop.example.com", contact_id: 5, linked_by: "implicit", display_name: "Shop Deals", messages_in: 96, outbound_ever: 0, first_seen: ago(300 * DAY), last_seen: ago(5 * HOUR), verdict: "mute" },
+  { address: "joao@example.org", contact_id: 6, linked_by: "implicit", display_name: "João", messages_in: 1, outbound_ever: 0, first_seen: ago(2 * DAY), last_seen: ago(2 * DAY), verdict: null },
+];
+
+/**
  * The inbound queue, drawn to carry every fact a row can state at once: each of the five
  * classes, a message triage has not reached (`null`, which must NOT read as `noise`), both
  * sender verdicts, an attachment, a subject long enough to wrap, and one with no subject at
@@ -2648,11 +2664,16 @@ export function answer(path: string, init?: RequestInit): unknown {
     return { turns: CHAT_TURNS, more: false };
   }
 
+  if (path === "/contacts") return CONTACTS;
   if (path === "/teams") return TEAMS;
   if (path === "/team-runs") return RUNS;
   if (path === "/team-triggers") return TRIGGERS;
   if (path === "/team-actions") return ACTIONS;
   if (path === "/vcs/requests") return VCS_REQUESTS;
+  // The preview settles nothing, so every escalated or blocked row is still waiting.
+  if (path === "/waiting/git") {
+    return VCS_REQUESTS.filter((row) => row.status === "escalated" || row.status === "blocked");
+  }
   /* Matched on the route rather than the whole path: `useScoreboard` always sends
      `?project_id=`, so a `path ===` comparison would never fire. */
   if (splitQuery(path)[0] === "/scoreboard") {

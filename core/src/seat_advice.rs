@@ -481,6 +481,7 @@ mod tests {
             context_window: None,
             messages: None,
             allowed_mcp_tools: None,
+            background_tasks: false,
         }
     }
 

@@ -36,6 +36,7 @@ the one path where failing open would matter.
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -93,8 +94,28 @@ def governed_git_verb(command: str) -> str:
     normalized = command
     for separator in SEGMENT_SEPARATORS:
         normalized = normalized.replace(separator, " ")
-    tokens = [token.strip("\"'") for token in normalized.split()]
+    # Backslashes become slashes first: posix shlex would eat them, and the only thing read out of
+    # a path here is its last component.
+    flattened = normalized.replace("\\", "/")
+    # Two readings, and either one governing the command is enough. The quote-aware one keeps
+    # `-C "C:/My Repo"` as ONE token; plain whitespace splitting cut it in two and read the second
+    # half as the verb, so the push walked past the queue. But shlex also swallows a quoted
+    # `sh -c "<command>"` into a single word, which the plain reading still sees. Over-broad on
+    # purpose.
+    readings = [[token.strip("\"'") for token in flattened.split()]]
+    try:
+        readings.append(shlex.split(flattened, posix=True))
+    except ValueError:
+        pass  # an unbalanced quote: the plain reading above is all there is
+    for tokens in readings:
+        verb = _verb_in(tokens)
+        if verb:
+            return verb
+    return ""
 
+
+def _verb_in(tokens) -> str:
+    """The first queue verb a git call in `tokens` would run, or `""`."""
     for index, token in enumerate(tokens):
         # `git`, `/usr/bin/git`, `C:\Program Files\Git\bin\git.exe` — the name it was invoked by
         # says nothing about what it does.

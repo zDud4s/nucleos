@@ -150,6 +150,18 @@ export interface ChatSummary {
    * reporting.
    */
   notices_waiting?: number;
+  /** A turn is running in this conversation right now. Absent on an older daemon. */
+  working?: boolean;
+  /** The last settled turn ended by asking the user a question (AskUserQuestion). */
+  asked_question?: boolean;
+  /** Tool approvals waiting on the user in this conversation. */
+  pending_asks?: number;
+  /** Derived by the daemon; precedence needs_input > working > unread > idle. */
+  activity?: "needs_input" | "working" | "unread" | "idle";
+  /** The user group this conversation sits in, or null/absent when ungrouped. */
+  group_id?: number | null;
+  /** Set on archived conversations only. */
+  archived_at?: string | null;
 }
 
 /**
@@ -504,11 +516,42 @@ export interface ModelChoice {
   installed?: boolean | null;
 }
 
+/** A user-made group of conversations — `GET /assistant/chat-groups`. */
+export interface ChatGroup {
+  id: number;
+  name: string;
+  position: number;
+  created_at: string;
+}
+
+/** One provider/family block of the model picker, newest model first. */
+export interface ModelGroup {
+  provider: string;
+  family: string;
+  /** "Claude · Opus" */
+  label: string;
+  models: ModelChoice[];
+}
+
+/** `GET /assistant/models/groups`. */
+export interface ModelGroups {
+  groups: ModelGroup[];
+  /** Ids listed but not pickable here: Codex models, which need a conversation rooted in a
+   * project with the classifier hook wired. Absent from an older daemon. */
+  needs_root?: string[];
+  /** Where the list came from: the vendor APIs or the versioned fallback. */
+  source: string;
+  catalogue_version: string;
+  fetched_at: string | null;
+}
+
 /** `GET /assistant/models` — the menu, and what an unpinned conversation runs on. */
 export interface AssistantModels {
   choices: ModelChoice[];
   /** The model a conversation with none pinned uses, so that state can be named. */
   configured: string;
+  /** The product name of `configured`. Absent on an older daemon. */
+  configured_label?: string;
   /**
    * Every level any model on the menu takes, weakest first.
    *
@@ -557,6 +600,108 @@ export function useAssistantModels(chatId?: string) {
         `/assistant/models${chatId === undefined ? "" : `?chat=${encodeURIComponent(chatId)}`}`,
       ),
     staleTime: 60 * 60 * 1000,
+  });
+}
+
+/**
+ * Models grouped by provider and family, newest first.
+ *
+ * An hour of `staleTime` and no retry: the daemon caches the vendor answer for a day and serves a
+ * versioned fallback, so an error here means an older daemon, and the caller keeps its flat menu.
+ */
+export function useModelGroups(chatId?: string) {
+  return useQuery({
+    queryKey: chatId === undefined ? keys.chats.modelGroups : keys.chats.modelGroupsFor(chatId),
+    queryFn: () =>
+      apiFetch<ModelGroups>(
+        `/assistant/models/groups${chatId === undefined ? "" : `?chat=${encodeURIComponent(chatId)}`}`,
+      ),
+    staleTime: 60 * 60 * 1000,
+    retry: false,
+  });
+}
+
+/** Archived conversations, listed only while `enabled` (the section is open). */
+export function useArchivedChats(enabled: boolean) {
+  return useQuery({
+    queryKey: keys.chats.archived,
+    queryFn: () => apiFetch<ChatSummary[]>("/assistant/chats?archived=true"),
+    enabled,
+  });
+}
+
+/** Return an archived conversation to the list. */
+export function useRestoreChat() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (chatId: string) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/restore`, { method: "POST" }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+export function useChatGroups() {
+  return useQuery({
+    queryKey: keys.chats.groups,
+    queryFn: () => apiFetch<ChatGroup[]>("/assistant/chat-groups"),
+  });
+}
+
+export function useCreateChatGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      apiFetch<ChatGroup>("/assistant/chat-groups", { method: "POST", body: JSON.stringify({ name }) }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+export function useRenameChatGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { id: number; name: string }) =>
+      apiFetch<ChatGroup>(`/assistant/chat-groups/${v.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: v.name }),
+      }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/** Deleting a group ungroups its conversations; it never archives them. */
+export function useDeleteChatGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => apiFetch<void>(`/assistant/chat-groups/${id}`, { method: "DELETE" }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/** Put a conversation in a group, or `null` to ungroup it. */
+export function useSetChatGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { chatId: string; groupId: number | null }) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(v.chatId)}/group`, {
+        method: "PUT",
+        body: JSON.stringify({ group_id: v.groupId }),
+      }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
   });
 }
 

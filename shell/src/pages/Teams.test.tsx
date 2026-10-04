@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import {
   Outlet,
@@ -568,14 +568,65 @@ describe("Teams - the headline", () => {
     expect(within(row).queryByText("waiting on you")).toBeNull();
   });
 
-  it("keeps the create form closed until it is asked for", async () => {
+  it("keeps the create form closed until it is asked for, then opens it as a dialog", async () => {
     daemon.apiFetch.mockImplementation(teamsFetch({ teams: [teamView()] }));
 
     await renderTeams();
 
     // The old page opened an eleven-field editor above a list nobody had read.
-    expect(await screen.findByRole("button", { name: "New team" })).toBeDefined();
-    expect(screen.queryByRole("heading", { level: 2, name: "New team" })).toBeNull();
+    const opener = await screen.findByRole("button", { name: "New team" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    fireEvent.click(opener);
+    const dialog = await screen.findByRole("dialog", { name: "New team" });
+    expect(within(dialog).getByRole("button", { name: "Create team" })).toBeDefined();
+    // The submit and the Cancel live in the footer, outside the form, and point back at it.
+    expect(within(dialog).getByRole("button", { name: "Create team" }).getAttribute("form")).toBe("new-team-form");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("closes the dialog on Escape and on its Close button", async () => {
+    daemon.apiFetch.mockImplementation(teamsFetch({ teams: [teamView()] }));
+
+    await renderTeams();
+
+    fireEvent.click(await screen.findByRole("button", { name: "New team" }));
+    await screen.findByRole("dialog", { name: "New team" });
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    fireEvent.click(await screen.findByRole("button", { name: "New team" }));
+    const dialog = await screen.findByRole("dialog", { name: "New team" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("still creates a team from the dialog", async () => {
+    const sent: unknown[] = [];
+    const fetcher = teamsFetch({ teams: [teamView()] });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/teams" && init?.method === "POST") {
+        sent.push(JSON.parse(String(init.body)));
+        return teamView({ id: "vendas", name: "Vendas" });
+      }
+      if (path === "/agents") return [{ id: "controller", name: "Controller" }];
+      return fetcher(path, init);
+    });
+
+    await renderTeams();
+
+    fireEvent.click(await screen.findByRole("button", { name: "New team" }));
+    const dialog = await screen.findByRole("dialog", { name: "New team" });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "Name" }), { target: { value: "Vendas" } });
+    fireEvent.change(within(dialog).getByRole("textbox", { name: "Mission" }), { target: { value: "sell things" } });
+    fireEvent.change(within(dialog).getByRole("combobox", { name: "Director" }), { target: { value: "controller" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create team" }));
+
+    await waitFor(() => expect(sent).toHaveLength(1));
+    expect(sent[0]).toMatchObject({ name: "Vendas", mission: "sell things", director_agent_id: "controller" });
+    // Landing on the new team's bench takes the dialog away with the page.
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 });
 

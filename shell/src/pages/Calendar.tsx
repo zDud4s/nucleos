@@ -40,9 +40,9 @@ import "./calendar.css";
  * **The grid selects and the sheet acts.** These were two disconnected halves:
  * a grid with no click on it, and below it a flat list of every occurrence in
  * the six-week window with four controls each. Now a cell selects a day, a
- * week slot selects a day and an hour, and `DaySheet` is the one place
- * anything is done — including drafting, which design §6.14 asks for "inline
- * no slot clicado".
+ * week slot selects a day and an hour, and the click opens `DaySheet` over the
+ * grid as the one place anything is done — including drafting, which design
+ * §6.14 asks for "inline no slot clicado".
  *
  * **Both views, because the month cannot answer the questions the week can.**
  * Overlap lanes, the working-hours wash and a rule at the current minute all
@@ -225,6 +225,10 @@ export function Calendar() {
     publish(view, slot.day);
   }
 
+  /** Whether the day sheet is up. Only a click opens it — see `DaySheet`. */
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const openSheet = () => setSheetOpen(true);
+
   /**
    * The occurrence currently under the hand, and what a drop does with it.
    *
@@ -374,6 +378,7 @@ export function Calendar() {
               config={config.data}
               selected={selected}
               onSelect={select}
+              onOpen={openSheet}
               drag={drag}
             />
           ) : (
@@ -384,24 +389,21 @@ export function Calendar() {
               config={config.data}
               selected={selected}
               onSelect={select}
+              onOpen={openSheet}
               drag={drag}
             />
           ))}
         {move.isError && <MoveError error={move.error} />}
       </Panel>
 
-      {/* Untitled, because the sheet inside already names the day it is showing — with
-          the marks that qualify it — as its own heading. "Selected day" above that was a
-          label for a thing the next line said better, and it was the same label on every
-          day of the year. */}
-      <Panel>
-        <DaySheet
-          slot={selected}
-          occurrences={byDay.get(dateKeyOf(selected.day)) ?? []}
-          now={now}
-          config={config.data}
-        />
-      </Panel>
+      <DaySheet
+        slot={selected}
+        occurrences={byDay.get(dateKeyOf(selected.day)) ?? []}
+        now={now}
+        config={config.data}
+        open={sheetOpen}
+        onOpenChange={setSheetOpen}
+      />
 
       <HeldNotifications />
     </>

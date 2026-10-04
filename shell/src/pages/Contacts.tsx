@@ -280,40 +280,57 @@ function IdentityRefusal({ error }: { error: unknown }) {
 
 function PeopleRoster({ rows }: { rows: Correspondent[] }) {
   const merged = mergedContactIds(rows);
-  // Hairline-ruled and not a column of cards: this is read by scanning down it,
-  // not by picking rows out of it — the same posture the mail queue takes, and
-  // the argument `.ui-rows` now carries for all four lists that had it.
+  // A grid of profile cards, one per address — the owner's call (2026-10-02):
+  // the roster is browsed for people, not scanned down like the mail queue.
+  // Each card is the inset rank, the one card a Panel is allowed to hold.
   return (
-    <Rows label="People">
+    <ul className="contacts-cards" aria-label="People">
       {rows.map((row) => (
-        <PersonRow key={row.address} row={row} merged={merged.has(row.contact_id)} />
+        <PersonCard key={row.address} row={row} merged={merged.has(row.contact_id)} />
       ))}
-    </Rows>
+    </ul>
   );
 }
 
-function PersonRow({ row, merged }: { row: Correspondent; merged: boolean }) {
+/** Up to two letters for the avatar: the name's initials, else the address's first letter. */
+function initials(row: Correspondent): string {
+  const words = (row.display_name ?? "").trim().split(/\s+/).filter((word) => word !== "");
+  if (words.length >= 2) return (words[0][0] + words[words.length - 1][0]).toUpperCase();
+  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  return row.address.slice(0, 1).toUpperCase();
+}
+
+function PersonCard({ row, merged }: { row: Correspondent; merged: boolean }) {
   return (
-    <Row>
-      <div className="contacts-row-head">
-        <span className="contacts-row-address">{row.address}</span>
-        <span className="contacts-row-name">{row.display_name ?? "no name recorded"}</span>
-        {/* §6.13's badges, every one derived from this one row — there is no
-            daemon-side rollup to read any of them off instead. */}
-        {row.verdict === "pin" && <Badge tone="pending">urgent</Badge>}
-        {row.verdict === "mute" && <Badge tone="off">noise</Badge>}
-        {row.outbound_ever === 1 && <Badge tone="info">you write back</Badge>}
-        {merged && <Badge tone="shadow">merged</Badge>}
-        <RelativeTime at={row.last_seen} />
+    <li className="ui-panel-inset contacts-card">
+      <div className="contacts-card-head">
+        <span className="contacts-avatar" aria-hidden="true">
+          {initials(row)}
+        </span>
+        <div className="contacts-card-who">
+          <span className="contacts-card-name">{row.display_name ?? "no name recorded"}</span>
+          <span className="contacts-card-address">{row.address}</span>
+        </div>
       </div>
+      {/* §6.13's badges, every one derived from this one row — there is no
+          daemon-side rollup to read any of them off instead. */}
+      {(row.verdict !== null || row.outbound_ever === 1 || merged) && (
+        <div className="contacts-card-badges">
+          {row.verdict === "pin" && <Badge tone="pending">urgent</Badge>}
+          {row.verdict === "mute" && <Badge tone="off">noise</Badge>}
+          {row.outbound_ever === 1 && <Badge tone="info">you write back</Badge>}
+          {merged && <Badge tone="shadow">merged</Badge>}
+        </div>
+      )}
       <p className="contacts-meta">
-        {row.messages_in} messages in — first seen <RelativeTime at={row.first_seen} />
+        {row.messages_in} messages in · last <RelativeTime at={row.last_seen} /> · first seen{" "}
+        <RelativeTime at={row.first_seen} />
       </p>
-      <div className="contacts-row-actions">
+      <div className="contacts-card-actions">
         <SenderVerdictToggles address={row.address} verdict={row.verdict} />
         <UnmergeButton address={row.address} linkedBy={row.linked_by} />
       </div>
-    </Row>
+    </li>
   );
 }
 

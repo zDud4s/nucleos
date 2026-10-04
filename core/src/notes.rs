@@ -209,7 +209,7 @@ mod tests {
     /// The words an owner would actually leave, used by every test here so that what is asserted
     /// about them is asserted about one thing.
     const NOTE: &str = "when you get to item 3, update the docs too";
-    const OWNER: &str = "duarte";
+    const OWNER: &str = "helena";
 
     /// `None` and not `Some("")`: the empty queue has to leave the prompt untouched byte for byte.
     ///

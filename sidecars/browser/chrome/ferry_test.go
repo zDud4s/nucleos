@@ -3,14 +3,22 @@
 package chrome
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/cdp/cdptest"
+	"nucleosbrowser/fence"
 )
 
 // inWorld tells the driver where a page's world is, which is where the ferry's same-origin rule
@@ -187,4 +195,241 @@ func answers(fake *cdptest.Browser) []string {
 		}
 	}
 	return said
+}
+
+// setCookieCalls is every cookie the driver put back into the profile, with the url it was put
+// under.
+func setCookieCalls(t *testing.T, fake *cdptest.Browser) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, call := range fake.Calls() {
+		if call.Method != "Network.setCookies" {
+			continue
+		}
+		var params struct {
+			Cookies []map[string]any `json:"cookies"`
+		}
+		if err := json.Unmarshal(call.Params, &params); err != nil {
+			t.Fatalf("setCookies params: %v", err)
+		}
+		out = append(out, params.Cookies...)
+	}
+	return out
+}
+
+// TestACookieSetOnARedirectIsKeptUnderTheUrlThatSetIt.
+//
+// The ferry used to keep only the last response's cookies, and under the url the PAGE asked for.
+// A Set-Cookie on a hop belongs to that hop, and one scoped by Path to the final url was filed
+// against a url it does not match — the profile and the server disagreeing about a session.
+func TestACookieSetOnARedirectIsKeptUnderTheUrlThatSetIt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/start":
+			http.SetCookie(w, &http.Cookie{Name: "hop", Value: "1"})
+			http.Redirect(w, r, "/final", http.StatusFound)
+		case "/final":
+			http.SetCookie(w, &http.Cookie{Name: "end", Value: "2"})
+			_, _ = io.WriteString(w, "ok")
+		}
+	}))
+	defer server.Close()
+
+	fake, driver := connectedUnder(t, fence.Policy{Profile: fence.Ephemeral, Loopback: []string{server.URL}})
+	_, _, _, err := driver.carry(context.Background(), "S1", server.URL, server.URL+"/start", true, false)
+	if err != nil {
+		t.Fatalf("carry: %v", err)
+	}
+
+	kept := map[string]string{}
+	for _, cookie := range setCookieCalls(t, fake) {
+		kept[fmt.Sprint(cookie["name"])] = fmt.Sprint(cookie["url"])
+	}
+	if kept["hop"] != server.URL+"/start" {
+		t.Errorf("the redirect's cookie was kept under %q, want %q", kept["hop"], server.URL+"/start")
+	}
+	if kept["end"] != server.URL+"/final" {
+		t.Errorf("the final cookie was kept under %q, want %q", kept["end"], server.URL+"/final")
+	}
+}
+
+// loopbackResolver answers every name with this machine, which is what `127.0.0.1.nip.io` and a
+// rebinding domain both do.
+type loopbackResolver struct{}
+
+func (loopbackResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) {
+	return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+}
+
+// TestTheFerryWillNotReachThisMachineThroughAName.
+//
+// The ferry dialled by name with the default transport, so a name the policy admitted that RESOLVED
+// to 127.0.0.1 reached whatever listened there — the núcleo's API on 8791 included — and it honoured
+// HTTPS_PROXY besides, which is a way out of the fence nobody wrote down.
+func TestTheFerryWillNotReachThisMachineThroughAName(t *testing.T) {
+	var reached atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Store(true)
+		_, _ = io.WriteString(w, "the daemon")
+	}))
+	defer server.Close()
+	_, port, _ := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+
+	previous := ferryDialer.Resolver
+	ferryDialer.Resolver = loopbackResolver{}
+	defer func() { ferryDialer.Resolver = previous }()
+
+	_, driver := connectedUnder(t, fence.Policy{Profile: fence.Ephemeral})
+	target := "http://127.0.0.1.nip.io:" + port + "/"
+	if _, _, _, err := driver.carry(context.Background(), "S1", target, target, false, false); err == nil {
+		t.Fatal("the ferry carried a request to a name that resolves to this machine")
+	}
+	if reached.Load() {
+		t.Fatal("the loopback server was reached")
+	}
+	if ferryTransport.Proxy != nil {
+		t.Fatal("the ferry's transport consults an environment proxy")
+	}
+}
+
+// TestAnUncredentialedRequestKeepsNoCookies is fetch's own rule: credentials "omit" means the
+// answer's Set-Cookie is ignored, not filed into the profile behind the page's back.
+func TestAnUncredentialedRequestKeepsNoCookies(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "tracker", Value: "1"})
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	fake, driver := connectedUnder(t, fence.Policy{Profile: fence.Ephemeral, Loopback: []string{server.URL}})
+	if _, _, _, err := driver.carry(context.Background(), "S1", server.URL, server.URL+"/", false, false); err != nil {
+		t.Fatalf("carry: %v", err)
+	}
+	if kept := setCookieCalls(t, fake); len(kept) != 0 {
+		t.Fatalf("an uncredentialed request put %v into the profile", kept)
+	}
+}
+
+// TestACrossSiteRequestCarriesOnlySameSiteNoneCookies.
+//
+// SameSite is the server saying which requests its cookie may ride on, relative to the site that
+// STARTED the request. The ferry asked the browser for every cookie matching the url and sent the
+// lot, so a page on one site reading another sent that site's Lax and Strict cookies with it — the
+// exact request SameSite exists to strip them from.
+func TestACrossSiteRequestCarriesOnlySameSiteNoneCookies(t *testing.T) {
+	fake, driver := connected(t)
+	fake.Handle("Network.getCookies", func(cdptest.Call) (any, error) {
+		return map[string]any{"cookies": []map[string]any{
+			{"name": "strict", "value": "s", "sameSite": "Strict"},
+			{"name": "lax", "value": "l", "sameSite": "Lax"},
+			{"name": "unstated", "value": "u"},
+			{"name": "none", "value": "n", "sameSite": "None"},
+		}}, nil
+	})
+	jar := &ferryJar{d: driver, ctx: context.Background(), on: "S1", initiator: "https://app.example.com", credentialed: true}
+
+	names := func(cookies []*http.Cookie) string {
+		out := make([]string, 0, len(cookies))
+		for _, cookie := range cookies {
+			out = append(out, cookie.Name)
+		}
+		return strings.Join(out, ",")
+	}
+	sameSiteURL, _ := url.Parse("https://api.example.com/data")
+	if got := names(jar.Cookies(sameSiteURL)); got != "strict,lax,unstated,none" {
+		t.Errorf("same-site request carried %q, want every cookie", got)
+	}
+	crossSiteURL, _ := url.Parse("https://bank.example.net/data")
+	if got := names(jar.Cookies(crossSiteURL)); got != "none" {
+		t.Errorf("cross-site request carried %q, want only the SameSite=None one", got)
+	}
+	// A suffix the public list knows is not a site: two co.uk sites are two sites.
+	jar.initiator = "https://one.co.uk"
+	other, _ := url.Parse("https://two.co.uk/")
+	if got := names(jar.Cookies(other)); got != "none" {
+		t.Errorf("one.co.uk -> two.co.uk carried %q, want only the SameSite=None one", got)
+	}
+	// Schemeful: http and https of the same domain are different sites.
+	jar.initiator = "http://app.example.com"
+	if got := names(jar.Cookies(sameSiteURL)); got != "none" {
+		t.Errorf("http -> https carried %q, want only the SameSite=None one", got)
+	}
+
+	// And the other direction: a cross-site answer may set only a SameSite=None cookie.
+	jar.initiator = "https://app.example.com"
+	jar.SetCookies(crossSiteURL, []*http.Cookie{
+		{Name: "lax", Value: "1", SameSite: http.SameSiteLaxMode},
+		{Name: "none", Value: "1", SameSite: http.SameSiteNoneMode, Secure: true},
+	})
+	kept := setCookieCalls(t, fake)
+	if len(kept) != 1 || kept[0]["name"] != "none" {
+		t.Fatalf("a cross-site answer set %v, want only the SameSite=None cookie", kept)
+	}
+}
+
+// TestAFerryFromTheLastDocumentDoesNotCountDownTheNextOne.
+//
+// A navigation zeroes the in-flight count, and a request the old document asked for finishes after
+// it. Its count-down used to land on the NEW document's count, which went negative — and a page with
+// its own requests still out then read as finished.
+func TestAFerryFromTheLastDocumentDoesNotCountDownTheNextOne(t *testing.T) {
+	_, driver, id := ferrying(t)
+	entry, err := driver.lookup(id)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+
+	driver.mu.Lock()
+	oldDone := driver.carryingOne(entry)
+	driver.mu.Unlock()
+
+	driver.forgetRefs(entry) // the page navigated
+
+	driver.mu.Lock()
+	newDone := driver.carryingOne(entry)
+	driver.mu.Unlock()
+
+	oldDone()
+	if _, carrying := driver.ferryState(entry); carrying != 1 {
+		t.Fatalf("carrying is %d after the old document's request finished, want 1", carrying)
+	}
+	newDone()
+	if _, carrying := driver.ferryState(entry); carrying != 0 {
+		t.Fatalf("carrying is %d after every request finished, want 0", carrying)
+	}
+}
+
+// TestClosingASessionForgetsEverythingThatPointedAtIt is the bookkeeping half of Close: a frame's
+// session, a popup's target and the ferry's execution contexts each pointed at the session, and
+// were left behind for the life of the browser.
+func TestClosingASessionForgetsEverythingThatPointedAtIt(t *testing.T) {
+	_, driver, id := ferrying(t)
+
+	driver.mu.Lock()
+	entry := driver.sessions[id]
+	driver.cdpToSession["FRAME"] = id
+	entry.frames["FRAME"] = frameRef{target: "frame-target"}
+	driver.targets["popup-target"] = id
+	driver.contexts[contextKey{session: "FRAME", id: 3}] = executionContext{origin: "https://example.org"}
+	driver.mu.Unlock()
+
+	if err := driver.Close(context.Background(), id); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	for on, owner := range driver.cdpToSession {
+		if owner == id {
+			t.Errorf("cdpToSession still maps %s to the closed session", on)
+		}
+	}
+	for target, owner := range driver.targets {
+		if owner == id {
+			t.Errorf("targets still maps %s to the closed session", target)
+		}
+	}
+	if len(driver.contexts) != 0 {
+		t.Errorf("execution contexts survived the session: %v", driver.contexts)
+	}
 }

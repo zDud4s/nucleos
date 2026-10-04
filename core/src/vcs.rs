@@ -1900,6 +1900,110 @@ pub async fn list(
     .await
 }
 
+/// The one predicate for "this request still wants a person": a terminal `escalated` or `blocked`
+/// row nobody has settled. The count on the badge and the list on the Waiting page both read it, so
+/// they cannot disagree about what is open.
+pub const WANTS_A_PERSON_SQL: &str = "status IN ('escalated','blocked') AND settled_at IS NULL";
+
+/// Every request that still wants a person, newest first, with no limit.
+///
+/// `list` is capped at `LIST_LIMIT`, so a count taken from it silently stopped at the cap. This is
+/// the uncapped read, and it carries the same columns so the shell draws both the same way.
+pub async fn waiting_on_a_person(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<RequestSummary>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT id, op, project_id, repo_key, origin, status, created_at
+           FROM vcs_requests
+          WHERE {WANTS_A_PERSON_SQL}
+          ORDER BY id DESC"
+    )))
+    .fetch_all(pool)
+    .await
+}
+
+/// Marks an open `escalated`/`blocked` request as no longer wanting a person, and says why.
+///
+/// The status is left alone: it is the history. Only the first settlement counts, so a row keeps
+/// its first reason. Returns whether this call settled it.
+pub async fn settle(pool: &sqlx::SqlitePool, id: i64, reason: &str) -> sqlx::Result<bool> {
+    let settled_at = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE vcs_requests SET settled_at = ?, settled_reason = ?
+          WHERE id = ? AND status IN ('escalated','blocked') AND settled_at IS NULL",
+    )
+    .bind(settled_at)
+    .bind(reason)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Settles what the table itself already proves moot, with no git subprocess.
+///
+/// `superseded`: a later request with the same project and arguments succeeded (the wording of
+/// `resolver::next_conflict`'s own subquery). `resolved`: the row was handed to a resolution that
+/// lands under another request. Returns how many rows were settled.
+pub async fn settle_by_record(pool: &sqlx::SqlitePool) -> sqlx::Result<u64> {
+    let settled_at = chrono::Utc::now().to_rfc3339();
+    let superseded = sqlx::query(
+        "UPDATE vcs_requests AS open SET settled_at = ?, settled_reason = 'superseded'
+          WHERE open.status IN ('escalated','blocked') AND open.settled_at IS NULL
+            AND EXISTS (
+                SELECT 1 FROM vcs_requests AS settled
+                 WHERE settled.project_id = open.project_id
+                   AND settled.args = open.args
+                   AND settled.status = 'succeeded'
+                   AND settled.id > open.id
+            )",
+    )
+    .bind(&settled_at)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let resolved = sqlx::query(
+        "UPDATE vcs_requests SET settled_at = ?, settled_reason = 'resolved'
+          WHERE status IN ('escalated','blocked') AND settled_at IS NULL
+            AND resolved_by IS NOT NULL",
+    )
+    .bind(&settled_at)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(superseded + resolved)
+}
+
+/// Why `dismiss` did not dismiss.
+#[derive(Debug)]
+pub enum DismissError {
+    /// No request has this id.
+    NotFound,
+    /// It exists, but is not an open `escalated`/`blocked` row: succeeded, still running, or
+    /// already settled.
+    NotOpen,
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for DismissError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+/// A person putting an open request away: settles it as `dismissed`.
+pub async fn dismiss(pool: &sqlx::SqlitePool, id: i64) -> Result<(), DismissError> {
+    if settle(pool, id, "dismissed").await? {
+        return Ok(());
+    }
+    let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM vcs_requests WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Err(match exists {
+        None => DismissError::NotFound,
+        Some(_) => DismissError::NotOpen,
+    })
+}
+
 /// The longest a caller that asked to wait is held before it gets a ticket instead.
 ///
 /// Spec decision 3. The common case — an empty queue — answers from the first read and never
@@ -6633,6 +6737,171 @@ mod tests {
         assert!(
             Op::from_stored("push", r#"{"op":"push","remote":"-o","branch":"main"}"#).is_err(),
             "a hand-edited row is not trusted either"
+        );
+    }
+
+    // ---- settling: an escalated/blocked row that stopped wanting a person ----
+
+    /// A row admitted through the real INSERT and then moved to `status`.
+    async fn row_in_status(
+        pool: &sqlx::SqlitePool,
+        project: &str,
+        source: &str,
+        status: &str,
+    ) -> i64 {
+        let op = Op::Merge {
+            source: source.into(),
+            target: "master".into(),
+        };
+        let id = submit(pool, &repo_for(project), &op, Origin::Shell)
+            .await
+            .expect("admit the merge");
+        sqlx::query("UPDATE vcs_requests SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("move it to its status");
+        id
+    }
+
+    /// `(settled_at, settled_reason)` as stored. Read by SQL because the summary the listings return
+    /// deliberately carries neither.
+    async fn settlement_of(pool: &sqlx::SqlitePool, id: i64) -> (Option<String>, Option<String>) {
+        sqlx::query_as("SELECT settled_at, settled_reason FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read the settlement")
+    }
+
+    #[tokio::test]
+    async fn a_later_identical_success_settles_an_escalation_and_an_earlier_one_does_not() {
+        let pool = test_pool().await;
+        // A success BEFORE the escalation is a different event: the branches moved on afterwards.
+        let earlier = row_in_status(&pool, "alpha", "feat/x", "succeeded").await;
+        let escalated = row_in_status(&pool, "alpha", "feat/x", "escalated").await;
+        let blocked = row_in_status(&pool, "alpha", "feat/y", "blocked").await;
+
+        settle_by_record(&pool).await.expect("settle by record");
+        assert_eq!(
+            settlement_of(&pool, escalated).await.0,
+            None,
+            "an earlier success says nothing about a later escalation"
+        );
+        assert_eq!(settlement_of(&pool, blocked).await.0, None);
+
+        // The same operation in ANOTHER project is not the same operation.
+        row_in_status(&pool, "beta", "feat/x", "succeeded").await;
+        settle_by_record(&pool).await.unwrap();
+        assert_eq!(settlement_of(&pool, escalated).await.0, None);
+
+        let later = row_in_status(&pool, "alpha", "feat/x", "succeeded").await;
+        assert!(later > escalated && earlier < escalated);
+        settle_by_record(&pool).await.unwrap();
+        let (at, reason) = settlement_of(&pool, escalated).await;
+        assert!(at.is_some(), "a later identical success settles it");
+        assert_eq!(reason.as_deref(), Some("superseded"));
+        assert_eq!(
+            settlement_of(&pool, blocked).await.0,
+            None,
+            "a different operation is untouched"
+        );
+        assert_eq!(
+            settlement_of(&pool, earlier).await,
+            (None, None),
+            "a succeeded row is never settled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_handed_to_a_resolution_is_settled_as_resolved() {
+        let pool = test_pool().await;
+        let handed = row_in_status(&pool, "alpha", "feat/x", "escalated").await;
+        let landing = row_in_status(&pool, "alpha", "feat/x", "queued").await;
+        let open = row_in_status(&pool, "alpha", "feat/y", "escalated").await;
+        sqlx::query("UPDATE vcs_requests SET resolved_by = ? WHERE id = ?")
+            .bind(landing)
+            .bind(handed)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        settle_by_record(&pool).await.unwrap();
+        assert_eq!(
+            settlement_of(&pool, handed).await.1.as_deref(),
+            Some("resolved")
+        );
+        assert_eq!(settlement_of(&pool, open).await, (None, None));
+        assert_eq!(
+            settlement_of(&pool, landing).await,
+            (None, None),
+            "the landing row itself is not escalated or blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_row_keeps_its_status_and_its_first_reason() {
+        let pool = test_pool().await;
+        let escalated = row_in_status(&pool, "alpha", "feat/x", "escalated").await;
+        let queued = row_in_status(&pool, "alpha", "feat/y", "queued").await;
+        let succeeded = row_in_status(&pool, "alpha", "feat/z", "succeeded").await;
+
+        assert!(settle(&pool, escalated, "merged").await.unwrap());
+        let (first_at, first_reason) = settlement_of(&pool, escalated).await;
+        assert_eq!(first_reason.as_deref(), Some("merged"));
+
+        assert!(
+            !settle(&pool, escalated, "dismissed").await.unwrap(),
+            "a second settle changes nothing"
+        );
+        assert_eq!(
+            settlement_of(&pool, escalated).await,
+            (first_at, first_reason),
+            "neither the moment nor the reason is overwritten"
+        );
+        assert_eq!(
+            status_of(&pool, escalated).await,
+            "escalated",
+            "settling is a note on the row, never a status change"
+        );
+
+        for outside in [queued, succeeded] {
+            assert!(!settle(&pool, outside, "dismissed").await.unwrap());
+            assert_eq!(settlement_of(&pool, outside).await, (None, None));
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 3, "history is never deleted");
+    }
+
+    #[tokio::test]
+    async fn waiting_on_a_person_is_uncapped_and_skips_settled_rows() {
+        let pool = test_pool().await;
+        // More rows than `list`'s 200-row window: the badge used to be capped by accident.
+        for n in 0..205 {
+            row_in_status(&pool, "alpha", &format!("feat/{n}"), "escalated").await;
+        }
+        let blocked = row_in_status(&pool, "alpha", "feat/blocked", "blocked").await;
+        let settled = row_in_status(&pool, "alpha", "feat/settled", "escalated").await;
+        row_in_status(&pool, "alpha", "feat/done", "succeeded").await;
+        row_in_status(&pool, "alpha", "feat/failed", "failed").await;
+        assert!(settle(&pool, settled, "merged").await.unwrap());
+
+        let waiting = waiting_on_a_person(&pool).await.expect("list the waiting");
+        assert_eq!(waiting.len(), 206, "205 escalated + 1 blocked, uncapped");
+        assert!(waiting.iter().all(|r| r.id != settled));
+        assert!(waiting.iter().any(|r| r.id == blocked));
+        assert!(
+            waiting
+                .iter()
+                .all(|r| r.status == "escalated" || r.status == "blocked")
+        );
+        assert!(
+            waiting.windows(2).all(|w| w[0].id > w[1].id),
+            "newest first, like the history listing"
         );
     }
 }

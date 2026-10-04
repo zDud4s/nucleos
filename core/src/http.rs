@@ -597,6 +597,7 @@ pub fn build_router(state: AppState) -> Router {
         // because it is the same answer for every chat and a per-chat copy would be fetched once
         // per row in the list.
         .route("/assistant/models", get(get_assistant_models))
+        .route("/assistant/models/groups", get(get_model_groups))
         .route("/assistant/tools", get(get_deniable_tools))
         .route("/assistant/commands", get(get_commands))
         .route("/assistant/chats", get(list_chats).post(create_chat))
@@ -638,6 +639,22 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/assistant/chats/{chat_id}/title", post(post_chat_title))
         .route("/assistant/chats/{chat_id}/seen", post(post_chat_seen))
+        .route(
+            "/assistant/chats/{chat_id}/restore",
+            post(post_chat_restore),
+        )
+        .route(
+            "/assistant/chat-groups",
+            get(list_chat_groups).post(create_chat_group),
+        )
+        .route(
+            "/assistant/chat-groups/{group_id}",
+            axum::routing::patch(rename_chat_group).delete(delete_chat_group),
+        )
+        .route(
+            "/assistant/chats/{chat_id}/group",
+            axum::routing::put(put_chat_group),
+        )
         // The two context gestures. Separate routes rather than one with a flag, because they are
         // separate decisions and a caller that got the flag backwards would silently throw away a
         // conversation's memory.
@@ -682,6 +699,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/proposals", get(get_proposals))
         // The sidebar's "waiting on you" number, read in one request instead of seven.
         .route("/waiting/count", get(get_waiting_count))
+        .route("/waiting/git", get(get_waiting_git))
         // A literal at the same depth as no `{id}` sibling — `/proposals/{id}` is not a route, only
         // `/proposals/{id}/approve` and `/reject` one segment deeper — so the shadowing question
         // that `/runs/awaiting-approval` raises does not arise here.
@@ -709,6 +727,7 @@ pub fn build_router(state: AppState) -> Router {
         // zero deadline, which `wait_for` answers from its first look at the row.
         .route("/vcs/requests/{id}", get(get_vcs_request))
         .route("/vcs/requests/{id}/wait", get(wait_vcs_request))
+        .route("/vcs/requests/{id}/dismiss", post(post_vcs_request_dismiss))
         // Admin-only by construction: absent from BOTH scope tables in `auth.rs`, for the
         // `POST /email/send` reason rather than the `POST /runs` one. It is not out of a scoped
         // key's reach because it is expensive; it is out of reach because it LEAVES THE MACHINE.
@@ -972,10 +991,12 @@ pub fn build_router(state: AppState) -> Router {
         // gives `Scope::Run` this route beside the two above for the same reason it gives it those:
         // one run, asking about one tool call of its own.
         .route("/hooks/posttooluse", post(posttooluse_outcome))
-        // The same gate for the sessions nobody launched. It is `Scope::Control` only, and by
-        // construction rather than by a list: `permits` gives `Control` everything and answers every
-        // other scope from an allowlist, so a route absent from all of them is reachable by the
-        // control token alone. `Scope::Run` must never arrive here — a run has its own route, whose
+        // The same gate for the sessions nobody launched. It is in no scope's table, by construction
+        // rather than by a list: `permits` gives `Control` and an Admin API key everything and
+        // answers every other scope from an allowlist, so a route absent from all of them is
+        // reachable by the control token and an Admin key only — the same reach every other
+        // unlisted route has (`an_admin_api_key_reaches_everything_control_reaches` holds Admin to
+        // exactly that). `Scope::Run` must never arrive here — a run has its own route, whose
         // handler checks the claimed run against the token, and this one has no run to check.
         .route(
             "/hooks/session-git-decision",
@@ -1914,6 +1935,10 @@ struct BulkAttachment {
     mime_type: Option<String>,
     size_bytes: i64,
     content_base64: String,
+    /// True when `content_base64` is only the first part of the file (`size_bytes` is the true
+    /// size). Absent from older sidecars, which means complete.
+    #[serde(default)]
+    truncated: bool,
 }
 
 /// Every attachment of one message, read in a single pass over the mailbox.
@@ -1980,6 +2005,11 @@ async fn post_email_attachments_save_all(
 ) -> Result<Json<SaveAllOutcome>, StatusCode> {
     let root = files_root(&state)?.to_path_buf();
     let attachments = fetch_all_attachments(&state, id).await?;
+    // A cut-off file would be filed as if it were whole. Refuse before anything is written, in the
+    // same spirit as the no-partial-success rule above.
+    if attachments.iter().any(|a| a.truncated) {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
 
     let decoded: Vec<(String, Vec<u8>)> = attachments
         .into_iter()
@@ -2059,6 +2089,9 @@ async fn fetch_attachment(
             // The stored description and the live message disagree: the mail was deleted or
             // replaced since it was read.
             StatusCode::NOT_FOUND
+        } else if response.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            // The attachment is over the sidecar's cap and it refused to hand over a cut-off file.
+            StatusCode::PAYLOAD_TOO_LARGE
         } else {
             StatusCode::BAD_GATEWAY
         });
@@ -7338,11 +7371,12 @@ async fn post_project_command_run(
     // that disconnects mid-request drops this future, and a drop landing between the two would
     // leave a row saying `running` with nothing running.
     let claimed = uncancellable(async move {
-        if !crate::project_commands::mark_running(&pool, &project_id, command_id)
-            .await
-            .unwrap_or(false)
-        {
-            return false;
+        // A failed claim is a storage error, not a command already running: reporting it as
+        // `already_running` would send the owner looking for a second click that never happened.
+        match crate::project_commands::mark_running(&pool, &project_id, command_id).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(error) => return Err(error),
         }
         tokio::spawn(async move {
             // **The reference is the same directory the command runs in, on purpose.**
@@ -7352,14 +7386,26 @@ async fn post_project_command_run(
             // the same path makes the check a no-op by construction rather than by luck. Passing
             // the project root instead would compare a subdirectory's scripts against paths that
             // do not exist there and report a tamper that never happened.
-            let outcome = crate::gate::run_gate(
-                &cwd,
-                &cwd,
-                &text,
-                crate::project_commands::COMMAND_TIMEOUT,
-            )
+            //
+            // In a task of its own, awaited here, so a panic inside the measurement still reaches
+            // `finish` below. Without that the row would say `running` until the next restart,
+            // and the conditional claim above would refuse every later click as `already_running`.
+            let measured = tokio::spawn(async move {
+                crate::gate::run_gate(&cwd, &cwd, &text, crate::project_commands::COMMAND_TIMEOUT)
+                    .await
+            })
             .await;
-            let finished = crate::project_commands::verdict(pass, outcome);
+            let finished = match measured {
+                Ok(outcome) => crate::project_commands::verdict(pass, outcome),
+                Err(error) => {
+                    tracing::error!(%error, command_id, "a project command's task ended without a result");
+                    crate::project_commands::Finished {
+                        outcome: crate::project_commands::Outcome::Errored,
+                        exit_code: None,
+                        output: Some(format!("the command's task ended without a result: {error}")),
+                    }
+                }
+            };
             let said = match finished.outcome {
                 crate::project_commands::Outcome::Passed => format!("{name} passed"),
                 crate::project_commands::Outcome::Failed => match finished.exit_code {
@@ -7378,10 +7424,14 @@ async fn post_project_command_run(
             let _ = crate::feed::append(&pool, Some(&project_id), "command_finished", &said, None, None)
                 .await;
         });
-        true
+        Ok(true)
     })
     .await
-    .map_err(|status| refusal(status, "internal"))?;
+    .map_err(|status| refusal(status, "internal"))?
+    .map_err(|error: sqlx::Error| {
+        tracing::warn!(%error, command_id, "claiming a project command failed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
 
     if !claimed {
         return Err(refusal(StatusCode::CONFLICT, "already_running"));
@@ -10471,6 +10521,14 @@ struct AssistantTurn {
     /// what says so.
     session_id: Option<String>,
     created_at: String,
+    /// When the turn ended, in `created_at`'s format, or null while it runs. The Chats window
+    /// counts the prompt cache down from here.
+    completed_at: Option<String>,
+    /// The model the CLI reported answering with, or null when the stream never said and on
+    /// every turn from before it was recorded. Distinct from `answered_by`, which says WHO.
+    model: Option<String>,
+    /// How long this turn's prompt cache lives: `"5m"`, `"1h"`, or null when unknown.
+    cache_ttl: Option<String>,
     /// How much context this turn ran with, as an absolute token count. Null on a turn whose stream
     /// never reported one -- a turn that failed before the CLI said anything, and every turn from
     /// before the column existed.
@@ -11087,7 +11145,8 @@ async fn get_assistant_chat(
     // missing one; the id beside it always resolves.
     let mut turns = sqlx::query_as::<_, AssistantTurn>(
         "SELECT r.id, r.prompt AS asked, r.stdout AS answer, r.stderr AS error, r.status,
-                r.cost_usd, r.answered_by, r.session_id, r.created_at, r.context_fill,
+                r.cost_usd, r.answered_by, r.session_id, r.created_at, r.completed_at,
+                r.model, r.cache_ttl, r.context_fill,
                 r.tools_used, r.thought, r.thought_tokens, r.prompt_images, r.compacted,
                 rel.from_chat_id AS relayed_from_chat_id,
                 src.title        AS relayed_from_title
@@ -11731,27 +11790,43 @@ async fn post_local_model_pull(
     };
 
     let model = body.model;
+    // The download in a task of its own, awaited by this one, so a panic inside it still closes
+    // the slot. A slot left with no outcome reads as `pull_in_flight` to every later request, and
+    // nothing short of a restart would ever clear it.
     tokio::spawn(async move {
-        let outcome = crate::capabilities::pull_local_model(
-            ollama_pull_client(),
-            crate::runner::OLLAMA_BASE_URL,
-            &model,
-            |frame| {
-                if let Ok(mut slot) = LOCAL_PULL.lock()
-                    && let Some(pull) = slot.as_mut()
-                {
-                    pull.status = frame.status;
-                    pull.completed = frame.completed;
-                    pull.total = frame.total;
-                }
-            },
-        )
-        .await;
-        if let Ok(mut slot) = LOCAL_PULL.lock()
-            && let Some(pull) = slot.as_mut()
-        {
+        let outcome = tokio::spawn(async move {
+            crate::capabilities::pull_local_model(
+                ollama_pull_client(),
+                crate::runner::OLLAMA_BASE_URL,
+                &model,
+                |frame| {
+                    if let Ok(mut slot) = LOCAL_PULL.lock()
+                        && let Some(pull) = slot.as_mut()
+                    {
+                        pull.status = frame.status;
+                        pull.completed = frame.completed;
+                        pull.total = frame.total;
+                    }
+                },
+            )
+            .await
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "the local model download's task ended without a result");
+            Err(format!("the download ended without a result: {error}"))
+        });
+        // A panic inside the progress callback poisons the lock while holding it; the slot it
+        // guards is still whole, so it is taken back and the poison cleared rather than leaving
+        // every later request on `pull_state_poisoned`.
+        let mut slot = LOCAL_PULL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pull) = slot.as_mut() {
             pull.outcome = Some(outcome);
         }
+        drop(slot);
+        LOCAL_PULL.clear_poison();
     });
 
     Ok((StatusCode::ACCEPTED, Json(pull_readout(&started))))
@@ -11770,6 +11845,13 @@ async fn get_local_model_pull() -> Result<Json<serde_json::Value>, StatusCode> {
     Ok(Json(pull_readout(pull)))
 }
 
+#[derive(serde::Deserialize)]
+struct ListChatsQuery {
+    /// Archived conversations instead of the live list.
+    #[serde(default)]
+    archived: bool,
+}
+
 /// The conversations the app opened, most recently active first.
 ///
 /// The Telegram sidecar's chats are absent from this, and no line here says so. They are absent
@@ -11778,14 +11860,27 @@ async fn get_local_model_pull() -> Result<Json<serde_json::Value>, StatusCode> {
 /// maintenance.
 async fn list_chats(
     State(state): State<AppState>,
+    Query(query): Query<ListChatsQuery>,
 ) -> Result<Json<Vec<crate::chats::ChatSummary>>, StatusCode> {
-    crate::chats::list(&state.pool)
-        .await
-        .map(Json)
-        .map_err(|error| {
-            tracing::warn!(%error, "listing chats failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    let rows = if query.archived {
+        crate::chats::list_archived(&state.pool).await
+    } else {
+        crate::chats::list(&state.pool).await
+    };
+    rows.map(|rows| {
+        Json(
+            rows.into_iter()
+                .map(|row| {
+                    let asks = crate::hooks::asks_for(&row.chat_id).len();
+                    crate::chats::settle(row, asks)
+                })
+                .collect(),
+        )
+    })
+    .map_err(|error| {
+        tracing::warn!(%error, "listing chats failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -12723,6 +12818,14 @@ enum Asking {
     Chat { rooted: bool },
 }
 
+/// Whether the asker is a rooted chat: `None` for the daemon's own menu.
+fn rooted_of(asking: Asking) -> Option<bool> {
+    match asking {
+        Asking::Daemon => None,
+        Asking::Chat { rooted } => Some(rooted),
+    }
+}
+
 /// Which route a choice id names and can actually run, or a refusal.
 ///
 /// One function because two routes ask — opening a conversation and re-pointing one — and sharing
@@ -12764,7 +12867,12 @@ async fn chosen_brain_in(
     id: &str,
     asking: Asking,
 ) -> Result<crate::chats::Brain, BrainRefusal> {
-    if matches!(asking, Asking::Chat { rooted: false }) && config.runner_of(id) == Some("codex") {
+    if matches!(asking, Asking::Chat { rooted: false })
+        && config
+            .runner_of(id)
+            .or_else(|| crate::model_catalog::runner_by_id(id))
+            == Some("codex")
+    {
         return Err(BrainRefusal::NeedsRoot);
     }
 
@@ -12774,6 +12882,20 @@ async fn chosen_brain_in(
     };
     let brain = if let Some(choice) = cheap_choices.into_iter().find(|choice| choice.id == id) {
         crate::chats::Brain::from_wire(&choice.brain)
+    } else if crate::model_catalog::cached_or_fallback()
+        .iter()
+        .any(|found| {
+            found.id == id
+                && crate::model_catalog::admits(
+                    config.active_runner(),
+                    rooted_of(asking),
+                    found.runner,
+                )
+        })
+    {
+        // A model the vendor lists (or the built-in catalogue names) that no config row does.
+        // Looked up without the network, like the cheap catalogue above.
+        crate::chats::Brain::Cloud
     } else {
         let (_, choices) = menu(asking).await;
         choices
@@ -12855,11 +12977,75 @@ async fn get_assistant_models(
         // What an unpinned conversation runs on, so the window can NAME that state rather than
         // showing an empty selection and letting a person guess.
         "configured": config.configured_model(),
+        // The same model as a person reads it, from the daemon's one naming function.
+        "configured_label": crate::model_catalog::display_name(config.configured_model()),
         // The union, for the one case with no model chosen yet — the front door before anybody
         // picks. Also what the door validates against. Unaffected by the installed merge: an
         // installed model carries no effort levels of its own, `effort_levels()` keeps calling the
         // sync `catalogue()`, and there is nothing for the network read to add here.
         "efforts": config.effort_levels(),
+    }))
+}
+
+/// The picker as groups: provider and family, newest first, named as a person reads them.
+///
+/// The config's cloud choices come first and win; the discovered models (live vendor lists, or the
+/// built-in catalogue when there is no key or the vendor does not answer) are appended when the
+/// runner may answer them. Never carries a key.
+async fn get_model_groups(
+    State(state): State<AppState>,
+    Query(query): Query<ModelsQuery>,
+) -> Json<serde_json::Value> {
+    let asking = match query.chat {
+        Some(chat_id) => Asking::Chat {
+            rooted: crate::assistant::may_answer_on_codex(
+                crate::chats::cwd_of(&state.pool, &chat_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+            ),
+        },
+        None => Asking::Daemon,
+    };
+    let (config, choices) = menu(asking).await;
+    let mut cloud: Vec<crate::config::AssistantChoice> = choices
+        .into_iter()
+        .filter(|choice| choice.brain == "cloud")
+        .map(|mut choice| {
+            if choice.label == choice.id {
+                choice.label = crate::model_catalog::display_name(&choice.id);
+            }
+            choice
+        })
+        .collect();
+    let snapshot = crate::model_catalog::current().await;
+    let mut created = std::collections::HashMap::new();
+    // Codex models this caller may not pick are still listed, and named here, so the picker shows
+    // the whole vendor list and says why a row is closed instead of leaving the vendor out.
+    let mut needs_root: Vec<String> = Vec::new();
+    for found in &snapshot.models {
+        if let Some(at) = found.created {
+            created.insert(found.id.clone(), at);
+        }
+        if cloud.iter().any(|choice| choice.id == found.id) {
+            continue;
+        }
+        if crate::model_catalog::admits(config.active_runner(), rooted_of(asking), found.runner) {
+            cloud.push(crate::model_catalog::as_choice(found));
+        } else if found.runner == "codex"
+            && crate::model_catalog::admits(config.active_runner(), Some(true), found.runner)
+        {
+            needs_root.push(found.id.clone());
+            cloud.push(crate::model_catalog::as_choice(found));
+        }
+    }
+    Json(serde_json::json!({
+        "groups": crate::model_catalog::group(cloud, &created),
+        "needs_root": needs_root,
+        "source": snapshot.source,
+        "catalogue_version": crate::model_catalog::CATALOGUE_VERSION,
+        "fetched_at": snapshot.fetched_at,
     }))
 }
 
@@ -13517,6 +13703,98 @@ async fn post_chat_seen(
         })
 }
 
+/// Puts an archived conversation back on the list: 204, or 404 when it was not archived.
+async fn post_chat_restore(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::chats::restore(&state.pool, &chat_id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, "restoring a chat failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Chat groups (P4): the list, create, rename, delete and assign handlers.
+async fn list_chat_groups(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::chat_groups::ChatGroup>>, StatusCode> {
+    crate::chat_groups::list(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(serde::Deserialize)]
+struct ChatGroupName {
+    name: String,
+}
+
+fn group_refusal(error: crate::chat_groups::GroupError) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::chat_groups::GroupError;
+    match error {
+        GroupError::Blank => refusal(StatusCode::BAD_REQUEST, "blank_name"),
+        GroupError::TooLong => refusal(StatusCode::BAD_REQUEST, "name_too_long"),
+        GroupError::NoGroup | GroupError::NoChat => refusal(StatusCode::NOT_FOUND, "not_found"),
+        GroupError::Db(error) => {
+            tracing::warn!(%error, "chat group operation failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
+
+async fn create_chat_group(
+    State(state): State<AppState>,
+    Json(body): Json<ChatGroupName>,
+) -> Result<(StatusCode, Json<crate::chat_groups::ChatGroup>), (StatusCode, Json<serde_json::Value>)>
+{
+    crate::chat_groups::create(&state.pool, &body.name)
+        .await
+        .map(|group| (StatusCode::CREATED, Json(group)))
+        .map_err(group_refusal)
+}
+
+async fn rename_chat_group(
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+    Json(body): Json<ChatGroupName>,
+) -> Result<Json<crate::chat_groups::ChatGroup>, (StatusCode, Json<serde_json::Value>)> {
+    crate::chat_groups::rename(&state.pool, group_id, &body.name)
+        .await
+        .map(Json)
+        .map_err(group_refusal)
+}
+
+async fn delete_chat_group(
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::chat_groups::delete(&state.pool, group_id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ChatGroupAssignment {
+    group_id: Option<i64>,
+}
+
+async fn put_chat_group(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Json(body): Json<ChatGroupAssignment>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    crate::chat_groups::assign(&state.pool, &chat_id, body.group_id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(group_refusal)
+}
+
 /// Takes a conversation off the list, and leaves every turn of it in place.
 ///
 /// Archive rather than delete, because every turn is a billed run: removing the rows would hide
@@ -13567,9 +13845,6 @@ struct WaitingCount {
     git: Option<usize>,
 }
 
-/// The vcs statuses that need a person — the shell's `VCS_WANTS_A_PERSON`.
-const VCS_WANTS_A_PERSON: [&str; 2] = ["escalated", "blocked"];
-
 /// The badge every page of the shell draws, as one read.
 ///
 /// It used to be seven polls from every window, each shipping a whole list only for its length to
@@ -13584,7 +13859,7 @@ async fn get_waiting_count(State(state): State<AppState>) -> Json<WaitingCount> 
         crate::proposals::list_pending_recruits(pool, None),
         crate::contacts::pending_merges(pool),
         crate::exclusion::pending_requests(pool),
-        vcs::list(pool, None),
+        vcs::waiting_on_a_person(pool),
     );
     Json(WaitingCount {
         // The shell's `isWheelRequest`: an agent asked for the wheel and a proposal stands behind it.
@@ -13601,12 +13876,41 @@ async fn get_waiting_count(State(state): State<AppState>) -> Json<WaitingCount> 
         recruits: recruits.ok().map(|rows| rows.len()),
         merges: merges.ok().map(|rows| rows.len()),
         exclusions: exclusions.ok().map(|rows| rows.len()),
-        git: git.ok().map(|rows| {
-            rows.iter()
-                .filter(|row| VCS_WANTS_A_PERSON.contains(&row.status.as_str()))
-                .count()
-        }),
+        git: git.ok().map(|rows| rows.len()),
     })
+}
+
+/// The git requests that still want a person, uncapped: the same predicate the badge counts, so the
+/// Waiting page and its number cannot disagree. Admin-only by default-deny, like `/waiting/count`
+/// — no scope table entry.
+async fn get_waiting_git(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<vcs::RequestSummary>>, StatusCode> {
+    vcs::waiting_on_a_person(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing the git requests that want a person failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Puts an open git request away without touching its status: 204, 404 for an unknown id, 409 for
+/// one that is not open (succeeded, running, or already settled). Admin-only by default-deny, like
+/// `/waiting/count` — no scope table entry.
+async fn post_vcs_request_dismiss(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    match vcs::dismiss(&state.pool, id).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(vcs::DismissError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(vcs::DismissError::NotOpen) => Err(StatusCode::CONFLICT),
+        Err(vcs::DismissError::Db(error)) => {
+            tracing::warn!(request_id = id, %error, "dismissing a git request failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 async fn get_skipped_items(
@@ -14539,7 +14843,8 @@ async fn create_job(
                 // `MAX_ROUNDS_CEILING` and under the house budget, both applied on the way in.
                 max_rounds: request.max_rounds,
                 budget_usd: request.budget_usd,
-                gate_each: true,
+                // What a rule that said nothing gets: only the last item is gated.
+                gate_each: false,
                 review: true,
                 // The answer a rule that said nothing about retries gets, and for the same reason:
                 // nobody asked, and one more implement run told what the gate said is cheaper than
@@ -18146,6 +18451,21 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    /// An older sidecar sends no `truncated`; that must read as complete, and a newer one's flag
+    /// must survive the parse, or save-all would file a cut-off file as whole.
+    #[test]
+    fn the_bulk_entry_reads_truncated_and_defaults_to_complete() {
+        let old: BulkAttachment =
+            serde_json::from_str(r#"{"position":0,"size_bytes":3,"content_base64":"YWJj"}"#)
+                .unwrap();
+        assert!(!old.truncated);
+        let cut: BulkAttachment = serde_json::from_str(
+            r#"{"position":1,"size_bytes":99,"content_base64":"YWJj","truncated":true}"#,
+        )
+        .unwrap();
+        assert!(cut.truncated);
     }
 
     /// The literal `save-all` must keep winning over `{position}`, or filing everything starts
@@ -24587,6 +24907,34 @@ mod tests {
         assert_eq!(refused["refusal"], "already_running");
     }
 
+    /// A claim the database could not make is a 500, not a `409 already_running`: nothing is
+    /// running, and saying so would send the owner looking for a second click.
+    #[tokio::test]
+    async fn a_claim_the_database_refuses_is_an_error_not_already_running() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let (_, body) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "version", "command": "git --version" }),
+        )
+        .await;
+        let command_id = body["id"].as_i64().unwrap();
+
+        // The read before the claim still works; only the claim's UPDATE fails.
+        sqlx::query(
+            "CREATE TRIGGER refuse_claim BEFORE UPDATE ON project_commands
+             BEGIN SELECT RAISE(ABORT, 'storage refused'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (status, refused) = run_command(state.clone(), "alpha", command_id).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(refused["refusal"], "internal");
+    }
+
     /// Another project's id does not reach this project's command, and a command that is not there
     /// is the same answer — an integer in a URL names nothing on its own.
     #[tokio::test]
@@ -26835,6 +27183,48 @@ mod tests {
         );
     }
 
+    /// What the Chats window's cache countdown and model label read: when the turn ended, which
+    /// model answered, and how long its cache lives — null on a turn that recorded none of them.
+    #[tokio::test]
+    async fn a_turn_carries_its_end_its_model_and_its_cache_ttl() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at, completed_at, model, cache_ttl)
+             VALUES ('hello', 'completed', 'assistant', 's', 'ttl-chat', '2026-10-03T10:00:00+00:00',
+                     '2026-10-03T10:00:09+00:00', 'claude-opus-4', '1h'),
+                    ('again', 'running', 'assistant', 's', 'ttl-chat', '2026-10-03T10:01:00+00:00',
+                     NULL, NULL, NULL)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/ttl-chat")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let turns: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let done = &turns["turns"][0];
+        assert_eq!(done["completed_at"], "2026-10-03T10:00:09+00:00");
+        assert_eq!(done["model"], "claude-opus-4");
+        assert_eq!(done["cache_ttl"], "1h");
+        let live = &turns["turns"][1];
+        assert!(live["completed_at"].is_null());
+        assert!(live["model"].is_null());
+        assert!(live["cache_ttl"].is_null());
+    }
+
     /// A chat named like a number must not be read as a turn id. Static segments win in matchit,
     /// which is what keeps the two routes apart — asserted rather than assumed, because the failure
     /// would be a chat silently answering with one unrelated run.
@@ -28517,6 +28907,77 @@ mod tests {
         assert!(body["configured"].is_string());
     }
 
+    /// The grouped picker: provider and family groups, product names for labels, the version of
+    /// the catalogue the fallback came from, and never a key.
+    #[tokio::test]
+    async fn model_groups_route_answers_groups_with_labels() {
+        let state = test_state().await;
+
+        let (status, body) = call(state, "GET", "/assistant/models/groups", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "fallback");
+        assert_eq!(
+            body["catalogue_version"],
+            crate::model_catalog::CATALOGUE_VERSION
+        );
+        assert!(body["fetched_at"].is_string());
+        let groups = body["groups"].as_array().expect("groups is a list");
+        assert!(!groups.is_empty());
+        for group in groups {
+            assert!(group["provider"].is_string());
+            assert!(group["family"].is_string());
+            assert!(group["label"].as_str().unwrap().contains(" · "));
+            let models = group["models"].as_array().unwrap();
+            assert!(!models.is_empty(), "an empty group was served: {group}");
+            for model in models {
+                assert_ne!(
+                    model["label"], model["id"],
+                    "a raw id leaked into a label: {model}"
+                );
+            }
+        }
+        // The daemon's own menu follows the active runner, which is Claude here.
+        let all: Vec<&serde_json::Value> = groups
+            .iter()
+            .flat_map(|g| g["models"].as_array().unwrap())
+            .collect();
+        let ids: Vec<&str> = all.iter().filter_map(|m| m["id"].as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-5-5"), "{ids:?}");
+        // A Codex model is listed, but named as needing a rooted conversation: the daemon's own
+        // menu cannot open one on Codex.
+        assert!(ids.contains(&"gpt-5.5"), "{ids:?}");
+        let needs_root: Vec<&str> = body["needs_root"]
+            .as_array()
+            .expect("needs_root is a list")
+            .iter()
+            .filter_map(|id| id.as_str())
+            .collect();
+        assert!(needs_root.contains(&"gpt-5.5"), "{needs_root:?}");
+        assert!(!needs_root.contains(&"claude-sonnet-5-5"), "{needs_root:?}");
+        let sonnet = all.iter().find(|m| m["id"] == "claude-sonnet-5-5").unwrap();
+        assert_eq!(sonnet["label"], "Sonnet 5.5");
+    }
+
+    /// A catalogue model the config never listed can still be pinned, because the door validates
+    /// against what the picker offers.
+    #[tokio::test]
+    async fn a_fallback_catalogue_model_can_be_pinned_on_a_chat() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let status =
+            patch_chat_request(state.clone(), &id, r#"{"model":"claude-sonnet-5-5"}"#).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            crate::chats::model_of(&state.pool, &id).await.unwrap().0,
+            Some("claude-sonnet-5-5".to_string())
+        );
+    }
+
     /// `installed` reaches the wire, and reads `null` wherever the question is meaningless.
     ///
     /// The other half — `true` for a model this machine has, `false` for one it does not — is
@@ -29613,6 +30074,189 @@ mod tests {
                 .unwrap(),
             Some("a-session".to_string())
         );
+    }
+
+    async fn chats_request(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.unwrap_or("").to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn list_chats_marks_a_pending_approval_ask_as_needs_input() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let ask = crate::hooks::ask_about(&id, 1, "Bash", Some("npm publish".into()));
+
+        let (status, body) = chats_request(&state, "GET", "/assistant/chats", None).await;
+        crate::hooks::answer_ask(&ask, false);
+
+        assert_eq!(status, StatusCode::OK);
+        let row = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["chat_id"] == id.as_str())
+            .unwrap();
+        assert_eq!(row["activity"], "needs_input");
+        assert_eq!(row["pending_asks"], 1);
+    }
+
+    #[tokio::test]
+    async fn restore_route_returns_a_chat_to_the_list_and_404s_unknown() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::archive(&state.pool, &id).await.unwrap();
+
+        let (_, archived) =
+            chats_request(&state, "GET", "/assistant/chats?archived=true", None).await;
+        assert!(
+            archived
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["chat_id"] == id.as_str())
+        );
+
+        let (status, _) = chats_request(
+            &state,
+            "POST",
+            &format!("/assistant/chats/{id}/restore"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
+        assert!(
+            live.as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["chat_id"] == id.as_str())
+        );
+
+        let (status, _) =
+            chats_request(&state, "POST", "/assistant/chats/nope/restore", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn chat_group_routes_round_trip() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        let (status, group) = chats_request(
+            &state,
+            "POST",
+            "/assistant/chat-groups",
+            Some(r#"{"name":"Work"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let gid = group["id"].as_i64().unwrap();
+
+        let (status, blank) = chats_request(
+            &state,
+            "POST",
+            "/assistant/chat-groups",
+            Some(r#"{"name":"  "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(blank["refusal"], "blank_name");
+        let long = format!(r#"{{"name":"{}"}}"#, "x".repeat(81));
+        let (status, too_long) =
+            chats_request(&state, "POST", "/assistant/chat-groups", Some(&long)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(too_long["refusal"], "name_too_long");
+
+        let (status, renamed) = chats_request(
+            &state,
+            "PATCH",
+            &format!("/assistant/chat-groups/{gid}"),
+            Some(r#"{"name":"Job"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(renamed["name"], "Job");
+        let (status, _) = chats_request(
+            &state,
+            "PATCH",
+            "/assistant/chat-groups/999",
+            Some(r#"{"name":"x"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let put_uri = format!("/assistant/chats/{id}/group");
+        let (status, _) = chats_request(
+            &state,
+            "PUT",
+            &put_uri,
+            Some(&format!(r#"{{"group_id":{gid}}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
+        assert_eq!(live[0]["group_id"], gid);
+        let (status, _) = chats_request(&state, "PUT", &put_uri, Some(r#"{"group_id":999}"#)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = chats_request(
+            &state,
+            "PUT",
+            "/assistant/chats/nope/group",
+            Some(r#"{"group_id":null}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, listed) = chats_request(&state, "GET", "/assistant/chat-groups", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        let (status, _) = chats_request(
+            &state,
+            "DELETE",
+            &format!("/assistant/chat-groups/{gid}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, live) = chats_request(&state, "GET", "/assistant/chats", None).await;
+        assert!(live[0]["group_id"].is_null());
+        let (status, _) = chats_request(
+            &state,
+            "DELETE",
+            &format!("/assistant/chat-groups/{gid}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     async fn mark_seen_request(state: AppState, chat_id: &str) -> StatusCode {
@@ -34212,6 +34856,153 @@ mod tests {
 
         let counted = read(app).await;
         assert_eq!(counted["approvals"], 1, "only the pending approval counts");
+    }
+
+    /// A git-queue row admitted through the real INSERT and moved to `status`.
+    async fn vcs_row_in(pool: &sqlx::SqlitePool, source: &str, status: &str) -> i64 {
+        let repo = vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj");
+        let op = vcs::Op::Merge {
+            source: source.into(),
+            target: "master".into(),
+        };
+        let id = vcs::submit(pool, &repo, &op, vcs::Origin::Shell)
+            .await
+            .expect("admit the merge");
+        sqlx::query("UPDATE vcs_requests SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("move it to its status");
+        id
+    }
+
+    /// One authenticated request, answered as `(status, body)`.
+    async fn waiting_call(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// The badge's `git` field reads the one uncapped predicate: a settled row stops counting, and
+    /// the 200-row window of the history listing no longer decides how many people are wanted.
+    #[tokio::test]
+    async fn the_waiting_count_git_field_skips_settled_rows_and_the_cap() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        for n in 0..205 {
+            vcs_row_in(&pool, &format!("feat/{n}"), "escalated").await;
+        }
+        let blocked = vcs_row_in(&pool, "feat/blocked", "blocked").await;
+        let settled = vcs_row_in(&pool, "feat/settled", "escalated").await;
+        vcs_row_in(&pool, "feat/done", "succeeded").await;
+        assert!(vcs::settle(&pool, settled, "merged").await.unwrap());
+        assert!(vcs::settle(&pool, blocked, "dismissed").await.unwrap());
+
+        let (status, counted) = waiting_call(&state, "GET", "/waiting/count").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            counted["git"], 205,
+            "205 open escalations; the settled pair is out and nothing is capped at 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_waiting_git_listing_returns_only_unsettled_rows() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let open_escalated = vcs_row_in(&pool, "feat/a", "escalated").await;
+        let open_blocked = vcs_row_in(&pool, "feat/b", "blocked").await;
+        let settled = vcs_row_in(&pool, "feat/c", "escalated").await;
+        vcs_row_in(&pool, "feat/d", "succeeded").await;
+        vcs_row_in(&pool, "feat/e", "queued").await;
+        assert!(vcs::settle(&pool, settled, "superseded").await.unwrap());
+
+        let (status, listing) = waiting_call(&state, "GET", "/waiting/git").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut ids: Vec<i64> = listing
+            .as_array()
+            .expect("a JSON array of request summaries")
+            .iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![open_escalated, open_blocked],
+            "no settled row and no other status"
+        );
+        for row in listing.as_array().unwrap() {
+            assert!(row["status"] == "escalated" || row["status"] == "blocked");
+        }
+    }
+
+    #[tokio::test]
+    async fn dismissing_a_vcs_request_settles_it_once() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let escalated = vcs_row_in(&pool, "feat/a", "escalated").await;
+        let succeeded = vcs_row_in(&pool, "feat/b", "succeeded").await;
+
+        let uri = format!("/vcs/requests/{escalated}/dismiss");
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT settled_reason FROM vcs_requests WHERE id = ?")
+                .bind(escalated)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some("dismissed"));
+
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a second dismissal is refused"
+        );
+        let (status, _) = waiting_call(
+            &state,
+            "POST",
+            &format!("/vcs/requests/{succeeded}/dismiss"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a succeeded row was never waiting"
+        );
+        let (status, _) = waiting_call(&state, "POST", "/vcs/requests/999999/dismiss").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Put away, not deleted: the history listing still holds the row, status untouched.
+        let (status, history) = waiting_call(&state, "GET", "/vcs/requests").await;
+        assert_eq!(status, StatusCode::OK);
+        let row = history
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"].as_i64() == Some(escalated))
+            .expect("the dismissed row is still in the history");
+        assert_eq!(row["status"], "escalated");
     }
 
     #[tokio::test]

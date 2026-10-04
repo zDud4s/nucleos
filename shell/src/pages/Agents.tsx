@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
   canTakeASeat,
@@ -23,6 +23,7 @@ import {
   ConfirmButton,
   ErrorNote,
   PageHeader,
+  Modal,
   Panel,
   RefusalNote,
   RelativeTime,
@@ -106,8 +107,8 @@ export function Agents() {
         title="Agents"
         headline={headlineFor(rows, departments, answered, employmentKnown)}
         actions={
-          <Button intent="go" onClick={() => setCreating((open) => !open)} aria-expanded={creating}>
-            {creating ? "Close" : "New agent"}
+          <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog">
+            New agent
           </Button>
         }
       />
@@ -117,11 +118,7 @@ export function Agents() {
 
       {/* Closed by default. The old page opened six fields above a catalogue
           nobody had read yet — the very thing the console rewrite undid. */}
-      {creating && (
-        <Panel title="New agent">
-          <NewAgentForm onDone={() => setCreating(false)} />
-        </Panel>
-      )}
+      {creating && <NewAgentForm onDone={() => setCreating(false)} />}
 
       {!answered && !agents.isError && <p className="agents-loading">reading the catalogue…</p>}
 
@@ -151,10 +148,10 @@ export function Agents() {
       )}
 
       {/*
-        One editor, always in the same place, below the table — so opening it
-        never changes the height of the catalogue above it. `key` remounts it on
-        a change of selection, which is what reseeds the draft; without it a
-        half-typed edit would survive onto a different agent.
+        One editor at a time, in a modal opened by selecting a row. `key`
+        remounts it on a change of selection, which is what reseeds the draft;
+        without it a half-typed edit would survive onto a different agent.
+        Closing the modal clears the selection.
       */}
       {chosen !== null && (
         <AgentEditor
@@ -691,14 +688,33 @@ function NewAgentForm({ onDone }: { onDone: () => void }) {
   const [draft, setDraft] = useState<AgentDraft>(EMPTY_DRAFT);
   const create = useCreateAgent();
   const valid = draftIsValid(draft);
+  const formId = useId();
 
   function patch(next: Partial<AgentDraft>) {
     setDraft((current) => ({ ...current, ...next }));
   }
 
   return (
-    <>
+    <Modal
+      open
+      onOpenChange={(open) => {
+        if (!open) onDone();
+      }}
+      title="New agent"
+      size="md"
+      footer={
+        <>
+          <Button variant="ghost" onClick={onDone}>
+            Cancel
+          </Button>
+          <Button type="submit" form={formId} intent="go" disabled={!valid || create.isPending}>
+            Add agent
+          </Button>
+        </>
+      }
+    >
       <form
+        id={formId}
         className="agents-form"
         onSubmit={(event) => {
           event.preventDefault();
@@ -712,30 +728,25 @@ function NewAgentForm({ onDone }: { onDone: () => void }) {
         }}
       >
         <AgentFields draft={draft} onChange={patch} />
-        <div className="agents-form-foot">
-          <Button type="submit" intent="go" disabled={!valid || create.isPending}>
-            Add agent
-          </Button>
-          <p className="agents-aside">
-            The id is taken from the name, once, and never recomputed. Renaming later changes the
-            label and not the address.
-          </p>
-        </div>
+        <p className="agents-aside">
+          The id is taken from the name, once, and never recomputed. Renaming later changes the
+          label and not the address.
+        </p>
       </form>
       {create.isError && <SaveRefusal error={create.error} />}
-    </>
+    </Modal>
   );
 }
 
 /* ------------------------------------------------------------------ editor -- */
 
 /**
- * The one editor on the page, below the table.
+ * The one editor on the page, in a modal opened by selecting a row.
  *
- * Below and not inside the row, so opening it never changes the height of the
- * catalogue above it — the same move the console made when it lifted live work
- * out of the cards. "One editor at a time" was already this page's stated
- * invariant; here it is structural rather than a promise.
+ * Not inside the row and not below the table, so opening it never changes the
+ * height of the catalogue — the same move the console made when it lifted live
+ * work out of the cards. "One editor at a time" was already this page's stated
+ * invariant; a modal makes it structural rather than a promise.
  *
  * The prompt is read here too. It used to sit behind a per-row `<details>`,
  * which was a second shape for a thing this panel already shows — and the
@@ -756,21 +767,33 @@ function AgentEditor({
   const update = useUpdateAgent();
   const del = useDeleteAgent();
   const valid = draftIsValid(draft);
+  const formId = useId();
 
   function patch(next: Partial<AgentDraft>) {
     setDraft((current) => ({ ...current, ...next }));
   }
 
   return (
-    <Panel
+    <Modal
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
       title={`Editing ${agent.name}`}
-      aside={
-        <Button variant="ghost" onClick={onClose}>
-          Close
-        </Button>
+      size="md"
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" form={formId} intent="go" disabled={!valid || update.isPending}>
+            Save changes
+          </Button>
+        </>
       }
     >
       <form
+        id={formId}
         className="agents-form"
         onSubmit={(event) => {
           event.preventDefault();
@@ -790,21 +813,16 @@ function AgentEditor({
         }}
       >
         <AgentFields draft={draft} onChange={patch} />
-        <div className="agents-form-foot">
-          <Button type="submit" intent="go" disabled={!valid || update.isPending}>
-            Save changes
-          </Button>
-          {/*
-            Said here rather than nowhere, because it is the one consequence of
-            this form that is not obvious: `job::persona_for` reads an agent's
-            prompt when an item is DISPATCHED and does not store it on the row,
-            so saving reaches work that was planned before the edit.
-          */}
-          <p className="agents-aside">
-            Saving reaches work that is already queued — an item reads its agent&rsquo;s prompt when
-            it is dispatched, not when it was planned.
-          </p>
-        </div>
+        {/*
+          Said here rather than nowhere, because it is the one consequence of
+          this form that is not obvious: `job::persona_for` reads an agent's
+          prompt when an item is DISPATCHED and does not store it on the row,
+          so saving reaches work that was planned before the edit.
+        */}
+        <p className="agents-aside">
+          Saving reaches work that is already queued — an item reads its agent&rsquo;s prompt when
+          it is dispatched, not when it was planned.
+        </p>
       </form>
       {update.isError && <SaveRefusal error={update.error} />}
 
@@ -827,7 +845,7 @@ function AgentEditor({
         />
       </div>
       {del.isError && <DeleteRefusal error={del.error} />}
-    </Panel>
+    </Modal>
   );
 }
 

@@ -11,7 +11,6 @@ import { RouteError } from "./app/RouteError";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
 import { Agents } from "./pages/Agents";
 import { Autopilot } from "./pages/Autopilot";
-import { Browser } from "./pages/Browser";
 import { Calendar, validateCalendarSearch } from "./pages/Calendar";
 import { Chats } from "./pages/Chats";
 import { Contacts } from "./pages/Contacts";
@@ -37,7 +36,7 @@ import { Bench } from "./team/Bench";
 import { Voice, validateVoiceSearch } from "./pages/Voice";
 import { Brain, validateBrainSearch } from "./pages/Brain";
 import { Waiting, validateWaitingSearch } from "./pages/Waiting";
-import { Web } from "./pages/Web";
+import { BrowserRedirect, WebTabs } from "./pages/WebTabs";
 
 /**
  * Memory history, in the real app as well as in the tests.
@@ -79,8 +78,7 @@ export const PAGES: Record<string, () => ReactNode> = {
   "/calendar": Calendar,
   "/voice": Voice,
   "/brain": Brain,
-  "/web": Web,
-  "/browser": Browser,
+  "/web": WebTabs,
   "/files": Files,
   "/system": System,
 };
@@ -241,7 +239,11 @@ const DETAIL_ROUTES: {
   { path: "/teams/$teamId", component: Bench },
   { path: "/team-runs/$runId", component: TeamRunDetail },
   { path: "/mail/$emailId", component: MailDetail },
-  { path: "/web/pages/$pageId", component: Web },
+  { path: "/web/pages/$pageId", component: WebTabs },
+  // The Sessions tab of the Web page; it is a route of its own so the tab survives a reload.
+  { path: "/web/sessions", component: WebTabs },
+  // Old bookmarks and feed rows still point at /browser; it now only forwards to the tab.
+  { path: "/browser", component: BrowserRedirect },
   { path: "/system/$view", component: System },
 ];
 

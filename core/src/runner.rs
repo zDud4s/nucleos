@@ -436,6 +436,12 @@ pub struct RunRequest {
     /// `--allowedTools` at all. A narrowing passed without an MCP config narrows nothing, which is
     /// the harmless direction.
     pub allowed_mcp_tools: Option<&'static [&'static str]>,
+    /// Keep background tasks even though nothing can wake this run once its turn ends.
+    ///
+    /// Set by chat turns only: a person is watching, and a task that dies with the turn is still
+    /// worth seeing launched. With this set the run is not failed for leaving a task behind — see
+    /// [`background_env`] and [`orphaned_background_tasks`].
+    pub background_tasks: bool,
 }
 
 /// A picture travelling with a turn, as the API carries one.
@@ -1039,7 +1045,7 @@ pub struct LiveTurn {
 }
 
 /// One tool call, as much of it as is worth showing.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub name: String,
     /// The one argument that says what this call was about, or `None` when none of them does.
@@ -1087,6 +1093,39 @@ pub struct ToolCall {
     /// nothing about those rows says a tool failed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub result_failed: bool,
+    // Everything below is what the agent map draws: who made the call, when, and what became of
+    // it. Every field is defaulted and skipped when empty, so rows recorded before them still
+    // parse and an ordinary call costs nothing extra on the wire.
+    /// The CLI's `tool_use` id, which is what `parent` on a subagent's calls points at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The `parent_tool_use_id` of the message that made this call: the `Task`/`Agent` call whose
+    /// subagent made it. `None` for the main agent's own calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// A `Task`/`Agent` call's `subagent_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
+    /// A `Task`/`Agent` call's `model` input, when it named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Whether the call asked to run in the background (`run_in_background: true`), or the CLI
+    /// reported its task as backgrounded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
+    /// RFC 3339: when the `tool_use` was seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// RFC 3339: when its answer was seen — for a background call, when its task ended, since the
+    /// answer only acknowledges the launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// A `Task`/`Agent` call's total tokens, as its result or its task events report them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    /// A background call's task: `running`, `completed`, `failed` or `killed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 impl ToolCall {
@@ -1201,6 +1240,15 @@ pub(crate) fn detail_of(input: &serde_json::Value) -> Option<String> {
         "query",
         "description",
     ];
+    // `AskUserQuestion` names no path or command; what it is about is the question it asks.
+    if let Some(q) = input
+        .pointer("/questions/0/question")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    {
+        return Some(cut_detail(q));
+    }
     let found = KEYS
         .iter()
         .find_map(|key| input.get(key).and_then(|value| value.as_str()))?;
@@ -1244,20 +1292,32 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
     let mut pondering = String::new();
     let mut doing: Option<String> = None;
     let mut did: Vec<ToolCall> = Vec::new();
-    // The `tool_use` id of each call in `did`, by the same index. Parallel rather than a field on
-    // `ToolCall`, because the id is a fact about this stream and not about the call: it is used to
-    // pair an answer with the question that asked it, and then it is finished with. A field would
-    // put it in the database and in the window, where nothing would ever read it.
+    // The `tool_use` id of each call in `did`, by the same index: the pairing key for answers and
+    // task events, kept beside `ToolCall::id` so a call sent without an id still holds its place.
     let mut called: Vec<Option<String>> = Vec::new();
+
+    // Background task ids to the index of the call that launched them, learned from the task
+    // events and from the launch's own answer.
+    let mut tasks: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for line in stream.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
         };
+        // Set on every line a subagent wrote: the `Task`/`Agent` call that spawned it.
+        let parent = value
+            .get("parent_tool_use_id")
+            .and_then(|p| p.as_str())
+            .map(str::to_string);
+        // The stream's own clock, which the CLI puts on `user` lines and not on `assistant` ones.
+        let stamp = value.get("timestamp").and_then(|t| t.as_str());
         match value.get("type").and_then(|t| t.as_str()) {
             // Only `text_delta` carries a `text`. A tool call's arguments stream as
             // `input_json_delta` under `partial_json`, and reading that as speech would put a
             // half-written JSON object in the middle of a sentence.
+            // A subagent's own words stream on the same channel, marked with the call that spawned
+            // it. They are not this turn's answer, and reading them would splice them into it.
+            Some("stream_event") if parent.is_some() => {}
             Some("stream_event") => {
                 if let Some(text) = value.pointer("/event/delta/text").and_then(|t| t.as_str()) {
                     writing.push_str(text);
@@ -1285,6 +1345,7 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
             {
                 thought_tokens = larger(thought_tokens, value.get("estimated_tokens"));
             }
+            Some("system") => task_event(&value, stamp, &mut did, &called, &mut tasks),
             Some("assistant") => {
                 let blocks = value
                     .pointer("/message/content")
@@ -1301,12 +1362,17 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
 
 ",
                     );
-                if !text.trim().is_empty() {
+                // A subagent's message contributes its tool calls and nothing else: its text and
+                // its thinking belong to the subagent, and the deltas being buffered are the main
+                // agent's, so they must not be cleared by it either.
+                let own = parent.is_none();
+                if own && !text.trim().is_empty() {
                     finished.push(text);
                 }
                 thought.extend(
                     blocks
                         .iter()
+                        .filter(|_| own)
                         .filter(|block| {
                             block.get("type").and_then(|t| t.as_str()) == Some("thinking")
                         })
@@ -1321,28 +1387,52 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                     let Some(name) = block.get("name").and_then(|n| n.as_str()) else {
                         continue;
                     };
+                    let input = block.get("input");
+                    let id = block
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string);
+                    let spawns = matches!(name, "Task" | "Agent");
+                    let spawn_field = |key: &str| {
+                        input
+                            .filter(|_| spawns)
+                            .and_then(|input| input.get(key))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    };
+                    let background = input
+                        .and_then(|input| input.get("run_in_background"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
                     did.push(ToolCall {
                         name: name.to_string(),
-                        detail: block.get("input").and_then(detail_of),
-                        todos: plan_of(name, block.get("input")),
-                        result: None,
-                        result_chars: None,
-                        result_failed: false,
+                        detail: input.and_then(detail_of),
+                        todos: plan_of(name, input),
+                        subagent_type: spawn_field("subagent_type"),
+                        model: spawn_field("model"),
+                        background,
+                        status: background.then(|| "running".to_string()),
+                        started_at: Some(seen_at(
+                            stamp,
+                            id.as_deref().map(|id| format!("use:{id}")),
+                        )),
+                        parent: parent.clone(),
+                        id: id.clone(),
+                        ..ToolCall::default()
                     });
-                    called.push(
-                        block
-                            .get("id")
-                            .and_then(|id| id.as_str())
-                            .map(str::to_string),
-                    );
-                    doing = Some(name.to_string());
+                    called.push(id);
+                    if own {
+                        doing = Some(name.to_string());
+                    }
                 }
                 // The message that just completed is the one those deltas were writing — both
                 // kinds of them. The CLI sends one `assistant` event per API message carrying every
                 // block of it, so a message that ended a thought carries that thought, and keeping
                 // the buffer as well would show it twice.
-                writing.clear();
-                pondering.clear();
+                if own {
+                    writing.clear();
+                    pondering.clear();
+                }
             }
             // A tool answering is the only thing that ends a tool call. Clearing this anywhere else
             // would show the model as writing while a command is still running.
@@ -1370,10 +1460,32 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                     else {
                         continue;
                     };
+                    let call = &mut did[index];
+                    // A background call's answer only acknowledges the launch; it finishes when
+                    // its task does (`task_event`).
+                    if !call.background {
+                        call.finished_at = Some(seen_at(
+                            stamp,
+                            call.id.as_deref().map(|id| format!("result:{id}")),
+                        ));
+                    }
+                    let reported = value.get("tool_use_result");
+                    if matches!(call.name.as_str(), "Task" | "Agent")
+                        && let Some(total) = reported
+                            .and_then(|r| r.get("totalTokens"))
+                            .and_then(serde_json::Value::as_u64)
+                    {
+                        call.tokens = Some(total);
+                    }
+                    if let Some(task) = reported
+                        .and_then(|r| r.get("backgroundTaskId"))
+                        .and_then(|t| t.as_str())
+                    {
+                        tasks.insert(task.to_string(), index);
+                    }
                     let Some(text) = result_text(block.get("content")) else {
                         continue;
                     };
-                    let call = &mut did[index];
                     call.result_chars = Some(text.chars().count() as i64);
                     call.result = Some(text.chars().take(RESULT_LIMIT).collect());
                     call.result_failed = block
@@ -1421,6 +1533,216 @@ fn larger(known: Option<i64>, claimed: Option<&serde_json::Value>) -> Option<i64
         Some(seen) => Some(known.map_or(seen, |known| known.max(seen))),
         None => known,
     }
+}
+
+/// When this daemon first saw each keyed event, for lines that carry no clock of their own.
+///
+/// `live_from_stream` re-reads the whole stream on every poll and once more at turn end, so "now"
+/// taken during a parse would move each time. Remembered by key (a `tool_use` id) instead, so the
+/// first parse fixes the time and every later one repeats it.
+static FIRST_SEEN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Above this many remembered keys the memory starts over. Keys are only needed while their turn
+/// is being read, so forgetting old ones costs nothing that is still shown.
+const FIRST_SEEN_LIMIT: usize = 4096;
+
+/// The stream's own timestamp when the line has one, else when this daemon first saw `key`.
+fn seen_at(stamp: Option<&str>, key: Option<String>) -> String {
+    if let Some(stamp) = stamp.filter(|stamp| !stamp.is_empty()) {
+        return stamp.to_string();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let Some(key) = key else {
+        return now;
+    };
+    let Ok(mut seen) = FIRST_SEEN.lock() else {
+        return now;
+    };
+    if seen.len() >= FIRST_SEEN_LIMIT && !seen.contains_key(&key) {
+        seen.clear();
+    }
+    seen.entry(key).or_insert(now).clone()
+}
+
+/// The CLI's word for a task's state, in the four the agent map draws, or `None` for one it does
+/// not know. `stopped` is what `task_notification` says of a task that was killed.
+fn task_status(word: &str) -> Option<&'static str> {
+    match word {
+        "running" | "pending" => Some("running"),
+        "completed" => Some("completed"),
+        "failed" => Some("failed"),
+        "killed" | "stopped" => Some("killed"),
+        _ => None,
+    }
+}
+
+/// Folds one `system` line's `task_*` event into the call that launched the task.
+///
+/// The shapes, read out of CLI 2.1.280's own emitters:
+///
+/// ```text
+/// {"type":"system","subtype":"task_started","task_id":..,"tool_use_id":..,"description":..,
+///  "subagent_type":..,"is_backgrounded":..,"task_type":"local_bash"|..}
+/// {"type":"system","subtype":"task_progress","task_id":..,"tool_use_id":..,
+///  "usage":{"total_tokens":..,"tool_uses":..,"duration_ms":..}}
+/// {"type":"system","subtype":"task_updated","task_id":..,"patch":{"status":..,"end_time":<ms>}}
+/// {"type":"system","subtype":"task_notification","task_id":..,"tool_use_id":..,
+///  "status":"completed"|"failed"|"stopped","usage":..}
+/// ```
+///
+/// `task_updated` names no tool call, so the task id is learned from whichever line named both.
+fn task_event(
+    value: &serde_json::Value,
+    stamp: Option<&str>,
+    did: &mut [ToolCall],
+    called: &[Option<String>],
+    tasks: &mut std::collections::HashMap<String, usize>,
+) {
+    let subtype = value.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+    if !subtype.starts_with("task_") {
+        return;
+    }
+    let Some(task) = value.get("task_id").and_then(|t| t.as_str()) else {
+        return;
+    };
+    if let Some(index) = value
+        .get("tool_use_id")
+        .and_then(|id| id.as_str())
+        .and_then(|id| called.iter().position(|made| made.as_deref() == Some(id)))
+    {
+        tasks.insert(task.to_string(), index);
+    }
+    let Some(&index) = tasks.get(task) else {
+        return;
+    };
+    let call = &mut did[index];
+    if subtype == "task_started"
+        && value.get("is_backgrounded").and_then(|b| b.as_bool()) == Some(true)
+    {
+        // An answer already paired with it only acknowledged the launch.
+        if !call.background {
+            call.finished_at = None;
+        }
+        call.background = true;
+        call.status.get_or_insert_with(|| "running".to_string());
+    }
+    if let Some(total) = value
+        .pointer("/usage/total_tokens")
+        .and_then(serde_json::Value::as_u64)
+    {
+        call.tokens = Some(total);
+    }
+    let word = match subtype {
+        "task_updated" => value.pointer("/patch/status"),
+        "task_notification" => value.get("status"),
+        _ => None,
+    };
+    let Some(status) = word.and_then(|w| w.as_str()).and_then(task_status) else {
+        return;
+    };
+    if !call.background {
+        return;
+    }
+    call.status = Some(status.to_string());
+    if status != "running" && call.finished_at.is_none() {
+        call.finished_at = value
+            .pointer("/patch/end_time")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|end| end.to_rfc3339())
+            .or_else(|| Some(seen_at(stamp, Some(format!("task:{task}")))));
+    }
+}
+
+/// How long this turn's prompt cache lives: `"1h"`, `"5m"`, or `None` when the stream never said.
+///
+/// Read off the `cache_creation` split the API reports on every usage block. The main agent's
+/// messages decide it — a subagent's cache is its own — and the `result`'s usage is the fallback
+/// for a stream with no such message. Any 1-hour write wins: that is the entry that outlives the
+/// others.
+pub(crate) fn cache_ttl_from_stream(stdout: &str) -> Option<&'static str> {
+    fn ttl_of(usage: Option<&serde_json::Value>) -> Option<&'static str> {
+        let split = usage?.get("cache_creation")?;
+        let count = |key: &str| {
+            split
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        if count("ephemeral_1h_input_tokens") > 0 {
+            Some("1h")
+        } else if count("ephemeral_5m_input_tokens") > 0 {
+            Some("5m")
+        } else {
+            None
+        }
+    }
+    let mut own: Option<&'static str> = None;
+    let mut result: Option<&'static str> = None;
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let found = match value.get("type").and_then(|t| t.as_str()) {
+            Some("assistant")
+                if value
+                    .get("parent_tool_use_id")
+                    .is_none_or(serde_json::Value::is_null) =>
+            {
+                &mut own
+            }
+            Some("result") => &mut result,
+            _ => continue,
+        };
+        let usage = value
+            .pointer("/message/usage")
+            .or_else(|| value.get("usage"));
+        match (ttl_of(usage), *found) {
+            (Some("1h"), _) => *found = Some("1h"),
+            (Some(ttl), None) => *found = Some(ttl),
+            _ => {}
+        }
+    }
+    own.or(result)
+}
+
+/// The model that answered this turn: the main agent's first message names it, and the `init`
+/// line names what the CLI launched with when no message got that far.
+pub(crate) fn model_from_stream(stdout: &str) -> Option<String> {
+    let mut launched: Option<String> = None;
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("assistant")
+                if value
+                    .get("parent_tool_use_id")
+                    .is_none_or(serde_json::Value::is_null) =>
+            {
+                if let Some(model) = value
+                    .pointer("/message/model")
+                    .and_then(|m| m.as_str())
+                    .filter(|m| !m.is_empty() && *m != "<synthetic>")
+                {
+                    return Some(model.to_string());
+                }
+            }
+            Some("system")
+                if launched.is_none()
+                    && value.get("subtype").and_then(|s| s.as_str()) == Some("init") =>
+            {
+                launched = value
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+    launched
 }
 
 /// Context occupied while a Claude `stream-json` run is still alive.
@@ -1503,10 +1825,14 @@ pub(crate) fn window_env(request: &RunRequest) -> Option<(&'static str, String)>
 /// the turn, which is what a task's notification needs. A steerable run with no channel closes its
 /// stdin after the opening turn, and for this purpose is a headless run.
 ///
+/// A chat turn (`background_tasks`) keeps them too: a person is watching it, and returning `None`
+/// also exempts it from the orphan check at turn end.
+///
 /// Set before `request.env` at the spawn site, like [`window_env`], so an explicit entry still wins.
 pub(crate) fn background_env(request: &RunRequest) -> Option<(&'static str, &'static str)> {
     let can_be_woken = request.steerable && request.messages.is_some();
-    (!can_be_woken).then_some(("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"))
+    (!can_be_woken && !request.background_tasks)
+        .then_some(("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"))
 }
 
 /// PURE: the background tasks this stream reports killed after its last answer, each named once.
@@ -2837,9 +3163,14 @@ impl CommandRunner for ClaudeCliRunner {
             policy_violation = policy_unverified_after_stream(request.tool_policy, init_seen);
         }
 
+        // A stdout read error stops this loop listening, and nothing else ever will: the CLI may be
+        // alive and still writing into a pipe nobody drains, so `wait()` below would block until it
+        // chose to exit — or, with a full pipe, forever. Stopping it is the only way to reach the
+        // terminal write the error already decided on.
         if policy_violation.is_some()
             || progress_timeout_elapsed.is_some()
             || turns_exceeded.is_some()
+            || post_launch_error.is_some()
         {
             // Kill the whole tree first so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
@@ -3524,7 +3855,12 @@ impl CommandRunner for CodexCliRunner {
             }
         }
 
-        if progress_timeout_elapsed.is_some() || turns_exceeded.is_some() {
+        // A read error is in the list for the Claude body's reason: nothing is listening any more,
+        // and a CLI still alive behind a broken pipe would hold `wait()` until it chose to exit.
+        if progress_timeout_elapsed.is_some()
+            || turns_exceeded.is_some()
+            || post_launch_error.is_some()
+        {
             // Kill the whole tree first, so terminating the supervisor cannot orphan its tools.
             drop(tree_killer.take());
             let _ = child.start_kill();
@@ -4011,6 +4347,22 @@ mod tests {
                 "notebook_path": "notes.ipynb",
             })),
             Some("notes.ipynb".to_owned())
+        );
+    }
+
+    /// An `AskUserQuestion` call carries its question under `questions[0].question`; that is the
+    /// detail worth showing beside the tool name, not nothing.
+    #[test]
+    fn ask_user_question_detail_is_the_question() {
+        assert_eq!(
+            detail_of(&serde_json::json!({
+                "questions": [{"question": "  Which database?  ", "options": []}]
+            })),
+            Some("Which database?".to_owned())
+        );
+        assert_eq!(
+            detail_of(&serde_json::json!({"questions": [{"question": "   "}]})),
+            None
         );
     }
 
@@ -4834,6 +5186,7 @@ mod tests {
             context_window: None,
             messages: None,
             allowed_mcp_tools: None,
+            background_tasks: false,
         }
     }
 
@@ -5028,6 +5381,7 @@ mod tests {
             context_window: None,
             messages: None,
             allowed_mcp_tools: None,
+            background_tasks: false,
         }
     }
 
@@ -5566,11 +5920,7 @@ mod tests {
     fn a_call_without_an_answer_serialises_without_the_fields() {
         let bare = ToolCall {
             name: "Read".to_string(),
-            detail: None,
-            todos: Vec::new(),
-            result: None,
-            result_chars: None,
-            result_failed: false,
+            ..ToolCall::default()
         };
 
         let json = serde_json::to_string(&bare).unwrap();
@@ -5578,6 +5928,146 @@ mod tests {
         assert!(
             !json.contains("result"),
             "the empty answer was serialised: {json}"
+        );
+    }
+
+    /// The agent map's whole input from one stream: a `Task` call, the calls its subagent made,
+    /// a background `Bash`, and the task events that say what became of it.
+    #[test]
+    fn a_stream_with_a_subagent_and_a_background_task_fills_the_agent_map_fields() {
+        let stream = [
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","id":"toolu_task","name":"Task","input":{"description":"Find callers","prompt":"p","subagent_type":"Explore","model":"haiku"}}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_task","message":{"content":[{"type":"text","text":"subagent words"},{"type":"tool_use","id":"toolu_child","name":"Grep","input":{"pattern":"fn main"}}]}}"#,
+            r#"{"type":"user","parent_tool_use_id":"toolu_task","timestamp":"2026-10-03T10:00:02.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_child","content":"src/main.rs"}]}}"#,
+            r#"{"type":"user","parent_tool_use_id":null,"timestamp":"2026-10-03T10:00:05.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_task","content":"done"}]},"tool_use_result":{"status":"completed","totalTokens":4242}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","id":"toolu_bg","name":"Bash","input":{"command":"sleep 20","run_in_background":true}}]}}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_bg","description":"sleep 20","task_type":"local_bash"}"#,
+            r#"{"type":"user","parent_tool_use_id":null,"timestamp":"2026-10-03T10:00:06.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bg","content":"Command running in background with ID: b1"}]},"tool_use_result":{"backgroundTaskId":"b1"}}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"b1","patch":{"status":"completed","end_time":1791021626000}}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_bg","status":"completed"}"#,
+        ]
+        .join("\n");
+
+        let live = live_from_stream(&stream);
+        let [task, child, bash] = live.did.as_slice() else {
+            panic!("expected three calls, got {:?}", live.did);
+        };
+
+        assert_eq!(task.id.as_deref(), Some("toolu_task"));
+        assert_eq!(task.parent, None);
+        assert_eq!(task.subagent_type.as_deref(), Some("Explore"));
+        assert_eq!(task.model.as_deref(), Some("haiku"));
+        assert_eq!(task.tokens, Some(4242));
+        assert!(task.started_at.is_some());
+        assert_eq!(
+            task.finished_at.as_deref(),
+            Some("2026-10-03T10:00:05.000Z")
+        );
+        assert!(!task.background && task.status.is_none());
+
+        assert_eq!(child.parent.as_deref(), Some("toolu_task"));
+        assert_eq!(child.subagent_type, None);
+        assert_eq!(
+            child.finished_at.as_deref(),
+            Some("2026-10-03T10:00:02.000Z")
+        );
+
+        assert!(bash.background);
+        assert_eq!(bash.status.as_deref(), Some("completed"));
+        assert_eq!(
+            bash.finished_at.as_deref(),
+            chrono::DateTime::from_timestamp_millis(1791021626000)
+                .map(|end| end.to_rfc3339())
+                .as_deref()
+        );
+
+        // The subagent's words are its own, not the turn's answer.
+        assert!(!live.text.contains("subagent words"), "{}", live.text);
+    }
+
+    /// A task killed under the turn reads as killed, and `stopped` is the CLI's word for it.
+    #[test]
+    fn a_background_task_stopped_reads_as_killed() {
+        let stream = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bg","name":"Bash","input":{"command":"sleep 99","run_in_background":true}}]}}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"b2","tool_use_id":"toolu_bg","status":"stopped"}"#,
+        ]
+        .join("\n");
+
+        let did = live_from_stream(&stream).did;
+
+        assert_eq!(did[0].status.as_deref(), Some("killed"));
+        assert!(did[0].finished_at.is_some());
+    }
+
+    /// The daemon-clock fallback is fixed by the first parse, so a re-read does not move it.
+    #[test]
+    fn a_start_time_without_a_stream_clock_is_stable_across_reads() {
+        let stream = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_stable_clock","name":"Read","input":{"file_path":"a"}}]}}"#;
+
+        let first = live_from_stream(stream).did[0].started_at.clone();
+        std::thread::sleep(Duration::from_millis(5));
+        let second = live_from_stream(stream).did[0].started_at.clone();
+
+        assert!(first.is_some());
+        assert_eq!(first, second);
+    }
+
+    /// `tools_used` rows recorded before the agent-map fields still read back.
+    #[test]
+    fn an_old_tools_used_row_still_deserialises() {
+        let old =
+            r#"[{"name":"Read","detail":"src/a.rs","todos":[],"result":"x","result_chars":1}]"#;
+
+        let calls: Vec<ToolCall> = serde_json::from_str(old).unwrap();
+
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].id, None);
+        assert!(!calls[0].background);
+        assert_eq!(calls[0].status, None);
+    }
+
+    #[test]
+    fn the_cache_ttl_comes_from_the_ephemeral_split() {
+        let usage = |five: u64, hour: u64| {
+            format!(
+                r#"{{"type":"assistant","message":{{"usage":{{"cache_creation":{{"ephemeral_5m_input_tokens":{five},"ephemeral_1h_input_tokens":{hour}}}}}}}}}"#
+            )
+        };
+
+        assert_eq!(cache_ttl_from_stream(&usage(120, 0)), Some("5m"));
+        assert_eq!(
+            cache_ttl_from_stream(&[usage(120, 0), usage(0, 40)].join("\n")),
+            Some("1h")
+        );
+        assert_eq!(cache_ttl_from_stream(&usage(0, 0)), None);
+        assert_eq!(
+            cache_ttl_from_stream(r#"{"type":"result","usage":{"cache_creation_input_tokens":9}}"#),
+            None
+        );
+        // The result is the fallback when no main-agent message carried the split.
+        assert_eq!(
+            cache_ttl_from_stream(
+                r#"{"type":"result","usage":{"cache_creation":{"ephemeral_1h_input_tokens":7}}}"#
+            ),
+            Some("1h")
+        );
+    }
+
+    #[test]
+    fn the_model_is_the_main_agents_not_a_subagents() {
+        let stream = [
+            r#"{"type":"system","subtype":"init","model":"claude-opus-4"}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_x","message":{"model":"claude-haiku"}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"model":"claude-sonnet"}}"#,
+        ]
+        .join("\n");
+
+        assert_eq!(model_from_stream(&stream).as_deref(), Some("claude-sonnet"));
+        assert_eq!(
+            model_from_stream(r#"{"type":"system","subtype":"init","model":"claude-opus-4"}"#)
+                .as_deref(),
+            Some("claude-opus-4")
         );
     }
 
@@ -6294,6 +6784,11 @@ mod tests {
         conversation.steerable = true;
         conversation.messages = Some(turns);
         assert_eq!(background_env(&conversation), None);
+
+        // A chat turn keeps them even on the one-shot path: a person is watching it.
+        let mut chat = test_run_request("p");
+        chat.background_tasks = true;
+        assert_eq!(background_env(&chat), None);
     }
 
     /// The signature, as run 900473's own stream wrote it.

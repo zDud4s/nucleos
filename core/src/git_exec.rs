@@ -87,6 +87,104 @@ pub mod spawns {
     }
 }
 
+/// How many [`run_git`] processes are alive against each repository path, so a timeout can tell
+/// whether the `index.lock` it finds was left by the process it just killed or is held by a sibling
+/// that is still working.
+mod in_flight {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    static LIVE: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Counts one process against `repo` for as long as it is held.
+    pub(super) struct Guard(PathBuf);
+
+    impl Guard {
+        pub(super) fn enter(repo: &Path) -> Self {
+            *LIVE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(repo.to_path_buf())
+                .or_default() += 1;
+            Guard(repo.to_path_buf())
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let mut live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(count) = live.get_mut(&self.0) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    live.remove(&self.0);
+                }
+            }
+        }
+    }
+
+    pub(super) fn any(repo: &Path) -> bool {
+        LIVE.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(repo)
+            .is_some_and(|count| *count > 0)
+    }
+}
+
+/// Removes the `index.lock` a timed-out git was killed holding, when nothing of ours still runs there.
+///
+/// A git killed mid-write never gets to delete its lock, and every later index-touching command in
+/// that checkout — the integration worktree's `reset --hard` first of all — then fails on "Unable to
+/// create index.lock: File exists", which wedges the project's whole queue until somebody deletes the
+/// file by hand. Removed only when no other [`run_git`] process is alive against the same path, since
+/// a live sibling's lock is not stale. Best effort: any failure to resolve or remove leaves the file.
+async fn remove_stale_index_lock(repo: &Path) {
+    if in_flight::any(repo) {
+        return;
+    }
+    let mut command = crate::worktree::git();
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--git-path", "index.lock"])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(10), command.output()).await
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let reported = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if reported.is_empty() {
+        return;
+    }
+    // `--git-path` answers relative to the directory git was pointed at unless it is absolute.
+    let lock = Path::new(&reported);
+    let lock = if lock.is_absolute() {
+        lock.to_path_buf()
+    } else {
+        repo.join(lock)
+    };
+    if in_flight::any(repo) {
+        return;
+    }
+    match tokio::fs::remove_file(&lock).await {
+        Ok(()) => tracing::warn!(
+            path = %lock.display(),
+            "removed the index.lock a timed-out git left behind"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %lock.display(),
+            %error,
+            "could not remove the index.lock a timed-out git left behind"
+        ),
+    }
+}
+
 /// How long a *finished* git command is given to finish emptying its pipes.
 ///
 /// Its own budget rather than a share of the operation's, for the reason `gate.rs` gives about the
@@ -210,6 +308,7 @@ pub async fn run_git(
     #[cfg(test)]
     spawns::record(repo);
 
+    let live = in_flight::Guard::enter(repo);
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not run git: {error}"))?;
@@ -249,6 +348,10 @@ pub async fn run_git(
             let _ = child.wait().await;
             stdout_task.abort();
             stderr_task.abort();
+            // The process is gone, so this one no longer counts — and a kill mid-write leaves its
+            // `index.lock` behind, which would wedge every later command in this checkout.
+            drop(live);
+            remove_stale_index_lock(repo).await;
             return Err(format!(
                 "git {} timed out after {timeout:?}",
                 rendered(args)
@@ -986,6 +1089,43 @@ pub async fn is_ancestor(
     )
     .await?;
     Ok(result.succeeded())
+}
+
+/// Every local branch and remote-tracking ref, as full refnames (`refs/heads/...`,
+/// `refs/remotes/...`).
+///
+/// Another sanctioned entry to `run_git`, for the reason the others are. `land.rs` is the caller: it
+/// decides which cargo target directories a landing may delete, and a directory name another live
+/// branch also derives is not the landed branch's alone to delete.
+pub async fn branch_refs(path: &Path, deadline: std::time::Instant) -> Result<Vec<String>, String> {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return Err("the operation ran out of time before the branches could be listed".to_owned());
+    }
+    let result = run_git(
+        path,
+        &[
+            OsStr::new("for-each-ref"),
+            OsStr::new("--format=%(refname)"),
+            OsStr::new("refs/heads"),
+            OsStr::new("refs/remotes"),
+        ],
+        budget,
+    )
+    .await?;
+    if !result.succeeded() {
+        return Err(format!(
+            "could not list the branches: {}",
+            result.output_tail.trim()
+        ));
+    }
+    Ok(result
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 /// The branch `origin`'s `HEAD` points at, or `None` when there is no `origin` or no such symbolic
@@ -2244,8 +2384,29 @@ async fn rebase(
         };
     }
 
+    // Asked again, because the rebase took time and somebody may have checked the branch out in the
+    // meantime: moving the ref under that checkout would leave its files describing the old commit,
+    // which reads as a dirty tree full of changes nobody made. This narrows the window to the
+    // instant between this answer and the compare-and-swap; it cannot close it, since git offers no
+    // ref update that is conditional on no worktree holding the branch.
+    match worktree_holding(project_root, branch, deadline).await {
+        Ok(Some(holder)) => {
+            return Outcome::Blocked {
+                reason: format!(
+                    "{branch} was checked out in {} while it was being rebased, so the rebase \
+                     was not published — this queue will not move a branch under a worktree it \
+                     does not own. Check that branch out somewhere else and resubmit.",
+                    holder.display()
+                ),
+                output_tail: String::new(),
+            };
+        }
+        Ok(None) => {}
+        Err(outcome) => return outcome,
+    }
+
     // The same compare-and-swap `publish_by_update_ref` performs for a merge, and reached the same
-    // way: nobody holds this branch — checked above, before any of the work — so there is no
+    // way: nobody holds this branch — checked above, before and after the work — so there is no
     // worktree whose files have to move with the ref.
     publish_by_update_ref(
         project_root,
@@ -2744,6 +2905,58 @@ pub(crate) mod tests {
             "stderr goes last, so a truncation drops stdout first; got: {}",
             result.output_tail
         );
+    }
+
+    /// A git killed at its deadline never deletes its `index.lock`, and the next `reset --hard` in
+    /// that checkout then fails for ever. The lock planted here stands in for the one the killed
+    /// process left; with nothing else of ours running there, the timeout takes it away.
+    #[tokio::test]
+    async fn a_timed_out_git_does_not_leave_its_index_lock_behind() {
+        let (_container, repo) = init_contained_repo("nucleos-gitexec-lock-");
+        let lock = repo.join(".git").join("index.lock");
+        std::fs::write(&lock, "").expect("plant the stale lock");
+
+        let error = run_git(
+            &repo,
+            &[
+                OsStr::new("-c"),
+                OsStr::new("alias.nap=!sleep 30"),
+                OsStr::new("nap"),
+            ],
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect_err("the deadline has already passed");
+
+        assert!(error.contains("timed out"), "got: {error}");
+        assert!(
+            !lock.exists(),
+            "the timed-out git's index.lock was left behind"
+        );
+    }
+
+    /// The control: a lock is only stale when nothing of ours is still running in that checkout.
+    #[tokio::test]
+    async fn a_timeout_leaves_the_index_lock_of_a_git_still_running_there() {
+        let (_container, repo) = init_contained_repo("nucleos-gitexec-lock-live-");
+        let lock = repo.join(".git").join("index.lock");
+        std::fs::write(&lock, "").expect("plant the live lock");
+        let _sibling = super::in_flight::Guard::enter(&repo);
+
+        let error = run_git(
+            &repo,
+            &[
+                OsStr::new("-c"),
+                OsStr::new("alias.nap=!sleep 30"),
+                OsStr::new("nap"),
+            ],
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect_err("the deadline has already passed");
+
+        assert!(error.contains("timed out"), "got: {error}");
+        assert!(lock.exists(), "a running sibling's index.lock was removed");
     }
 
     /// A git command still running when its deadline passes is killed and reported, never awaited.
@@ -4887,6 +5100,87 @@ pub(crate) mod tests {
                 .status
                 .success(),
             "and no second parent, which is what tells a rebase from a merge"
+        );
+    }
+
+    /// A branch checked out WHILE it is being rebased is not moved under that checkout. A
+    /// `post-rewrite` hook — which git runs in the integration worktree as the rebase finishes —
+    /// opens the branch in a worktree of its own, after the first holder check has already passed.
+    #[tokio::test]
+    async fn a_branch_checked_out_during_its_rebase_is_not_published() {
+        use crate::vcs::VcsExecutor;
+
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-race-");
+        let _env = WorktreeRootEnv::set(&container.path().join("roots"));
+        std::fs::write(repo.join("later.txt"), "later\n").expect("write");
+        assert!(git_ok(&repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new("later")]
+        ));
+        let before = sha_of(&repo, "refs/heads/feat/x");
+
+        let holder = container.path().join("holder");
+        let hooks = container.path().join("hooks");
+        std::fs::create_dir_all(&hooks).expect("create hooks directory");
+        let slashed = |path: &Path| path.to_string_lossy().replace('\\', "/");
+        let hook = hooks.join("post-rewrite");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\n\
+                 git -C \"{}\" worktree add \"{}\" feat/x >/dev/null 2>&1\n",
+                slashed(&repo),
+                slashed(&holder)
+            ),
+        )
+        .expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .expect("make hook executable");
+        }
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("config"),
+                OsStr::new("core.hooksPath"),
+                hooks.as_os_str()
+            ]
+        ));
+
+        let outcome = GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Rebase {
+                    branch: "feat/x".into(),
+                    onto: "master".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
+                run_id: None,
+                integration_branch: None,
+            })
+            .await;
+
+        assert!(
+            holder.join(".git").exists(),
+            "the hook did not open the branch, so this test proves nothing"
+        );
+        match &outcome {
+            Outcome::Blocked { reason, .. } => assert!(
+                reason.contains("while it was being rebased"),
+                "the refusal must say why: {reason}"
+            ),
+            other => panic!("a branch opened mid-rebase must be blocked, got {other:?}"),
+        }
+        assert_eq!(
+            sha_of(&repo, "refs/heads/feat/x"),
+            before,
+            "the branch moved under the worktree that holds it"
         );
     }
 

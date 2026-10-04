@@ -964,7 +964,7 @@ mod tests {
     /// afterwards is a different proposition, so credentials come out on the way in.
     #[test]
     fn credentials_in_a_connection_error_do_not_reach_the_log() {
-        let line = keepable_line("dial imaps://duarte:hunter2@imap.gmail.com:993 failed")
+        let line = keepable_line("dial imaps://helena:hunter2@imap.gmail.com:993 failed")
             .expect("a line with a URL is still a line");
         assert!(
             !line.contains("hunter2"),

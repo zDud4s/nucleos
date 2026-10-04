@@ -238,6 +238,45 @@ export interface CouncilConfig {
   default_roster: { chairman: ConfiguredSeat; members: ConfiguredSeat[] } | null;
 }
 
+/**
+ * PURE: the config the wire delivered, or `null` when its shape is not one.
+ *
+ * `apiFetch` casts a `200` body without looking at it, so a daemon answering
+ * with the wrong shape would otherwise reach the composer as a config whose
+ * bounds are `undefined` — and a sentence built from them. Accepted only when
+ * every field is what `council::CouncilConfigView` promises: rounds positive
+ * integers with the default inside the ceiling, roles a list of strings, and a
+ * roster that is `null` or a chairman plus a list of members.
+ */
+export function readCouncilConfig(raw: unknown): CouncilConfig | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const config = raw as Record<string, unknown>;
+  if (typeof config.configured !== "boolean") return null;
+  const positive = (value: unknown): value is number =>
+    typeof value === "number" && Number.isInteger(value) && value > 0;
+  if (!positive(config.default_rounds) || !positive(config.max_rounds)) return null;
+  if (config.default_rounds > config.max_rounds) return null;
+  if (!Array.isArray(config.roles) || !config.roles.every((role) => typeof role === "string")) {
+    return null;
+  }
+  const roster = config.default_roster;
+  if (roster !== null) {
+    if (typeof roster !== "object" || roster === undefined) return null;
+    const { chairman, members } = roster as Record<string, unknown>;
+    if (typeof chairman !== "object" || chairman === null || !Array.isArray(members)) return null;
+  }
+  return raw as CouncilConfig;
+}
+
+/**
+ * The steps a council takes one after another: the answers, each round's
+ * critique, every revision but the last round's, and the synthesis. The calls
+ * inside one step run side by side, so this is the length of the wait.
+ */
+export function stepsInSequence(rounds: number): number {
+  return 2 * rounds + 1;
+}
+
 /* ---------------------------------------------------------------- helpers -- */
 
 /**
@@ -311,6 +350,11 @@ export function useCouncils() {
     queryKey: COUNCIL_KEYS.list,
     queryFn: () => apiFetch<CouncilSummary[]>("/council"),
     placeholderData: keepPreviousData,
+    // Every landed read re-renders the list, not only one whose rows compare
+    // unequal: structural sharing keeps the old reference when `apiFetch`
+    // hands back the very array it handed last time (a mocked daemon does),
+    // and a row whose council settled would then keep drawing it running.
+    notifyOnChangeProps: ["data", "isError", "dataUpdatedAt"],
   });
 }
 
@@ -349,6 +393,65 @@ export function useCouncil(id: string) {
     queryFn: () => apiFetch<CouncilView>(`/council/${encodeURIComponent(id)}`),
     refetchInterval: pollWhile<CouncilView>(POLL.council, (view) => councilIsAlive(view.status)),
   });
+}
+
+/**
+ * How a settled council ended, for its list row — the same read as
+ * `useCouncil` under the same key, so opening a council warms its row and the
+ * reverse. Never polled. Never stale once settled — a settled council answers
+ * the same bytes forever — but a cached view that is still `running` (left by
+ * opening the council while it ran) is stale at once, or the row would keep
+ * that view after the list lands the council settled and never show how it
+ * ended. `enabled` is the caller's bound — `CouncilSummary` carries no error,
+ * synthesis or agreement, so every row that shows one costs a read.
+ */
+export function useCouncilOutcome(id: string, enabled: boolean) {
+  return useQuery({
+    queryKey: COUNCIL_KEYS.detail(id),
+    queryFn: () => apiFetch<CouncilView>(`/council/${encodeURIComponent(id)}`),
+    enabled,
+    staleTime: (query) => {
+      const view = query.state.data;
+      return view !== undefined && councilIsAlive(view.status) ? 0 : Infinity;
+    },
+  });
+}
+
+/**
+ * How far the ballots agreed, in the words a reader uses.
+ *
+ * The daemon's `tally::Agreement` level is a code ("strong", "none"); "none"
+ * printed bare reads as "no data", which is the opposite of what it says — the
+ * seats were compared and did not agree. A level this table does not know is
+ * printed as the daemon sent it rather than hidden: an unknown word is still
+ * the fact, and a missing badge would claim there was nothing to report.
+ */
+export const AGREEMENT_WORDS: Record<string, string> = {
+  strong: "strong consensus",
+  split: "split",
+  none: "no consensus",
+  insufficient: "too few votes",
+};
+
+/** "τ 0.42 · split", or the words alone when there was nothing to compare. */
+export function agreementText(agreement: Agreement): string {
+  const words = AGREEMENT_WORDS[agreement.level] ?? agreement.level;
+  return agreement.tau === null ? words : `τ ${agreement.tau.toFixed(2)} · ${words}`;
+}
+
+/**
+ * How a council ended, in one line: why it failed, that it was cancelled, or
+ * the chairman's confidence and the ballots' agreement. `null` while it has
+ * not ended — a running view has no outcome, and "answered" would claim one.
+ */
+export function outcomeOf(view: CouncilView): string | null {
+  if (councilIsAlive(view.status)) return null;
+  if (view.status === "error") return view.error ?? "failed — no reason recorded";
+  if (view.status === "cancelled") return "cancelled";
+  const structured = view.synthesis_structured;
+  if (structured === null) return "answered";
+  const confidence = `${structured.confidence.level} confidence`;
+  return view.agreement === null ? confidence : `${confidence} · ${agreementText(view.agreement)}`;
 }
 
 /* --------------------------------------------------------------- writes -- */

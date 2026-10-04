@@ -28,10 +28,6 @@ const ALLOWED = new Map<string, { reason: string; only?: string }>([
     "app.css:.nav-item-active",
     { reason: "the rail's current row: where you are is identity, not state", only: "var(--accent-quiet)" },
   ],
-  [
-    "app.css:.nav-switch-item[aria-current]",
-    { reason: "the project switcher's current row, the same decision", only: "var(--accent-quiet)" },
-  ],
 ]);
 
 function tsxFiles(dir: string): string[] {
@@ -101,7 +97,7 @@ describe("Reserved Cyan", () => {
   it("stylesheets spend Signal Cyan only on links", () => {
     const violations: string[] = [];
     // tailwind.css declares the --color-accent aliases; the TSX audit covers what they enable.
-    // app.css is read: its two "here" fills are quiet-form-only, while round 9 moved the
+    // app.css is read: its "here" fill is quiet-form-only, while round 9 moved the
     // label, glyph, and bar off the accent.
     for (const file of cssFiles(shellSource)) {
       const text = readFileSync(file, "utf8");

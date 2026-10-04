@@ -78,7 +78,16 @@ impl Drop for TempAudio {
         // Best effort by necessity: Drop cannot report, and a failure here must not mask the
         // transcription's own result. A leftover file is visible in the temp directory; a panic in
         // Drop during unwinding is not recoverable.
-        let _ = std::fs::remove_file(&self.path);
+        //
+        // On Windows a just-killed child can still hold the recording open for a moment (os error
+        // 32), so a refusal is retried briefly instead of being swallowed on the first attempt.
+        for _ in 0..50 {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
     }
 }
 
@@ -168,6 +177,9 @@ impl Transcriber for CommandTranscriber {
             .expect("stdout was piped when the command was configured");
 
         let deadline = deadline_for(duration);
+        // The child is borrowed, not moved, so it is still ours after a timeout and can be killed
+        // and reaped before `audio_file` drops (Windows will not delete a file a live process holds).
+        let child_ref = &mut child;
         let collected = tokio::time::timeout(deadline, async move {
             let mut text = Vec::new();
             // One byte past the ceiling is all it takes to know the ceiling was breached, and reading
@@ -176,7 +188,7 @@ impl Transcriber for CommandTranscriber {
                 .take(MAX_TRANSCRIPT_BYTES as u64 + 1)
                 .read_to_end(&mut text)
                 .await?;
-            let status = child.wait().await?;
+            let status = child_ref.wait().await?;
             Ok::<_, std::io::Error>((text, status))
         })
         .await;
@@ -185,6 +197,9 @@ impl Transcriber for CommandTranscriber {
             Ok(Ok(pair)) => pair,
             Ok(Err(error)) => return Err(error),
             Err(_elapsed) => {
+                // Errors ignored: the child may already be gone, and the timeout is the result.
+                let _ = child.kill().await;
+                let _ = child.wait().await;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(

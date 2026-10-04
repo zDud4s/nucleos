@@ -14,7 +14,6 @@ import { ConversationChord } from "./ConversationChord";
 import { DictationProvider } from "./Dictation";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
-import { PaletteTrigger } from "./PaletteTrigger";
 import { QuotaNotch } from "./QuotaNotch";
 import { useNotchMode, useSetNotchMode } from "./notch-mode";
 import { useScreenLine } from "./screen-line";
@@ -76,18 +75,13 @@ function Frame() {
    */
   const chats = useChats();
   /**
-   * The roster, for the sidebar's project group.
+   * The roster, for the sidebar's project switcher.
    *
    * Already polled — this is the same query the roster page and the pending
-   * counts read, so the rail costs no extra request. `undefined` until it has
-   * answered once, and the rail draws no rows for that rather than an empty
-   * group: a heading with nothing under it reads as "you have no projects",
-   * which is a claim about the daemon's answer before it gave one.
-   *
-   * Handed over on every page even though the rail only draws it inside the
-   * projects area, and that is not waste: the query is shared, so the request
-   * happens either way, and deciding *where* the roster is shown is the rail's
-   * business rather than something this component should have to know.
+   * counts read, so the switcher costs no extra request. `undefined` until it
+   * has answered once, and the switcher says nothing about projects for that:
+   * "you have no projects" would be a claim about the daemon's answer before it
+   * gave one.
    */
   const projects = useProjects();
   /**
@@ -150,13 +144,6 @@ function Frame() {
             people already know — the drawer is somewhere you choose to go, which
             is a lower claim on the footer than the emergency stop has.
           */}
-          {/*
-            First into the slot, and put here rather than in `Sidebar.tsx`: the
-            slot's own comment says that only whoever fills it knows where the
-            break falls, and the rail does not otherwise know a palette exists.
-            `Sidebar.tsx` stays untouched, and so does its twenty-five-case test.
-          */}
-          <PaletteTrigger />
           <NotificationsDrawer />
           {/*
             The break this footer actually has. Everything above it is somewhere to

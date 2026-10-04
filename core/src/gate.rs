@@ -407,7 +407,9 @@ mod tests {
             worktree.path(),
             worktree.path(),
             r#"sh -c "exit 3""#,
-            Duration::from_secs(1),
+            // The command exits at once; the number only has to survive spawning `sh` on a
+            // loaded Windows machine, where one second was not enough.
+            Duration::from_secs(30),
         )
         .await;
 

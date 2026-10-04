@@ -196,8 +196,8 @@
   /* The same three stacks `tokens.css` declares. Written out rather than
      referenced because `--font-display: var(--font-display)` is a cycle: the
      token name and Tailwind's namespace are the same word. */
-  --font-display: "Cabinet Grotesk", "General Sans", system-ui, sans-serif;
-  --font-body: "General Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
+  --font-body: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "Spline Sans Mono", ui-monospace, "Cascadia Mono", monospace;
 
   --text-xs: 0.6875rem;

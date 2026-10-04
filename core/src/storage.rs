@@ -251,7 +251,9 @@ mod tests {
         )
         .await;
 
-        crate::testdb::apply_migrations_after(&pool, 153).await;
+        // 0154 alone: later migrations may append columns with `ADD COLUMN`, which is not this
+        // rebuild moving anything.
+        crate::testdb::apply_migration(&pool, 154).await;
 
         let columns_after = runs_columns(&pool).await;
         let tail: Vec<&str> = columns_after[columns_after.len() - 7..]

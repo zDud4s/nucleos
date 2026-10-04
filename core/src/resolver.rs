@@ -12,6 +12,7 @@
 //! in which an agent can publish a resolution nothing verified.
 
 use crate::state::AppState;
+use crate::vcs;
 
 /// How often the daemon looks for a conflict nobody has attempted.
 ///
@@ -24,10 +25,12 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Looks for conflicts to resolve, forever. Spawned once by `main.rs`.
 ///
-/// Four passes on one tick, and they are separate because they are about different rows at
+/// Five passes on one tick, and they are separate because they are about different rows at
 /// different moments: one stops a resolution nobody needs any more, one starts a resolution, one
 /// hands a finished resolution to the queue (`land_finished`), and one says what an
-/// already-published one cost. Sharing a tick is all they share — the last runs even when the
+/// already-published one cost. A fifth, `settle_moot`, marks rows that no longer want a person,
+/// which both stops counting them and keeps `next_conflict` from launching on them. Sharing a tick
+/// is all they share — the last runs even when the
 /// others have been stopped, which is deliberate and argued at `record_discards`.
 ///
 /// Stopping comes before starting, and the order is the point rather than a preference: a tick that
@@ -42,6 +45,7 @@ pub async fn run_resolution_loop(state: AppState) {
         launch_once(&state).await;
         land_finished(&state.pool, &mut refused).await;
         record_discards(&state.pool).await;
+        settle_moot(&state.pool).await;
     }
 }
 
@@ -113,6 +117,12 @@ struct Candidate {
 /// that difference where it is made: skipping is right for a resolution paused at
 /// `awaiting_approval`, and stopping one is not.
 ///
+/// **A row `settle_moot` or a person has settled is never launched either.** `settled_at` is set
+/// when git says the source is already in its target or is gone, or when somebody put the row away
+/// from the Waiting page; an agent started on any of those spends a run on nothing, and on a
+/// dismissed row it overrides a person's "nobody needs to act". The later-success subquery below
+/// stays: it covers the tick before `settle_moot` has run, which runs after this on the same tick.
+///
 /// Separated from `launch_once` so the filter can be tested against a pool alone. It is the part
 /// that decides which conflicts a person never has to look at, and it should not need an agent
 /// runner to prove.
@@ -124,6 +134,7 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
             AND op = 'merge'
             AND resolution_run_id IS NULL
             AND from_resolution = 0
+            AND settled_at IS NULL
             AND NOT EXISTS (
                 SELECT 1
                   FROM vcs_requests AS attempted
@@ -427,6 +438,82 @@ struct Published {
     /// off it by sha — `^2` is the resolution, `^2^2` is the branch it was asked to bring in — which
     /// is what lets this run after the worktree GC has deleted the resolution's branch by name.
     result_sha: String,
+}
+
+/// Settles the escalated or blocked merges and rebases that have stopped wanting a person.
+///
+/// Two arms, cheapest first. The table's own record (`vcs::settle_by_record`: a later identical
+/// success, a hand-off to a resolution) needs no git. The git arm then asks the repository about
+/// each open merge or rebase: a source branch that is gone settles as `source-gone`, a source
+/// already contained in its target as `merged`.
+///
+/// **Any git error leaves the row alone.** A repository that moved, a timeout, a missing path: none
+/// of those is evidence the work is done, and a row wrongly kept costs a glance where a row wrongly
+/// hidden costs the work.
+async fn settle_moot(pool: &sqlx::SqlitePool) {
+    if let Err(error) = vcs::settle_by_record(pool).await {
+        tracing::warn!(%error, "resolver: could not settle requests by the record");
+    }
+    let rows: Vec<(i64, String, String, String)> =
+        match sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT id, op, args, project_root FROM vcs_requests
+          WHERE {} AND op IN ('merge','rebase')",
+            vcs::WANTS_A_PERSON_SQL
+        )))
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "resolver: could not look for moot git requests");
+                return;
+            }
+        };
+    for (id, op, args, root) in rows {
+        let Ok(op) = vcs::Op::from_stored(&op, &args) else {
+            continue;
+        };
+        // `ancestor` must be contained in `descendant` for the work to be in.
+        let (source, target, ancestor, descendant) = match &op {
+            vcs::Op::Merge { source, target } => (
+                source.as_str(),
+                target.as_str(),
+                source.as_str(),
+                target.as_str(),
+            ),
+            vcs::Op::Rebase { branch, onto } => (
+                branch.as_str(),
+                onto.as_str(),
+                onto.as_str(),
+                branch.as_str(),
+            ),
+            _ => continue,
+        };
+        let root = std::path::Path::new(&root);
+        // `branch_exists` answers `false` for a directory git cannot read at all, and "source-gone"
+        // must mean the branch is gone, not that the repository moved: no `.git`, no verdict.
+        if !root.join(".git").exists() {
+            continue;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let reason = match crate::git_exec::branch_exists(root, source, deadline).await {
+            Ok(false) => "source-gone",
+            Ok(true) => {
+                match crate::git_exec::branch_exists(root, target, deadline).await {
+                    Ok(true) => {}
+                    _ => continue,
+                }
+                match crate::git_exec::is_ancestor(root, ancestor, descendant, deadline).await {
+                    Ok(true) => "merged",
+                    _ => continue,
+                }
+            }
+            Err(_) => continue,
+        };
+        if let Err(error) = vcs::settle(pool, id, reason).await {
+            tracing::warn!(request_id = id, %error, "resolver: could not settle a moot request");
+        }
+    }
 }
 
 /// Works out what ONE published resolution left behind, and writes it on the row.
@@ -1886,5 +1973,188 @@ mod tests {
         let prompt = resolution_prompt("feat/x", "master", None);
         assert!(prompt.contains("ALREADY STAGED"));
         assert!(!prompt.contains("Git's own account"));
+    }
+
+    // ---- settle_moot: the pass that stops counting what no longer wants a person ----
+
+    /// A real repository on `master`, and the directory that keeps it alive.
+    fn moot_repo(prefix: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let container = crate::git_exec::tests::space_free_tempdir(prefix);
+        let repo = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&repo);
+        assert!(git_at(&repo, &["branch", "-M", "master"]));
+        (container, repo)
+    }
+
+    fn commit_file(repo: &std::path::Path, content: &str, message: &str) {
+        std::fs::write(repo.join("seed.txt"), content).unwrap();
+        assert!(git_at(repo, &["commit", "-qam", message]));
+    }
+
+    /// Points a request at a repository on disk, which is where the git arm reads from.
+    async fn rooted_at(pool: &sqlx::SqlitePool, id: i64, root: &std::path::Path) {
+        sqlx::query("UPDATE vcs_requests SET project_root = ? WHERE id = ?")
+            .bind(root.to_string_lossy().into_owned())
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("point the request at the repository");
+    }
+
+    /// An escalated rebase, admitted through the real INSERT like `escalated_merge_of`.
+    async fn escalated_rebase_of(pool: &sqlx::SqlitePool, branch: &str, onto: &str) -> i64 {
+        let repo = crate::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj");
+        let op = crate::vcs::Op::Rebase {
+            branch: branch.into(),
+            onto: onto.into(),
+        };
+        let id = crate::vcs::submit(pool, &repo, &op, crate::vcs::Origin::Shell)
+            .await
+            .expect("admit the rebase");
+        sqlx::query("UPDATE vcs_requests SET status = 'escalated' WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("escalate it");
+        id
+    }
+
+    async fn settlement_of(pool: &sqlx::SqlitePool, id: i64) -> (Option<String>, Option<String>) {
+        sqlx::query_as("SELECT settled_at, settled_reason FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read the settlement")
+    }
+
+    async fn status_of(pool: &sqlx::SqlitePool, id: i64) -> String {
+        sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_merge_already_in_its_target_is_settled_as_merged() {
+        let (_container, repo) = moot_repo("nucleos-settle-merged-");
+        // `feat/x` stays where master was, then master moves on: the source is an ancestor.
+        assert!(git_at(&repo, &["branch", "feat/x"]));
+        commit_file(&repo, "ahead\n", "master moves on");
+        // And a rebase target already underneath its branch.
+        assert!(git_at(&repo, &["checkout", "-q", "-b", "feat/r"]));
+        commit_file(&repo, "rebased\n", "on top of master");
+        assert!(git_at(&repo, &["checkout", "-q", "master"]));
+
+        let pool = test_pool().await;
+        let merge = escalated_merge_of(&pool, "feat/x", false).await;
+        let rebase = escalated_rebase_of(&pool, "feat/r", "master").await;
+        rooted_at(&pool, merge, &repo).await;
+        rooted_at(&pool, rebase, &repo).await;
+
+        settle_moot(&pool).await;
+
+        for id in [merge, rebase] {
+            let (at, reason) = settlement_of(&pool, id).await;
+            assert!(at.is_some(), "request {id} no longer wants a person");
+            assert_eq!(reason.as_deref(), Some("merged"));
+            assert_eq!(
+                status_of(&pool, id).await,
+                "escalated",
+                "settling is a note on the row, never a status change"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_merge_whose_source_is_gone_is_settled_as_source_gone() {
+        let (_container, repo) = moot_repo("nucleos-settle-gone-");
+        let pool = test_pool().await;
+        let merge = escalated_merge_of(&pool, "feat/deleted", false).await;
+        let rebase = escalated_rebase_of(&pool, "feat/also-deleted", "master").await;
+        rooted_at(&pool, merge, &repo).await;
+        rooted_at(&pool, rebase, &repo).await;
+
+        settle_moot(&pool).await;
+
+        for id in [merge, rebase] {
+            assert_eq!(
+                settlement_of(&pool, id).await.1.as_deref(),
+                Some("source-gone"),
+                "request {id} names a branch that is no longer `refs/heads/<b>`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_conflict_or_unreadable_repo_stays_unsettled() {
+        let (_container, repo) = moot_repo("nucleos-settle-live-");
+        // The same conflicting pair `resolution_scenario` builds: the branches are still apart.
+        assert!(git_at(&repo, &["checkout", "-q", "-b", "feat/x"]));
+        commit_file(&repo, "theirs\n", "theirs");
+        assert!(git_at(&repo, &["checkout", "-q", "master"]));
+        commit_file(&repo, "ours\n", "ours");
+
+        let pool = test_pool().await;
+        let live = escalated_merge_of(&pool, "feat/x", false).await;
+        rooted_at(&pool, live, &repo).await;
+
+        // A root git cannot read at all: failing toward showing the row is the whole point.
+        let missing = repo.parent().unwrap().join("no-such-repository");
+        let unreadable = escalated_merge_of(&pool, "feat/y", false).await;
+        rooted_at(&pool, unreadable, &missing).await;
+
+        settle_moot(&pool).await;
+
+        for id in [live, unreadable] {
+            assert_eq!(
+                settlement_of(&pool, id).await,
+                (None, None),
+                "request {id} still wants a person"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_conflict_the_settle_pass_settled_is_never_launched() {
+        let (_container, repo) = moot_repo("nucleos-settle-launch-");
+        // Already merged into master, so the git arm settles it, and an agent started on it would
+        // spend a run resolving work that is already in.
+        assert!(git_at(&repo, &["branch", "feat/x"]));
+        commit_file(&repo, "ahead\n", "master moves on");
+
+        let pool = test_pool().await;
+        let escalated = escalated_merge_of(&pool, "feat/x", false).await;
+        rooted_at(&pool, escalated, &repo).await;
+
+        let before = next_conflict(&pool).await.unwrap().map(|c| c.id);
+        assert_eq!(
+            before,
+            Some(escalated),
+            "unsettled, it is launched as before"
+        );
+
+        settle_moot(&pool).await;
+        assert!(
+            settlement_of(&pool, escalated).await.0.is_some(),
+            "the pass really did settle it, or this test proves nothing"
+        );
+
+        let after = next_conflict(&pool).await.unwrap().map(|c| c.id);
+        assert_eq!(after, None, "a settled conflict starts no agent");
+    }
+
+    #[tokio::test]
+    async fn a_conflict_a_person_put_away_is_never_launched() {
+        let pool = test_pool().await;
+        let dismissed = escalated_merge_of(&pool, "feat/put-away", false).await;
+        let open = escalated_merge_of(&pool, "feat/still-open", false).await;
+
+        crate::vcs::dismiss(&pool, dismissed).await.unwrap();
+
+        // "Nobody needs to act" is a person's answer; the loop must not act on it either. The row
+        // beside it, never put away, is still the one launched.
+        let next = next_conflict(&pool).await.unwrap().map(|c| c.id);
+        assert_eq!(next, Some(open));
     }
 }

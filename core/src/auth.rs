@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     http::{Method, StatusCode, header},
     middleware::Next,
     response::Response,
@@ -12,12 +12,43 @@ use crate::state::AppState;
 #[derive(Clone)]
 pub struct Token(pub String);
 
-pub fn generate_token() -> String {
+/// 32 random alphanumerics, with no marker. The raw material of every credential below; nothing
+/// the daemon hands out should be this bare string any more — see [`mint_secret`].
+fn generate_token() -> String {
     rand::rng()
         .sample_iter(&rand::distr::Alphanumeric)
         .take(32)
         .map(char::from)
         .collect()
+}
+
+/// The marker every secret this daemon mints opens with, the way GitHub's open with `ghp_`.
+///
+/// It exists for `redact.rs`. Before it, a run key was `<run_id>.<32 alnum>` and a sidecar key
+/// `<service>.<32 alnum>` — nothing in either that a scanner could tell from `file.rs` with a long
+/// tail, so the redactor could only catch the families that happened to carry `api:`/`team:`/
+/// `chat:`. With it, every key is recognisable on its own, wherever it lands in a log.
+pub const SECRET_PREFIX: &str = "nos_";
+
+/// A fresh secret of one family: `nos_<kind>_<32 alnum>`.
+///
+/// The marker goes in the SECRET half, never in front of the whole key, so the `<id>.` /
+/// `api:<name>.` / `team:<id>.` / `chat:<id>.` structure `resolve` splits on is untouched. And
+/// because what is stored is exactly this string, verification needs no change of its own: a new
+/// key's secret compares against a new stored value, and a key minted before the prefix existed
+/// still compares against the bare value stored beside it. Nothing is rewritten, so nothing that
+/// already works stops working; the bare keys retire as their runs end and their rows are
+/// re-minted.
+///
+/// `kind` is a short lowercase tag naming the family (`ctl`, `run`, `api`, ...), 2 to 8 letters,
+/// which is the shape `redact::nucleos_secrets` looks for. It is never parsed back: it is there so
+/// a person reading a redaction knows what leaked, nothing more.
+pub fn mint_secret(kind: &str) -> String {
+    debug_assert!(
+        (2..=8).contains(&kind.len()) && kind.bytes().all(|b| b.is_ascii_lowercase()),
+        "secret kind {kind:?} must be 2-8 lowercase letters"
+    );
+    format!("{SECRET_PREFIX}{kind}_{}", generate_token())
 }
 
 /// Generates an RFC 9562 UUID version 4 without adding a second randomness dependency.
@@ -427,6 +458,32 @@ const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
 /// fail somewhere other than production.
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
+    grants(scope, method, path, Target::Path)
+}
+
+/// PURE: whether `scope` may perform `method` on the route TEMPLATE axum actually dispatched to.
+///
+/// This is what the middleware asks, and it is stricter than `permits`. A concrete path cannot
+/// tell `/assistant/chats` (a route of its own) from `/assistant/{turn_id}` called with the turn id
+/// `chats`: both are two segments, and a `{param}` in a table matched any non-empty one — so a key
+/// granted the read of one turn also reached every literal sibling of it (the conversation list,
+/// the search, the IDE sessions), and a council or team key holding `/runs/{id}` reached
+/// `/runs/awaiting-approval`. The template the router chose carries no such ambiguity: a `{param}`
+/// in a table matches only a `{param}` in the template, and a literal only the same literal.
+pub(crate) fn permits_route(scope: &Scope, method: &Method, route: &str) -> bool {
+    grants(scope, method, route, Target::Route)
+}
+
+/// What the string handed to `grants` is: a request path as a client sent it, or the template of
+/// the route the router matched it to.
+#[derive(Clone, Copy)]
+enum Target {
+    Path,
+    Route,
+}
+
+fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
+    let listed = |routes: &[(Method, &str)]| route_is_listed_as(routes, method, path, target);
     match scope {
         Scope::Control => true,
         Scope::Run(_) => {
@@ -436,25 +493,43 @@ pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
                     || path == POSTTOOLUSE_ROUTE
                     || path == FINDING_ROUTE)
         }
-        Scope::Service(Service::Email) => route_is_listed(EMAIL_ROUTES, method, path),
-        Scope::Service(Service::Council) => route_is_listed(COUNCIL_ROUTES, method, path),
-        Scope::TeamRun(_) => route_is_listed(TEAM_ROUTES, method, path),
-        Scope::ApiToken(ApiTokenLevel::ReadOnly) => route_is_listed(READ_ONLY_ROUTES, method, path),
+        Scope::Service(Service::Email) => listed(EMAIL_ROUTES),
+        Scope::Service(Service::Council) => listed(COUNCIL_ROUTES),
+        Scope::TeamRun(_) => listed(TEAM_ROUTES),
+        Scope::ApiToken(ApiTokenLevel::ReadOnly) => listed(READ_ONLY_ROUTES),
         Scope::ApiToken(ApiTokenLevel::RunCreating) => {
-            route_is_listed(READ_ONLY_ROUTES, method, path)
-                || route_is_listed(RUN_CREATING_ROUTES, method, path)
+            listed(READ_ONLY_ROUTES) || listed(RUN_CREATING_ROUTES)
         }
         Scope::ApiToken(ApiTokenLevel::Admin) => true,
     }
 }
 
+/// Whether a concrete path is listed. The tests' table assertions ask this, the loosest reading,
+/// so an absence they assert holds under the stricter template reading as well.
+#[cfg(test)]
 fn route_is_listed(routes: &[(Method, &str)], method: &Method, path: &str) -> bool {
-    routes
-        .iter()
-        .any(|(allowed, pattern)| allowed == method && path_matches(pattern, path))
+    route_is_listed_as(routes, method, path, Target::Path)
 }
 
-fn path_matches(pattern: &str, path: &str) -> bool {
+fn route_is_listed_as(
+    routes: &[(Method, &str)],
+    method: &Method,
+    path: &str,
+    target: Target,
+) -> bool {
+    routes
+        .iter()
+        .any(|(allowed, pattern)| allowed == method && path_matches(pattern, path, target))
+}
+
+fn is_param(segment: &str) -> bool {
+    segment.starts_with('{') && segment.ends_with('}')
+}
+
+/// Segment by segment. Against a concrete path a `{param}` takes any non-empty value; against a
+/// route template it takes only another `{param}`, so a literal sibling route never borrows the
+/// grant of the parameterised one.
+fn path_matches(pattern: &str, path: &str, target: Target) -> bool {
     let mut pattern = pattern.trim_matches('/').split('/');
     let mut actual = path.trim_matches('/').split('/');
 
@@ -463,9 +538,11 @@ fn path_matches(pattern: &str, path: &str) -> bool {
             (None, None) => return true,
             (Some(expected), Some(found))
                 if expected == found
-                    || (expected.starts_with('{')
-                        && expected.ends_with('}')
-                        && !found.is_empty()) => {}
+                    || (is_param(expected)
+                        && match target {
+                            Target::Path => !found.is_empty(),
+                            Target::Route => is_param(found),
+                        }) => {}
             _ => return false,
         }
     }
@@ -476,13 +553,13 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 /// The id travels in the token so the lookup is by primary key rather than by the secret itself,
 /// which keeps the comparison in Rust — and constant-time — instead of in SQLite's `=`.
 pub fn mint_run_token(id: i64) -> (String, String) {
-    let secret = generate_token();
+    let secret = mint_secret("run");
     (format!("{id}.{secret}"), secret)
 }
 
 /// A durable API key and the secret stored for it: `api:<name>.<secret>`.
 pub fn mint_api_token(name: &str) -> (String, String) {
-    let secret = generate_token();
+    let secret = mint_secret("api");
     (format!("api:{name}.{secret}"), secret)
 }
 
@@ -613,7 +690,7 @@ const TEAM_ROUTES: &[(Method, &str)] = &[
 /// established, so the comment saying the prefix "picks the table without a second marker" now
 /// names four families instead of three.
 pub fn mint_team_token(team_run_id: &str) -> (String, String) {
-    let secret = generate_token();
+    let secret = mint_secret("team");
     (format!("team:{team_run_id}.{secret}"), secret)
 }
 
@@ -662,7 +739,7 @@ pub async fn mint_service_token(
     pool: &sqlx::SqlitePool,
     service: Service,
 ) -> Result<String, sqlx::Error> {
-    let secret = generate_token();
+    let secret = mint_secret("svc");
     sqlx::query("INSERT OR REPLACE INTO service_tokens (name, token) VALUES (?, ?)")
         .bind(service.name())
         .bind(&secret)
@@ -683,7 +760,7 @@ pub async fn mint_chat_token(
     pool: &sqlx::SqlitePool,
     chat_id: &str,
 ) -> Result<String, sqlx::Error> {
-    let secret = generate_token();
+    let secret = mint_secret("chat");
     sqlx::query("INSERT OR REPLACE INTO chat_tokens (chat_id, token) VALUES (?, ?)")
         .bind(chat_id)
         .bind(&secret)
@@ -705,7 +782,8 @@ async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
     // others take everything before the FIRST dot as their prefix, which is safe for a fixed
     // service name and for an integer, and is not safe for a conversation id: ids are UUIDs today,
     // but a dotted one would silently become somebody else's lookup rather than a failed one. The
-    // secret is `generate_token`'s alphanumerics and can never hold a dot, so the last one is
+    // secret is `mint_secret`'s `nos_<kind>_` plus alphanumerics (or, for a key minted before the
+    // prefix, the alphanumerics alone) and can never hold a dot, so the last one is
     // always the separator.
     if let Some(rest) = presented.strip_prefix("chat:") {
         let (chat_id, secret) = rest.rsplit_once('.')?;
@@ -828,7 +906,14 @@ pub async fn require_token(
     // 403 rather than 401: the caller authenticated, it is simply not allowed here. Warned rather
     // than silently refused, because a run reaching for a control route is the exact signature of
     // the thing this scope exists to stop, and it should be visible when it happens.
-    if !permits(&scope, req.method(), req.uri().path()) {
+    // Graded against the route the router chose, not the path the client typed: see
+    // `permits_route` for the over-grant the raw path allowed. A request that matched no route has
+    // no template and falls back to its path — it is headed for a 404 either way.
+    let allowed = match req.extensions().get::<MatchedPath>() {
+        Some(matched) => permits_route(&scope, req.method(), matched.as_str()),
+        None => permits(&scope, req.method(), req.uri().path()),
+    };
+    if !allowed {
         tracing::warn!(
             ?scope,
             method = %req.method(),
@@ -946,6 +1031,13 @@ mod tests {
             .route("/presets/{id}/run", post(|| async {}))
             .route("/assistant/message", post(|| async {}))
             .route("/assistant/{turn_id}", get(|| async {}))
+            // Literal siblings of `/assistant/{turn_id}` and `/runs/{id}`, mounted so the tests that
+            // they do NOT inherit the parameterised grant are answered by `require_token` rather
+            // than by the router not knowing the path.
+            .route("/assistant/chats", get(|| async {}))
+            .route("/assistant/search", get(|| async {}))
+            .route("/assistant/ide-sessions", get(|| async {}))
+            .route("/runs/awaiting-approval", get(|| async {}))
             .route("/proposals", get(|| async {}))
             // A stand-in for the real gate route: these tests are about who may reach it, and the
             // path is what `permits` matches on.
@@ -1622,6 +1714,96 @@ mod tests {
             status_of(&app, "POST", "/route/report", &token).await,
             StatusCode::FORBIDDEN
         );
+    }
+
+    /// Against a route template a `{param}` grant covers only the parameterised route, never a
+    /// literal sibling the router dispatches separately.
+    #[test]
+    fn a_param_grant_does_not_cover_a_literal_sibling_route() {
+        let reader = Scope::ApiToken(ApiTokenLevel::ReadOnly);
+        assert!(permits_route(&reader, &Method::GET, "/assistant/{turn_id}"));
+        for sibling in [
+            "/assistant/chats",
+            "/assistant/search",
+            "/assistant/ide-sessions",
+            "/assistant/local-model",
+            "/assistant/models",
+            "/assistant/tools",
+            "/assistant/commands",
+        ] {
+            assert!(
+                !permits_route(&reader, &Method::GET, sibling),
+                "GET {sibling} must not borrow the grant of /assistant/{{turn_id}}"
+            );
+        }
+
+        let council = Scope::Service(Service::Council);
+        let team = Scope::TeamRun("run-1".to_owned());
+        assert!(permits_route(&council, &Method::GET, "/runs/{id}"));
+        assert!(!permits_route(
+            &council,
+            &Method::GET,
+            "/runs/awaiting-approval"
+        ));
+        for scope in [&council, &team] {
+            assert!(permits_route(scope, &Method::GET, "/email/{id}"));
+            assert!(!permits_route(scope, &Method::GET, "/email/cursor"));
+        }
+        // The parameter's name is not part of the grant: only its position is.
+        assert!(permits_route(&reader, &Method::GET, "/runs/{run_id}"));
+    }
+
+    /// The same, through the real middleware: what reaches `require_token` is the template axum
+    /// chose, so the literal siblings are refused while the parameterised routes still answer.
+    #[tokio::test]
+    async fn a_param_grant_does_not_reach_a_literal_sibling_over_http() {
+        let state = test_state("control-token").await;
+        let reader = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let council = mint_service_token(&state.pool, Service::Council)
+            .await
+            .unwrap();
+        let team = live_team_run_with_token(&state, "run-1").await;
+        let app = protected_router(state);
+
+        assert_eq!(
+            status_of(&app, "GET", "/assistant/42", &reader).await,
+            StatusCode::OK
+        );
+        for sibling in [
+            "/assistant/chats",
+            "/assistant/search",
+            "/assistant/ide-sessions",
+        ] {
+            assert_eq!(
+                status_of(&app, "GET", sibling, &reader).await,
+                StatusCode::FORBIDDEN,
+                "{sibling} is not a turn"
+            );
+        }
+        // Listed in its own right for the read-only key, so that one still answers.
+        assert_eq!(
+            status_of(&app, "GET", "/runs/awaiting-approval", &reader).await,
+            StatusCode::OK
+        );
+
+        assert_eq!(
+            status_of(&app, "GET", "/runs/7", &council).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(&app, "GET", "/runs/awaiting-approval", &council).await,
+            StatusCode::FORBIDDEN
+        );
+        for key in [&council, &team] {
+            assert_eq!(
+                status_of(&app, "GET", "/email/7", key).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                status_of(&app, "GET", "/email/cursor", key).await,
+                StatusCode::FORBIDDEN
+            );
+        }
     }
 
     /// §11 item 9, asked of a real token through the real middleware rather than of `permits`.
@@ -2414,6 +2596,30 @@ mod tests {
                 "Admin: {method} {path}"
             );
         }
+
+        // And by template: no scope table grants any of them, so a grant added later to a
+        // table that matches templates cannot reach the notes by accident either.
+        const TEMPLATES: &[(Method, &str)] = &[
+            (Method::GET, "/owner-notes"),
+            (Method::POST, "/owner-notes"),
+            (Method::GET, "/owner-notes/search"),
+            (Method::GET, "/owner-notes/graph"),
+            (Method::GET, "/owner-notes/{id}"),
+            (Method::PATCH, "/owner-notes/{id}"),
+            (Method::POST, "/owner-notes/{id}/links"),
+            (Method::DELETE, "/owner-notes/links/{link_id}"),
+            (Method::POST, "/owner-notes/{id}/teach"),
+        ];
+        for (method, pattern) in TEMPLATES {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, method, pattern)
+                    && !route_is_listed(RUN_CREATING_ROUTES, method, pattern)
+                    && !route_is_listed(TEAM_ROUTES, method, pattern)
+                    && !route_is_listed(EMAIL_ROUTES, method, pattern)
+                    && !route_is_listed(COUNCIL_ROUTES, method, pattern),
+                "{method} {pattern} is in a scope table; the owner's notes are owner-only"
+            );
+        }
     }
 
     #[test]
@@ -3062,5 +3268,126 @@ mod tests {
                 "{method} {uri}"
             );
         }
+    }
+
+    /// Every family the daemon mints now carries `nos_<kind>_`, in the secret half, with the
+    /// lookup structure in front of it exactly as it was — and the redactor recognises each one
+    /// without help, including the run and service keys that used to be a bare `<id>.<secret>`.
+    #[tokio::test]
+    async fn every_minted_key_carries_the_prefix_and_is_redacted_whole() {
+        let state = test_state("control-token").await;
+        let (run, run_secret) = mint_run_token(42);
+        let (api, api_secret) = mint_api_token("deploy-bot");
+        let (team, team_secret) = mint_team_token("tr-1");
+        let service = mint_service_token(&state.pool, Service::Email)
+            .await
+            .unwrap();
+        let chat = mint_chat_token(&state.pool, "c-1").await.unwrap();
+        let control = mint_secret("ctl");
+
+        assert!(run.starts_with("42.nos_run_"), "{run}");
+        assert!(api.starts_with("api:deploy-bot.nos_api_"), "{api}");
+        assert!(team.starts_with("team:tr-1.nos_team_"), "{team}");
+        assert!(service.starts_with("email.nos_svc_"), "{service}");
+        assert!(chat.starts_with("chat:c-1.nos_chat_"), "{chat}");
+        assert!(control.starts_with("nos_ctl_"), "{control}");
+        for secret in [&run_secret, &api_secret, &team_secret] {
+            assert!(secret.starts_with(SECRET_PREFIX), "{secret}");
+            assert!(
+                !secret.contains('.'),
+                "the separator must stay unambiguous: {secret}"
+            );
+        }
+
+        for key in [&run, &api, &team, &service, &chat, &control] {
+            let redacted = crate::redact::redact_secrets(&format!("leaked {key} here"));
+            assert!(
+                redacted.contains("[SECRET:nucleos-token]"),
+                "{key} was not redacted: {redacted}"
+            );
+            let secret = key.rsplit('.').next().unwrap();
+            assert!(!redacted.contains(secret), "{redacted}");
+        }
+    }
+
+    /// Backward compatibility, the hard constraint of the prefix: a key minted before it — a bare
+    /// 32-alphanumeric secret stored, and presented in the old shape — must still resolve to the
+    /// scope it always did, for every family. Nothing was migrated, so nothing may stop working.
+    #[tokio::test]
+    async fn keys_minted_before_the_prefix_still_resolve() {
+        let bare = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
+        assert_eq!(bare.len(), 32);
+
+        // The control token, as an older daemon stored it.
+        let state = test_state(bare).await;
+        assert_eq!(resolve(&state, bare).await, Some(Scope::Control));
+
+        // A run.
+        let (run_id, _) = running_run_with_token(&state).await;
+        sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
+            .bind(bare)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve(&state, &format!("{run_id}.{bare}")).await,
+            Some(Scope::Run(run_id))
+        );
+
+        // An API key somebody pasted into a script months ago.
+        sqlx::query(
+            "INSERT INTO api_tokens (name, token, access_level, created_at)
+             VALUES ('old-bot', ?, 'read-only', '2026-01-01T00:00:00Z')",
+        )
+        .bind(bare)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            resolve(&state, &format!("api:old-bot.{bare}")).await,
+            Some(Scope::ApiToken(ApiTokenLevel::ReadOnly))
+        );
+
+        // A team run still working when the daemon was upgraded.
+        live_team_run_with_token(&state, "tr-old").await;
+        sqlx::query("UPDATE team_runs SET token = ? WHERE id = 'tr-old'")
+            .bind(bare)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve(&state, &format!("team:tr-old.{bare}")).await,
+            Some(Scope::TeamRun("tr-old".to_owned()))
+        );
+
+        // A sidecar's key, from the row an older daemon left behind.
+        sqlx::query("INSERT OR REPLACE INTO service_tokens (name, token) VALUES ('email', ?)")
+            .bind(bare)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve(&state, &format!("email.{bare}")).await,
+            Some(Scope::Service(Service::Email))
+        );
+
+        // A conversation's key, held by a CLI spawned before the upgrade.
+        sqlx::query("INSERT OR REPLACE INTO chat_tokens (chat_id, token) VALUES ('c-old', ?)")
+            .bind(bare)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let turn = running_turn_of(&state, "c-old").await;
+        assert_eq!(
+            resolve(&state, &format!("chat:c-old.{bare}")).await,
+            Some(Scope::Run(turn))
+        );
+
+        // And the prefix is no master key: a bare row does not answer to the marker glued on.
+        assert_eq!(
+            resolve(&state, &format!("{run_id}.nos_run_{bare}")).await,
+            None
+        );
     }
 }

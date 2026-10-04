@@ -405,6 +405,16 @@ pub static SECRETS: &[Secret] = &[
         what: "OpenRouter's key; without it a hosted chat turn is refused before any request leaves the machine, however `hosted_assistant_model` is set",
     },
     Secret {
+        key: "anthropic-api-key",
+        area: "models",
+        what: "Anthropic's key, used only to list its newest models in the chat picker; without it the picker uses the built-in catalogue. Takes effect after a daemon restart",
+    },
+    Secret {
+        key: "openai-api-key",
+        area: "models",
+        what: "OpenAI's key, used only to list its newest models in the chat picker; without it the picker uses the built-in catalogue. Takes effect after a daemon restart",
+    },
+    Secret {
         key: crate::judge::TYPESAFE_KEY,
         area: "models",
         what: "TypeSafe's key for the autopilot's judge (the Jev); without it a project in observe or enforce decides exactly as it would with the judge off, and nothing is sent",

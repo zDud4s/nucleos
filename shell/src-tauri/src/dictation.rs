@@ -716,6 +716,12 @@ pub fn voice_phase(state: State<'_, Dictation>) -> Result<&'static str, String> 
     })
 }
 
+/// Whether a paste is legitimate in this phase: only while the transcript of a finished recording
+/// is being delivered.
+fn may_paste(phase: Phase) -> bool {
+    phase == Phase::Transcribing
+}
+
 /// Types a transcript into the window the dictation started in, or explains why it did not.
 ///
 /// The three refusals are `voice`'s, not this function's. What is here is only the order: check the
@@ -725,6 +731,11 @@ pub fn voice_phase(state: State<'_, Dictation>) -> Result<&'static str, String> 
 pub fn voice_paste(state: State<'_, Dictation>, text: String) -> Result<Delivery, String> {
     let recorded_into = {
         let mut inner = state.inner.lock().map_err(|_| poisoned())?;
+        // Only a dictation that has been recorded and is being transcribed has anything to paste.
+        // Without this guard the command typed arbitrary text into the front window on demand.
+        if !may_paste(inner.phase) {
+            return Err("no dictation is waiting to be pasted".to_string());
+        }
         // Released here rather than at the end: pasting takes up to two seconds of waiting for a
         // chord, and holding the phase across that would absorb every press made in the meantime.
         inner.phase = Phase::Idle;
@@ -947,6 +958,13 @@ mod tests {
             "\"dictation\""
         );
         assert_eq!(serde_json::to_string(&Kind::Memo).unwrap(), "\"memo\"");
+    }
+
+    #[test]
+    fn a_paste_is_refused_unless_a_recording_is_being_transcribed() {
+        assert!(!may_paste(Phase::Idle));
+        assert!(!may_paste(Phase::Recording));
+        assert!(may_paste(Phase::Transcribing));
     }
 
     #[test]

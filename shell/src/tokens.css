@@ -26,8 +26,8 @@
 :root {
   /* ---------------------------------------------------------------- type -- */
   /* The three families declared in fonts.css, each with a job. */
-  --font-display: "Cabinet Grotesk", "General Sans", system-ui, sans-serif;
-  --font-body: "General Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
+  --font-body: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "Spline Sans Mono", ui-monospace, "Cascadia Mono", monospace;
 
   --text-xs: 0.6875rem;

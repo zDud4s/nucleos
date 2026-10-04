@@ -14,6 +14,7 @@ mod browser_wheel;
 mod budget;
 mod calendar;
 mod capabilities;
+mod chat_groups;
 mod chat_notices;
 mod chats;
 mod classifier;
@@ -60,6 +61,7 @@ mod map_store;
 mod map_triage;
 mod mcp_tools;
 mod mentions;
+mod model_catalog;
 mod notes;
 mod notify;
 mod notify_policy;
@@ -1139,7 +1141,9 @@ async fn main() {
 
     let token_value = match secrets::daemon_token(
         secrets::load_secret(TOKEN_KEY),
-        auth::generate_token,
+        // Only a FIRST start mints: a token already in the store is returned as it is, prefixed or
+        // not, so the shell, the telegram sidecar and every hook holding it keep working.
+        || auth::mint_secret("ctl"),
         |fresh| secrets::store_secret(TOKEN_KEY, fresh),
     ) {
         Ok(token) => token,
@@ -1328,16 +1332,16 @@ async fn main() {
     // needs a secret solely to refuse anything else on the machine that can open a socket. A
     // per-boot random value is therefore strictly better than a long-lived one — there is nothing
     // to leak and nothing to rotate.
-    let web_sidecar_token = auth::generate_token();
+    let web_sidecar_token = auth::mint_secret("web");
     // The browser sidecar's, minted the same way and for the same reason. It matters more here: the
     // process it authenticates drives browsers holding the owner's logged-in profiles, so a secret
     // that leaked would hand those sessions to anything on the machine that can open a socket.
-    let browser_sidecar_token = auth::generate_token();
+    let browser_sidecar_token = auth::mint_secret("browser");
     // The quota sidecar's, the same way again. Nothing of the owner's travels on this connection in
     // either direction — the request is empty and the answer is a handful of percentages — so this
     // secret exists only to keep anything else on the machine from asking the daemon's sidecar how
     // much of the owner's limit is gone.
-    let quota_sidecar_token = auth::generate_token();
+    let quota_sidecar_token = auth::mint_secret("quota");
     // Cleanup is armed SEPARATELY from transcription, and a failed probe costs only the tidying up.
     //
     // That asymmetry is deliberate. Local triage refuses to run at all when its probe fails, because
@@ -1603,6 +1607,28 @@ async fn main() {
         (None, Ok(None)) => (None, None),
         (None, Err(_)) => (None, None),
     };
+
+    // Model discovery keys: the credential store first, the environment second. Only whether each
+    // is present is ever logged. A key stored while the daemon runs takes effect after a restart.
+    {
+        let key = |name: &str, env: &str| {
+            secrets::load_secret(name)
+                .ok()
+                .flatten()
+                .or_else(|| std::env::var(env).ok())
+                .filter(|k| !k.trim().is_empty())
+        };
+        let keys = model_catalog::Keys {
+            anthropic: key("anthropic-api-key", "ANTHROPIC_API_KEY"),
+            openai: key("openai-api-key", "OPENAI_API_KEY"),
+        };
+        tracing::info!(
+            anthropic = keys.anthropic.is_some(),
+            openai = keys.openai.is_some(),
+            "model discovery keys"
+        );
+        model_catalog::install_keys(keys);
+    }
 
     // Read after the local model has been probed, because whether a `kind: local` seat is runnable
     // is not something a config file can assert — startup PROVES it, and a roster naming a local

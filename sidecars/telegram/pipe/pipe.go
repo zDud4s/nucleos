@@ -831,7 +831,33 @@ func HandleCallback(bot Bot, dc Daemon, cb telegram.CallbackQuery) {
 	}
 }
 
-func RunNotifier(ctx context.Context, bot Bot, dc Daemon, to telegram.Destination, interval time.Duration) {
+// feedDestination picks where one feed line goes: its project's topic when the project is mapped,
+// the configured chat otherwise. project_id may be absent or an explicit null, so it is read by
+// type assertion and never by key presence.
+func feedDestination(f map[string]any, configured telegram.Destination, topics map[string]int64) (telegram.Destination, bool) {
+	id, _ := f["project_id"].(string)
+	if id == "" {
+		return configured, false
+	}
+	n, ok := topics[id]
+	if !ok {
+		return configured, false
+	}
+	return telegram.Destination{ChatID: configured.ChatID, ThreadID: n}, true
+}
+
+// refusedByTelegram reports a 4xx client refusal other than 429. Only that says the topic
+// itself is wrong; a 429, with or without retry_after, and a 5xx are transient, so the line
+// keeps the Forget-and-retry loop.
+func refusedByTelegram(err error) bool {
+	var api *telegram.APIError
+	if !errors.As(err, &api) || telegram.IsRateLimited(err) {
+		return false
+	}
+	return api.StatusCode >= 400 && api.StatusCode < 500 && api.StatusCode != 429
+}
+
+func RunNotifier(ctx context.Context, bot Bot, dc Daemon, to telegram.Destination, topics map[string]int64, interval time.Duration) {
 	state := notifier.NewState()
 
 	// Seeding has to succeed before anything is announced, and at boot the daemon is usually not up
@@ -872,7 +898,15 @@ func RunNotifier(ctx context.Context, bot Bot, dc Daemon, to telegram.Destinatio
 					// the row again next round, and it would be declined again for ever.
 					continue
 				}
-				err := bot.SendMessage(to, "📣 "+formatFeed(f))
+				dest, routed := feedDestination(f, to, topics)
+				err := bot.SendMessage(dest, "📣 "+formatFeed(f))
+				// A topic Telegram refuses (deleted, closed, not a forum) must not loop for ever, so
+				// it falls back once to the configured chat. Throttle and transport errors are not
+				// a refusal of the topic and keep the Forget-and-retry path below.
+				if err != nil && routed && refusedByTelegram(err) {
+					log.Printf("feed item: topic %d refused (%v); sending to the configured chat", dest.ThreadID, err)
+					err = bot.SendMessage(to, "📣 "+formatFeed(f))
+				}
 				logSend("feed item", err)
 				if err != nil {
 					state.Forget(idOf(f))

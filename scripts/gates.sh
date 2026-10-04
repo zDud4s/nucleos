@@ -6,14 +6,10 @@
 # `.github/workflows/ci.yml` calls it rather than repeating them — one definition of green, run in
 # two places.
 #
-# The workflow does not run yet: this repo has no remote, and Actions reads workflows server-side.
-# It is committed anyway because it is the thing you need in place BEFORE the first push, not
-# after — otherwise whoever adds the remote has to know to write it.
-#
 # Every stack runs even when an earlier one fails — a summary of three real failures beats
 # stopping at the first and re-running twice to discover the other two.
 #
-# Usage: scripts/gates.sh [core|sidecars|shell|hooks|security|all]   (default: all)
+# Usage: scripts/gates.sh [core|sidecars|shell|tauri|hooks|security|all]   (default: all)
 set -uo pipefail
 
 failures=""
@@ -46,8 +42,9 @@ run() {
   # were printed: rustfmt's diff goes to one and cargo's `error:` to the other. The daemon already
   # reads the two as one stream. The cost: a step that leaves a background process holding its
   # output now holds the gate until that process lets go, since `tee` waits for every writer.
-  # A heavy cargo subcommand takes a build slot (see `slot_run`). It is decided HERE and not written
-  # on each gate line, because the classifier test reads those lines as plain commands.
+  # A heavy cargo subcommand takes a build slot (see `slot_run`; check|clippy pass through it
+  # without one). It is decided HERE and not written on each gate line, because the classifier
+  # test reads those lines as plain commands.
   if [ "$1" = cargo ]; then
     case "$2" in build|check|clippy|test|run|doc) set -- slot_run "$@" ;; esac
   fi
@@ -96,6 +93,8 @@ print_summary() {
 # whose pid no longer answers `kill -0` is reaped by the next acquirer (a SIGKILLed holder cannot
 # clean up after itself). A short-lived `mkdir` mutex makes reap-count-claim one atomic step.
 #
+# `cargo check` and `cargo clippy` are free: `slot_run` runs them directly, without a slot.
+#
 # The logic lives HERE and not in a file this one sources, for the tamper-check reason below;
 # scripts/build-slot.sh is a thin wrapper that sources this file and calls `slot_run`.
 #
@@ -119,6 +118,18 @@ _slot_holders() {
   done
 }
 
+_self_pid() {
+  # Sets _pid to the pid of the CURRENT (sub)shell, which is what $BASHPID means. macOS ships bash
+  # 3.2, which has no BASHPID, and `set -u` made the first read of it end the gate there. The
+  # fallback relies on `exec`: the command substitution's subshell becomes sh, so sh's parent is
+  # the shell that asked.
+  if [ -n "${BASHPID:-}" ]; then
+    _pid="$BASHPID"
+  else
+    _pid="$(exec sh -c 'echo "$PPID"')"
+  fi
+}
+
 _slot_try() {
   # _slot_try <dir> <n> <command...>: one attempt, under the mutex. 0 = slot claimed.
   local dir="$1" n="$2" f pid count=0 got=1
@@ -133,7 +144,8 @@ _slot_try() {
       return 1
     fi
   fi
-  printf '%s\n' "$BASHPID" > "$dir/.mutex/pid"
+  _self_pid
+  printf '%s\n' "$_pid" > "$dir/.mutex/pid"
   for f in "$dir"/held/*; do
     [ -f "$f" ] || continue
     pid="$(basename "$f")"
@@ -145,8 +157,8 @@ _slot_try() {
     fi
   done
   if [ "$count" -lt "$n" ]; then
-    printf '%s\n%s\n%s\n%s\n' "$BASHPID" "$(date +%s)" "$(pwd)" "$*" > "$dir/held/$BASHPID"
-    _slot_file="$dir/held/$BASHPID"
+    printf '%s\n%s\n%s\n%s\n' "$_pid" "$(date +%s)" "$(pwd)" "$*" > "$dir/held/$_pid"
+    _slot_file="$dir/held/$_pid"
     got=0
   fi
   rm -rf "$dir/.mutex"
@@ -159,6 +171,12 @@ slot_run() {
   local dir="${NUCLEOS_BUILD_SLOTS_DIR:-${HOME:-}/.nucleos/build-slots}"
   local n="${NUCLEOS_BUILD_SLOTS:-2}" timeout="${NUCLEOS_BUILD_SLOT_TIMEOUT:-1800}"
   local waited=0 child="" status
+  # `cargo check` and `cargo clippy` never take a slot. Measured 2026-10-02: a 15s clippy waited 49
+  # minutes behind two other sessions' long suites. With sccache they are cheap; the slot exists to
+  # protect the heavy build and test steps, not these.
+  if [ "$1" = cargo ]; then
+    case "$2" in check|clippy) "$@"; return $? ;; esac
+  fi
   case "$n" in
     ''|*[!0-9]*) echo "build-slot: NUCLEOS_BUILD_SLOTS must be a non-negative integer, got '$n'" >&2; return 2 ;;
   esac
@@ -185,7 +203,8 @@ slot_run() {
     sleep 1
     waited=$((waited + 1))
   done
-  export NUCLEOS_BUILD_SLOT_HELD="$BASHPID"
+  _self_pid
+  export NUCLEOS_BUILD_SLOT_HELD="$_pid"
   trap slot_release EXIT
   # The command runs in the background and is waited on: bash defers a trap until a FOREGROUND
   # child ends, so a TERM would otherwise leave the slot held for as long as the build ran.
@@ -212,8 +231,8 @@ fi
 
 target="${1:-all}"
 case "$target" in
-  core|sidecars|shell|hooks|security|all) ;;
-  *) echo "usage: $0 [core|sidecars|shell|hooks|security|all]" >&2; exit 2 ;;
+  core|sidecars|shell|tauri|hooks|security|all) ;;
+  *) echo "usage: $0 [core|sidecars|shell|tauri|hooks|security|all]" >&2; exit 2 ;;
 esac
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -278,7 +297,9 @@ if [ "$target" = shell ] || [ "$target" = all ]; then
     # first ran. Builds its own bundle (~30s) rather than trusting one on disk.
     run "shell: csp"       . node scripts/csp-gate.mjs
   fi
+fi
 
+if [ "$target" = tauri ] || [ "$target" = all ]; then
   # shell/src-tauri is deliberately excluded from the cargo workspace (see the root Cargo.toml),
   # which means the root `cargo fmt --all`, `cargo clippy --all-targets` and `cargo test
   # -p nucleos-core` every one of them miss it. Until these three lines existed its Rust side was
@@ -338,10 +359,6 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     run "gates: own target" . "$py" scripts/test-own-cargo-target.py
     run "gates: build slot" . "$py" scripts/test-build-slot.py
     run "daemon: from copy" . "$py" scripts/test-run-daemon.py
-    run "eval: approver"  . "$py" scripts/eval/test-auto-approve.py
-    run "eval: promote"   . "$py" scripts/eval/test-promote.py
-    run "eval: ingest"    . "$py" scripts/eval/test-ingest.py
-    run "eval: layer"     . "$py" scripts/eval/test-layer.py
     # Hermetic like its neighbours: the network is behind one seam the test swaps out, so this
     # runs green on a machine with no route to OpenRouter at all.
     run "models: refresh"   . "$py" scripts/test-refresh-models.py
