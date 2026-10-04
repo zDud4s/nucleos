@@ -35,6 +35,7 @@ import {
   Teach,
   Section,
 } from "../ui";
+import { VoiceOrb } from "./VoiceOrb";
 import "./voice.css";
 
 /**
@@ -185,6 +186,7 @@ function Conversation({ armed }: { armed: boolean | undefined }) {
     <Panel title="Conversation" aside={<ConversationBadge phase={voice.phase} />}>
       {armed === true ? (
         <>
+          <VoiceOrb phase={voice.phase} level={voice.level} threshold={voice.threshold} />
           <div className="voice-capture-buttons">
             <Button intent={on ? "stop" : "go"} disabled={opening} onClick={() => void press()}>
               {on ? "Stop talking" : "Start talking"}
