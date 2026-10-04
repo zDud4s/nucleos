@@ -147,8 +147,14 @@ pub async fn open_window(
             // Spec §4.4a's shape, for the same reason: a launch that failed is reported as a failed
             // delivery rather than cleaned away, so the person sees that their window did not open
             // instead of a click that did nothing.
-            let _ =
-                browser::set_mode(&state.pool, row_id, mode::HUMAN, mode::DELIVERY_FAILED).await;
+            let _ = browser::set_mode(
+                &state.pool,
+                &state.browser.modes,
+                row_id,
+                mode::HUMAN,
+                mode::DELIVERY_FAILED,
+            )
+            .await;
             return Err(WheelError::Sidecar(error));
         }
     };
@@ -174,7 +180,15 @@ pub async fn request(state: &AppState, session_id: i64, reason: &str) -> Result<
             row.mode
         )));
     }
-    if !browser::set_mode(&state.pool, session_id, mode::AGENT, mode::WHEEL_REQUESTED).await? {
+    if !browser::set_mode(
+        &state.pool,
+        &state.browser.modes,
+        session_id,
+        mode::AGENT,
+        mode::WHEEL_REQUESTED,
+    )
+    .await?
+    {
         return Err(WheelError::WrongState(
             "somebody already asked for this session's wheel".to_string(),
         ));
@@ -248,6 +262,7 @@ pub async fn accept(state: &AppState, session_id: i64) -> Result<SessionRow, Whe
             // decide whether to try again.
             let _ = browser::set_mode(
                 &state.pool,
+                &state.browser.modes,
                 session_id,
                 mode::WHEEL_REQUESTED,
                 mode::DELIVERY_FAILED,
@@ -284,7 +299,15 @@ pub async fn accept(state: &AppState, session_id: i64) -> Result<SessionRow, Whe
         &placement.profile.id,
     )
     .await?;
-    if !browser::set_mode(&state.pool, session_id, mode::WHEEL_REQUESTED, mode::HUMAN).await? {
+    if !browser::set_mode(
+        &state.pool,
+        &state.browser.modes,
+        session_id,
+        mode::WHEEL_REQUESTED,
+        mode::HUMAN,
+    )
+    .await?
+    {
         tracing::warn!(
             session = session_id,
             "the wheel landed on a session that had moved"
@@ -592,6 +615,7 @@ mod tests {
             std::sync::Arc::new(crate::browser::BrowserRuntime {
                 enabled: true,
                 client: BrowserClient::new(&address.to_string(), "tok".into()),
+                modes: Default::default(),
             }),
             seen,
         )

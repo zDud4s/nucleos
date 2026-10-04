@@ -892,6 +892,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/browser/keep", post(crate::browser_wheel::post_keep))
         .route("/browser/sessions", get(crate::browser::list_open_sessions))
         .route(
+            "/browser/sessions/{id}/live",
+            get(crate::browser_live::get_live),
+        )
+        .route(
             "/browser/sites/{project_id}",
             get(crate::browser::get_sites),
         )

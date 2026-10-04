@@ -40,6 +40,8 @@ pub struct BrowserRuntime {
     /// the tools are green together.
     pub enabled: bool,
     pub client: BrowserClient,
+    /// Where a session's mode changes are announced to whoever is watching its live view.
+    pub modes: crate::browser_live::ModeChannels,
 }
 
 impl BrowserRuntime {
@@ -53,6 +55,7 @@ impl BrowserRuntime {
         Self {
             enabled: false,
             client: BrowserClient::new(crate::sidecar::BROWSER_ADDR, String::new()),
+            modes: Default::default(),
         }
     }
 }
@@ -727,7 +730,13 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
 /// `agente_conduz` é a mesma escrita atómica que regista a aceitação". A read-then-write would leave
 /// a window in which two callers both believed they had the wheel — and one of them would be an
 /// agent clicking on a page a person had just been handed.
-pub async fn set_mode(pool: &SqlitePool, id: i64, from: &str, to: &str) -> sqlx::Result<bool> {
+pub async fn set_mode(
+    pool: &SqlitePool,
+    modes: &crate::browser_live::ModeChannels,
+    id: i64,
+    from: &str,
+    to: &str,
+) -> sqlx::Result<bool> {
     let result = sqlx::query(
         "UPDATE browser_sessions SET mode = ? WHERE id = ? AND mode = ? AND closed_at IS NULL",
     )
@@ -736,7 +745,13 @@ pub async fn set_mode(pool: &SqlitePool, id: i64, from: &str, to: &str) -> sqlx:
     .bind(from)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() == 1)
+    let moved = result.rows_affected() == 1;
+    if moved {
+        // Announced only after the write that made it true, so a watcher never cuts for a change
+        // that did not happen.
+        modes.publish(id, to);
+    }
+    Ok(moved)
 }
 
 /// Point a session at the proposal that asked for its wheel.
@@ -1392,14 +1407,14 @@ async fn requester_now(state: &AppState, now: chrono::DateTime<chrono::Utc>) -> 
 
 /// The session row, if it is still open. A closed one is not addressable: the browser behind it is
 /// gone, and answering from the row would describe a page that no longer exists.
-async fn live_session(state: &AppState, id: i64) -> Option<SessionRow> {
+pub(crate) async fn live_session(state: &AppState, id: i64) -> Option<SessionRow> {
     match session_row(&state.pool, id).await {
         Ok(Some(row)) if row.closed_at.is_none() => Some(row),
         _ => None,
     }
 }
 
-fn gone() -> axum::response::Response {
+pub(crate) fn gone() -> axum::response::Response {
     (StatusCode::NOT_FOUND, "no such browsing session").into_response()
 }
 
@@ -1413,7 +1428,7 @@ fn db_error(error: sqlx::Error) -> axum::response::Response {
 /// `FenceDown` is 503 and not 500 for the reason spec §6.2a gives: nothing is broken, browsing is
 /// simply not available, and a 500 reads as a crash and invites the retry loop that would run
 /// against an unfenced browser.
-fn browser_error(error: BrowserError) -> axum::response::Response {
+pub(crate) fn browser_error(error: BrowserError) -> axum::response::Response {
     let status = match error {
         BrowserError::Unreachable(_) => StatusCode::BAD_GATEWAY,
         BrowserError::FenceDown(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -1485,6 +1500,7 @@ mod tests {
             BrowserRuntime {
                 enabled: true,
                 client: BrowserClient::new(&address.to_string(), "tok".into()),
+                modes: Default::default(),
             },
             seen,
         )
@@ -2328,6 +2344,7 @@ mod tests {
         let gone = BrowserRuntime {
             enabled: true,
             client: BrowserClient::new("127.0.0.1:1", "tok".into()),
+            modes: Default::default(),
         };
         let _ = close(&db.pool, &gone, row.id, "2026-08-16T11:00:00Z").await;
         let after = session_row(&db.pool, row.id)
