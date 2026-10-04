@@ -2156,12 +2156,18 @@ fn heavy_wrapper_inner(segment: &str, cwd: Option<&Path>) -> Option<String> {
         if token == "--" {
             return (!after.is_empty()).then(|| after.to_owned());
         }
-        if matches!(token.as_str(), "--prio" | "--agent" | "--kind" | "--wait-max") {
+        if matches!(
+            token.as_str(),
+            "--prio" | "--agent" | "--kind" | "--wait-max"
+        ) {
             let (_, after_value) = split_first_token(after)?;
             rest = after_value;
             continue;
         }
-        if ["--prio=", "--agent=", "--kind=", "--wait-max="].iter().any(|p| token.starts_with(p)) {
+        if ["--prio=", "--agent=", "--kind=", "--wait-max="]
+            .iter()
+            .any(|p| token.starts_with(p))
+        {
             rest = after;
             continue;
         }
@@ -2187,7 +2193,11 @@ fn main_checkout_of(cwd: &Path) -> Option<String> {
         return Some(normalize_path(&dir.to_string_lossy(), None));
     }
     let text = std::fs::read_to_string(&dot_git).ok()?;
-    let gitdir = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?.trim().replace('\\', "/");
+    let gitdir = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+        .trim()
+        .replace('\\', "/");
     let index = gitdir.rfind("/.git/")?;
     let main = &gitdir[..index];
     (!main.is_empty()).then(|| normalize_path(main, None))
@@ -7291,13 +7301,20 @@ mod tests {
         let workspace = wt.as_path();
         let bare = classify_asked_for("cargo test -p nucleos-core foo", Some(workspace));
         for command in [
-            format!("python {main}/scripts/heavy.py --prio 2 --wait-max 90 -- cargo test -p nucleos-core foo"),
-            format!("python {main}/scripts/heavy.py --prio 2 --wait-max=90 -- cargo test -p nucleos-core foo"),
+            format!(
+                "python {main}/scripts/heavy.py --prio 2 --wait-max 90 -- cargo test -p nucleos-core foo"
+            ),
+            format!(
+                "python {main}/scripts/heavy.py --prio 2 --wait-max=90 -- cargo test -p nucleos-core foo"
+            ),
         ] {
             let command = command.as_str();
             let wrapped = classify_asked_for(command, Some(workspace));
             assert_eq!(wrapped.decision.decision, "allow", "{command}");
-            assert_eq!(wrapped.decision.decision, bare.decision.decision, "{command}");
+            assert_eq!(
+                wrapped.decision.decision, bare.decision.decision,
+                "{command}"
+            );
             assert_eq!(wrapped.action_class, bare.action_class, "{command}");
             assert_eq!(wrapped.action_class, "read-local", "{command}");
         }
@@ -7358,11 +7375,17 @@ mod tests {
         let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
         let bare = classify_asked_for("cargo test -p nucleos-core foo", Some(&wt));
         let ours = classify_asked_for(
-            &format!("python {}/scripts/heavy.py -- cargo test -p nucleos-core foo", slash(&main)),
+            &format!(
+                "python {}/scripts/heavy.py -- cargo test -p nucleos-core foo",
+                slash(&main)
+            ),
             Some(&wt),
         );
         let other = classify_asked_for(
-            &format!("python {}/other/scripts/heavy.py -- cargo test -p nucleos-core foo", slash(&base)),
+            &format!(
+                "python {}/other/scripts/heavy.py -- cargo test -p nucleos-core foo",
+                slash(&base)
+            ),
             Some(&wt),
         );
         let _ = std::fs::remove_dir_all(&base);
