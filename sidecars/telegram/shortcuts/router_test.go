@@ -88,3 +88,36 @@ func TestFormerErrandCommandsGoToTheAgent(t *testing.T) {
 		}
 	}
 }
+
+func TestRouteNote(t *testing.T) {
+	cases := []struct {
+		in   string
+		want Intent
+	}{
+		{"/note buy milk", Intent{Kind: Note, Arg: "buy milk"}},
+		{"/NOTE  Buy Milk  ", Intent{Kind: Note, Arg: "Buy Milk"}},
+		{"/Note a /kill b", Intent{Kind: Note, Arg: "a /kill b"}},
+		{"/note", Intent{Kind: Note, Arg: ""}},
+		{"  /Note  ", Intent{Kind: Note, Arg: ""}},
+		// A phone types a long note on a new line, and a group's command menu inserts the bot's
+		// name. Either one missed would send the note to the agent as a message.
+		{"/note\nline one\nline two", Intent{Kind: Note, Arg: "line one\nline two"}},
+		{"/note\tbuy milk", Intent{Kind: Note, Arg: "buy milk"}},
+		{"/note@NucleosBot buy milk", Intent{Kind: Note, Arg: "buy milk"}},
+		{"/note@NucleosBot\nbuy milk", Intent{Kind: Note, Arg: "buy milk"}},
+		{"/note@NucleosBot", Intent{Kind: Note, Arg: ""}},
+		{"/notes for the agent", Intent{Kind: SendToAgent, Text: "/notes for the agent"}},
+	}
+	for _, c := range cases {
+		if got := Route(c.in); got != c.want {
+			t.Errorf("Route(%q) = %+v, want %+v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestRouteTranscriptRefusesNote(t *testing.T) {
+	got := RouteTranscript("/note buy milk")
+	if got.Kind != Refused {
+		t.Errorf("RouteTranscript(/note ...) kind = %v, want Refused", got.Kind)
+	}
+}

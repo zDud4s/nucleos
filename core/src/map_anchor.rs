@@ -3391,6 +3391,8 @@ mod tests {
             model: std::env::var("NUCLEOS_ANCHOR_MODEL").unwrap_or_else(|_| "sonnet".to_owned()),
             plan_model: None,
             review_model: None,
+            resolve_model: None,
+            resolve_effort: None,
         }
     }
 

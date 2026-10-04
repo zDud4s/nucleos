@@ -459,6 +459,13 @@
   border-color: var(--text-faint);
 }
 
+/* An `<a>` wearing the recipe — navigation that looks like the other header actions.
+   `base.css` underlines every link on hover and focus, and a boxed control that grows an
+   underline reads as two affordances at once. `-link` keeps its own underline. */
+a.ui-button:not(.ui-button-link):is(:hover, :focus-visible) {
+  text-decoration: none;
+}
+
 /**
  * Pressed. The app had no `:active` anywhere, so every button in it released
  * without ever having been held — the pointer went down, nothing acknowledged

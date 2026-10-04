@@ -67,6 +67,7 @@ mod notify;
 mod notify_policy;
 mod onboarding;
 mod openai_compatible;
+mod owner_notes;
 mod ownership;
 mod pii_shadow;
 mod presets;
@@ -587,6 +588,7 @@ fn workflow_package_args(
 
 #[tokio::main]
 async fn main() {
+    http::remember_home();
     if std::env::args().any(|a| a == "--print-token") {
         match secrets::load_secret(TOKEN_KEY) {
             Ok(Some(t)) => println!("{t}"),
@@ -1405,6 +1407,8 @@ async fn main() {
         model: models_config.claude_model.clone(),
         plan_model: models_config.plan_model.clone(),
         review_model: models_config.review_model.clone(),
+        resolve_model: models_config.resolve_model.clone(),
+        resolve_effort: models_config.resolve_effort.clone(),
     };
     let configured_runner = models_config.primary_runner.as_deref();
     let primary_runner: Arc<dyn runner::CommandRunner> = match configured_runner {
@@ -1627,6 +1631,13 @@ async fn main() {
             "model discovery keys"
         );
         model_catalog::install_keys(keys);
+        // Without a key a vendor is still discovered: Codex from the CLI's own cache, Anthropic
+        // from the public models.dev catalogue. A newly shipped model shows without a code edit.
+        model_catalog::enable_keyless();
+        // Warm the snapshot off the request path: the first picker open then finds it ready.
+        tokio::spawn(async {
+            model_catalog::current().await;
+        });
     }
 
     // Read after the local model has been probed, because whether a `kind: local` seat is runnable

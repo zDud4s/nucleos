@@ -6580,6 +6580,8 @@ mod tests {
                 model: "sonnet".to_owned(),
                 plan_model: None,
                 review_model: None,
+                resolve_model: None,
+                resolve_effort: None,
             },
             launches: Mutex::new(0),
         });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED, RESOLVE_MIN_REVIEWED } from "../data/autopilot";
-import { judgeResolveFixture, JUDGE_RESOLUTIONS, JUDGE_RESOLVE_STATUS, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOW, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import { judgeResolveFixture, JUDGE_RESOLUTIONS, JUDGE_RESOLVE_STATUS, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOTES_GRAPH, NOW, OWNER_NOTES, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
 import { readEfficiencySignal, readFeedKind, waitReasonFromSummary } from "../data/feed";
 import { LANE_FOLD_ABOVE, buildSequences, traceLanes } from "../lib/sequences";
 import { quietGaps } from "../lib/timeline";
@@ -206,5 +206,16 @@ describe("the preview fixtures", () => {
     expect(statuses.some((status) => status !== "escalated" && status !== "blocked")).toBe(true);
     // Every row names a project, or `onlyProject()` drops it before the page ever draws it.
     expect(VCS_REQUESTS.every((row) => row.project_id !== "")).toBe(true);
+  });
+
+  it("the brain graph has a note-to-note link, a missing target and an archived note to reveal", () => {
+    expect(NOTES_GRAPH.links.some((link) => link.target_kind === "note")).toBe(true);
+    expect(NOTES_GRAPH.targets.some((target) => target.missing)).toBe(true);
+    expect(OWNER_NOTES.some((note) => note.state === "archived")).toBe(true);
+    expect(NOTES_GRAPH.notes.every((note) => note.state === "active")).toBe(true);
+    // Every non-note link resolves to a target row, or the graph would draw an edge to nothing.
+    for (const link of NOTES_GRAPH.links.filter((row) => row.target_kind !== "note")) {
+      expect(NOTES_GRAPH.targets.some((target) => target.kind === link.target_kind && target.ref === link.target_ref), link.target_ref).toBe(true);
+    }
   });
 });

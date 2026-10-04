@@ -2363,6 +2363,12 @@ pub trait CommandRunner: Send + Sync {
         None
     }
 
+    /// The per-role reasoning effort, or `None` for the CLI's own default. Defaulted for the same
+    /// reason as `model_for_stage`, and only the stage the CLI runner configures answers `Some`.
+    fn effort_for_stage(&self, _stage: Option<&str>) -> Option<String> {
+        None
+    }
+
     /// The llm-router this runner consults before a run, or `None` when routing is off.
     ///
     /// Defaulted to `None`, and only `route_advice::RoutedRunner` answers `Some`: that wrapper is
@@ -2851,7 +2857,16 @@ pub struct ClaudeCliRunner {
     pub plan_model: Option<String>,
     /// Where a job's `review` stage runs. `None` keeps `model`.
     pub review_model: Option<String>,
+    /// Where the queue's conflict resolution runs ([`RESOLVE_STAGE`]). `None` keeps `model`.
+    pub resolve_model: Option<String>,
+    /// The effort a conflict resolution is launched with. `None` sends no `--effort`.
+    pub resolve_effort: Option<String>,
 }
+
+/// The stage name a conflict resolution is routed by. Not a job stage — no node carries it — but
+/// the resolution is the daemon's own read-and-merge turn, and naming it lets the same
+/// `model_for_stage` seam route it without a second mechanism.
+pub const RESOLVE_STAGE: &str = "resolve";
 
 #[async_trait]
 impl CommandRunner for ClaudeCliRunner {
@@ -2862,6 +2877,15 @@ impl CommandRunner for ClaudeCliRunner {
         match stage {
             Some("plan") => self.plan_model.clone(),
             Some("review") => self.review_model.clone(),
+            Some(RESOLVE_STAGE) => self.resolve_model.clone(),
+            _ => None,
+        }
+    }
+
+    /// Only the resolution carries a configured effort; every other stage keeps the CLI default.
+    fn effort_for_stage(&self, stage: Option<&str>) -> Option<String> {
+        match stage {
+            Some(RESOLVE_STAGE) => self.resolve_effort.clone(),
             _ => None,
         }
     }
@@ -5222,6 +5246,8 @@ mod tests {
             model: "sonnet".to_owned(),
             plan_model: None,
             review_model: None,
+            resolve_model: None,
+            resolve_effort: None,
         };
         let process = tokio::spawn(async move {
             runner
@@ -5347,6 +5373,8 @@ mod tests {
             model: "sonnet".to_owned(),
             plan_model: None,
             review_model: None,
+            resolve_model: None,
+            resolve_effort: None,
         }
     }
 
@@ -7218,6 +7246,8 @@ mod tests {
             model: "claude-sonnet-5".to_string(),
             plan_model: Some("claude-opus-4-8".to_string()),
             review_model: Some("claude-haiku-4-5".to_string()),
+            resolve_model: Some("opus".to_string()),
+            resolve_effort: Some("high".to_string()),
         };
 
         assert_eq!(
@@ -7238,17 +7268,45 @@ mod tests {
             None,
             "a run that named no stage keeps the runner's own model"
         );
+        assert_eq!(
+            configured.model_for_stage(Some(RESOLVE_STAGE)).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(
+            configured.effort_for_stage(Some(RESOLVE_STAGE)).as_deref(),
+            Some("high")
+        );
+        for stage in [Some("plan"), Some("review"), Some("implement"), None] {
+            assert_eq!(
+                configured.effort_for_stage(stage),
+                None,
+                "only the resolution carries a configured effort: {stage:?}"
+            );
+        }
 
         let unconfigured = ClaudeCliRunner {
             model: "claude-sonnet-5".to_string(),
             plan_model: None,
             review_model: None,
+            resolve_model: None,
+            resolve_effort: None,
         };
-        for stage in [Some("plan"), Some("review"), Some("implement"), None] {
+        for stage in [
+            Some("plan"),
+            Some("review"),
+            Some("implement"),
+            Some(RESOLVE_STAGE),
+            None,
+        ] {
             assert_eq!(
                 unconfigured.model_for_stage(stage),
                 None,
                 "an unconfigured runner routes nothing anywhere: {stage:?}"
+            );
+            assert_eq!(
+                unconfigured.effort_for_stage(stage),
+                None,
+                "an unconfigured runner sends no effort anywhere: {stage:?}"
             );
         }
     }

@@ -45,6 +45,8 @@ export interface VoiceConfigView {
   memo_hotkey: string;
   /** The chord that toggles hands-free conversation. `""` when unconfigured. */
   conversation_hotkey: string;
+  /** The chord that opens the Brain's capture box from anywhere. `""` when unconfigured. */
+  capture_hotkey: string;
   /**
    * Whether an answer can be SPOKEN, as opposed to merely arrived at.
    *

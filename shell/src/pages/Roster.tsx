@@ -80,7 +80,10 @@ export function Roster() {
               : headline(rows)
         }
         actions={
-          <Link className="text-sm" to="/projects/new">
+          // A button by look, a link by nature: it goes somewhere, so it stays an `<a href>` the
+          // keyboard and a middle-click both understand, and wears the same ghost-go recipe as
+          // New agent and New team so the three headers read alike.
+          <Link className="ui-button ui-button-ghost ui-button-go" to="/projects/new">
             New project
           </Link>
         }
@@ -256,10 +259,21 @@ function Groups({ rows, stale }: { rows: ProjectSummary[]; stale: boolean }) {
     (project) => project.mode !== "off" && !needsYou(project) && flightOf(project.project_id) !== null,
   );
   const placed = new Set([...needs, ...working].map((project) => project.project_id));
-  // By name, because a quiet project is looked up rather than read about.
-  const quiet = rows
-    .filter((project) => !placed.has(project.project_id))
-    .sort((a, b) => a.project_id.localeCompare(b.project_id));
+  const quiet = rows.filter((project) => !placed.has(project.project_id));
+  /*
+    By state first — what it is doing when left alone — and by name inside each, because within a
+    state a quiet project is still looked up rather than read about. Running before watching before
+    switched off; a mode this page has never heard of goes last rather than vanishing.
+  */
+  const byState = [...QUIET_STATES, ...new Set(quiet.map((project) => project.mode))]
+    .filter((mode, i, all) => all.indexOf(mode) === i)
+    .map((mode) => ({
+      mode,
+      projects: quiet
+        .filter((project) => project.mode === mode)
+        .sort((a, b) => a.project_id.localeCompare(b.project_id)),
+    }))
+    .filter((state) => state.projects.length > 0);
 
   /*
     Muted while stale: the values recede to the register of a thing remembered, and the note above
@@ -303,19 +317,30 @@ function Groups({ rows, stale }: { rows: ProjectSummary[]; stale: boolean }) {
 
       {quiet.length > 0 && (
         <Group label="Quiet" n={quiet.length}>
-          <div className="rs-quiet">
-            {quiet.map((project) => (
-              <Link
-                key={project.project_id}
-                className="rs-quiet-item"
-                to="/projects/$projectId/$view"
-                params={{ projectId: project.project_id, view: "state" }}
-              >
-                <ModeDot mode={project.mode} />
-                <span className="rs-quiet-name">{project.project_id}</span>
-                {project.mode === "off" && <span className="rs-quiet-off">off</span>}
-              </Link>
-            ))}
+          <div className="rs-quiet-states">
+            {byState.map(({ mode, projects }) => {
+              const label = readState("autopilot", mode)?.label ?? mode;
+              return (
+                <div key={mode} role="group" aria-label={label} className="rs-quiet-state">
+                  <h3 className="rs-quiet-label">
+                    <ModeDot mode={mode} />
+                    {label} <Count n={projects.length} />
+                  </h3>
+                  <div className="rs-quiet">
+                    {projects.map((project) => (
+                      <Link
+                        key={project.project_id}
+                        className="rs-quiet-item"
+                        to="/projects/$projectId/$view"
+                        params={{ projectId: project.project_id, view: "state" }}
+                      >
+                        <span className="rs-quiet-name">{project.project_id}</span>
+                      </Link>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </Group>
       )}
@@ -340,6 +365,9 @@ function Group({ label, n, children }: { label: string; n: number; children: Rea
     </section>
   );
 }
+
+/** The order the states of *Quiet* are drawn in: running, then watching, then switched off. */
+const QUIET_STATES = ["active", "shadow", "off"];
 
 /** The project's mode in the width of a dot — the rail's mark, so the two read alike. */
 function ModeDot({ mode }: { mode: string }) {

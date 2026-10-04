@@ -106,7 +106,7 @@ describe("the roster", () => {
     expect(count?.textContent).toBe("4");
   });
 
-  it("keeps the quiet group alphabetical, switched-off projects included whatever their folder says", async () => {
+  it("orders the quiet group by state and then by name, switched-off projects included whatever their folder says", async () => {
     await openRoster([
       fine("zulu"),
       project({ project_id: "asleep", mode: "off", project_root: null, root_exists: null }),
@@ -115,13 +115,13 @@ describe("the roster", () => {
     ]);
 
     await screen.findByRole("region", { name: "Quiet" });
-    expect(names("Quiet")).toEqual(["asleep", "Mike", "moved", "zulu"]);
+    expect(names("Quiet")).toEqual(["Mike", "zulu", "asleep", "moved"]);
     expect(screen.queryByRole("region", { name: "Needs you" })).toBeNull();
-    // Only the switched-off ones say so.
-    const asleep = within(group("Quiet")).getByRole("link", { name: /asleep/ });
-    expect(within(asleep).getByText("off")).toBeTruthy();
-    const zulu = within(group("Quiet")).getByRole("link", { name: /zulu/ });
-    expect(within(zulu).queryByText("off")).toBeNull();
+    // Each state is its own labelled group, so "off" is said once over its projects.
+    const off = within(group("Quiet")).getByRole("group", { name: "off" });
+    expect(within(off).getAllByRole("link").map((link) => link.textContent)).toEqual(["asleep", "moved"]);
+    const shadow = within(group("Quiet")).getByRole("group", { name: "shadow" });
+    expect(within(shadow).getAllByRole("link").map((link) => link.textContent)).toEqual(["Mike", "zulu"]);
   });
 
   /** A group with nothing in it is not drawn — an empty heading is a sentence about nothing. */

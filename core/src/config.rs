@@ -25,6 +25,14 @@ pub struct ModelsConfig {
     /// Where a job's `review` stage runs, on the same absent-means-unrouted posture as `plan_model`.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub review_model: Option<String>,
+    /// Where the queue's conflict resolution runs (`resolver.rs`), on the same absent-means-unrouted
+    /// posture as `plan_model`: absent keeps it on `claude_model`.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub resolve_model: Option<String>,
+    /// The reasoning effort a conflict resolution is launched with. Absent sends no `--effort`, so
+    /// the CLI keeps its own default — exactly what every resolution got before this key existed.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub resolve_effort: Option<String>,
     /// Absent leaves chat turns from the Telegram sidecar answered by the cloud CLI, exactly as they
     /// are today. Naming a model here is what moves them onto this machine.
     ///
@@ -679,6 +687,8 @@ impl Default for ModelsConfig {
             primary_runner: None,
             plan_model: None,
             review_model: None,
+            resolve_model: None,
+            resolve_effort: None,
             local_assistant_model: None,
             hosted_assistant_model: None,
             local_engine: None,
@@ -899,18 +909,19 @@ Keep the original language. Return only the corrected text.";
 ///
 /// **UNVERIFIED on a real Mac.** The collision list above is read from Apple's documented
 /// shortcuts, not pressed: CI compiles this arm, and only a person on a Mac can confirm that
-/// the three chords it ships are free.
+/// the four chords it ships are free.
 #[cfg(target_os = "macos")]
-const DEFAULT_HOTKEYS: [&str; 3] = [
+const DEFAULT_HOTKEYS: [&str; 4] = [
     "Ctrl+Alt+Super+Space",
     "Ctrl+Alt+Super+M",
     "Ctrl+Alt+Super+C",
+    "Ctrl+Alt+Super+N",
 ];
 
 /// Windows and Linux leave the `Ctrl+Alt` family alone, so the shorter chords stay — see the
 /// macOS arm above for why that platform needs a third modifier.
 #[cfg(not(target_os = "macos"))]
-const DEFAULT_HOTKEYS: [&str; 3] = ["Ctrl+Alt+Space", "Ctrl+Alt+M", "Ctrl+Alt+C"];
+const DEFAULT_HOTKEYS: [&str; 4] = ["Ctrl+Alt+Space", "Ctrl+Alt+M", "Ctrl+Alt+C", "Ctrl+Alt+N"];
 
 /// `~/.nucleos/voice.yaml`. Every field defaults, so a partial file is valid and an absent one leaves the
 /// pillar off without comment.
@@ -957,6 +968,10 @@ pub struct VoiceConfig {
     /// conversation sends it to the agent. A single key that guessed between them would guess wrong
     /// in the direction that types a question into a terminal.
     pub conversation_hotkey: String,
+    /// Opens the Brain capture box, where the owner types a note into the knowledge store. A chord
+    /// of its own because it neither records nor talks: folding it into one of the other three
+    /// would make a keystroke that only shows a text box start a microphone.
+    pub capture_hotkey: String,
     /// Dictations are a searchable record of everything said, in a pillar whose first requirement is
     /// privacy, so they expire. Memos do not: those are documents somebody asked for.
     pub retain_dictations_days: u8,
@@ -988,6 +1003,7 @@ impl Default for VoiceConfig {
             hotkey: DEFAULT_HOTKEYS[0].to_string(),
             memo_hotkey: DEFAULT_HOTKEYS[1].to_string(),
             conversation_hotkey: DEFAULT_HOTKEYS[2].to_string(),
+            capture_hotkey: DEFAULT_HOTKEYS[3].to_string(),
             retain_dictations_days: 7,
             hints: Vec::new(),
             closing_words: vec!["câmbio".into()],
@@ -3770,6 +3786,57 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         );
     }
 
+    /// The conflict resolver's model and effort are the same posture as the per-role keys above:
+    /// named is honoured, absent or blank changes nothing about what a resolution runs on.
+    #[test]
+    fn models_config_reads_the_resolve_keys_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-sonnet-5
+codex_model: gpt-5.6-sol
+resolve_model: opus
+resolve_effort: high
+",
+        )
+        .unwrap();
+        let named = load_models_config(&path).unwrap();
+        assert_eq!(named.resolve_model, Some("opus".to_string()));
+        assert_eq!(named.resolve_effort, Some("high".to_string()));
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-sonnet-5
+codex_model: gpt-5.6-sol
+",
+        )
+        .unwrap();
+        let absent = load_models_config(&path).unwrap();
+        assert_eq!(absent.resolve_model, None, "an older file routes nothing");
+        assert_eq!(absent.resolve_effort, None, "an older file sends no effort");
+
+        std::fs::write(
+            &path,
+            "claude_model: claude-sonnet-5
+codex_model: gpt-5.6-sol
+resolve_model: \"\"
+resolve_effort: \"  \"
+",
+        )
+        .unwrap();
+        let blank = load_models_config(&path).unwrap();
+        assert_eq!(
+            blank.resolve_model, None,
+            "a blanked key means off, not empty"
+        );
+        assert_eq!(
+            blank.resolve_effort, None,
+            "a blanked key means off, not empty"
+        );
+    }
+
     /// Absent and malformed must reach the SAME inert state, and neither may be an error.
     ///
     /// Written in the negative because the failure this guards is a daemon that will not start: this
@@ -3865,9 +3932,10 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             "Ctrl+Alt+Super+Space",
             "Ctrl+Alt+Super+M",
             "Ctrl+Alt+Super+C",
+            "Ctrl+Alt+Super+N",
         ];
         #[cfg(not(target_os = "macos"))]
-        let expected = ["Ctrl+Alt+Space", "Ctrl+Alt+M", "Ctrl+Alt+C"];
+        let expected = ["Ctrl+Alt+Space", "Ctrl+Alt+M", "Ctrl+Alt+C", "Ctrl+Alt+N"];
 
         assert_eq!(
             DEFAULT_HOTKEYS, expected,
@@ -3886,6 +3954,10 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         assert_eq!(
             defaults.conversation_hotkey, DEFAULT_HOTKEYS[2],
             "the conversation default must come from DEFAULT_HOTKEYS, not from a second literal"
+        );
+        assert_eq!(
+            defaults.capture_hotkey, DEFAULT_HOTKEYS[3],
+            "the capture default must come from DEFAULT_HOTKEYS, not from a second literal"
         );
     }
 

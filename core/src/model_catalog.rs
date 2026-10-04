@@ -1,6 +1,7 @@
 //! Model discovery. The pure half lives here first: product names for ids, the family and runner an
-//! id implies, parsing the vendors' `/v1/models` payloads, grouping, and the versioned fallback
-//! catalogue shown when no key is set or the vendor cannot be reached.
+//! id implies, parsing the vendors' `/v1/models` payloads and the key-less sources (the Codex
+//! CLI's own model cache, the public models.dev catalogue), grouping, and the versioned fallback
+//! catalogue shown when no source can be reached.
 //!
 //! Naming is fixed in ONE place, on the daemon (`display_name`), because the daemon is where vendor
 //! ids arrive; every client then shows the same label for the same id.
@@ -37,12 +38,14 @@ pub struct ModelGroup {
 const ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
 
 /// Bumped whenever `FALLBACK` is refreshed by hand.
-pub const CATALOGUE_VERSION: &str = "2026-10-03";
+pub const CATALOGUE_VERSION: &str = "2026-10-04";
 
 const ALL: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const THREE: &[&str] = &["low", "medium", "high"];
+const ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 
-/// What the picker shows when no vendor list is available. Ids already known to this repo.
+/// What the picker shows when no source at all is available (no key, no Codex cache, models.dev
+/// unreachable), and what fills the ids a source omits. The last resort, not the list.
 pub const FALLBACK: &[(&str, &[&str])] = &[
     ("claude-opus-5-5", ALL),
     ("claude-opus-5", ALL),
@@ -52,11 +55,12 @@ pub const FALLBACK: &[(&str, &[&str])] = &[
     ("claude-fable-5-1", ALL),
     ("claude-fable-5", ALL),
     ("claude-haiku-4-5", &[]),
+    ("gpt-6.1-sol", ULTRA),
+    ("gpt-6-astra", ULTRA),
+    ("gpt-6-sol", ULTRA),
+    ("gpt-6-luna", ALL),
     ("gpt-5.6-sol", ALL),
-    (
-        "gpt-5.6-terra",
-        &["low", "medium", "high", "xhigh", "max", "ultra"],
-    ),
+    ("gpt-5.6-terra", ULTRA),
     ("gpt-5.6-luna", ALL),
     ("gpt-5.5", &["low", "medium", "high", "xhigh"]),
 ];
@@ -267,6 +271,136 @@ pub fn parse_openai(body: &str) -> Vec<Discovered> {
         .collect()
 }
 
+/// The Codex CLI's own model cache (`$CODEX_HOME/models_cache.json`), which the CLI refreshes by
+/// itself on subscription, no API key involved:
+/// `{fetched_at, models:[{slug, visibility, supported_reasoning_levels:[{effort}], priority}]}`.
+/// Only `visibility: "list"` rows the codex runner answers are kept; efforts come from the cache.
+///
+/// The cache carries no release dates, only `priority` (1 = shown first). It is turned into a
+/// `created` stamp that sorts the same way — the cache's `fetched_at` minus the priority — so
+/// `group`'s newest-first tie-break inside one version (`gpt-6-astra`, `-sol`, `-luna`) keeps the
+/// CLI's own order instead of falling back to the alphabet.
+pub fn parse_codex_cache(body: &str) -> Vec<Discovered> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(models) = v.get("models").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    let anchor = v
+        .get("fetched_at")
+        .and_then(|f| f.as_str())
+        .and_then(|f| chrono::DateTime::parse_from_rfc3339(f).ok())
+        .map_or(0, |d| d.timestamp());
+    models
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("slug")?.as_str()?;
+            if m.get("visibility").and_then(|v| v.as_str()) != Some("list")
+                || runner_by_id(id) != Some("codex")
+            {
+                return None;
+            }
+            let efforts: Vec<String> = m
+                .get("supported_reasoning_levels")
+                .and_then(|l| l.as_array())
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(|l| l.get("effort")?.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let efforts = (!efforts.is_empty()).then_some(efforts);
+            let created = m
+                .get("priority")
+                .and_then(|p| p.as_i64())
+                .map(|p| anchor - p);
+            make(id, efforts, created)
+        })
+        .collect()
+}
+
+/// How many distinct versions of each Anthropic family `parse_models_dev` keeps, newest first.
+const MODELS_DEV_GENERATIONS: usize = 3;
+
+/// The public, key-less catalogue at models.dev (`{"anthropic":{"models":{id:{id, release_date,
+/// status?}}}}`), used for Anthropic when no API key is set. The catalogue lists every model the
+/// vendor ever shipped, so it is filtered:
+/// - only `claude-*` ids the claude runner answers;
+/// - nothing marked `status: "deprecated"`;
+/// - a dated snapshot (`claude-opus-4-5-20251101`) is dropped when an undated alias of it
+///   (`claude-opus-4-5`, `claude-opus-4-5-latest`) is listed;
+/// - old generations: a major version more than one behind the newest Anthropic major anywhere
+///   (with 5.x out, 3.x goes and 4.x stays), so a family that stopped shipping fades out too;
+/// - per family, only the newest `MODELS_DEV_GENERATIONS` distinct versions — a family that ships
+///   a new version pushes its oldest out, with no list to edit.
+///
+/// Labels stay `display_name(id)` (the vendor-neutral scheme every other row uses), `created` is
+/// the `release_date`, and a model the built-in catalogue knows takes its efforts from there.
+pub fn parse_models_dev(body: &str) -> Vec<Discovered> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(models) = v
+        .get("anthropic")
+        .and_then(|a| a.get("models"))
+        .and_then(|m| m.as_object())
+    else {
+        return Vec::new();
+    };
+    let listed: Vec<(&str, &serde_json::Value)> = models
+        .iter()
+        .filter_map(|(key, m)| {
+            let id = m.get("id").and_then(|i| i.as_str()).unwrap_or(key);
+            let deprecated = m.get("status").and_then(|s| s.as_str()) == Some("deprecated");
+            (id.starts_with("claude-") && runner_by_id(id) == Some("claude") && !deprecated)
+                .then_some((id, m))
+        })
+        .collect();
+    let undated = |id: &str| {
+        listed
+            .iter()
+            .any(|(other, _)| !is_dated(other) && normalise(other) == normalise(id))
+    };
+    let mut found: Vec<Discovered> = listed
+        .iter()
+        .filter(|(id, _)| !(is_dated(id) && undated(id)))
+        .filter_map(|(id, m)| {
+            let created = m
+                .get("release_date")
+                .and_then(|d| d.as_str())
+                .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|d| d.and_utc().timestamp());
+            let efforts = FALLBACK
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, e)| e.iter().map(|l| l.to_string()).collect());
+            make(id, efforts, created)
+        })
+        .collect();
+    let major = |d: &Discovered| version_of(&d.id).first().copied();
+    if let Some(newest) = found.iter().filter_map(major).max() {
+        found.retain(|d| major(d).is_some_and(|m| m + 1 >= newest));
+    }
+    let mut versions: HashMap<String, Vec<Vec<u64>>> = HashMap::new();
+    for d in &found {
+        let seen = versions.entry(d.family.clone()).or_default();
+        let v = version_of(&d.id);
+        if !seen.contains(&v) {
+            seen.push(v);
+        }
+    }
+    for seen in versions.values_mut() {
+        seen.sort_by(|a, b| b.cmp(a));
+        seen.truncate(MODELS_DEV_GENERATIONS);
+    }
+    found.retain(|d| versions[&d.family].contains(&version_of(&d.id)));
+    found.sort_by(|a, b| a.id.cmp(&b.id));
+    found
+}
+
 /// Numeric version of an id, for ordering. Empty for an alias.
 fn version_of(id: &str) -> Vec<u64> {
     let s = normalise(id);
@@ -416,8 +550,12 @@ pub enum FetchError {
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub models: Vec<Discovered>,
-    /// `live` or `fallback`.
+    /// The best source any vendor came from: `live` (a vendor API, with a key), `keyless` (the
+    /// Codex CLI's cache or models.dev), or `fallback` (the built-in catalogue only).
     pub source: &'static str,
+    /// Per vendor (`anthropic`, `openai`): `api`, `codex-cache`, `models.dev` or `fallback`. A
+    /// vendor carried over from the previous snapshot keeps the source it was learned from.
+    pub sources: std::collections::BTreeMap<&'static str, &'static str>,
     /// RFC 3339.
     pub fetched_at: String,
     #[serde(skip)]
@@ -444,84 +582,155 @@ impl Snapshot {
     }
 }
 
+const VENDORS: [&str; 2] = ["anthropic", "openai"];
+
 fn fallback_snapshot(ok: bool) -> Snapshot {
     Snapshot {
         models: fallback(),
         source: "fallback",
+        sources: VENDORS.iter().map(|v| (*v, "fallback")).collect(),
         fetched_at: chrono::Utc::now().to_rfc3339(),
         at: std::time::Instant::now(),
         ok,
     }
 }
 
-/// Fetches both vendors (those with a key) through `fetch` and builds a snapshot. With no keys it
-/// never calls `fetch`. A failed vendor keeps what `previous` knew of it, else the fallback.
+/// The key-less source of a vendor, as named in `Snapshot::sources`.
+fn keyless_source(provider: &str) -> &'static str {
+    if provider == "anthropic" {
+        "models.dev"
+    } else {
+        "codex-cache"
+    }
+}
+
+fn keyless_parse(provider: &str) -> fn(&str) -> Vec<Discovered> {
+    if provider == "anthropic" {
+        parse_models_dev
+    } else {
+        parse_codex_cache
+    }
+}
+
+async fn no_keyless(_: &'static str) -> Option<Result<String, FetchError>> {
+    None
+}
+
+/// `refresh_all` with no key-less source: only vendors with a key are asked.
 pub async fn refresh_with<F, Fut>(keys: &Keys, fetch: F, previous: Option<&Snapshot>) -> Snapshot
 where
     F: Fn(&'static str, String) -> Fut,
     Fut: std::future::Future<Output = Result<String, FetchError>>,
+{
+    refresh_all(keys, fetch, no_keyless, previous).await
+}
+
+/// Builds a snapshot vendor by vendor, each from the first source that yields models:
+/// 1. the vendor API through `fetch`, when a key is set;
+/// 2. the key-less source through `keyless` (`openai`: the Codex CLI's cache file; `anthropic`:
+///    models.dev) — `None` means there is no such source here, `Err` that it failed;
+/// 3. what `previous` learned of that vendor from a real source;
+/// 4. the built-in `FALLBACK`.
+///
+/// Fallback ids no source listed are appended, so a source that omits one never hides it. A
+/// source that failed (as opposed to being absent) makes the snapshot short-lived.
+pub async fn refresh_all<F, Fut, K, KFut>(
+    keys: &Keys,
+    fetch: F,
+    keyless: K,
+    previous: Option<&Snapshot>,
+) -> Snapshot
+where
+    F: Fn(&'static str, String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, FetchError>>,
+    K: Fn(&'static str) -> KFut,
+    KFut: std::future::Future<Output = Option<Result<String, FetchError>>>,
 {
     type Parse = fn(&str) -> Vec<Discovered>;
     let vendors: [(&'static str, &Option<String>, Parse); 2] = [
         ("anthropic", &keys.anthropic, parse_anthropic),
         ("openai", &keys.openai, parse_openai),
     ];
-    let mut live: Vec<Discovered> = Vec::new();
-    let mut asked = false;
+    let mut models: Vec<Discovered> = Vec::new();
+    let mut sources = std::collections::BTreeMap::new();
     let mut ok = true;
     for (provider, key, parse) in vendors {
-        let Some(key) = key.as_ref().filter(|k| !k.is_empty()) else {
-            continue;
-        };
-        asked = true;
-        let found = match fetch(provider, key.clone()).await {
-            Ok(body) => {
-                let found = parse(&body);
-                if found.is_empty() {
-                    tracing::warn!(provider, "model list came back empty");
-                }
-                found
+        let mut found = Vec::new();
+        let mut source = "fallback";
+        if let Some(key) = key.as_ref().filter(|k| !k.is_empty()) {
+            match fetch(provider, key.clone()).await {
+                Ok(body) => found = parse(&body),
+                Err(error) => tracing::warn!(provider, ?error, "model list fetch failed"),
             }
-            Err(error) => {
-                tracing::warn!(provider, ?error, "model list fetch failed");
-                Vec::new()
+            if found.is_empty() {
+                ok = false;
+                tracing::warn!(provider, "no model list from the vendor API");
+            } else {
+                source = "api";
             }
-        };
-        if found.is_empty() {
-            ok = false;
-            if let Some(prev) = previous.filter(|p| p.source == "live") {
-                live.extend(
-                    prev.models
-                        .iter()
-                        .filter(|d| d.provider == provider)
-                        .cloned(),
-                );
-            }
-        } else {
-            live.extend(found);
         }
+        if found.is_empty() {
+            // An absent source (`None`) is not a failure; one that answered nothing usable is.
+            let attempted = match keyless(provider).await {
+                Some(Ok(body)) => {
+                    found = keyless_parse(provider)(&body);
+                    true
+                }
+                Some(Err(error)) => {
+                    tracing::warn!(provider, ?error, "key-less model list failed");
+                    true
+                }
+                None => false,
+            };
+            if !found.is_empty() {
+                source = keyless_source(provider);
+            } else if attempted {
+                ok = false;
+            }
+        }
+        if found.is_empty()
+            && let Some(prev) = previous
+            && let Some(prev_source) = prev.sources.get(provider).filter(|s| **s != "fallback")
+        {
+            ok = false;
+            found = prev
+                .models
+                .iter()
+                .filter(|d| d.provider == provider)
+                .cloned()
+                .collect();
+            source = prev_source;
+        }
+        sources.insert(provider, source);
+        models.extend(found);
     }
-    if !asked {
-        return fallback_snapshot(true);
-    }
-    if live.is_empty() {
-        return fallback_snapshot(false);
+    if models.is_empty() {
+        return fallback_snapshot(ok);
     }
     for d in fallback() {
-        if !live.iter().any(|l| l.id == d.id) {
-            live.push(d);
+        if !models.iter().any(|l| l.id == d.id) {
+            models.push(d);
         }
     }
+    let source = if sources.values().any(|s| *s == "api") {
+        "live"
+    } else if sources.values().any(|s| *s != "fallback") {
+        "keyless"
+    } else {
+        "fallback"
+    };
     Snapshot {
-        models: live,
-        source: "live",
+        models,
+        source,
+        sources,
         fetched_at: chrono::Utc::now().to_rfc3339(),
         at: std::time::Instant::now(),
         ok,
     }
 }
 
-/// `previous` while it is fresh, a refresh otherwise.
+/// `previous` while it is fresh, a refresh otherwise. The freshness rule `current` applies.
+#[cfg(test)]
 pub async fn ensure_with<F, Fut>(keys: &Keys, fetch: F, previous: Option<&Snapshot>) -> Snapshot
 where
     F: Fn(&'static str, String) -> Fut,
@@ -535,19 +744,22 @@ where
 
 static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
-async fn fetch_live(provider: &'static str, key: String) -> Result<String, FetchError> {
-    let client = CLIENT.get_or_init(|| {
+fn client() -> &'static reqwest::Client {
+    CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default()
-    });
+    })
+}
+
+async fn fetch_live(provider: &'static str, key: String) -> Result<String, FetchError> {
     let request = match provider {
-        "anthropic" => client
+        "anthropic" => client()
             .get("https://api.anthropic.com/v1/models?limit=1000")
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01"),
-        _ => client
+        _ => client()
             .get("https://api.openai.com/v1/models")
             .header("Authorization", format!("Bearer {key}")),
     };
@@ -559,16 +771,93 @@ async fn fetch_live(provider: &'static str, key: String) -> Result<String, Fetch
     response.text().await.map_err(|_| FetchError::Transport)
 }
 
+/// The public, key-less catalogue. Asked with no credential of any kind.
+const MODELS_DEV_URL: &str = "https://models.dev/api.json";
+
+/// Where the Codex CLI keeps its model cache: `$CODEX_HOME/models_cache.json`, else
+/// `<home>/.codex/models_cache.json`. Pure, so the order is testable.
+fn codex_cache_path(
+    codex_home: Option<String>,
+    home: Option<String>,
+) -> Option<std::path::PathBuf> {
+    let base = match codex_home.filter(|h| !h.trim().is_empty()) {
+        Some(h) => std::path::PathBuf::from(h),
+        None => std::path::PathBuf::from(home.filter(|h| !h.trim().is_empty())?).join(".codex"),
+    };
+    Some(base.join("models_cache.json"))
+}
+
+async fn fetch_keyless(provider: &'static str) -> Option<Result<String, FetchError>> {
+    if provider == "openai" {
+        let path = codex_cache_path(
+            std::env::var("CODEX_HOME").ok(),
+            std::env::var("USERPROFILE")
+                .ok()
+                .or_else(|| std::env::var("HOME").ok()),
+        )?;
+        // No cache file means no Codex CLI here: an absent source, not a failure to retry.
+        return match tokio::fs::read_to_string(&path).await {
+            Ok(body) => Some(Ok(body)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(Err(FetchError::Transport)),
+        };
+    }
+    // Deliberately a bare GET: no key, no auth header, nothing that identifies the owner.
+    let response = match client().get(MODELS_DEV_URL).send().await {
+        Ok(r) => r,
+        Err(_) => return Some(Err(FetchError::Transport)),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return Some(Err(FetchError::Status(status.as_u16())));
+    }
+    Some(response.text().await.map_err(|_| FetchError::Transport))
+}
+
+static KEYLESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Turns on the key-less sources (the Codex CLI's cache, models.dev) for the life of the process.
+/// `main.rs` calls it; tests never do, so a test daemon touches neither the network nor `~/.codex`.
+pub fn enable_keyless() {
+    let _ = KEYLESS.set(true);
+}
+
 static SNAPSHOT: std::sync::LazyLock<tokio::sync::Mutex<Option<Snapshot>>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
 
-/// The process-wide snapshot, refreshed when stale. With no keys installed it is the fallback and
-/// touches no network.
-pub async fn current() -> Snapshot {
+async fn refresh_process(previous: Option<&Snapshot>) -> Snapshot {
     let keys = KEYS.get().cloned().unwrap_or_default();
+    if KEYLESS.get().copied().unwrap_or(false) {
+        refresh_all(&keys, fetch_live, fetch_keyless, previous).await
+    } else {
+        refresh_with(&keys, fetch_live, previous).await
+    }
+}
+
+/// Set while a background refresh runs, so a burst of requests on a stale snapshot starts one.
+static REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The process-wide snapshot. Only the very first call waits on a refresh (and `main.rs` makes
+/// that call at start-up); after that a stale snapshot is served as it is while ONE background
+/// task refreshes it, so the picker never waits on models.dev or a vendor API. With no keys
+/// installed and the key-less sources off it is the fallback and touches no network.
+pub async fn current() -> Snapshot {
     let mut guard = SNAPSHOT.lock().await;
-    let snap = ensure_with(&keys, fetch_live, guard.as_ref()).await;
-    *guard = Some(snap.clone());
+    let Some(snap) = guard.clone() else {
+        let snap = refresh_process(None).await;
+        *guard = Some(snap.clone());
+        return snap;
+    };
+    drop(guard);
+    if !snap.is_fresh() && !REFRESHING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let previous = snap.clone();
+        tokio::spawn(async move {
+            // The lock is not held across the network, so `cached_or_fallback` keeps answering.
+            let fresh = refresh_process(Some(&previous)).await;
+            *SNAPSHOT.lock().await = Some(fresh);
+            REFRESHING.store(false, std::sync::atomic::Ordering::Release);
+        });
+    }
     snap
 }
 
@@ -591,6 +880,65 @@ pub fn admits(active_runner: &str, rooted: Option<bool>, runner: &str) -> bool {
         Some(true) => true,
         Some(false) => runner == active_runner && runner != "codex",
     }
+}
+
+/// The vendors `latest` answers for, in the order it lists them.
+pub const LATEST_VENDORS: [&str; 2] = VENDORS;
+
+/// What the agents' `latest_models` tool answers: per vendor, its models newest first, and where
+/// that vendor's list came from. Pure over a snapshot, so no network and no waiting; the caller
+/// hands it `current()`, which only ever blocks on the process's very first call.
+///
+/// `vendor` narrows to one of `LATEST_VENDORS`, case-insensitively; anything else is an error that
+/// names the valid ones, so an agent asking for `google` learns what it may ask for instead of
+/// receiving an empty list it could read as "no such models exist".
+///
+/// Newest first is by the vendor's own `created` stamp; a model with none sorts after every
+/// stamped one, and ties keep the catalogue's order, so a source that stamps nothing (the fallback)
+/// still comes back in the order the catalogue lists it.
+pub fn latest(snapshot: &Snapshot, vendor: Option<&str>) -> Result<serde_json::Value, String> {
+    let wanted = vendor.map(str::trim).filter(|v| !v.is_empty());
+    let wanted = match wanted {
+        None => None,
+        Some(v) => match LATEST_VENDORS.iter().find(|k| k.eq_ignore_ascii_case(v)) {
+            Some(k) => Some(*k),
+            None => {
+                return Err(format!(
+                    "unknown vendor {v:?}; use one of: {}",
+                    LATEST_VENDORS.join(", ")
+                ));
+            }
+        },
+    };
+    let vendors: Vec<serde_json::Value> = LATEST_VENDORS
+        .iter()
+        .filter(|k| wanted.is_none_or(|w| w == **k))
+        .map(|k| {
+            let mut models: Vec<&Discovered> = snapshot
+                .models
+                .iter()
+                .filter(|m| m.provider == *k)
+                .collect();
+            // Stable, so equal stamps keep the catalogue's order.
+            models.sort_by_key(|m| std::cmp::Reverse(m.created));
+            serde_json::json!({
+                "vendor": k,
+                "source": snapshot.sources.get(k).copied().unwrap_or("fallback"),
+                "models": models.iter().map(|m| serde_json::json!({
+                    "id": m.id,
+                    "name": if m.label.is_empty() { display_name(&m.id) } else { m.label.clone() },
+                    "family": m.family,
+                    "efforts": m.efforts,
+                    "created": m.created,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "vendors": vendors,
+        "fetched_at": snapshot.fetched_at,
+        "catalogue_version": CATALOGUE_VERSION,
+    }))
 }
 
 /// A discovered model as a picker row.
@@ -626,6 +974,92 @@ mod tests {
 
     fn ids(models: &[AssistantChoice]) -> Vec<&str> {
         models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    fn found(id: &str, provider: &'static str, created: Option<i64>) -> Discovered {
+        let (_, family) = family_of(id);
+        Discovered {
+            id: id.to_string(),
+            label: display_name(id),
+            provider,
+            family,
+            runner: if provider == "anthropic" {
+                "claude"
+            } else {
+                "codex"
+            },
+            efforts: vec!["low".to_string(), "high".to_string()],
+            created,
+        }
+    }
+
+    #[test]
+    fn latest_lists_each_vendor_newest_first_with_its_source() {
+        let mut snap = fallback_snapshot(true);
+        snap.models = vec![
+            found("claude-opus-4-1", "anthropic", Some(100)),
+            found("claude-opus-4-7", "anthropic", Some(300)),
+            found("claude-sonnet-4-5", "anthropic", None),
+            found("gpt-5", "openai", Some(200)),
+        ];
+        snap.sources.insert("anthropic", "models.dev");
+
+        let body = latest(&snap, None).unwrap();
+
+        let vendors = body["vendors"].as_array().unwrap();
+        assert_eq!(vendors.len(), 2);
+        assert_eq!(vendors[0]["vendor"], "anthropic");
+        assert_eq!(vendors[0]["source"], "models.dev");
+        let ids: Vec<&str> = vendors[0]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        // Stamped newest first, the unstamped one after every stamped one.
+        assert_eq!(
+            ids,
+            ["claude-opus-4-7", "claude-opus-4-1", "claude-sonnet-4-5"]
+        );
+        let first = &vendors[0]["models"][0];
+        assert_eq!(first["name"], display_name("claude-opus-4-7"));
+        assert_eq!(first["family"], "opus");
+        assert_eq!(first["efforts"], serde_json::json!(["low", "high"]));
+        assert_eq!(vendors[1]["vendor"], "openai");
+        assert_eq!(vendors[1]["source"], "fallback");
+        assert_eq!(body["fetched_at"], snap.fetched_at);
+    }
+
+    #[test]
+    fn latest_filters_by_vendor_and_refuses_an_unknown_one() {
+        let snap = fallback_snapshot(true);
+
+        let body = latest(&snap, Some(" OpenAI ")).unwrap();
+        let vendors = body["vendors"].as_array().unwrap();
+        assert_eq!(vendors.len(), 1);
+        assert_eq!(vendors[0]["vendor"], "openai");
+        assert!(!vendors[0]["models"].as_array().unwrap().is_empty());
+
+        // An empty filter is no filter.
+        let all = latest(&snap, Some("")).unwrap();
+        assert_eq!(all["vendors"].as_array().unwrap().len(), 2);
+
+        let err = latest(&snap, Some("google")).unwrap_err();
+        assert!(err.contains("anthropic") && err.contains("openai"), "{err}");
+    }
+
+    #[test]
+    fn latest_over_the_fallback_serves_the_one_catalogue_and_nothing_else() {
+        let snap = fallback_snapshot(true);
+        let body = latest(&snap, None).unwrap();
+        let served: usize = body["vendors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["models"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(served, fallback().len());
+        assert_eq!(body["catalogue_version"], CATALOGUE_VERSION);
     }
 
     const FAKE_KEY: &str = "sk-test-secret-key-0123456789";
@@ -990,6 +1424,10 @@ mod tests {
             "claude-fable-5-1",
             "claude-sonnet-5",
             "claude-haiku-4-5",
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
@@ -1025,5 +1463,289 @@ mod tests {
         assert_eq!(groups[0].provider, "anthropic");
         assert_eq!(groups[0].family, "opus");
         assert!(groups.iter().any(|g| g.label == "OpenAI · GPT"));
+    }
+
+    /// The shape of the Codex CLI's `models_cache.json`, trimmed to what the parser reads.
+    const CODEX_CACHE: &str = r#"{
+        "fetched_at": "2026-10-03T22:07:11.224534Z",
+        "etag": "W/\"x\"",
+        "client_version": "0.159.2",
+        "identity": "abc",
+        "models": [
+            {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "visibility": "list", "priority": 1,
+             "supported_reasoning_levels": [{"effort": "low", "description": "a"}, {"effort": "medium"},
+                {"effort": "high"}, {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"}]},
+            {"slug": "gpt-6-luna", "display_name": "GPT-6-Luna", "visibility": "list", "priority": 4,
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]},
+            {"slug": "gpt-6-astra", "display_name": "GPT-6-Astra", "visibility": "list", "priority": 2,
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "ultra"}]},
+            {"slug": "gpt-6-sol", "display_name": "GPT-6-Sol", "visibility": "list", "priority": 3,
+             "supported_reasoning_levels": []},
+            {"slug": "gpt-reserve", "display_name": "GPT-Reserve", "visibility": "hide", "priority": 4},
+            {"slug": "codex-auto-review", "display_name": "Codex Auto Review", "visibility": "hide", "priority": 43},
+            {"slug": "codex-mini-latest", "display_name": "Codex Mini", "visibility": "list", "priority": 50}
+        ]
+    }"#;
+
+    /// The shape of models.dev's `api.json`, trimmed: a provider map, `anthropic.models` by id.
+    const MODELS_DEV: &str = r#"{
+        "openai": {"id": "openai", "models": {"gpt-9": {"id": "gpt-9", "release_date": "2026-09-01"}}},
+        "anthropic": {"id": "anthropic", "name": "Anthropic", "models": {
+            "claude-opus-5-5": {"id": "claude-opus-5-5", "name": "Claude Opus 5.5", "release_date": "2026-09-22"},
+            "claude-opus-5": {"id": "claude-opus-5", "name": "Claude Opus 5", "release_date": "2026-07-24"},
+            "claude-opus-4-8": {"id": "claude-opus-4-8", "name": "Claude Opus 4.8", "release_date": "2026-05-28"},
+            "claude-opus-4-7": {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "release_date": "2026-04-14"},
+            "claude-opus-4-5": {"id": "claude-opus-4-5", "name": "Claude Opus 4.5 (latest)", "release_date": "2025-11-24"},
+            "claude-opus-4-5-20251101": {"id": "claude-opus-4-5-20251101", "name": "Claude Opus 4.5", "release_date": "2025-11-24"},
+            "claude-haiku-4-5": {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5 (latest)", "release_date": "2025-10-15"},
+            "claude-haiku-4-5-20251001": {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5", "release_date": "2025-10-15"},
+            "claude-3-7-sonnet-20250219": {"id": "claude-3-7-sonnet-20250219", "release_date": "2025-02-19"},
+            "claude-sonnet-4-5-20250929": {"id": "claude-sonnet-4-5-20250929", "release_date": "2025-09-29"},
+            "claude-3-5-haiku-latest": {"id": "claude-3-5-haiku-latest", "release_date": "2024-10-22"},
+            "claude-3-5-haiku-20241022": {"id": "claude-3-5-haiku-20241022", "release_date": "2024-10-22"},
+            "claude-sonnet-3-5": {"id": "claude-sonnet-3-5", "release_date": "2024-06-20", "status": "deprecated"},
+            "claude-fable-5-1": {"id": "claude-fable-5-1", "name": "Claude Fable 5.1", "release_date": "2026-09-01"},
+            "not-a-claude": {"id": "not-a-claude", "release_date": "2026-09-01"}
+        }}
+    }"#;
+
+    fn found_ids(found: &[Discovered]) -> Vec<&str> {
+        found.iter().map(|d| d.id.as_str()).collect()
+    }
+
+    #[test]
+    fn parses_the_codex_cli_cache_keeping_listed_models_and_their_efforts() {
+        let found = parse_codex_cache(CODEX_CACHE);
+        assert_eq!(
+            found_ids(&found),
+            ["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra", "gpt-6-sol"],
+            "hidden rows and slugs codex does not route are dropped"
+        );
+        for d in &found {
+            assert_eq!(
+                (d.provider, d.family.as_str(), d.runner),
+                ("openai", "gpt", "codex")
+            );
+            assert_eq!(d.label, display_name(&d.id));
+        }
+        assert_eq!(found[0].label, "GPT-6.1 Sol");
+        assert_eq!(found[2].label, "GPT-6 Astra");
+        assert_eq!(found[0].efforts, ULTRA);
+        assert_eq!(found[1].efforts, ["low", "high"]);
+        assert_eq!(
+            found[3].efforts,
+            default_efforts("openai", "gpt"),
+            "an empty level list falls back to the family default"
+        );
+
+        // Inside one version the CLI's priority order holds, not the alphabet.
+        let created: HashMap<String, i64> = found
+            .iter()
+            .filter_map(|d| d.created.map(|c| (d.id.clone(), c)))
+            .collect();
+        let choices = found
+            .iter()
+            .map(|d| choice(&d.id, &d.label, d.runner, &[]))
+            .collect();
+        let groups = group(choices, &created);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "OpenAI · GPT");
+        assert_eq!(
+            ids(&groups[0].models),
+            ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
+        );
+
+        assert!(parse_codex_cache("not json").is_empty());
+        assert!(parse_codex_cache(r#"{"models": 3}"#).is_empty());
+    }
+
+    #[test]
+    fn parses_models_dev_keeping_current_claude_generations() {
+        let found = parse_models_dev(MODELS_DEV);
+        assert_eq!(
+            found_ids(&found),
+            [
+                "claude-fable-5-1",
+                "claude-haiku-4-5",
+                "claude-opus-4-8",
+                "claude-opus-5",
+                "claude-opus-5-5",
+                "claude-sonnet-4-5-20250929",
+            ],
+            "dated twins of a listed alias, deprecated rows, non-claude ids, other providers, \
+             3.x generations and all but the newest three opus versions are dropped; a dated \
+             id with no alias stays"
+        );
+        let fable = found.iter().find(|d| d.id == "claude-fable-5-1").unwrap();
+        assert_eq!(
+            fable.efforts, ALL,
+            "a model the fallback knows keeps its efforts"
+        );
+        assert_eq!(fable.label, "Fable 5.1");
+        assert_eq!(fable.runner, "claude");
+        let opus = found.iter().find(|d| d.id == "claude-opus-5-5").unwrap();
+        assert_eq!(
+            opus.created,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-09-22T00:00:00Z")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+
+        assert!(parse_models_dev("<html>").is_empty());
+        assert!(parse_models_dev(r#"{"anthropic": {}}"#).is_empty());
+    }
+
+    #[test]
+    fn the_codex_cache_path_prefers_codex_home() {
+        let p = |c: Option<&str>, h: Option<&str>| {
+            codex_cache_path(c.map(str::to_string), h.map(str::to_string))
+        };
+        assert_eq!(
+            p(Some("/x/codex"), Some("/home/me")),
+            Some(std::path::Path::new("/x/codex").join("models_cache.json"))
+        );
+        assert_eq!(
+            p(Some("  "), Some("/home/me")),
+            Some(
+                std::path::Path::new("/home/me")
+                    .join(".codex")
+                    .join("models_cache.json")
+            )
+        );
+        assert_eq!(p(None, None), None);
+    }
+
+    /// A key-less source that answers from the fixtures and counts its calls.
+    fn keyless_fixtures(
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl Fn(&'static str) -> std::future::Ready<Option<Result<String, FetchError>>> {
+        move |provider| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = if provider == "anthropic" {
+                MODELS_DEV
+            } else {
+                CODEX_CACHE
+            };
+            std::future::ready(Some(Ok(body.to_string())))
+        }
+    }
+
+    #[tokio::test]
+    async fn without_keys_the_keyless_sources_are_used() {
+        let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = fetches.clone();
+        let snap = refresh_all(
+            &Keys::default(),
+            move |_, _| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(FetchError::Transport) }
+            },
+            keyless_fixtures(Default::default()),
+            None,
+        )
+        .await;
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(snap.source, "keyless");
+        assert_eq!(snap.sources["anthropic"], "models.dev");
+        assert_eq!(snap.sources["openai"], "codex-cache");
+        assert!(snap.models.iter().any(|d| d.id == "gpt-6-astra"));
+        assert!(snap.models.iter().any(|d| d.id == "claude-opus-4-8"));
+        assert!(
+            snap.models.iter().any(|d| d.id == "claude-opus-4-6"),
+            "fallback ids no source listed stay"
+        );
+        assert_eq!(snap.ttl(), FRESH_FOR);
+        let wire = serde_json::to_value(&snap).unwrap();
+        assert_eq!(wire["sources"]["openai"], "codex-cache");
+    }
+
+    #[tokio::test]
+    async fn a_key_wins_over_the_keyless_source_and_a_failed_key_falls_to_it() {
+        let keyless_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let snap = refresh_all(
+            &both_keys(),
+            |provider, _| async move {
+                if provider == "anthropic" {
+                    Ok(r#"{"data":[{"id":"claude-opus-9-9","created_at":"2026-01-01T00:00:00Z"}]}"#
+                        .to_string())
+                } else {
+                    Err(FetchError::Status(401))
+                }
+            },
+            keyless_fixtures(keyless_calls.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(snap.source, "live");
+        assert_eq!(snap.sources["anthropic"], "api");
+        assert_eq!(snap.sources["openai"], "codex-cache");
+        assert_eq!(
+            keyless_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "models.dev is not asked when the Anthropic key answered"
+        );
+        assert!(snap.models.iter().any(|d| d.id == "claude-opus-9-9"));
+        assert!(
+            !snap.models.iter().any(|d| d.id == "claude-opus-4-8"),
+            "nothing from models.dev"
+        );
+        assert!(snap.models.iter().any(|d| d.id == "gpt-6-astra"));
+        assert!(
+            snap.ttl() < FRESH_FOR,
+            "a failed key is retried soon even when the key-less source covered it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_keyless_source_keeps_the_previous_snapshot_then_the_fallback() {
+        let first = refresh_all(
+            &Keys::default(),
+            |_, _| async { Err(FetchError::Transport) },
+            keyless_fixtures(Default::default()),
+            None,
+        )
+        .await;
+        let failing = |provider: &'static str| async move {
+            if provider == "anthropic" {
+                Some(Err(FetchError::Transport))
+            } else {
+                None // no Codex CLI on this machine
+            }
+        };
+        let again = refresh_all(
+            &Keys::default(),
+            |_, _| async { Err(FetchError::Transport) },
+            failing,
+            Some(&first),
+        )
+        .await;
+        assert_eq!(again.sources["anthropic"], "models.dev", "carried over");
+        assert_eq!(again.sources["openai"], "codex-cache", "carried over");
+        assert!(again.models.iter().any(|d| d.id == "claude-opus-4-8"));
+        assert!(again.models.iter().any(|d| d.id == "gpt-6-astra"));
+        assert!(again.ttl() < FRESH_FOR);
+
+        let cold = refresh_all(
+            &Keys::default(),
+            |_, _| async { Err(FetchError::Transport) },
+            failing,
+            None,
+        )
+        .await;
+        assert_eq!(cold.source, "fallback");
+        assert_eq!(cold.models.len(), FALLBACK.len());
+        assert!(cold.ttl() < FRESH_FOR, "models.dev failed: retried soon");
+
+        let absent = refresh_all(
+            &Keys::default(),
+            |_, _| async { Err(FetchError::Transport) },
+            |_| async { None },
+            None,
+        )
+        .await;
+        assert_eq!(absent.source, "fallback");
+        assert_eq!(absent.ttl(), FRESH_FOR, "an absent source is not a failure");
     }
 }

@@ -197,6 +197,8 @@ pub struct VoiceRuntime {
     pub tts_command: String,
     /// The chord that toggles hands-free conversation, carried for the shell like the other two.
     pub conversation_hotkey: String,
+    /// The chord that opens the Brain capture box, carried for the shell like the other three.
+    pub capture_hotkey: String,
     /// Absent means the núcleo has no voice. NOT the same as voice being off — the conversation
     /// still happens, it is just read rather than heard (`VoiceConfig::speaks`).
     pub speaker: Option<Arc<dyn crate::speak::Speaker>>,
@@ -224,6 +226,7 @@ impl Default for VoiceRuntime {
             transcriber: None,
             tts_command: String::new(),
             conversation_hotkey: String::new(),
+            capture_hotkey: String::new(),
             speaker: None,
             client: reqwest::Client::new(),
         }
@@ -247,6 +250,7 @@ impl VoiceRuntime {
             transcriber: transcriber_for(config),
             tts_command: config.tts_command.clone(),
             conversation_hotkey: config.conversation_hotkey.clone(),
+            capture_hotkey: config.capture_hotkey.clone(),
             speaker: speaker_for(config),
             ..Self::default()
         }
@@ -1173,6 +1177,8 @@ pub struct VoiceConfigView {
     pub hotkey: String,
     pub memo_hotkey: String,
     pub conversation_hotkey: String,
+    /// Opens the Brain capture box; a chord of its own because it neither records nor talks.
+    pub capture_hotkey: String,
     /// Whether an answer can be SPOKEN, as opposed to merely arrived at.
     ///
     /// Separate from `armed` because the two failures are different sizes and the window must be able
@@ -1196,6 +1202,7 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
         hotkey: state.voice.hotkey.clone(),
         memo_hotkey: state.voice.memo_hotkey.clone(),
         conversation_hotkey: state.voice.conversation_hotkey.clone(),
+        capture_hotkey: state.voice.capture_hotkey.clone(),
         speaks: state.voice.speaker.is_some(),
         max_capture_seconds: MAX_CAPTURE_SECONDS,
         max_body_bytes: max_body_bytes(),
@@ -2694,6 +2701,26 @@ mod tests {
         assert_eq!(runtime.conversation_hotkey, "Ctrl+Alt+C");
         assert_eq!(runtime.tts_command, "piper -m voz.onnx -f -");
         assert!(runtime.speaker.is_some());
+    }
+
+    /// The capture chord reaches the shell through `/voice/config` like the other three, from the one
+    /// file that owns it; the Brain capture box is opened by a key the shell may not read itself.
+    #[tokio::test]
+    async fn the_voice_config_readout_carries_the_capture_chord() {
+        let config = crate::config::VoiceConfig {
+            capture_hotkey: "Ctrl+Alt+N".to_string(),
+            ..Default::default()
+        };
+        let state = conversing_state(VoiceRuntime::from_config(&config, None)).await;
+
+        let response = get_config(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["capture_hotkey"], "Ctrl+Alt+N");
     }
 
     /// Nothing is synthesised until it is asked for, and THAT is what makes barge-in free.

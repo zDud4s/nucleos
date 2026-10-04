@@ -227,6 +227,10 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     vcs_request_finished: { tone: "info", label: "git request settled" },
     vcs_request_cancelled: { tone: "off", label: "git request cancelled" },
     vcs_request_interrupted: { tone: "paused", label: "git request interrupted" },
+    // Settled: the request stopped wanting a person (merged by hand, superseded, dismissed, its
+    // branch gone). Closes the request's sequence, so a resolution started before it stops reading
+    // as still going.
+    vcs_request_settled: { tone: "info", label: "git request no longer needs you" },
     vcs_resolution_started: { tone: "info", label: "conflict resolution started" },
     vcs_resolution_cancelled: { tone: "off", label: "conflict resolution stopped" },
     vcs_resolution_discarded: { tone: "danger", label: "resolution discarded changes" },

@@ -1326,7 +1326,7 @@ A fatura de julho segue em anexo.\n\n\
             running_in.display(),
         );
         let source_dir = running_in.join("src");
-        let forbidden = ["body_excerpt", "body_text", "subject"];
+        let forbidden = ["body_excerpt", "body_text", "subject", "note_text"];
 
         for entry in fs::read_dir(source_dir).expect("core source directory must be readable") {
             let entry = entry.expect("core source entry must be readable");

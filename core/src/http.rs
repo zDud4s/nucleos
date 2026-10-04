@@ -43,6 +43,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/status", get(status))
+        .route("/home", get(get_home))
         // Deliberately in NO auth.rs table: a route absent from every table is reachable by the
         // control token and an Admin key only, which is exactly who may stop the daemon.
         .route("/daemon/shutdown", post(post_daemon_shutdown))
@@ -548,6 +549,24 @@ pub fn build_router(state: AppState) -> Router {
         .route("/knowledge/findings", post(post_finding))
         .route("/knowledge/{id}", get(get_knowledge))
         .route("/knowledge/{id}/revert", post(revert_knowledge))
+        // The owner's own notes. In no `auth.rs` table on purpose: the table is default-deny, so a
+        // route nobody lists is reachable by Control and Admin alone — the same reasoning as
+        // `post_job_note`. No run, service, team or narrower API token reaches them, which is the
+        // point: these are the person's thinking, and nothing in the agent's memory reads them.
+        // Static segments (`search`, `graph`, `links`) win over `{id}` in matchit.
+        .route("/owner-notes", get(list_owner_notes).post(post_owner_note))
+        .route("/owner-notes/search", get(search_owner_notes))
+        .route("/owner-notes/graph", get(get_owner_notes_graph))
+        .route(
+            "/owner-notes/{id}",
+            get(get_owner_note).patch(patch_owner_note),
+        )
+        .route("/owner-notes/{id}/links", post(post_owner_note_link))
+        .route("/owner-notes/{id}/teach", post(post_owner_note_teach))
+        .route(
+            "/owner-notes/links/{link_id}",
+            delete(delete_owner_note_link),
+        )
         .route("/assistant/message", post(post_assistant_message))
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
@@ -583,6 +602,7 @@ pub fn build_router(state: AppState) -> Router {
         // per row in the list.
         .route("/assistant/models", get(get_assistant_models))
         .route("/assistant/models/groups", get(get_model_groups))
+        .route("/models/latest", get(get_latest_models))
         .route("/assistant/tools", get(get_deniable_tools))
         .route("/assistant/commands", get(get_commands))
         .route("/assistant/chats", get(list_chats).post(create_chat))
@@ -1091,6 +1111,35 @@ async fn post_daemon_shutdown() -> impl IntoResponse {
 
 async fn status() -> impl IntoResponse {
     (StatusCode::OK, "daemon running")
+}
+
+/// The directory the daemon was started from, fixed by [`remember_home`] at startup.
+static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Records the daemon's own directory. Called once from `main`; later calls change nothing, so
+/// a `set_current_dir` somewhere never moves what the shell was told.
+pub fn remember_home() {
+    if let Ok(dir) = std::env::current_dir() {
+        let _ = HOME.set(std::path::absolute(&dir).unwrap_or(dir));
+    }
+}
+
+#[derive(Serialize)]
+struct Home {
+    /// Where NucleOS itself lives: the folder the daemon was started from. `None` when the
+    /// working directory was unreadable, never a guess.
+    root: Option<String>,
+}
+
+/// `GET /home` — the folder the chat picker calls Root.
+async fn get_home() -> Json<Home> {
+    let dir = HOME.get().cloned().or_else(|| std::env::current_dir().ok());
+    Json(Home {
+        root: dir.map(|dir| {
+            dir.to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        }),
+    })
 }
 
 #[derive(Deserialize)]
@@ -13023,6 +13072,27 @@ async fn get_assistant_models(
     }))
 }
 
+/// Query parameters for `GET /models/latest`.
+#[derive(serde::Deserialize)]
+struct LatestModelsQuery {
+    vendor: Option<String>,
+}
+
+/// The newest models per vendor, for the `latest_models` agent tool. The same snapshot the picker
+/// serves, so there is one list; `current()` only waits on the process's very first call.
+async fn get_latest_models(
+    Query(query): Query<LatestModelsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let snapshot = crate::model_catalog::current().await;
+    match crate::model_catalog::latest(&snapshot, query.vendor.as_deref()) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ),
+    }
+}
+
 /// The picker as groups: provider and family, newest first, named as a person reads them.
 ///
 /// The config's cloud choices come first and win; the discovered models (live vendor lists, or the
@@ -13080,6 +13150,7 @@ async fn get_model_groups(
         "groups": crate::model_catalog::group(cloud, &created),
         "needs_root": needs_root,
         "source": snapshot.source,
+        "sources": snapshot.sources,
         "catalogue_version": crate::model_catalog::CATALOGUE_VERSION,
         "fetched_at": snapshot.fetched_at,
     }))
@@ -15322,6 +15393,339 @@ async fn post_job_note(
             tracing::warn!(job_id = id, %error, "leaving a note on a job failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+/// Body of `POST /owner-notes`. The field is `note_text` in Rust so the redact scan keeps it out of
+/// any tracing call, and `text` on the wire. No `author`: a note is the owner's by construction.
+#[derive(serde::Deserialize)]
+struct PostOwnerNoteRequest {
+    #[serde(rename = "text")]
+    note_text: String,
+    origin: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PatchOwnerNoteRequest {
+    #[serde(rename = "text")]
+    note_text: Option<String>,
+    state: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OwnerNoteListQuery {
+    state: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OwnerNoteSearchQuery {
+    q: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OwnerNoteGraphQuery {
+    include_archived: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct PostOwnerNoteLinkRequest {
+    link_type: String,
+    target_kind: String,
+    target_ref: String,
+}
+
+/// Body of `POST /owner-notes/{id}/teach`. Every field is optional: the kind defaults to `memory`
+/// and the title to the note's first line.
+#[derive(serde::Deserialize)]
+struct TeachOwnerNoteRequest {
+    kind: Option<String>,
+    title: Option<String>,
+    project_id: Option<String>,
+}
+
+/// The status a note failure answers with. Never logs the text: only the id and the database error.
+fn owner_note_status(error: &crate::owner_notes::NoteError, note_id: Option<i64>) -> StatusCode {
+    use crate::owner_notes::NoteError;
+    match error {
+        NoteError::Empty | NoteError::UnknownOrigin | NoteError::UnknownState => {
+            StatusCode::BAD_REQUEST
+        }
+        NoteError::NotFound => StatusCode::NOT_FOUND,
+        NoteError::Db(error) => {
+            tracing::warn!(note_id, %error, "an owner note operation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+fn owner_note_db_status(error: &sqlx::Error, note_id: Option<i64>) -> StatusCode {
+    tracing::warn!(note_id, %error, "reading the owner notes failed");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+async fn post_owner_note(
+    State(state): State<AppState>,
+    Json(request): Json<PostOwnerNoteRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let origin = request.origin.as_deref().unwrap_or("shell");
+    let id = crate::owner_notes::create(&state.pool, &request.note_text, origin)
+        .await
+        .map_err(|error| owner_note_status(&error, None))?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
+}
+
+async fn list_owner_notes(
+    State(state): State<AppState>,
+    Query(query): Query<OwnerNoteListQuery>,
+) -> Result<Json<Vec<crate::owner_notes::OwnerNote>>, StatusCode> {
+    use crate::owner_notes::StateFilter;
+    let filter = match query.state.as_deref() {
+        None | Some("active") => StateFilter::Active,
+        Some("archived") => StateFilter::Archived,
+        Some("all") => StateFilter::All,
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+    crate::owner_notes::list(&state.pool, filter)
+        .await
+        .map(Json)
+        .map_err(|error| owner_note_status(&error, None))
+}
+
+async fn search_owner_notes(
+    State(state): State<AppState>,
+    Query(query): Query<OwnerNoteSearchQuery>,
+) -> Result<Json<Vec<crate::owner_notes::OwnerNote>>, StatusCode> {
+    crate::owner_notes::search(&state.pool, query.q.as_deref().unwrap_or(""))
+        .await
+        .map(Json)
+        .map_err(|error| owner_note_status(&error, None))
+}
+
+async fn get_owner_note(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let note = crate::owner_notes::get(&state.pool, id)
+        .await
+        .map_err(|error| owner_note_status(&error, Some(id)))?;
+    let links_out = crate::owner_notes::links_out(&state.pool, id)
+        .await
+        .map_err(|error| owner_note_db_status(&error, Some(id)))?;
+    let links_in = crate::owner_notes::links_in(&state.pool, "note", &id.to_string())
+        .await
+        .map_err(|error| owner_note_db_status(&error, Some(id)))?;
+    let events = crate::owner_notes::events(&state.pool, id)
+        .await
+        .map_err(|error| owner_note_status(&error, Some(id)))?;
+    Ok(Json(serde_json::json!({
+        "note": note,
+        "links_out": links_out,
+        "links_in": links_in,
+        "events": events,
+    })))
+}
+
+async fn patch_owner_note(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<PatchOwnerNoteRequest>,
+) -> Result<Json<crate::owner_notes::OwnerNote>, StatusCode> {
+    crate::owner_notes::update(
+        &state.pool,
+        id,
+        request.note_text.as_deref(),
+        request.state.as_deref(),
+    )
+    .await
+    .map(Json)
+    .map_err(|error| owner_note_status(&error, Some(id)))
+}
+
+/// Whether a project id is on the roster. Roster failures are a 500, never "absent".
+async fn owner_note_project_exists(state: &AppState, project_id: &str) -> Result<bool, StatusCode> {
+    let roster = crate::autopilot::project_roster(&state.pool)
+        .await
+        .map_err(|error| owner_note_db_status(&error, None))?;
+    Ok(roster
+        .iter()
+        .any(|project| project.project_id == project_id))
+}
+
+/// Whether a path names a file under the files root.
+fn owner_note_file_exists(state: &AppState, path: &str) -> Result<bool, StatusCode> {
+    let root = files_root(state)?;
+    Ok(crate::files::resolve_file(root, path).is_ok_and(|target| target.is_file()))
+}
+
+async fn post_owner_note_link(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<PostOwnerNoteLinkRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    use crate::owner_notes::LinkError;
+    let target_ref = request.target_ref.trim();
+    crate::owner_notes::link_allowed(&request.link_type, &request.target_kind, id, target_ref)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    let exists = match request.target_kind.as_str() {
+        "project" => owner_note_project_exists(&state, target_ref)
+            .await
+            .map_err(|status| (status, String::new()))?,
+        "file" => {
+            owner_note_file_exists(&state, target_ref).map_err(|status| (status, String::new()))?
+        }
+        kind => crate::owner_notes::target_exists(&state.pool, kind, target_ref)
+            .await
+            .map_err(|error| (owner_note_db_status(&error, Some(id)), String::new()))?
+            .unwrap_or(false),
+    };
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "that target does not exist".into()));
+    }
+
+    match crate::owner_notes::add_link(
+        &state.pool,
+        id,
+        &request.link_type,
+        &request.target_kind,
+        target_ref,
+    )
+    .await
+    {
+        Ok(link_id) => Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": link_id })),
+        )),
+        Err(LinkError::Duplicate) => Err((StatusCode::CONFLICT, LinkError::Duplicate.to_string())),
+        Err(LinkError::NotFound) => Err((StatusCode::NOT_FOUND, "note not found".into())),
+        Err(LinkError::Db(error)) => Err((owner_note_db_status(&error, Some(id)), String::new())),
+        Err(other) => Err((StatusCode::BAD_REQUEST, other.to_string())),
+    }
+}
+
+/// Teaching a note: it becomes a `proposed` lesson owned by the owner, and reaches no prompt until
+/// the proposal is approved through `POST /proposals/{id}/approve`.
+async fn post_owner_note_teach(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<TeachOwnerNoteRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    use crate::owner_notes::TeachError;
+    let kind = crate::knowledge::Kind::parse(request.kind.as_deref().unwrap_or("memory"))
+        .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "unknown_kind"))?;
+    // A lesson scoped to a project nobody has is one no run's scope chain ever reads.
+    if let Some(project_id) = request.project_id.as_deref() {
+        let known = owner_note_project_exists(&state, project_id)
+            .await
+            .map_err(|status| refusal(status, "internal"))?;
+        if !known {
+            return Err(refusal(StatusCode::BAD_REQUEST, "unknown_project"));
+        }
+    }
+    match crate::owner_notes::teach(
+        &state.pool,
+        id,
+        kind,
+        request.title.as_deref(),
+        request.project_id.as_deref(),
+    )
+    .await
+    {
+        Ok((knowledge_id, proposal_id, link_id)) => Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "knowledge_id": knowledge_id,
+                "proposal_id": proposal_id,
+                "link_id": link_id,
+            })),
+        )),
+        Err(TeachError::NotFound) => Err(refusal(StatusCode::NOT_FOUND, "not_found")),
+        Err(TeachError::Archived) => Err(refusal(StatusCode::CONFLICT, "archived")),
+        Err(TeachError::AlreadyTaught) => Err(refusal(StatusCode::CONFLICT, "already_taught")),
+        // Only the id and the error: the note's text never reaches a log line.
+        Err(error) => {
+            tracing::warn!(note_id = id, %error, "teaching an owner note failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
+}
+
+async fn delete_owner_note_link(
+    State(state): State<AppState>,
+    Path(link_id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    use crate::owner_notes::LinkError;
+    match crate::owner_notes::remove_link(&state.pool, link_id).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(LinkError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(LinkError::Db(error)) => Err(owner_note_db_status(&error, None)),
+        Err(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+/// The graph: notes, the links between them and what they point at. Only entities some link
+/// references are returned as targets — the rest of the house is not a node (spec S5).
+async fn get_owner_notes_graph(
+    State(state): State<AppState>,
+    Query(query): Query<OwnerNoteGraphQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::owner_notes::StateFilter;
+    let include_archived = query.include_archived.unwrap_or(false);
+    let filter = if include_archived {
+        StateFilter::All
+    } else {
+        StateFilter::Active
+    };
+    let notes = crate::owner_notes::list(&state.pool, filter)
+        .await
+        .map_err(|error| owner_note_status(&error, None))?;
+    let shown: std::collections::HashSet<i64> = notes.iter().map(|note| note.id).collect();
+    let links: Vec<_> = crate::owner_notes::all_links(&state.pool)
+        .await
+        .map_err(|error| owner_note_db_status(&error, None))?
+        .into_iter()
+        .filter(|link| shown.contains(&link.note_id))
+        .collect();
+
+    let mut wanted: Vec<(&str, &str)> = Vec::new();
+    for link in &links {
+        let pair = (link.target_kind.as_str(), link.target_ref.as_str());
+        if !wanted.contains(&pair) {
+            wanted.push(pair);
+        }
+    }
+    let mut targets = crate::owner_notes::resolve_sql_labels(&state.pool, &wanted)
+        .await
+        .map_err(|error| owner_note_db_status(&error, None))?;
+
+    let roster = if targets.iter().any(|target| target.kind == "project") {
+        crate::autopilot::project_roster(&state.pool)
+            .await
+            .map_err(|error| owner_note_db_status(&error, None))?
+    } else {
+        Vec::new()
+    };
+    for target in &mut targets {
+        match target.kind.as_str() {
+            "project" => {
+                target.missing = !roster
+                    .iter()
+                    .any(|project| project.project_id == target.r#ref);
+                target.label = Some(target.r#ref.clone());
+            }
+            "file" => {
+                // No files root, or a path that no longer resolves, is a missing file here and not
+                // an error: the graph must still draw.
+                target.missing = !owner_note_file_exists(&state, &target.r#ref).unwrap_or(false);
+                target.label = Some(target.r#ref.clone());
+            }
+            _ => {}
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "notes": notes,
+        "links": links,
+        "targets": targets,
+    })))
 }
 
 async fn post_worktree_release(
@@ -28610,6 +29014,27 @@ mod tests {
         assert!(body["configured"].is_string());
     }
 
+    /// The agents' `latest_models` read: both vendors by default, one on request, a 400 naming the
+    /// valid vendors otherwise. No network in a test daemon, so it is the built-in catalogue.
+    #[tokio::test]
+    async fn latest_models_route_answers_per_vendor_and_refuses_an_unknown_vendor() {
+        let state = test_state().await;
+
+        let (status, body) = call(state.clone(), "GET", "/models/latest", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["vendors"].as_array().unwrap().len(), 2);
+        assert_eq!(body["vendors"][0]["source"], "fallback");
+
+        let (status, body) = call(state.clone(), "GET", "/models/latest?vendor=openai", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["vendors"].as_array().unwrap().len(), 1);
+        assert_eq!(body["vendors"][0]["vendor"], "openai");
+
+        let (status, body) = call(state, "GET", "/models/latest?vendor=google", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("anthropic"));
+    }
+
     /// The grouped picker: provider and family groups, product names for labels, the version of
     /// the catalogue the fallback came from, and never a key.
     #[tokio::test]
@@ -31978,6 +32403,42 @@ mod tests {
         // drives depends on the exact pool it was written against. It still has to close it, or the
         // directory outlives the run for the same reason every other one did.
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn home_answers_with_the_directory_the_daemon_runs_in() {
+        remember_home();
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/home")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let home: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let running_in = std::env::current_dir().unwrap();
+        let expected = running_in
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        assert_eq!(home["root"], expected);
+    }
+
+    #[tokio::test]
+    async fn home_requires_the_bearer_token() {
+        let app = build_router(test_state().await);
+        let response = app
+            .oneshot(Request::builder().uri("/home").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -36471,6 +36932,414 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(judge, "enforce");
+    }
+
+    async fn file_owner_note(state: &AppState, text: &str) -> i64 {
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/owner-notes",
+            Some(serde_json::json!({ "text": text })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        body["id"].as_i64().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_taught_note_becomes_active_knowledge_only_after_approval() {
+        let state = test_state().await;
+        let id = file_owner_note(&state, "Release notes are written before the tag").await;
+        let uri = format!("/owner-notes/{id}/teach");
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &uri,
+            Some(serde_json::json!({ "kind": "nonsense" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, refused) = call(
+            state.clone(),
+            "POST",
+            &uri,
+            Some(serde_json::json!({ "project_id": "no-such-project" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused["refusal"], "unknown_project");
+
+        let (status, taught) = call(state.clone(), "POST", &uri, Some(serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{taught}");
+        let knowledge_id = taught["knowledge_id"].as_i64().unwrap();
+        let proposal_id = taught["proposal_id"].as_i64().unwrap();
+        assert!(taught["link_id"].as_i64().is_some());
+
+        let (status, source): (String, String) =
+            sqlx::query_as("SELECT status, source FROM knowledge WHERE id = ?")
+                .bind(knowledge_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!((status.as_str(), source.as_str()), ("proposed", "owner"));
+
+        let (status, again) = call(state.clone(), "POST", &uri, Some(serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(again["refusal"], "already_taught");
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/owner-notes/9999/teach",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{proposal_id}/approve"),
+            None,
+        )
+        .await;
+        assert!(status.is_success(), "approve answered {status}");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM knowledge WHERE id = ?")
+            .bind(knowledge_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "active");
+    }
+
+    #[tokio::test]
+    async fn an_owner_note_is_created_listed_and_read_back() {
+        let state = test_state().await;
+        let id = file_owner_note(&state, "  an idea worth keeping  ").await;
+
+        let (status, list) = call(state.clone(), "GET", "/owner-notes", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["text"], "an idea worth keeping");
+        assert_eq!(list[0]["origin"], "shell", "origin defaults to the shell");
+        assert!(
+            list[0].get("note_text").is_none(),
+            "the wire name is `text`"
+        );
+
+        let (status, detail) =
+            call(state.clone(), "GET", &format!("/owner-notes/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["note"]["id"], id);
+        assert_eq!(detail["events"][0]["kind"], "created");
+        assert_eq!(detail["links_out"].as_array().unwrap().len(), 0);
+        assert_eq!(detail["links_in"].as_array().unwrap().len(), 0);
+
+        let (status, _) = call(state.clone(), "GET", "/owner-notes/9999", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, created) = call(
+            state,
+            "POST",
+            "/owner-notes",
+            Some(serde_json::json!({ "text": "from a phone", "origin": "telegram" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(created["id"].as_i64().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_empty_owner_note_is_a_400() {
+        let state = test_state().await;
+        for body in [
+            serde_json::json!({ "text": "   " }),
+            serde_json::json!({ "text": "x", "origin": "carrier-pigeon" }),
+        ] {
+            let (status, _) = call(state.clone(), "POST", "/owner-notes", Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        let (status, list) = call(state, "GET", "/owner-notes?state=all", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(list.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_owner_note_is_archived_and_restored_by_patch() {
+        let state = test_state().await;
+        let id = file_owner_note(&state, "to be archived").await;
+        let uri = format!("/owner-notes/{id}");
+
+        let (status, note) = call(
+            state.clone(),
+            "PATCH",
+            &uri,
+            Some(serde_json::json!({ "state": "archived" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(note["state"], "archived");
+        let (_, active) = call(state.clone(), "GET", "/owner-notes", None).await;
+        assert!(active.as_array().unwrap().is_empty());
+        let (_, archived) = call(state.clone(), "GET", "/owner-notes?state=archived", None).await;
+        assert_eq!(archived.as_array().unwrap().len(), 1);
+
+        let (status, note) = call(
+            state.clone(),
+            "PATCH",
+            &uri,
+            Some(serde_json::json!({ "state": "active", "text": "restored and reworded" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(note["state"], "active");
+        assert_eq!(note["text"], "restored and reworded");
+
+        let (status, _) = call(
+            state.clone(),
+            "PATCH",
+            &uri,
+            Some(serde_json::json!({ "state": "deleted" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            state.clone(),
+            "PATCH",
+            "/owner-notes/9999",
+            Some(serde_json::json!({ "state": "archived" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, detail) = call(state, "GET", &uri, None).await;
+        let kinds: Vec<&str> = detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["created", "archived", "edited", "restored"]);
+    }
+
+    #[tokio::test]
+    async fn owner_notes_are_searchable_over_http() {
+        let state = test_state().await;
+        let hit = file_owner_note(&state, "the invoice from the plumber").await;
+        file_owner_note(&state, "something else entirely").await;
+
+        let (status, found) =
+            call(state.clone(), "GET", "/owner-notes/search?q=plumber", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(found.as_array().unwrap().len(), 1);
+        assert_eq!(found[0]["id"], hit);
+
+        // Hostile FTS syntax is a quiet empty or a hit, never a 500; no `q` at all is empty.
+        let (status, _) = call(
+            state.clone(),
+            "GET",
+            "/owner-notes/search?q=%22%20OR%20%28",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, none) = call(state, "GET", "/owner-notes/search", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(none.as_array().unwrap().is_empty());
+    }
+
+    async fn insert_contact(state: &AppState, name: &str) -> i64 {
+        sqlx::query("INSERT INTO contacts (display_name, created_at) VALUES (?, 'now')")
+            .bind(name)
+            .execute(&state.pool)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn an_owner_note_links_to_a_contact_and_the_graph_resolves_it() {
+        let state = test_state().await;
+        let note = file_owner_note(&state, "met her at the fair").await;
+        let contact = insert_contact(&state, "Ada Lovelace").await;
+
+        let (status, link) = call(
+            state.clone(),
+            "POST",
+            &format!("/owner-notes/{note}/links"),
+            Some(serde_json::json!({
+                "link_type": "relates",
+                "target_kind": "contact",
+                "target_ref": contact.to_string(),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(link["id"].as_i64().is_some());
+
+        // The same edge twice is a conflict; a self link or a bad type is a 400.
+        let body = serde_json::json!({
+            "link_type": "relates", "target_kind": "contact", "target_ref": contact.to_string(),
+        });
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/owner-notes/{note}/links"),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/owner-notes/{note}/links"),
+            Some(serde_json::json!({
+                "link_type": "relates", "target_kind": "note", "target_ref": note.to_string(),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/owner-notes/{note}/links"),
+            Some(serde_json::json!({
+                "link_type": "befriends", "target_kind": "contact", "target_ref": "1",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, graph) = call(state.clone(), "GET", "/owner-notes/graph", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(graph["notes"].as_array().unwrap().len(), 1);
+        assert_eq!(graph["links"].as_array().unwrap().len(), 1);
+        assert_eq!(graph["targets"][0]["kind"], "contact");
+        assert_eq!(graph["targets"][0]["ref"], contact.to_string());
+        assert_eq!(graph["targets"][0]["label"], "Ada Lovelace");
+        assert_eq!(graph["targets"][0]["missing"], false);
+
+        // The note's own detail carries the edge, and removing it is a 204 then a 404.
+        let link_id = link["id"].as_i64().unwrap();
+        let (_, detail) = call(state.clone(), "GET", &format!("/owner-notes/{note}"), None).await;
+        assert_eq!(detail["links_out"][0]["id"], link_id);
+        let (status, _) = call(
+            state.clone(),
+            "DELETE",
+            &format!("/owner-notes/links/{link_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(
+            state,
+            "DELETE",
+            &format!("/owner-notes/links/{link_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_link_to_a_missing_target_is_a_404() {
+        let state = test_state().await;
+        let note = file_owner_note(&state, "points nowhere").await;
+        let uri = format!("/owner-notes/{note}/links");
+        for (kind, target) in [
+            ("contact", "9999"),
+            ("mail", "9999"),
+            ("knowledge", "9999"),
+            ("note", "9999"),
+            ("project", "no-such-project"),
+        ] {
+            let (status, _) = call(
+                state.clone(),
+                "POST",
+                &uri,
+                Some(serde_json::json!({
+                    "link_type": "relates", "target_kind": kind, "target_ref": target,
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{kind}:{target}");
+        }
+        // A missing note is a 404 too, and nothing was written for any of them.
+        let contact = insert_contact(&state, "Someone").await;
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/owner-notes/9999/links",
+            Some(serde_json::json!({
+                "link_type": "relates", "target_kind": "contact", "target_ref": contact.to_string(),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (_, detail) = call(state, "GET", &format!("/owner-notes/{note}"), None).await;
+        assert!(detail["links_out"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_mail_target_shows_as_missing_in_the_graph() {
+        let state = test_state().await;
+        let note = file_owner_note(&state, "about a mail that is gone").await;
+        // The link was valid when it was made; the mail has since been deleted.
+        crate::owner_notes::add_link(&state.pool, note, "relates", "mail", "9999")
+            .await
+            .unwrap();
+
+        let (status, graph) = call(state, "GET", "/owner-notes/graph", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(graph["targets"].as_array().unwrap().len(), 1);
+        assert_eq!(graph["targets"][0]["kind"], "mail");
+        assert_eq!(graph["targets"][0]["missing"], true);
+    }
+
+    #[tokio::test]
+    async fn the_graph_holds_only_linked_entities() {
+        let state = test_state().await;
+        let note = file_owner_note(&state, "a linked note").await;
+        let archived = file_owner_note(&state, "an archived note").await;
+        let linked = insert_contact(&state, "Linked").await;
+        let unlinked = insert_contact(&state, "Never linked").await;
+        crate::owner_notes::add_link(&state.pool, note, "relates", "contact", &linked.to_string())
+            .await
+            .unwrap();
+        crate::owner_notes::add_link(
+            &state.pool,
+            archived,
+            "relates",
+            "contact",
+            &unlinked.to_string(),
+        )
+        .await
+        .unwrap();
+        crate::owner_notes::update(&state.pool, archived, None, Some("archived"))
+            .await
+            .unwrap();
+
+        let (_, graph) = call(state.clone(), "GET", "/owner-notes/graph", None).await;
+        assert_eq!(graph["notes"].as_array().unwrap().len(), 1);
+        let refs: Vec<&str> = graph["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|target| target["ref"].as_str().unwrap())
+            .collect();
+        assert_eq!(refs, vec![linked.to_string()]);
+
+        let (_, graph) = call(
+            state,
+            "GET",
+            "/owner-notes/graph?include_archived=true",
+            None,
+        )
+        .await;
+        assert_eq!(graph["notes"].as_array().unwrap().len(), 2);
+        assert_eq!(graph["targets"].as_array().unwrap().len(), 2);
     }
 
     /// The updater stops the daemon through this route, so it must not be open to anyone without

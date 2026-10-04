@@ -1,52 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
 import { Button, Modal } from "../ui";
-import { useProjects } from "../data/system";
-
-/**
- * The folder every rostered project lives under, or null when there is no sensible one.
- *
- * This is what "Root" means in the picker: not one project, but the place the projects sit side by
- * side — `C:/Projects` for `C:/Projects/nucleos` and `C:/Projects/site`. A conversation rooted
- * there can look across all of them, which is what somebody asks for when the question is about
- * more than one project or about none in particular.
- *
- * Derived from the roster rather than configured, because the roster is the only place this app
- * already knows where projects are. The longest common ancestor of every project root; when that
- * ancestor is itself one of the projects (one project, or one nested in another), its parent, so
- * Root is never just another name for a project already in the list.
- *
- * Null when the answer would be a bare filesystem root (`C:/`, `/`) or the roots share nothing
- * (two drives): handing a conversation tools over a whole drive is not what the word was asked to
- * mean, and the option is then offered disabled rather than guessed.
- */
-export function projectsRoot(roots: string[]): string | null {
-  const split = roots
-    .map((root) => root.replace(/\\/g, "/").replace(/\/+$/, ""))
-    .filter((root) => root !== "")
-    .map((root) => root.split("/"));
-  if (split.length === 0) return null;
-
-  let common = split[0];
-  for (const parts of split.slice(1)) {
-    let at = 0;
-    while (
-      at < common.length &&
-      at < parts.length &&
-      common[at].toLowerCase() === parts[at].toLowerCase()
-    ) {
-      at += 1;
-    }
-    common = common.slice(0, at);
-  }
-  // A project as the common ancestor is not a place ABOVE the projects; step out of it.
-  if (split.some((parts) => parts.length === common.length)) {
-    common = common.slice(0, -1);
-  }
-  // `["C:"]` and `[""]` (a POSIX `/`) are whole filesystems, and `[]` is nothing shared at all.
-  const meaningful = common.filter((part) => part !== "");
-  if (meaningful.length < 2) return null;
-  return common.join("/");
-}
+import { useHome, useProjects } from "../data/system";
 
 /** One row in the picker: a project, or Root. */
 interface Choice {
@@ -72,7 +26,7 @@ export interface ProjectPickerProps {
  * Where a conversation runs, chosen before it says anything.
  *
  * A choice among the NucleOS projects — the daemon's roster, the same list the Projects page
- * draws — plus Root (see `projectsRoot`). Not a free-text folder: a conversation is about a
+ * draws — plus Root, the folder NucleOS itself lives in (`GET /home`, whatever the daemon was started from). Not a free-text folder: a conversation is about a
  * project this app already looks after, and a path typed by hand was one more way to point it
  * somewhere nothing else in the app knows about.
  *
@@ -88,6 +42,7 @@ export function ProjectPicker({
   holding,
 }: ProjectPickerProps) {
   const projects = useProjects();
+  const home = useHome();
   const group = useId();
   const [chosen, setChosen] = useState<string | null>(null);
 
@@ -100,7 +55,8 @@ export function ProjectPicker({
     label: project.project_id,
     path: project.project_root,
   }));
-  const root = projectsRoot(rooted.map((project) => project.project_root));
+  // Whatever the daemon says and nothing else: until it has, Root is not offered a path.
+  const root = home.data?.root ?? null;
   const picked =
     chosen === "root"
       ? root
@@ -169,7 +125,10 @@ export function ProjectPicker({
             />
             <span className="chats-picker-name">Root</span>
             <span className="chats-picker-path">
-              {root ?? "no folder holds all the projects"}
+              {root ??
+                (home.isPending
+                  ? "reading where NucleOS lives…"
+                  : "the núcleo did not say where it lives")}
             </span>
           </label>
         )}
