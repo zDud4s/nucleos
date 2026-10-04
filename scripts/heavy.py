@@ -785,7 +785,7 @@ def _own_target_dir_config(argv: list[str], root: str, cwd: str | None) -> bool:
             return True
     else:
         d = base
-    rootp = _real(root)
+    rootp = Path(_real(root))
     d = Path(_real(d))
     while True:
         if d == rootp:
