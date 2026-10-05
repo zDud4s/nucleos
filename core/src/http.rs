@@ -1373,6 +1373,10 @@ struct RunsQuery {
     ///
     /// Absent, the answer is byte for byte today's — which is what leaves the Runs tab as it is.
     live: Option<bool>,
+    /// Only one conversation's turns.
+    chat_id: Option<String>,
+    /// `chat` folds every chat turn into one row per conversation; anything else is a 400.
+    group: Option<String>,
 }
 
 /// One run's checkout, as the shell needs it to open a door to the editor.
@@ -9898,6 +9902,13 @@ async fn get_runs(
     Query(query): Query<RunsQuery>,
 ) -> Result<Json<Vec<runs::RunSearchResult>>, StatusCode> {
     let live = query.live == Some(true);
+    // One grouping exists. Anything else is refused, not ignored: a caller that asked for a
+    // grouping and got the flat list would read turns as conversations.
+    let group_by_chat = match query.group.as_deref() {
+        None => false,
+        Some("chat") => true,
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+    };
     // A live listing with no explicit limit inherits the ceiling of live listings, not search's 50.
     // Without this the daemon would promise a shared constant and hand back the search window — and
     // the client would be the only thing guaranteeing the number, which is no guarantee at all.
@@ -9917,6 +9928,8 @@ async fn get_runs(
             until: parse_time_bound(query.until)?,
             limit,
             live,
+            chat_id: query.chat_id,
+            group_by_chat,
         },
     )
     .await
@@ -16259,6 +16272,58 @@ mod tests {
             live.iter().any(|run| run.id == parked),
             "the live ceiling did not replace search's"
         );
+
+        db.close().await;
+    }
+
+    /// `group=chat` folds a conversation's turns into one row, and only when asked; `chat_id`
+    /// lists one conversation's turns; any other grouping is refused rather than ignored.
+    #[tokio::test]
+    async fn the_runs_route_groups_by_chat_only_when_asked_and_refuses_an_unknown_grouping() {
+        let (state, db) = file_test_state().await;
+        for created_at in ["2026-10-01T00:00:01Z", "2026-10-01T00:00:02Z"] {
+            sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+                 VALUES ('a turn', 'completed', 'assistant', 'c-1', ?)",
+            )
+            .bind(created_at)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let autopilot =
+            seed_run_row(&state.pool, "project-a", "completed", "2026-10-01T00:00:00Z").await;
+
+        let app = Router::new()
+            .route("/runs", get(get_runs))
+            .layer(Extension(Scope::Control))
+            .with_state(state);
+
+        assert_eq!(runs_at(&app, "/runs").await.len(), 3);
+
+        let folded = runs_at(&app, "/runs?group=chat").await;
+        assert_eq!(folded.len(), 2);
+        let plain = folded.iter().find(|run| run.id == autopilot).unwrap();
+        assert!(plain.turns.is_none());
+        let conversation = folded
+            .iter()
+            .find(|run| run.chat_id.as_deref() == Some("c-1"))
+            .unwrap();
+        assert_eq!(conversation.turns, Some(2));
+
+        assert_eq!(runs_at(&app, "/runs?chat_id=c-1").await.len(), 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/runs?group=project")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         db.close().await;
     }

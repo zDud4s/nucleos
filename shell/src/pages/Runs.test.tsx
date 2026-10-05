@@ -191,7 +191,7 @@ describe("Runs - the filters live in the route", () => {
     await screen.findByRole("heading", { level: 1, name: "Runs" });
     // Nothing is filtered to begin with, and the ceiling is asked for out loud
     // rather than left to the daemon's default.
-    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?limit=50");
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?group=chat&limit=50");
 
     fireEvent.click(screen.getByRole("button", { name: "More filters" }));
     fireEvent.change(await screen.findByLabelText("Filter by status"), {
@@ -211,10 +211,10 @@ describe("Runs - the filters live in the route", () => {
     await waitFor(() => {
       const entry = queryClient
         .getQueryCache()
-        .find({ queryKey: keys.runs.search({ status: "timed_out" }), exact: true });
+        .find({ queryKey: keys.runs.search({ status: "timed_out", group: "chat" }), exact: true });
       expect(entry).toBeDefined();
     });
-    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?status=timed_out&limit=50");
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?status=timed_out&group=chat&limit=50");
   });
 
   it("drops a filter that was cleared instead of asking for the empty string", async () => {
@@ -250,7 +250,7 @@ describe("Runs - the filters live in the route", () => {
     // The same route model as every other filter — a scope is a status, not a
     // second piece of state beside it.
     await waitFor(() => expect(searchOf(router)).toEqual({ status: "failed" }));
-    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?status=failed&limit=50");
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?status=failed&group=chat&limit=50");
     await waitFor(() => {
       expect(within(scopes).getByRole("button", { name: "Failed" }).getAttribute("aria-pressed")).toBe(
         "true",
@@ -273,6 +273,76 @@ describe("Runs - the filters live in the route", () => {
     expect(
       Array.from(status.options).some((option) => option.textContent === "awaiting approval"),
     ).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------- conversations -- */
+
+/** A folded conversation row, as `GET /runs?group=chat` sends it: the latest turn's columns plus the aggregates. */
+function conversation(overrides: Partial<RunSearchResult> = {}): RunSearchResult {
+  return row({
+    id: 90,
+    mode: "assistant",
+    chat_id: "c-1",
+    chat_title: "Refactor the gate",
+    turns: 40,
+    running_turns: 1,
+    status: "running",
+    completed_at: null,
+    cost_usd: 3.2,
+    prompt_excerpt: "latest turn",
+    ...overrides,
+  });
+}
+
+describe("Runs - conversations", () => {
+  it("folds a conversation into one row that opens the chat", async () => {
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [conversation(), row({ id: 7 })] })));
+
+    await renderRuns();
+
+    const list = await screen.findByRole("list", { name: "Runs" });
+    expect(list.children.length).toBe(2);
+    const link = screen.getByRole("link", { name: "Refactor the gate" });
+    expect(link.getAttribute("href")).toBe("/chats/c-1");
+    expect(screen.getByText("40 turns")).toBeDefined();
+    expect(screen.getByText("1 running")).toBeDefined();
+    expect(screen.getByText(money(3.2))).toBeDefined();
+  });
+
+  it("a run outside any conversation keeps its own row", async () => {
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [conversation(), row({ id: 7 })] })));
+
+    await renderRuns();
+
+    const link = await screen.findByRole("link", { name: "tidy the imports" });
+    expect(link.getAttribute("href")).toBe("/runs/7");
+    expect(screen.getByText("run 7")).toBeDefined();
+    expect(
+      within(link.closest(".runs-row") as HTMLElement).queryByRole("button", { name: "Show turns" }),
+    ).toBeNull();
+  });
+
+  it("expanding a conversation lists its turns, one click away", async () => {
+    const base = runsFetch(world({ rows: [conversation()] }));
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path.startsWith("/runs?chat_id=c-1")
+        ? [row({ id: 88, mode: "assistant", chat_id: "c-1", prompt_excerpt: "first turn" })]
+        : await base(path, init),
+    );
+
+    await renderRuns();
+
+    const show = await screen.findByRole("button", { name: "Show turns" });
+    // Nothing is fetched for a conversation nobody opened.
+    expect(daemon.apiFetch.mock.calls.some(([path]) => String(path).includes("chat_id="))).toBe(false);
+
+    fireEvent.click(show);
+
+    await screen.findByRole("list", { name: "Turns of Refactor the gate" });
+    expect(screen.getByRole("link", { name: "first turn" }).getAttribute("href")).toBe("/runs/88");
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?chat_id=c-1&limit=50");
+    expect(screen.getByRole("button", { name: "Hide turns" }).getAttribute("aria-expanded")).toBe("true");
   });
 });
 

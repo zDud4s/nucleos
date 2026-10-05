@@ -414,6 +414,27 @@
   text-align: right;
 }
 
+/* A conversation row's toggle line sits under the name, in the text column. */
+.runs-row-turns {
+  grid-column: 2;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0;
+}
+
+/* How many of the conversation's turns are running, quiet beside the toggle. */
+.runs-row-running {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* The expanded turns line up with the text column, not the state glyph. */
+.runs-turns {
+  grid-column: 2;
+}
+
 /* Each row is its own container, so the metadata line decides by the width the
    row actually has. The fixed columns need about 44rem of row; under that they
    ran past the excerpt's column and `.ui-rows` clipped the time and the cost off

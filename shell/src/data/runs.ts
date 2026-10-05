@@ -71,6 +71,8 @@ export interface RunDetail {
    * records was reachable only by reading the database.
    */
   successor_run_id: number | null;
+  /** The conversation this run is a turn of. */
+  chat_id?: string | null;
   /**
    * How much of this run's prompt the daemon wrote itself, as an estimated
    * token count: the MCP tool schemas it announced, the standing instructions
@@ -202,6 +204,8 @@ export interface RunFilters {
   status?: string;
   mode?: string;
   q?: string;
+  chat?: string;
+  group?: "chat";
 }
 
 /** A filter set as a plain record, which is what the query key is built from. */
@@ -211,6 +215,8 @@ export function runFilterFields(filters: RunFilters): Record<string, string | un
     status: blankToUndefined(filters.status),
     mode: blankToUndefined(filters.mode),
     q: blankToUndefined(filters.q),
+    chat: blankToUndefined(filters.chat),
+    group: filters.group,
   };
 }
 
@@ -234,6 +240,8 @@ function runsQuery(filters: RunFilters): string {
   if (fields.status !== undefined) params.set("status", fields.status);
   if (fields.mode !== undefined) params.set("mode", fields.mode);
   if (fields.q !== undefined) params.set("q", fields.q);
+  if (fields.chat !== undefined) params.set("chat_id", fields.chat);
+  if (fields.group !== undefined) params.set("group", fields.group);
   params.set("limit", String(RUN_LIST_LIMIT));
   return `?${params.toString()}`;
 }
