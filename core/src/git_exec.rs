@@ -2154,6 +2154,8 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                         // --hard` and `clean` the very checkout being measured.
                         let measured = match gate_the_merge(
                             self.machine_root.as_deref(),
+                            self.pool.as_ref(),
+                            request.id,
                             &request.project_id,
                             project_root,
                             &integration_worktree(project_root),
@@ -2251,6 +2253,8 @@ impl crate::vcs::VcsExecutor for GitExecutor {
 /// every other red suite is fixed — in their own worktree, on their own branch.
 async fn gate_the_merge(
     machine_root: Option<&Path>,
+    pool: Option<&sqlx::SqlitePool>,
+    request_id: i64,
     project_id: &str,
     project_root: &Path,
     integration: &Path,
@@ -2283,7 +2287,21 @@ async fn gate_the_merge(
         )));
     };
 
-    match crate::gate::run_gate(integration, project_root, &command, timeout).await {
+    let measured = crate::verify_runs::timed_gate(
+        pool,
+        crate::verify_runs::GateContext {
+            project_id: Some(project_id),
+            origin: crate::verify_runs::ORIGIN_MERGE,
+            origin_id: Some(request_id),
+            ordinal: None,
+        },
+        integration,
+        project_root,
+        &command,
+        timeout,
+    )
+    .await;
+    match measured {
         crate::gate::GateOutcome::Passed => Ok(true),
         crate::gate::GateOutcome::Failed { exit_code, output } => Err(Outcome::Failed {
             // Says WHERE the failure lives, because the asker's first instinct will be that their

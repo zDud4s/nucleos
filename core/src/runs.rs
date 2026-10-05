@@ -2105,7 +2105,14 @@ fn spawn_run(
                             },
                             Some(worktree),
                         ) => Some(
-                            crate::gate::run_gate(
+                            crate::verify_runs::timed_gate(
+                                Some(&pool),
+                                crate::verify_runs::GateContext {
+                                    project_id: project_id.as_deref(),
+                                    origin: crate::verify_runs::ORIGIN_RUN,
+                                    origin_id: Some(id),
+                                    ordinal: None,
+                                },
                                 worktree,
                                 std::path::Path::new(project_root),
                                 command,

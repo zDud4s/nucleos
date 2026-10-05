@@ -4403,7 +4403,14 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
     if matches!(set_live_status(pool, job.id, "gating").await, Ok(false)) {
         return Step::Stopped;
     }
-    let outcome = crate::gate::run_gate(
+    let outcome = crate::verify_runs::timed_gate(
+        Some(pool),
+        crate::verify_runs::GateContext {
+            project_id: Some(&job.project_id),
+            origin: crate::verify_runs::ORIGIN_JOB_ITEM,
+            origin_id: Some(job.id),
+            ordinal: Some(ordinal as i64),
+        },
         &worktree,
         Path::new(&job.project_root),
         &command,
