@@ -309,6 +309,14 @@ def control_token_cases():
             _token_found_at(os.path.join("T", "target", "debug", name)),
         )
         for name in ("nucleos-core", "nucleos-core.exe")
+    ] + [
+        (
+            # The daemon started by scripts/run-daemon.ps1 runs from this copy, and a machine that
+            # only starts it that way has nothing under any target dir: the guard refused --land.
+            f"control_token reads the token from the staged run copy, .nucleos-run/{name}",
+            _token_found_at(os.path.join(os.path.dirname("/repo"), ".nucleos-run", name)),
+        )
+        for name in ("nucleos-core", "nucleos-core.exe")
     ]
 
 
