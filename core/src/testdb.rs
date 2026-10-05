@@ -62,7 +62,7 @@ async fn apply_migrations(pool: &sqlx::SqlitePool, wanted: impl Fn(i64) -> bool)
 /// hits the primary key and the run fails; on one that already applied either file, the other's
 /// checksum disagrees and startup stops with `VersionMismatch`. Git sees nothing wrong — the file
 /// names differ — so two branches cut from the same tip can each take "the next number" and both
-/// land. That is how `0159_owner_notes` and `0159_vcs_settled_feed` reached master on 2026-10-04.
+/// land. That is how two `0159_*` files reached master on 2026-10-04.
 #[test]
 fn no_two_migrations_share_a_version() {
     let mut seen = std::collections::BTreeMap::new();

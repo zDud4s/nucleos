@@ -198,6 +198,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     resume_did_not_act: { tone: "info", label: "approved action never attempted" },
     shadow_run_completed: { tone: "shadow", label: "shadow run completed" },
     worktree_run_completed: { tone: "info", label: "worktree run completed" },
+    run_launched_unclassified: { tone: "danger", label: "run launched without the classifier" },
     token_efficiency: { tone: "info", label: "efficiency observation" },
     // A provider's usage window crossed one of the owner's thresholds (`core/src/quota.rs`, design
     // D11). Held Ember and not Stated Blue: unlike a slot, this one waits on a hand — the reader
