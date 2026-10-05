@@ -55,6 +55,7 @@ import {
   useSetChatProject,
   useSetPermissionMode,
   useWireChatTools,
+  useSeedChatWorkflow,
   useWireIdeSessionTools,
   useAnswerAsk,
   useChatCommands,
@@ -117,7 +118,14 @@ import {
   type Span as RichSpan,
 } from "../lib/rich";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { commandAt, mentionAt, withCommand, withMention } from "../lib/mention";
+import {
+  commandAt,
+  mentionAt,
+  orchestratePrompt,
+  orchestrateTask,
+  withCommand,
+  withMention,
+} from "../lib/mention";
 import { fetchFileBlob } from "../data/files";
 import { attachmentFrom, isPicture } from "../lib/picture";
 import { PlusMenu } from "../chats/PlusMenu";
@@ -1573,7 +1581,7 @@ function Project({
   // Nothing at all until it is known. A conversation is not "without a project" because the answer
   // has not arrived yet, and a note that appears and then retracts itself is worse than a late one.
   if (project.data === undefined) return null;
-  const { cwd, tools } = project.data;
+  const { cwd, tools, workflow_missing } = project.data;
 
   return (
     <>
@@ -1584,7 +1592,10 @@ function Project({
       {cwd === null && (
         <NoProject chatId={chatId} picking={picking} onPicking={onPicking} />
       )}
-      {cwd !== null && !tools && (
+      {cwd !== null && workflow_missing === true && (
+        <WorkflowMissing chatId={chatId} cwd={cwd} tools={tools} />
+      )}
+      {cwd !== null && !tools && workflow_missing !== true && (
         <ProjectWithoutTools chatId={chatId} cwd={cwd} />
       )}
       {/* `CarryOn` was here, above every transcript. It is behind the `⋯` now — see
@@ -1871,6 +1882,67 @@ function ProjectWithoutTools({ chatId, cwd }: { chatId: string; cwd: string }) {
       </Button>
       {wire.isError && <WireRefusal error={wire.error} cwd={cwd} />}
     </div>
+  );
+}
+
+/**
+ * A worktree the AI workflow was never copied into: no orchestrate skill, no phase agents, and —
+ * because `.claude/` is not committed either — usually no tools. One confirmed act answers both.
+ */
+function WorkflowMissing({
+  chatId,
+  cwd,
+  tools,
+}: {
+  chatId: string;
+  cwd: string;
+  tools: boolean;
+}) {
+  const seed = useSeedChatWorkflow(chatId);
+
+  return (
+    <div className="chats-project">
+      <p className="chats-new-warning" role="status">
+        this conversation is about {cwd}, a worktree the AI workflow was never
+        copied into — it has no orchestrate skill and no phase agents
+        {tools ? (
+          ""
+        ) : (
+          <>
+            , and it <b>cannot read or change any file</b> or run anything
+          </>
+        )}
+      </p>
+      <ConfirmButton
+        label="Set up workflow"
+        confirmLabel="Set up workflow — copy it from the main checkout, overwriting this worktree's copy"
+        disabled={seed.isPending}
+        onConfirm={() => seed.mutate()}
+      />
+      {seed.isError && <SeedRefusal error={seed.error} />}
+    </div>
+  );
+}
+
+function SeedRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error)) {
+    return (
+      <ErrorNote>
+        the núcleo did not answer — the worktree was left as it was
+      </ErrorNote>
+    );
+  }
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{
+        bad_request:
+          "the núcleo wants an explicit confirmation before it copies anything",
+        conflict:
+          "this folder is not a worktree whose main checkout has the workflow — nothing was copied",
+        not_found: "that conversation is no longer here",
+      }}
+    />
   );
 }
 
@@ -5304,6 +5376,9 @@ function Composer({
   const [dismissed, setDismissed] = useState<string | null>(null);
   const [highlight, setHighlight] = useState(0);
   const [attached, setAttached] = useState<Attachment[]>([]);
+  // `/orchestrate` was typed where the workflow or the tools are missing: not sent, and said why.
+  const [orchestrateBlocked, setOrchestrateBlocked] = useState(false);
+  useEffect(() => setOrchestrateBlocked(false), [text]);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const send = useSendMessage(chatId);
   const project = useChatProject(chatId);
@@ -5427,16 +5502,28 @@ function Composer({
     (text.trim() !== "" || attached.length > 0) && !send.isPending;
   const say = () => {
     if (!sayable) return;
+    // `/orchestrate <task>` goes out as a request to run the skill, not as raw text: the CLI's own
+    // slash expansion was only measured for `claude -p`.
+    const task = orchestrateTask(text);
+    const outgoing = task === null ? text.trim() : orchestratePrompt(task);
+    if (
+      task !== null &&
+      rooted &&
+      (project.data?.tools !== true || project.data?.workflow_missing === true)
+    ) {
+      setOrchestrateBlocked(true);
+      return;
+    }
     if (!rooted) {
       // Not sent: a conversation does not start before it knows where it runs. See `held.ts`.
-      holdMessage(chatId, { text: text.trim(), images: attached }, MAX_PICTURES);
+      holdMessage(chatId, { text: outgoing, images: attached }, MAX_PICTURES);
       setText("");
       setAttached([]);
       if (project.data !== undefined) onNeedsProject?.();
       return;
     }
     send.mutate(
-      { text: text.trim(), images: attached },
+      { text: outgoing, images: attached },
       {
         onSuccess: () => {
           setText("");
@@ -5507,6 +5594,12 @@ ${was}`));
       {nowhere && (
         <p className="chats-mentions-none">
           this conversation has no directory, so there are no files to name here
+        </p>
+      )}
+      {orchestrateBlocked && (
+        <p className="chats-mentions-none" role="status">
+          /orchestrate needs this conversation's project to have the workflow and
+          its tools — set them up above, then send again
         </p>
       )}
       {choices.length > 0 && (

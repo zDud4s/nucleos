@@ -636,6 +636,8 @@ pub fn build_router(state: AppState) -> Router {
         // The act that turns a conversation with a directory into one with tools. The same thing
         // `wire_ide_session_tools` does before a pick-up, reached from the other side.
         .route("/assistant/chats/{chat_id}/tools", post(wire_chat_tools))
+        // Copies the AI workflow into a conversation's worktree; only ever on an explicit confirm.
+        .route("/assistant/chats/{chat_id}/workflow", post(seed_chat_workflow))
         // Taking back something that has not been sent. A segment deeper than the chat, and named
         // for the thing it removes rather than for the chat it removes it from.
         .route(
@@ -11012,6 +11014,9 @@ struct ChatProjectOut {
     /// `.claude/` is not committed — so a conversation pointed at one still cannot open a file, and
     /// a window that reported only the directory would be telling the truth and misleading at once.
     tools: bool,
+    /// Whether `cwd` is a linked worktree the AI workflow was never copied into while its main
+    /// checkout has it — the case "Set up workflow" answers.
+    workflow_missing: bool,
 }
 
 /// Where a conversation runs, and whether that gives it tools.
@@ -11045,14 +11050,19 @@ async fn read_chat_project(
             session,
             permission_mode,
             tools: false,
+            workflow_missing: false,
         }));
     };
 
     let dir = std::path::PathBuf::from(&cwd);
-    let wired =
-        tokio::task::spawn_blocking(move || crate::autopilot::classifier_hook_is_wired(&dir))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (wired, workflow_missing) = tokio::task::spawn_blocking(move || {
+        (
+            crate::autopilot::classifier_hook_is_wired(&dir),
+            crate::autopilot::workflow_missing(&dir),
+        )
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Asked of the same function the turn path asks, rather than restated here. A second copy of
     // this rule would be a second thing to keep true, and the one that answers the window is the
@@ -11072,6 +11082,7 @@ async fn read_chat_project(
         session,
         permission_mode,
         tools,
+        workflow_missing,
     }))
 }
 
@@ -11101,6 +11112,45 @@ async fn wire_chat_tools(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct SeedWorkflowIn {
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// Copies the AI workflow into a conversation's worktree from its main checkout, then wires the
+/// hook. Overwrites the worktree's workflow core, so it runs only on an explicit `confirm: true`.
+async fn seed_chat_workflow(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Json(body): Json<SeedWorkflowIn>,
+) -> Result<StatusCode, StatusCode> {
+    // Checked first: nothing below runs on anything but an explicit yes.
+    if !body.confirm {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let cwd = crate::chats::opened_in(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading a conversation's project failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?
+        .ok_or(StatusCode::CONFLICT)?;
+
+    match crate::autopilot::seed_workflow(std::path::Path::new(&cwd)).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(
+            crate::autopilot::SeedRefusal::NotAWorktree
+            | crate::autopilot::SeedRefusal::NoWorkflowInMain,
+        ) => Err(StatusCode::CONFLICT),
+        Err(crate::autopilot::SeedRefusal::Failed(error)) => {
+            tracing::warn!(%error, cwd = %cwd, "could not set up the workflow in a conversation's worktree");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Takes a message back off a conversation's queue before it is sent.
@@ -28848,6 +28898,131 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    async fn seed_workflow_request(state: AppState, chat_id: &str, confirm: bool) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{chat_id}/workflow"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "confirm": confirm }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A conversation in a linked worktree that was never seeded says its workflow is missing —
+    /// the reason it has no tools — while one in the main checkout says nothing of the kind.
+    #[tokio::test]
+    async fn a_conversation_in_an_unseeded_worktree_is_told_its_workflow_is_missing() {
+        let state = test_state().await;
+        let (_container, main, wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+        let in_worktree = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &in_worktree, wt.to_str().unwrap())
+            .await
+            .unwrap();
+        let in_main = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &in_main, main.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let worktree_body = json_body(project_request(state.clone(), &in_worktree).await).await;
+        let main_body = json_body(project_request(state.clone(), &in_main).await).await;
+
+        assert_eq!(worktree_body["workflow_missing"], true);
+        assert_eq!(worktree_body["tools"], false);
+        assert_eq!(main_body["workflow_missing"], false);
+    }
+
+    /// Seeding overwrites a worktree's workflow core, so it runs only on an explicit yes: anything
+    /// else is refused and nothing is written.
+    #[tokio::test]
+    async fn seeding_the_workflow_refuses_without_confirmation() {
+        let state = test_state().await;
+        let (_container, _main, wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let status = seed_workflow_request(state.clone(), &chat_id, false).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!wt.join(".ai").exists());
+    }
+
+    /// A conversation in the main checkout has no worktree to seed, and one in a worktree whose main
+    /// checkout holds no workflow has nothing to seed it from: both are told so, and nothing is written.
+    #[tokio::test]
+    async fn seeding_the_workflow_refuses_a_conversation_without_a_worktree_and_a_workflow_behind_it()
+     {
+        let state = test_state().await;
+        let (_container, main, _wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+        let in_main = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &in_main, main.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seed_workflow_request(state.clone(), &in_main, true).await,
+            StatusCode::CONFLICT
+        );
+
+        let (_bare_container, _bare_main, bare_wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", false);
+        let in_bare = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &in_bare, bare_wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seed_workflow_request(state.clone(), &in_bare, true).await,
+            StatusCode::CONFLICT
+        );
+        assert!(!bare_wt.join(".ai").exists());
+    }
+
+    /// The end-to-end of "Set up workflow": after a confirmed seed the project read no longer says
+    /// the workflow is missing, and says the conversation has tools.
+    #[tokio::test]
+    async fn seeding_the_workflow_into_a_conversations_worktree_clears_the_flag_and_gives_it_tools()
+     {
+        let state = test_state().await;
+        let (_container, _main, wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let status = seed_workflow_request(state.clone(), &chat_id, true).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let after = json_body(project_request(state.clone(), &chat_id).await).await;
+        assert_eq!(after["workflow_missing"], false);
+        assert_eq!(after["tools"], true);
     }
 
     /// A conversation can be told which project it is about, which is the only way one started here
