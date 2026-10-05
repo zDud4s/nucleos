@@ -1746,6 +1746,69 @@
   background: var(--surface);
 }
 
+/**
+ * System and the notifications drawer, side by side, marks only.
+ *
+ * Each half is centred on its own mark; the words stay in the accessible names
+ * and the titles. At icon width there is no room for two marks in 40px, so the
+ * pair stacks back into two rows there.
+ */
+.nav-footer-pair {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.nav-footer-pair > .nav-item,
+.nav-footer-pair > .app-notify {
+  flex: 1 1 0;
+  justify-content: center;
+  gap: 0;
+}
+
+.nav-collapsed .nav-footer-pair {
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.nav-collapsed .nav-footer-pair > .nav-item,
+.nav-collapsed .nav-footer-pair > .app-notify {
+  justify-content: flex-start;
+}
+
+.nav-footer-pair .nav-label,
+.nav-footer-pair .app-notify-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The dot and the count leave the flow for the corner, so the mark alone is
+   what gets centred. */
+/* Beside its own mark, not in the half's far corner: centred in a half-row, a
+   corner mark landed forty pixels from the icon it belonged to. */
+.nav-footer-pair .nav-dot,
+.nav-footer-pair .app-notify-count {
+  position: absolute;
+  top: var(--space-1);
+  right: auto;
+  left: calc(50% + 0.375rem);
+}
+
+/* Stacked at icon width, the mark is back on the left axis, so its corner is
+   the row's own again. */
+.nav-collapsed .nav-footer-pair .nav-dot,
+.nav-collapsed .nav-footer-pair .app-notify-count {
+  left: auto;
+  right: var(--space-1);
+}
+
+.nav-footer-pair > .app-notify {
+  position: relative;
+}
+
 .nav-rule {
   width: 100%;
   margin: 0;
@@ -1815,12 +1878,11 @@
  * make the words behave like every label above them: covered by the closing rail
  * rather than re-laid out by it.
  *
- * **Content to the left, not centred**, and the padding is what puts the mark on
- * `--nav-axis` — one pixel less than a row pays, because a row has no border and
- * this has one. Centred, the mark drifted with the button's width and, once the
- * words were clipped, was itself clipped: centred overflow spills equally at both
- * ends, so the first thing to go would have been the mark. Left-aligned it stands
- * on the same line as System and the drawer, and the footer reads as one column.
+ * **Centred, safely** (it was left-aligned until 2026-10-05). Plain centring spills
+ * overflow equally at both ends, so the first thing the closing rail clipped was
+ * the mark; `safe center` aligns to the start once the content no longer fits, and
+ * the left padding — one pixel less than a row pays, because a row has no border
+ * and this has one — then puts the mark on `--nav-axis`.
  *
  * `font-size: 0` once the rail is shut, and not `display: none` on the words:
  * they are the button's accessible name, and the `title` beside them — "Stop
@@ -1832,10 +1894,14 @@
  * whatever `font-size: 0` left behind closed. Two round pixels of deliberate
  * height beat two accidental ones that happen to agree today.
  */
+/* Centred since 2026-10-05 (owner's call), but `safe`: once the closing rail is
+   narrower than the content it falls back to the start edge, so the overflow is
+   clipped on the right and the mark — the part that must survive — stays on
+   `--nav-axis`, which the left padding still puts it on. */
 .app-kill .ui-button {
-  justify-content: flex-start;
+  justify-content: safe center;
   min-height: 2.125rem;
-  padding-inline: calc(var(--nav-inset) - 1px) var(--space-3);
+  padding-inline: calc(var(--nav-inset) - 1px);
   overflow: hidden;
   white-space: nowrap;
 }
@@ -1852,6 +1918,7 @@
    left-aligned row, so a zero-width label after it moves nothing. The gap can
    stay for the same reason — it is trailing space, not space in front. */
 .nav-collapsed .app-kill .ui-button {
+  justify-content: flex-start;
   font-size: 0;
 }
 

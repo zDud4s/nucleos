@@ -546,6 +546,14 @@ export interface SidebarProps {
    */
   systemAlert?: boolean;
   /**
+   * The control that shares System's row — the notifications drawer, today.
+   *
+   * A slot for the same reason `children` is one: the drawer needs live queries
+   * and this component needs a router and nothing else. Both halves of the row
+   * are drawn as marks only, with the word in the accessible name and the title.
+   */
+  besideSystem?: ReactNode;
+  /**
    * The pinned footer — connection line, budget, kill switch.
    *
    * Passed in rather than built here so that this component stays a *navigation*
@@ -582,7 +590,7 @@ export interface SidebarProps {
  *    Drawing them would be an invented affordance, which is the one failure mode
  *    an adoption like this makes easy.
  */
-export function Sidebar({ badges, projects, systemAlert, children }: SidebarProps) {
+export function Sidebar({ badges, projects, systemAlert, besideSystem, children }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(readCollapsed);
   /**
    * What is *drawn* at icon width, as opposed to what the rail is currently wide.
@@ -717,8 +725,8 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
   }
 
   /** One row. */
-  function item(entry: NavItem, options: { alert?: boolean } = {}) {
-    const { alert = false } = options;
+  function item(entry: NavItem, options: { alert?: boolean; markOnly?: boolean } = {}) {
+    const { alert = false, markOnly = false } = options;
     const active = isActive(pathname, entry.path);
     const count = entry.badge === undefined ? undefined : badges?.[entry.badge];
     const noun = entry.badge === undefined ? "" : BADGE_NOUN[entry.badge];
@@ -745,7 +753,7 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
           and not in the accessible name is a summons only some people get.
         */
         aria-label={spokenName(entry.label, counted ? count : undefined, noun, alert)}
-        title={entry.disabled ?? (iconsOnly ? entry.label : undefined)}
+        title={entry.disabled ?? (iconsOnly || markOnly ? entry.label : undefined)}
       >
         <Icon className="nav-icon" strokeWidth={1.5} aria-hidden="true" />
         <span className="nav-label">{entry.label}</span>
@@ -826,7 +834,14 @@ export function Sidebar({ badges, projects, systemAlert, children }: SidebarProp
       </div>
 
       <div className="nav-footer">
-        {item(SYSTEM_ITEM, { alert: systemAlert === true })}
+        {/*
+          System and the drawer split one row, marks only (owner's call,
+          2026-10-05): two places you go when told to, not two rows of the rail.
+        */}
+        <div className="nav-footer-pair">
+          {item(SYSTEM_ITEM, { alert: systemAlert === true, markOnly: true })}
+          {besideSystem}
+        </div>
         {/*
           The rule moved out of here on 2026-09-05 and into the slot below.
           It used to sit between System and everything else, which read as "the

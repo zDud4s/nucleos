@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
   NOTIFY_FAMILIES,
@@ -85,12 +85,21 @@ export function NotificationsView() {
   }
 
   return (
-    <Panel title="Telegram notifications">
+    <Panel
+      title="Telegram notifications"
+      /* Save sits in the head, where it is on screen whatever is expanded below it. */
+      aside={
+        <div className="sy-notify-actions">
+          {dirty && <span className="sy-meta">unsaved changes</span>}
+          <Button onClick={() => save.mutate(draft)} disabled={!dirty || save.isPending}>
+            {save.isPending ? "saving…" : "Save"}
+          </Button>
+        </div>
+      }
+    >
       <p className="sy-note">
         A family is a prefix, and a kind can override its family. Anything no rule claims is sent —
         so a machine nobody has configured behaves exactly as it did before this screen existed.
-      </p>
-      <p className="sy-note">
         Proposals, the kill switch and budget alerts are never silenced by these switches, whatever
         you set here. The sidecar re-reads this on its next round: nothing needs restarting.
       </p>
@@ -115,20 +124,13 @@ export function NotificationsView() {
             Kinds no family prefix claims. Each is silenced on its own; there is no group switch
             because there is no group — the grouping here is presentation, not a rule.
           </p>
-          <ul className="sy-notify-kinds">
+          <ul className="sy-notify-kinds sy-notify-loose">
             {loose.map((row) => (
               <KindItem key={row.kind} row={row} onKind={setKind} inFamily={false} />
             ))}
           </ul>
         </>
       )}
-
-      <div className="sy-notify-actions">
-        <Button onClick={() => save.mutate(draft)} disabled={!dirty || save.isPending}>
-          {save.isPending ? "saving…" : "Save"}
-        </Button>
-        {dirty && <span className="sy-note">unsaved changes</span>}
-      </div>
     </Panel>
   );
 }
@@ -168,16 +170,40 @@ function FamilyItem({
   onKind: (kind: string, verdict: KindVerdict) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const card = useRef<HTMLLIElement>(null);
+
+  /*
+    The kinds open OVER the page, not inside the card: grown in place, one open family pushed
+    every card below it down by its whole list. So it behaves like a menu — a click anywhere
+    outside the card, or Escape, closes it.
+  */
+  useEffect(() => {
+    if (!open) return undefined;
+    function onPointer(event: PointerEvent) {
+      if (card.current !== null && !card.current.contains(event.target as Node)) setOpen(false);
+    }
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("pointerdown", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
   // `null` — no stored rule — draws as ON, because that is what it does.
   const on = family.rule ?? true;
   const known = NOTIFY_FAMILIES.some((f) => f.selector === family.selector);
 
   return (
-    <li className="sy-notify-family">
+    <li ref={card} className={open ? "sy-notify-family sy-notify-family-open" : "sy-notify-family"}>
       <div className="sy-notify-family-row">
         <label className="sy-notify-switch">
           <input
             type="checkbox"
+            className="sy-switch"
             checked={on}
             onChange={(event) => onFamily(family.selector, event.target.checked)}
           />
@@ -187,19 +213,25 @@ function FamilyItem({
             hidden: the rule is in force either way, and a rule you cannot see is one you cannot
             undo. */}
         {!known && <span className="sy-note">unknown family</span>}
-        <button type="button" className="sy-notify-disclose" onClick={() => setOpen(!open)}>
-          {family.kinds.length} kind{family.kinds.length === 1 ? "" : "s"} {open ? "▾" : "▸"}
+        <button
+          type="button"
+          className="sy-notify-disclose"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+        >
+          {family.kinds.length} kind{family.kinds.length === 1 ? "" : "s"}{" "}
+          <span aria-hidden="true">{open ? "▾" : "▸"}</span>
         </button>
       </div>
       {open && family.kinds.length > 0 && (
-        <ul className="sy-notify-kinds">
+        <ul className="sy-notify-kinds sy-notify-pop">
           {family.kinds.map((row) => (
             <KindItem key={row.kind} row={row} onKind={onKind} />
           ))}
         </ul>
       )}
       {open && family.kinds.length === 0 && (
-        <p className="sy-note">
+        <p className="sy-note sy-notify-pop">
           This machine has written none of these in the last 90 days. The switch still covers the
           ones it writes next.
         </p>
@@ -234,6 +266,7 @@ function KindItem({
       )}
       {inFamily ? (
         <select
+          className="sy-notify-select"
           value={row.verdict}
           aria-label={row.kind}
           onChange={(event) => onKind(row.kind, event.target.value as KindVerdict)}
@@ -249,6 +282,7 @@ function KindItem({
         // this draws are the two it can be in.
         <input
           type="checkbox"
+          className="sy-switch"
           aria-label={row.kind}
           checked={row.verdict !== "never"}
           onChange={(event) => onKind(row.kind, event.target.checked ? "inherit" : "never")}

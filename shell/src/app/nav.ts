@@ -37,7 +37,7 @@ import {
   Mic,
   Rss,
   Scale,
-  SlidersHorizontal,
+  Settings,
   Users,
   type LucideIcon,
 } from "lucide-react";
@@ -191,7 +191,7 @@ export const SYSTEM_ITEM: NavItem = {
   id: "system",
   label: "System",
   path: "/system",
-  icon: SlidersHorizontal,
+  icon: Settings,
 };
 
 /** Every item in the sidebar, groups flattened, System last. */

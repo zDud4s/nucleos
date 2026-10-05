@@ -397,6 +397,12 @@ async function renderSystemAt(initialPath: string) {
   return { ...result, router, queryClient };
 }
 
+/** The settings tab shows one file at a time: pick it from the list first. */
+async function openSettingsFile(area: string): Promise<void> {
+  const list = await screen.findByRole("list", { name: "Settings files" });
+  fireEvent.click(within(list).getByRole("button", { name: area }));
+}
+
 function rowFor(list: HTMLElement, name: string): HTMLElement {
   const row = within(list).getByText(name).closest("li");
   if (row === null) throw new Error(`no row for ${name}`);
@@ -564,7 +570,7 @@ describe("System - health readout", () => {
     fireEvent.click(within(list).getByRole("button", { name: "Restart" }));
     await afterDwell();
     fireEvent.click(
-      await within(list).findByRole("button", { name: "Start it again · browser_sidecar" }),
+      await within(list).findByRole("button", { name: "Start it again" }),
     );
 
     await waitFor(() => {
@@ -595,7 +601,7 @@ describe("System - health readout", () => {
     fireEvent.click(within(list).getByRole("button", { name: "Restart" }));
     await afterDwell();
     fireEvent.click(
-      await within(list).findByRole("button", { name: "Start it again · browser_sidecar" }),
+      await within(list).findByRole("button", { name: "Start it again" }),
     );
 
     expect(await within(list).findByText(/nothing is supervising it/)).toBeDefined();
@@ -722,7 +728,7 @@ describe("System - budget", () => {
 
     await renderSystem();
 
-    const windowInput = await screen.findByLabelText("Window limit (USD, blank = no ceiling)");
+    const windowInput = await screen.findByLabelText("Window limit (USD)");
     fireEvent.change(windowInput, { target: { value: "" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
@@ -791,7 +797,7 @@ describe("System - budget", () => {
 
       await renderSystem();
 
-      const windowInput = await screen.findByLabelText("Window limit (USD, blank = no ceiling)");
+      const windowInput = await screen.findByLabelText("Window limit (USD)");
       fireEvent.change(windowInput, { target: { value: garbage } });
 
       fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
@@ -826,7 +832,7 @@ describe("System - budget", () => {
 
     await renderSystem();
 
-    const hourlyInput = await screen.findByLabelText("Hourly limit (USD, blank = no ceiling)");
+    const hourlyInput = await screen.findByLabelText("Hourly limit (USD)");
     fireEvent.change(hourlyInput, { target: { value: "abc" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
@@ -923,7 +929,7 @@ describe("System - backups", () => {
 
     fireEvent.click(within(snap1Row).getByRole("button", { name: "Stage a restore" }));
     await afterDwell();
-    fireEvent.click(within(snap1Row).getByRole("button", { name: "Restore snap-1 on next start" }));
+    fireEvent.click(within(snap1Row).getByRole("button", { name: "Restore on next start" }));
 
     // By its words, not by being the row's only live region: the row's own interlock
     // ("Stage a restore") now carries one too, so that arming it is announced.
@@ -952,7 +958,7 @@ describe("System - backups", () => {
 
     fireEvent.click(within(row).getByRole("button", { name: "Stage a restore" }));
     await afterDwell();
-    fireEvent.click(within(row).getByRole("button", { name: "Restore snap-1 on next start" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Restore on next start" }));
 
     expect(
       await within(row).findByText(
@@ -1067,8 +1073,11 @@ describe("System - this machine's settings", () => {
 
     await renderSystemAt("/system/settings");
 
-    // The four the removed panel used to name are now editable like the rest.
+    // The four the removed panel used to name are now editable like the rest — each in
+    // the list, and each opening its own file.
+    const list = await screen.findByRole("list", { name: "Settings files" });
     for (const area of ["web", "browser", "council", "models"]) {
+      fireEvent.click(within(list).getByRole("button", { name: area }));
       expect(await screen.findByRole("heading", { name: area })).toBeDefined();
     }
     expect(daemon.apiFetch).toHaveBeenCalledWith("/config/machine");
@@ -1092,6 +1101,7 @@ describe("System - this machine's settings", () => {
 
     await renderSystemAt("/system/settings");
 
+    await openSettingsFile("calendar");
     const editor = await screen.findByLabelText("~/.nucleos/calendar.yaml");
     fireEvent.change(editor, { target: { value: 'working_hours_start: "10:00"\n' } });
     fireEvent.click(within(editor.closest("section") as HTMLElement).getByRole("button", { name: "Save" }));
@@ -1114,6 +1124,7 @@ describe("System - this machine's settings", () => {
 
     await renderSystemAt("/system/settings");
 
+    await openSettingsFile("browser");
     const editor = await screen.findByLabelText("~/.nucleos/browser.yaml");
     fireEvent.change(editor, { target: { value: "!!bad\n" } });
     fireEvent.click(within(editor.closest("section") as HTMLElement).getByRole("button", { name: "Save" }));
@@ -1134,6 +1145,7 @@ describe("System - credentials", () => {
 
     // The github credential renders inside the github panel, not in a list of
     // its own: a pillar and its key are one decision.
+    await openSettingsFile("github");
     const githubPanel = (await screen.findByRole("heading", { name: "github" })).closest(
       "section",
     ) as HTMLElement;
@@ -1152,6 +1164,7 @@ describe("System - credentials", () => {
 
     await renderSystemAt("/system/settings");
 
+    await openSettingsFile("github");
     const githubPanel = (await screen.findByRole("heading", { name: "github" })).closest(
       "section",
     ) as HTMLElement;

@@ -84,6 +84,8 @@ export function NotificationsDrawer() {
             ? "Notifications, nothing held"
             : `Notifications, ${held.length} held by the calendar`
         }
+        /* The word is not drawn beside the bell any more, so the pointer gets it here. */
+        title="Notifications"
         onClick={() => setOpen((current) => !current)}
       >
         {/*
