@@ -118,6 +118,7 @@ mod transcribe;
 mod triage;
 mod trust;
 mod vcs;
+mod verify_runs;
 mod voice;
 mod wave;
 mod web;
@@ -1966,6 +1967,7 @@ async fn main() {
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor {
             machine_root: machine_config_root.clone(),
+            pool: Some(state.pool.clone()),
             ..git_exec::GitExecutor::default()
         }),
     ));

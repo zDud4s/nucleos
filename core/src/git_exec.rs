@@ -2061,6 +2061,10 @@ pub struct GitExecutor {
     /// reads every project as having no rules file, which is how a test that never configures one
     /// stays out of the real home directory.
     pub machine_root: Option<std::path::PathBuf>,
+    /// Where a gated merge records its measurement (`verify_runs`). `None` - what `Default`
+    /// gives - measures exactly as before and records nothing, which is every test that never
+    /// asked for a database.
+    pub pool: Option<sqlx::SqlitePool>,
 }
 
 impl Default for GitExecutor {
@@ -2068,6 +2072,7 @@ impl Default for GitExecutor {
         Self {
             timeout: OPERATION_TIMEOUT,
             machine_root: None,
+            pool: None,
         }
     }
 }
@@ -2149,6 +2154,8 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                         // --hard` and `clean` the very checkout being measured.
                         let measured = match gate_the_merge(
                             self.machine_root.as_deref(),
+                            self.pool.as_ref(),
+                            request.id,
                             &request.project_id,
                             project_root,
                             &integration_worktree(project_root),
@@ -2246,6 +2253,8 @@ impl crate::vcs::VcsExecutor for GitExecutor {
 /// every other red suite is fixed — in their own worktree, on their own branch.
 async fn gate_the_merge(
     machine_root: Option<&Path>,
+    pool: Option<&sqlx::SqlitePool>,
+    request_id: i64,
     project_id: &str,
     project_root: &Path,
     integration: &Path,
@@ -2278,7 +2287,21 @@ async fn gate_the_merge(
         )));
     };
 
-    match crate::gate::run_gate(integration, project_root, &command, timeout).await {
+    let measured = crate::verify_runs::timed_gate(
+        pool,
+        crate::verify_runs::GateContext {
+            project_id: Some(project_id),
+            origin: crate::verify_runs::ORIGIN_MERGE,
+            origin_id: Some(request_id),
+            ordinal: None,
+        },
+        integration,
+        project_root,
+        &command,
+        timeout,
+    )
+    .await;
+    match measured {
         crate::gate::GateOutcome::Passed => Ok(true),
         crate::gate::GateOutcome::Failed { exit_code, output } => Err(Outcome::Failed {
             // Says WHERE the failure lives, because the asker's first instinct will be that their
@@ -3383,6 +3406,68 @@ pub(crate) mod tests {
         };
         assert_ne!(sha_of(&repo, "master"), before, "nothing was published");
         assert_eq!(sha_of(&repo, "master"), published);
+    }
+
+    /// A gated merge leaves its measurement in `verify_runs`, under the request that asked for it.
+    #[tokio::test]
+    async fn o_gate_de_um_merge_fica_em_verify_runs() {
+        use crate::vcs::VcsExecutor;
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-rec-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(
+            container.path(),
+            "gate_before_publish: true
+gate_command: git --version
+",
+        );
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let outcome = GitExecutor {
+            machine_root: Some(container.path().to_path_buf()),
+            pool: Some(pool.clone()),
+            ..GitExecutor::default()
+        }
+        .execute(&crate::vcs::ClaimedRequest {
+            id: 41,
+            op: crate::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            project_id: "alpha".to_owned(),
+            project_root: repo.to_string_lossy().into_owned(),
+            from_resolution: false,
+            run_id: None,
+            integration_branch: None,
+        })
+        .await;
+        assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
+
+        let (origin, origin_id, status, project_id, sha): (
+            String,
+            Option<i64>,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as("SELECT origin, origin_id, status, project_id, sha FROM verify_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(origin, crate::verify_runs::ORIGIN_MERGE);
+        assert_eq!(origin_id, Some(41));
+        assert_eq!(status, crate::verify_runs::STATUS_PASSED);
+        assert_eq!(project_id.as_deref(), Some("alpha"));
+        assert!(sha.is_some(), "the merge commit that was measured");
     }
 
     /// **The key is off by default, and that is what makes this free for every project that never

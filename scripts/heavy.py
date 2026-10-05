@@ -34,6 +34,10 @@ import time
 from pathlib import Path
 
 LOG_VERSION = 1
+# A log line names the command, clipped: enough to tell a filtered test from a full suite,
+# never a megabyte of generated arguments.
+LOG_ARGV_WORDS = 40
+LOG_ARGV_CHARS = 300
 MUTEX_STALE_S = 60.0
 MUTEX_WAIT_S = 30.0
 STILL_ACTIVE = 259
@@ -1097,6 +1101,13 @@ def registry_forget(directory: Path, target_dir: str) -> None:
         pass
 
 
+def _log_argv(argv: list[str]) -> list[str]:
+    words = [w if len(w) <= LOG_ARGV_CHARS else w[:LOG_ARGV_CHARS] + "…" for w in argv]
+    if len(words) > LOG_ARGV_WORDS:
+        words = words[:LOG_ARGV_WORDS] + [f"…(+{len(argv) - LOG_ARGV_WORDS})"]
+    return words
+
+
 def append_log(row: dict, directory: Path) -> None:
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -1417,7 +1428,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
             "kind": opts["kind"], "weight": None, "wait_lock_s": 0.0, "wait_token_s": 0.0,
             "run_s": round(time.time() - t_start, 3), "compiled": stats["compiled"],
             "fp_hit": False, "fp_miss": False, "exit": code,
-            "argv0": argv[0], "broker_error": f"{type(exc).__name__}: {exc}",
+            "argv0": argv[0], "argv": _log_argv(argv), "broker_error": f"{type(exc).__name__}: {exc}",
         }, _safe_state_dir())
         return code
 
@@ -1434,7 +1445,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
     row.update({
         "run_s": round(time.time() - t_run, 3), "compiled": stats["compiled"],
         "fp_hit": hit, "fp_miss": hit and stats["compiled"], "exit": code,
-        "argv0": argv[0],
+        "argv0": argv[0], "argv": _log_argv(argv),
     })
     # Register and log BEFORE releasing: the lock's next owner reads the registry the moment
     # it holds the lock, and must see what this run just built.
@@ -1466,7 +1477,7 @@ def _log_timeout(directory, agent, prio, kind, weight, waited, argv) -> None:
         "worktree": os.getcwd(), "agent": agent, "prio": prio, "eff_prio": prio,
         "kind": kind, "weight": weight, "wait_lock_s": round(waited, 3), "wait_token_s": 0.0,
         "run_s": 0.0, "compiled": False, "fp_hit": False, "fp_miss": False,
-        "exit": EXIT_QUEUE_TIMEOUT, "argv0": argv[0],
+        "exit": EXIT_QUEUE_TIMEOUT, "argv0": argv[0], "argv": _log_argv(argv),
     }, directory)
 
 
