@@ -276,6 +276,16 @@ export async function apiBlob(path: string, init?: RequestInit): Promise<Blob> {
 }
 
 /**
+ * A route that answers as a stream (server-sent events).
+ *
+ * The caller reads `res.body` itself. A 204 is returned, not thrown: it is how
+ * the daemon says "nothing to stream", and the caller decides what that means.
+ */
+export async function apiStream(path: string, init?: RequestInit): Promise<Response> {
+  return await request(path, init);
+}
+
+/**
  * Is the daemon there?
  *
  * The one call that carries no token — it is what the shell asks *before* it

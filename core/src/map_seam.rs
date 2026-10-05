@@ -289,17 +289,17 @@ pub struct Requests {
     pub opaque: Vec<usize>,
 }
 
-/// Every `apiFetch` / `apiText` / `apiBlob` call in one file, and what it asks for.
+/// Every `apiFetch` / `apiText` / `apiBlob` / `apiStream` call in one file, and what it asks for.
 ///
-/// **The three names are the whole of the shell's side of the boundary**, and that is a property of
+/// **The four names are the whole of the shell's side of the boundary**, and that is a property of
 /// `data/client.ts` rather than an assumption: `DAEMON_URL` is joined to a path in exactly one
-/// place, and these are the three exported wrappers over it. A fourth wrapper would go unread here,
+/// place, and these are the four exported wrappers over it. A fifth wrapper would go unread here,
 /// which is the same class of gap as the one [`Seam::opaque`] counts.
 pub fn requests(source: &str) -> Requests {
     let chars: Vec<char> = source.chars().collect();
     let masked = mask(source, false);
     let mut found = Requests::default();
-    for name in ["apiFetch", "apiText", "apiBlob"] {
+    for name in ["apiFetch", "apiText", "apiBlob", "apiStream"] {
         let needle: Vec<char> = name.chars().collect();
         let mut at = 0;
         while let Some(hit) = find(&masked, &needle, at) {

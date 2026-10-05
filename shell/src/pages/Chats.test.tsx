@@ -21,6 +21,7 @@ const daemon = vi.hoisted(() => ({
   apiFetch: vi.fn(),
   apiText: vi.fn(),
   apiBlob: vi.fn(),
+  apiStream: vi.fn(),
   probeHealth: vi.fn(),
 }));
 vi.mock("../data/client", async (original) => ({
@@ -71,6 +72,8 @@ beforeEach(() => {
   daemon.apiFetch.mockReset();
   daemon.apiBlob.mockReset();
   daemon.apiBlob.mockResolvedValue(new Blob(["hello"], { type: "image/png" }));
+  daemon.apiStream.mockReset();
+  daemon.apiStream.mockRejectedValue(new Error("no stream in tests"));
   daemon.apiText.mockReset();
   daemon.probeHealth.mockReset();
   daemon.probeHealth.mockResolvedValue(true);
@@ -4311,6 +4314,66 @@ describe("a turn in flight", () => {
     await renderChats("/chats/c-1");
 
     expect(await screen.findByText(/running Read/i)).toBeTruthy();
+  });
+
+  it("a streamed live answer renders as markdown while it is written", async () => {
+    // A stream that opens, says one state and then stays open, as a turn still being written does.
+    const frame =
+      'event: live\ndata: {"text":"so **far**","doing":null,"did":[],"thought":[],"thought_tokens":null}\n\n';
+    let sent = false;
+    daemon.apiStream.mockReset();
+    daemon.apiStream.mockResolvedValue({
+      status: 200,
+      body: {
+        getReader: () => ({
+          read: () => {
+            if (!sent) {
+              sent = true;
+              return Promise.resolve({ done: false, value: new TextEncoder().encode(frame) });
+            }
+            return new Promise(() => {});
+          },
+          cancel: () => Promise.resolve(),
+          releaseLock: () => {},
+        }),
+      },
+    });
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const strong = await waitFor(() => {
+      const found = document.querySelector(".chats-turn-writing strong");
+      expect(found).not.toBeNull();
+      return found as Element;
+    });
+    expect(strong.textContent).toBe("far");
+    expect(daemon.apiStream.mock.calls.map((call) => String(call[0]))).toContain(
+      "/assistant/1/live/stream",
+    );
+  });
+
+  it("a live answer falls back to the poll when the stream cannot open", async () => {
+    daemon.apiStream.mockReset();
+    daemon.apiStream.mockRejectedValue(new Error("cannot open"));
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }, { live: { 1: { text: "polled words", doing: null } } }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText("polled words")).toBeTruthy();
+    // The stream was tried first; the poll is the fallback and not the only road.
+    expect(daemon.apiStream.mock.calls.map((call) => String(call[0]))).toContain(
+      "/assistant/1/live/stream",
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("still says thinking when the daemon has nothing to show yet", async () => {
