@@ -701,6 +701,11 @@ pub fn build_router(state: AppState) -> Router {
         // A turn in flight, as words. The literal is a segment deeper than `{turn_id}` above, so
         // the two cannot shadow each other whatever a turn id looks like.
         .route("/assistant/{turn_id}/live", get(get_assistant_live))
+        // The same state as a push stream. A literal deeper than `/live`, so it cannot shadow it.
+        .route(
+            "/assistant/{turn_id}/live/stream",
+            get(get_assistant_live_stream),
+        )
         .route("/proposals", get(get_proposals))
         // The sidebar's "waiting on you" number, read in one request instead of seven.
         .route("/waiting/count", get(get_waiting_count))
@@ -11594,6 +11599,96 @@ async fn get_assistant_live(
     let stream =
         crate::runs::read_tail(&state.run_tails, turn_id, 0).ok_or(StatusCode::NO_CONTENT)?;
     Ok(Json(crate::runner::live_from_stream(&stream)))
+}
+
+/// Length in bytes of a turn's tail, or `None` once nothing is writing it. Peeks without cloning
+/// the text, so the poll loop below costs a pair of lock acquisitions per tick and not a copy.
+fn tail_len(tails: &crate::state::RunTails, run_id: i64) -> Option<usize> {
+    let tail = tails.lock().unwrap().get(&run_id).cloned()?;
+    let len = tail.lock().unwrap().len();
+    Some(len)
+}
+
+/// `get_assistant_live` as a Server-Sent Events stream: one `live` event per change of the turn's
+/// distilled state, then an `end` event when the run stops being written.
+///
+/// SSE rather than a socket because the traffic is one-way and plain HTTP, so the bearer token
+/// travels in the header like on every other route and never in a URL. The events carry the
+/// distilled [`crate::runner::LiveTurn`], never the CLI's raw lines, for the reason given on
+/// `get_assistant_live`: a chat bubble is not the place to learn what a `content_block_delta` is.
+///
+/// The tail is polled every 100 ms rather than waited on, so the writers (`runner.rs`) stay as
+/// they are and nothing has to learn about subscribers. Only the length is read per tick; the
+/// stream is re-distilled when it changed, and an event goes out only if the state differs from
+/// the last one sent.
+///
+/// `204` when no tail exists, same as `/live`: the run ended or this daemon never started it.
+async fn get_assistant_live_stream(
+    State(state): State<AppState>,
+    Path(turn_id): Path<i64>,
+) -> Result<axum::response::Response, StatusCode> {
+    use tokio::io::AsyncWriteExt;
+
+    crate::runs::read_tail(&state.run_tails, turn_id, 0).ok_or(StatusCode::NO_CONTENT)?;
+    let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+    let tails = state.run_tails.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut seen_len: Option<usize> = None;
+        let mut last: Option<crate::runner::LiveTurn> = None;
+        let mut idle = 0u32;
+        loop {
+            tick.tick().await;
+            let Some(len) = tail_len(&tails, turn_id) else {
+                let _ = writer.write_all(b"event: end\ndata: {}\n\n").await;
+                break;
+            };
+            let mut wrote = false;
+            if seen_len != Some(len) {
+                seen_len = Some(len);
+                if let Some(stream) = crate::runs::read_tail(&tails, turn_id, 0) {
+                    let live = crate::runner::live_from_stream(&stream);
+                    if last.as_ref() != Some(&live) {
+                        let Ok(json) = serde_json::to_string(&live) else {
+                            break;
+                        };
+                        let frame = format!("event: live\ndata: {json}\n\n");
+                        if writer.write_all(frame.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        last = Some(live);
+                        wrote = true;
+                    }
+                }
+            }
+            if wrote {
+                idle = 0;
+            } else {
+                idle += 1;
+                if idle >= 150 {
+                    idle = 0;
+                    if writer.write_all(b": keep-alive\n\n").await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    Ok((
+        headers,
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
+    )
+        .into_response())
 }
 
 /// Whether this machine has a model that can answer a conversation.
@@ -28214,6 +28309,125 @@ mod tests {
         let body = json_body(watched).await;
         assert_eq!(body["text"], "deixa ver");
         assert_eq!(body["doing"], "Read");
+    }
+
+    /// A live turn is pushed as its distilled state, frame by frame, and the stream says when it ends.
+    #[tokio::test]
+    async fn a_live_turn_streams_its_distilled_state_and_says_when_it_ends() {
+        let first =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"so far"}]}}"#;
+        let second = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"so far and more"}]}}"#;
+        let state = test_state().await;
+        let tail = std::sync::Arc::new(std::sync::Mutex::new(first.to_owned()));
+        state.run_tails.lock().unwrap().insert(78, tail.clone());
+
+        let tails = state.run_tails.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            tail.lock().unwrap().push_str(&format!("\n{second}"));
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            tails.lock().unwrap().remove(&78);
+        });
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/78/live/stream")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "content-type was {content_type:?}"
+        );
+
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the stream must end once the tail is removed")
+        .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        writer.await.unwrap();
+
+        assert!(
+            !text.contains(r#""type":"assistant""#),
+            "a raw CLI line leaked into the stream: {text}"
+        );
+        let frames: Vec<&str> = text
+            .split("\n\n")
+            .filter(|f| !f.trim().is_empty() && !f.trim_start().starts_with(':'))
+            .collect();
+        let lives: Vec<&str> = frames
+            .iter()
+            .copied()
+            .filter(|f| f.starts_with("event: live"))
+            .collect();
+        assert!(
+            lives.len() >= 2,
+            "expected at least two live frames: {text}"
+        );
+        assert!(
+            frames.last().is_some_and(|f| f.starts_with("event: end")),
+            "the last frame must be the end: {text}"
+        );
+
+        let data = |frame: &str| -> serde_json::Value {
+            let line = frame
+                .lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .expect("a data line");
+            serde_json::from_str(line).unwrap()
+        };
+        let first_live = crate::runner::live_from_stream(first);
+        let final_stream = format!("{first}\n{second}");
+        let final_live = crate::runner::live_from_stream(&final_stream);
+        assert_eq!(data(lives[0])["text"], first_live.text);
+        assert_eq!(
+            data(lives[lives.len() - 1]),
+            serde_json::to_value(final_live).unwrap()
+        );
+    }
+
+    /// Nothing writing means no stream to open, and the route is not an exception to the token.
+    #[tokio::test]
+    async fn a_turn_nothing_is_writing_has_no_stream_to_open() {
+        let state = test_state().await;
+
+        let quiet = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/4321/live/stream")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(quiet.status(), StatusCode::NO_CONTENT);
+
+        let anonymous = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/4321/live/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// A runner whose turn never lands, so the chat it belongs to stays genuinely busy.

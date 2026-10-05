@@ -1632,9 +1632,9 @@
  * restyling them would make the turn appear to change its mind about what it said when the run
  * lands. The line below it is what says it is not finished.
  *
- * The measure is set here as well as on `.chats-prose`, because this half of it is drawn as one
- * plain paragraph — the parser only runs once the words have stopped arriving — and a paragraph
- * that reflows to a different width the moment the turn lands would make the answer appear to move.
+ * The measure is set here as well as on `.chats-prose`: the live half is now parsed as it arrives,
+ * but it is still a different wrapper from the settled answer, and a block that reflows to a
+ * different width the moment the turn lands would make the answer appear to move.
  */
 .chats-turn-writing {
   border-left: 2px solid var(--border);

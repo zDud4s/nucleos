@@ -4488,8 +4488,9 @@ function StopTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
 /**
  * A turn as it happens: the words so far, and what it is doing between them.
  *
- * Its own component so the poll lives and dies with the live turn — mounted only where `TurnBlock`
- * has decided the turn is in flight, so a settled conversation asks the daemon nothing at all.
+ * Its own component so the stream lives and dies with the live turn — mounted only where `TurnBlock`
+ * has decided the turn is in flight, so a settled conversation asks the daemon nothing at all. The
+ * poll is only the fallback for a stream that cannot open or drops.
  *
  * Three states, and they are different claims. Nothing written and no tool is "thinking…", which is
  * what this said before and is still the honest answer while the daemon has nothing to show. A tool
@@ -4497,7 +4498,7 @@ function StopTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
  * for the wait. And words already written are shown as they arrive.
  */
 function LiveAnswer({ turnId, since }: { turnId: number; since: string }) {
-  const live = useLiveTurn(turnId, true);
+  const live = useLiveTurn(turnId, true, { stream: true });
   const text = live.data?.text ?? "";
   const doing = live.data?.doing ?? null;
   const keepUp = useContext(KeepsUp);
@@ -4526,7 +4527,9 @@ function LiveAnswer({ turnId, since }: { turnId: number; since: string }) {
         tokens={live.data?.thought_tokens ?? null}
       />
       {text !== "" && (
-        <p className="chats-turn-answer chats-turn-writing">{text}</p>
+        <div className="chats-turn-answer chats-turn-writing">
+          <Rich text={text} />
+        </div>
       )}
       <Plan todos={planOf(live.data?.did ?? [])} />
       {/* `settled={false}`: the answers are already on this stream — the live route reads it whole

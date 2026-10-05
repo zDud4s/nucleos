@@ -1,4 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
 import {
   anyTurnLive,
   merge,
@@ -11,6 +12,7 @@ import {
 } from "../lib/turns";
 import { apiFetch, apiText } from "./client";
 import { keys } from "./keys";
+import { streamLiveTurn } from "./liveStream";
 import { POLL, backgroundCadence } from "./poll";
 
 /**
@@ -1392,12 +1394,37 @@ export function useStartConversation() {
  * Enabled only while the turn is live, which is also what stops the poll: a
  * turn that has landed has its answer in the transcript, and asking after it
  * would be asking the daemon to describe something it has already forgotten.
+ *
+ * With `stream`, the words arrive over the daemon's event stream and are written straight into the
+ * query cache; the poll stays off. If the stream cannot open or drops, the hook falls back to the
+ * poll silently. On `end` the last state stays until the transcript settles the turn.
  */
-export function useLiveTurn(turnId: number, alive: boolean) {
+export function useLiveTurn(
+  turnId: number,
+  alive: boolean,
+  options: { stream?: boolean } = {},
+) {
+  const queryClient = useQueryClient();
+  const wantStream = options.stream === true && alive;
+  const [mode, setMode] = useState<"stream" | "poll">("stream");
+
+  useEffect(() => {
+    if (!wantStream) return;
+    const controller = new AbortController();
+    setMode("stream");
+    void streamLiveTurn(turnId, {
+      signal: controller.signal,
+      onLive: (live) => queryClient.setQueryData(keys.chats.live(turnId), live),
+    }).then((outcome) => {
+      if (outcome === "failed" && !controller.signal.aborted) setMode("poll");
+    });
+    return () => controller.abort();
+  }, [turnId, wantStream, queryClient]);
+
   return useQuery({
     queryKey: keys.chats.live(turnId),
     queryFn: () => apiFetch<LiveTurn | undefined>(`/assistant/${turnId}/live`),
-    enabled: alive,
+    enabled: alive && (!wantStream || mode === "poll"),
     refetchInterval: POLL.turn,
   });
 }
