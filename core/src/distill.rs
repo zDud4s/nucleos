@@ -48,15 +48,12 @@ pub const STATUS_RUNNING: &str = "running";
 pub const STATUS_DONE: &str = "done";
 pub const STATUS_FAILED: &str = "failed";
 
-// Wired in P5: until the job loop and the vcs queue call the enqueue helpers, only tests do.
-#[allow(dead_code)]
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
 /// Queue a job that ended without completing. Callers pass `&mut *tx` so the row rides the
 /// retirement's own transaction.
-#[allow(dead_code)] // wired in P5: only tests call it until the job loop and vcs queue do
 pub async fn enqueue_job_ending_in(
     conn: &mut SqliteConnection,
     job_id: i64,
@@ -77,7 +74,6 @@ pub async fn enqueue_job_ending_in(
 /// Queue the item verdict just written for `(job_id, ordinal)`: a pass after at least one red
 /// gate is a recovery, and a `gate_failed` item whose reds exceed the job's retries is
 /// exhausted. Anything else queues nothing.
-#[allow(dead_code)] // wired in P5: only tests call it until the job loop and vcs queue do
 pub async fn enqueue_item_verdict_in(
     conn: &mut SqliteConnection,
     job_id: i64,
@@ -116,7 +112,6 @@ pub async fn enqueue_item_verdict_in(
 
 /// Queue a land: a succeeded merge of a job's own branch (`nucleos/job-<id>`, same project) into
 /// a branch outside `nucleos/`.
-#[allow(dead_code)] // wired in P5: only tests call it until the job loop and vcs queue do
 pub async fn enqueue_landed_in(
     conn: &mut SqliteConnection,
     vcs_request_id: i64,
