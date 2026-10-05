@@ -162,6 +162,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/map", get(get_project_map))
+        .route("/projects/{id}/tests-map", get(get_project_tests_map))
         // Which specs a project has, so the extraction button offers a list and not a text box.
         // Beside `map` because it answers about the same tree, read the same way.
         .route("/projects/{id}/map/specs", get(get_project_map_specs))
@@ -6660,6 +6661,45 @@ async fn get_project_blame(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .map_err(inspect_status)
+}
+
+/// What `GET /projects/{id}/tests-map` answers: the state of the project's `nucleos.tests.yaml`
+/// and, always, what this daemon would propose — beside a valid map too, so the owner can see
+/// what a new build file would add.
+#[derive(Debug, Serialize)]
+struct TestsMapView {
+    /// `absent`, `invalid` or `valid`.
+    state: &'static str,
+    errors: Vec<String>,
+    groups: Vec<String>,
+    proposal: crate::detect::TestsMapProposal,
+}
+
+fn tests_map_view(root: &std::path::Path) -> TestsMapView {
+    let (state, errors, groups) = match crate::tests_map::load(root) {
+        crate::tests_map::MapState::Absent => ("absent", Vec::new(), Vec::new()),
+        crate::tests_map::MapState::Invalid(errors) => ("invalid", errors, Vec::new()),
+        crate::tests_map::MapState::Valid(map) => {
+            ("valid", Vec::new(), map.tests.groups.into_keys().collect())
+        }
+    };
+    TestsMapView {
+        state,
+        errors,
+        groups,
+        proposal: crate::detect::propose_tests_map(root),
+    }
+}
+
+async fn get_project_tests_map(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TestsMapView>, StatusCode> {
+    let root = resolve_project_root(&state, &id).await?;
+    tokio::task::spawn_blocking(move || tests_map_view(&root))
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// What one run has changed, and how big the tree it changed it in is.
@@ -16074,6 +16114,32 @@ mod tests {
     use axum::http::Request;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    #[test]
+    fn the_tests_map_view_reports_the_map_and_always_a_proposal() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let view = tests_map_view(temp.path());
+        assert_eq!(view.state, "absent");
+        assert!(view.proposal.yaml.contains("cargo test -p x"));
+
+        std::fs::write(
+            temp.path().join(crate::tests_map::MAP_FILE),
+            "version: 9\ntests: {}\n",
+        )
+        .unwrap();
+        let view = tests_map_view(temp.path());
+        assert_eq!(view.state, "invalid");
+        assert!(view.errors[0].contains("version 9"));
+
+        std::fs::write(
+            temp.path().join(crate::tests_map::MAP_FILE),
+            "version: 1\ntests:\n  groups:\n    x:\n      paths: [src/]\n      command: cargo test\n",
+        )
+        .unwrap();
+        let view = tests_map_view(temp.path());
+        assert_eq!((view.state, view.groups), ("valid", vec!["x".to_string()]));
+    }
 
     /// A state whose database is a real file, handed back inside a [`crate::storage::TempDb`] rather
     /// than a bare `TempDir` — which is the whole reason that type exists. `TempDir`'s drop cannot

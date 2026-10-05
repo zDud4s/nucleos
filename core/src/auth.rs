@@ -320,6 +320,7 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/worktree"),
     (Method::GET, "/projects/{id}/ownership"),
     (Method::GET, "/projects/{id}/map"),
+    (Method::GET, "/projects/{id}/tests-map"),
     (Method::GET, "/projects/{id}/map/decisions"),
     (Method::GET, "/projects/{id}/map/specs"),
     (Method::GET, "/projects/{id}/map/silenced"),
