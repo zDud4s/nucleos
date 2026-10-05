@@ -2739,6 +2739,42 @@ mod tests {
         }
     }
 
+    /// The live view of a browser session is pixels of a page the agent is driving, so it is the
+    /// owner's to watch and nobody else's. Safe today by being in no table; this is what says no to
+    /// filing it beside the other `/browser/...` reads (spec browser-ao-vivo).
+    #[test]
+    fn the_live_view_is_in_no_scope_table() {
+        const LIVE_ROUTE: &str = "/browser/sessions/{id}/live";
+
+        assert!(
+            !route_is_listed(READ_ONLY_ROUTES, &Method::GET, LIVE_ROUTE)
+                && !route_is_listed(RUN_CREATING_ROUTES, &Method::GET, LIVE_ROUTE)
+                && !route_is_listed(TEAM_ROUTES, &Method::GET, LIVE_ROUTE)
+                && !route_is_listed(EMAIL_ROUTES, &Method::GET, LIVE_ROUTE)
+                && !route_is_listed(COUNCIL_ROUTES, &Method::GET, LIVE_ROUTE),
+            "the live screen must stay out of every scope table"
+        );
+
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+            Scope::TeamRun("team-1".to_owned()),
+        ] {
+            assert!(
+                !permits(&scope, &Method::GET, "/browser/sessions/7/live"),
+                "{scope:?} must not watch a browser session's screen"
+            );
+        }
+
+        for scope in [Scope::Control, Scope::ApiToken(ApiTokenLevel::Admin)] {
+            assert!(
+                permits(&scope, &Method::GET, "/browser/sessions/7/live"),
+                "{scope:?} is the owner and may watch"
+            );
+        }
+    }
+
     /// Onboarding a project is the owner's: the POST sets the gate command and writes an executable
     /// hook into a folder it may be told the name of, and the GET serves the rules' gate, which
     /// `GET /projects/{id}/rules` has always kept to Admin. Safe today by being in no table, and

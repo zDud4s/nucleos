@@ -165,6 +165,8 @@ Matching is on the whole origin: scheme, host and port, exactly. This is deliber
 
 **Reach: the v1 serves the assistant.** An autonomous pillar is refused structurally (`reach-undesigned`, not recoverable); an assistant turn with nobody in the foreground is refused situationally (`no-one-present`, recoverable by opening the shell). Those are two rules and not one because the requester is derived from owner presence, which cannot tell a cron job from a Telegram message at midnight — and telling that person "autonomous reach is not designed" would send them to fix something that is not broken.
 
+**The live view is a second pixel path: sidecar -> núcleo -> shell, agent mode only.** `GET /browser/sessions/{id}/live` is reachable with the control token or the admin key and no narrower scope; frames are relayed and never persisted or logged. The núcleo cuts the stream when the wheel is asked for (a mode change, at a record boundary) and the sidecar cuts it again at Handoff, so neither side alone is what keeps a person's own screen out of the agent's view.
+
 ### What this does not solve
 
 Prompt injection. The agent reads text a stranger wrote and can be talked into anything that text can express. Everything above is about what happens next; nothing in it makes the agent harder to persuade.

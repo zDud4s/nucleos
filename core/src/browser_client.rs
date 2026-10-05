@@ -441,6 +441,9 @@ impl std::fmt::Display for BrowserError {
 #[derive(Debug, Clone)]
 pub struct BrowserClient {
     http: reqwest::Client,
+    /// For the live view's long-lived stream: a connect timeout and no total one, because a stream
+    /// that lasts as long as the session would be cut by `CALL_TIMEOUT`.
+    stream_http: reqwest::Client,
     base: String,
     token: String,
 }
@@ -455,6 +458,10 @@ impl BrowserClient {
         Self {
             http: reqwest::Client::builder()
                 .timeout(CALL_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
+            stream_http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
                 .build()
                 .unwrap_or_default(),
             base: format!("http://{addr}"),
@@ -641,6 +648,24 @@ impl BrowserClient {
             .json::<T>()
             .await
             .map_err(|error| BrowserError::Failed(error.to_string()))
+    }
+
+    /// Opens the sidecar's record stream for a session. The response is handed back unread: the
+    /// caller pumps it, and dropping it closes the request.
+    pub async fn watch(&self, session: &str) -> Result<reqwest::Response, BrowserError> {
+        let response = self
+            .stream_http
+            .post(format!("{}/watch", self.base))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "session_id": session }))
+            .send()
+            .await
+            .map_err(|error| BrowserError::Unreachable(error.to_string()))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        Err(self.read_error(status, response).await)
     }
 
     async fn post(

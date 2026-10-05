@@ -19,6 +19,7 @@ import {
   type Written,
 } from "../data/browser";
 import { useProjects } from "../data/system";
+import { LiveView } from "./LiveView";
 import {
   Badge,
   Button,
@@ -185,6 +186,7 @@ function LiveSessions({
   const closeSession = useCloseSession();
   const returnWheel = useReturnWheel();
   const rows = view.data ?? [];
+  const [watching, setWatching] = useState<number | null>(null);
 
   return (
     <Panel title="Live sessions" aside={<Count n={view.data?.length} />}>
@@ -208,6 +210,8 @@ function LiveSessions({
                 })
               }
               returnPending={returnWheel.isPending}
+              watching={watching === session.id}
+              onWatch={() => setWatching(watching === session.id ? null : session.id)}
             />
           ))}
         </Rows>
@@ -224,12 +228,16 @@ function SessionRow({
   closePending,
   onReturn,
   returnPending,
+  watching,
+  onWatch,
 }: {
   session: BrowserSession;
   onClose: () => void;
   closePending: boolean;
   onReturn: () => void;
   returnPending: boolean;
+  watching: boolean;
+  onWatch: () => void;
 }) {
   const redirected = session.final_url !== session.requested_url && session.final_url !== "";
 
@@ -277,6 +285,11 @@ function SessionRow({
             onConfirm={onReturn}
           />
         )}
+        {session.mode === "agent" && (
+          <Button variant="ghost" aria-pressed={watching} onClick={onWatch}>
+            {watching ? "Stop watching" : "Watch"}
+          </Button>
+        )}
         {(session.mode === "agent" || session.mode === "delivery-failed") && (
           <ConfirmButton
             label="Close session"
@@ -287,6 +300,7 @@ function SessionRow({
           />
         )}
       </div>
+      {watching && <LiveView sessionId={session.id} />}
     </Row>
   );
 }

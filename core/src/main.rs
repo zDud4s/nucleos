@@ -9,6 +9,7 @@ mod backup;
 mod brief;
 mod browser;
 mod browser_client;
+mod browser_live;
 mod browser_policy;
 mod browser_wheel;
 mod budget;
@@ -1757,6 +1758,7 @@ async fn main() {
                 sidecar::BROWSER_ADDR,
                 browser_sidecar_token.clone(),
             ),
+            modes: Default::default(),
         }),
         web: Arc::new(web::WebRuntime {
             enabled: web_config.enabled,

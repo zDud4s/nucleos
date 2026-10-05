@@ -39,6 +39,7 @@ func (p *Pool) TakeWheel(ctx context.Context, req browser.WheelRequest) (browser
 	// gone rather than idling behind it.
 	if req.Session != "" {
 		if session, err := p.lookup(req.Session); err == nil {
+			p.endWatchers(browser.EndWheel, req.Session)
 			_ = session.holder.driver.Close(ctx, session.inner)
 			p.release(ctx, session.holder, req.Session)
 		}
@@ -132,6 +133,7 @@ func (p *Pool) Forget(ctx context.Context, ref profile.Ref) ([]browser.SessionID
 	}
 	p.mu.Unlock()
 
+	p.endWatchers(browser.EndGone, stopped...)
 	if holder != nil {
 		<-holder.ready
 		if holder.driver != nil {
@@ -167,6 +169,7 @@ func (p *Pool) beginHuman(ctx context.Context, ref profile.Ref) (*entry, []brows
 	p.running[ref] = holder
 	p.mu.Unlock()
 
+	p.endWatchers(browser.EndWheel, displaced...)
 	if previous != nil {
 		<-previous.ready
 		if previous.driver != nil {
