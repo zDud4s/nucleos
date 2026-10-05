@@ -705,6 +705,16 @@ fn wire_event(
 /// understand is somebody's work in progress, or a version of the CLI this daemon has never seen,
 /// and the cost of guessing at it is settings nobody asked to lose.
 pub(crate) fn wire_classifier_hook(dir: &Path) -> Result<(), String> {
+    wire_hook(dir, true)
+}
+
+/// Like `wire_classifier_hook`, but a hook script already present in `dir` is left as it is:
+/// a provisioned worktree may check out a script the project tracks, and that copy wins.
+pub(crate) fn wire_classifier_hook_keeping_script(dir: &Path) -> Result<(), String> {
+    wire_hook(dir, false)
+}
+
+fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
     let claude = dir.join(".claude");
     let settings_path = claude.join("settings.json");
 
@@ -750,8 +760,11 @@ pub(crate) fn wire_classifier_hook(dir: &Path) -> Result<(), String> {
 
     std::fs::create_dir_all(claude.join("hooks"))
         .map_err(|error| format!("could not make {}: {error}", claude.display()))?;
-    std::fs::write(claude.join("hooks").join("ask_daemon.py"), HOOK_SOURCE)
-        .map_err(|error| format!("could not write the hook script: {error}"))?;
+    let script_path = claude.join("hooks").join("ask_daemon.py");
+    if overwrite_script || !script_path.is_file() {
+        std::fs::write(&script_path, HOOK_SOURCE)
+            .map_err(|error| format!("could not write the hook script: {error}"))?;
+    }
     std::fs::write(
         &settings_path,
         format!(
@@ -2659,5 +2672,32 @@ mod tests {
             fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
             "{ this is not json"
         );
+    }
+
+    /// A worktree is a checkout of tracked files, and a project may track its hook script while
+    /// gitignoring the settings file. Wiring such a worktree registers the hook and leaves the
+    /// script the checkout carries alone; only a tree with no script gets one written.
+    #[test]
+    fn wiring_a_worktree_keeps_its_checked_out_hook_script() {
+        let tracked = TempDir::new().unwrap();
+        let hooks_dir = tracked.path().join(".claude/hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        fs::write(hooks_dir.join("ask_daemon.py"), "# tracked").unwrap();
+        assert!(!classifier_hook_is_wired(tracked.path()));
+
+        wire_classifier_hook_keeping_script(tracked.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(hooks_dir.join("ask_daemon.py")).unwrap(),
+            "# tracked",
+            "the checked-out script must keep its bytes"
+        );
+        assert!(classifier_hook_is_wired(tracked.path()));
+
+        let bare = TempDir::new().unwrap();
+        wire_classifier_hook_keeping_script(bare.path()).unwrap();
+        assert!(bare.path().join(".claude/settings.json").is_file());
+        assert!(bare.path().join(HOOK_SCRIPT).is_file());
+        assert!(classifier_hook_is_wired(bare.path()));
     }
 }

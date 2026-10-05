@@ -789,6 +789,7 @@ struct Finished {
     base_sha: Option<String>,
     completed_at: Option<String>,
     gate_status: Option<String>,
+    run_status: String,
 }
 
 /// How long a completed run is left alone before its worktree is read, so a run that is about to
@@ -802,7 +803,10 @@ const HANDOFF_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 /// with the escalation's own target, which still routes the branch through `verify_resolution`
 /// (`landing_is_a_resolution`) and links the escalation to the new row.
 ///
-/// A resolution counts as finished when its run `completed` (not failed, not cancelled), has no
+/// A resolution run that `failed`, or `completed` without a committed merge, is announced once per
+/// request (`RESOLUTION_FAILED_KIND`) and never handed over.
+///
+/// A resolution counts as finished when its run `completed` (not cancelled), has no
 /// successor and ended more than `HANDOFF_GRACE` ago, and its worktree holds a committed merge: no
 /// `MERGE_HEAD`, a second parent, and a HEAD that is not the base it was opened on. Idempotent from
 /// existing rows alone: `resolved_by IS NULL` is the brake, and a refusal is remembered in memory
@@ -820,7 +824,7 @@ async fn land_finished(
     }
     let finished: Vec<Finished> = match sqlx::query_as(
         "SELECT c.id, c.op, c.args, c.project_id, w.path AS worktree_path, w.branch,
-                w.base_sha, r.completed_at, r.gate_status
+                w.base_sha, r.completed_at, r.gate_status, r.status AS run_status
            FROM vcs_requests AS c
            JOIN runs AS r ON r.id = c.resolution_run_id
            JOIN worktrees AS w
@@ -829,7 +833,7 @@ async fn land_finished(
             AND c.op = 'merge'
             AND c.from_resolution = 0
             AND c.resolved_by IS NULL
-            AND r.status = 'completed'
+            AND r.status IN ('completed', 'failed')
             AND r.successor_run_id IS NULL
             AND NOT EXISTS (SELECT 1 FROM vcs_requests s
                              WHERE s.project_id = c.project_id AND s.args = c.args
@@ -855,12 +859,42 @@ async fn land_finished(
         if !old_enough {
             continue;
         }
-        let Some(head) = finished_merge_head(
-            std::path::Path::new(&row.worktree_path),
-            row.base_sha.as_deref(),
-        )
-        .await
-        else {
+        let head = if row.run_status == "completed" {
+            finished_merge_head(
+                std::path::Path::new(&row.worktree_path),
+                row.base_sha.as_deref(),
+            )
+            .await
+        } else {
+            None
+        };
+        let Some(head) = head else {
+            // Ended with nothing the queue could land (failed, or stopped short of a committed
+            // merge): said once per request, because the escalation would otherwise sit
+            // `resolving` with nobody told. The empty head is the dedupe key.
+            if refused.insert((row.id, String::new())) {
+                let why = if row.run_status == "completed" {
+                    "its run ended without a finished merge commit"
+                } else {
+                    "its run failed"
+                };
+                let summary = format!(
+                    "{}'s conflict resolution on {} was not handed to the queue: {why};                      it needs a person",
+                    row.project_id, row.branch
+                );
+                if let Err(error) = crate::notify::deliver_or_defer(
+                    pool,
+                    crate::land::RESOLUTION_FAILED_KIND,
+                    &summary,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        %error,
+                        "resolver: could not notify about a resolution that ended without a merge"
+                    );
+                }
+            }
             continue;
         };
         if refused.contains(&(row.id, head.clone())) {
@@ -1842,6 +1876,44 @@ mod tests {
                     .unwrap();
             assert_eq!(summaries.len(), 1, "announced once, not every tick");
             assert!(summaries[0].contains(status), "{}", summaries[0]);
+        }
+    }
+
+    /// A resolution run that ended without a merge the queue could land used to vanish: not handed
+    /// over, and not announced either, so the escalation sat `resolving` with nobody told. It is
+    /// announced, once, however many ticks look at it afterwards.
+    #[tokio::test]
+    async fn a_resolution_that_ended_without_a_landable_merge_is_announced_once() {
+        for (status, progress) in [
+            ("completed", Progress::MidMerge),
+            ("completed", Progress::Untouched),
+            ("failed", Progress::MidMerge),
+            ("failed", Progress::Untouched),
+        ] {
+            let pool = test_pool().await;
+            let scenario =
+                resolution_scenario(&pool, "nucleos-resolver-unlandable-", status, progress).await;
+
+            let mut refused = Default::default();
+            land_finished(&pool, &mut refused).await;
+            land_finished(&pool, &mut refused).await;
+
+            assert!(
+                admitted_resolutions(&pool, &scenario).await.is_empty(),
+                "a {status} resolution without a finished merge is never handed over"
+            );
+            let summaries: Vec<String> =
+                sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?")
+                    .bind(crate::land::RESOLUTION_FAILED_KIND)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                summaries.len(),
+                1,
+                "a {status} resolution that ended without a landable merge is announced exactly \
+                 once: {summaries:?}"
+            );
         }
     }
 

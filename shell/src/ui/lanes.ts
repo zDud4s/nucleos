@@ -74,6 +74,7 @@ const LANE_OF: Record<string, FeedLane> = {
   run_stopped_by_judge: "runs",
   shadow_run_completed: "runs",
   worktree_run_completed: "runs",
+  run_launched_unclassified: "runs",
   worktree_gate_failed: "runs",
   worktree_provision_failed: "runs",
   worktree_workflow_missing: "runs",
