@@ -332,8 +332,13 @@ procedural), `title` (one line), `body` (short) and `files` (repository paths it
 lessons about THIS project. Never quote the owner context. Do not repeat the known titles. `[]` \
 is a good answer when nothing is worth keeping.";
 
-pub fn extraction_prompt(dossier: &str) -> String {
-    format!("{STANDING}\n\n--- DOSSIER ---\n{dossier}\n--- END OF DOSSIER ---")
+/// The whole extraction prompt: the standing instruction, one line naming why the work was queued
+/// (the closed [`Cause`] vocabulary, never free text), then the dossier.
+pub fn extraction_prompt(cause: Cause, dossier: &str) -> String {
+    let why = cause.as_str();
+    format!(
+        "{STANDING}\n\nWhy this was queued: {why}\n\n--- DOSSIER ---\n{dossier}\n--- END OF DOSSIER ---"
+    )
 }
 
 /// The JSON schema of the answer: an array of at most [`MAX_ITEMS`] items.
@@ -710,7 +715,13 @@ async fn ask(asked: Extractor<'_>, prompt: String) -> std::io::Result<String> {
 
 /// Record a failed attempt: back to `pending` with a backoff, or `failed` once the attempts are
 /// spent. `message` is a category word or an error kind, never dossier or answer text.
-async fn fail(pool: &SqlitePool, row: &QueueRow, category: &str, message: &str, now: DateTime<Utc>) {
+async fn fail(
+    pool: &SqlitePool,
+    row: &QueueRow,
+    category: &str,
+    message: &str,
+    now: DateTime<Utc>,
+) {
     let attempts = row.attempts + 1;
     let error = format!("{category}: {message}");
     let written = match retry_at(attempts, now) {
@@ -762,7 +773,10 @@ async fn write_items(
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     let mut evidence_list = vec![serde_json::json!({"t": "job", "id": job_id})];
-    evidence_list.extend(runs.iter().map(|r| serde_json::json!({"t": "run", "id": r})));
+    evidence_list.extend(
+        runs.iter()
+            .map(|r| serde_json::json!({"t": "run", "id": r})),
+    );
     let evidence = serde_json::Value::Array(evidence_list).to_string();
     let reasoning = format!("distilled from job #{job_id} ({})", cause.as_str());
 
@@ -860,7 +874,7 @@ pub(crate) async fn process_one(
         }
     };
     let built = dossier(&inputs, DOSSIER_CEILING);
-    let extraction_answer = match ask(asked, extraction_prompt(&built.text)).await {
+    let extraction_answer = match ask(asked, extraction_prompt(inputs.cause, &built.text)).await {
         Ok(answer) => answer,
         Err(error) => {
             fail(pool, &row, "model", &format!("{:?}", error.kind()), now).await;
@@ -920,9 +934,7 @@ pub async fn run_distill_loop(state: crate::state::AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CAUSES, Cause, enqueue_item_verdict_in, enqueue_job_ending_in, enqueue_landed_in,
-    };
+    use super::{CAUSES, Cause, enqueue_item_verdict_in, enqueue_job_ending_in, enqueue_landed_in};
     use sqlx::SqlitePool;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
@@ -1097,13 +1109,19 @@ mod tests {
             .unwrap();
         assert_eq!(res.rows_affected(), 1, "the run's own write must succeed");
 
-        let rows: Vec<(String, String, Option<i64>, Option<i64>, Option<i64>, String)> =
-            sqlx::query_as(
-                "SELECT cause, project_id, job_id, item_id, run_id, status FROM distill_queue",
-            )
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+        let rows: Vec<(
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            String,
+        )> = sqlx::query_as(
+            "SELECT cause, project_id, job_id, item_id, run_id, status FROM distill_queue",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(rows.len(), 1, "a failed review queued {} rows", rows.len());
         let (cause, project, job_id, item_id, run_id, status) = &rows[0];
         assert_eq!(cause, Cause::ReviewBlocking.as_str());
@@ -1129,7 +1147,11 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
-            assert_eq!(res.rows_affected(), 1, "the update of run {id} must succeed");
+            assert_eq!(
+                res.rows_affected(),
+                1,
+                "the update of run {id} must succeed"
+            );
         }
         assert_eq!(
             queued_total(&pool).await,
@@ -1196,7 +1218,9 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         for ordinal in 1..=4 {
-            enqueue_item_verdict_in(&mut *conn, 3, ordinal).await.unwrap();
+            enqueue_item_verdict_in(&mut *conn, 3, ordinal)
+                .await
+                .unwrap();
         }
         // Writing the same verdict again is not a second cause.
         enqueue_item_verdict_in(&mut *conn, 3, 1).await.unwrap();
@@ -1226,12 +1250,11 @@ mod tests {
             "only the item whose reds exceed gate_retries is exhausted"
         );
         for untouched in [first_time, still_retrying] {
-            let n: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM distill_queue WHERE item_id = ?")
-                    .bind(untouched)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM distill_queue WHERE item_id = ?")
+                .bind(untouched)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
             assert_eq!(n, 0, "item {untouched} queued something it should not");
         }
     }
@@ -1244,17 +1267,46 @@ mod tests {
         seed_job(&pool, 5, "alpha", 0).await;
         seed_job(&pool, 6, "bravo", 0).await;
 
-        let landed = seed_merge(&pool, "alpha", "merge", "nucleos/job-5", "master", "succeeded").await;
+        let landed = seed_merge(
+            &pool,
+            "alpha",
+            "merge",
+            "nucleos/job-5",
+            "master",
+            "succeeded",
+        )
+        .await;
         let not_succeeded =
             seed_merge(&pool, "alpha", "merge", "nucleos/job-5", "master", "failed").await;
         let feature = seed_merge(&pool, "alpha", "merge", "feat/x", "master", "succeeded").await;
-        let into_nucleos =
-            seed_merge(&pool, "alpha", "merge", "nucleos/job-5", "nucleos/staging", "succeeded")
-                .await;
-        let not_a_merge =
-            seed_merge(&pool, "alpha", "rebase", "nucleos/job-5", "master", "succeeded").await;
+        let into_nucleos = seed_merge(
+            &pool,
+            "alpha",
+            "merge",
+            "nucleos/job-5",
+            "nucleos/staging",
+            "succeeded",
+        )
+        .await;
+        let not_a_merge = seed_merge(
+            &pool,
+            "alpha",
+            "rebase",
+            "nucleos/job-5",
+            "master",
+            "succeeded",
+        )
+        .await;
         // Job 6 belongs to another project, so a request of `alpha` naming it matches nothing.
-        let foreign = seed_merge(&pool, "alpha", "merge", "nucleos/job-6", "master", "succeeded").await;
+        let foreign = seed_merge(
+            &pool,
+            "alpha",
+            "merge",
+            "nucleos/job-6",
+            "master",
+            "succeeded",
+        )
+        .await;
 
         let mut conn = pool.acquire().await.unwrap();
         for id in [not_succeeded, feature, into_nucleos, not_a_merge, foreign] {
@@ -1351,8 +1403,14 @@ mod tests {
         // One char under the full length: only block 6 (the long gate output) has to go.
         let ceiling = full.text.chars().count() - 1;
         let one_cut = dossier(&inputs, ceiling);
-        assert!(one_cut.text.contains("KNOWN-TITLE"), "block 5 was cut too early");
-        assert!(!one_cut.text.contains("GATE-OUT-AGAIN"), "block 6 survived the cut");
+        assert!(
+            one_cut.text.contains("KNOWN-TITLE"),
+            "block 5 was cut too early"
+        );
+        assert!(
+            !one_cut.text.contains("GATE-OUT-AGAIN"),
+            "block 6 survived the cut"
+        );
         assert!(
             one_cut.text.lines().last().unwrap().contains('1'),
             "the notice names one dropped block:\n{}",
@@ -1367,10 +1425,25 @@ mod tests {
         // A ceiling that stops just before block 4's text keeps blocks 1-3 whole and drops 4, 5, 6.
         let ceiling = at(&full.text, "FAILED-HEADLINE");
         let three_cut = dossier(&inputs, ceiling);
-        for kept in ["OWNER-NOTE", "REVIEW-ONE", "REVIEW-TWO", "JOB-PROMPT", "ITEM-A", "OUTCOME-X"] {
-            assert!(three_cut.text.contains(kept), "`{kept}` was lost with the tail");
+        for kept in [
+            "OWNER-NOTE",
+            "REVIEW-ONE",
+            "REVIEW-TWO",
+            "JOB-PROMPT",
+            "ITEM-A",
+            "OUTCOME-X",
+        ] {
+            assert!(
+                three_cut.text.contains(kept),
+                "`{kept}` was lost with the tail"
+            );
         }
-        for gone in ["FAILED-HEADLINE", "PASSING-STDOUT", "KNOWN-TITLE", "GATE-OUT-AGAIN"] {
+        for gone in [
+            "FAILED-HEADLINE",
+            "PASSING-STDOUT",
+            "KNOWN-TITLE",
+            "GATE-OUT-AGAIN",
+        ] {
             assert!(!three_cut.text.contains(gone), "`{gone}` survived the cut");
         }
         assert!(
@@ -1383,7 +1456,10 @@ mod tests {
         // Block 1 is never dropped: a ceiling below it clips it and keeps nothing after it.
         let floor = dossier(&inputs, 10);
         assert!(!floor.text.contains("REVIEW-ONE"));
-        assert!(floor.runs.is_empty(), "no run id survives when only block 1 is left");
+        assert!(
+            floor.runs.is_empty(),
+            "no run id survives when only block 1 is left"
+        );
     }
 
     /// Empty blocks are omitted rather than rendered as a bare heading.
@@ -1402,7 +1478,10 @@ mod tests {
         };
         let d = dossier(&inputs, 1_000_000);
         assert!(d.text.contains("JOB-PROMPT"));
-        assert!(!d.text.contains("Never quote it."), "an empty block 1 still printed its heading");
+        assert!(
+            !d.text.contains("Never quote it."),
+            "an empty block 1 still printed its heading"
+        );
         assert!(d.runs.is_empty());
     }
 
@@ -1413,7 +1492,10 @@ mod tests {
         let d = dossier(&full_inputs(), 1_000_000);
         let heading = at(&d.text, "Never quote it.");
         let note = at(&d.text, "OWNER-NOTE");
-        assert!(heading < note, "the owner text must sit UNDER the do-not-quote heading");
+        assert!(
+            heading < note,
+            "the owner text must sit UNDER the do-not-quote heading"
+        );
         assert!(
             heading < at(&d.text, "REVIEW-ONE"),
             "the marking belongs to block 1, ahead of the reviews"
@@ -1444,7 +1526,10 @@ mod tests {
         );
         assert_eq!(items[1].layer, Layer::Procedural);
         assert_eq!(items[1].title, "kept two");
-        assert!(items[1].files.is_empty(), "a missing `files` is an empty list");
+        assert!(
+            items[1].files.is_empty(),
+            "a missing `files` is an empty list"
+        );
 
         assert_eq!(MAX_ITEMS, 5);
         let seven: Vec<String> = (0..7)
@@ -1452,7 +1537,11 @@ mod tests {
             .collect();
         let many = parse_items(&format!("[{}]", seven.join(","))).unwrap();
         let titles: Vec<&str> = many.iter().map(|i| i.title.as_str()).collect();
-        assert_eq!(titles, vec!["t0", "t1", "t2", "t3", "t4"], "the FIRST five are kept");
+        assert_eq!(
+            titles,
+            vec!["t0", "t1", "t2", "t3", "t4"],
+            "the FIRST five are kept"
+        );
     }
 
     #[test]
@@ -1464,7 +1553,10 @@ mod tests {
             "",
         ] {
             let err = parse_items(answer).expect_err(answer);
-            assert!(matches!(err, ParseError::NotAnArray), "{answer:?} gave {err:?}");
+            assert!(
+                matches!(err, ParseError::NotAnArray),
+                "{answer:?} gave {err:?}"
+            );
             let shown = err.to_string();
             let fragment = answer.trim();
             assert!(
@@ -1474,17 +1566,26 @@ mod tests {
         }
 
         assert!(
-            parse_items("[]").expect("an empty array is a good answer").is_empty(),
+            parse_items("[]")
+                .expect("an empty array is a good answer")
+                .is_empty(),
             "`[]` means nothing was worth keeping"
         );
-        assert!(parse_items("  \n[]\n ").unwrap().is_empty(), "surrounding whitespace is trimmed");
+        assert!(
+            parse_items("  \n[]\n ").unwrap().is_empty(),
+            "surrounding whitespace is trimmed"
+        );
 
         let fenced = "```json\n[{\"layer\":\"semantic\",\"title\":\"t\",\"body\":\"b\"}]\n```";
         let items = parse_items(fenced).expect("a ```json fence around the array is stripped");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "t");
         let bare_fence = "```\n[{\"layer\":\"episodic\",\"title\":\"t\",\"body\":\"b\"}]\n```";
-        assert_eq!(parse_items(bare_fence).unwrap().len(), 1, "a bare ``` fence too");
+        assert_eq!(
+            parse_items(bare_fence).unwrap().len(),
+            1,
+            "a bare ``` fence too"
+        );
     }
 
     /// The model picks only the layer; kind and the door it goes through are derived from it, so
@@ -1506,7 +1607,11 @@ mod tests {
         assert_eq!(retry_at(1, now), Some(now + chrono::Duration::minutes(10)));
         assert_eq!(retry_at(2, now), Some(now + chrono::Duration::minutes(20)));
         assert_eq!(retry_at(3, now), None);
-        assert_eq!(retry_at(4, now), None, "past the limit never schedules again");
+        assert_eq!(
+            retry_at(4, now),
+            None,
+            "past the limit never schedules again"
+        );
     }
 
     // ---- P4: the worker ----
@@ -1634,7 +1739,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(episodic.0, "active", "an episodic learning is recorded as it is");
+        assert_eq!(
+            episodic.0, "active",
+            "an episodic learning is recorded as it is"
+        );
         assert_eq!(episodic.2.as_deref(), Some("job_failed"));
         let evidence: Vec<serde_json::Value> = serde_json::from_str(&episodic.1).unwrap();
         assert!(
@@ -1652,7 +1760,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(semantic.0, "proposed", "a rule waits for a person to approve it");
+        assert_eq!(
+            semantic.0, "proposed",
+            "a rule waits for a person to approve it"
+        );
         assert_eq!(learnings(&pool).await, 2);
     }
 
@@ -1678,7 +1789,11 @@ mod tests {
         assert_eq!(row.id, second);
         process_one(&pool, Extractor::Cli(&runner), row, noon()).await;
 
-        assert_eq!(learnings(&pool).await, 1, "the repeat must not become a second row");
+        assert_eq!(
+            learnings(&pool).await,
+            1,
+            "the repeat must not become a second row"
+        );
         assert_eq!(queue_state(&pool, second).await.0, "done");
         let events: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_events WHERE note = 'reconfirmed'")
@@ -1701,12 +1816,22 @@ mod tests {
         assert_eq!((status.as_str(), attempts), ("pending", 1));
         assert_eq!(
             not_before.as_deref(),
-            Some((noon() + chrono::Duration::minutes(10)).to_rfc3339().as_str())
+            Some(
+                (noon() + chrono::Duration::minutes(10))
+                    .to_rfc3339()
+                    .as_str()
+            )
         );
         let error = error.expect("the failure is recorded");
-        assert!(error.starts_with("model:"), "a category prefix, got {error:?}");
+        assert!(
+            error.starts_with("model:"),
+            "a category prefix, got {error:?}"
+        );
         for text in ["SECRET-JOB-PROMPT", "REVIEW-BODY"] {
-            assert!(!error.contains(text), "dossier text leaked into error: {error}");
+            assert!(
+                !error.contains(text),
+                "dossier text leaked into error: {error}"
+            );
         }
 
         // Second failure, once it is due again.
@@ -1742,8 +1867,15 @@ mod tests {
         let due = (noon() + chrono::Duration::minutes(10)).to_rfc3339();
         let id = seed_queue(&pool, "job_failed", 1, None, "pending", 1, Some(&due)).await;
 
-        assert!(claim_next(&pool, noon()).await.unwrap().is_none(), "not due yet");
-        assert_eq!(queue_state(&pool, id).await.0, "pending", "looking must not claim");
+        assert!(
+            claim_next(&pool, noon()).await.unwrap().is_none(),
+            "not due yet"
+        );
+        assert_eq!(
+            queue_state(&pool, id).await.0,
+            "pending",
+            "looking must not claim"
+        );
 
         let taken = claim_next(&pool, noon() + chrono::Duration::minutes(10))
             .await
@@ -1763,7 +1895,11 @@ mod tests {
 
         assert_eq!(recover_running(&pool).await.unwrap(), 1);
         assert_eq!(queue_state(&pool, stuck).await.0, "pending");
-        assert_eq!(queue_state(&pool, done).await.0, "done", "finished rows are left alone");
+        assert_eq!(
+            queue_state(&pool, done).await.0,
+            "done",
+            "finished rows are left alone"
+        );
         assert_eq!(recover_running(&pool).await.unwrap(), 0);
     }
 
@@ -1847,6 +1983,10 @@ mod tests {
             .find(|body| body.get("format").is_some())
             .cloned()
             .expect("a chat request carrying a grammar was posted");
-        assert_eq!(body["format"], items_format(), "the grammar is the array of items");
+        assert_eq!(
+            body["format"],
+            items_format(),
+            "the grammar is the array of items"
+        );
     }
 }
