@@ -344,6 +344,21 @@ describe("Runs - conversations", () => {
     expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?chat_id=c-1&limit=50");
     expect(screen.getByRole("button", { name: "Hide turns" }).getAttribute("aria-expanded")).toBe("true");
   });
+  it("says so when a conversation has more turns than the list shows", async () => {
+    const base = runsFetch(world({ rows: [conversation({ turns: 60 })] }));
+    const listed = Array.from({ length: 50 }, (_, i) =>
+      row({ id: 100 + i, mode: "assistant", chat_id: "c-1", prompt_excerpt: `turn ${i}` }),
+    );
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path.startsWith("/runs?chat_id=c-1") ? listed : await base(path, init),
+    );
+
+    await renderRuns();
+    fireEvent.click(await screen.findByRole("button", { name: "Show turns" }));
+
+    await screen.findByRole("list", { name: "Turns of Refactor the gate" });
+    expect(screen.getByText("showing the newest 50 of 60 turns")).toBeDefined();
+  });
 });
 
 /* ----------------------------------------------------------------- list -- */

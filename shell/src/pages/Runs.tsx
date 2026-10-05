@@ -497,7 +497,7 @@ function ConversationRow({ row, filters }: { row: RunSearchResult; filters: RunF
         </Button>
       </p>
       <div id={turnsId} className="runs-turns" hidden={!open}>
-        {open && <ConversationTurns chatId={chatId} filters={filters} name={name} />}
+        {open && <ConversationTurns chatId={chatId} filters={filters} name={name} total={turns} />}
       </div>
     </Row>
   );
@@ -511,21 +511,30 @@ function ConversationTurns({
   chatId,
   filters,
   name,
+  total,
 }: {
   chatId: string;
   filters: RunFilters;
   name: string;
+  total: number;
 }) {
   const turns = useRuns({ ...filters, chat: chatId });
   if (turns.data === undefined) {
     return turns.isError ? <ListError error={turns.error} /> : <Quiet says="reading the turns…" />;
   }
   return (
-    <Rows label={`Turns of ${name}`}>
-      {turns.data.map((turn) => (
-        <RunRow key={turn.id} row={turn} />
-      ))}
-    </Rows>
+    <>
+      <Rows label={`Turns of ${name}`}>
+        {turns.data.map((turn) => (
+          <RunRow key={turn.id} row={turn} />
+        ))}
+      </Rows>
+      {total > turns.data.length && (
+        <p className="runs-ceiling">
+          showing the newest {turns.data.length} of {total} turns
+        </p>
+      )}
+    </>
   );
 }
 
