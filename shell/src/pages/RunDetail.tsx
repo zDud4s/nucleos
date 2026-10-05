@@ -254,6 +254,12 @@ function FactsPanel({ run }: { run: Run }) {
           <Link to={`/runs/${run.successor_run_id}`}>Run {run.successor_run_id} continued it</Link>.
         </p>
       )}
+      {run.chat_id != null && (
+        <p className="runs-successor">
+          This run is one turn of a conversation.{" "}
+          <Link to={`/chats/${run.chat_id}`}>See the conversation</Link>.
+        </p>
+      )}
     </Panel>
   );
 }

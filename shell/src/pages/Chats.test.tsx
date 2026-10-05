@@ -330,7 +330,18 @@ function chatsFetch(
       if (told !== undefined) told.tools = true;
       return undefined;
     }
-    const files = /^\/assistant\/chats\/([^/?]+)\/files\?q=(.*)$/.exec(path);
+    const seedChat = /^\/assistant\/chats\/([^/?]+)\/workflow$/.exec(path);
+    if (seedChat !== null && init?.method === "POST") {
+      // What the daemon does: the workflow is copied in and the hook wired, so the next read says
+      // both.
+      const told = opts.projects?.[decodeURIComponent(seedChat[1])];
+      if (told !== undefined) {
+        (told as { workflow_missing?: boolean }).workflow_missing = false;
+        told.tools = true;
+      }
+      return undefined;
+    }
+    const files =/^\/assistant\/chats\/([^/?]+)\/files\?q=(.*)$/.exec(path);
     if (files !== null) {
       const offered = opts.files?.[decodeURIComponent(files[1])];
       if (offered === undefined) return { rooted: false, hits: [], truncated: false };
@@ -2963,6 +2974,167 @@ describe("Chats - giving a conversation a project", () => {
         ),
       ).toBe(true);
     });
+  });
+
+  // A worktree nobody seeded has neither the tools nor the workflow. Wiring the hook alone would
+  // leave the orchestrate skill missing, so the offer is the whole setup, and it overwrites, so it
+  // waits for a second click.
+  it("says a worktree without the workflow cannot use tools, and sets it up only after confirming", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/fresh-worktree",
+              tools: false,
+              session: null,
+              permission_mode: "auto",
+              workflow_missing: true,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/never copied into/i)).toBeTruthy();
+    const seeded = () =>
+      daemon.apiFetch.mock.calls.some(
+        (call) =>
+          String(call[0]) === "/assistant/chats/c-1/workflow" && call[1]?.method === "POST",
+      );
+
+    fireEvent.click(screen.getByRole("button", { name: "Set up workflow" }));
+    expect(seeded()).toBe(false);
+
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: /copy it from the main checkout/i }));
+
+    await waitFor(() => expect(seeded()).toBe(true));
+    const post = daemon.apiFetch.mock.calls.find(
+      (call) => String(call[0]) === "/assistant/chats/c-1/workflow" && call[1]?.method === "POST",
+    );
+    expect(JSON.parse(String((post?.[1] as RequestInit).body))).toEqual({ confirm: true });
+    await waitFor(() => expect(screen.queryByText(/never copied into/i)).toBeNull());
+  });
+
+  // `/orchestrate x` is a shortcut, and the CLI's own slash expansion was only measured for
+  // `claude -p`, so the window says in words what it wants.
+  it("sends /orchestrate <task> as a request to run the orchestrate skill", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: null,
+              permission_mode: "auto",
+              workflow_missing: false,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "/orchestrate fix the login" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(sentMessages()).toEqual([
+        { chat_id: "c-1", text: "Use the orchestrate skill to run this task:\n\nfix the login" },
+      ]),
+    );
+  });
+
+  it("does not send /orchestrate where the workflow or the tools are missing, and says why", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/fresh-worktree",
+              tools: false,
+              session: null,
+              permission_mode: "auto",
+              workflow_missing: true,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    // The project read has to land first: the guard reads it, and a send before it would pass.
+    expect(await screen.findByText(/never copied into/i)).toBeTruthy();
+    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "/orchestrate x" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(/orchestrate needs this conversation/i)).toBeTruthy();
+    expect(sentMessages()).toEqual([]);
+  });
+
+  it("does not send /orchestrate where the project has no tools even though its workflow is present", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/unwired" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/unwired",
+              tools: false,
+              session: null,
+              permission_mode: "auto",
+              workflow_missing: false,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    // The project read has to land first: the guard reads it, and a send before it would pass.
+    expect(await screen.findByRole("button", { name: "Give it the tools" })).toBeTruthy();
+    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "/orchestrate x" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(/orchestrate needs this conversation/i)).toBeTruthy();
+    expect(sentMessages()).toEqual([]);
+  });
+
+  it("says nothing about the workflow for a conversation in the main checkout", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: null,
+              permission_mode: "auto",
+              workflow_missing: false,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByRole("list", { name: "Transcript" })).toBeTruthy();
+    expect(screen.queryByText(/never copied into/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Set up workflow" })).toBeNull();
   });
 
   // The loop closes both ways and always did — the id simply appeared nowhere a person could read,

@@ -833,6 +833,148 @@ pub(crate) fn classifier_hook_is_wired(dir: &Path) -> bool {
     registered && dir.join(HOOK_SCRIPT).is_file()
 }
 
+/// The main checkout's own script, which also syncs the memory vocabulary and applies retractions;
+/// re-implementing it here would be a second copy to keep true.
+const SEED_SCRIPT: &str = ".ai/scripts/seed_worktree.py";
+const SEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Resolves `.` and `..` lexically, never touching the disk and never producing a `\\?\` verbatim
+/// path, which would break `seed_worktree.py`'s comparison of repository roots.
+fn fold(path: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The main checkout a linked worktree belongs to, read from disk: the worktree's `.git` file names
+/// its git dir, whose `commondir` names the shared one, and that one's parent is the main checkout.
+/// No git process, so it is cheap enough for every project read. `None` for a main checkout (its
+/// `.git` is a directory), a plain directory, or anything unreadable.
+pub(crate) fn main_checkout_of(dir: &Path) -> Option<std::path::PathBuf> {
+    let link = std::fs::read_to_string(dir.join(".git")).ok()?;
+    let gitdir = dir.join(link.lines().next()?.strip_prefix("gitdir:")?.trim());
+    let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let main = fold(&gitdir.join(common.trim())).parent()?.to_path_buf();
+    main.join(".git").is_dir().then_some(main)
+}
+
+fn carries_workflow(dir: &Path) -> bool {
+    dir.join(".ai/workflow").is_dir() && dir.join(".claude/skills").is_dir()
+}
+
+/// Whether the main checkout has a workflow worth copying and the script that copies it.
+fn seeds_from(main: &Path) -> bool {
+    carries_workflow(main) && main.join(SEED_SCRIPT).is_file()
+}
+
+/// The roots of the projects this daemon knows: every `autopilot_state` row that carries one.
+pub(crate) async fn rostered_roots(pool: &SqlitePool) -> sqlx::Result<Vec<std::path::PathBuf>> {
+    let roots = sqlx::query_scalar::<_, String>(
+        "SELECT project_root FROM autopilot_state WHERE project_root IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(roots.into_iter().map(std::path::PathBuf::from).collect())
+}
+
+/// Whether `main` is the root of a rostered project, compared lexically after the same folding
+/// `main_checkout_of` applies (case-insensitively on Windows). A worktree's `.git` file is
+/// attacker-controllable text, so the main checkout it names is trusted only when the daemon
+/// already knows that directory as a project: its script is run as the daemon.
+fn is_rostered(main: &Path, roots: &[std::path::PathBuf]) -> bool {
+    let same = |a: &Path, b: &Path| {
+        if cfg!(windows) {
+            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+        } else {
+            a == b
+        }
+    };
+    let main = fold(main);
+    roots.iter().any(|root| same(&fold(root), &main))
+}
+
+/// Whether `dir` is a linked worktree the workflow was never copied into, while its main checkout
+/// (a rostered project) has it. False elsewhere: offering a setup that has nothing to copy would be
+/// a button that fails.
+pub(crate) fn workflow_missing(dir: &Path, roots: &[std::path::PathBuf]) -> bool {
+    main_checkout_of(dir).is_some_and(|main| {
+        is_rostered(&main, roots) && seeds_from(&main) && !carries_workflow(dir)
+    })
+}
+
+/// Why `seed_workflow` wrote nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SeedRefusal {
+    NotAWorktree,
+    NoWorkflowInMain,
+    /// The worktree's main checkout is not a project the daemon knows, so its script is not run.
+    MainNotRostered,
+    /// The script ran and succeeded but the hook could not be wired afterwards.
+    NotWired(String),
+    Failed(String),
+}
+
+/// Copies the AI workflow into a linked worktree by running its main checkout's own script, then
+/// wires the classifier hook: the script does not copy `.claude/settings.json`, and without the
+/// hook the conversation would still have no tools. `dir` is used exactly as given, never
+/// canonicalised.
+pub(crate) async fn seed_workflow(
+    dir: &Path,
+    roots: &[std::path::PathBuf],
+) -> Result<(), SeedRefusal> {
+    // Blocking file reads, kept off the async runtime.
+    let (probe_dir, probe_roots) = (dir.to_path_buf(), roots.to_vec());
+    let main = tokio::task::spawn_blocking(move || {
+        let main = main_checkout_of(&probe_dir).ok_or(SeedRefusal::NotAWorktree)?;
+        if !is_rostered(&main, &probe_roots) {
+            return Err(SeedRefusal::MainNotRostered);
+        }
+        if !seeds_from(&main) {
+            return Err(SeedRefusal::NoWorkflowInMain);
+        }
+        Ok(main)
+    })
+    .await
+    .map_err(|error| {
+        SeedRefusal::Failed(format!("the workflow probe did not finish: {error}"))
+    })??;
+    let mut command = tokio::process::Command::new(HOOK_INTERPRETER);
+    command
+        .arg(main.join(SEED_SCRIPT))
+        .arg(dir)
+        .current_dir(&main)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(SEED_TIMEOUT, command.output())
+        .await
+        .map_err(|_| SeedRefusal::Failed("seed_worktree.py did not finish in time".to_owned()))?
+        .map_err(|error| {
+            SeedRefusal::Failed(format!("could not start {HOOK_INTERPRETER}: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(SeedRefusal::Failed(format!(
+            "seed_worktree.py exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let wire_dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || wire_classifier_hook(&wire_dir))
+        .await
+        .map_err(|error| SeedRefusal::NotWired(format!("the hook wiring did not finish: {error}")))?
+        .map_err(SeedRefusal::NotWired)
+}
+
 /// What `shadow` and `active` both need: a person onboarded the project, and this daemon's
 /// classifier hook is wired at its root.
 ///
@@ -925,7 +1067,7 @@ pub async fn list_scoped_kills(pool: &SqlitePool) -> sqlx::Result<Vec<ScopedKill
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The script the daemon SHIPS knows the verdict the daemon GIVES.
@@ -950,6 +1092,151 @@ mod tests {
     }
     use std::fs;
     use tempfile::TempDir;
+
+    /// A stand-in for the main checkout's `seed_worktree.py`: copies the two workflow entries the
+    /// detection looks for. The real script is gitignored and lives only in the main checkout, so a
+    /// test repository cannot carry it; what matters here is that the daemon INVOKES the script
+    /// that sits beside the repository, with the worktree as its one argument.
+    pub(crate) const STUB_SEED: &str = "import shutil, sys\nfrom pathlib import Path\nroot = Path(__file__).resolve().parents[2]\ntarget = Path(sys.argv[1])\nfor entry in (\".ai/workflow\", \".claude/skills\"):\n    shutil.copytree(root / entry, target / entry, dirs_exist_ok=True)\n";
+
+    /// A real repository with a real linked worktree named `wt` that was never seeded. With
+    /// `workflow` the main checkout holds the (untracked, as in reality) workflow and the stub
+    /// script. Returns `(container, main, wt)`; keep `container` alive for the test's duration.
+    pub(crate) fn repo_with_an_unseeded_worktree(
+        prefix: &str,
+        workflow: bool,
+    ) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let container = crate::git_exec::tests::space_free_tempdir(prefix);
+        let main = container.path().join("main");
+        crate::git_exec::tests::initialize_repo(&main);
+        if workflow {
+            fs::create_dir_all(main.join(".ai/workflow")).unwrap();
+            fs::write(main.join(".ai/workflow/workflow.md"), "# workflow\n").unwrap();
+            fs::create_dir_all(main.join(".claude/skills/orchestrate")).unwrap();
+            fs::write(
+                main.join(".claude/skills/orchestrate/SKILL.md"),
+                "# orchestrate\n",
+            )
+            .unwrap();
+            fs::create_dir_all(main.join(".ai/scripts")).unwrap();
+            fs::write(main.join(".ai/scripts/seed_worktree.py"), STUB_SEED).unwrap();
+        }
+        let wt = container.path().join("wt");
+        let added = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", "-b", "wt"])
+            .arg(&wt)
+            .status()
+            .expect("run git worktree add");
+        assert!(added.success(), "git worktree add failed");
+        (container, main, wt)
+    }
+
+    /// An unseeded linked worktree is the one case "Set up workflow" answers: its own tree has no
+    /// workflow, and the main checkout it hangs off does. The main checkout itself, a seeded
+    /// worktree and a plain directory are none of those, and must never be offered the button.
+    #[test]
+    fn a_worktree_without_the_workflow_is_missing_it_and_its_main_checkout_is_not() {
+        let (container, main, wt) = repo_with_an_unseeded_worktree("nucleos-wfmiss-", true);
+
+        let roots = vec![main_checkout_of(&wt).unwrap()];
+
+        assert!(workflow_missing(&wt, &roots));
+        assert!(!workflow_missing(&main, &roots));
+        assert_eq!(
+            fs::canonicalize(main_checkout_of(&wt).unwrap()).unwrap(),
+            fs::canonicalize(&main).unwrap()
+        );
+        assert!(!workflow_missing(container.path(), &roots));
+
+        fs::create_dir_all(wt.join(".ai/workflow")).unwrap();
+        fs::create_dir_all(wt.join(".claude/skills")).unwrap();
+        assert!(!workflow_missing(&wt, &roots));
+    }
+
+    /// A stub script that would leave a marker if it ever ran, for proving it did not.
+    const STUB_MARKER: &str =
+        "import sys\nfrom pathlib import Path\nPath(sys.argv[1], 'ran.marker').write_text('ran')\n";
+
+    /// The main checkout a worktree's `.git` file names is trusted only when the daemon already
+    /// knows it as a project: a crafted directory could otherwise point at a crafted "main" and get
+    /// its script run. Not rostered means nothing offered and nothing executed.
+    #[tokio::test]
+    async fn a_worktree_whose_main_checkout_is_not_rostered_is_not_offered_the_workflow() {
+        let (_container, main, wt) = repo_with_an_unseeded_worktree("nucleos-wfroster-", true);
+        fs::write(main.join(SEED_SCRIPT), STUB_MARKER).unwrap();
+        let elsewhere = vec![std::path::PathBuf::from("/not/this/project")];
+
+        assert!(!workflow_missing(&wt, &[]));
+        assert!(!workflow_missing(&wt, &elsewhere));
+        assert_eq!(
+            seed_workflow(&wt, &elsewhere).await,
+            Err(SeedRefusal::MainNotRostered)
+        );
+        assert!(!wt.join("ran.marker").exists());
+        assert!(!wt.join(".ai").exists());
+    }
+
+    /// The main's script exiting non-zero is a failure, and the worktree still reads as missing its
+    /// workflow so the offer stays.
+    #[tokio::test]
+    async fn a_seed_script_that_exits_non_zero_fails_and_leaves_the_workflow_missing() {
+        let (_container, main, wt) = repo_with_an_unseeded_worktree("nucleos-wffail-", true);
+        fs::write(
+            main.join(SEED_SCRIPT),
+            "import sys\nsys.stderr.write('boom')\nsys.exit(3)\n",
+        )
+        .unwrap();
+        let roots = vec![main_checkout_of(&wt).unwrap()];
+
+        let result = seed_workflow(&wt, &roots).await;
+
+        assert!(
+            matches!(&result, Err(SeedRefusal::Failed(message)) if message.contains("boom")),
+            "got {result:?}"
+        );
+        assert!(workflow_missing(&wt, &roots));
+    }
+
+    /// Nothing to copy means nothing to offer: a worktree whose main checkout has no workflow is
+    /// not reported missing, and seeding refuses it — and refuses a main checkout — writing nothing.
+    #[tokio::test]
+    async fn a_worktree_whose_main_checkout_has_no_workflow_is_not_offered_one() {
+        let (_container, _main, wt) = repo_with_an_unseeded_worktree("nucleos-wfnone-", false);
+        let roots = vec![main_checkout_of(&wt).unwrap()];
+
+        assert!(!workflow_missing(&wt, &roots));
+        assert_eq!(
+            seed_workflow(&wt, &roots).await,
+            Err(SeedRefusal::NoWorkflowInMain)
+        );
+        assert!(!wt.join(".ai").exists());
+
+        let (_other, other_main, _other_wt) =
+            repo_with_an_unseeded_worktree("nucleos-wfmain-", true);
+        assert_eq!(
+            seed_workflow(&other_main, std::slice::from_ref(&other_main)).await,
+            Err(SeedRefusal::NotAWorktree)
+        );
+    }
+
+    /// The whole of "Set up workflow": the main checkout's script runs against the worktree, and the
+    /// hook is wired afterwards because that script never copies `.claude/settings.json`.
+    #[tokio::test]
+    async fn seeding_a_worktree_copies_the_workflow_and_wires_the_hook() {
+        let (_container, _main, wt) = repo_with_an_unseeded_worktree("nucleos-wfseed-", true);
+
+        let roots = vec![main_checkout_of(&wt).unwrap()];
+
+        seed_workflow(&wt, &roots)
+            .await
+            .expect("seeding an unseeded worktree");
+
+        assert!(wt.join(".claude/skills/orchestrate/SKILL.md").is_file());
+        assert!(classifier_hook_is_wired(&wt));
+        assert!(!workflow_missing(&wt, &roots));
+    }
 
     /// Spec B D11: observing is an opt-in per project, independent of spec A's; enforcing is
     /// refused until the project clears the bar.

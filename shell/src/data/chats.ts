@@ -193,6 +193,11 @@ export interface ChatProject {
    * what it will choose not to.
    */
   permission_mode: PermissionMode;
+  /**
+   * Whether `cwd` is a linked worktree the AI workflow was never copied into while its main
+   * checkout has it. Optional: an older daemon omits it, and that reads as false.
+   */
+  workflow_missing?: boolean;
 }
 
 /**
@@ -1587,6 +1592,27 @@ export function useWireChatTools(chatId: string) {
   return useMutation({
     mutationFn: () =>
       apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/tools`, { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+    },
+  });
+}
+
+/**
+ * Copy the AI workflow from the main checkout into this conversation's worktree.
+ *
+ * Always sends `confirm: true`: the daemon refuses anything else, and the window only reaches this
+ * through a `ConfirmButton`.
+ */
+export function useSeedChatWorkflow(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/workflow`, {
+        method: "POST",
+        body: JSON.stringify({ confirm: true }),
+      }),
     retry: false,
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });

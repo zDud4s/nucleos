@@ -775,3 +775,24 @@ describe("RunDetail — the prompt budget", () => {
     expect(screen.queryByText(/estimate — what we wrote/)).toBeNull();
   });
 });
+
+
+describe("RunDetail - a chat turn", () => {
+  it("links a chat turn to its conversation", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail({ chat_id: "c-9" }), NO_TAIL, []));
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    const link = await screen.findByRole("link", { name: "See the conversation" });
+    expect(link.getAttribute("href")).toBe("/chats/c-9");
+  });
+
+  it("draws no conversation link for a run outside one", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail(), NO_TAIL, []));
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    await screen.findByText("This run");
+    expect(screen.queryByRole("link", { name: "See the conversation" })).toBeNull();
+  });
+});
