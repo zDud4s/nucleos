@@ -137,6 +137,333 @@ pub async fn enqueue_landed_in(
     Ok(())
 }
 
+// ---- P3: the pure parts (dossier, extraction prompt, strict parsing, layer mapping, backoff) ----
+
+use crate::knowledge::{Kind, Layer};
+
+/// The most characters a dossier may hold before whole blocks start to go (spec §4.3).
+pub const DOSSIER_CEILING: usize = 24_000;
+/// The most characters kept of one stdout or gate entry, tail first; applied when gathering.
+pub const ENTRY_CHARS: usize = 4_000;
+pub const MAX_ITEMS: usize = 5;
+pub const MAX_ATTEMPTS: i64 = 3;
+pub const BACKOFF_BASE: chrono::Duration = chrono::Duration::minutes(5);
+
+/// What failed and what finally passed, for a `gate_recovered` cause.
+pub struct Recovery {
+    pub failed_headline: String,
+    pub passing_run: (i64, String),
+}
+
+/// Everything the dossier may say, already gathered and already clipped per entry.
+pub struct DossierInputs {
+    pub cause: Cause,
+    pub owner_context: Vec<String>,
+    pub reviews: Vec<(i64, String)>,
+    pub job_prompt: Option<String>,
+    pub items: Vec<String>,
+    pub outcome: Option<String>,
+    pub recovery: Option<Recovery>,
+    pub known_titles: Vec<String>,
+    pub gate_outputs: Vec<(i64, String)>,
+}
+
+/// The text handed to the model and the runs whose text survived the cut.
+pub struct Dossier {
+    pub text: String,
+    pub runs: Vec<i64>,
+}
+
+/// Keep the first `width` characters (char-safe).
+fn clip_head(s: &str, width: usize) -> String {
+    s.chars().take(width).collect()
+}
+
+fn present(s: &str) -> bool {
+    !s.trim().is_empty()
+}
+
+/// Render the six blocks of spec §4.3 in order, each with the run ids it names. A block with
+/// nothing in it is omitted.
+fn blocks(inputs: &DossierInputs) -> Vec<(String, Vec<i64>)> {
+    let mut out: Vec<(String, Vec<i64>)> = Vec::new();
+
+    // 1. Owner context: understood, never quoted.
+    let notes: Vec<&str> = inputs
+        .owner_context
+        .iter()
+        .map(String::as_str)
+        .filter(|n| present(n))
+        .collect();
+    if !notes.is_empty() {
+        out.push((
+            format!(
+                "## Owner context: for your understanding only. Never quote it.\n{}",
+                notes.join("\n---\n")
+            ),
+            Vec::new(),
+        ));
+    }
+
+    // 2. Review output.
+    let reviews: Vec<&(i64, String)> = inputs.reviews.iter().filter(|(_, t)| present(t)).collect();
+    if !reviews.is_empty() {
+        let body: Vec<String> = reviews
+            .iter()
+            .map(|(id, text)| format!("Review run #{id}:\n{text}"))
+            .collect();
+        out.push((
+            format!("## Review output\n{}", body.join("\n\n")),
+            reviews.iter().map(|(id, _)| *id).collect(),
+        ));
+    }
+
+    // 3. The job: prompt, items, outcome.
+    let mut job: Vec<String> = Vec::new();
+    if let Some(prompt) = inputs.job_prompt.as_deref().filter(|p| present(p)) {
+        job.push(format!("Job prompt:\n{prompt}"));
+    }
+    let items: Vec<&str> = inputs
+        .items
+        .iter()
+        .map(String::as_str)
+        .filter(|i| present(i))
+        .collect();
+    if !items.is_empty() {
+        job.push(format!("Items:\n- {}", items.join("\n- ")));
+    }
+    if let Some(outcome) = inputs.outcome.as_deref().filter(|o| present(o)) {
+        job.push(format!("Outcome:\n{outcome}"));
+    }
+    if !job.is_empty() {
+        out.push((format!("## The job\n{}", job.join("\n\n")), Vec::new()));
+    }
+
+    // 4. A recovery: what failed, what passed.
+    if let Some(rec) = &inputs.recovery {
+        let (id, stdout) = &rec.passing_run;
+        let mut parts: Vec<String> = Vec::new();
+        if present(&rec.failed_headline) {
+            parts.push(format!("What failed:\n{}", rec.failed_headline));
+        }
+        if present(stdout) {
+            parts.push(format!("The run that passed (run #{id}):\n{stdout}"));
+        }
+        if !parts.is_empty() {
+            out.push((format!("## Recovery\n{}", parts.join("\n\n")), vec![*id]));
+        }
+    }
+
+    // 5. What is already known, so it is not repeated.
+    let known: Vec<&str> = inputs
+        .known_titles
+        .iter()
+        .map(String::as_str)
+        .filter(|t| present(t))
+        .collect();
+    if !known.is_empty() {
+        out.push((
+            format!("## Already known (do not repeat)\n- {}", known.join("\n- ")),
+            Vec::new(),
+        ));
+    }
+
+    // 6. Gate output.
+    let gates: Vec<&(i64, String)> = inputs
+        .gate_outputs
+        .iter()
+        .filter(|(_, t)| present(t))
+        .collect();
+    if !gates.is_empty() {
+        let body: Vec<String> = gates
+            .iter()
+            .map(|(id, text)| format!("Gate output of run #{id}:\n{text}"))
+            .collect();
+        out.push((
+            format!("## Gate output\n{}", body.join("\n\n")),
+            gates.iter().map(|(id, _)| *id).collect(),
+        ));
+    }
+
+    out
+}
+
+/// Build the dossier. While the text is over `ceiling` characters the LAST remaining block goes,
+/// whole, until only the first is left; if that alone is still over, it is clipped. A dropped
+/// block is announced by one closing line, which may itself pass the ceiling.
+pub fn dossier(inputs: &DossierInputs, ceiling: usize) -> Dossier {
+    let all = blocks(inputs);
+    let total = all.len();
+    let join = |n: usize| -> String {
+        all[..n]
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+
+    let mut kept = total;
+    while kept > 1 && join(kept).chars().count() > ceiling {
+        kept -= 1;
+    }
+    let mut text = join(kept);
+    if kept == 1 && text.chars().count() > ceiling {
+        text = clip_head(&text, ceiling);
+    }
+    let dropped = total - kept;
+    if dropped > 0 {
+        let noun = if dropped == 1 { "block" } else { "blocks" };
+        text.push_str(&format!(
+            "\n\n[{dropped} {noun} left out to keep this within its size limit]"
+        ));
+    }
+
+    let mut runs: Vec<i64> = all[..kept]
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    runs.sort_unstable();
+    runs.dedup();
+    Dossier { text, runs }
+}
+
+/// The standing instruction of every extraction call.
+pub const STANDING: &str = "You read the dossier below, about one finished piece of work in ONE \
+software project, and write down what is worth remembering for the next time. Answer with a JSON \
+array and nothing else: 0 to 5 items, each an object with `layer` (episodic, semantic or \
+procedural), `title` (one line), `body` (short) and `files` (repository paths it concerns). Only \
+lessons about THIS project. Never quote the owner context. Do not repeat the known titles. `[]` \
+is a good answer when nothing is worth keeping.";
+
+pub fn extraction_prompt(dossier: &str) -> String {
+    format!("{STANDING}\n\n--- DOSSIER ---\n{dossier}\n--- END OF DOSSIER ---")
+}
+
+/// The JSON schema of the answer: an array of at most [`MAX_ITEMS`] items.
+pub fn items_format() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "maxItems": MAX_ITEMS,
+        "items": {
+            "type": "object",
+            "properties": {
+                "layer": { "type": "string", "enum": ["episodic", "semantic", "procedural"] },
+                "title": { "type": "string" },
+                "body": { "type": "string" },
+                "files": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["layer", "title", "body"]
+        }
+    })
+}
+
+/// One learning the model proposed, already checked.
+#[derive(Debug)]
+pub struct Item {
+    pub layer: Layer,
+    pub title: String,
+    pub body: String,
+    pub files: Vec<String>,
+}
+
+/// Why an answer was refused whole. The text of the answer is never part of it.
+#[derive(Debug)]
+pub enum ParseError {
+    NotAnArray,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::NotAnArray => f.write_str("the answer is not a JSON array"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+fn strip_fence(answer: &str) -> &str {
+    let s = answer.trim();
+    let Some(rest) = s.strip_prefix("```") else {
+        return s;
+    };
+    let rest = rest.strip_prefix("json").unwrap_or(rest);
+    match rest.trim_end().strip_suffix("```") {
+        Some(inner) => inner.trim(),
+        None => s,
+    }
+}
+
+fn parse_item(value: &serde_json::Value) -> Option<Item> {
+    let obj = value.as_object()?;
+    let layer = Layer::parse(obj.get("layer")?.as_str()?)?;
+    if layer == Layer::Working {
+        return None;
+    }
+    let title = obj.get("title")?.as_str()?.trim();
+    let body = obj.get("body")?.as_str()?.trim();
+    if title.is_empty() || body.is_empty() {
+        return None;
+    }
+    let files = obj
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Item {
+        layer,
+        title: title.to_string(),
+        body: body.to_string(),
+        files,
+    })
+}
+
+/// Strict parse: anything that is not a JSON array fails whole; inside an array a bad element is
+/// dropped alone, and only the first [`MAX_ITEMS`] good ones are kept.
+pub fn parse_items(answer: &str) -> Result<Vec<Item>, ParseError> {
+    let values = serde_json::from_str::<Vec<serde_json::Value>>(strip_fence(answer))
+        .map_err(|_| ParseError::NotAnArray)?;
+    Ok(values
+        .iter()
+        .filter_map(parse_item)
+        .take(MAX_ITEMS)
+        .collect())
+}
+
+/// How a learning enters the store: recorded as it is, or proposed for a person to approve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Door {
+    Record,
+    Propose,
+}
+
+/// The model picks only the layer; kind and door follow from it.
+pub fn door(layer: Layer) -> (Kind, Door) {
+    match layer {
+        Layer::Episodic => (Kind::Memory, Door::Record),
+        Layer::Semantic => (Kind::Memory, Door::Propose),
+        Layer::Procedural => (Kind::Prompt, Door::Propose),
+        // The parser never lets `working` through; if one arrives it is proposed like a rule.
+        Layer::Working => (Kind::Memory, Door::Propose),
+    }
+}
+
+/// When to try again after the `attempts_after_failure`-th failure; `None` once it is final.
+pub fn retry_at(
+    attempts_after_failure: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if attempts_after_failure >= MAX_ATTEMPTS {
+        return None;
+    }
+    let exp = attempts_after_failure.clamp(0, 16) as u32;
+    Some(now + BACKOFF_BASE * (1i32 << exp))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -504,5 +831,227 @@ mod tests {
             )],
             "a landed job branch is queued once, with its job and project"
         );
+    }
+
+    // ---- P3: the pure parts (dossier, parsing, layer mapping, backoff) ----
+
+    use super::{
+        BACKOFF_BASE, Door, DossierInputs, MAX_ATTEMPTS, MAX_ITEMS, ParseError, Recovery, door,
+        dossier, parse_items, retry_at,
+    };
+    use crate::knowledge::{Kind, Layer};
+    use chrono::TimeZone;
+
+    /// Every block filled, each with a marker no other block carries, so a test can tell which
+    /// blocks a rendering kept. Run 1 appears in a review AND a gate output, to pin the dedup.
+    fn full_inputs() -> DossierInputs {
+        DossierInputs {
+            cause: Cause::GateRecovered,
+            owner_context: vec!["OWNER-NOTE".to_string()],
+            reviews: vec![(1, "REVIEW-ONE".to_string()), (2, "REVIEW-TWO".to_string())],
+            job_prompt: Some("JOB-PROMPT".to_string()),
+            items: vec!["ITEM-A".to_string()],
+            outcome: Some("OUTCOME-X".to_string()),
+            recovery: Some(Recovery {
+                failed_headline: "FAILED-HEADLINE".to_string(),
+                passing_run: (3, "PASSING-STDOUT".to_string()),
+            }),
+            known_titles: vec!["KNOWN-TITLE".to_string()],
+            gate_outputs: vec![(4, "g".repeat(500)), (1, "GATE-OUT-AGAIN".to_string())],
+        }
+    }
+
+    fn at(text: &str, needle: &str) -> usize {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` is missing from the dossier:\n{text}"))
+    }
+
+    /// Spec §4.3: blocks 1..6 in a fixed order, and a ceiling cuts whole blocks from the END, never
+    /// mid-block, saying so in the text; the run ids of a dropped block leave `runs`.
+    #[test]
+    fn the_dossier_keeps_its_order_and_cuts_whole_blocks_from_the_end() {
+        let inputs = full_inputs();
+        let full = dossier(&inputs, 1_000_000);
+
+        let order = [
+            "OWNER-NOTE",
+            "REVIEW-ONE",
+            "JOB-PROMPT",
+            "FAILED-HEADLINE",
+            "KNOWN-TITLE",
+            "GATE-OUT-AGAIN",
+        ];
+        let positions: Vec<usize> = order.iter().map(|m| at(&full.text, m)).collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "blocks are out of the spec order: {positions:?}"
+        );
+        assert!(full.text.contains("ITEM-A") && full.text.contains("OUTCOME-X"));
+        assert!(full.text.contains("PASSING-STDOUT") && full.text.contains("REVIEW-TWO"));
+        assert_eq!(
+            full.runs,
+            vec![1, 2, 3, 4],
+            "runs are the surviving review/recovery/gate ids, deduplicated, ascending"
+        );
+
+        // One char under the full length: only block 6 (the long gate output) has to go.
+        let ceiling = full.text.chars().count() - 1;
+        let one_cut = dossier(&inputs, ceiling);
+        assert!(one_cut.text.contains("KNOWN-TITLE"), "block 5 was cut too early");
+        assert!(!one_cut.text.contains("GATE-OUT-AGAIN"), "block 6 survived the cut");
+        assert!(
+            one_cut.text.lines().last().unwrap().contains('1'),
+            "the notice names one dropped block:\n{}",
+            one_cut.text
+        );
+        assert_eq!(
+            one_cut.runs,
+            vec![1, 2, 3],
+            "run 4 lived only in the dropped block; run 1 survives through its review"
+        );
+
+        // A ceiling that stops just before block 4's text keeps blocks 1-3 whole and drops 4, 5, 6.
+        let ceiling = at(&full.text, "FAILED-HEADLINE");
+        let three_cut = dossier(&inputs, ceiling);
+        for kept in ["OWNER-NOTE", "REVIEW-ONE", "REVIEW-TWO", "JOB-PROMPT", "ITEM-A", "OUTCOME-X"] {
+            assert!(three_cut.text.contains(kept), "`{kept}` was lost with the tail");
+        }
+        for gone in ["FAILED-HEADLINE", "PASSING-STDOUT", "KNOWN-TITLE", "GATE-OUT-AGAIN"] {
+            assert!(!three_cut.text.contains(gone), "`{gone}` survived the cut");
+        }
+        assert!(
+            three_cut.text.lines().last().unwrap().contains('3'),
+            "the notice names three dropped blocks:\n{}",
+            three_cut.text
+        );
+        assert_eq!(three_cut.runs, vec![1, 2]);
+
+        // Block 1 is never dropped: a ceiling below it clips it and keeps nothing after it.
+        let floor = dossier(&inputs, 10);
+        assert!(!floor.text.contains("REVIEW-ONE"));
+        assert!(floor.runs.is_empty(), "no run id survives when only block 1 is left");
+    }
+
+    /// Empty blocks are omitted rather than rendered as a bare heading.
+    #[test]
+    fn an_empty_block_is_left_out_of_the_dossier() {
+        let inputs = DossierInputs {
+            cause: Cause::JobFailed,
+            owner_context: vec![],
+            reviews: vec![],
+            job_prompt: Some("JOB-PROMPT".to_string()),
+            items: vec![],
+            outcome: None,
+            recovery: None,
+            known_titles: vec![],
+            gate_outputs: vec![],
+        };
+        let d = dossier(&inputs, 1_000_000);
+        assert!(d.text.contains("JOB-PROMPT"));
+        assert!(!d.text.contains("Never quote it."), "an empty block 1 still printed its heading");
+        assert!(d.runs.is_empty());
+    }
+
+    /// Block 1 is the owner's own words: the model reads them to understand, and must not repeat
+    /// them in what it writes down.
+    #[test]
+    fn owner_context_is_marked_not_to_be_quoted() {
+        let d = dossier(&full_inputs(), 1_000_000);
+        let heading = at(&d.text, "Never quote it.");
+        let note = at(&d.text, "OWNER-NOTE");
+        assert!(heading < note, "the owner text must sit UNDER the do-not-quote heading");
+        assert!(
+            heading < at(&d.text, "REVIEW-ONE"),
+            "the marking belongs to block 1, ahead of the reviews"
+        );
+    }
+
+    #[test]
+    fn a_bad_item_is_dropped_alone() {
+        let answer = r#"[
+            {"layer": "episodic", "title": "kept one", "body": "b1", "files": ["a.rs", 7, null, "b.rs"]},
+            "not an object",
+            {"layer": "working", "title": "wrong layer", "body": "b"},
+            {"layer": "dream", "title": "unknown layer", "body": "b"},
+            {"layer": "semantic", "title": "   ", "body": "blank title"},
+            {"layer": "semantic", "title": "blank body", "body": "  \n"},
+            {"title": "no layer", "body": "b"},
+            {"layer": "procedural", "title": "kept two", "body": "b2"}
+        ]"#;
+        let items = parse_items(answer).expect("a bad element must not fail the whole answer");
+        assert_eq!(items.len(), 2, "only the two good items survive: {items:?}");
+        assert_eq!(items[0].layer, Layer::Episodic);
+        assert_eq!(items[0].title, "kept one");
+        assert_eq!(items[0].body, "b1");
+        assert_eq!(
+            items[0].files,
+            vec!["a.rs".to_string(), "b.rs".to_string()],
+            "`files` keeps its string elements and nothing else"
+        );
+        assert_eq!(items[1].layer, Layer::Procedural);
+        assert_eq!(items[1].title, "kept two");
+        assert!(items[1].files.is_empty(), "a missing `files` is an empty list");
+
+        assert_eq!(MAX_ITEMS, 5);
+        let seven: Vec<String> = (0..7)
+            .map(|n| format!(r#"{{"layer":"semantic","title":"t{n}","body":"b{n}"}}"#))
+            .collect();
+        let many = parse_items(&format!("[{}]", seven.join(","))).unwrap();
+        let titles: Vec<&str> = many.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, vec!["t0", "t1", "t2", "t3", "t4"], "the FIRST five are kept");
+    }
+
+    #[test]
+    fn an_answer_that_is_not_a_json_array_fails_whole() {
+        for answer in [
+            "I could not find anything worth keeping.",
+            r#"{"layer": "semantic", "title": "t", "body": "b"}"#,
+            r#"[{"layer": "semantic", "title": "t""#,
+            "",
+        ] {
+            let err = parse_items(answer).expect_err(answer);
+            assert!(matches!(err, ParseError::NotAnArray), "{answer:?} gave {err:?}");
+            let shown = err.to_string();
+            let fragment = answer.trim();
+            assert!(
+                fragment.is_empty() || !shown.contains(fragment),
+                "the error must name the category, never the answer text: {shown}"
+            );
+        }
+
+        assert!(
+            parse_items("[]").expect("an empty array is a good answer").is_empty(),
+            "`[]` means nothing was worth keeping"
+        );
+        assert!(parse_items("  \n[]\n ").unwrap().is_empty(), "surrounding whitespace is trimmed");
+
+        let fenced = "```json\n[{\"layer\":\"semantic\",\"title\":\"t\",\"body\":\"b\"}]\n```";
+        let items = parse_items(fenced).expect("a ```json fence around the array is stripped");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "t");
+        let bare_fence = "```\n[{\"layer\":\"episodic\",\"title\":\"t\",\"body\":\"b\"}]\n```";
+        assert_eq!(parse_items(bare_fence).unwrap().len(), 1, "a bare ``` fence too");
+    }
+
+    /// The model picks only the layer; kind and the door it goes through are derived from it, so
+    /// `skill` and `subagent` can never come out of the distiller.
+    #[test]
+    fn the_layer_decides_kind_and_door() {
+        assert_eq!(door(Layer::Episodic), (Kind::Memory, Door::Record));
+        assert_eq!(door(Layer::Semantic), (Kind::Memory, Door::Propose));
+        assert_eq!(door(Layer::Procedural), (Kind::Prompt, Door::Propose));
+    }
+
+    /// Table: the delay after the n-th failure is `BACKOFF_BASE * 2^n`, and the third failure ends
+    /// the retrying.
+    #[test]
+    fn backoff_doubles_and_gives_up_after_three() {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
+        assert_eq!(MAX_ATTEMPTS, 3);
+        assert_eq!(BACKOFF_BASE, chrono::Duration::minutes(5));
+        assert_eq!(retry_at(1, now), Some(now + chrono::Duration::minutes(10)));
+        assert_eq!(retry_at(2, now), Some(now + chrono::Duration::minutes(20)));
+        assert_eq!(retry_at(3, now), None);
+        assert_eq!(retry_at(4, now), None, "past the limit never schedules again");
     }
 }
