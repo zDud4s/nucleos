@@ -17,6 +17,7 @@ import { LeaveRoster } from "./LeaveRoster";
 import { Occupancy } from "./Occupancy";
 import { OwnedFiles } from "./OwnedFiles";
 import { Settings } from "./Settings";
+import { TestsMap } from "./TestsMap";
 import { WorkflowSummary } from "./Workflows";
 import { leadingConcern, toneFor, type LeadingConcern, type ProjectConcerns } from "./priority";
 
@@ -120,6 +121,10 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
 
       <Section label="Files the app owns">
         <OwnedFiles projectId={projectId} />
+      </Section>
+
+      <Section label="Test map">
+        <TestsMap projectId={projectId} />
       </Section>
 
       {/*
