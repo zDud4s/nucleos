@@ -98,6 +98,16 @@ pub const DEFAULT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
 /// reason: a test that shortens the deadline must still get a short one.
 pub const AUTONOMOUS_PROGRESS_TIMEOUT_MULTIPLIER: u32 = 6;
 
+/// How long a chat turn bound to a project root may go without a new stream event, as a multiple
+/// of `progress_timeout`: 2 x 300 s = 10 min of silence. Derived rather than given its own
+/// `Duration` so a test that shortens `progress_timeout` gets a short one.
+pub const ROOTED_CHAT_PROGRESS_TIMEOUT_MULTIPLIER: u32 = 2;
+
+/// The total ceiling of a chat turn bound to a project root, as a multiple of `run_timeout`:
+/// 24 x 600 s = 4 h. A backstop only; silence is what catches a hung turn (spec
+/// `.ai/specs/2026-10-04-chats-como-ambiente-de-desenvolvimento.md`, P1).
+pub const ROOTED_CHAT_RUN_TIMEOUT_MULTIPLIER: u32 = 24;
+
 /// Production default for how long a repository verification gate may run.
 ///
 /// A gate is a subprocess over a repository the daemon does not control, so its deadline answers a
