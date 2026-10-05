@@ -142,6 +142,9 @@ enum LiveTurn {
     /// its way out. The turn is lost and must NOT be quietly started again — whatever it had already
     /// done, a command run or a file written, would be done a second time.
     DiedMidTurn(Option<String>),
+    /// No event arrived for that long. The turn is lost like `DiedMidTurn`, and the caller drops
+    /// the process.
+    WentSilent(std::time::Duration),
 }
 
 impl LiveChat {
@@ -151,6 +154,7 @@ impl LiveChat {
         text: &str,
         images: &[crate::runner::Attachment],
         transcript: &std::sync::Arc<Mutex<String>>,
+        silence: Option<std::time::Duration>,
     ) -> LiveTurn {
         let said = crate::runner::LaterTurn {
             text: text.to_owned(),
@@ -159,13 +163,17 @@ impl LiveChat {
         if self.messages.send(said).is_err() {
             return LiveTurn::NotWritten;
         }
-        self.gather(transcript).await
+        self.gather(transcript, silence).await
     }
 
     /// Gathers the turn the process was STARTED with, which travelled in its opening line rather
     /// than down this channel — so there is nothing to send, only an answer to wait for.
-    async fn opening(&mut self, transcript: &std::sync::Arc<Mutex<String>>) -> LiveTurn {
-        self.gather(transcript).await
+    async fn opening(
+        &mut self,
+        transcript: &std::sync::Arc<Mutex<String>>,
+        silence: Option<std::time::Duration>,
+    ) -> LiveTurn {
+        self.gather(transcript, silence).await
     }
 
     /// Reads one turn's worth of the stream into `transcript`, stopping at its own end.
@@ -174,8 +182,20 @@ impl LiveChat {
     /// the turn after this one; stopping short would hand that turn the tail of this one. Both fail
     /// the same way from outside — a conversation whose answers are quietly somebody else's — which
     /// is why the boundary is drawn in `runner::TurnSplitter`, where a test can reach it.
-    async fn gather(&mut self, transcript: &std::sync::Arc<Mutex<String>>) -> LiveTurn {
-        while let Some(event) = self.events.recv().await {
+    async fn gather(
+        &mut self,
+        transcript: &std::sync::Arc<Mutex<String>>,
+        silence: Option<std::time::Duration>,
+    ) -> LiveTurn {
+        loop {
+            let next = match silence {
+                Some(d) => match tokio::time::timeout(d, self.events.recv()).await {
+                    Ok(event) => event,
+                    Err(_) => return LiveTurn::WentSilent(d),
+                },
+                None => self.events.recv().await,
+            };
+            let Some(event) = next else { break };
             match event {
                 crate::runner::TurnEvent::Line(line) => {
                     // The same accumulation the runner does for a one-turn process, so a turn served
@@ -267,21 +287,23 @@ fn reap_now() {
 /// Serves one turn: down the conversation's living process when it has one, by starting one when it
 /// does not, and by the one-shot path every turn used to take when it may not have one at all.
 ///
-/// Answers in exactly the shape `tokio::time::timeout(run_timeout, runner.run_prompt(..))` answered
-/// in before this existed, so everything downstream reads one thing whichever door the turn took.
+/// The answer shape is unchanged, so everything downstream reads one thing whichever door the turn
+/// took; the deadlines are the turn's own: `ceiling` bounds the whole turn, `silence` how long it may
+/// go without a new stream event.
 #[allow(clippy::too_many_arguments)]
 async fn serve_turn(
     runner: &std::sync::Arc<dyn crate::runner::CommandRunner>,
-    request: crate::runner::RunRequest,
+    mut request: crate::runner::RunRequest,
     session_tx: tokio::sync::mpsc::UnboundedSender<String>,
     transcript: &std::sync::Arc<Mutex<String>>,
     chat_id: &str,
-    run_timeout: std::time::Duration,
+    deadlines: TurnDeadlines,
     may_live: bool,
 ) -> Result<std::io::Result<crate::runner::RunOutcome>, tokio::time::error::Elapsed> {
     if !may_live {
+        request.progress_timeout = deadlines.silence;
         return tokio::time::timeout(
-            run_timeout,
+            deadlines.ceiling,
             runner.run_prompt(request, session_tx, std::sync::Arc::clone(transcript)),
         )
         .await;
@@ -306,8 +328,13 @@ async fn serve_turn(
             // Bound before the match, not inside its scrutinee: a temporary there would hold the
             // borrow of `live` through every arm, and one of them has to hand it back.
             let served = tokio::time::timeout(
-                run_timeout,
-                live.turn(&request.prompt, &request.images, transcript),
+                deadlines.ceiling,
+                live.turn(
+                    &request.prompt,
+                    &request.images,
+                    transcript,
+                    deadlines.silence,
+                ),
             )
             .await;
             match served {
@@ -339,21 +366,17 @@ async fn serve_turn(
                 // Nothing was written, so as far as anything outside is concerned this turn has not
                 // happened yet, and starting a process for it is safe.
                 Ok(LiveTurn::NotWritten) => {}
+                // Silent for the whole deadline: dropping `live` stops the process.
+                Ok(LiveTurn::WentSilent(after)) => {
+                    return Ok(Ok(went_silent(transcript, after, Some(session_id))));
+                }
                 // Dropping `live` on the way out is what stops a process that stopped answering.
                 Err(elapsed) => return Err(elapsed),
             }
         }
     }
 
-    start_live_chat(
-        runner,
-        request,
-        session_tx,
-        transcript,
-        chat_id,
-        run_timeout,
-    )
-    .await
+    start_live_chat(runner, request, session_tx, transcript, chat_id, deadlines).await
 }
 
 /// Starts a conversation's process, gathers the turn it was started with, and keeps it for the next.
@@ -363,7 +386,7 @@ async fn start_live_chat(
     session_tx: tokio::sync::mpsc::UnboundedSender<String>,
     transcript: &std::sync::Arc<Mutex<String>>,
     chat_id: &str,
-    run_timeout: std::time::Duration,
+    deadlines: TurnDeadlines,
 ) -> Result<std::io::Result<crate::runner::RunOutcome>, tokio::time::error::Elapsed> {
     let (messages, incoming) = tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
@@ -379,6 +402,10 @@ async fn start_live_chat(
     // stdin IS the channel a later turn arrives on, so a process meant to serve more than one has to
     // take that door whether or not this turn carries anything that could only fit through it.
     request.steerable = true;
+    // Never the runner's progress deadline here: its read loop spans the whole multi-turn process,
+    // so the idle time between two turns would count as silence. Silence is enforced per event in
+    // `LiveChat::gather` instead.
+    request.progress_timeout = None;
     request.messages = Some(incoming);
 
     // The PROCESS's transcript, which is nobody's turn. What the window watches is built out of the
@@ -470,7 +497,11 @@ async fn start_live_chat(
         idle_since: std::time::Instant::now(),
     };
 
-    let served = tokio::time::timeout(run_timeout, live.opening(transcript)).await;
+    let served = tokio::time::timeout(
+        deadlines.ceiling,
+        live.opening(transcript, deadlines.silence),
+    )
+    .await;
     match served {
         Ok(LiveTurn::Answered(outcome)) => {
             let stdout = transcript
@@ -491,6 +522,11 @@ async fn start_live_chat(
             Some(why) => format!("the conversation's process ended without answering: {why}"),
             None => "the conversation's process ended without answering".to_owned(),
         }))),
+        Ok(LiveTurn::WentSilent(after)) => Ok(Ok(went_silent(
+            transcript,
+            after,
+            session_id.lock().unwrap().clone(),
+        ))),
         Err(elapsed) => Err(elapsed),
     }
 }
@@ -518,6 +554,34 @@ fn gathered(
         cache_creation_tokens: outcome.usage.cache_creation_tokens,
         num_turns: outcome.usage.num_turns,
         compacted: outcome.compacted,
+    }
+}
+
+/// What a turn that went silent leaves behind: the runner's own shape for a run whose progress
+/// deadline expired, so everything downstream reads one thing whichever door the turn took.
+fn went_silent(
+    transcript: &std::sync::Arc<Mutex<String>>,
+    after: std::time::Duration,
+    session_id: Option<String>,
+) -> crate::runner::RunOutcome {
+    crate::runner::RunOutcome {
+        exit_code: crate::runner::PROGRESS_TIMEOUT_EXIT_CODE,
+        stdout: transcript
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default(),
+        stderr: format!(
+            "nucleos: run went silent for {after:?}; progress deadline expired
+"
+        ),
+        session_id,
+        cost_usd: None,
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
+        num_turns: None,
+        compacted: false,
     }
 }
 
@@ -1986,6 +2050,32 @@ pub(crate) fn may_keep_process(policy: crate::runner::ToolPolicy, cli: &str) -> 
     matches!(policy, crate::runner::ToolPolicy::Unrestricted) && cli == "claude"
 }
 
+/// How long a chat turn may run: `silence` is how long without a new stream event, `ceiling` the
+/// total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnDeadlines {
+    silence: Option<std::time::Duration>,
+    ceiling: std::time::Duration,
+}
+
+/// A rooted turn (`Unrestricted`) dies on silence or a long ceiling; any other keeps the plain wall.
+fn turn_deadlines(
+    run_timeout: std::time::Duration,
+    progress_timeout: std::time::Duration,
+    policy: crate::runner::ToolPolicy,
+) -> TurnDeadlines {
+    match policy {
+        crate::runner::ToolPolicy::Unrestricted => TurnDeadlines {
+            silence: Some(progress_timeout * crate::state::ROOTED_CHAT_PROGRESS_TIMEOUT_MULTIPLIER),
+            ceiling: run_timeout * crate::state::ROOTED_CHAT_RUN_TIMEOUT_MULTIPLIER,
+        },
+        _ => TurnDeadlines {
+            silence: None,
+            ceiling: run_timeout,
+        },
+    }
+}
+
 fn system_prompt_with_knowledge(
     cli: &str,
     instructions: Option<String>,
@@ -2063,7 +2153,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
     let pool = state.pool.clone();
     let daemon_runner = state.runner.clone();
     let assistants = state.assistants.clone();
-    let run_timeout = state.run_timeout;
+    let deadlines = turn_deadlines(state.run_timeout, state.progress_timeout, tool_policy);
     let control_token = state.token.0.clone();
     // Built HERE, outside the task, and captured by the async block. A task aborted before its first
     // poll drops its captured state without ever running a line of the body, so a guard constructed
@@ -2315,11 +2405,14 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // nothing else, and the MCP allowlist does not enforce that on its own, because
             // an allowlist only grants.
             tool_policy,
+            // Stays `None` in the request: `serve_turn` decides the silence rule per door (the
+            // runner's own deadline one-shot, a per-event timeout on a living process).
             progress_timeout: None,
             // No ceiling, and the only production `None`. A chat turn is
             // watched by the person who asked for it, who can stop it — and a turn cut off
             // mid-answer by a limit nobody set reads as the app breaking rather than as a
-            // brake working. The wall clock around this call is the guard here.
+            // brake working. The guard is the turn's deadlines: silence plus a 4 h ceiling for a rooted
+            // turn, the plain 600 s wall for an McpOnly one.
             max_turns: None,
             // Always set. `cli_args` reads this only when there is no `--resume`, which is
             // exactly the first turn — the one that used to be launched with no session id
@@ -2370,7 +2463,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                 .map(std::path::PathBuf::from)
                 .collect(),
             // A ceiling on THIS answer, not on the conversation. The CLI stops the invocation; the
-            // wall clock around this call is still the other guard, and `max_turns` above is
+            // turn's deadlines around this call are still the other guard, and `max_turns` above is
             // deliberately `None` here for the reason its own comment gives.
             max_budget_usd: answering.turn_budget_usd,
             // The helpers this conversation defined, ADDED to whatever the CLI finds in the
@@ -2435,12 +2528,12 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // The published buffer, so what the window watches is what the CLI is writing.
             //
             // Still not the turn's PRODUCT: the reply is what `extract_reply` pulls out of the
-            // `result` event of a completed run, and a turn the wall clock killed has no reply to
+            // `result` event of a completed run, and a turn the turn's deadlines killed has no reply to
             // salvage. This is the same distinction as before — the stream is transport, the result
             // is the answer — with the transport now visible while it moves.
             &transcript,
             &turn.slot.chat_id,
-            run_timeout,
+            deadlines,
             may_live,
         )
         .await;
@@ -2569,9 +2662,16 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                 // The measurements are kept for the reason the cost is: a turn that answered nothing
                 // still spent what it spent, and one stopped at its ceiling has read the most.
                 None => {
+                    // A silence kill is a timeout, as `runs.rs` records it.
+                    let status = if o.exit_code == crate::runner::PROGRESS_TIMEOUT_EXIT_CODE {
+                        "timed_out"
+                    } else {
+                        "failed"
+                    };
                     let failed = sqlx::query(
-                        "UPDATE runs SET status = 'failed', exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
+                    .bind(status)
                     .bind(o.exit_code)
                     .bind(&o.stderr)
                     .bind(&o.session_id)
@@ -2585,7 +2685,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .bind(id)
                     .execute(&pool)
                     .await;
-                    crate::runs::warn_on_terminal_write_err(&failed, id, "failed");
+                    crate::runs::warn_on_terminal_write_err(&failed, id, status);
                 }
             },
             Ok(Err(e)) => {
@@ -6123,7 +6223,8 @@ mod tests {
             ))
             .unwrap();
 
-        let LiveTurn::Answered(outcome) = live.turn("e agora?", &[], &transcript).await else {
+        let LiveTurn::Answered(outcome) = live.turn("e agora?", &[], &transcript, None).await
+        else {
             panic!("a process with an answer queued must answer");
         };
 
@@ -6157,11 +6258,11 @@ mod tests {
         }
 
         assert!(matches!(
-            live.turn("um", &[], &first).await,
+            live.turn("um", &[], &first, None).await,
             LiveTurn::Answered(_)
         ));
         assert!(matches!(
-            live.turn("dois", &[], &second).await,
+            live.turn("dois", &[], &second, None).await,
             LiveTurn::Answered(_)
         ));
 
@@ -6187,7 +6288,7 @@ mod tests {
         // start over: nothing reached the process, so as far as anything outside is concerned this
         // turn has not happened yet.
         assert!(matches!(
-            live.turn("estas ai?", &[], &transcript).await,
+            live.turn("estas ai?", &[], &transcript, None).await,
             LiveTurn::NotWritten
         ));
     }
@@ -6206,7 +6307,7 @@ mod tests {
         drop(events);
 
         assert!(matches!(
-            live.turn("faz isso", &[], &transcript).await,
+            live.turn("faz isso", &[], &transcript, None).await,
             LiveTurn::DiedMidTurn(_)
         ));
         // It really was written — which is the whole reason this case may not be retried.
@@ -6598,7 +6699,10 @@ mod tests {
             tx,
             &first,
             chat_id,
-            std::time::Duration::from_secs(180),
+            TurnDeadlines {
+                silence: None,
+                ceiling: std::time::Duration::from_secs(180),
+            },
             true,
         )
         .await
@@ -6625,7 +6729,10 @@ mod tests {
             tx,
             &second_said,
             chat_id,
-            std::time::Duration::from_secs(180),
+            TurnDeadlines {
+                silence: None,
+                ceiling: std::time::Duration::from_secs(180),
+            },
             true,
         )
         .await
@@ -6844,7 +6951,8 @@ mod tests {
             .unwrap();
         drop(events);
 
-        let LiveTurn::DiedMidTurn(reason) = live.turn("faz isso", &[], &transcript).await else {
+        let LiveTurn::DiedMidTurn(reason) = live.turn("faz isso", &[], &transcript, None).await
+        else {
             panic!("a process that never answered must not report a turn");
         };
 
@@ -7365,5 +7473,356 @@ mod tests {
         settled_turn(&state.pool, id).await;
 
         assert_eq!(runner.last_prompt.lock().unwrap().clone().unwrap(), "olá");
+    }
+
+    // ---- chat turn silence deadline -------------------------------------------------------------
+
+    /// The request a rooted live turn is served with: `take_live` only reuses a process standing on
+    /// the same ground (here no cwd, default permission) and resuming the session it already has.
+    fn silence_request() -> crate::runner::RunRequest {
+        let mut request = seam_request("go", &std::env::temp_dir(), Some("s-1".into()));
+        request.cwd = None;
+        request
+    }
+
+    /// A canned one-shot answer: `lines` assistant events and a closing `result`.
+    fn silence_canned(lines: usize) -> crate::runner::RunOutcome {
+        let mut stdout = String::new();
+        for n in 0..lines {
+            stdout.push_str(&format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"part {n}"}}]}}}}"#
+            ));
+            stdout.push('\n');
+        }
+        stdout.push_str(r#"{"type":"result","subtype":"success","result":"done"}"#);
+        crate::runner::RunOutcome {
+            exit_code: 0,
+            stdout,
+            stderr: String::new(),
+            session_id: Some("s-1".to_owned()),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        }
+    }
+
+    fn silence_runner(
+        lines: usize,
+        delay: Duration,
+    ) -> std::sync::Arc<dyn crate::runner::CommandRunner> {
+        Arc::new(FakeCommandRunner {
+            canned: Mutex::new(Some(silence_canned(lines))),
+            delay: Mutex::new(Some(delay)),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn chat_silence_defaults_give_a_rooted_turn_ten_minutes_of_silence_and_four_hours() {
+        let deadlines = turn_deadlines(
+            crate::state::DEFAULT_RUN_TIMEOUT,
+            crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            crate::runner::ToolPolicy::Unrestricted,
+        );
+        assert_eq!(
+            deadlines,
+            TurnDeadlines {
+                silence: Some(Duration::from_secs(600)),
+                ceiling: Duration::from_secs(14_400),
+            }
+        );
+    }
+
+    #[test]
+    fn chat_silence_an_mcp_only_turn_keeps_the_run_timeout_and_no_silence_rule() {
+        let deadlines = turn_deadlines(
+            crate::state::DEFAULT_RUN_TIMEOUT,
+            crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            crate::runner::ToolPolicy::McpOnly,
+        );
+        assert_eq!(
+            deadlines,
+            TurnDeadlines {
+                silence: None,
+                ceiling: Duration::from_secs(600),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_silence_a_live_rooted_turn_that_keeps_streaming_outlives_the_run_timeout() {
+        let chat_id = "chat-silence-live-streaming";
+        let (live, _said, events, _why) = live_chat_for_testing();
+        LIVE_CHATS.lock().unwrap().insert(chat_id.to_owned(), live);
+        let deadlines = turn_deadlines(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            crate::runner::ToolPolicy::Unrestricted,
+        );
+        let feeder = tokio::spawn(async move {
+            for n in 0..20 {
+                let _ = events.send(crate::runner::TurnEvent::Line(format!("line {n}")));
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            let _ = events.send(crate::runner::TurnEvent::Ended(
+                crate::runner::TurnOutcome::default(),
+            ));
+            events
+        });
+        let runner: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(Mutex::new(String::new()));
+
+        let started = std::time::Instant::now();
+        let served = serve_turn(
+            &runner,
+            silence_request(),
+            tx,
+            &transcript,
+            chat_id,
+            deadlines,
+            true,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let _events = feeder.await.unwrap();
+        evict_live(chat_id);
+
+        let outcome = served
+            .expect("a turn that keeps streaming is not past any deadline")
+            .expect("the process answered");
+        assert_eq!(outcome.exit_code, 0);
+        assert!(
+            elapsed > Duration::from_millis(100),
+            "the turn must outlast the old run_timeout wall, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_silence_a_live_rooted_turn_that_goes_silent_is_stopped() {
+        let chat_id = "chat-silence-live-silent";
+        let (live, _said, events, _why) = live_chat_for_testing();
+        LIVE_CHATS.lock().unwrap().insert(chat_id.to_owned(), live);
+        let deadlines = turn_deadlines(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            crate::runner::ToolPolicy::Unrestricted,
+        );
+        // One line, then the stream stays open and says nothing: `events` is held, not dropped.
+        events
+            .send(crate::runner::TurnEvent::Line("one line".to_owned()))
+            .unwrap();
+        let runner: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(Mutex::new(String::new()));
+
+        let started = std::time::Instant::now();
+        let served = serve_turn(
+            &runner,
+            silence_request(),
+            tx,
+            &transcript,
+            chat_id,
+            deadlines,
+            true,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let still_kept = LIVE_CHATS.lock().unwrap().contains_key(chat_id);
+        evict_live(chat_id);
+        drop(events);
+
+        let outcome = served
+            .expect("silence is reported as an outcome, not as the ceiling elapsing")
+            .expect("the turn was written");
+        assert_eq!(outcome.exit_code, crate::runner::PROGRESS_TIMEOUT_EXIT_CODE);
+        assert!(outcome.stderr.contains("went silent"), "{}", outcome.stderr);
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert!(!still_kept, "a process that went silent must be dropped");
+    }
+
+    #[tokio::test]
+    async fn chat_silence_a_live_rooted_turn_past_the_ceiling_is_stopped_while_streaming() {
+        let chat_id = "chat-silence-live-ceiling";
+        let (live, _said, events, _why) = live_chat_for_testing();
+        LIVE_CHATS.lock().unwrap().insert(chat_id.to_owned(), live);
+        let deadlines = TurnDeadlines {
+            silence: Some(Duration::from_millis(200)),
+            ceiling: Duration::from_millis(400),
+        };
+        let feeder = tokio::spawn(async move {
+            while events
+                .send(crate::runner::TurnEvent::Line("still going".to_owned()))
+                .is_ok()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let runner: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(Mutex::new(String::new()));
+
+        let started = std::time::Instant::now();
+        let served = serve_turn(
+            &runner,
+            silence_request(),
+            tx,
+            &transcript,
+            chat_id,
+            deadlines,
+            true,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        evict_live(chat_id);
+        // The turn was dropped with the process, so the feeder's sends start failing and it ends.
+        let _ = tokio::time::timeout(Duration::from_secs(2), feeder).await;
+
+        assert!(
+            served.is_err(),
+            "the ceiling must stop a turn still streaming"
+        );
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn chat_silence_a_one_shot_rooted_turn_that_keeps_streaming_outlives_the_run_timeout() {
+        let deadlines = turn_deadlines(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            crate::runner::ToolPolicy::Unrestricted,
+        );
+        let runner = silence_runner(20, Duration::from_millis(30));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(Mutex::new(String::new()));
+
+        let served = serve_turn(
+            &runner,
+            silence_request(),
+            tx,
+            &transcript,
+            "chat-silence-one-shot-streaming",
+            deadlines,
+            false,
+        )
+        .await
+        .expect("a turn that keeps streaming is not past any deadline")
+        .expect("the runner answered");
+
+        assert_eq!(served.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn chat_silence_a_one_shot_rooted_turn_that_goes_silent_is_stopped() {
+        let deadlines = TurnDeadlines {
+            silence: Some(Duration::from_millis(100)),
+            ceiling: Duration::from_secs(2),
+        };
+        let runner = silence_runner(5, Duration::from_millis(500));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(Mutex::new(String::new()));
+
+        let served = serve_turn(
+            &runner,
+            silence_request(),
+            tx,
+            &transcript,
+            "chat-silence-one-shot-silent",
+            deadlines,
+            false,
+        )
+        .await
+        .expect("silence is the runner's outcome, not the ceiling elapsing")
+        .expect("the runner answered");
+
+        assert_eq!(served.exit_code, crate::runner::PROGRESS_TIMEOUT_EXIT_CODE);
+    }
+
+    #[tokio::test]
+    async fn chat_silence_a_one_shot_rooted_turn_past_the_ceiling_is_stopped_while_streaming() {
+        let deadlines = TurnDeadlines {
+            silence: Some(Duration::from_millis(200)),
+            ceiling: Duration::from_millis(300),
+        };
+        let runner = silence_runner(100, Duration::from_millis(20));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(Mutex::new(String::new()));
+
+        let started = std::time::Instant::now();
+        let served = serve_turn(
+            &runner,
+            silence_request(),
+            tx,
+            &transcript,
+            "chat-silence-one-shot-ceiling",
+            deadlines,
+            false,
+        )
+        .await;
+
+        assert!(
+            served.is_err(),
+            "the ceiling must stop a turn still streaming"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn chat_silence_an_mcp_only_turn_still_dies_at_the_run_timeout() {
+        let deadlines = turn_deadlines(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            crate::runner::ToolPolicy::McpOnly,
+        );
+        let runner = silence_runner(5, Duration::from_secs(2));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(Mutex::new(String::new()));
+
+        let started = std::time::Instant::now();
+        let served = serve_turn(
+            &runner,
+            silence_request(),
+            tx,
+            &transcript,
+            "chat-silence-mcp-only",
+            deadlines,
+            false,
+        )
+        .await;
+
+        assert!(
+            served.is_err(),
+            "an McpOnly turn keeps the plain wall clock"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn chat_silence_a_rooted_turn_that_went_silent_is_recorded_timed_out() {
+        let mut state = test_state().await;
+        state.runner = silence_runner(5, Duration::from_secs(5));
+        state.progress_timeout = Duration::from_millis(50);
+        let _root = rooted_chat(&state, "silent-chat").await;
+
+        let id = send_message(&state, "silent-chat", "go", Origin::Shell)
+            .await
+            .unwrap();
+        let (status, _) = settled_turn(&state.pool, id).await;
+        evict_live("silent-chat");
+
+        assert_eq!(status, "timed_out");
+        let stderr: Option<String> = sqlx::query_scalar("SELECT stderr FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert!(
+            stderr.unwrap_or_default().contains("went silent"),
+            "the silence line must reach the row"
+        );
     }
 }
