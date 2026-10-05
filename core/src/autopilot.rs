@@ -943,7 +943,9 @@ pub(crate) async fn seed_workflow(
         Ok(main)
     })
     .await
-    .map_err(|error| SeedRefusal::Failed(format!("the workflow probe did not finish: {error}")))??;
+    .map_err(|error| {
+        SeedRefusal::Failed(format!("the workflow probe did not finish: {error}"))
+    })??;
     let mut command = tokio::process::Command::new(HOOK_INTERPRETER);
     command
         .arg(main.join(SEED_SCRIPT))
@@ -1154,7 +1156,8 @@ pub(crate) mod tests {
     }
 
     /// A stub script that would leave a marker if it ever ran, for proving it did not.
-    const STUB_MARKER: &str = "import sys\nfrom pathlib import Path\nPath(sys.argv[1], 'ran.marker').write_text('ran')\n";
+    const STUB_MARKER: &str =
+        "import sys\nfrom pathlib import Path\nPath(sys.argv[1], 'ran.marker').write_text('ran')\n";
 
     /// The main checkout a worktree's `.git` file names is trusted only when the daemon already
     /// knows it as a project: a crafted directory could otherwise point at a crafted "main" and get

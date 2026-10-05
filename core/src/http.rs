@@ -637,7 +637,10 @@ pub fn build_router(state: AppState) -> Router {
         // `wire_ide_session_tools` does before a pick-up, reached from the other side.
         .route("/assistant/chats/{chat_id}/tools", post(wire_chat_tools))
         // Copies the AI workflow into a conversation's worktree; only ever on an explicit confirm.
-        .route("/assistant/chats/{chat_id}/workflow", post(seed_chat_workflow))
+        .route(
+            "/assistant/chats/{chat_id}/workflow",
+            post(seed_chat_workflow),
+        )
         // Taking back something that has not been sent. A segment deeper than the chat, and named
         // for the thing it removes rather than for the chat it removes it from.
         .route(
@@ -16358,8 +16361,13 @@ mod tests {
             .await
             .unwrap();
         }
-        let autopilot =
-            seed_run_row(&state.pool, "project-a", "completed", "2026-10-01T00:00:00Z").await;
+        let autopilot = seed_run_row(
+            &state.pool,
+            "project-a",
+            "completed",
+            "2026-10-01T00:00:00Z",
+        )
+        .await;
 
         let app = Router::new()
             .route("/runs", get(get_runs))
@@ -29095,7 +29103,7 @@ mod tests {
     /// the workflow is missing, and says the conversation has tools.
     #[tokio::test]
     async fn seeding_the_workflow_into_a_conversations_worktree_clears_the_flag_and_gives_it_tools()
-     {
+    {
         let state = test_state().await;
         let (_container, _main, wt) =
             crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
