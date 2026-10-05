@@ -29,6 +29,7 @@ mod contacts;
 mod council;
 mod daemon_client;
 mod detect;
+mod distill;
 mod email;
 mod exclusion;
 mod feed;

@@ -39,6 +39,8 @@ const PROJECT_SCOPED: &[&str] = &[
     "browser_sessions",
     "browser_sites",
     "browser_writes",
+    // Pending distillations are the project's history; a forgotten project must not be distilled later.
+    "distill_queue",
     "feed",
     "fleet_exclusions",
     "jobs",
@@ -1117,6 +1119,42 @@ mod tests {
         assert_eq!(their_land_targets, 1);
 
         assert!(on_roster(&pool, "bravo").await);
+    }
+
+    /// A pending distillation is the project's history: forgetting the project must not leave a
+    /// row that would later be distilled, and must not touch another project's queue.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_its_distill_queue() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        register(&pool, "bravo").await;
+        // Job ids are global, so each project gets its own (the unique index has no project_id).
+        for (id, job_id) in [("alpha", 1_i64), ("bravo", 2_i64)] {
+            sqlx::query(
+                "INSERT INTO distill_queue (cause, project_id, job_id, status, attempts, created_at)
+                 VALUES ('job_failed', ?, ?, 'pending', 0, '2026-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        let ours: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM distill_queue WHERE project_id = 'alpha'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ours, 0, "a forgotten project's distill queue outlived it");
+        let theirs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM distill_queue WHERE project_id = 'bravo'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(theirs, 1, "forgetting alpha took bravo's distill queue");
     }
 
     /// A slot taken here is work in flight, and nothing is removed under it.
