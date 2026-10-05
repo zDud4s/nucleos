@@ -28,6 +28,15 @@ const ALLOWED = new Map<string, { reason: string; only?: string }>([
     "app.css:.nav-item-active",
     { reason: "the rail's current row: where you are is identity, not state", only: "var(--accent-quiet)" },
   ],
+  [
+    "system.css:.sy-settings-item-current",
+    { reason: "the System settings list's current row, the same case as the rail's", only: "var(--accent-quiet)" },
+  ],
+  [
+    "system.css:.sy-token-level:has(input:checked)",
+    { reason: "the chosen token level: the current choice in a set, like a current row", only: "var(--accent-quiet)" },
+  ],
+  ["contacts.css:.contacts-avatar", { reason: "the contact's initials disc, the owner's call on 2026-10-05" }],
 ]);
 
 function tsxFiles(dir: string): string[] {
