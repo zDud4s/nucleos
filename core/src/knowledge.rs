@@ -2997,7 +2997,10 @@ mod tests {
             "Run cargo fmt before the gate ...",
             "Run cargo fmt before the gate:",
         ] {
-            assert_eq!(title_fingerprint(variant).as_deref(), Some(canonical.as_str()));
+            assert_eq!(
+                title_fingerprint(variant).as_deref(),
+                Some(canonical.as_str())
+            );
         }
         assert_ne!(
             title_fingerprint("Run cargo clippy before the gate").unwrap(),
@@ -3017,7 +3020,11 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         let id = record_distilled(
             &mut tx,
-            &distilled("The linker lock", "The gate failed on a locked exe.", Kind::Memory),
+            &distilled(
+                "The linker lock",
+                "The gate failed on a locked exe.",
+                Kind::Memory,
+            ),
             &Provenance {
                 distill_cause: Some("gate_recovered"),
                 evidence: Some(r#"[{"t":"job","id":7},{"t":"run","id":3}]"#),
@@ -3098,7 +3105,10 @@ mod tests {
         assert_eq!(row.status, "proposed");
         assert_eq!(row.source, "distiller");
         assert_eq!(row.layer, "procedural");
-        assert_eq!(row.fingerprint.as_deref(), Some("title:format before gating"));
+        assert_eq!(
+            row.fingerprint.as_deref(),
+            Some("title:format before gating")
+        );
         assert_eq!(row.evidence.as_deref(), Some(r#"[{"t":"job","id":9}]"#));
         assert_eq!(row.points_at.as_deref(), Some("scripts/gates.sh"));
         assert_eq!(row.proposal_id, Some(proposal_id));
@@ -3119,12 +3129,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(note, "distilled from a job");
-        let kind: String =
-            sqlx::query_scalar("SELECT kind FROM proposals WHERE id = ?")
-                .bind(proposal_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let kind: String = sqlx::query_scalar("SELECT kind FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(kind, "refinement");
     }
 
@@ -3211,11 +3220,13 @@ mod tests {
         .await
         .unwrap();
         tx.commit().await.unwrap();
-        sqlx::query("UPDATE knowledge SET last_confirmed_at = '2020-01-01T00:00:00+00:00' WHERE id = ?")
-            .bind(episode)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE knowledge SET last_confirmed_at = '2020-01-01T00:00:00+00:00' WHERE id = ?",
+        )
+        .bind(episode)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let again = reconfirm_in(
@@ -3278,10 +3289,16 @@ mod tests {
 
         let proposed = fetch(&pool, rule).await.unwrap().unwrap();
         assert_eq!(proposed.status, "proposed");
-        assert_eq!(proposed.last_confirmed_at, None, "a proposed row is not renewed");
+        assert_eq!(
+            proposed.last_confirmed_at, None,
+            "a proposed row is not renewed"
+        );
         let merged: serde_json::Value =
             serde_json::from_str(proposed.evidence.as_deref().unwrap()).unwrap();
-        assert_eq!(merged, serde_json::json!([{"t":"job","id":7},{"t":"job","id":8}]));
+        assert_eq!(
+            merged,
+            serde_json::json!([{"t":"job","id":7},{"t":"job","id":8}])
+        );
         let events: Vec<(String, String)> = sqlx::query_as(
             "SELECT from_status, to_status FROM knowledge_events
              WHERE knowledge_id = ? AND note = ?",
@@ -3291,7 +3308,10 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(events, vec![("proposed".to_string(), "proposed".to_string())]);
+        assert_eq!(
+            events,
+            vec![("proposed".to_string(), "proposed".to_string())]
+        );
 
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
             .fetch_one(&pool)

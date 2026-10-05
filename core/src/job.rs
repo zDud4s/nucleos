@@ -13828,12 +13828,10 @@ mod tests {
     async fn distill_rows(
         pool: &sqlx::SqlitePool,
     ) -> Vec<(String, Option<i64>, Option<i64>, String)> {
-        sqlx::query_as(
-            "SELECT cause, job_id, item_id, project_id FROM distill_queue ORDER BY id",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap()
+        sqlx::query_as("SELECT cause, job_id, item_id, project_id FROM distill_queue ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
     }
 
     /// A job that ends without completing is queued for the distiller, once; a completed one is
