@@ -69,6 +69,7 @@ const PROJECT_SCOPED: &[&str] = &[
     "runs",
     "scheduler_state",
     "vcs_requests",
+    "verify_runs",
     "webhook_deliveries",
     "worktree_touched_paths",
     "worktrees",

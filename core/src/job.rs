@@ -11338,6 +11338,54 @@ mod tests {
             crate::worktree::remove(&repo, &root.path().join(format!("job-{job_id}")), &[]).await;
     }
 
+    /// Every gate the walk ran left one `verify_runs` row naming the job and the item.
+    #[tokio::test(flavor = "current_thread")]
+    async fn each_item_gate_is_recorded_in_verify_runs() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) =
+            walkable_repo("nucleos-job-verify-", "git rev-parse --verify no-such-ref");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
+
+        let job_id = start_job_for(
+            &state,
+            &runner,
+            &repo,
+            r#"{"items":[{"description":"first"},{"description":"second"}]}"#,
+        )
+        .await;
+        walk(&state, job_id).await;
+
+        let gated: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_items WHERE job_id = ? AND gate_status IS NOT NULL",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let rows: Vec<(String, Option<i64>, String, Option<String>)> = sqlx::query_as(
+            "SELECT origin, ordinal, status, project_id FROM verify_runs              WHERE origin = 'job_item' AND origin_id = ? ORDER BY ordinal",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            gated > 0,
+            "the walk must have gated something for this test to mean anything"
+        );
+        assert_eq!(rows.len() as i64, gated);
+        for (origin, ordinal, status, project_id) in &rows {
+            assert_eq!(origin, crate::verify_runs::ORIGIN_JOB_ITEM);
+            assert!(ordinal.is_some());
+            assert_eq!(status, crate::verify_runs::STATUS_FAILED);
+            assert!(project_id.is_some());
+        }
+    }
+
     /// Walked rather than asserted against a seeded row: a red gate no longer ends the night.
     ///
     /// This test used to pin the opposite, and the sentence it carried — *"Never started. The
