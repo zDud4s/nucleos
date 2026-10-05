@@ -237,6 +237,30 @@ def daemon_binary_candidates(roots, os_name=None):
     ]
 
 
+def run_dir_candidates(main_root, os_name=None):
+    """The daemon binary as `scripts/run-daemon.ps1` stages it: `<parent of root>/.nucleos-run/`.
+
+    The daemon runs from that copy, not from a cargo target dir, so a machine that only ever
+    starts it through the script may have no `nucleos-core` under any target dir at all -- and
+    the guard refused every queue operation, `--land` included, for a token it never looked for
+    where it was. This is the script's default `-RunDir`; a run dir moved elsewhere is not found.
+    """
+    os_name = os.name if os_name is None else os_name
+    names = ("nucleos-core.exe", "nucleos-core") if os_name == "nt" else (
+        "nucleos-core", "nucleos-core.exe")
+    run_dir = os.path.join(os.path.dirname(main_root), ".nucleos-run")
+    return [os.path.join(run_dir, name) for name in names]
+
+
+def daemon_binaries(main_root):
+    """Every path the daemon binary might have: the staged run copy first, then cargo's builds.
+
+    The run copy goes first because it is the binary actually running; any of them prints the
+    same token, since it is read from the credential store, not from the binary.
+    """
+    return run_dir_candidates(main_root) + daemon_binary_candidates(cargo_target_dirs(main_root))
+
+
 def control_token(cwd: str) -> str:
     """The daemon's own token, read the way the desktop app reads it.
 
@@ -287,7 +311,7 @@ def read_control_token(cwd: str, git_timeout=10, print_timeout=20):
             return None, "repo"
         main_root = os.path.dirname(common.stdout.strip())
 
-        for binary in daemon_binary_candidates(cargo_target_dirs(main_root)):
+        for binary in daemon_binaries(main_root):
             if os.path.exists(binary):
                 printed = subprocess.run(
                     [binary, "--print-token"], capture_output=True, text=True,
