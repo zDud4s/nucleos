@@ -15,6 +15,7 @@
 package serve
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -446,6 +447,11 @@ func watchHandler(watcher browser.Watcher) http.HandlerFunc {
 			return
 		}
 
+		// A failed write ends the watch: the viewer is gone or too slow, and the screencast behind it
+		// must not keep encoding until the connection finally closes.
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+
 		rc := http.NewResponseController(w)
 		// The driver may call the sink from a goroutine of its own and keep calling it after Watch has
 		// returned, so every touch of w is under mu, and `finished` makes the late ones no-ops.
@@ -468,10 +474,12 @@ func watchHandler(watcher browser.Watcher) http.HandlerFunc {
 			_ = rc.SetWriteDeadline(time.Now().Add(WatchWriteDeadline))
 			if err := WriteRecord(w, kind, body); err != nil {
 				failed = true
+				cancel()
 				return
 			}
 			if err := rc.Flush(); err != nil {
 				failed = true
+				cancel()
 			}
 		}
 		sink := func(f browser.Frame) {
@@ -480,7 +488,7 @@ func watchHandler(watcher browser.Watcher) http.HandlerFunc {
 			write(RecordFrame, f.JPEG)
 		}
 
-		err := watcher.Watch(r.Context(), browser.SessionID(request.SessionID), sink)
+		err := watcher.Watch(ctx, browser.SessionID(request.SessionID), sink)
 
 		mu.Lock()
 		defer mu.Unlock()

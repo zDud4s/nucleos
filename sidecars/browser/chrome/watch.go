@@ -126,6 +126,16 @@ func (d *Driver) Watch(ctx context.Context, id browser.SessionID, sink func(brow
 		case <-cast.done:
 			return browser.ErrNoSuchSession
 		case frame := <-me.slot:
+			// select picks at random between ready cases, so a cancelled ctx or a dead target must be
+			// checked again here: no frame goes to the sink once the watch is over.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			select {
+			case <-cast.done:
+				return browser.ErrNoSuchSession
+			default:
+			}
 			sink(frame)
 		}
 	}

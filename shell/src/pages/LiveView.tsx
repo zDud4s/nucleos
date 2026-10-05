@@ -57,6 +57,12 @@ export function LiveView({ sessionId }: { sessionId: number }) {
       current = null;
     };
 
+    const end = (sentence: string) => {
+      drop();
+      setSrc(null);
+      setStatus({ kind: "ended", sentence });
+    };
+
     setStatus({ kind: "connecting" });
 
     void (async () => {
@@ -77,10 +83,10 @@ export function LiveView({ sessionId }: { sessionId: number }) {
               setNow(Date.now());
               setStatus({ kind: "live" });
             } else if (record.reason === "wheel") {
-              setStatus({ kind: "ended", sentence: "The wheel was asked for, or a person has it." });
+              end("The wheel was asked for, or a person has it.");
               return;
             } else if (record.reason === "closed") {
-              setStatus({ kind: "ended", sentence: "Session closed." });
+              end("Session closed.");
               return;
             } else {
               break;
@@ -90,11 +96,11 @@ export function LiveView({ sessionId }: { sessionId: number }) {
           if (signal.aborted) return;
           if (isApiRefusal(error)) {
             if (error.status === 409) {
-              setStatus({ kind: "ended", sentence: error.detail });
+              end(error.detail);
               return;
             }
             if (error.status === 404) {
-              setStatus({ kind: "ended", sentence: "Session closed." });
+              end("Session closed.");
               return;
             }
           }

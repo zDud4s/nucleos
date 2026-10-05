@@ -324,3 +324,65 @@ func TestWatchStalledClientIsDroppedWithinTheWriteDeadline(t *testing.T) {
 		t.Fatalf("the handler was still stuck %v after the watch ended", time.Since(ended))
 	}
 }
+
+// sinkingWatcher keeps handing frames to the sink from Watch itself until its ctx is done, and says
+// when that happened. It stands for a screencast that goes on encoding for as long as it is allowed.
+type sinkingWatcher struct {
+	*browser.Fake
+	ctxEnded chan struct{}
+}
+
+func (s *sinkingWatcher) Watch(ctx context.Context, _ browser.SessionID, sink func(browser.Frame)) error {
+	go func() {
+		<-ctx.Done()
+		close(s.ctxEnded)
+	}()
+	frame := browser.Frame{JPEG: make([]byte, 1<<20)}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		sink(frame)
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// brokenWrites is a ResponseWriter whose body writes fail while the connection underneath stays open
+// and silent. net/http closes a connection whose write failed, which cancels the request context by
+// itself, so the real socket cannot tell a handler that ends the watch from one that waits for that.
+type brokenWrites struct{ http.ResponseWriter }
+
+func (brokenWrites) Write([]byte) (int, error)     { return 0, errors.New("write failed") }
+func (b brokenWrites) Unwrap() http.ResponseWriter { return b.ResponseWriter }
+
+// TestWatchAFailedWriteEndsTheWatch. Once a record write has failed the client is gone for good, so
+// the watch must stop at once: a screencast left running until the connection closes keeps encoding
+// frames nobody will receive. The client here stays connected and silent, so only the failed write
+// can end the watch.
+func TestWatchAFailedWriteEndsTheWatch(t *testing.T) {
+	watcher := &sinkingWatcher{Fake: &browser.Fake{FenceAttached: true}, ctxEnded: make(chan struct{})}
+	server := watchServer(t, watcher, func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) { next(brokenWrites{w}, r) }
+	})
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	body := `{"session_id":"s1"}`
+	request := fmt.Sprintf("POST /watch HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
+		token, len(body), body)
+	sent := time.Now()
+	if _, err := io.WriteString(conn, request); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-watcher.ctxEnded:
+	case <-time.After(WatchWriteDeadline + 2*time.Second):
+		t.Fatalf("the watch was still running %v after the request, though a record write had failed", time.Since(sent))
+	}
+}

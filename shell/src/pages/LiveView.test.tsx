@@ -123,6 +123,24 @@ describe("LiveView", () => {
     expect(daemon.openStream).toHaveBeenCalledTimes(1);
   });
 
+  it("clears the last frame and revokes its URL when the wheel is asked for", async () => {
+    const pipe = openPipe();
+    daemon.openStream.mockResolvedValue(pipe.stream);
+
+    render(<LiveView sessionId={7} />);
+    await settle();
+    pipe.send(frame(1, 2, 3));
+    await settle();
+    expect(screen.getByAltText("live view of session 7").getAttribute("src")).toBe("blob:live-1");
+
+    pipe.send(end("wheel"));
+    await settle();
+
+    expect(screen.getByText("The wheel was asked for, or a person has it.")).toBeDefined();
+    expect(screen.queryByRole("img")).toBeNull();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:live-1");
+  });
+
   it("ends on closed and does not reconnect", async () => {
     daemon.openStream.mockImplementation(async () => streamOf(frame(1), end("closed")));
 

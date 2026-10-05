@@ -418,3 +418,74 @@ func TestWatchLastViewerLeavingStopsTheScreencast(t *testing.T) {
 		t.Errorf("Page.stopScreencast was called %d times, want 1", got)
 	}
 }
+
+// TestWatchDeliversNoFrameOnceItsContextIsCancelled. A Go select picks at random between ready
+// cases, so a viewer whose context is cancelled while a frame waits in its slot used to hand that
+// frame to the sink about half the time. Each round cancels from inside the sink (the first frame is
+// the screenshot), waits until a second frame sits in the viewer's slot, and then lets the loop
+// choose: anything the sink is given after that is a frame shown after the end.
+func TestWatchDeliversNoFrameOnceItsContextIsCancelled(t *testing.T) {
+	fake, driver, id := watchSession(t)
+	jpegAnswer(fake, []byte("shot"))
+	fake.Handle("Page.screencastFrameAck", func(cdptest.Call) (any, error) { return nil, nil })
+
+	slotFull := func() bool {
+		driver.mu.Lock()
+		defer driver.mu.Unlock()
+		for _, cast := range driver.casts {
+			for v := range cast.viewers {
+				if len(v.slot) > 0 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	const rounds = 200
+	late := 0
+	for round := 0; round < rounds; round++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		var mu sync.Mutex
+		calls := 0
+		afterCancel := 0
+		sink := func(browser.Frame) {
+			mu.Lock()
+			calls++
+			first := calls == 1
+			if !first {
+				afterCancel++
+			}
+			mu.Unlock()
+			if !first {
+				return
+			}
+			emitFrame(fake, []byte("next"), round+1)
+			deadline := time.Now().Add(3 * time.Second)
+			for !slotFull() && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			cancel()
+		}
+		finished := make(chan struct{})
+		go func() {
+			_ = driver.Watch(ctx, id, sink)
+			close(finished)
+		}()
+		select {
+		case <-finished:
+		case <-time.After(10 * time.Second):
+			cancel()
+			t.Fatalf("round %d: Watch did not return after its context was cancelled", round)
+		}
+		cancel()
+		mu.Lock()
+		if afterCancel > 0 {
+			late++
+		}
+		mu.Unlock()
+	}
+	if late > 0 {
+		t.Errorf("%d of %d rounds handed the sink a frame after the context was cancelled; want none", late, rounds)
+	}
+}
