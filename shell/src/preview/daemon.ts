@@ -8,10 +8,22 @@ import type {
   ProjectRules,
 } from "../data/projects";
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
-import type { FeedEntry, FeedSeen, FeedTimeline, PendingNotification } from "../data/feed";
+import type { FeedEntry, FeedSeen, FeedTimeline, NotifyPolicy, PendingNotification } from "../data/feed";
+import type { MachineConfig, MachineSecret } from "../data/machine-config";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
-import type { BudgetView, HealthReadout, KillSwitchState, ProjectSummary, Proposal, QuotaBrakeView, SidecarState } from "../data/system";
+import type {
+  ApiTokenSummary,
+  BackupInfo,
+  BudgetView,
+  HealthReadout,
+  KillSwitchState,
+  PiiTallyRow,
+  ProjectSummary,
+  Proposal,
+  QuotaBrakeView,
+  SidecarState,
+} from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
 import type { NoteDetail, NoteLink, NotesGraph, OwnerNote } from "../data/owner-notes";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
@@ -2085,6 +2097,87 @@ const EMAIL_CONFIG = {
  * `disabled`, nothing supervises it, and a sidecar list that invented a row for it would contradict
  * the row above.
  */
+/**
+ * Snapshots, named the way `backup.rs` names them (`nucleos-<UTC stamp>-<seq>.db`), newest first,
+ * with one that predates version stamping so the "unknown" migration has a row to show on.
+ */
+/** `backup.rs`'s file name for a snapshot taken `ms` ago — the stamp is what the page dates it by. */
+function snapshotName(ms: number, sequence = 0): string {
+  const stamp = ago(ms).replace(/[-:]/g, "").replace(/\.\d+Z$/, "");
+  return `nucleos-${stamp}.000000000Z-${String(sequence).padStart(4, "0")}.db`;
+}
+
+const BACKUPS: BackupInfo[] = [
+  { name: snapshotName(7 * HOUR), migration_version: 64, size_bytes: 18_874_368 },
+  { name: snapshotName(DAY + 7 * HOUR), migration_version: 64, size_bytes: 18_612_224 },
+  { name: snapshotName(2 * DAY + 2 * HOUR, 1), migration_version: 63, size_bytes: 18_350_080 },
+  { name: snapshotName(2 * DAY + 7 * HOUR), migration_version: 63, size_bytes: 18_087_936 },
+  { name: snapshotName(15 * DAY), migration_version: null, size_bytes: 15_204_352 },
+];
+
+/** This machine's settings files, a few written and most not — the honest state of a new install. */
+const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
+  ["email", "Which mailbox the e-mail pillar reads, and how often.", "host: imap.example.com\nusername: me@example.com\nmailbox: INBOX\npoll_interval_secs: 120\n"],
+  ["voice", "Dictation hotkeys, the clean-up model and how long recordings are kept.", "hotkey: Ctrl+Alt+Space\nretain_dictations_days: 14\n"],
+  ["calendar", "Working hours and the default timezone.", 'default_tz: Europe/Lisbon\nworking_hours_start: "09:00"\nworking_hours_end: "18:00"\n'],
+  ["web", "The search provider and how many results a query returns.", null],
+  ["browser", "Which browser driver the browser pillar starts.", "driver: chrome\n"],
+  ["telegram", "The bot and the chat notifications are sent to.", null],
+  ["github", "Which account `gh` acts as.", null],
+  ["council", "Who sits on the council and how votes are counted.", null],
+  ["models", "Which model each phase uses.", null],
+];
+
+const MACHINE_CONFIG: MachineConfig = {
+  root: "C:/Users/owner/.nucleos",
+  root_display: "~/.nucleos",
+  settings: MACHINE_AREAS.map(([area, what, contents]) => ({
+    path: `${area}.yaml`,
+    display: `~/.nucleos/${area}.yaml`,
+    area,
+    what,
+    takes_effect: "when the daemon restarts",
+    exists: contents !== null,
+    contents,
+    resolved: `C:/Users/owner/.nucleos/${area}.yaml`,
+  })),
+};
+
+const MACHINE_SECRETS: MachineSecret[] = [
+  { key: "email-password", area: "email", what: "the IMAP password", present: true },
+  { key: "telegram-bot-token", area: "telegram", what: "the bot's token", present: false },
+  { key: "github-token", area: "github", what: "the token gh is handed", present: false },
+  { key: "web-search-api-key", area: "web", what: "the search provider's key", present: true },
+];
+
+/** One family silenced, one kind overridden, and a kind no family claims. */
+const NOTIFY_POLICY: NotifyPolicy = {
+  families: [{ selector: "worktree_", enabled: false }],
+  kinds: [{ selector: "job_gc_failed", enabled: false }],
+};
+
+const NOTIFY_KINDS: string[] = [
+  "job_started", "job_failed", "job_gc_failed", "run_started", "run_finished", "run_failed",
+  "worktree_created", "worktree_pruned", "judge_verdict", "vcs_merged", "vcs_conflict",
+  "council_convened", "schedule_reminder", "email_needs_reply", "team_handoff", "web.search_failed",
+  "config_written",
+];
+
+const API_TOKENS: ApiTokenSummary[] = [
+  { name: "phone-shortcuts", level: "read-only", created_at: ago(23 * DAY) },
+  { name: "ci-runner", level: "run-creating", created_at: ago(7 * DAY) },
+  { name: "home-assistant", level: "read-only", created_at: ago(3 * DAY) },
+  { name: "admin-laptop", level: "admin", created_at: ago(36 * DAY) },
+];
+
+const PII: PiiTallyRow[] = [
+  { column: "contacts.email", class: "email", count: 412 },
+  { column: "contacts.phone", class: "phone", count: 287 },
+  { column: "mail.body_text", class: "email", count: 1_934 },
+  { column: "mail.body_text", class: "phone", count: 211 },
+  { column: "mail.body_text", class: "iban", count: 9 },
+];
+
 const SIDECARS: SidecarState[] = [
   {
     name: "echo",
@@ -2393,6 +2486,13 @@ export function answer(path: string, init?: RequestInit): unknown {
   }
 
   if (path === "/sidecars" && init?.method === undefined) return SIDECARS;
+  if (path === "/backups" && init?.method === undefined) return BACKUPS;
+  if (path === "/pii/observations") return PII;
+  if (path === "/api-tokens" && init?.method === undefined) return API_TOKENS;
+  if (path === "/config/machine" && init?.method === undefined) return MACHINE_CONFIG;
+  if (path === "/config/secrets" && init?.method === undefined) return { secrets: MACHINE_SECRETS };
+  if (path === "/notifications/policy" && init?.method === undefined) return NOTIFY_POLICY;
+  if (path === "/notifications/kinds") return NOTIFY_KINDS;
 
   /* The notch's own reading. See `QUOTA` above for why these figures are the shape they are. */
   if (path === "/quota") return QUOTA;

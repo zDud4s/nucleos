@@ -48,7 +48,6 @@ import {
   ConfirmButton,
   CopyOnce,
   ErrorNote,
-  Inset,
   PageHeader,
   Panel,
   Quiet,
@@ -101,7 +100,7 @@ const VIEW_LABEL: Record<SystemView, string> = {
   backups: "Backups",
   tokens: "Tokens",
   notifications: "Notifications",
-  settings: "Settings",
+  settings: "System",
 };
 
 /**
@@ -232,8 +231,12 @@ function HealthView({
     <>
       <HealthReadoutPanel health={health} />
       <SidecarCardsPanel sidecars={sidecars} />
-      <ScopedKillsPanel />
-      <BudgetPanel />
+      {/* Side by side when there is room: neither needs the page's full width,
+          and stacked they made the health view three screens long. */}
+      <div className="sy-health-pair">
+        <ScopedKillsPanel />
+        <BudgetPanel />
+      </div>
     </>
   );
 }
@@ -259,11 +262,11 @@ function HealthReadoutPanel({
         </p>
       )}
       {health.data !== undefined && !isAggregateTimeout(health.data) && (
-        <Rows label="Subsystems">
+        <ul className="sy-subsystems" aria-label="Subsystems">
           {[...health.data.subsystems].sort(bySubsystemHealth).map((row) => (
             <SubsystemRow key={row.name} row={row} />
           ))}
-        </Rows>
+        </ul>
       )}
     </Panel>
   );
@@ -272,25 +275,35 @@ function HealthReadoutPanel({
 function SubsystemRow({ row }: { row: SubsystemReadout }) {
   const key = sidecarKeyOf(row.name);
   return (
-    <Row className="sy-subsystem-row">
-      <span className="sy-subsystem-name">{row.name}</span>
-      <StateBadge domain="pillar" state={row.status} />
-      <span className="sy-meta">{row.reason !== undefined && <>reason: {row.reason}</>}</span>
-      <div className="sy-subsystem-action">
-        {key !== null && row.status === "down" && <RestartSidecar name={key} subject={row.name} />}
+    <li className="sy-subsystem">
+      <div className="sy-subsystem-head">
+        <span className="sy-subsystem-name">{row.name}</span>
+        <StateBadge domain="pillar" state={row.status} />
       </div>
-    </Row>
+      {/* Always drawn, empty or not, so every tile is the same two lines tall. */}
+      <div className="sy-subsystem-foot">
+        <span className="sy-meta sy-subsystem-reason">
+          {row.reason !== undefined && <>reason: {row.reason}</>}
+        </span>
+        {key !== null && row.status === "down" && (
+          <div className="sy-subsystem-action">
+            <RestartSidecar name={key} />
+          </div>
+        )}
+      </div>
+    </li>
   );
 }
 
-function RestartSidecar({ name, subject }: { name: string; subject: string }) {
+function RestartSidecar({ name }: { name: string }) {
   const restart = useRestartSidecar();
   return (
     <>
       <ConfirmButton
         label="Restart"
+        /* No `subject`: the tile already names the sidecar, and the subject drawn into the
+           armed label made the control wider than the tile it sits in. */
         confirmLabel="Start it again"
-        subject={subject}
         variant="quiet"
         disabled={restart.isPending}
         onConfirm={() => {
@@ -351,11 +364,11 @@ function SidecarCardsPanel({
         </ErrorNote>
       )}
       {sidecars.data !== undefined && sidecars.data.length > 0 && (
-        <ul className="sy-sidecars" aria-label="Sidecars">
+        <Rows label="Sidecars">
           {sidecars.data.map((row) => (
             <SidecarCard key={row.name} sidecar={row} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
@@ -363,7 +376,7 @@ function SidecarCardsPanel({
 
 function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
   return (
-    <Inset as="li">
+    <Row dense className="sy-sidecar-row">
       <div className="sy-sidecar-head">
         <span className="sy-sidecar-name">{sidecar.name}</span>
         <span className="sy-sidecar-state">{sidecar.state}</span>
@@ -382,29 +395,33 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
           <dd>{sidecar.restarts}</dd>
         </div>
       </dl>
-      {sidecar.last_failure !== null && (
-        <p className="sy-sidecar-failure" role="alert">
-          {sidecar.last_failure}
-          {sidecar.last_failure_at !== null && (
-            <>
-              {" "}
-              (<RelativeTime at={sidecar.last_failure_at} />)
-            </>
-          )}
-        </p>
-      )}
-      {sidecar.last_line !== null && (
-        <p className="sy-sidecar-line">
-          <code>{sidecar.last_line}</code>
-          {sidecar.last_line_at !== null && (
-            <>
-              {" "}
-              (<RelativeTime at={sidecar.last_line_at} />)
-            </>
-          )}
-        </p>
-      )}
-    </Inset>
+      {/* The third column: what the sidecar last said, and the failure above it when
+          there is one — each one clipped line, the whole text in the tooltip. */}
+      <div className="sy-sidecar-out">
+        {sidecar.last_failure !== null && (
+          <p className="sy-sidecar-failure" role="alert" title={sidecar.last_failure}>
+            {sidecar.last_failure}
+            {sidecar.last_failure_at !== null && (
+              <span className="sy-sidecar-when">
+                {" "}
+                <RelativeTime at={sidecar.last_failure_at} />
+              </span>
+            )}
+          </p>
+        )}
+        {sidecar.last_line !== null && (
+          <p className="sy-sidecar-line" title={sidecar.last_line}>
+            <code>{sidecar.last_line}</code>
+            {sidecar.last_line_at !== null && (
+              <span className="sy-sidecar-when">
+                {" "}
+                <RelativeTime at={sidecar.last_line_at} />
+              </span>
+            )}
+          </p>
+        )}
+      </div>
+    </Row>
   );
 }
 
@@ -439,7 +456,7 @@ function ScopedKillsPanel() {
       )}
       {!projects.isError && projects.data === undefined && <p className="sy-loading">reading the projects…</p>}
       {projects.data !== undefined && projects.data.length > 0 && (
-        <Rows label="Project brakes">
+        <ul className="sy-brakes" aria-label="Project brakes">
           {projects.data.map((project) => {
             const engaged = scopeEngaged(
               kills.data,
@@ -447,12 +464,18 @@ function ScopedKillsPanel() {
               project.project_id,
             );
             return (
-              <Row className="sy-project-brake-row" key={project.project_id}>
-                <span className="sy-project-brake-name">{project.project_id}</span>
+              <li className="sy-brake" key={project.project_id}>
+                <span className="sy-project-brake-name" title={project.project_id}>
+                  {project.project_id}
+                </span>
                 <StateBadge domain="brake" state={engaged ? "held" : "released"} />
                 <Button
                   variant="ghost"
                   intent={engaged ? "go" : "stop"}
+                  /* The tile already names the project; the button says only the verb. */
+                  aria-label={
+                    engaged ? `Release ${project.project_id}` : `Hold ${project.project_id}`
+                  }
                   disabled={kills.data === undefined || setKill.isPending}
                   onClick={() =>
                     setKill.mutate({
@@ -462,14 +485,12 @@ function ScopedKillsPanel() {
                     })
                   }
                 >
-                  {engaged
-                    ? `Release ${project.project_id}`
-                    : `Hold ${project.project_id}`}
+                  {engaged ? "Release" : "Hold"}
                 </Button>
-              </Row>
+              </li>
             );
           })}
-        </Rows>
+        </ul>
       )}
       {setKill.isError && (
         <ErrorNote>
@@ -608,213 +629,200 @@ function BudgetPanel() {
           </div>
         </dl>
       )}
-      {form !== null && (
-        <div className="sy-budget-form">
-          <div className="sy-field">
-            <label htmlFor="sy-budget-window-limit">
-              Window limit (USD, blank = no ceiling)
-            </label>
-            <input
-              id="sy-budget-window-limit"
-              className="sy-field-input"
-              type="text"
-              inputMode="decimal"
-              placeholder="no ceiling"
-              value={form.windowLimit}
-              onChange={(event) => {
-                setForm({ ...form, windowLimit: event.target.value });
-                setBadCeilings([]);
-              }}
-            />
-            <p className="sy-field-hint">
-              currently:{" "}
-              {form.windowLimit.trim() === ""
-                ? "no ceiling"
-                : `$${form.windowLimit}`}
-            </p>
-          </div>
-          <div className="sy-field">
-            <label htmlFor="sy-budget-period">Period</label>
-            <select
-              id="sy-budget-period"
-              className="sy-field-input"
-              value={form.period}
-              onChange={(event) =>
-                setForm({
-                  ...form,
-                  period: event.target.value as BudgetView["period"],
-                })
-              }
-            >
-              {BUDGET_PERIODS.map((period) => (
-                <option key={period} value={period}>
-                  {period}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="sy-field">
-            <label htmlFor="sy-budget-hourly-limit">
-              Hourly limit (USD, blank = no ceiling)
-            </label>
-            <input
-              id="sy-budget-hourly-limit"
-              className="sy-field-input"
-              type="text"
-              inputMode="decimal"
-              placeholder="no ceiling"
-              value={form.hourlyLimit}
-              onChange={(event) => {
-                setForm({ ...form, hourlyLimit: event.target.value });
-                setBadCeilings([]);
-              }}
-            />
-            <p className="sy-field-hint">
-              currently:{" "}
-              {form.hourlyLimit.trim() === ""
-                ? "no ceiling"
-                : `$${form.hourlyLimit}`}
-            </p>
-          </div>
-          <div className="sy-field">
-            <label htmlFor="sy-budget-per-run-reserve">
-              Per-run reserve (USD)
-            </label>
-            <input
-              id="sy-budget-per-run-reserve"
-              className="sy-field-input"
-              type="text"
-              inputMode="decimal"
-              value={form.perRunReserve}
-              onChange={(event) =>
-                setForm({ ...form, perRunReserve: event.target.value })
-              }
-            />
-          </div>
-          <div className="sy-field">
-            <label htmlFor="sy-budget-time-cost">
-              Time cost per hour (USD)
-            </label>
-            <input
-              id="sy-budget-time-cost"
-              className="sy-field-input"
-              type="text"
-              inputMode="decimal"
-              value={form.timeCost}
-              onChange={(event) =>
-                setForm({ ...form, timeCost: event.target.value })
-              }
-            />
-          </div>
-          <ConfirmButton
-            label="Save budget"
-            confirmLabel="Send these five fields to the daemon"
-            variant="ghost"
-            onConfirm={() => {
-              const windowLimit = parseCeiling(form.windowLimit);
-              const hourlyLimit = parseCeiling(form.hourlyLimit);
-              const invalid: string[] = [];
-              if (!windowLimit.ok) invalid.push("the window limit");
-              if (!hourlyLimit.ok) invalid.push("the hourly limit");
-              if (!windowLimit.ok || !hourlyLimit.ok) {
-                setBadCeilings(invalid);
-                return;
-              }
-              setBadCeilings([]);
-              const change: BudgetChange = {
-                limit_usd: windowLimit.value,
-                period: form.period,
-                hourly_limit_usd: hourlyLimit.value,
-                per_run_reserve_usd: parseAmount(form.perRunReserve),
-                time_cost_per_hour_usd: parseAmount(form.timeCost),
-              };
-              setBudget.mutate(change);
-            }}
-          />
-          {badCeilings.length > 0 && (
-            <ErrorNote>
-              the budget was not sent — {badCeilings.join(" and ")} must be a
-              number, or blank for no ceiling
-            </ErrorNote>
-          )}
-          {setBudget.isError && (
-            <ErrorNote>
-              the budget was not changed — the núcleo refused or did not answer
-            </ErrorNote>
-          )}
-        </div>
-      )}
-      {quotaBrakeForm !== null && quotaBrake.data !== undefined && (
-        <section className="sy-budget-form">
-          <h3>Quota brake</h3>
-          <div className="sy-field">
-            <label>
-              <input
-                type="checkbox"
-                checked={quotaBrakeForm.enabled}
-                onChange={(event) =>
-                  setQuotaBrakeForm({ ...quotaBrakeForm, enabled: event.target.checked })
+      <div className="sy-budget-groups">
+        {form !== null && (
+          <section className="sy-budget-group">
+            <h3 className="sy-budget-heading">Spend limits</h3>
+            <div className="sy-budget-fields">
+              <div className="sy-field">
+                <label htmlFor="sy-budget-window-limit">Window limit (USD)</label>
+                <input
+                  id="sy-budget-window-limit"
+                  className="sy-field-input"
+                  type="text"
+                  inputMode="decimal"
+                  placeholder="no ceiling"
+                  value={form.windowLimit}
+                  onChange={(event) => {
+                    setForm({ ...form, windowLimit: event.target.value });
+                    setBadCeilings([]);
+                  }}
+                />
+              </div>
+              <div className="sy-field">
+                <label htmlFor="sy-budget-period">Period</label>
+                <select
+                  id="sy-budget-period"
+                  className="sy-field-input"
+                  value={form.period}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      period: event.target.value as BudgetView["period"],
+                    })
+                  }
+                >
+                  {BUDGET_PERIODS.map((period) => (
+                    <option key={period} value={period}>
+                      {period}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="sy-field">
+                <label htmlFor="sy-budget-hourly-limit">Hourly limit (USD)</label>
+                <input
+                  id="sy-budget-hourly-limit"
+                  className="sy-field-input"
+                  type="text"
+                  inputMode="decimal"
+                  placeholder="no ceiling"
+                  value={form.hourlyLimit}
+                  onChange={(event) => {
+                    setForm({ ...form, hourlyLimit: event.target.value });
+                    setBadCeilings([]);
+                  }}
+                />
+              </div>
+              <div className="sy-field">
+                <label htmlFor="sy-budget-per-run-reserve">Per-run reserve (USD)</label>
+                <input
+                  id="sy-budget-per-run-reserve"
+                  className="sy-field-input"
+                  type="text"
+                  inputMode="decimal"
+                  value={form.perRunReserve}
+                  onChange={(event) =>
+                    setForm({ ...form, perRunReserve: event.target.value })
+                  }
+                />
+              </div>
+              <div className="sy-field">
+                <label htmlFor="sy-budget-time-cost">Time cost per hour (USD)</label>
+                <input
+                  id="sy-budget-time-cost"
+                  className="sy-field-input"
+                  type="text"
+                  inputMode="decimal"
+                  value={form.timeCost}
+                  onChange={(event) =>
+                    setForm({ ...form, timeCost: event.target.value })
+                  }
+                />
+              </div>
+            </div>
+            <ConfirmButton
+              label="Save budget"
+              confirmLabel="Send these five fields to the daemon"
+              variant="ghost"
+              onConfirm={() => {
+                const windowLimit = parseCeiling(form.windowLimit);
+                const hourlyLimit = parseCeiling(form.hourlyLimit);
+                const invalid: string[] = [];
+                if (!windowLimit.ok) invalid.push("the window limit");
+                if (!hourlyLimit.ok) invalid.push("the hourly limit");
+                if (!windowLimit.ok || !hourlyLimit.ok) {
+                  setBadCeilings(invalid);
+                  return;
                 }
-              />
-              Enable quota brake
-            </label>
-          </div>
-          <div className="sy-field">
-            <label htmlFor="sy-quota-brake-five-hour">Pause above 5h usage (%)</label>
-            <input
-              id="sy-quota-brake-five-hour"
-              className="sy-field-input"
-              type="text"
-              inputMode="numeric"
-              value={quotaBrakeForm.fiveHour}
-              onChange={(event) => {
-                setQuotaBrakeForm({ ...quotaBrakeForm, fiveHour: event.target.value });
-                setBadQuotaBrake(false);
+                setBadCeilings([]);
+                const change: BudgetChange = {
+                  limit_usd: windowLimit.value,
+                  period: form.period,
+                  hourly_limit_usd: hourlyLimit.value,
+                  per_run_reserve_usd: parseAmount(form.perRunReserve),
+                  time_cost_per_hour_usd: parseAmount(form.timeCost),
+                };
+                setBudget.mutate(change);
               }}
             />
-          </div>
-          <div className="sy-field">
-            <label htmlFor="sy-quota-brake-seven-day">Pause above 7d usage (%)</label>
-            <input
-              id="sy-quota-brake-seven-day"
-              className="sy-field-input"
-              type="text"
-              inputMode="numeric"
-              value={quotaBrakeForm.sevenDay}
-              onChange={(event) => {
-                setQuotaBrakeForm({ ...quotaBrakeForm, sevenDay: event.target.value });
-                setBadQuotaBrake(false);
-              }}
-            />
+            {badCeilings.length > 0 && (
+              <ErrorNote>
+                the budget was not sent — {badCeilings.join(" and ")} must be a
+                number, or blank for no ceiling
+              </ErrorNote>
+            )}
+            {setBudget.isError && (
+              <ErrorNote>
+                the budget was not changed — the núcleo refused or did not answer
+              </ErrorNote>
+            )}
+          </section>
+        )}
+        {quotaBrakeForm !== null && quotaBrake.data !== undefined && (
+          <section className="sy-budget-group">
+            <h3 className="sy-budget-heading">Quota brake</h3>
+            <div className="sy-field">
+              <label className="sy-check">
+                <input
+                  type="checkbox"
+                  checked={quotaBrakeForm.enabled}
+                  onChange={(event) =>
+                    setQuotaBrakeForm({ ...quotaBrakeForm, enabled: event.target.checked })
+                  }
+                />
+                Enable quota brake
+              </label>
+            </div>
+            <div className="sy-budget-fields">
+              <div className="sy-field">
+                <label htmlFor="sy-quota-brake-five-hour">Pause above 5h usage (%)</label>
+                <input
+                  id="sy-quota-brake-five-hour"
+                  className="sy-field-input"
+                  type="text"
+                  inputMode="numeric"
+                  value={quotaBrakeForm.fiveHour}
+                  onChange={(event) => {
+                    setQuotaBrakeForm({ ...quotaBrakeForm, fiveHour: event.target.value });
+                    setBadQuotaBrake(false);
+                  }}
+                />
+              </div>
+              <div className="sy-field">
+                <label htmlFor="sy-quota-brake-seven-day">Pause above 7d usage (%)</label>
+                <input
+                  id="sy-quota-brake-seven-day"
+                  className="sy-field-input"
+                  type="text"
+                  inputMode="numeric"
+                  value={quotaBrakeForm.sevenDay}
+                  onChange={(event) => {
+                    setQuotaBrakeForm({ ...quotaBrakeForm, sevenDay: event.target.value });
+                    setBadQuotaBrake(false);
+                  }}
+                />
+              </div>
+            </div>
             <p className="sy-field-hint">only {quotaBrake.data.provider}'s windows count</p>
-          </div>
-          <ConfirmButton
-            label="Save quota brake"
-            confirmLabel="Save these three quota brake settings to the daemon"
-            variant="ghost"
-            onConfirm={() => {
-              const fiveHour = parseQuotaPercent(quotaBrakeForm.fiveHour);
-              const sevenDay = parseQuotaPercent(quotaBrakeForm.sevenDay);
-              if (fiveHour === null || sevenDay === null) {
-                setBadQuotaBrake(true);
-                return;
-              }
-              setBadQuotaBrake(false);
-              setQuotaBrake.mutate({
-                enabled: quotaBrakeForm.enabled,
-                pause_above_percent_5h: fiveHour,
-                pause_above_percent_7d: sevenDay,
-              });
-            }}
-          />
-          {badQuotaBrake && (
-            <ErrorNote>the quota brake was not sent — usage must be an integer from 1 to 100</ErrorNote>
-          )}
-          {setQuotaBrake.isError && (
-            <ErrorNote>the quota brake was not changed — the núcleo refused or did not answer</ErrorNote>
-          )}
-        </section>
-      )}
+            <ConfirmButton
+              label="Save quota brake"
+              confirmLabel="Save these three quota brake settings to the daemon"
+              variant="ghost"
+              onConfirm={() => {
+                const fiveHour = parseQuotaPercent(quotaBrakeForm.fiveHour);
+                const sevenDay = parseQuotaPercent(quotaBrakeForm.sevenDay);
+                if (fiveHour === null || sevenDay === null) {
+                  setBadQuotaBrake(true);
+                  return;
+                }
+                setBadQuotaBrake(false);
+                setQuotaBrake.mutate({
+                  enabled: quotaBrakeForm.enabled,
+                  pause_above_percent_5h: fiveHour,
+                  pause_above_percent_7d: sevenDay,
+                });
+              }}
+            />
+            {badQuotaBrake && (
+              <ErrorNote>the quota brake was not sent — usage must be an integer from 1 to 100</ErrorNote>
+            )}
+            {setQuotaBrake.isError && (
+              <ErrorNote>the quota brake was not changed — the núcleo refused or did not answer</ErrorNote>
+            )}
+          </section>
+        )}
+      </div>
     </Panel>
   );
 }
@@ -823,11 +831,25 @@ function BudgetPanel() {
 
 function BackupsView() {
   return (
-    <>
+    <div className="sy-backups-layout">
       <BackupsPanel />
       <PiiObservations />
-    </>
+    </div>
   );
+}
+
+/**
+ * When a snapshot was taken, read back out of its name.
+ *
+ * `backup.rs` names every snapshot `nucleos-<UTC stamp>-<seq>.db`, and that stamp is the only
+ * time the listing carries. A name that does not fit the pattern answers `null` and the row
+ * shows the name alone, rather than a date this page made up.
+ */
+export function takenAt(name: string): string | null {
+  const match = /^nucleos-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/.exec(name);
+  if (match === null) return null;
+  const [, year, month, day, hour, minute, second] = match;
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
 }
 
 /**
@@ -841,21 +863,33 @@ function BackupsPanel() {
   const backups = useBackups();
   const takeBackup = useTakeBackup();
   const noBackups = backups.data !== undefined && backups.data.length === 0;
+  const latest = backups.data?.map((backup) => takenAt(backup.name)).find((at) => at !== null);
+  const total = backups.data?.reduce((sum, backup) => sum + backup.size_bytes, 0) ?? 0;
 
   return (
-    <Panel title="Backups">
+    <Panel
+      title="Backups"
+      aside={
+        <Button variant="ghost" disabled={takeBackup.isPending} onClick={() => takeBackup.mutate()}>
+          Take a backup now
+        </Button>
+      }
+    >
+      {backups.data !== undefined && backups.data.length > 0 && (
+        <p className="sy-backups-summary">
+          {backups.data.length} {backups.data.length === 1 ? "snapshot" : "snapshots"} ·{" "}
+          {formatBytes(total)}
+          {latest !== undefined && (
+            <>
+              {" "}
+              · latest <RelativeTime at={latest} />
+            </>
+          )}
+        </p>
+      )}
       <PanelNote empty={noBackups} says="no backup has been taken yet.">
         Staging a restore changes nothing yet — the swap happens the next time the núcleo starts.
       </PanelNote>
-      <div className="sy-backups-actions">
-        <Button
-          variant="ghost"
-          disabled={takeBackup.isPending}
-          onClick={() => takeBackup.mutate()}
-        >
-          Take a backup now
-        </Button>
-      </div>
       {takeBackup.isError && (
         <ErrorNote>
           the backup was not taken — the núcleo refused or did not answer
@@ -868,11 +902,11 @@ function BackupsPanel() {
         <p className="sy-loading">reading the backups…</p>
       )}
       {backups.data !== undefined && backups.data.length > 0 && (
-        <ul className="sy-backups" aria-label="Backups">
+        <Rows label="Backups">
           {backups.data.map((backup) => (
             <BackupRow key={backup.name} backup={backup} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
@@ -880,32 +914,42 @@ function BackupsPanel() {
 
 function BackupRow({ backup }: { backup: BackupInfo }) {
   const stageRestore = useStageRestore();
+  const at = takenAt(backup.name);
 
   return (
-    <Inset as="li">
-      <div className="sy-backup-head">
-        <span className="sy-backup-name">{backup.name}</span>
-        <span className="sy-backup-meta">
-          {formatBytes(backup.size_bytes)} · migration{" "}
-          {backup.migration_version === null
-            ? "unknown"
-            : backup.migration_version}
-        </span>
+    <Row dense className="sy-backup-row">
+      <span className="sy-backup-when">
+        {at === null ? "—" : <RelativeTime at={at} />}
+      </span>
+      {/* The file name, faint: it is what the daemon calls it, and the date in front of it
+          is the same fact made readable. Clipped, with the whole of it as the tooltip. */}
+      <span className="sy-backup-name" title={backup.name}>
+        {backup.name}
+      </span>
+      <span className="sy-backup-meta">{formatBytes(backup.size_bytes)}</span>
+      <span className="sy-backup-meta">
+        migration {backup.migration_version === null ? "unknown" : backup.migration_version}
+      </span>
+      <div className="sy-backup-action">
+        <ConfirmButton
+          label="Stage a restore"
+          confirmLabel="Restore on next start"
+          variant="ghost"
+          disabled={stageRestore.isPending}
+          onConfirm={() => stageRestore.mutate(backup.name)}
+        />
       </div>
-      <ConfirmButton
-        label="Stage a restore"
-        confirmLabel={`Restore ${backup.name} on next start`}
-        variant="ghost"
-        disabled={stageRestore.isPending}
-        onConfirm={() => stageRestore.mutate(backup.name)}
-      />
       {stageRestore.isSuccess && stageRestore.data !== undefined && (
         <p className="sy-restore-applied" role="status">
           Nothing has changed yet — {stageRestore.data.applies}
         </p>
       )}
-      {stageRestore.isError && <RestoreError error={stageRestore.error} />}
-    </Inset>
+      {stageRestore.isError && (
+        <div className="sy-backup-error">
+          <RestoreError error={stageRestore.error} />
+        </div>
+      )}
+    </Row>
   );
 }
 
@@ -1044,40 +1088,51 @@ function TokensPanel() {
         />
       )}
 
-      <div className="sy-mint-form">
-        <div className="sy-field">
+      {/* One line: name, level, mint. Enter in the name box mints, the way a one-field form
+          is expected to. */}
+      <form
+        className="sy-mint-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!mintToken.isPending) handleMint();
+        }}
+      >
+        <div className="sy-field sy-mint-name">
           <label htmlFor="sy-token-name">Name</label>
           <input
             id="sy-token-name"
             className="sy-field-input"
             type="text"
+            placeholder="e.g. ci-runner"
             value={name}
             onChange={(event) => setName(event.target.value)}
           />
         </div>
         <fieldset className="sy-token-levels">
           <legend>Level</legend>
-          {TOKEN_LEVELS.map((candidate) => (
-            <label key={candidate} className="sy-token-level">
-              <input
-                type="radio"
-                name="sy-token-level"
-                value={candidate}
-                checked={level === candidate}
-                onChange={() => setLevel(candidate)}
-              />
-              {candidate}
-            </label>
-          ))}
+          <div className="sy-token-level-set">
+            {TOKEN_LEVELS.map((candidate) => (
+              <label key={candidate} className="sy-token-level">
+                <input
+                  type="radio"
+                  name="sy-token-level"
+                  value={candidate}
+                  checked={level === candidate}
+                  onChange={() => setLevel(candidate)}
+                />
+                {candidate}
+              </label>
+            ))}
+          </div>
         </fieldset>
         <Button
+          type="submit"
           variant="ghost"
           disabled={mintToken.isPending || name.trim() === ""}
-          onClick={handleMint}
         >
           Mint token
         </Button>
-      </div>
+      </form>
       {mintToken.isError && <MintError error={mintToken.error} />}
 
       {tokens.isError && tokens.data === undefined && (
@@ -1090,11 +1145,11 @@ function TokensPanel() {
         <Quiet says="no token has been minted." />
       )}
       {tokens.data !== undefined && tokens.data.length > 0 && (
-        <ul className="sy-tokens" aria-label="API tokens">
+        <Rows label="API tokens">
           {tokens.data.map((token) => (
             <TokenRow key={token.name} token={token} />
           ))}
-        </ul>
+        </Rows>
       )}
     </Panel>
   );
@@ -1123,23 +1178,35 @@ function TokenRow({ token }: { token: ApiTokenSummary }) {
   const revokeToken = useRevokeToken();
 
   return (
-    <Inset as="li">
-      <div className="sy-token-head">
-        <span className="sy-token-name">{token.name}</span>
+    <Row dense className="sy-token-row">
+      <span className="sy-token-name" title={token.name}>
+        {token.name}
+      </span>
+      <span>
         <Badge tone="info">{token.level}</Badge>
-        <span className="sy-token-meta">
-          minted <RelativeTime at={token.created_at} />
-        </span>
+      </span>
+      <span className="sy-token-meta">
+        minted <RelativeTime at={token.created_at} />
+      </span>
+      <div className="sy-token-action">
+        <ConfirmButton
+          label="Revoke"
+          /* The row names the token; the armed label only has to say the verb is final.
+             With the name in it, every row's button was a different width and the
+             columns before it could not line up. */
+          confirmLabel="Really revoke"
+          sayAs={`Revoke ${token.name}`}
+          variant="danger"
+          disabled={revokeToken.isPending}
+          onConfirm={() => revokeToken.mutate(token.name)}
+        />
       </div>
-      <ConfirmButton
-        label="Revoke"
-        confirmLabel={`Revoke ${token.name}`}
-        variant="danger"
-        disabled={revokeToken.isPending}
-        onConfirm={() => revokeToken.mutate(token.name)}
-      />
-      {revokeToken.isError && <RevokeError error={revokeToken.error} />}
-    </Inset>
+      {revokeToken.isError && (
+        <div className="sy-token-error">
+          <RevokeError error={revokeToken.error} />
+        </div>
+      )}
+    </Row>
   );
 }
 
@@ -1178,11 +1245,11 @@ function RevokeError({ error }: { error: unknown }) {
  */
 function ConfigIndex() {
   return (
-    <>
+    <div className="sy-config-grid">
       <EmailConfigPanel />
       <VoiceConfigPanel />
       <CalendarConfigPanel />
-    </>
+    </div>
   );
 }
 
