@@ -1216,7 +1216,7 @@ pub(crate) mod tests {
         let (_other, other_main, _other_wt) =
             repo_with_an_unseeded_worktree("nucleos-wfmain-", true);
         assert_eq!(
-            seed_workflow(&other_main, &[other_main.clone()]).await,
+            seed_workflow(&other_main, std::slice::from_ref(&other_main)).await,
             Err(SeedRefusal::NotAWorktree)
         );
     }

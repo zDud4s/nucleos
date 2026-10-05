@@ -1916,6 +1916,7 @@ function WorkflowMissing({
       <ConfirmButton
         label="Set up workflow"
         confirmLabel="Set up workflow — copy it from the main checkout, overwriting this worktree's copy"
+        variant="ghost"
         disabled={seed.isPending}
         onConfirm={() => seed.mutate()}
       />
