@@ -3083,6 +3083,35 @@ describe("Chats - giving a conversation a project", () => {
     expect(sentMessages()).toEqual([]);
   });
 
+  it("does not send /orchestrate where the project has no tools even though its workflow is present", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/unwired" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/unwired",
+              tools: false,
+              session: null,
+              permission_mode: "auto",
+              workflow_missing: false,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    // The project read has to land first: the guard reads it, and a send before it would pass.
+    expect(await screen.findByRole("button", { name: "Give it the tools" })).toBeTruthy();
+    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "/orchestrate x" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(/orchestrate needs this conversation/i)).toBeTruthy();
+    expect(sentMessages()).toEqual([]);
+  });
+
   it("says nothing about the workflow for a conversation in the main checkout", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
