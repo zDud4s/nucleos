@@ -1,6 +1,7 @@
 //! The devtime ingestion cycle: walks the transcripts directory read-only, streams each file from
 //! its stored offset, applies the parsed events through `devtime_store`, and rebuilds the lanes of
-//! every session it touched. Owns no SQL and no parse rule.
+//! every session it touched, then hands the touched sessions to the rules pass
+//! (`devtime_rules::run_rules_pass`). Owns no SQL and no parse rule.
 //!
 //! **Read-only on the transcripts.** Files are only ever opened for reading; nothing under the
 //! projects directory is written, moved or removed.
@@ -21,7 +22,8 @@
 use crate::config::DevtimeConfig;
 use crate::devtime_lanes;
 use crate::devtime_map;
-use crate::devtime_parse::{self, Event, EventKind, PARSER_VERSION, Parsed};
+use crate::devtime_parse::{self, Event, EventKind, PARSER_VERSION, ParseVocab, Parsed};
+use crate::devtime_rules::{self, AdapterSources};
 use crate::devtime_store::{
     self, AttemptResult, AttemptRow, CwdMapping, FileCounters, MarkerRow, MessageRow, SessionRow,
 };
@@ -30,6 +32,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 /// The most bytes one transaction covers.
@@ -248,7 +251,7 @@ fn tool_inputs(event: &Event, line: &[u8]) -> Vec<(String, Vec<String>)> {
 }
 
 /// Reads and parses up to one chunk of complete lines from `offset`.
-fn read_chunk(path: &Path, offset: u64) -> std::io::Result<Chunk> {
+fn read_chunk(path: &Path, offset: u64, vocab: Arc<ParseVocab>) -> std::io::Result<Chunk> {
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut reader = BufReader::new(file);
@@ -281,7 +284,7 @@ fn read_chunk(path: &Path, offset: u64) -> std::io::Result<Chunk> {
             continue;
         }
         chunk.lines_read += 1;
-        match devtime_parse::parse_line(line) {
+        match devtime_parse::parse_line_with(line, &vocab) {
             Parsed::Event(event) => {
                 let inputs = tool_inputs(&event, line);
                 chunk.items.push(Item { event, inputs });
@@ -317,6 +320,19 @@ fn lane_of(file_lane: &str, event: &Event) -> String {
 
 fn attempt_id(session: &str, tool_use_id: &str) -> String {
     format!("{session}:{tool_use_id}")
+}
+
+/// A path a call writes, as stored: an absolute one relative to the worktree (see [`rel_path`]), and
+/// a relative one (a `git restore a.rs` names it from the call's own directory) as written, with its
+/// separators normalised.
+fn written_path(worktree: Option<&str>, path: &str) -> String {
+    let unix = path.replace('\\', "/");
+    let absolute = unix.starts_with('/') || unix.as_bytes().get(1) == Some(&b':');
+    if absolute {
+        rel_path(worktree, path)
+    } else {
+        unix.strip_prefix("./").unwrap_or(&unix).to_owned()
+    }
 }
 
 /// A path relative to the session's worktree; outside it, only the basename survives.
@@ -363,11 +379,16 @@ async fn apply_event(
     let event = &item.event;
     let lane = lane_of(ctx.file_lane, event);
     match &event.kind {
-        EventKind::HumanPrompt { .. } => {
+        EventKind::HumanPrompt { correction, .. } => {
             if lane == "main" {
-                let seq =
-                    devtime_store::open_turn(conn, ctx.session, &event.ts, None, PARSER_VERSION)
-                        .await?;
+                let seq = devtime_store::open_turn(
+                    conn,
+                    ctx.session,
+                    &event.ts,
+                    *correction,
+                    PARSER_VERSION,
+                )
+                .await?;
                 *turn = Some(seq);
             }
         }
@@ -403,7 +424,7 @@ async fn apply_event(
                 let files: Vec<String> = tool
                     .files
                     .iter()
-                    .map(|p| rel_path(ctx.worktree, p))
+                    .map(|p| written_path(ctx.worktree, p))
                     .collect();
                 let edits: Vec<Value> = tool
                     .edits
@@ -439,6 +460,7 @@ async fn apply_event(
                         edits: serde_json::to_string(&edits).unwrap_or_default(),
                         reads: serde_json::to_string(&reads).unwrap_or_default(),
                         parser_version: PARSER_VERSION,
+                        refs_in: serde_json::to_string(&tool.refs).unwrap_or_default(),
                         ..Default::default()
                     },
                 )
@@ -475,7 +497,7 @@ async fn apply_event(
                         agent_id: result.agent_id.clone(),
                         model: result.resolved_model.clone(),
                         bg_task_id: result.bg_task_id.clone(),
-                        refs_out: String::new(),
+                        refs_out: serde_json::to_string(&result.refs).unwrap_or_default(),
                     },
                 )
                 .await?;
@@ -496,7 +518,12 @@ async fn apply_event(
                 devtime_store::mark_turn_interrupted(conn, ctx.session, seq).await?;
             }
         }
-        EventKind::Notification { tool_use_id, .. } => {
+        EventKind::Notification {
+            tool_use_id,
+            status,
+            exit_code,
+            ..
+        } => {
             if tool_use_id.is_empty() {
                 return Ok(());
             }
@@ -513,6 +540,12 @@ async fn apply_event(
                 ),
             )
             .await?;
+            // How it ended, for any launch kind: a status outside the closed vocabulary is left out.
+            if let Some(launch) = &launch
+                && devtime_store::BG_STATUSES.contains(&status.as_str())
+            {
+                devtime_store::set_bg_status(conn, &launch.attempt_id, status, *exit_code).await?;
+            }
             // A background Bash really ended when it said so; the earliest sighting is that moment.
             if let Some(launch) = &launch
                 && launch.kind != "agent"
@@ -592,6 +625,7 @@ async fn ingest_file(
     file: &Found,
     project: &str,
     worktree: Option<&str>,
+    vocab: &Arc<ParseVocab>,
     stats: &mut CycleStats,
     touched: &mut BTreeSet<String>,
 ) -> Result<(), Fail> {
@@ -652,7 +686,8 @@ async fn ingest_file(
     loop {
         let path = file.path.clone();
         let from = u64::try_from(offset).unwrap_or(0);
-        let chunk = tokio::task::spawn_blocking(move || read_chunk(&path, from))
+        let vocab = Arc::clone(vocab);
+        let chunk = tokio::task::spawn_blocking(move || read_chunk(&path, from, vocab))
             .await
             .map_err(|error| Fail::Io(std::io::Error::other(error)))??;
 
@@ -716,6 +751,7 @@ pub async fn ingest_cycle(
     let mut mappings: HashMap<PathBuf, Option<CwdMapping>> = HashMap::new();
     let mut counted: HashSet<PathBuf> = HashSet::new();
     let mut touched: BTreeSet<String> = BTreeSet::new();
+    let vocab = Arc::new(ParseVocab::from_config(&cfg.rules.vocab));
 
     for file in &found {
         let mapping = match mappings.get(&file.main) {
@@ -754,6 +790,7 @@ pub async fn ingest_cycle(
                     file,
                     project,
                     worktree.as_deref(),
+                    &vocab,
                     &mut stats,
                     &mut touched,
                 )
@@ -781,6 +818,7 @@ pub async fn ingest_cycle(
     }
 
     let idle = Duration::from_secs(cfg.idle_minutes.saturating_mul(60));
+    let mut lanes_failed: BTreeSet<String> = BTreeSet::new();
     for session in &touched {
         let rebuilt = async {
             let rows = devtime_store::session_rows(pool, session).await?;
@@ -790,7 +828,25 @@ pub async fn ingest_cycle(
         .await;
         if let Err(error) = rebuilt {
             tracing::warn!(%error, session = %session, "devtime: could not rebuild a session's lanes");
+            lanes_failed.insert(session.clone());
         }
+    }
+    // The rules read the spans just rebuilt, so a session whose lanes failed waits for the next cycle.
+    if cfg.rules.enabled {
+        let pass = devtime_rules::run_rules_pass(
+            pool,
+            &cfg.rules,
+            AdapterSources::detect(&cfg.rules.adapters),
+            &touched,
+            &lanes_failed,
+        )
+        .await;
+        tracing::debug!(
+            sessions_ruled = pass.sessions_ruled,
+            sessions_failed = pass.sessions_failed,
+            families_panicked = pass.families_panicked,
+            "devtime: rules pass"
+        );
     }
     stats
 }
@@ -1125,7 +1181,7 @@ mod tests {
     }
 
     async fn dump(pool: &SqlitePool) -> Vec<String> {
-        const TABLES: [&str; 8] = [
+        const TABLES: [&str; 11] = [
             "devtime_files",
             "devtime_sessions",
             "devtime_turns",
@@ -1134,8 +1190,11 @@ mod tests {
             "devtime_spans",
             "devtime_markers",
             "devtime_cwd_map",
+            "devtime_findings",
+            "devtime_attempt_marks",
+            "devtime_turn_stats",
         ];
-        const CLOCK: [&str; 4] = ["updated_at", "resolved_at", "cycle_at", "id"];
+        const CLOCK: [&str; 5] = ["updated_at", "resolved_at", "cycle_at", "id", "rules_at"];
         let mut out = Vec::new();
         for table in TABLES {
             let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
@@ -1396,6 +1455,123 @@ mod tests {
         assert_eq!(rendered, golden);
     }
 
+    /// The 8-hex reference a token is stored as, written out here so the test does not borrow the parser's.
+    fn ref8(token: &str) -> String {
+        Sha256::digest(token.as_bytes())
+            .iter()
+            .take(4)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    async fn attempt_refs(pool: &SqlitePool, tool_use_id: &str) -> (Vec<String>, Vec<String>) {
+        let (refs_in, refs_out): (String, String) =
+            sqlx::query_as("SELECT refs_in, refs_out FROM devtime_attempts WHERE tool_use_id = ?")
+                .bind(tool_use_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (
+            serde_json::from_str(&refs_in).unwrap(),
+            serde_json::from_str(&refs_out).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn v2_rows_store_correction_refs_bg_status_and_git_paths() {
+        let h = harness(&["parallel"]).await;
+        let stamp = |n: u32| format!("2026-10-04T12:00:{n:02}.000Z");
+        let lines = [
+            serde_json::json!({"type": "user", "timestamp": stamp(0), "sessionId": "s-v2",
+                "cwd": ROOT, "entrypoint": "cli", "origin": {"kind": "human"},
+                "message": {"role": "user", "content": "Não era isso, volta"}}),
+            serde_json::json!({"type": "assistant", "timestamp": stamp(2), "sessionId": "s-v2",
+            "cwd": ROOT, "message": {"id": "m-v2", "model": "claude-x",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+            "content": [
+                {"type": "tool_use", "id": "toolu_r", "name": "Read",
+                 "input": {"file_path": format!("{ROOT}/src/a.rs")}},
+                {"type": "tool_use", "id": "toolu_g", "name": "Grep",
+                 "input": {"pattern": "fn main", "path": ROOT}},
+                {"type": "tool_use", "id": "toolu_b", "name": "Bash",
+                 "input": {"command": "cargo build", "run_in_background": true}},
+                {"type": "tool_use", "id": "toolu_gr", "name": "Bash",
+                 "input": {"command": "git restore a.rs"}}
+            ]}}),
+            serde_json::json!({"type": "user", "timestamp": stamp(4), "sessionId": "s-v2",
+            "cwd": ROOT, "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_r", "content": "file body"},
+                {"type": "tool_result", "tool_use_id": "toolu_g",
+                 "content": "src/a.rs:12: fn main() {}"},
+                {"type": "tool_result", "tool_use_id": "toolu_gr", "content": ""}
+            ]}}),
+            serde_json::json!({"type": "user", "timestamp": stamp(5), "sessionId": "s-v2",
+            "cwd": ROOT, "toolUseResult": {"backgroundTaskId": "bV2"},
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_b", "content": "started"}
+            ]}}),
+            serde_json::json!({"type": "queue-operation", "operation": "enqueue",
+                "timestamp": stamp(9), "sessionId": "s-v2",
+                "content": "<task-notification>\n<task-id>bV2</task-id>\n<tool-use-id>toolu_b</tool-use-id>\n\
+                            <status>completed</status>\n<summary>Background command \"cargo build\" completed (exit code 2)</summary>\n</task-notification>"}),
+        ];
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(proj_file(&h, "s-v2.jsonl"), body).unwrap();
+
+        let stats = ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        assert_eq!(stats.lines_failed, 0);
+
+        let corrected: Option<i64> = sqlx::query_scalar(
+            "SELECT opens_with_correction FROM devtime_turns WHERE session_id = 's-v2'",
+        )
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            corrected,
+            Some(1),
+            "the prompt opens with a correction opener"
+        );
+
+        let (read_in, read_out) = attempt_refs(&h.pool, "toolu_r").await;
+        let (grep_in, grep_out) = attempt_refs(&h.pool, "toolu_g").await;
+        assert_eq!(read_in, vec![ref8("a.rs")]);
+        assert!(read_out.is_empty(), "{read_out:?}");
+        assert_eq!(grep_in, vec![ref8("proj")]);
+        assert_eq!(grep_out, vec![ref8("a.rs")]);
+        assert!(
+            read_in.iter().any(|r| grep_out.contains(r)),
+            "the read used what the grep returned"
+        );
+
+        let (status, exit_code, task): (Option<String>, Option<i64>, Option<String>) =
+            sqlx::query_as(
+                "SELECT bg_status, exit_code, bg_task_id FROM devtime_attempts
+                 WHERE tool_use_id = 'toolu_b'",
+            )
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(exit_code, Some(2));
+        assert_eq!(task.as_deref(), Some("bV2"));
+
+        let files: String =
+            sqlx::query_scalar("SELECT files FROM devtime_attempts WHERE tool_use_id = 'toolu_gr'")
+                .fetch_one(&h.pool)
+                .await
+                .unwrap();
+        assert_eq!(files, r#"["a.rs"]"#);
+
+        let versions: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT parser_version FROM devtime_attempts WHERE session_id = 's-v2'",
+        )
+        .fetch_all(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(versions, vec![PARSER_VERSION]);
+    }
+
     const SENTINEL: &str = "SECRET-TEXT-42";
 
     #[tokio::test]
@@ -1445,6 +1621,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(secret_rows, 2, "the sentinel session was ingested");
+        // The sentinel looks like an id, so it was tokenized: what is stored is its hash.
+        let refs_in: String = sqlx::query_scalar(
+            "SELECT refs_in FROM devtime_attempts WHERE tool_use_id = 'toolu_sec1'",
+        )
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_ne!(
+            refs_in, "[]",
+            "the sentinel was read, and kept only as a hash"
+        );
+        // The prompt was evaluated against the openers, and only the flag was kept.
+        let corrected: Option<i64> = sqlx::query_scalar(
+            "SELECT opens_with_correction FROM devtime_turns WHERE session_id = 's-secret'",
+        )
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(corrected, Some(0));
 
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'devtime\\_%' ESCAPE '\\'",
@@ -1453,6 +1648,17 @@ mod tests {
         .await
         .unwrap();
         assert!(tables.len() >= 9, "{tables:?}");
+        for table in [
+            "devtime_findings",
+            "devtime_attempt_marks",
+            "devtime_turn_stats",
+            "devtime_feedback",
+        ] {
+            assert!(
+                tables.iter().any(|t| t == table),
+                "{table} is part of the scan: {tables:?}"
+            );
+        }
         for table in tables {
             let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT name FROM pragma_table_info('{table}') WHERE upper(type) = 'TEXT'"

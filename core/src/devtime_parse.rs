@@ -3,10 +3,15 @@
 //! Also strips a line down to its structure, for fixtures.
 //!
 //! **What it keeps.** Timestamps, ids, token counts, tool names, a program token (`cargo test`) and a
-//! sha256 prefix of the whitespace-collapsed command, closed outcome and error tokens, and the hashes
-//! of edited text. **What it never keeps** is message text, thinking, file contents, error text or the
+//! sha256 prefix of the whitespace-collapsed command, closed outcome and error tokens, the hashes
+//! of edited text, and (parser v2) 8-hex hashes of the basenames and ids a call or result mentions.
+//! **What it never keeps** is message text, thinking, file contents, error text or the
 //! arguments of a command: the privacy line of the devtime spec (§3.1/§8) is drawn here, before
 //! anything reaches a row. Paths stay absolute and are relativised by the ingestion packet.
+//!
+//! **Vocabulary (v2).** A [`ParseVocab`] (the config's `rules.vocab`) is matched against prompts and
+//! error text in memory: the prompt gives one flag (does it open with a correction opener) and a
+//! failed result gives one class token. The words themselves are never stored.
 //!
 //! The parser is total: a line it cannot read is [`Parsed::Failed`], an unfamiliar `type` is
 //! [`Parsed::Unknown`], and neither panics. It builds on `serde_json::Value` rather than a typed
@@ -16,19 +21,22 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 use crate::command_reader::{self, Shell};
+use crate::config::DevtimeVocabConfig;
 
 /// The parser generation. Derived rows carry it so a parser fix can re-derive what it changed.
-pub const PARSER_VERSION: i64 = 1;
+/// Version 2 adds the correction flag, the `wrong_shell` class, `refs` and git paths.
+pub const PARSER_VERSION: i64 = 2;
 
 const INTERRUPT_MARK: &str = "[Request interrupted by user";
 const DENIAL_MARKS: [&str; 3] = ["doesn't want to proceed", "User rejected", "user declined"];
 const NOTIFICATION_TAG: &str = "<task-notification>";
 
-/// The closed vocabulary of `ToolResult::error_class`.
-#[cfg_attr(not(test), allow(dead_code))]
-pub const ERROR_CLASSES: [&str; 8] = [
+/// The closed vocabulary of `ToolResult::error_class`. `config::RULES_ERROR_CLASSES` lists the same
+/// tokens in the same order, and a test holds the two equal.
+pub const ERROR_CLASSES: [&str; 9] = [
     "exit_nonzero",
     "exit_75",
     "timeout",
@@ -36,14 +44,110 @@ pub const ERROR_CLASSES: [&str; 8] = [
     "permission_denied",
     "hook_block",
     "edit_not_found",
+    "wrong_shell",
     "tool_error",
+];
+
+/// The order a failed result's text is classified in: the first class that matches wins. A hook
+/// rejection carries `Exit code 1` and a wrong-shell failure usually does too, so the bare exit code
+/// is a late resort, and `tool_error` (nothing matched) is the fallback after the list.
+const CLASS_PRECEDENCE: [&str; 7] = [
+    "exit_75",
+    "timeout",
+    "wrong_shell",
+    "hook_block",
+    "permission_denied",
+    "edit_not_found",
+    "exit_nonzero",
 ];
 
 /// Programs whose second word (a subcommand) is part of what the command is. Everything else keeps
 /// the program alone: `ls -la` and `ls src` are the same program.
-const SUBCOMMAND_PROGRAMS: [&str; 9] = [
-    "cargo", "git", "npm", "npx", "go", "python", "python3", "node", "bash",
+const SUBCOMMAND_PROGRAMS: [&str; 13] = [
+    "cargo", "git", "npm", "npx", "go", "python", "python3", "node", "bash", "make", "dotnet",
+    "yarn", "pnpm",
 ];
+
+/// The most reference hashes one tool call or result keeps.
+const REFS_CAP: usize = 256;
+/// A text longer than this is read only up to here when its reference tokens are taken.
+const REFS_SCAN_BYTES: usize = 200_000;
+/// Input keys that carry bodies of text, not something a later call could refer to.
+const NO_REF_KEYS: [&str; 5] = ["content", "old_string", "new_string", "new_source", "edits"];
+
+/// The words the parser matches in memory (the config's `rules.vocab`), and nothing it keeps: only
+/// the derived flag or token is ever stored.
+#[derive(Debug, Clone, Default)]
+pub struct ParseVocab {
+    /// Lower-cased and non-empty. Empty means the correction flag is not evaluated.
+    pub correction_openers: Vec<String>,
+    /// Extra substrings per error class, none of them empty.
+    pub signatures: Vec<(&'static str, Vec<String>)>,
+}
+
+impl ParseVocab {
+    /// No vocabulary: no correction flag, and only the built-in error detectors.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Takes the openers and the signatures of the classes this parser knows; a key outside
+    /// [`ERROR_CLASSES`] is ignored (the config validates it, so none arrives).
+    pub fn from_config(vocab: &DevtimeVocabConfig) -> Self {
+        let correction_openers = vocab
+            .correction_openers
+            .iter()
+            .map(|opener| opener.trim().to_lowercase())
+            .filter(|opener| !opener.is_empty())
+            .collect();
+        let signatures = ERROR_CLASSES
+            .iter()
+            .filter_map(|class| {
+                let list = vocab.error_signatures.get(*class)?;
+                let list: Vec<String> = list.iter().filter(|s| !s.is_empty()).cloned().collect();
+                Some((*class, list))
+            })
+            .collect();
+        Self {
+            correction_openers,
+            signatures,
+        }
+    }
+
+    /// Whether a prompt opens with one of the correction openers, at a word boundary. `None` when no
+    /// opener is configured: the turn was not evaluated.
+    fn correction_flag(&self, prompt: &str) -> Option<bool> {
+        if self.correction_openers.is_empty() {
+            return None;
+        }
+        let window = self
+            .correction_openers
+            .iter()
+            .map(|opener| opener.chars().count())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let head: String = prompt
+            .trim_start()
+            .chars()
+            .take(window)
+            .flat_map(char::to_lowercase)
+            .collect();
+        Some(self.correction_openers.iter().any(|opener| {
+            head.strip_prefix(opener.as_str()).is_some_and(|rest| {
+                !opener.ends_with(char::is_alphanumeric)
+                    || !rest.chars().next().is_some_and(char::is_alphanumeric)
+            })
+        }))
+    }
+
+    fn matches(&self, class: &str, text: &str) -> bool {
+        self.signatures
+            .iter()
+            .any(|(known, list)| *known == class && list.iter().any(|s| text.contains(s.as_str())))
+    }
+}
 
 /// Record types the parser knows. Anything else is `Unknown`, counted and never a failure.
 const KNOWN_TYPES: [&str; 10] = [
@@ -102,6 +206,9 @@ pub enum EventKind {
     HumanPrompt {
         /// The prompt's text mentions the interrupt mark somewhere other than at its start.
         interrupted_marker: bool,
+        /// The prompt opens with a correction opener; `None` when none is configured (not evaluated).
+        /// Only this flag is kept, never the prompt.
+        correction: Option<bool>,
     },
     Interrupt,
     Notification {
@@ -125,12 +232,15 @@ pub struct ToolUse {
     /// First 16 hex chars of the sha256 of the whitespace-collapsed command.
     pub cmd_hash: Option<String>,
     pub timeout_ms: Option<i64>,
-    /// Absolute paths the call writes.
+    /// Absolute paths the call writes; for a Bash call, the paths a `git checkout`/`git restore`
+    /// names, as written (relative ones stay relative).
     pub files: Vec<String>,
     /// `(path, before_hash, after_hash)`; a hash of text that is not in the input is the hash of `""`.
     pub edits: Vec<(String, String, String)>,
     /// `(path, offset)`, offset 0 when absent.
     pub reads: Vec<(String, i64)>,
+    /// Sorted, deduplicated 8-hex hashes of the basenames and ids the input mentions.
+    pub refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +256,8 @@ pub struct ToolResult {
     pub resolved_model: Option<String>,
     pub async_launched: bool,
     pub bg_task_id: Option<String>,
+    /// Sorted, deduplicated 8-hex hashes of the basenames and ids the result text mentions.
+    pub refs: Vec<String>,
 }
 
 fn text_of<'a>(map: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -169,8 +281,84 @@ fn sha16(text: &str) -> String {
         .collect()
 }
 
-/// PURE: one transcript line to one [`Parsed`]. Never panics, never keeps text.
+/// The first 8 hex chars of the sha256 of `text`: the form a reference is stored in.
+fn sha8(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `name.ext` with a short alphanumeric extension that has a letter in it (so `1.5` is not one) and
+/// something before the dot or a long enough extension (so `e.g` is not one, and `.env` is).
+fn has_extension(name: &str) -> bool {
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    (1..=8).contains(&ext.len())
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        && ext.chars().any(|c| c.is_ascii_alphabetic())
+        && stem.len() + ext.len() >= 3
+}
+
+/// A long token of letters, digits, `_` and `-` with both a letter and a digit in it: a tool-use id,
+/// an agent id, a task id, a hash.
+fn is_id_like(token: &str) -> bool {
+    (8..=64).contains(&token.len())
+        && token.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && token.chars().any(|c| c.is_ascii_digit())
+        && token.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// The reference hash of one token, when it looks like a file or an id. A file is named by its
+/// lower-cased basename, so `C:/x/core/src/a.rs` and `core/src/a.rs:12:` are the same reference.
+fn ref_of(token: &str) -> Option<String> {
+    let token = token.trim_end_matches(['.', '/', '\\']);
+    let token = token.strip_prefix("./").unwrap_or(token);
+    let name = token.rsplit(['/', '\\']).next().unwrap_or("");
+    if name.is_empty() {
+        return None;
+    }
+    let has_separator = name.len() != token.len();
+    let wanted = has_extension(name)
+        || (has_separator && name.chars().count() >= 3)
+        || (!has_separator && is_id_like(name));
+    wanted.then(|| sha8(&name.to_lowercase()))
+}
+
+/// Adds the reference hashes of `text` to `into`. The text is read here and dropped: only hashes
+/// of its tokens leave.
+fn collect_refs(text: &str, into: &mut BTreeSet<String>) {
+    let mut end = text.len().min(REFS_SCAN_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let delimiter = |c: char| c.is_whitespace() || "\"'`()[]{}<>,;:=|*?!#$&@^~+%".contains(c);
+    for token in text[..end].split(delimiter) {
+        if let Some(reference) = ref_of(token) {
+            into.insert(reference);
+        }
+    }
+}
+
+/// Sorted, deduplicated and capped.
+fn finish_refs(set: BTreeSet<String>) -> Vec<String> {
+    set.into_iter().take(REFS_CAP).collect()
+}
+
+/// PURE: one transcript line to one [`Parsed`], with no vocabulary: no correction flag, and only
+/// the built-in error detectors.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_line(line: &[u8]) -> Parsed {
+    parse_line_with(line, &ParseVocab::empty())
+}
+
+/// PURE: one transcript line to one [`Parsed`]. Never panics, never keeps text.
+pub fn parse_line_with(line: &[u8], vocab: &ParseVocab) -> Parsed {
     let Ok(value) = serde_json::from_slice::<Value>(line) else {
         return Parsed::Failed;
     };
@@ -182,7 +370,7 @@ pub fn parse_line(line: &[u8]) -> Parsed {
     };
     match kind {
         "assistant" => parse_assistant(rec),
-        "user" => parse_user(rec),
+        "user" => parse_user(rec, vocab),
         "system" => parse_system(rec),
         "queue-operation" => parse_queue(rec),
         k if KNOWN_TYPES.contains(&k) => Parsed::Skipped,
@@ -278,6 +466,7 @@ fn parse_tool_use(block: &Map<String, Value>) -> ToolUse {
         files: Vec::new(),
         edits: Vec::new(),
         reads: Vec::new(),
+        refs: Vec::new(),
         name,
     };
     let hash_of = |key: &str| sha16(text_of(input, key).unwrap_or(""));
@@ -292,6 +481,7 @@ fn parse_tool_use(block: &Map<String, Value>) -> ToolUse {
                 };
                 tool.cmd_program = command_program(cmd, shell);
                 tool.cmd_hash = Some(sha16(&cmd.split_whitespace().collect::<Vec<_>>().join(" ")));
+                tool.files = git_paths(cmd, shell);
             }
         }
         "Edit" => {
@@ -337,7 +527,63 @@ fn parse_tool_use(block: &Map<String, Value>) -> ToolUse {
         }
         _ => {}
     }
+    let mut refs = BTreeSet::new();
+    for (key, value) in input {
+        if let Some(text) = value.as_str()
+            && !NO_REF_KEYS.contains(&key.as_str())
+        {
+            collect_refs(text, &mut refs);
+        }
+    }
+    tool.refs = finish_refs(refs);
     tool
+}
+
+/// The paths a `git checkout` or `git restore` names, which is the only thing a Bash call writes
+/// that its input says plainly: the words after `--`, or for `restore` its non-flag arguments. The
+/// subcommand is looked for in the first non-`cd` segment only, as [`command_program`] does, and
+/// `git checkout main` names none.
+fn git_paths(cmd: &str, shell: Shell) -> Vec<String> {
+    for segment in command_reader::segments(cmd, shell) {
+        let mut words = segment.split_whitespace().skip_while(|w| is_assignment(w));
+        let Some(first) = words.next() else { continue };
+        let program = program_of(first);
+        if program.is_empty() || program == "cd" {
+            continue;
+        }
+        if program != "git" {
+            return Vec::new();
+        }
+        let sub = match words.next() {
+            Some(sub) if sub == "checkout" || sub == "restore" => sub,
+            _ => return Vec::new(),
+        };
+        let rest: Vec<&str> = words.collect();
+        let paths: Vec<&str> = match rest.iter().position(|w| *w == "--") {
+            Some(at) => rest[at + 1..].to_vec(),
+            None if sub == "restore" => {
+                let mut kept = Vec::new();
+                let mut skip_value = false;
+                for word in rest {
+                    if skip_value {
+                        skip_value = false;
+                    } else if matches!(word, "-s" | "--source") {
+                        skip_value = true;
+                    } else if !word.starts_with('-') {
+                        kept.push(word);
+                    }
+                }
+                kept
+            }
+            None => Vec::new(),
+        };
+        return paths
+            .into_iter()
+            .map(|p| p.trim_matches(|c| c == '"' || c == '\'').to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+    }
+    Vec::new()
 }
 
 fn program_of(word: &str) -> String {
@@ -400,33 +646,32 @@ fn exit_code_of(text: &str) -> Option<i64> {
     rest[..end].parse().ok()
 }
 
-/// The closed class of a failed result's text, and its exit code when the class carries one.
-fn classify_error(text: &str) -> (&'static str, Option<i64>) {
-    if let Some(code) = exit_code_of(text) {
-        return (
-            if code == 75 {
-                "exit_75"
-            } else {
-                "exit_nonzero"
-            },
-            Some(code),
-        );
+/// The closed class of a failed result's text, by [`CLASS_PRECEDENCE`], and its exit code whatever
+/// the class. A class matches on its built-in detector or on the vocabulary's signatures.
+fn classify_error(text: &str, vocab: &ParseVocab) -> (&'static str, Option<i64>) {
+    let code = exit_code_of(text);
+    for class in CLASS_PRECEDENCE {
+        let built_in = match class {
+            "exit_75" => code == Some(75),
+            "timeout" => text.contains("Command timed out"),
+            "hook_block" => text.contains("PreToolUse") && text.contains("hook"),
+            "permission_denied" => DENIAL_MARKS.iter().any(|m| text.contains(m)),
+            "edit_not_found" => text.contains("String to replace not found"),
+            "exit_nonzero" => code.is_some(),
+            _ => false,
+        };
+        if built_in || vocab.matches(class, text) {
+            return (class, code);
+        }
     }
-    let class = if text.contains("Command timed out") {
-        "timeout"
-    } else if DENIAL_MARKS.iter().any(|m| text.contains(m)) {
-        "permission_denied"
-    } else if text.contains("PreToolUse") && text.contains("hook") {
-        "hook_block"
-    } else if text.contains("String to replace not found") {
-        "edit_not_found"
-    } else {
-        "tool_error"
-    };
-    (class, None)
+    ("tool_error", code)
 }
 
-fn parse_tool_results(rec: &Map<String, Value>, blocks: &[Value]) -> Vec<ToolResult> {
+fn parse_tool_results(
+    rec: &Map<String, Value>,
+    blocks: &[Value],
+    vocab: &ParseVocab,
+) -> Vec<ToolResult> {
     let own: Vec<&Map<String, Value>> = blocks
         .iter()
         .filter_map(Value::as_object)
@@ -454,7 +699,7 @@ fn parse_tool_results(rec: &Map<String, Value>, blocks: &[Value]) -> Vec<ToolRes
             let (error_class, exit_code) = if interrupted {
                 (Some("interrupted"), None)
             } else if is_error {
-                let (class, code) = classify_error(&text);
+                let (class, code) = classify_error(&text, vocab);
                 (Some(class), code)
             } else {
                 (None, None)
@@ -468,6 +713,8 @@ fn parse_tool_results(rec: &Map<String, Value>, blocks: &[Value]) -> Vec<ToolRes
             } else {
                 "ok"
             };
+            let mut refs = BTreeSet::new();
+            collect_refs(&text, &mut refs);
             ToolResult {
                 tool_use_id: text_of(block, "tool_use_id").unwrap_or("").to_string(),
                 is_error,
@@ -478,6 +725,7 @@ fn parse_tool_results(rec: &Map<String, Value>, blocks: &[Value]) -> Vec<ToolRes
                 resolved_model: meta_str("resolvedModel"),
                 async_launched,
                 bg_task_id,
+                refs: finish_refs(refs),
             }
         })
         .collect()
@@ -496,7 +744,7 @@ fn text_pieces(content: Option<&Value>) -> Vec<String> {
     }
 }
 
-fn parse_user(rec: &Map<String, Value>) -> Parsed {
+fn parse_user(rec: &Map<String, Value>, vocab: &ParseVocab) -> Parsed {
     if rec.get("isMeta").and_then(Value::as_bool) == Some(true) {
         return Parsed::Skipped;
     }
@@ -506,7 +754,10 @@ fn parse_user(rec: &Map<String, Value>) -> Parsed {
             .iter()
             .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
     {
-        return wrap(rec, EventKind::ToolResults(parse_tool_results(rec, blocks)));
+        return wrap(
+            rec,
+            EventKind::ToolResults(parse_tool_results(rec, blocks, vocab)),
+        );
     }
     let pieces = text_pieces(content);
     if pieces
@@ -537,6 +788,7 @@ fn parse_user(rec: &Map<String, Value>) -> Parsed {
         rec,
         EventKind::HumanPrompt {
             interrupted_marker: joined.contains(INTERRUPT_MARK),
+            correction: vocab.correction_flag(&joined),
         },
     )
 }
@@ -899,7 +1151,9 @@ fn text_marker(text: &str) -> String {
     "[text]".into()
 }
 
-/// The canonical stand-in for a `tool_result`'s content: the one mark the classifier reads, or empty.
+/// The canonical stand-in for a `tool_result`'s content: the marks the classifier reads (the class's
+/// own and the exit code, which every class keeps), or empty. A class that only the vocabulary can
+/// give (`wrong_shell`) has no built-in mark, so it leaves none.
 #[cfg_attr(not(test), allow(dead_code))]
 fn result_marker(text: &str, is_error: bool) -> String {
     if text.contains(INTERRUPT_MARK) {
@@ -908,14 +1162,21 @@ fn result_marker(text: &str, is_error: bool) -> String {
     if !is_error {
         return String::new();
     }
-    match classify_error(text) {
-        ("exit_nonzero" | "exit_75", Some(code)) => format!("Exit code {code}"),
-        ("timeout", _) => "Command timed out".into(),
-        ("permission_denied", _) => DENIAL_MARKS[0].into(),
-        ("hook_block", _) => "PreToolUse hook".into(),
-        ("edit_not_found", _) => "String to replace not found".into(),
-        _ => String::new(),
+    let (class, code) = classify_error(text, &ParseVocab::empty());
+    let mut marks: Vec<String> = Vec::new();
+    match class {
+        "timeout" => marks.push("Command timed out".into()),
+        "permission_denied" => marks.push(DENIAL_MARKS[0].into()),
+        "hook_block" => marks.push("PreToolUse hook".into()),
+        "edit_not_found" => marks.push("String to replace not found".into()),
+        // `exit_*` and `tool_error` keep only the exit code below; `wrong_shell` can only come from
+        // the vocabulary, which a stripped line does not carry, so its mark is empty.
+        _ => {}
     }
+    if let Some(code) = code {
+        marks.push(format!("Exit code {code}"));
+    }
+    marks.join("\n")
 }
 
 #[cfg(test)]
@@ -1072,7 +1333,8 @@ mod tests {
         assert_eq!(
             event(parse_line(&human)).kind,
             EventKind::HumanPrompt {
-                interrupted_marker: false
+                interrupted_marker: false,
+                correction: None,
             }
         );
     }
@@ -1086,7 +1348,8 @@ mod tests {
         assert_eq!(
             event(parse_line(&human)).kind,
             EventKind::HumanPrompt {
-                interrupted_marker: false
+                interrupted_marker: false,
+                correction: None,
             }
         );
         let other = user_line(
@@ -1337,33 +1600,266 @@ mod tests {
             "permission_denied",
             "hook_block",
             "edit_not_found",
+            "wrong_shell",
             "tool_error",
         ] {
             assert!(ERROR_CLASSES.contains(&class), "{class}");
         }
-        assert_eq!(ERROR_CLASSES.len(), 8);
+        assert_eq!(ERROR_CLASSES.len(), 9);
     }
 
     /// The fields a stripped line legitimately changes: the cwd is rewritten onto the fixture root, paths
-    /// become relative, and the hashes of text that is no longer there cannot survive. Counts do.
+    /// become relative, and the hashes of text that is no longer there cannot survive (the command hash,
+    /// the references, the correction flag). Counts do.
     fn normalised(p: Parsed) -> Parsed {
         let Parsed::Event(mut e) = p else { return p };
         e.cwd = None;
-        if let EventKind::Assistant { tool_uses, .. } = &mut e.kind {
-            for t in tool_uses {
-                t.cmd_hash = None;
-                for f in &mut t.files {
-                    f.clear();
-                }
-                for ed in &mut t.edits {
-                    *ed = (String::new(), String::new(), String::new());
-                }
-                for rd in &mut t.reads {
-                    rd.0.clear();
+        match &mut e.kind {
+            EventKind::Assistant { tool_uses, .. } => {
+                for t in tool_uses {
+                    t.cmd_hash = None;
+                    t.refs.clear();
+                    for f in &mut t.files {
+                        f.clear();
+                    }
+                    for ed in &mut t.edits {
+                        *ed = (String::new(), String::new(), String::new());
+                    }
+                    for rd in &mut t.reads {
+                        rd.0.clear();
+                    }
                 }
             }
+            EventKind::ToolResults(results) => {
+                for r in results {
+                    r.refs.clear();
+                }
+            }
+            EventKind::HumanPrompt { correction, .. } => *correction = None,
+            _ => {}
         }
         Parsed::Event(e)
+    }
+
+    fn default_vocab() -> ParseVocab {
+        ParseVocab::from_config(&DevtimeVocabConfig::default())
+    }
+
+    /// The reference a token is stored as, written out here so the test does not borrow the parser's.
+    fn ref8(token: &str) -> String {
+        sha16(token)[..8].to_string()
+    }
+
+    fn tool_uses_of(l: &[u8]) -> Vec<ToolUse> {
+        match event(parse_line(l)).kind {
+            EventKind::Assistant { tool_uses, .. } => tool_uses,
+            other => panic!("expected an assistant, got {other:?}"),
+        }
+    }
+
+    fn bash_line(command: &str) -> Vec<u8> {
+        assistant_line(
+            "msg_g",
+            "claude-x",
+            json!({}),
+            json!([{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": command}}]),
+        )
+    }
+
+    #[test]
+    fn parser_version_is_two_and_error_classes_include_wrong_shell() {
+        assert_eq!(PARSER_VERSION, 2);
+        assert_eq!(ERROR_CLASSES.len(), 9);
+        assert!(ERROR_CLASSES.contains(&"wrong_shell"));
+        assert_eq!(
+            ERROR_CLASSES[..],
+            crate::config::RULES_ERROR_CLASSES[..],
+            "the parser and the config validator name the same classes"
+        );
+        // The classifier's own precedence list and its fallback together cover the text-classifiable
+        // classes, and each is a member of the closed vocabulary.
+        for class in CLASS_PRECEDENCE {
+            assert!(ERROR_CLASSES.contains(&class), "{class}");
+        }
+    }
+
+    #[test]
+    fn correction_opener_is_flagged_in_memory_only() {
+        let vocab = default_vocab();
+        let flag = |vocab: &ParseVocab, prompt: &str| {
+            let l = user_line(json!({"origin": {"kind": "human"}}), json!(prompt));
+            let ev = event(parse_line_with(&l, vocab));
+            let dump = format!("{ev:?}");
+            assert!(
+                !dump.contains("volta") && !dump.contains("add X"),
+                "the event holds no text: {dump}"
+            );
+            match ev.kind {
+                EventKind::HumanPrompt { correction, .. } => correction,
+                other => panic!("expected a prompt, got {other:?}"),
+            }
+        };
+        assert_eq!(flag(&vocab, "Não era isso, volta"), Some(true));
+        assert_eq!(flag(&vocab, "  nope, try again"), Some(true));
+        assert_eq!(flag(&vocab, "Now add X"), Some(false), "a word boundary");
+        assert_eq!(flag(&vocab, "Nothing changes, add X"), Some(false));
+        assert_eq!(
+            flag(&vocab, "Não era isso, volta"),
+            flag(&vocab, "NÃO era isso, volta")
+        );
+        let empty = ParseVocab::empty();
+        assert_eq!(flag(&empty, "Não era isso, volta"), None);
+        assert_eq!(flag(&empty, "Now add X"), None);
+    }
+
+    #[test]
+    fn configured_signatures_classify_wrong_shell_and_hook_before_exit_code() {
+        let vocab = default_vocab();
+        let classify = |text: &str| {
+            let l = tool_result_line(
+                json!({}),
+                json!({"type": "tool_result", "tool_use_id": "t", "is_error": true, "content": text}),
+            );
+            let r = results(parse_line_with(&l, &vocab)).remove(0);
+            (r.error_class, r.exit_code)
+        };
+        assert_eq!(
+            classify("Exit code 1\nParserError: unexpected token"),
+            (Some("wrong_shell"), Some(1))
+        );
+        assert_eq!(
+            classify("Exit code 1\nrejected by the pre-commit hook"),
+            (Some("hook_block"), Some(1))
+        );
+        assert_eq!(classify("Exit code 75\nbusy"), (Some("exit_75"), Some(75)));
+        assert_eq!(
+            classify("Exit code 75\nParserError"),
+            (Some("exit_75"), Some(75)),
+            "exit 75 is first in the precedence"
+        );
+        assert_eq!(
+            classify("Exit code 2\nplain failure"),
+            (Some("exit_nonzero"), Some(2))
+        );
+        assert_eq!(
+            classify("Found 2 matches of the string to replace"),
+            (Some("edit_not_found"), None)
+        );
+        assert_eq!(
+            classify("Command timed out\nExit code 124"),
+            (Some("timeout"), Some(124))
+        );
+        // Without the vocabulary, the same texts fall back to the built-in detectors.
+        let l = tool_result_line(
+            json!({}),
+            json!({"type": "tool_result", "tool_use_id": "t", "is_error": true,
+                   "content": "Exit code 1\nParserError"}),
+        );
+        assert_eq!(
+            results(parse_line(&l)).remove(0).error_class,
+            Some("exit_nonzero")
+        );
+    }
+
+    #[test]
+    fn refs_are_hashed_basenames_and_ids_capped() {
+        let read = assistant_line(
+            "msg_r",
+            "claude-x",
+            json!({}),
+            json!([{"type": "tool_use", "id": "t1", "name": "Read",
+                    "input": {"file_path": "C:/x/core/src/a.rs"}}]),
+        );
+        let in_refs = tool_uses_of(&read).remove(0).refs;
+        assert_eq!(in_refs, vec![ref8("a.rs")]);
+        let result = |content: &str| {
+            let l = tool_result_line(
+                json!({}),
+                json!({"type": "tool_result", "tool_use_id": "t1", "content": content}),
+            );
+            results(parse_line(&l)).remove(0).refs
+        };
+        let out_refs = result("core/src/a.rs:12:  fn main() {}");
+        assert_eq!(out_refs, in_refs, "one file seen from both sides");
+        for r in in_refs.iter().chain(&out_refs) {
+            assert_eq!(r.len(), 8, "{r}");
+            assert!(r.chars().all(|c| c.is_ascii_hexdigit()), "{r}");
+            assert!(!r.contains("a.rs"), "{r}");
+        }
+        // Case and the directory do not matter, and an id counts.
+        assert_eq!(result("SRC\\A.RS"), vec![ref8("a.rs")]);
+        let with_id = result("started agent a0123456789abcdef in 1.5 seconds");
+        assert_eq!(with_id, vec![ref8("a0123456789abcdef")]);
+        // Sorted, deduplicated, capped.
+        let many: String = (0..1000)
+            .map(|n| format!("file{n}.rs file{n}.rs "))
+            .collect();
+        let capped = result(&many);
+        assert_eq!(capped.len(), REFS_CAP);
+        let mut sorted = capped.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, capped);
+        // A prose result keeps nothing, and no raw token leaks into the event.
+        assert!(result("everything went fine, nothing to see").is_empty());
+        let secret = assistant_line(
+            "msg_s",
+            "claude-x",
+            json!({}),
+            json!([{"type": "tool_use", "id": "t1", "name": "Write",
+                    "input": {"file_path": "/p/SECRET-FILE.txt", "content": "see body-of-SECRET-TEXT.md"}}]),
+        );
+        let ev = format!("{:?}", event(parse_line(&secret)));
+        assert!(
+            !ev.contains("SECRET-TEXT") && !ev.contains("body-of"),
+            "a written body is not kept: {ev}"
+        );
+        let refs = tool_uses_of(&secret).remove(0).refs;
+        assert_eq!(
+            refs,
+            vec![ref8("secret-file.txt")],
+            "a written body is not scanned"
+        );
+    }
+
+    #[test]
+    fn git_restore_and_checkout_dashdash_paths_go_to_files() {
+        let files = |command: &str| tool_uses_of(&bash_line(command)).remove(0).files;
+        assert!(files("git checkout main").is_empty());
+        assert!(files("git checkout -b feature").is_empty());
+        assert_eq!(
+            files("git checkout -- a.rs src/b.rs"),
+            vec!["a.rs", "src/b.rs"]
+        );
+        assert_eq!(files("git checkout HEAD -- a.rs"), vec!["a.rs"]);
+        assert_eq!(files("git restore a.rs"), vec!["a.rs"]);
+        assert_eq!(
+            files("git restore --staged a.rs b.rs"),
+            vec!["a.rs", "b.rs"]
+        );
+        assert_eq!(
+            files("git restore --source HEAD~1 a.rs"),
+            vec!["a.rs"],
+            "the value of --source is not a path"
+        );
+        assert_eq!(files("git restore -- -odd.rs"), vec!["-odd.rs"]);
+        assert_eq!(files("cd /x && git restore 'q.rs'"), vec!["q.rs"]);
+        assert!(files("git status").is_empty());
+        assert!(files("cargo test a.rs").is_empty());
+    }
+
+    #[test]
+    fn make_and_dotnet_keep_their_subcommand() {
+        let program = |command: &str| tool_uses_of(&bash_line(command)).remove(0).cmd_program;
+        assert_eq!(program("make test").as_deref(), Some("make test"));
+        assert_eq!(program("make").as_deref(), Some("make"));
+        assert_eq!(
+            program("dotnet test --no-build").as_deref(),
+            Some("dotnet test")
+        );
+        assert_eq!(program("yarn build").as_deref(), Some("yarn build"));
+        assert_eq!(program("pnpm test").as_deref(), Some("pnpm test"));
+        assert_eq!(program("ls src").as_deref(), Some("ls"));
     }
 
     #[test]
