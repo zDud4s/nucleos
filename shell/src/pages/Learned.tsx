@@ -2,11 +2,13 @@ import { useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
+  distilledOrigin,
   groupWaiting,
   measuredByGenerator,
   parseEvidence,
   useApproveKnowledge,
   useDecideKnowledgeBatch,
+  useDistillCauses,
   useKnowledge,
   useKnowledgeHistory,
   useRejectKnowledge,
@@ -356,6 +358,9 @@ const OVER: ReadonlySet<KnownStatus> = new Set<KnownStatus>([
 function KnownRow({ row, decisions }: { row: Known; decisions?: ReactNode }) {
   const [chainId, setChainId] = useState<number | null>(null);
   const evidence = parseEvidence(row.evidence);
+  // One cached query however many rows ask; only a distiller row reads its answer.
+  const causes = useDistillCauses();
+  const origin = distilledOrigin(row, causes.data ?? new Map());
 
   return (
     <Row className="learned-row">
@@ -377,6 +382,17 @@ function KnownRow({ row, decisions }: { row: Known; decisions?: ReactNode }) {
       </div>
 
       <p className="learned-title">{row.title}</p>
+      {origin !== null && (
+        <p className="learned-origin">
+          distilled from{" "}
+          {origin.job === null ? (
+            "a job"
+          ) : (
+            <Link to="/fleet">job #{origin.job}</Link>
+          )}
+          {origin.causeLabel !== null && <> · {origin.causeLabel}</>}
+        </p>
+      )}
       <p className="learned-body">{row.body}</p>
 
       {evidence.length > 0 && (
@@ -387,6 +403,8 @@ function KnownRow({ row, decisions }: { row: Known; decisions?: ReactNode }) {
                 <Link to="/runs/$runId" params={{ runId: String(ref.id) }}>
                   run {ref.id}
                 </Link>
+              ) : ref.t === "job" ? (
+                <Link to="/fleet">job #{ref.id}</Link>
               ) : ref.t === "knowledge" && knowledgeId(ref.id) !== null ? (
                 <Button
                   variant="quiet"
