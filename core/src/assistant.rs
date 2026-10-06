@@ -3295,7 +3295,11 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         .await;
         // The process this turn kept (if any) learns what it has now served, before anything can
         // read it between turns.
-        note_served_by_kept(&turn.slot.chat_id, id, mode.as_str());
+        // Only a turn that could have run in the kept process: a one-shot turn never touched it, and
+        // its mode is not one that process served.
+        if may_live {
+            note_served_by_kept(&turn.slot.chat_id, id, mode.as_str());
+        }
         let completed_at = chrono::Utc::now().to_rfc3339();
 
         // Each terminal write below is guarded on the turn still being `running`. A `/cancel` aborts
@@ -8425,6 +8429,48 @@ mod tests {
         assert_eq!(
             task.5, 1,
             "the spontaneous turn was cleaner than the turn its process served"
+        );
+    }
+
+    /// A one-shot turn (here a Telegram one, which runs `McpOnly` and so never touches the kept
+    /// process) must not stamp its own, wider mode onto the barrier of the process kept from an
+    /// earlier turn: that process never served it.
+    #[tokio::test]
+    async fn a_one_shot_turn_does_not_change_the_barrier_of_a_kept_process() {
+        let (fake, unprompted) = fake_with_a_background_task();
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("one-shot-barrier");
+        let _root = rooted_chat(&state, &chat).await;
+        crate::chats::set_brain(&state.pool, &chat, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+        crate::chats::set_permission_mode(&state.pool, &chat, crate::chats::PermissionMode::Manual)
+            .await
+            .unwrap();
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        crate::chats::set_permission_mode(&state.pool, &chat, crate::chats::PermissionMode::Bypass)
+            .await
+            .unwrap();
+        let one_shot = send_message(&state, &chat, "de fora", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, one_shot).await;
+
+        unprompted.send(ANSWERS_ON_ITS_OWN.to_owned()).unwrap();
+        let task = settled_task_turn(&state.pool, &chat)
+            .await
+            .expect("the unprompted answer was never recorded as a turn of its own");
+
+        assert_eq!(
+            task.6.as_deref(),
+            Some("manual"),
+            "a one-shot turn's mode leaked into the barrier of a process that never served it"
         );
     }
 
