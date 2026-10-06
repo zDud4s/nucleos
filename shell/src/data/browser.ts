@@ -3,6 +3,7 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 import { apiFetch } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
+import { forgetSeat, rememberSeat } from "./seat";
 import { useSidecars, useSystemHealth } from "./system";
 import type { SidecarState, SubsystemReadout } from "./system";
 
@@ -19,9 +20,10 @@ export type { SidecarState, SubsystemReadout } from "./system";
  * `useContactMerges`, so the Waiting queue's own import keeps working
  * unchanged.
  *
- * **Wheel decisions are not this page's.** Taking or refusing a requested
+ * **Wheel decisions are mostly not this page's.** Taking or refusing a requested
  * wheel is `POST /proposals/{id}/approve|reject`, decided on the Waiting
- * page — this file still reads `GET /browser/sessions` because that is also
+ * page; {@link useApproveWheel} is the one door to the approval here, used only
+ * by Waiting because it must carry the seat and keep its nonce. This file still reads `GET /browser/sessions` because that is also
  * where every OTHER session mode lives, but it adds no door back into that
  * decision. What this pillar owns instead is the handover's own two-step
  * question, once a person is actually driving: `POST /browser/return` gives
@@ -48,6 +50,10 @@ export interface BrowserSession {
   rule: string;
   /** Spec §4.4's state machine. `wheel-requested` is the only one Waiting decides. */
   mode: "agent" | "wheel-requested" | "human" | "delivery-failed";
+  /** Who holds the wheel while `mode` is `human`: this shell, or a real window. Null otherwise. */
+  seat: "shell" | "window" | null;
+  /** Whether the session can be driven from the shell (as opposed to only a real window). */
+  shell_eligible: boolean;
   refusal: string | null;
   /** The proposal that asked for the wheel, once one exists. Null means nothing to decide yet. */
   proposal_id: number | null;
@@ -234,6 +240,12 @@ export interface ReturnedChain {
   chain: string[];
 }
 
+/** `to` names where the wheel goes: back to the agent, or the session closes. */
+export interface ReturnWheelInput {
+  sessionId: number;
+  to: "agent" | "close";
+}
+
 /**
  * Give the wheel back.
  *
@@ -245,12 +257,15 @@ export interface ReturnedChain {
 export function useReturnWheel() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (sessionId: number) =>
-      apiFetch<ReturnedChain>("/browser/return", {
+    mutationFn: (input: number | ReturnWheelInput) => {
+      const { sessionId, to } = typeof input === "number" ? { sessionId: input, to: undefined } : input;
+      return apiFetch<ReturnedChain>("/browser/return", {
         method: "POST",
-        body: JSON.stringify({ session_id: sessionId }),
-      }),
+        body: JSON.stringify(to === undefined ? { session_id: sessionId } : { session_id: sessionId, to }),
+      });
+    },
     retry: false,
+    onSuccess: (_chain, input) => forgetSeat(typeof input === "number" ? input : input.sessionId),
     onSettled: () => {
       for (const key of browserKeys()) void queryClient.invalidateQueries({ queryKey: key });
     },
@@ -419,6 +434,65 @@ export function useOpenWindow() {
         body: JSON.stringify({ project_id: input.projectId, url: input.url }),
       }),
     retry: false,
+    onSettled: () => {
+      for (const key of browserKeys()) void queryClient.invalidateQueries({ queryKey: key });
+    },
+  });
+}
+
+/** Take the wheel of an eligible agent session; the seat nonce it returns is kept in memory. */
+export function useTakeWheel() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (sessionId: number) =>
+      apiFetch<{ session?: BrowserSession; seat_nonce: string }>(`/browser/sessions/${sessionId}/take`, {
+        method: "POST",
+      }),
+    retry: false,
+    onSuccess: (outcome, sessionId) => rememberSeat(sessionId, outcome.seat_nonce),
+    onSettled: () => {
+      for (const key of browserKeys()) void queryClient.invalidateQueries({ queryKey: key });
+    },
+  });
+}
+
+export interface ApproveWheelInput {
+  proposalId: number;
+  sessionId: number;
+  seat: "shell" | "window";
+}
+
+/** Approve a wheel request, naming the seat; a shell seat comes back with its nonce. */
+export function useApproveWheel() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ proposalId, seat }: ApproveWheelInput) =>
+      apiFetch<{ session?: BrowserSession; seat_nonce?: string }>(`/proposals/${proposalId}/approve`, {
+        method: "POST",
+        body: JSON.stringify({ seat }),
+      }),
+    retry: false,
+    onSuccess: (outcome, input) => {
+      if (outcome.seat_nonce) rememberSeat(input.sessionId, outcome.seat_nonce);
+    },
+    onSettled: () => {
+      // What Waiting's own decisions invalidate, plus this pillar's.
+      for (const key of [...browserKeys(), keys.waiting.all, keys.proposals.all, keys.fleet.all, keys.runs.all]) {
+        void queryClient.invalidateQueries({ queryKey: key });
+      }
+    },
+  });
+}
+
+/** Hand a taken session over to a real browser window. */
+export function useOpenRealWindow() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    // Route per the core contract: POST /browser/sessions/{id}/window, no body.
+    mutationFn: (sessionId: number) =>
+      apiFetch<{ session: BrowserSession }>(`/browser/sessions/${sessionId}/window`, { method: "POST" }),
+    retry: false,
+    onSuccess: (_outcome, sessionId) => forgetSeat(sessionId),
     onSettled: () => {
       for (const key of browserKeys()) void queryClient.invalidateQueries({ queryKey: key });
     },
