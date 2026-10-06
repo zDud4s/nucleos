@@ -1061,6 +1061,8 @@ mod tests {
             .route("/vcs/requests", get(|| async {}).post(|| async {}))
             .route("/vcs/requests/{id}", get(|| async {}))
             .route("/vcs/requests/{id}/wait", get(|| async {}))
+            .route("/vcs/requests/{id}/approve", post(|| async {}))
+            .route("/vcs/requests/{id}/refuse", post(|| async {}))
             .route("/shadow-decisions", get(|| async {}))
             .route("/shadow-decisions/{id}/verdict", post(|| async {}))
             .route("/scoreboard", get(|| async {}))
@@ -1932,6 +1934,37 @@ mod tests {
             StatusCode::FORBIDDEN,
             "waiting is a read, but not one worth handing the weakest key a 45s connection for"
         );
+    }
+
+    /// The owner's decision on a merge held for a test map change is in no scope table: only the
+    /// full-access token reaches it, by default-deny. An agent that could approve its own map
+    /// change would defeat the hold.
+    #[tokio::test]
+    async fn only_the_owner_reaches_the_approve_and_refuse_routes_of_a_paused_merge() {
+        let state = test_state("control-token").await;
+        let reader = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let team = live_team_run_with_token(&state, "run-1").await;
+        let app = protected_router(state);
+
+        for token in [&reader, &team] {
+            for path in ["/vcs/requests/7/approve", "/vcs/requests/7/refuse"] {
+                assert_eq!(
+                    status_of(&app, "POST", path, token).await,
+                    StatusCode::FORBIDDEN,
+                    "POST {path} must be out of reach of a scoped token"
+                );
+            }
+        }
+        for path in ["/vcs/requests/{id}/approve", "/vcs/requests/{id}/refuse"] {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, &Method::POST, path)
+                    && !route_is_listed(RUN_CREATING_ROUTES, &Method::POST, path)
+                    && !route_is_listed(TEAM_ROUTES, &Method::POST, path)
+                    && !route_is_listed(EMAIL_ROUTES, &Method::POST, path)
+                    && !route_is_listed(COUNCIL_ROUTES, &Method::POST, path),
+                "POST {path} must stay out of every scope table"
+            );
+        }
     }
 
     /// Reading capacity is a read; touching the budget is not.
