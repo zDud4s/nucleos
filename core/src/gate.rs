@@ -244,7 +244,10 @@ pub(crate) async fn run_argv(
     let mut command = Command::new(program);
     command
         .args(arguments)
-        .envs(env.iter().map(|(name, value)| (name, value)))
+        .envs(
+            env.iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -1261,6 +1261,9 @@ pub fn parse_verify_config(contents: &str) -> Result<VerifyConfig, String> {
     if config.unit_timeout_seconds < 1 {
         return Err("unit_timeout_seconds must be at least 1".to_string());
     }
+    if config.disk_cap_gb < 1 {
+        return Err("disk_cap_gb must be at least 1".to_string());
+    }
     Ok(config)
 }
 
@@ -2393,6 +2396,13 @@ pub fn parse_schedule_rules(contents: &str) -> std::io::Result<AutopilotRules> {
 ///   that can never be reached is not a ceiling, and a rule that wants no ceiling of its own says so
 ///   by leaving the key out, which is what `None` already means.
 fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
+    if rules.verify_disk_cap_gb == Some(0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "verify_disk_cap_gb must be at least 1; a zero cap would evict all warm state on \
+             every unit — leave the key out to use the machine default",
+        ));
+    }
     for rule in &rules.schedules {
         let Some(budget) = rule.graph.as_ref().and_then(|graph| graph.budget_usd) else {
             continue;
@@ -4769,6 +4779,16 @@ cycle_seconds: 30
         let path = dir.path().join("verify.yaml");
         std::fs::write(&path, "capacity: 0\n").unwrap();
         assert_eq!(load_verify_config(&path), VerifyConfig::default());
+    }
+
+    #[test]
+    fn a_verify_disk_cap_of_zero_is_refused() {
+        assert!(parse_verify_config("disk_cap_gb: 0\n").is_err());
+    }
+
+    #[test]
+    fn a_project_verify_disk_cap_of_zero_is_refused() {
+        assert!(parse_schedule_rules("verify_disk_cap_gb: 0\n").is_err());
     }
 
     #[test]

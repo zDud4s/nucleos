@@ -29,9 +29,10 @@ pub const STATUS_RUNNING: &str = "running";
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub const PRIORITY_INTERACTIVE: i64 = 0;
-#[cfg_attr(not(test), allow(dead_code))]
+// Used from F2a-2 (verify); until then only the tests build them.
+#[allow(dead_code)]
 pub const PRIORITY_AUTONOMOUS: i64 = 1;
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub const PRIORITY_POSTGATE: i64 = 2;
 
 /// A row interrupted by this many daemon restarts is given up on, so a request that brings the
@@ -243,6 +244,8 @@ pub(crate) struct Claimed {
 /// What a reader sees of one row.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct State {
+    // Read from F2a-2 (verify); until then nothing reads it.
+    #[allow(dead_code)]
     pub id: i64,
     pub status: String,
     pub exit_code: Option<i64>,
@@ -263,7 +266,9 @@ pub(crate) async fn enqueue(
     now_ms: i64,
 ) -> sqlx::Result<Submitted> {
     let argv = serde_json::to_string(&request.argv).unwrap_or_else(|_| "[]".to_owned());
-    let mut tx = pool.begin().await?;
+    // IMMEDIATE takes the write lock up front: in a deferred transaction two equal submits could
+    // both run the join SELECT, both miss, and both insert (or the second would get SQLITE_BUSY).
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     if let Some(fingerprint) = &request.fingerprint {
         let existing: Option<i64> = sqlx::query_scalar(
             "SELECT id FROM verify_runs WHERE status IN ('queued', 'running') \
@@ -320,6 +325,9 @@ pub(crate) async fn enqueue(
 /// Every queued row, oldest first, for the scheduler to choose from.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn queued(pool: &SqlitePool) -> sqlx::Result<Vec<Queued>> {
+    // The tuple is the `SELECT`'s own shape and lives only until the `map` below builds `Queued`;
+    // a named struct would repeat the column order in two places.
+    #[allow(clippy::type_complexity)]
     let rows: Vec<(i64, Option<String>, i64, i64, Option<i64>)> = sqlx::query_as(
         "SELECT id, project_id, priority, weight, enqueued_ms FROM verify_runs \
          WHERE status = 'queued' ORDER BY enqueued_ms, id",
@@ -342,6 +350,9 @@ pub(crate) async fn queued(pool: &SqlitePool) -> sqlx::Result<Vec<Queued>> {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn claim(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Claimed>> {
     let started_at = chrono::Utc::now().to_rfc3339();
+    // The tuple is the `RETURNING` clause's own shape and lives only until the `map` below builds
+    // `Claimed`; a named struct would repeat the column order in two places.
+    #[allow(clippy::type_complexity)]
     let row: Option<(i64, Option<String>, String, String, i64, Option<i64>)> = sqlx::query_as(
         "UPDATE verify_runs SET status = 'running', started_at = ? \
          WHERE id = ? AND status = 'queued' \
@@ -393,6 +404,9 @@ pub(crate) async fn finish(
 /// One row as a reader sees it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<State>> {
+    // The tuple is the `SELECT`'s own shape and lives only until the `map` below builds `State`;
+    // a named struct would repeat the column order in two places.
+    #[allow(clippy::type_complexity)]
     let row: Option<(i64, String, Option<i64>, Option<i64>, Option<String>, i64)> = sqlx::query_as(
         "SELECT id, status, exit_code, duration_ms, output_tail, interruptions \
              FROM verify_runs WHERE id = ?",

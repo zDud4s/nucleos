@@ -1332,8 +1332,12 @@ pub async fn mark_removed(pool: &SqlitePool, owner: Owner) -> sqlx::Result<()> {
     .bind(owner.id())
     .fetch_all(pool)
     .await?;
+    // Tests must never schedule deletions under the developer's real `~/.nucleos/warm`.
+    #[cfg(test)]
+    let _ = removed;
     // The verification state kept for this tree is dead weight now. Detached and best-effort: the
     // executor's periodic sweep removes anything this misses.
+    #[cfg(not(test))]
     if let Some(root) = crate::machine_config::root() {
         for (project_id, path) in removed {
             let Some(project_id) = project_id else {
