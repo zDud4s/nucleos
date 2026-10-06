@@ -39,8 +39,6 @@ const PROJECT_SCOPED: &[&str] = &[
     "browser_sessions",
     "browser_sites",
     "browser_writes",
-    // Pending distillations are the project's history; a forgotten project must not be distilled later.
-    "distill_queue",
     // Dev time is project history, and it goes with the project. Its file offsets in
     // `devtime_files` are deliberately KEPT (owner's decision, 2026-10-05): re-adding the folder
     // then counts time from that moment on, instead of resurrecting the old time from transcripts
@@ -48,6 +46,8 @@ const PROJECT_SCOPED: &[&str] = &[
     "devtime_cwd_map",
     // The parent of five session-keyed tables; those are written out in `remove`, ahead of the loop.
     "devtime_sessions",
+    // Pending distillations are the project's history; a forgotten project must not be distilled later.
+    "distill_queue",
     "feed",
     "fleet_exclusions",
     "jobs",
