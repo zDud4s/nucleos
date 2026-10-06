@@ -2772,7 +2772,10 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/vcs/requests") return VCS_REQUESTS;
   // The preview settles nothing, so every escalated or blocked row is still waiting.
   if (path === "/waiting/git") {
-    return VCS_REQUESTS.filter((row) => row.status === "escalated" || row.status === "blocked");
+    return VCS_REQUESTS.filter(
+      (row) =>
+        row.status === "escalated" || row.status === "blocked" || row.status === "awaiting_owner",
+    );
   }
   /* Matched on the route rather than the whole path: `useScoreboard` always sends
      `?project_id=`, so a `path ===` comparison would never fire. */

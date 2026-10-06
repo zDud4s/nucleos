@@ -506,6 +506,70 @@ pub struct Computed {
     pub output_tail: String,
 }
 
+/// What `pending_map_blob` holds when the merge deletes the test map: there is no blob to name,
+/// and deleting the map is still a change the owner approves (spec 2026-10-05 §3.4).
+pub const DELETED_MAP: &str = "deleted";
+
+/// Whether `computed` changes the test map, and if so the blob id the target would carry (or
+/// `DELETED_MAP`). Diffs `old..new`, the merge commit against the target it would replace, so it
+/// sees the map however it reached the source branch: an edit, a checkout from another ref, a
+/// cherry-pick, a merge.
+async fn map_change(
+    project_root: &Path,
+    computed: &Computed,
+    deadline: std::time::Instant,
+) -> Result<Option<String>, Outcome> {
+    let map = crate::tests_map::MAP_FILE;
+    let changed = git(
+        project_root,
+        &[
+            "diff",
+            "--name-only",
+            &computed.old,
+            &computed.new,
+            "--",
+            map,
+        ],
+        deadline,
+    )
+    .await?;
+    if changed.exit_code != Some(0) {
+        return Err(Outcome::Failed {
+            reason: format!("could not tell whether this merge changes {map}"),
+            exit_code: changed.exit_code,
+            output_tail: changed.output_tail,
+        });
+    }
+    if changed.stdout.trim().is_empty() {
+        return Ok(None);
+    }
+    let spec = format!("{}:{map}", computed.new);
+    let blob = git(
+        project_root,
+        &["rev-parse", "--verify", "--quiet", &spec],
+        deadline,
+    )
+    .await?;
+    Ok(Some(if blob.exit_code == Some(0) {
+        blob.stdout.trim().to_owned()
+    } else {
+        DELETED_MAP.to_owned()
+    }))
+}
+
+/// Whether this merge publishes into the project's integration branch, the target the test map
+/// governs. Unknown (the branch could not be resolved) counts as yes: the safe side of a guard
+/// is the side that asks.
+fn lands_on_the_integration_branch(
+    request: &crate::vcs::ClaimedRequest,
+    target: &crate::vcs::Branch,
+) -> bool {
+    request
+        .integration_branch
+        .as_ref()
+        .is_none_or(|branch| branch.as_str() == target.as_str())
+}
+
 /// Computes `source` into `target` on a detached HEAD in the daemon's integration worktree.
 ///
 /// `Err` is the outcome to record, not an error to propagate: a conflict is the answer to the
@@ -2145,6 +2209,28 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                 match compute_merge(project_root, source.as_str(), target.as_str(), deadline).await
                 {
                     Ok(computed) => {
+                        // Spec 2026-10-05 §3.4, defence 1: a merge that changes the test map
+                        // waits for the owner, before the gate, which is the very thing the map
+                        // configures. Passes only when the owner approved exactly this content.
+                        // Only a merge INTO the integration branch asks: master merged into an
+                        // agent's branch carries a map the owner already approved.
+                        match map_change(project_root, &computed, deadline).await {
+                            Err(outcome) => return outcome,
+                            Ok(Some(blob))
+                                if lands_on_the_integration_branch(request, target)
+                                    && request.approved_map_blob.as_deref()
+                                        != Some(blob.as_str()) =>
+                            {
+                                return Outcome::AwaitingOwner {
+                                    reason: format!(
+                                        "this merge changes {}; it lands once the owner approves it",
+                                        crate::tests_map::MAP_FILE
+                                    ),
+                                    map_blob: blob,
+                                };
+                            }
+                            Ok(_) => {}
+                        }
                         // Measured on the commit `compute_merge` left at the integration worktree's
                         // HEAD — the tree `target` is about to become — and BEFORE `publish` moves
                         // anything.
@@ -3214,6 +3300,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: true,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await
@@ -3329,6 +3416,7 @@ pub(crate) mod tests {
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -3448,6 +3536,7 @@ gate_command: git --version
             project_root: repo.to_string_lossy().into_owned(),
             from_resolution: false,
             run_id: None,
+            approved_map_blob: None,
             integration_branch: None,
         })
         .await;
@@ -3551,6 +3640,7 @@ gate_command: git --version
             project_root: repo.to_string_lossy().into_owned(),
             from_resolution: false,
             run_id: None,
+            approved_map_blob: None,
             integration_branch: None,
         })
         .await
@@ -4406,6 +4496,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -4771,6 +4862,7 @@ gate_command: git --version
                 project_root: project_root.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5090,6 +5182,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5153,6 +5246,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5247,6 +5341,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5306,6 +5401,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5389,6 +5485,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5439,6 +5536,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5487,6 +5585,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5519,6 +5618,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: integration.map(Into::into),
             })
             .await
@@ -5646,6 +5746,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5686,6 +5787,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5734,6 +5836,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5775,6 +5878,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;
@@ -5878,6 +5982,7 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
+                approved_map_blob: None,
                 integration_branch: None,
             })
             .await;

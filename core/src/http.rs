@@ -744,6 +744,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/vcs/requests/{id}", get(get_vcs_request))
         .route("/vcs/requests/{id}/wait", get(wait_vcs_request))
         .route("/vcs/requests/{id}/dismiss", post(post_vcs_request_dismiss))
+        .route("/vcs/requests/{id}/approve", post(post_vcs_request_approve))
+        .route("/vcs/requests/{id}/refuse", post(post_vcs_request_refuse))
         // Admin-only by construction: absent from BOTH scope tables in `auth.rs`, for the
         // `POST /email/send` reason rather than the `POST /runs` one. It is not out of a scoped
         // key's reach because it is expensive; it is out of reach because it LEAVES THE MACHINE.
@@ -14237,6 +14239,44 @@ async fn post_vcs_request_dismiss(
         Err(vcs::DismissError::NotOpen) => Err(StatusCode::CONFLICT),
         Err(vcs::DismissError::Db(error)) => {
             tracing::warn!(request_id = id, %error, "dismissing a git request failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// The owner approves the test map change a paused merge carries (spec 2026-10-05 §3.4): 204,
+/// 404 for an unknown id, 409 for a row that is not waiting for the owner. Admin-only by
+/// default-deny, like `/dismiss`.
+async fn post_vcs_request_approve(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    owner_decision_status(
+        id,
+        "approving",
+        vcs::approve_for_owner(&state.pool, id).await,
+    )
+}
+
+/// The owner refuses it; the row ends `rejected`. Same answers as approving.
+async fn post_vcs_request_refuse(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    owner_decision_status(id, "refusing", vcs::refuse_for_owner(&state.pool, id).await)
+}
+
+fn owner_decision_status(
+    id: i64,
+    verb: &str,
+    decided: Result<(), vcs::DismissError>,
+) -> Result<StatusCode, StatusCode> {
+    match decided {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(vcs::DismissError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(vcs::DismissError::NotOpen) => Err(StatusCode::CONFLICT),
+        Err(vcs::DismissError::Db(error)) => {
+            tracing::warn!(request_id = id, %error, "{verb} a paused git request failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -35789,6 +35829,82 @@ mod tests {
             .find(|row| row["id"].as_i64() == Some(escalated))
             .expect("the dismissed row is still in the history");
         assert_eq!(row["status"], "escalated");
+    }
+
+    async fn vcs_status_of(pool: &sqlx::SqlitePool, id: i64) -> String {
+        sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_owner_approves_a_paused_merge_once() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let paused = vcs_row_in(&pool, "feat/a", "awaiting_owner").await;
+        let escalated = vcs_row_in(&pool, "feat/b", "escalated").await;
+
+        let uri = format!("/vcs/requests/{paused}/approve");
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(vcs_status_of(&pool, paused).await, "queued");
+
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(status, StatusCode::CONFLICT, "a second approval is refused");
+        let (status, _) = waiting_call(&state, "POST", "/vcs/requests/999999/approve").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = waiting_call(
+            &state,
+            "POST",
+            &format!("/vcs/requests/{escalated}/approve"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "an escalated row is not waiting for the owner"
+        );
+        assert_eq!(vcs_status_of(&pool, escalated).await, "escalated");
+    }
+
+    #[tokio::test]
+    async fn the_owner_refuses_a_paused_merge() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let paused = vcs_row_in(&pool, "feat/a", "awaiting_owner").await;
+
+        let uri = format!("/vcs/requests/{paused}/refuse");
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(vcs_status_of(&pool, paused).await, "rejected");
+
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(status, StatusCode::CONFLICT, "a second refusal is refused");
+    }
+
+    #[tokio::test]
+    async fn a_paused_merge_is_on_the_waiting_page() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let paused = vcs_row_in(&pool, "feat/a", "awaiting_owner").await;
+
+        let (status, listing) = waiting_call(&state, "GET", "/waiting/git").await;
+        assert_eq!(status, StatusCode::OK);
+        let found = listing
+            .as_array()
+            .expect("a JSON array of request summaries")
+            .iter()
+            .any(|row| row["id"].as_i64() == Some(paused) && row["status"] == "awaiting_owner");
+        assert!(found, "the paused row is listed with its status");
+
+        let (status, counted) = waiting_call(&state, "GET", "/waiting/count").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            counted["git"], 1,
+            "the paused row counts as a person wanted"
+        );
     }
 
     #[tokio::test]
