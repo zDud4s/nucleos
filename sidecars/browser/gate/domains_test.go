@@ -37,7 +37,7 @@ func TestTheDomainsTheFenceHangsOnExistWhereItHangsThem(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	cases := []availability{
-		{"Fetch.enable", map[string]any{"patterns": []map[string]any{{"urlPattern": "*"}}}, "browser",
+		{"Fetch.enable", map[string]any{"patterns": []map[string]any{{"urlPattern": "*"}}, "handleAuthRequests": true}, "browser",
 			"the interception itself; spec §6.2 and the spike's central finding"},
 		{"Target.setAutoAttach", map[string]any{"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}, "browser",
 			"closes the TOCTOU window of spec §5.4"},
@@ -119,4 +119,33 @@ func targetIDOf(t *testing.T, conn *cdp.Conn, session cdp.SessionID) string {
 		t.Fatalf("target info: %v", err)
 	}
 	return payload.TargetInfo.TargetID
+}
+
+// TestThePersonPromptDomainsExistWhereTheyAreCalled. Person mode intercepts the file chooser and finds
+// the node under a press, both on the page session; a fake browser answers anything, so the real one is
+// asked here.
+func TestThePersonPromptDomainsExistWhereTheyAreCalled(t *testing.T) {
+	conn := control(t)
+	page := openIn(t, conn, "about:blank")
+	time.Sleep(300 * time.Millisecond)
+
+	for _, testCase := range []availability{
+		{"Page.setInterceptFileChooserDialog", map[string]any{"enabled": false}, "page",
+			"the file prompt of a person's turn"},
+		{"DOM.getNodeForLocation", map[string]any{"x": 1, "y": 1, "includeUserAgentShadowDOM": true}, "page",
+			"the select prompt of a person's turn"},
+	} {
+		t.Run(testCase.method+"/"+testCase.session, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if _, err := conn.Call(ctx, page, testCase.method, testCase.params); err != nil {
+				var protocolErr *cdp.ProtocolError
+				if ok := asProtocol(err, &protocolErr); ok && protocolErr.Code == -32601 {
+					t.Fatalf("%s does not exist on the %s session, and person mode needs it there: %s",
+						testCase.method, testCase.session, testCase.why)
+				}
+				t.Logf("%s answered %v (not a missing-method error, so the method is there)", testCase.method, err)
+			}
+		})
+	}
 }

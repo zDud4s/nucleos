@@ -28,9 +28,14 @@ import (
 // agent for an element it never saw — including one a page's text talked it into. Refs make "act on
 // something that was not in the snapshot" unrepresentable rather than merely discouraged.
 func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser.SnapshotRequest) (browser.Snapshot, error) {
+	d.gate.RLock()
+	defer d.gate.RUnlock()
 	entry, err := d.lookup(id)
 	if err != nil {
 		return browser.Snapshot{}, err
+	}
+	if d.personHolds(id) {
+		return browser.Snapshot{}, browser.ErrPersonIsDriving
 	}
 
 	root, err := d.readTree(ctx, entry)

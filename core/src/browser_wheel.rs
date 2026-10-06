@@ -230,7 +230,34 @@ pub async fn request(state: &AppState, session_id: i64, reason: &str) -> Result<
 /// `accept` is called with the proposal ALREADY transitioned to approved — that transition is the
 /// atomic write of rule 1, and it belongs to the caller so that the same compare-and-set that decides
 /// who won a concurrent approve is the one that hands over the wheel.
+///
+/// This is the seat-less form the tests use; production goes through `accept_with_seat`.
+#[cfg(test)]
 pub async fn accept(state: &AppState, session_id: i64) -> Result<SessionRow, WheelError> {
+    accept_with_seat(state, session_id, None)
+        .await
+        .map(|(row, _)| row)
+}
+
+/// Where the person sits once they accept: in the shell, or in a real window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeatChoice {
+    Shell,
+    Window,
+}
+
+/// The approval with the seat spelled out (spec browser-volante §4.1).
+///
+/// The shell seat is on offer when the row is `shell_eligible`; with no explicit choice it is what
+/// the approval picks, and otherwise the person gets a real window as before. An explicit shell
+/// choice that is not on offer is refused rather than silently turned into a window. The second
+/// element is the `seat_nonce` and is `Some` only for the shell seat.
+pub async fn accept_with_seat(
+    state: &AppState,
+    session_id: i64,
+    choice: Option<SeatChoice>,
+) -> Result<(SessionRow, Option<String>), WheelError> {
     if !state.browser.enabled {
         return Err(WheelError::Disabled);
     }
@@ -241,6 +268,57 @@ pub async fn accept(state: &AppState, session_id: i64) -> Result<SessionRow, Whe
             row.mode
         )));
     }
+    let seat = match choice {
+        Some(SeatChoice::Shell) if !row.shell_eligible => {
+            return Err(WheelError::WrongState("seat_unavailable".to_string()));
+        }
+        Some(choice) => choice,
+        None if row.shell_eligible => SeatChoice::Shell,
+        None => SeatChoice::Window,
+    };
+
+    if seat == SeatChoice::Shell {
+        // Same browser, no new Chrome: the row moves first, then the sidecar is told the person's
+        // stretch begins. A failure here is a failed delivery (spec §4.4a), never a return to the
+        // agent.
+        if !browser::set_mode_seat(
+            &state.pool,
+            &state.browser.modes,
+            session_id,
+            mode::WHEEL_REQUESTED,
+            mode::HUMAN,
+            Some("shell"),
+        )
+        .await?
+        {
+            return Err(WheelError::WrongState(
+                "this session's wheel was already handed over".to_string(),
+            ));
+        }
+        if let Err(error) = state.browser.client.begin_person(&row.sidecar_id).await {
+            let _ = browser::set_mode(
+                &state.pool,
+                &state.browser.modes,
+                session_id,
+                mode::HUMAN,
+                mode::DELIVERY_FAILED,
+            )
+            .await;
+            if let Some(proposal) = row.proposal_id {
+                let _ = crate::proposals::note(
+                    &state.pool,
+                    proposal,
+                    &format!("the shell seat would not begin: {error}"),
+                )
+                .await;
+            }
+            return Err(WheelError::Sidecar(error));
+        }
+        let nonce = state.browser.seats.issue(session_id);
+        let row = live(&state.pool, session_id).await?;
+        return Ok((row, Some(nonce)));
+    }
+
     // Spec §4.5: the destination is the PROJECT's profile, never the throwaway the agent was in.
     // A login made in a profile that is deleted with the run is a login nobody keeps, and the
     // proposal outlives the run, so it would point at a directory that no longer exists.
@@ -299,12 +377,13 @@ pub async fn accept(state: &AppState, session_id: i64) -> Result<SessionRow, Whe
         &placement.profile.id,
     )
     .await?;
-    if !browser::set_mode(
+    if !browser::set_mode_seat(
         &state.pool,
         &state.browser.modes,
         session_id,
         mode::WHEEL_REQUESTED,
         mode::HUMAN,
+        Some("window"),
     )
     .await?
     {
@@ -313,6 +392,83 @@ pub async fn accept(state: &AppState, session_id: i64) -> Result<SessionRow, Whe
             "the wheel landed on a session that had moved"
         );
     }
+    Ok((live(&state.pool, session_id).await?, None))
+}
+
+/// The person moves a shell-seat session to a real window. Same mode (`human`), new seat.
+///
+/// The agent's browser is closed and a headful one opens on the project's profile, exactly as at an
+/// approval that chose a window; the shell's nonce is forgotten so the shell can no longer drive.
+pub async fn to_window(state: &AppState, session_id: i64) -> Result<SessionRow, WheelError> {
+    if !state.browser.enabled {
+        return Err(WheelError::Disabled);
+    }
+    let row = live(&state.pool, session_id).await?;
+    if row.mode != mode::HUMAN || row.seat.as_deref() != Some("shell") {
+        return Err(WheelError::WrongState(format!(
+            "this session is {}, and only a person driving from the shell can open a window",
+            row.mode
+        )));
+    }
+    let project = row.project_id.clone().unwrap_or_default();
+    let sites = browser::admitted_origins(&state.pool, &project).await?;
+    let placement = Placement::project(&project, sites.read);
+    let url = landing(&row);
+
+    let wheel = match state
+        .browser
+        .client
+        .take_wheel(&row.sidecar_id, &url, &placement)
+        .await
+    {
+        Ok(wheel) => wheel,
+        Err(error) => {
+            // The person had the session, so the headless browser is unfenced: ask the sidecar to
+            // end the person's stretch before the row is marked failed. Best effort; the error
+            // carries no session content.
+            if let Err(end_error) = state.browser.client.end_person(&row.sidecar_id).await {
+                tracing::warn!(error = %end_error, "could not end the person stretch after a failed window");
+            }
+            let _ = browser::set_mode(
+                &state.pool,
+                &state.browser.modes,
+                session_id,
+                mode::HUMAN,
+                mode::DELIVERY_FAILED,
+            )
+            .await;
+            state.browser.seats.forget(session_id);
+            return Err(WheelError::Sidecar(error));
+        }
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    for sidecar_id in &wheel.displaced {
+        if let Ok(Some(displaced)) = row_by_sidecar_id(&state.pool, sidecar_id).await
+            && displaced != session_id
+        {
+            let _ =
+                browser::close_session_row(&state.pool, displaced, "displaced-by-handover", &now)
+                    .await;
+        }
+    }
+    browser::rebind_sidecar(
+        &state.pool,
+        session_id,
+        &wheel.session,
+        &placement.profile.id,
+    )
+    .await?;
+    browser::set_mode_seat(
+        &state.pool,
+        &state.browser.modes,
+        session_id,
+        mode::HUMAN,
+        mode::HUMAN,
+        Some("window"),
+    )
+    .await?;
+    state.browser.seats.forget(session_id);
     live(&state.pool, session_id).await
 }
 
@@ -332,13 +488,24 @@ pub async fn refuse(state: &AppState, session_id: i64) -> Result<(), WheelError>
 /// Nothing is granted here. What comes back is a list of candidates to be shown, and the granting is
 /// a separate answer to a separate question — spec §5.2 is explicit that the concession happens at
 /// the return and covers the whole set, so the person has to see the set first.
-pub async fn give_back(state: &AppState, session_id: i64) -> Result<Vec<String>, WheelError> {
+///
+/// `to` says where the session goes. `Some("agent")` from the shell seat hands it back to the run
+/// that opened it, but only once the sidecar has confirmed the fence is restored; anything else
+/// closes it.
+pub async fn give_back(
+    state: &AppState,
+    session_id: i64,
+    to: Option<&str>,
+) -> Result<Vec<String>, WheelError> {
     let row = live(&state.pool, session_id).await?;
     if row.mode != mode::HUMAN {
         return Err(WheelError::WrongState(format!(
             "this session is {}, so there is no wheel to give back",
             row.mode
         )));
+    }
+    if row.seat.as_deref() == Some("shell") {
+        return give_back_from_shell(state, &row, to).await;
     }
     let returned = state
         .browser
@@ -353,6 +520,84 @@ pub async fn give_back(state: &AppState, session_id: i64) -> Result<Vec<String>,
     // may take a moment to answer, and the answer is about a login that has already happened.
     browser::close_session_row(&state.pool, session_id, "wheel-returned", &now).await?;
     Ok(returned.chain)
+}
+
+/// Is the run that owns this session still going? Only then is there somebody to hand it back to.
+async fn run_is_live(pool: &SqlitePool, row: &SessionRow) -> Result<bool, WheelError> {
+    let Some(run_id) = row.run_id else {
+        return Ok(false);
+    };
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(status.as_deref() == Some("running"))
+}
+
+/// The person's stretch in the shell is over. There is no window to give back, so the sidecar's
+/// `/person/end` stands in for `/wheel/return` and is what brings the chain home.
+async fn give_back_from_shell(
+    state: &AppState,
+    row: &SessionRow,
+    to: Option<&str>,
+) -> Result<Vec<String>, WheelError> {
+    let session_id = row.id;
+    let now = chrono::Utc::now().to_rfc3339();
+    let to_agent = to == Some("agent") && run_is_live(&state.pool, row).await?;
+
+    let ended = state.browser.client.end_person(&row.sidecar_id).await;
+    if to_agent {
+        let returned = match ended {
+            Ok(returned) => returned,
+            Err(error) => {
+                // The fence state is unknown, so the session must not go back to the agent.
+                let _ = browser::close_with_reason(
+                    &state.pool,
+                    &state.browser,
+                    session_id,
+                    "fence-not-restored",
+                    &now,
+                )
+                .await;
+                state.browser.seats.forget(session_id);
+                return Err(WheelError::Sidecar(error));
+            }
+        };
+        browser::record_chain(&state.pool, session_id, &returned.chain).await?;
+        let moved = browser::set_mode_seat(
+            &state.pool,
+            &state.browser.modes,
+            session_id,
+            mode::HUMAN,
+            mode::AGENT,
+            None,
+        )
+        .await?;
+        state.browser.seats.forget(session_id);
+        if !moved {
+            return Err(WheelError::WrongState(
+                "the session changed hands while it was being returned".to_string(),
+            ));
+        }
+        state.browser.seats.mark_returned(session_id);
+        return Ok(returned.chain);
+    }
+
+    // Close, an absent `to`, or no run alive to receive it: the chain from a best-effort end (empty
+    // when the sidecar is gone), and the row closes as a plain return.
+    let chain = ended.map(|returned| returned.chain).unwrap_or_default();
+    browser::record_chain(&state.pool, session_id, &chain).await?;
+    // The sidecar's session is closed here too: the browser is not a window the person owns.
+    let _ = browser::close_with_reason(
+        &state.pool,
+        &state.browser,
+        session_id,
+        "wheel-returned",
+        &now,
+    )
+    .await;
+    state.browser.seats.forget(session_id);
+    Ok(chain)
 }
 
 /// The person's answer to "keep these?" — the only way `browser_sites` grows (spec §5.2, §5.3a).
@@ -437,6 +682,9 @@ pub struct HandoffBody {
 #[derive(Debug, Deserialize)]
 pub struct WheelBody {
     pub session_id: i64,
+    /// Where the session goes: `agent` hands it back to its run, anything else (or nothing) closes.
+    #[serde(default)]
+    pub to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -471,6 +719,31 @@ pub async fn post_window(
     }
 }
 
+/// `POST /browser/sessions/{id}/window` — a person driving from the shell asks for a real window.
+///
+/// The same credential, run check and presence as `take`: it opens a headful browser on the
+/// project's profile, so a run must not be able to ask for it.
+pub async fn post_window_seat(
+    State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> axum::response::Response {
+    use crate::browser_seat::{SeatError, from_a_run, seat_error};
+
+    if from_a_run(&scope, &headers) {
+        return seat_error(SeatError::RunRequester);
+    }
+    if !crate::attention::owner_is_present(&state.pool, chrono::Utc::now()).await {
+        return seat_error(SeatError::OwnerAbsent);
+    }
+    match to_window(&state, id).await {
+        Ok(row) => axum::Json(serde_json::json!({ "session": row })).into_response(),
+        Err(WheelError::WrongState(_)) => seat_error(SeatError::NotPerson),
+        Err(error) => wheel_error(error),
+    }
+}
+
 /// `POST /browser/handoff` — the agent asks for the wheel.
 pub async fn post_handoff(
     State(state): State<AppState>,
@@ -487,7 +760,7 @@ pub async fn post_return(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<WheelBody>,
 ) -> axum::response::Response {
-    match give_back(&state, body.session_id).await {
+    match give_back(&state, body.session_id, body.to.as_deref()).await {
         Ok(chain) => axum::Json(serde_json::json!({ "chain": chain })).into_response(),
         Err(error) => wheel_error(error),
     }
@@ -539,6 +812,7 @@ mod tests {
     async fn stub_sidecar(
         chain: Vec<&'static str>,
         take_fails: bool,
+        person_fails: bool,
     ) -> (
         std::sync::Arc<crate::browser::BrowserRuntime>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -550,7 +824,27 @@ mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let wheel_recorder = seen.clone();
         let verb_recorder = seen.clone();
+        let person_recorder = seen.clone();
+        let person_chain = chain.clone();
         let app = axum::Router::new()
+            .route(
+                "/person/{verb}",
+                post(move |Path(verb): Path<String>, _body: axum::body::Bytes| {
+                    let recorder = person_recorder.clone();
+                    let chain = person_chain.clone();
+                    async move {
+                        recorder.lock().unwrap().push(format!("person/{verb}"));
+                        if verb == "begin" {
+                            if person_fails {
+                                return (axum::http::StatusCode::BAD_GATEWAY, "no pixels")
+                                    .into_response();
+                            }
+                            return axum::Json(serde_json::json!({})).into_response();
+                        }
+                        axum::Json(serde_json::json!({ "chain": chain })).into_response()
+                    }
+                }),
+            )
             .route(
                 "/wheel/{verb}",
                 post(move |Path(verb): Path<String>, _body: axum::body::Bytes| {
@@ -616,6 +910,7 @@ mod tests {
                 enabled: true,
                 client: BrowserClient::new(&address.to_string(), "tok".into()),
                 modes: Default::default(),
+                seats: Default::default(),
             }),
             seen,
         )
@@ -629,8 +924,20 @@ mod tests {
         AppState,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        wheeled_with(chain, take_fails, false).await
+    }
+
+    async fn wheeled_with(
+        chain: Vec<&'static str>,
+        take_fails: bool,
+        person_fails: bool,
+    ) -> (
+        TempDb,
+        AppState,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let db = TempDb::new().await;
-        let (browser, seen) = stub_sidecar(chain, take_fails).await;
+        let (browser, seen) = stub_sidecar(chain, take_fails, person_fails).await;
         let state = AppState {
             token: crate::auth::Token("test-token".into()),
             pool: db.pool.clone(),
@@ -884,7 +1191,7 @@ mod tests {
         request(&state, session, "login").await.expect("request");
         accept(&state, session).await.expect("accept");
 
-        let chain = give_back(&state, session).await.expect("give back");
+        let chain = give_back(&state, session, None).await.expect("give back");
         assert_eq!(chain.len(), 3);
         assert!(
             crate::browser::list_sites(&db.pool, "acme")
@@ -930,7 +1237,7 @@ mod tests {
         let session = a_session(&state).await;
         request(&state, session, "login").await.expect("request");
         accept(&state, session).await.expect("accept");
-        give_back(&state, session).await.expect("give back");
+        give_back(&state, session, None).await.expect("give back");
 
         keep(&state, session, true, true).await.expect("keep");
 
@@ -958,7 +1265,7 @@ mod tests {
         let session = a_session(&state).await;
         request(&state, session, "login").await.expect("request");
         accept(&state, session).await.expect("accept");
-        give_back(&state, session).await.expect("give back");
+        give_back(&state, session, None).await.expect("give back");
 
         assert!(
             keep(&state, session, false, true)
@@ -981,7 +1288,7 @@ mod tests {
         let session = a_session(&state).await;
         request(&state, session, "login").await.expect("request");
         accept(&state, session).await.expect("accept");
-        give_back(&state, session).await.expect("give back");
+        give_back(&state, session, None).await.expect("give back");
 
         assert!(
             keep(&state, session, false, false)
@@ -1016,7 +1323,7 @@ mod tests {
         ));
         // Giving back a wheel nobody has.
         assert!(matches!(
-            give_back(&state, session).await,
+            give_back(&state, session, None).await,
             Err(WheelError::WrongState(_))
         ));
         // Keeping a chain that was never recorded.
@@ -1070,7 +1377,7 @@ mod tests {
 
         // It leaves by the ordinary door: this is the same `give_back` the handover uses, which is
         // what makes the grant rule identical for both ways in.
-        assert!(give_back(&state, row.id).await.is_ok());
+        assert!(give_back(&state, row.id, None).await.is_ok());
         db.close().await;
     }
 
@@ -1099,6 +1406,569 @@ mod tests {
                 .is_empty(),
             "a refusal must not leave a row offering a handover"
         );
+        db.close().await;
+    }
+
+    /// One open row for project `acme` on sidecar id `s1`, in the given mode and seat.
+    async fn volante_row(
+        state: &AppState,
+        profile_kind: &str,
+        row_mode: &str,
+        seat: Option<&str>,
+    ) -> i64 {
+        let profile_id = if profile_kind == "project" {
+            "acme"
+        } else {
+            "run-7"
+        };
+        sqlx::query(
+            "INSERT INTO browser_sessions \
+                (sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
+                 final_url, rule, mode, seat, opened_at) \
+             VALUES ('s1', 7, 'acme', ?, ?, 'https://jira.example.org/login', \
+                     'https://jira.example.org/login', 'project-site', ?, ?, \
+                     '2026-08-16T10:00:00Z')",
+        )
+        .bind(profile_kind)
+        .bind(profile_id)
+        .bind(row_mode)
+        .bind(seat)
+        .execute(&state.pool)
+        .await
+        .expect("insert")
+        .last_insert_rowid()
+    }
+
+    fn volante_saw(seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, verb: &str) -> bool {
+        seen.lock().unwrap().iter().any(|seen| seen == verb)
+    }
+
+    /// Spec 4.1: a lone project-profile session is offered the shell seat, and with no explicit
+    /// choice the shell is what the approval picks. No second Chrome is launched for it.
+    #[tokio::test]
+    async fn volante_approval_on_the_project_profile_goes_shell_with_a_nonce() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        let id = volante_row(&state, "project", mode::WHEEL_REQUESTED, None).await;
+
+        let (row, nonce) = accept_with_seat(&state, id, None).await.expect("accept");
+
+        assert_eq!(row.mode, mode::HUMAN);
+        assert_eq!(row.seat.as_deref(), Some("shell"));
+        assert_eq!(
+            row.sidecar_id, "s1",
+            "the shell seat keeps the same browser"
+        );
+        let nonce = nonce.expect("a shell seat comes with a nonce");
+        assert!(state.browser.seats.matches(id, &nonce));
+        assert!(volante_saw(&seen, "person/begin"));
+        assert!(
+            !volante_saw(&seen, "wheel/take"),
+            "no new window for the shell seat"
+        );
+        db.close().await;
+    }
+
+    /// A throwaway cannot be driven from the shell, so the default is today's real window.
+    #[tokio::test]
+    async fn volante_approval_on_a_throwaway_goes_window() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        let id = volante_row(&state, "ephemeral", mode::WHEEL_REQUESTED, None).await;
+
+        let (row, nonce) = accept_with_seat(&state, id, None).await.expect("accept");
+
+        assert_eq!(row.mode, mode::HUMAN);
+        assert_eq!(row.seat.as_deref(), Some("window"));
+        assert_eq!(nonce, None);
+        assert!(volante_saw(&seen, "wheel/take"));
+        assert!(!volante_saw(&seen, "person/begin"));
+        db.close().await;
+    }
+
+    /// "Open real window" at approval time: the person chose a window although the shell was on
+    /// offer.
+    #[tokio::test]
+    async fn volante_open_real_window_at_approval_goes_window() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        let id = volante_row(&state, "project", mode::WHEEL_REQUESTED, None).await;
+
+        let (row, nonce) = accept_with_seat(&state, id, Some(SeatChoice::Window))
+            .await
+            .expect("accept");
+
+        assert_eq!(row.mode, mode::HUMAN);
+        assert_eq!(row.seat.as_deref(), Some("window"));
+        assert_eq!(row.sidecar_id, "h1", "the row follows the person's window");
+        assert_eq!(nonce, None);
+        assert!(volante_saw(&seen, "wheel/take"));
+        assert!(!volante_saw(&seen, "person/begin"));
+        db.close().await;
+    }
+
+    /// The door from the shell seat to a real window: same mode, new seat, and the shell's nonce is
+    /// forgotten so the shell can no longer drive.
+    #[tokio::test]
+    async fn volante_open_real_window_from_human_shell() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        let id = volante_row(&state, "project", mode::HUMAN, Some("shell")).await;
+        let nonce = state.browser.seats.issue(id);
+
+        let row = to_window(&state, id).await.expect("to window");
+
+        assert_eq!(row.mode, mode::HUMAN);
+        assert_eq!(row.seat.as_deref(), Some("window"));
+        assert_eq!(row.sidecar_id, "h1");
+        assert!(
+            !state.browser.seats.matches(id, &nonce),
+            "the nonce is forgotten"
+        );
+        assert!(volante_saw(&seen, "wheel/take"));
+
+        // Only a human/shell session may move; one already in a window may not.
+        assert!(matches!(
+            to_window(&state, id).await,
+            Err(WheelError::WrongState(_))
+        ));
+        db.close().await;
+    }
+
+    /// When the real window cannot open, the person is still on the shell seat, so the sidecar's
+    /// fence is restored (best effort `person/end`) rather than left half moved.
+    #[tokio::test]
+    async fn volante_to_window_failure_restores_the_fence() {
+        let (db, state, seen) = wheeled(vec![], true).await;
+        let id = volante_row(&state, "project", mode::HUMAN, Some("shell")).await;
+        state.browser.seats.issue(id);
+
+        let outcome = to_window(&state, id).await;
+
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert!(volante_saw(&seen, "wheel/take"));
+        assert!(
+            volante_saw(&seen, "person/end"),
+            "the fence is restored after the failure: {:?}",
+            seen.lock().unwrap()
+        );
+        db.close().await;
+    }
+
+    /// Spec 4.4a for the shell seat: when the person's stretch cannot begin it is a failed
+    /// delivery, never a return to the agent.
+    #[tokio::test]
+    async fn volante_shell_approval_with_failed_begin_person_is_delivery_failed() {
+        let (db, state, _) = wheeled_with(vec![], false, true).await;
+        let id = volante_row(&state, "project", mode::WHEEL_REQUESTED, None).await;
+        let proposal = crate::proposals::create_wheel_request(
+            &state.pool,
+            crate::proposals::WheelAsk {
+                run_id: Some(7),
+                project_id: "acme",
+                session_id: id,
+                requested_url: "https://jira.example.org/login",
+                final_url: "https://jira.example.org/login",
+                origin: "https://jira.example.org",
+                reasoning: "login",
+            },
+        )
+        .await
+        .expect("proposal");
+        sqlx::query("UPDATE browser_sessions SET proposal_id = ? WHERE id = ?")
+            .bind(proposal)
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let events_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposal_events WHERE proposal_id = ?")
+                .bind(proposal)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+
+        let outcome = accept_with_seat(&state, id, Some(SeatChoice::Shell)).await;
+        assert!(
+            matches!(outcome, Err(WheelError::Sidecar(_))),
+            "{outcome:?}"
+        );
+
+        let row = crate::browser::session_row(&state.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.mode, mode::DELIVERY_FAILED);
+        let events_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposal_events WHERE proposal_id = ?")
+                .bind(proposal)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(
+            events_after > events_before,
+            "the proposal carries the reason"
+        );
+        db.close().await;
+    }
+
+    // ---- returning the wheel: `to`, person-driving and wheel_returned (P6) ----------------------
+
+    /// A browser runtime whose sidecar is not there: the port was bound and released, so every call
+    /// is refused at the connection.
+    async fn volante_dead_runtime() -> std::sync::Arc<crate::browser::BrowserRuntime> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        std::sync::Arc::new(crate::browser::BrowserRuntime {
+            enabled: true,
+            client: BrowserClient::new(&address.to_string(), "tok".into()),
+            modes: Default::default(),
+            seats: Default::default(),
+        })
+    }
+
+    /// A browser runtime whose sidecar answers `/snapshot` with a page and everything else with 204.
+    async fn volante_snapshot_runtime() -> std::sync::Arc<crate::browser::BrowserRuntime> {
+        use axum::extract::Path;
+        use axum::response::IntoResponse as _;
+        use axum::routing::post;
+
+        let app = axum::Router::new().route(
+            "/{verb}",
+            post(
+                |Path(verb): Path<String>, _body: axum::body::Bytes| async move {
+                    if verb == "snapshot" {
+                        return axum::Json(serde_json::json!({
+                            "session_id": "s1",
+                            "url": "https://jira.example.org/login",
+                        }))
+                        .into_response();
+                    }
+                    axum::http::StatusCode::NO_CONTENT.into_response()
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        std::sync::Arc::new(crate::browser::BrowserRuntime {
+            enabled: true,
+            client: BrowserClient::new(&address.to_string(), "tok".into()),
+            modes: Default::default(),
+            seats: Default::default(),
+        })
+    }
+
+    /// A minimal `runs` row with the id `volante_row` gives its session (7), in the given status.
+    async fn volante_run(state: &AppState, status: &str) {
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at) \
+             VALUES (7, 'browse', ?, '2026-08-16T10:00:00Z')",
+        )
+        .bind(status)
+        .execute(&state.pool)
+        .await
+        .expect("insert run");
+    }
+
+    async fn volante_closed_reason(state: &AppState, id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT closed_reason FROM browser_sessions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn volante_response_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    /// Returning from the shell seat to the agent: the session stays open and goes back to the agent
+    /// with no seat, but only once the sidecar has confirmed the person's stretch is over (the fence
+    /// is restored). The chain is recorded and the keep question is open.
+    #[tokio::test]
+    async fn volante_return_to_agent_moves_the_row_only_after_person_end() {
+        let (db, state, seen) = wheeled(vec!["https://jira.example.org/login"], false).await;
+        let id = volante_row(&state, "project", mode::HUMAN, Some("shell")).await;
+        volante_run(&state, "running").await;
+        let nonce = state.browser.seats.issue(id);
+
+        let chain = give_back(&state, id, Some("agent")).await.expect("return");
+
+        assert_eq!(chain, vec!["https://jira.example.org/login".to_string()]);
+        assert!(volante_saw(&seen, "person/end"));
+        assert!(
+            !volante_saw(&seen, "wheel/return"),
+            "a shell seat has no window to give back"
+        );
+        let row = crate::browser::session_row(&state.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.mode, mode::AGENT);
+        assert_eq!(row.seat, None);
+        assert_eq!(row.closed_at, None, "the session stays open for the agent");
+        assert!(row.chain.is_some(), "the chain is recorded");
+        assert_eq!(row.chain_decided_at, None, "the keep question is open");
+        assert!(!state.browser.seats.matches(id, &nonce));
+        assert!(state.browser.seats.take_returned(id));
+        assert!(!state.browser.seats.take_returned(id), "announced once");
+        db.close().await;
+    }
+
+    /// If the sidecar cannot end the person's stretch, the fence state is unknown, so the session is
+    /// closed rather than handed back to the agent.
+    #[tokio::test]
+    async fn volante_return_to_agent_failed_person_end_closes_fence_not_restored() {
+        let (db, mut state, _) = wheeled(vec![], false).await;
+        state.browser = volante_dead_runtime().await;
+        let id = volante_row(&state, "project", mode::HUMAN, Some("shell")).await;
+        volante_run(&state, "running").await;
+        let nonce = state.browser.seats.issue(id);
+
+        let outcome = give_back(&state, id, Some("agent")).await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(WheelError::Sidecar(_)) | Err(WheelError::WrongState(_))
+            ),
+            "{outcome:?}"
+        );
+        let row = crate::browser::session_row(&state.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(row.mode, mode::AGENT, "never back to the agent");
+        assert!(row.closed_at.is_some());
+        assert_eq!(
+            volante_closed_reason(&state, id).await.as_deref(),
+            Some("fence-not-restored")
+        );
+        assert!(!state.browser.seats.matches(id, &nonce));
+        assert!(!state.browser.seats.take_returned(id));
+        db.close().await;
+    }
+
+    /// `to=agent` with no run alive to receive the session (no run row, or one that is not running)
+    /// closes it like a plain return.
+    #[tokio::test]
+    async fn volante_return_to_agent_without_a_live_run_closes() {
+        for finished in [None, Some("failed")] {
+            let (db, state, seen) = wheeled(vec!["https://jira.example.org/login"], false).await;
+            let id = volante_row(&state, "project", mode::HUMAN, Some("shell")).await;
+            if let Some(status) = finished {
+                volante_run(&state, status).await;
+            }
+            let nonce = state.browser.seats.issue(id);
+
+            let chain = give_back(&state, id, Some("agent")).await.expect("return");
+
+            assert_eq!(chain, vec!["https://jira.example.org/login".to_string()]);
+            assert!(volante_saw(&seen, "person/end"), "{finished:?}");
+            let row = crate::browser::session_row(&state.pool, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(row.closed_at.is_some(), "{finished:?}");
+            assert_ne!(row.mode, mode::AGENT, "{finished:?}");
+            assert!(row.chain.is_some(), "the chain outlives the row");
+            assert_eq!(
+                volante_closed_reason(&state, id).await.as_deref(),
+                Some("wheel-returned")
+            );
+            assert!(!state.browser.seats.matches(id, &nonce));
+            db.close().await;
+        }
+    }
+
+    /// `to=close`, an absent `to`, and the window seat all keep today's behaviour: the chain comes
+    /// home and the row closes as `wheel-returned`. A shell seat gets its chain from `/person/end`.
+    #[tokio::test]
+    async fn volante_return_close_or_absent_keeps_todays_behaviour() {
+        // Window seat, no `to`: the sidecar's wheel return, as before.
+        let (db, state, seen) = wheeled(vec!["https://jira.example.org/login"], false).await;
+        let id = volante_row(&state, "project", mode::HUMAN, Some("window")).await;
+        let chain = give_back(&state, id, None).await.expect("return");
+        assert_eq!(chain, vec!["https://jira.example.org/login".to_string()]);
+        assert!(volante_saw(&seen, "wheel/return"));
+        assert_eq!(
+            volante_closed_reason(&state, id).await.as_deref(),
+            Some("wheel-returned")
+        );
+        db.close().await;
+
+        // Shell seat, `to=close` and no `to`, both with a live run: both close.
+        for to in [Some("close"), None] {
+            let (db, state, seen) = wheeled(vec!["https://jira.example.org/login"], false).await;
+            let id = volante_row(&state, "project", mode::HUMAN, Some("shell")).await;
+            volante_run(&state, "running").await;
+            let chain = give_back(&state, id, to).await.expect("return");
+            assert_eq!(chain, vec!["https://jira.example.org/login".to_string()]);
+            assert!(volante_saw(&seen, "person/end"), "{to:?}");
+            let row = crate::browser::session_row(&state.pool, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(row.closed_at.is_some(), "{to:?}");
+            assert_eq!(
+                volante_closed_reason(&state, id).await.as_deref(),
+                Some("wheel-returned"),
+                "{to:?}"
+            );
+            db.close().await;
+        }
+
+        // Shell seat, `to=close`, the sidecar cannot end the stretch: the chain is empty and the row
+        // still closes as `wheel-returned`.
+        let (db, mut state, _) = wheeled(vec![], false).await;
+        state.browser = volante_dead_runtime().await;
+        let id = volante_row(&state, "project", mode::HUMAN, Some("shell")).await;
+        let chain = give_back(&state, id, Some("close")).await.expect("return");
+        assert!(chain.is_empty());
+        assert_eq!(
+            volante_closed_reason(&state, id).await.as_deref(),
+            Some("wheel-returned")
+        );
+        db.close().await;
+    }
+
+    /// A session can go to the person twice. Each return records a fresh chain and the keep question
+    /// is asked again, even though the first one was answered.
+    #[tokio::test]
+    async fn volante_a_second_return_reopens_the_keep_question() {
+        let (db, state, _) = wheeled(vec!["https://jira.example.org/login"], false).await;
+        let id = volante_row(&state, "project", mode::HUMAN, Some("shell")).await;
+        volante_run(&state, "running").await;
+
+        give_back(&state, id, Some("agent")).await.expect("first");
+        keep(&state, id, false, false).await.expect("first answer");
+        assert!(
+            matches!(
+                keep(&state, id, true, false).await,
+                Err(WheelError::WrongState(_))
+            ),
+            "answered once, not twice"
+        );
+
+        assert!(
+            crate::browser::set_mode_seat(
+                &state.pool,
+                &state.browser.modes,
+                id,
+                mode::AGENT,
+                mode::HUMAN,
+                Some("shell"),
+            )
+            .await
+            .unwrap()
+        );
+        give_back(&state, id, Some("agent")).await.expect("second");
+
+        let granted = keep(&state, id, true, false)
+            .await
+            .expect("the second chain can be answered");
+        assert!(!granted.is_empty(), "the second answer grants the chain");
+        db.close().await;
+    }
+
+    /// While a person drives (either seat) the agent's refusal says `person-driving`; a requested
+    /// wheel still says `wheel-requested`.
+    #[tokio::test]
+    async fn volante_person_driving_is_the_consequence_while_a_person_drives() {
+        let (db, state, _) = wheeled(vec![], false).await;
+        for (row_mode, seat, consequence) in [
+            (mode::HUMAN, Some("shell"), "person-driving"),
+            (mode::HUMAN, Some("window"), "person-driving"),
+            (mode::WHEEL_REQUESTED, None, "wheel-requested"),
+        ] {
+            sqlx::query(
+                "UPDATE browser_sessions SET closed_at = '2026-08-16T10:01:00Z' \
+                 WHERE closed_at IS NULL",
+            )
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            let id = volante_row(&state, "project", row_mode, seat).await;
+
+            let snapshot = volante_response_json(
+                crate::browser::post_snapshot(
+                    axum::extract::State(state.clone()),
+                    axum::Json(crate::browser::SessionBody {
+                        session_id: id,
+                        changes_only: false,
+                        text_from: 0,
+                        controls_from: 0,
+                        find: String::new(),
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(snapshot["outcome"], "refused", "{row_mode} {seat:?}");
+            assert_eq!(
+                snapshot["refusal"]["consequence"], consequence,
+                "snapshot, {row_mode} {seat:?}"
+            );
+
+            let act = volante_response_json(
+                crate::browser::post_act(
+                    axum::extract::State(state.clone()),
+                    axum::Json(crate::browser::ActBody {
+                        session_id: id,
+                        kind: "click".into(),
+                        element_ref: "e1".into(),
+                        text: String::new(),
+                        filename: String::new(),
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                act["refusal"]["consequence"], consequence,
+                "act, {row_mode} {seat:?}"
+            );
+        }
+        db.close().await;
+    }
+
+    /// After the wheel comes back the agent's next snapshot carries `wheel_returned: true`, once,
+    /// and the answer after that does not.
+    #[tokio::test]
+    async fn volante_wheel_returned_appears_once() {
+        let (db, mut state, _) = wheeled(vec![], false).await;
+        state.browser = volante_snapshot_runtime().await;
+        let id = volante_row(&state, "project", mode::AGENT, None).await;
+        let ask = |state: AppState| async move {
+            volante_response_json(
+                crate::browser::post_snapshot(
+                    axum::extract::State(state),
+                    axum::Json(crate::browser::SessionBody {
+                        session_id: id,
+                        changes_only: false,
+                        text_from: 0,
+                        controls_from: 0,
+                        find: String::new(),
+                    }),
+                )
+                .await,
+            )
+            .await
+        };
+
+        let before = ask(state.clone()).await;
+        assert!(before.get("wheel_returned").is_none(), "{before}");
+
+        state.browser.seats.mark_returned(id);
+        let first = ask(state.clone()).await;
+        assert_eq!(first["wheel_returned"], true, "{first}");
+        assert_eq!(first["session_id"], "s1", "the snapshot itself is intact");
+
+        let second = ask(state.clone()).await;
+        assert!(second.get("wheel_returned").is_none(), "{second}");
         db.close().await;
     }
 }

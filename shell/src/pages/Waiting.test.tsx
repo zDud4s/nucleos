@@ -12,6 +12,7 @@ vi.mock("../data/client", async (original) => ({
 import { Waiting } from "./Waiting";
 import { ApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
+import { seatNonce } from "../data/seat";
 import type { AgentRequest } from "../data/agents";
 import type { Proposal } from "../data/system";
 import type { TeamAction } from "../data/teams";
@@ -62,6 +63,8 @@ function session(overrides: Partial<BrowserSession> = {}): BrowserSession {
     final_url: "https://example.com/login",
     rule: "ask",
     mode: "wheel-requested",
+    seat: null,
+    shell_eligible: false,
     refusal: null,
     proposal_id: 91,
     chain: null,
@@ -1213,5 +1216,64 @@ describe("Waiting - declining only the action", () => {
     await waitFor(() =>
       expect(daemon.apiFetch).toHaveBeenCalledWith("/proposals/41/decline-action", { method: "POST" }),
     );
+  });
+});
+
+/** The dwell `ConfirmButton` needs between arming and confirming — a real gap. */
+function afterDwell(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 350));
+}
+
+describe("Waiting - wheel requests, two seats", () => {
+  const approvals = () =>
+    daemon.apiFetch.mock.calls
+      .filter(
+        ([path, init]) =>
+          /^\/proposals\/\d+\/approve$/.test(String(path)) && (init as RequestInit | undefined)?.method === "POST",
+      )
+      .map(([path, init]) => ({
+        path: String(path),
+        body: JSON.parse(String((init as RequestInit).body ?? "{}")),
+      }));
+
+  it("an eligible wheel request offers Approve and Open real window and sends the seat", async () => {
+    const world = waitingWorld({
+      sessions: [session({ id: 5, proposal_id: 91, shell_eligible: true })],
+      approveAnswer: { session: session({ id: 5, mode: "human", seat: "shell" }), seat_nonce: "n1" },
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+    await renderWaiting();
+
+    const approve = await screen.findByRole("button", { name: "Approve wheel #91" });
+    expect(screen.getByRole("button", { name: "Open real window for wheel #91" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Refuse wheel #91" })).toBeDefined();
+
+    fireEvent.click(approve);
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Drive it here in the shell" }));
+    await waitFor(() => expect(approvals()).toHaveLength(1));
+    expect(approvals()[0]).toEqual({ path: "/proposals/91/approve", body: { seat: "shell" } });
+    // After a shell approval the way to the session is a link, not a guess.
+    expect(await screen.findByRole("link", { name: "drive it on Web" })).toBeDefined();
+    // The returned nonce is what lets the shell drive: it must have been stored.
+    expect(seatNonce(5)).toBe("n1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open real window for wheel #91" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Open a real browser here" }));
+    await waitFor(() => expect(approvals()).toHaveLength(2));
+    expect(approvals()[1].body).toEqual({ seat: "window" });
+  });
+
+  it("an ineligible wheel request offers only Open real window", async () => {
+    const world = waitingWorld({
+      sessions: [session({ id: 5, proposal_id: 91, shell_eligible: false })],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+    await renderWaiting();
+
+    expect(await screen.findByRole("button", { name: "Open real window for wheel #91" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Approve wheel #91" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Refuse wheel #91" })).toBeDefined();
   });
 });

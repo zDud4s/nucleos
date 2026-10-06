@@ -45,7 +45,9 @@ type scriptedWatcher struct {
 	// the client has proved it received the one before.
 	beforeEach func(i int)
 	frames     [][]byte
-	end        error
+	// metas, when set, is the metadata sent with the frame at the same index.
+	metas []*browser.FrameMeta
+	end   error
 }
 
 func (s *scriptedWatcher) Watch(ctx context.Context, _ browser.SessionID, sink func(browser.Frame)) error {
@@ -53,7 +55,11 @@ func (s *scriptedWatcher) Watch(ctx context.Context, _ browser.SessionID, sink f
 		if s.beforeEach != nil {
 			s.beforeEach(i)
 		}
-		sink(browser.Frame{JPEG: jpeg})
+		frame := browser.Frame{JPEG: jpeg}
+		if i < len(s.metas) {
+			frame.Meta = s.metas[i]
+		}
+		sink(frame)
 	}
 	return s.end
 }
@@ -384,5 +390,169 @@ func TestWatchAFailedWriteEndsTheWatch(t *testing.T) {
 	case <-watcher.ctxEnded:
 	case <-time.After(WatchWriteDeadline + 2*time.Second):
 		t.Fatalf("the watch was still running %v after the request, though a record write had failed", time.Since(sent))
+	}
+}
+
+// TestWatchWritesMBeforeTheFirstFrameAndWhenItChanges. The viewer needs the geometry before the
+// picture it describes, and needs it again only when it changes: A, A, B reads back as M F F M F E.
+func TestWatchWritesMBeforeTheFirstFrameAndWhenItChanges(t *testing.T) {
+	a := &browser.FrameMeta{FrameWidth: 1280, FrameHeight: 720, DeviceWidth: 1280, DeviceHeight: 720, PageScaleFactor: 1}
+	same := *a
+	b := &browser.FrameMeta{FrameWidth: 1280, FrameHeight: 720, DeviceWidth: 1280, DeviceHeight: 720,
+		OffsetTop: 12, PageScaleFactor: 2, ScrollOffsetX: 3, ScrollOffsetY: 40}
+	watcher := &scriptedWatcher{
+		Fake:   &browser.Fake{FenceAttached: true},
+		frames: [][]byte{[]byte("one"), []byte("two"), []byte("three")},
+		metas:  []*browser.FrameMeta{a, &same, b},
+		end:    browser.WatchEnded{Reason: browser.EndWheel},
+	}
+	server := watchServer(t, watcher, nil)
+
+	reader := bufio.NewReader(rawWatch(t, server, "s1").Body)
+	var kinds []byte
+	var metaBodies [][]byte
+	var frameBodies []string
+	for {
+		kind, body, err := ReadRecord(reader)
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("read: %v", err)
+			}
+			break
+		}
+		kinds = append(kinds, kind)
+		switch kind {
+		case RecordMeta:
+			metaBodies = append(metaBodies, body)
+		case RecordFrame:
+			frameBodies = append(frameBodies, string(body))
+		}
+	}
+	if string(kinds) != "MFFMFE" {
+		t.Fatalf("record kinds = %q, want MFFMFE", kinds)
+	}
+	if got := strings.Join(frameBodies, ","); got != "one,two,three" {
+		t.Errorf("frames = %q, want them in order and untouched", got)
+	}
+	if len(metaBodies) != 2 {
+		t.Fatalf("got %d M records, want 2", len(metaBodies))
+	}
+	var first, second browser.FrameMeta
+	if err := json.Unmarshal(metaBodies[0], &first); err != nil || first != *a {
+		t.Errorf("first M = %s (%v), want %+v", metaBodies[0], err, *a)
+	}
+	if err := json.Unmarshal(metaBodies[1], &second); err != nil || second != *b {
+		t.Errorf("second M = %s (%v), want %+v", metaBodies[1], err, *b)
+	}
+	// The wire names are the contract the shell reads.
+	var raw map[string]any
+	if err := json.Unmarshal(metaBodies[1], &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"frameWidth", "frameHeight", "deviceWidth", "deviceHeight",
+		"offsetTop", "pageScaleFactor", "scrollOffsetX", "scrollOffsetY"} {
+		if _, ok := raw[name]; !ok {
+			t.Errorf("the M record has no %q field: %s", name, metaBodies[1])
+		}
+	}
+}
+
+// TestWatchRecordKindsAreFixed. The kind bytes are the wire format; adding M and P must not move F
+// and E.
+func TestWatchRecordKindsAreFixed(t *testing.T) {
+	if RecordFrame != 'F' || RecordEnd != 'E' || RecordMeta != 'M' || RecordPrompt != 'P' {
+		t.Fatalf("record kinds drifted: F=%q E=%q M=%q P=%q", RecordFrame, RecordEnd, RecordMeta, RecordPrompt)
+	}
+}
+
+// promptingWatcher sinks the prompts and frames of its script in order, then ends the way it says.
+type promptingWatcher struct {
+	*browser.Fake
+	script []browser.Frame
+	end    error
+}
+
+func (p *promptingWatcher) Watch(_ context.Context, _ browser.SessionID, sink func(browser.Frame)) error {
+	for _, frame := range p.script {
+		sink(frame)
+	}
+	return p.end
+}
+
+// TestWatchWritesAPromptRecord. A prompt is one P record carrying the prompt as JSON, and nothing
+// else: no F with an empty picture and no M for geometry it does not have. A resolved prompt is the
+// same record with `resolved` set, and the stream goes on around both.
+func TestWatchWritesAPromptRecord(t *testing.T) {
+	multiple := false
+	ask := &browser.Prompt{ID: "p1", Kind: "dialog", DialogType: "confirm", Message: "Delete everything?"}
+	choose := &browser.Prompt{ID: "p2", Kind: "select", Multiple: &multiple,
+		Options: []browser.PromptOption{{Value: "a", Label: "Alpha", Selected: true}}}
+	watcher := &promptingWatcher{
+		Fake: &browser.Fake{FenceAttached: true},
+		script: []browser.Frame{
+			{JPEG: []byte("one")},
+			{Prompt: ask},
+			{Prompt: choose},
+			{Prompt: &browser.Prompt{ID: "p1", Kind: "dialog", Resolved: true}},
+			{JPEG: []byte("two")},
+		},
+		end: browser.WatchEnded{Reason: browser.EndGone},
+	}
+	server := watchServer(t, watcher, nil)
+
+	reader := bufio.NewReader(rawWatch(t, server, "s1").Body)
+	var kinds []byte
+	var prompts [][]byte
+	for {
+		kind, body, err := ReadRecord(reader)
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("read: %v", err)
+			}
+			break
+		}
+		kinds = append(kinds, kind)
+		if kind == RecordPrompt {
+			prompts = append(prompts, body)
+		}
+	}
+	if string(kinds) != "FPPPFE" {
+		t.Fatalf("record kinds = %q, want FPPPFE", kinds)
+	}
+	if len(prompts) != 3 {
+		t.Fatalf("got %d P records, want 3", len(prompts))
+	}
+
+	var first map[string]any
+	if err := json.Unmarshal(prompts[0], &first); err != nil {
+		t.Fatalf("the first P is not JSON: %v", err)
+	}
+	if first["id"] != "p1" || first["kind"] != "dialog" || first["dialogType"] != "confirm" || first["message"] != "Delete everything?" {
+		t.Errorf("first P = %s", prompts[0])
+	}
+	if _, present := first["resolved"]; present {
+		t.Errorf("an open prompt carries `resolved`: %s", prompts[0])
+	}
+
+	var second map[string]any
+	if err := json.Unmarshal(prompts[1], &second); err != nil {
+		t.Fatalf("the second P is not JSON: %v", err)
+	}
+	if value, present := second["multiple"]; !present || value != false {
+		t.Errorf("a select prompt must say multiple=false out loud: %s", prompts[1])
+	}
+	if options, ok := second["options"].([]any); !ok || len(options) != 1 {
+		t.Errorf("the select's options were lost: %s", prompts[1])
+	}
+
+	var closed map[string]any
+	if err := json.Unmarshal(prompts[2], &closed); err != nil {
+		t.Fatalf("the third P is not JSON: %v", err)
+	}
+	if closed["id"] != "p1" || closed["kind"] != "dialog" || closed["resolved"] != true {
+		t.Errorf("resolved P = %s, want {id, kind, resolved:true}", prompts[2])
+	}
+	if _, present := closed["message"]; present {
+		t.Errorf("a resolved record repeats the question: %s", prompts[2])
 	}
 }

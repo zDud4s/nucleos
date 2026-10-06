@@ -66,6 +66,18 @@ type Fake struct {
 	// human is the session a person is driving, if any. The Fake keeps it for the same reason the
 	// pool does: a return has to be refusable for a session nobody was ever handed.
 	human SessionID
+	// person is the session a person drives in the agent's own browser (see BeginPerson).
+	person SessionID
+
+	// PersonErr, if set, is what BeginPerson returns instead of beginning.
+	PersonErr error
+	// PersonBegun and PersonEnded record the sessions BeginPerson and EndPerson accepted.
+	PersonBegun []SessionID
+	PersonEnded []SessionID
+
+	// Inputs is every batch Input accepted, in order. InputErr, if set, is what Input returns instead.
+	Inputs   [][]InputEvent
+	InputErr error
 }
 
 func (f *Fake) Name() string { return "fake" }

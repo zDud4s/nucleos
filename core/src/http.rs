@@ -916,7 +916,28 @@ pub fn build_router(state: AppState) -> Router {
         .route("/browser/sessions", get(crate::browser::list_open_sessions))
         .route(
             "/browser/sessions/{id}/live",
-            get(crate::browser_live::get_live),
+            get(crate::browser_live::get_live_checked),
+        )
+        // In no scope table on purpose: a run's key gets 403 here before the handler, and the handler
+        // refuses a control-token holder that carries a run id.
+        .route(
+            "/browser/sessions/{id}/take",
+            post(crate::browser_seat::post_take),
+        )
+        .route(
+            "/browser/sessions/{id}/window",
+            post(crate::browser_wheel::post_window_seat),
+        )
+        .route(
+            "/browser/sessions/{id}/input",
+            post(crate::browser_seat::post_input)
+                .layer(DefaultBodyLimit::max(crate::browser_seat::INPUT_BODY_LIMIT)),
+        )
+        .route(
+            "/browser/sessions/{id}/answer",
+            post(crate::browser_seat::post_answer).layer(DefaultBodyLimit::max(
+                crate::browser_seat::ANSWER_BODY_LIMIT,
+            )),
         )
         .route(
             "/browser/sites/{project_id}",
@@ -14509,6 +14530,8 @@ fn merge_decision_response(
 #[serde(default)]
 struct ApproveBody {
     hire: Option<crate::agent::AgentRequest>,
+    /// Only a browser-wheel approval reads it: `"shell"` or `"window"`.
+    seat: Option<String>,
 }
 
 async fn post_proposal_approve(
@@ -14518,7 +14541,10 @@ async fn post_proposal_approve(
     // kinds through this door send nothing.
     body: Option<Json<ApproveBody>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let edited = body.and_then(|Json(body)| body.hire);
+    let (edited, seat) = match body {
+        Some(Json(body)) => (body.hire, body.seat),
+        None => (None, None),
+    };
     // Two kinds of proposal share this table and this door, and they are decided by entirely
     // different machinery: an action approval resumes a paused run, a contact merge joins two
     // people and touches no run at all. Reading the kind first is only a dispatch — the kind never
@@ -14667,7 +14693,7 @@ async fn post_proposal_approve(
     }
 
     if kind == "browser-wheel" {
-        return approve_browser_wheel(state, id).await;
+        return approve_browser_wheel(state, id, seat).await;
     }
 
     if kind == "fleet-exclusion" {
@@ -14864,7 +14890,19 @@ async fn post_proposal_approve(
 async fn approve_browser_wheel(
     state: AppState,
     id: i64,
+    seat: Option<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let choice = match seat.as_deref() {
+        None => None,
+        Some("shell") => Some(crate::browser_wheel::SeatChoice::Shell),
+        Some("window") => Some(crate::browser_wheel::SeatChoice::Window),
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "seat must be \"shell\" or \"window\"".to_owned(),
+            ));
+        }
+    };
     let session_id = crate::proposals::get(&state.pool, id)
         .await
         .map_err(|error| {
@@ -14884,6 +14922,28 @@ async fn approve_browser_wheel(
             )
         })?;
 
+    // An explicit shell seat that is not on offer is refused BEFORE the decision is made: once the
+    // proposal is approved, a refusal would strand the row in `wheel-requested`. Reads only the
+    // database, so it does not depend on the pillar being on.
+    if choice == Some(crate::browser_wheel::SeatChoice::Shell) {
+        let offered = crate::browser::session_row(&state.pool, session_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(proposal_id = id, %error, "reading a wheel session failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the session could not be read".to_owned(),
+                )
+            })?
+            .is_some_and(|row| row.closed_at.is_none() && row.shell_eligible);
+        if !offered {
+            return Err((
+                StatusCode::CONFLICT,
+                serde_json::json!({ "error": "seat_unavailable" }).to_string(),
+            ));
+        }
+    }
+
     let transitioned = crate::proposals::transition(&state.pool, id, "approved", "wheel accepted")
         .await
         .map_err(|error| {
@@ -14901,11 +14961,19 @@ async fn approve_browser_wheel(
     }
 
     let handover = state.clone();
-    match uncancellable(async move { crate::browser_wheel::accept(&handover, session_id).await })
-        .await
-        .map_err(|status| (status, "the handover task did not finish".to_owned()))?
+    match uncancellable(async move {
+        crate::browser_wheel::accept_with_seat(&handover, session_id, choice).await
+    })
+    .await
+    .map_err(|status| (status, "the handover task did not finish".to_owned()))?
     {
-        Ok(row) => Ok(Json(serde_json::json!({ "session": row }))),
+        Ok((row, nonce)) => {
+            let mut answer = serde_json::json!({ "session": row });
+            if let Some(nonce) = nonce {
+                answer["seat_nonce"] = serde_json::Value::String(nonce);
+            }
+            Ok(Json(answer))
+        }
         Err(crate::browser_wheel::WheelError::NoSuchSession) => Err((
             StatusCode::NOT_FOUND,
             "the session this wheel was asked for is gone".to_owned(),
@@ -38310,6 +38378,200 @@ mod tests {
         assert!(
             rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
             "the exit watchdog died with the runtime that asked for shutdown"
+        );
+    }
+
+    async fn post_browser_body(uri: &str, body: Vec<u8>) -> StatusCode {
+        build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Input events are small: one byte over 64 KiB is refused before the handler reads it.
+    #[tokio::test]
+    async fn volante_input_body_over_64_kib_is_refused() {
+        let status = post_browser_body(
+            "/browser/sessions/1/input",
+            vec![b'x'; crate::browser_seat::INPUT_BODY_LIMIT + 1],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// An answer may carry a file chosen in a dialog, so its limit is 14 MiB, well above axum's 2 MiB
+    /// default: a 3 MiB body gets past the limit, one over 14 MiB does not.
+    #[tokio::test]
+    async fn volante_answer_body_limit_is_14_mib() {
+        assert_eq!(crate::browser_seat::ANSWER_BODY_LIMIT, 14 * 1024 * 1024);
+
+        let padding = "a".repeat(3 * 1024 * 1024);
+        let body = serde_json::json!({ "seat_nonce": "n", "prompt": "p", "answer": padding });
+        let status =
+            post_browser_body("/browser/sessions/1/answer", body.to_string().into_bytes()).await;
+        assert_ne!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "3 MiB is within the limit"
+        );
+        assert_ne!(status, StatusCode::NOT_FOUND, "the route must exist");
+
+        let status = post_browser_body(
+            "/browser/sessions/1/answer",
+            vec![b'x'; crate::browser_seat::ANSWER_BODY_LIMIT + 1],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// GETs `/browser/sessions/{id}/live` against a state whose browser pillar is on and whose
+    /// sidecar is not there, with or without the run-id header a run's own tool calls carry.
+    async fn volante_get_live(
+        with_run_header: bool,
+        mode: &str,
+        seat: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut state = test_state().await;
+        state.browser = std::sync::Arc::new(crate::browser::BrowserRuntime {
+            enabled: true,
+            client: crate::browser_client::BrowserClient::new("127.0.0.1:9", "tok".into()),
+            modes: Default::default(),
+            seats: Default::default(),
+        });
+        let id = sqlx::query(
+            "INSERT INTO browser_sessions \
+                (sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
+                 final_url, rule, mode, seat, opened_at) \
+             VALUES ('s1', 7, 'acme', 'project', 'acme', 'https://jira.example.org/login', \
+                     'https://jira.example.org/login', 'project-site', ?, ?, \
+                     '2026-08-16T10:00:00Z')",
+        )
+        .bind(mode)
+        .bind(seat)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(format!("/browser/sessions/{id}/live"))
+            .header("Authorization", "Bearer test-token");
+        if with_run_header {
+            request = request.header(crate::daemon_client::RUN_ID_HEADER, "7");
+        }
+        let response = build_router(state)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap_or_default();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    /// The pixels of a shell seat are the person's: a run (the run-id header on the control token)
+    /// is refused on `/live` exactly as `/take`, `/input` and `/answer` refuse it.
+    #[tokio::test]
+    async fn volante_live_refuses_a_run_for_a_shell_seat() {
+        let (status, body) = volante_get_live(true, "human", Some("shell")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "run_requester");
+    }
+
+    /// A run that opened the stream in agent mode must not keep receiving the person's pixels
+    /// after an approval: `/live` refuses a run whatever the session's mode or seat.
+    #[tokio::test]
+    async fn volante_live_refuses_a_run_in_agent_mode() {
+        let (status, body) = volante_get_live(true, "agent", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "run_requester");
+    }
+
+    #[tokio::test]
+    async fn volante_live_refuses_a_run_while_the_wheel_is_requested() {
+        let (status, body) = volante_get_live(true, "wheel-requested", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "run_requester");
+    }
+
+    /// The shell (no run header) is not refused by the run check in agent mode either.
+    #[tokio::test]
+    async fn volante_live_serves_the_shell_in_agent_mode() {
+        let (status, body) = volante_get_live(false, "agent", None).await;
+        assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_ne!(body["error"], "run_requester");
+    }
+
+    /// Without the run header the same request is the person's shell: the run check does not
+    /// refuse it (whatever happens next, it is not the run refusal).
+    #[tokio::test]
+    async fn volante_live_serves_the_person_a_shell_seat() {
+        let (status, body) = volante_get_live(false, "human", Some("shell")).await;
+        assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_ne!(body["error"], "run_requester");
+    }
+
+    /// Approving with `"seat":"shell"` on a session where the shell is not on offer (a throwaway)
+    /// is refused BEFORE the proposal moves, or it would be approved with no way to deliver.
+    #[tokio::test]
+    async fn volante_approve_refuses_seat_shell_not_offered_before_deciding() {
+        let state = test_state().await;
+        let session_id = sqlx::query(
+            "INSERT INTO browser_sessions \
+                (sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
+                 final_url, rule, mode, opened_at) \
+             VALUES ('s1', 7, 'acme', 'ephemeral', 'run-7', 'https://jira.example.org/login', \
+                     'https://jira.example.org/login', 'project-site', 'wheel-requested', \
+                     '2026-08-16T10:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let proposal = crate::proposals::create_wheel_request(
+            &state.pool,
+            crate::proposals::WheelAsk {
+                run_id: Some(7),
+                project_id: "acme",
+                session_id,
+                requested_url: "https://jira.example.org/login",
+                final_url: "https://jira.example.org/login",
+                origin: "https://jira.example.org",
+                reasoning: "login",
+            },
+        )
+        .await
+        .unwrap();
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{proposal}/approve"),
+            Some(serde_json::json!({ "seat": "shell" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "seat_unavailable");
+        let after = crate::proposals::get(&state.pool, proposal)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status, "pending",
+            "the decision must not have been made"
         );
     }
 

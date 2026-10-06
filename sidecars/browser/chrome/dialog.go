@@ -70,11 +70,30 @@ func (d *Driver) onDialog(event cdp.Event) {
 	var opening struct {
 		Type    string `json:"type"`
 		Message string `json:"message"`
+		Default string `json:"defaultPrompt"`
 	}
 	if err := json.Unmarshal(event.Params, &opening); err != nil {
 		// Unparseable, and answering anyway is still better than not: the renderer is frozen and the
 		// kind is only needed to choose between two answers. No is the safe one.
 		opening.Type = ""
+	}
+
+	// While a person drives, the question is theirs: it becomes a prompt and the page waits for their
+	// answer, or for the prompt's timeout. No CDP call is made here, so this goroutine goes on
+	// answering the fence.
+	if state := d.person.Load(); state != nil && state.page == event.Session {
+		on := event.Session
+		raised := d.raisePrompt(state, on, browser.Prompt{
+			Kind:          "dialog",
+			DialogType:    strings.ToLower(strings.TrimSpace(opening.Type)),
+			Message:       opening.Message,
+			DefaultPrompt: opening.Default,
+		}, func(ctx context.Context) {
+			_, _ = d.conn.Call(ctx, on, "Page.handleJavaScriptDialog", map[string]any{"accept": false})
+		})
+		if raised {
+			return
+		}
 	}
 
 	accept := strings.EqualFold(strings.TrimSpace(opening.Type), "beforeunload")

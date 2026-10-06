@@ -11,6 +11,7 @@ mod browser;
 mod browser_client;
 mod browser_live;
 mod browser_policy;
+mod browser_seat;
 mod browser_wheel;
 mod budget;
 mod calendar;
@@ -1789,6 +1790,7 @@ async fn main() {
                 browser_sidecar_token.clone(),
             ),
             modes: Default::default(),
+            seats: Default::default(),
         }),
         web: Arc::new(web::WebRuntime {
             enabled: web_config.enabled,
