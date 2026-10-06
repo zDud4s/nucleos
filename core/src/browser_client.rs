@@ -401,6 +401,13 @@ pub struct Returned {
     pub chain: Vec<String>,
 }
 
+/// A sidecar answer handed on untouched: its status and its body bytes.
+#[derive(Debug, Clone)]
+pub struct Relayed {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
 /// What went wrong, in the shapes a caller has to tell apart.
 #[derive(Debug)]
 pub enum BrowserError {
@@ -600,6 +607,64 @@ impl BrowserClient {
             &serde_json::json!({ "session_id": session_id }),
         )
         .await
+    }
+
+    /// Start a person-driven stretch on a session (the shell seat). Any 2xx is success; the sidecar's
+    /// refusal comes back as the usual classified error.
+    pub async fn begin_person(&self, session: &str) -> Result<(), BrowserError> {
+        let response = self
+            .post("/person/begin", &serde_json::json!({ "session": session }))
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(self.read_error(status, response).await)
+    }
+
+    /// End a person-driven stretch and read the navigation chain it recorded.
+    pub async fn end_person(&self, session: &str) -> Result<Returned, BrowserError> {
+        self.call("/person/end", &serde_json::json!({ "session": session }))
+            .await
+    }
+
+    /// Forward a batch of input events. The sidecar's status and body are relayed verbatim; `Err` only
+    /// when the sidecar is unreachable. The seat nonce is checked by the caller and never sent here.
+    pub async fn person_input(
+        &self,
+        session: &str,
+        events: &serde_json::Value,
+    ) -> Result<Relayed, BrowserError> {
+        self.relay(
+            "/input",
+            &serde_json::json!({ "session": session, "events": events }),
+        )
+        .await
+    }
+
+    /// Answer a page prompt (dialog, permission). Relayed verbatim, like [`Self::person_input`].
+    pub async fn answer(
+        &self,
+        session: &str,
+        prompt: &str,
+        answer: &serde_json::Value,
+    ) -> Result<Relayed, BrowserError> {
+        self.relay(
+            "/answer",
+            &serde_json::json!({ "session": session, "prompt": prompt, "answer": answer }),
+        )
+        .await
+    }
+
+    async fn relay(&self, path: &str, body: &serde_json::Value) -> Result<Relayed, BrowserError> {
+        let response = self.post(path, body).await?;
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| BrowserError::Unreachable(error.to_string()))?
+            .to_vec();
+        Ok(Relayed { status, body })
     }
 
     /// Delete a project's profile from disk — spec §10's "Esquecer".
@@ -1041,5 +1106,157 @@ mod tests {
         )
         .expect("a snapshot");
         assert_eq!(snapshot.elements[0].element_ref, "e5");
+    }
+
+    /// A stub for the person verbs: records the full path and JSON body of every call, and answers
+    /// either the happy shapes or a 409 `not_person` on everything. Test-only.
+    async fn volante_stub(
+        refuse: bool,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use axum::extract::Path;
+        use axum::response::IntoResponse as _;
+        use axum::routing::post;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let app = axum::Router::new().route(
+            "/{*path}",
+            post(
+                move |Path(path): Path<String>, axum::Json(body): axum::Json<serde_json::Value>| {
+                    let recorder = recorder.clone();
+                    async move {
+                        recorder
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::json!({ "path": path, "body": body }));
+                        if refuse {
+                            return (
+                                axum::http::StatusCode::CONFLICT,
+                                axum::Json(serde_json::json!({"error": "not_person"})),
+                            )
+                                .into_response();
+                        }
+                        match path.as_str() {
+                            "person/end" => axum::Json(serde_json::json!({
+                                "chain": ["https://a.example/", "https://b.example/"],
+                            }))
+                            .into_response(),
+                            "input" => (
+                                axum::http::StatusCode::ACCEPTED,
+                                axum::Json(serde_json::json!({"accepted": 2})),
+                            )
+                                .into_response(),
+                            _ => axum::Json(serde_json::json!({})).into_response(),
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address.to_string(), seen)
+    }
+
+    /// The four person verbs, by exact path and body keys. The sidecar reads `session`, not
+    /// `session_id`, and the seat nonce is the daemon's own and never goes down this wire.
+    #[tokio::test]
+    async fn volante_person_verbs_reach_the_sidecar_as_the_contract_reads_them() {
+        let (address, seen) = volante_stub(false).await;
+        let client = BrowserClient::new(&address, "tok".into());
+
+        client.begin_person("s1").await.expect("begin_person");
+        let returned = client.end_person("s1").await.expect("end_person");
+        assert_eq!(
+            returned.chain,
+            vec![
+                "https://a.example/".to_string(),
+                "https://b.example/".to_string()
+            ]
+        );
+        let events = serde_json::json!([{"t": "click", "x": 1, "y": 2}]);
+        client
+            .person_input("s1", &events)
+            .await
+            .expect("person_input");
+        client
+            .answer("s1", "dialog-1", &serde_json::json!("yes"))
+            .await
+            .expect("answer");
+
+        let calls = seen.lock().unwrap();
+        let paths = calls
+            .iter()
+            .map(|call| call["path"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["person/begin", "person/end", "input", "answer"]);
+        assert_eq!(calls[0]["body"], serde_json::json!({"session": "s1"}));
+        assert_eq!(calls[1]["body"], serde_json::json!({"session": "s1"}));
+        assert_eq!(
+            calls[2]["body"],
+            serde_json::json!({"session": "s1", "events": events})
+        );
+        assert_eq!(
+            calls[3]["body"],
+            serde_json::json!({"session": "s1", "prompt": "dialog-1", "answer": "yes"})
+        );
+        for call in calls.iter() {
+            let body = call["body"].as_object().expect("a JSON object body");
+            assert!(
+                !body.contains_key("seat_nonce"),
+                "no nonce on the wire: {call}"
+            );
+            assert!(
+                !body.contains_key("session_id"),
+                "the key is `session`: {call}"
+            );
+        }
+    }
+
+    /// `/input` and `/answer` relay ANY status and body verbatim, so the shell sees the sidecar's
+    /// own refusal; `begin_person` treats a non-2xx as an error.
+    #[tokio::test]
+    async fn volante_relayed_answers_keep_the_sidecar_status_and_body() {
+        let (address, _seen) = volante_stub(false).await;
+        let client = BrowserClient::new(&address, "tok".into());
+        let ok = client
+            .person_input("s1", &serde_json::json!([]))
+            .await
+            .expect("relayed");
+        assert_eq!(ok.status, 202);
+        let parsed: serde_json::Value = serde_json::from_slice(&ok.body).expect("a JSON body");
+        assert_eq!(parsed, serde_json::json!({"accepted": 2}));
+
+        let (address, _seen) = volante_stub(true).await;
+        let client = BrowserClient::new(&address, "tok".into());
+        let refused = client
+            .answer("s1", "p", &serde_json::json!(true))
+            .await
+            .expect("a refusal is relayed, not an error");
+        assert_eq!(refused.status, 409);
+        let parsed: serde_json::Value = serde_json::from_slice(&refused.body).expect("a JSON body");
+        assert_eq!(parsed, serde_json::json!({"error": "not_person"}));
+        let refused = client
+            .person_input("s1", &serde_json::json!([]))
+            .await
+            .expect("relayed");
+        assert_eq!(refused.status, 409);
+
+        assert!(
+            client.begin_person("s1").await.is_err(),
+            "a 409 on begin_person is an error"
+        );
+
+        let down = BrowserClient::new("127.0.0.1:1", "tok".into());
+        let error = down
+            .person_input("s1", &serde_json::json!([]))
+            .await
+            .expect_err("nothing is listening");
+        assert!(matches!(error, BrowserError::Unreachable(_)), "{error}");
     }
 }

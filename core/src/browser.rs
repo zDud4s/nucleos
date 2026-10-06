@@ -42,6 +42,8 @@ pub struct BrowserRuntime {
     pub client: BrowserClient,
     /// Where a session's mode changes are announced to whoever is watching its live view.
     pub modes: crate::browser_live::ModeChannels,
+    /// Who holds the person's seat in each session, kept in memory only (spec browser-volante §4.3).
+    pub seats: crate::browser_seat::SeatState,
 }
 
 impl BrowserRuntime {
@@ -56,6 +58,7 @@ impl BrowserRuntime {
             enabled: false,
             client: BrowserClient::new(crate::sidecar::BROWSER_ADDR, String::new()),
             modes: Default::default(),
+            seats: Default::default(),
         }
     }
 }
@@ -103,6 +106,12 @@ pub struct SessionRow {
     /// When the person answered "keep these?" — either way. `None` with a `chain` present means the
     /// question is still open, which is exactly what the UI needs to know to ask it.
     pub chain_decided_at: Option<String>,
+    /// Where a person drives once the mode is `human`: `shell` or `window`. `None` until a person
+    /// drives; rows from before the column existed are `window`.
+    pub seat: Option<String>,
+    /// Whether the shell could take the seat: a lone open project-profile session. A second open
+    /// session on the same profile would share its cookies, so neither qualifies.
+    pub shell_eligible: bool,
     pub opened_at: String,
     pub closed_at: Option<String>,
 }
@@ -693,6 +702,12 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
     let row = sqlx::query(
         "SELECT id, sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
                 final_url, rule, mode, refusal, proposal_id, chain, chain_decided_at, \
+                seat, \
+                (profile_kind = 'project' AND closed_at IS NULL AND \
+                 (SELECT COUNT(*) FROM browser_sessions o \
+                  WHERE o.profile_id = browser_sessions.profile_id \
+                    AND o.profile_kind = 'project' AND o.closed_at IS NULL) = 1) \
+                    AS shell_eligible, \
                 opened_at, closed_at \
          FROM browser_sessions WHERE id = ?",
     )
@@ -714,6 +729,8 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
         proposal_id: row.get("proposal_id"),
         chain: row.get("chain"),
         chain_decided_at: row.get("chain_decided_at"),
+        seat: row.get("seat"),
+        shell_eligible: row.get::<i64, _>("shell_eligible") != 0,
         opened_at: row.get("opened_at"),
         closed_at: row.get("closed_at"),
     }))
@@ -749,7 +766,48 @@ pub async fn set_mode(
     if moved {
         // Announced only after the write that made it true, so a watcher never cuts for a change
         // that did not happen.
-        modes.publish(id, to);
+        modes.publish(
+            id,
+            crate::browser_live::LiveMode {
+                mode: to.to_owned(),
+                seat: None,
+            },
+        );
+    }
+    Ok(moved)
+}
+
+/// [`set_mode`] that also writes the seat, in the same compare-and-set.
+///
+/// Mode and seat describe one fact (who drives, and where), so they move together or not at all; two
+/// writes would leave a window where a `human` row has no seat yet.
+pub async fn set_mode_seat(
+    pool: &SqlitePool,
+    modes: &crate::browser_live::ModeChannels,
+    id: i64,
+    from: &str,
+    to: &str,
+    seat: Option<&str>,
+) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE browser_sessions SET mode = ?, seat = ?          WHERE id = ? AND mode = ? AND closed_at IS NULL",
+    )
+    .bind(to)
+    .bind(seat)
+    .bind(id)
+    .bind(from)
+    .execute(pool)
+    .await?;
+    let moved = result.rows_affected() == 1;
+    if moved {
+        // Published even when the mode string is unchanged: human/shell -> human/window must cut.
+        modes.publish(
+            id,
+            crate::browser_live::LiveMode {
+                mode: to.to_owned(),
+                seat: seat.map(str::to_owned),
+            },
+        );
     }
     Ok(moved)
 }
@@ -822,7 +880,9 @@ pub async fn insert_person_window(
 
 /// Store the navigation a person's window recorded, unanswered.
 pub async fn record_chain(pool: &SqlitePool, id: i64, chain: &[String]) -> sqlx::Result<()> {
-    sqlx::query("UPDATE browser_sessions SET chain = ? WHERE id = ?")
+    // `chain_decided_at` goes back to NULL: a session can be returned twice, and without this the
+    // second chain would find its keep question already answered.
+    sqlx::query("UPDATE browser_sessions SET chain = ?, chain_decided_at = NULL WHERE id = ?")
         .bind(serde_json::to_string(chain).unwrap_or_else(|_| "[]".to_string()))
         .bind(id)
         .execute(pool)
@@ -941,6 +1001,18 @@ pub async fn close(
     id: i64,
     now: &str,
 ) -> Result<bool, BrowserError> {
+    close_with_reason(pool, runtime, id, "closed", now).await
+}
+
+/// [`close`] with the reason the row carries, for the paths that close a session for a cause the
+/// record has to name (a fence that could not be restored, say).
+pub async fn close_with_reason(
+    pool: &SqlitePool,
+    runtime: &BrowserRuntime,
+    id: i64,
+    reason: &str,
+    now: &str,
+) -> Result<bool, BrowserError> {
     let Some(row) = session_row(pool, id)
         .await
         .map_err(|error| BrowserError::Failed(error.to_string()))?
@@ -953,7 +1025,7 @@ pub async fn close(
     // The sidecar first, and its failure is not fatal here. A session it has already forgotten —
     // because it restarted — must still be closed in this table, or it stays open for ever.
     let sidecar = runtime.client.close(&row.sidecar_id).await;
-    close_row(pool, id, "closed", now)
+    close_row(pool, id, reason, now)
         .await
         .map_err(|error| BrowserError::Failed(error.to_string()))?;
     match sidecar {
@@ -1099,14 +1171,7 @@ pub async fn post_snapshot(
     // [`post_act`] warns about: the daemon-side guard exists for the case where the two processes
     // DISAGREE about who is driving, and a layer that is only believed in cannot do that.
     if row.mode != mode::AGENT {
-        return axum::Json(serde_json::json!({
-            "outcome": "refused",
-            "refusal": {
-                "consequence": "wheel-requested",
-                "detail": format!("this session is {}, so what is on its screen is theirs", row.mode),
-            },
-        }))
-        .into_response();
+        return not_the_agents(&row, "what is on its screen is theirs");
     }
     match state
         .browser
@@ -1120,9 +1185,40 @@ pub async fn post_snapshot(
         )
         .await
     {
-        Ok(snapshot) => axum::Json(snapshot).into_response(),
+        Ok(snapshot) => {
+            let mut value = serde_json::to_value(&snapshot).unwrap_or_default();
+            // Told once, to the first read after the person handed the wheel back: the page may have
+            // changed under the agent while it was not driving.
+            if state.browser.seats.take_returned(row.id)
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert("wheel_returned".into(), serde_json::Value::Bool(true));
+            }
+            axum::Json(value).into_response()
+        }
         Err(error) => browser_error(error),
     }
+}
+
+/// The refusal an agent gets for a session that is not in its hands.
+///
+/// `person-driving` while a person has the wheel (either seat), `wheel-requested` for the mode in
+/// which the wheel has only been asked for. The shape is a fence refusal, so an agent reads it with
+/// the vocabulary it already has.
+fn not_the_agents(row: &SessionRow, what: &str) -> axum::response::Response {
+    let consequence = if row.mode == mode::HUMAN {
+        "person-driving"
+    } else {
+        "wheel-requested"
+    };
+    axum::Json(serde_json::json!({
+        "outcome": "refused",
+        "refusal": {
+            "consequence": consequence,
+            "detail": format!("this session is {}, so {what}", row.mode),
+        },
+    }))
+    .into_response()
 }
 
 /// `POST /browser/act`.
@@ -1144,14 +1240,7 @@ pub async fn post_act(
     //
     // A refusal and not an error, in the shape the agent already knows how to read (§6.2).
     if row.mode != mode::AGENT {
-        return axum::Json(serde_json::json!({
-            "outcome": "refused",
-            "refusal": {
-                "consequence": "wheel-requested",
-                "detail": format!("this session is {}, so it is not the agent's to act on", row.mode),
-            },
-        }))
-        .into_response();
+        return not_the_agents(&row, "it is not the agent's to act on");
     }
     match state
         .browser
@@ -1196,7 +1285,13 @@ pub async fn post_act(
                 )
                 .await;
             }
-            axum::Json(result).into_response()
+            let mut value = serde_json::to_value(&result).unwrap_or_default();
+            if state.browser.seats.take_returned(row.id)
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert("wheel_returned".into(), serde_json::Value::Bool(true));
+            }
+            axum::Json(value).into_response()
         }
         Err(error) => browser_error(error),
     }
@@ -1220,14 +1315,7 @@ pub async fn post_look(
         return gone();
     };
     if row.mode != mode::AGENT {
-        return axum::Json(serde_json::json!({
-            "outcome": "refused",
-            "refusal": {
-                "consequence": "wheel-requested",
-                "detail": format!("this session is {}, so what is on its screen is theirs", row.mode),
-            },
-        }))
-        .into_response();
+        return not_the_agents(&row, "what is on its screen is theirs");
     }
     match state.browser.client.look(&row.sidecar_id).await {
         Ok(result) => axum::Json(result).into_response(),
@@ -1259,14 +1347,7 @@ pub async fn post_screenshot(
     // out — "the layer that matters most: the page in front of the person during a handover is a
     // login form, with a password half-typed into it."
     if row.mode != mode::AGENT {
-        return axum::Json(serde_json::json!({
-            "outcome": "refused",
-            "refusal": {
-                "consequence": "wheel-requested",
-                "detail": format!("this session is {}, so what is on its screen is theirs", row.mode),
-            },
-        }))
-        .into_response();
+        return not_the_agents(&row, "what is on its screen is theirs");
     }
     match state.browser.client.screenshot(&row.sidecar_id).await {
         Ok(image) => ([(axum::http::header::CONTENT_TYPE, "image/png")], image).into_response(),
@@ -1501,6 +1582,7 @@ mod tests {
                 enabled: true,
                 client: BrowserClient::new(&address.to_string(), "tok".into()),
                 modes: Default::default(),
+                seats: Default::default(),
             },
             seen,
         )
@@ -2345,6 +2427,7 @@ mod tests {
             enabled: true,
             client: BrowserClient::new("127.0.0.1:1", "tok".into()),
             modes: Default::default(),
+            seats: Default::default(),
         };
         let _ = close(&db.pool, &gone, row.id, "2026-08-16T11:00:00Z").await;
         let after = session_row(&db.pool, row.id)
@@ -2404,6 +2487,102 @@ mod tests {
             panic!("must open");
         };
         assert_eq!(row.profile_kind, "ephemeral");
+        db.close().await;
+    }
+
+    /// Inserts one bare row, the way a database written before the seat column would hold it.
+    async fn raw_session(
+        pool: &sqlx::SqlitePool,
+        profile_kind: &str,
+        profile_id: &str,
+        closed: bool,
+    ) -> i64 {
+        let closed_at = closed.then_some(NOW);
+        sqlx::query(
+            "INSERT INTO browser_sessions                (sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url,                 final_url, rule, mode, opened_at, closed_at)              VALUES ('s', 1, 'acme', ?, ?, 'https://example.org/', 'https://example.org/',                      'project-site', 'agent', ?, ?)",
+        )
+        .bind(profile_kind)
+        .bind(profile_id)
+        .bind(NOW)
+        .bind(closed_at)
+        .execute(pool)
+        .await
+        .expect("insert")
+        .last_insert_rowid()
+    }
+
+    /// Rows that existed before the seat column was added are today's behaviour, a real window, and
+    /// the migration must say so rather than leave them NULL (which means "no person drives yet").
+    #[tokio::test]
+    async fn volante_migration_leaves_existing_rows_window() {
+        let pool = crate::testdb::pool_migrated_through(166).await;
+        raw_session(&pool, "project", "acme", false).await;
+        crate::testdb::apply_migrations_after(&pool, 166).await;
+        let seat: Option<String> = sqlx::query_scalar("SELECT seat FROM browser_sessions")
+            .fetch_one(&pool)
+            .await
+            .expect("seat");
+        assert_eq!(seat.as_deref(), Some("window"));
+    }
+
+    /// The row carries the seat and whether the shell could take it: only a lone open project-profile
+    /// session qualifies, because a second one on the same profile would share cookies with it.
+    #[tokio::test]
+    async fn volante_session_json_carries_seat_and_shell_eligible() {
+        let db = TempDb::new().await;
+        let first = raw_session(&db.pool, "project", "acme", false).await;
+        let row = session_row(&db.pool, first).await.unwrap().unwrap();
+        assert_eq!(row.seat, None);
+        assert!(row.shell_eligible);
+        let json = serde_json::to_value(&row).unwrap();
+        assert!(json["seat"].is_null());
+        assert_eq!(json["shell_eligible"], serde_json::json!(true));
+
+        let second = raw_session(&db.pool, "project", "acme", false).await;
+        for id in [first, second] {
+            let row = session_row(&db.pool, id).await.unwrap().unwrap();
+            assert!(!row.shell_eligible, "two open rows share one profile");
+        }
+
+        let throwaway = raw_session(&db.pool, "ephemeral", "run-1", false).await;
+        let row = session_row(&db.pool, throwaway).await.unwrap().unwrap();
+        assert!(!row.shell_eligible);
+        db.close().await;
+    }
+
+    /// Mode and seat change in one compare-and-set, and only from the mode the caller expected.
+    #[tokio::test]
+    async fn volante_set_mode_seat_moves_mode_and_seat_together() {
+        let db = TempDb::new().await;
+        let id = raw_session(&db.pool, "project", "acme", false).await;
+        let modes = crate::browser_live::ModeChannels::default();
+        let mut watcher = modes.subscribe(id);
+
+        assert!(
+            !set_mode_seat(&db.pool, &modes, id, "human", "agent", None)
+                .await
+                .unwrap(),
+            "wrong expected mode must not move the row"
+        );
+        assert!(
+            set_mode_seat(&db.pool, &modes, id, "agent", "human", Some("shell"))
+                .await
+                .unwrap()
+        );
+        let row = session_row(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(row.mode, "human");
+        assert_eq!(row.seat.as_deref(), Some("shell"));
+        assert!(watcher.has_changed().unwrap());
+        assert_eq!(*watcher.borrow_and_update(), "human");
+
+        assert!(
+            set_mode_seat(&db.pool, &modes, id, "human", "agent", None)
+                .await
+                .unwrap()
+        );
+        let row = session_row(&db.pool, id).await.unwrap().unwrap();
+        assert_eq!(row.mode, "agent");
+        assert_eq!(row.seat, None);
         db.close().await;
     }
 }
