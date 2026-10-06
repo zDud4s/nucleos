@@ -5071,11 +5071,14 @@ pub async fn cancel_run(State(state): State<AppState>, Path(id): Path<i64>) -> S
     }
 }
 
+/// A run recovered from orphaned state: (id, project_id, chat_id, mode)
+type ReconcileRow = (i64, Option<String>, Option<String>, Option<String>);
+
 /// Marks every run still `"running"` as `"interrupted"` — called once at startup to recover from a
 /// daemon crash that left in-flight runs' rows stuck (spec §3.2). Returns how many rows it changed.
 pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sqlx::Error> {
     let now = chrono::Utc::now().to_rfc3339();
-    let reconciled: Vec<(i64, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+    let reconciled: Vec<ReconcileRow> = sqlx::query_as(
         "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE status = 'running'
          RETURNING id, project_id, chat_id, mode",
     )
