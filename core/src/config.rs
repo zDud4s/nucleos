@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1174,6 +1175,8 @@ pub struct DevtimeConfig {
     pub parse_failure_amber_rate: f64,
     /// Fewer lines than this and the rate above is not judged.
     pub parse_failure_min_lines: u64,
+    /// The rule engine's vocabularies and thresholds (sub-project 2).
+    pub rules: DevtimeRulesConfig,
 }
 
 impl Default for DevtimeConfig {
@@ -1185,14 +1188,442 @@ impl Default for DevtimeConfig {
             projects_dir: String::new(),
             parse_failure_amber_rate: 0.02,
             parse_failure_min_lines: 200,
+            rules: DevtimeRulesConfig::default(),
         }
     }
+}
+
+/// The parser's closed error-class vocabulary as `devtime.yaml` may name it in
+/// `rules.vocab.error_signatures`. It lists the same nine tokens as `devtime_parse::ERROR_CLASSES`
+/// (the parser's own const gains `wrong_shell` with parser v2), and a parser test holds the two equal:
+/// this module must not import the parser, so the list is stated twice and checked once.
+pub const RULES_ERROR_CLASSES: [&str; 9] = [
+    "exit_nonzero",
+    "exit_75",
+    "timeout",
+    "interrupted",
+    "permission_denied",
+    "hook_block",
+    "edit_not_found",
+    "wrong_shell",
+    "tool_error",
+];
+
+fn owned(items: &[&str]) -> Vec<String> {
+    items.iter().map(|item| (*item).to_string()).collect()
+}
+
+/// The rule engine's whole configuration: every threshold, program list and vocabulary a rule reads.
+/// Rule code holds no such literal (spec §3.5), so a partial file at any nesting level is valid and
+/// every field has the default the spec states.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeRulesConfig {
+    pub enabled: bool,
+    /// Backlog cap per cycle after a `rules_version` change; sessions touched this cycle always run.
+    pub sessions_per_cycle: u32,
+    pub commands: DevtimeCommandsConfig,
+    pub roles: DevtimeRolesConfig,
+    pub vocab: DevtimeVocabConfig,
+    pub thresholds: DevtimeThresholdsConfig,
+    pub paths: DevtimePathsConfig,
+    pub precision: DevtimePrecisionConfig,
+    pub unexplained: DevtimeUnexplainedConfig,
+    pub adapters: DevtimeAdaptersConfig,
+}
+
+impl Default for DevtimeRulesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sessions_per_cycle: 200,
+            commands: DevtimeCommandsConfig::default(),
+            roles: DevtimeRolesConfig::default(),
+            vocab: DevtimeVocabConfig::default(),
+            thresholds: DevtimeThresholdsConfig::default(),
+            paths: DevtimePathsConfig::default(),
+            precision: DevtimePrecisionConfig::default(),
+            unexplained: DevtimeUnexplainedConfig::default(),
+            adapters: DevtimeAdaptersConfig::default(),
+        }
+    }
+}
+
+/// Which programs count as a test, a build, a lint, a mutation, a sleep, a commit or a revert, and
+/// which tool names are shell, edit, read or search tools.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeCommandsConfig {
+    pub test: Vec<String>,
+    pub build: Vec<String>,
+    pub lint: Vec<String>,
+    pub mutating: Vec<String>,
+    pub sleep: Vec<String>,
+    pub commit: Vec<String>,
+    pub revert_with_paths: Vec<String>,
+    pub revert_pathless: Vec<String>,
+    /// First words that run a script rather than name a program (`bash scripts/gates.sh`).
+    pub interpreters: Vec<String>,
+    pub shell_tools: Vec<String>,
+    pub edit_tools: Vec<String>,
+    pub read_tools: Vec<String>,
+    pub search_tools: Vec<String>,
+    /// Project id to extra programs, appended to the base lists above.
+    pub per_project: BTreeMap<String, DevtimeProjectCommands>,
+}
+
+impl Default for DevtimeCommandsConfig {
+    fn default() -> Self {
+        Self {
+            test: owned(&[
+                "cargo test",
+                "go test",
+                "npm test",
+                "npx vitest",
+                "npx jest",
+                "pytest",
+                "dotnet test",
+                "make test",
+            ]),
+            build: owned(&[
+                "cargo build",
+                "cargo check",
+                "go build",
+                "go vet",
+                "npx tsc",
+                "mvn",
+                "gradle",
+                "dotnet build",
+                "make",
+            ]),
+            lint: owned(&["cargo fmt", "cargo clippy", "npx eslint", "gofmt"]),
+            mutating: owned(&[
+                "cargo fmt",
+                "gofmt",
+                "git checkout",
+                "git restore",
+                "git stash",
+                "git reset",
+                "git apply",
+                "git merge",
+                "git rebase",
+                "git pull",
+                "sed",
+                "patch",
+            ]),
+            sleep: owned(&["sleep", "Start-Sleep", "timeout"]),
+            commit: owned(&["git commit"]),
+            revert_with_paths: owned(&["git checkout", "git restore"]),
+            revert_pathless: owned(&["git reset", "git stash"]),
+            interpreters: owned(&[
+                "bash",
+                "sh",
+                "python",
+                "python3",
+                "node",
+                "pwsh",
+                "powershell",
+            ]),
+            shell_tools: owned(&["Bash", "PowerShell"]),
+            edit_tools: owned(&["Edit", "Write", "MultiEdit", "NotebookEdit"]),
+            read_tools: owned(&["Read"]),
+            search_tools: owned(&["Grep", "Glob"]),
+            per_project: BTreeMap::new(),
+        }
+    }
+}
+
+/// One project's extra test, build and lint programs.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeProjectCommands {
+    pub test: Vec<String>,
+    pub build: Vec<String>,
+    pub lint: Vec<String>,
+}
+
+/// Case-insensitive globs (`*` only) over a subagent's `agentType`. The reviewer list is tried first.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeRolesConfig {
+    pub reviewer: Vec<String>,
+    pub implementer: Vec<String>,
+}
+
+impl Default for DevtimeRolesConfig {
+    fn default() -> Self {
+        Self {
+            reviewer: owned(&["*review*"]),
+            implementer: owned(&["*executor*", "*implement*", "general-purpose"]),
+        }
+    }
+}
+
+/// The words the parser and the rules match in memory. Only the derived flag or token is ever stored.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeVocabConfig {
+    /// A prompt that opens with one of these counts as a correction of the previous answer.
+    pub correction_openers: Vec<String>,
+    /// Model families, weakest first.
+    pub model_strength: Vec<String>,
+    /// Error class to extra substrings that classify a failed tool result into it.
+    pub error_signatures: BTreeMap<String, Vec<String>>,
+}
+
+impl Default for DevtimeVocabConfig {
+    fn default() -> Self {
+        let mut error_signatures = BTreeMap::new();
+        error_signatures.insert(
+            "wrong_shell".to_string(),
+            owned(&[
+                "is not recognized as the name of a cmdlet",
+                "is not a valid statement separator",
+                "ParserError",
+                "Windows Subsystem for Linux",
+                "C:/Program Files/Git/",
+            ]),
+        );
+        error_signatures.insert(
+            "hook_block".to_string(),
+            owned(&["pre-commit hook", "hook rejected", "hook declined"]),
+        );
+        error_signatures.insert(
+            "edit_not_found".to_string(),
+            owned(&[
+                "matches of the string to replace",
+                "File has not been read yet",
+            ]),
+        );
+        error_signatures.insert("permission_denied".to_string(), Vec::new());
+        Self {
+            correction_openers: owned(&[
+                "não",
+                "nao",
+                "não era isso",
+                "nao era isso",
+                "errado",
+                "está errado",
+                "isso não",
+                "that's not",
+                "that is not",
+                "not what i",
+                "wrong",
+                "no,",
+                "nope",
+            ]),
+            model_strength: owned(&["haiku", "sonnet", "opus"]),
+            error_signatures,
+        }
+    }
+}
+
+/// Every numeric threshold a rule compares against.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeThresholdsConfig {
+    /// D3: a Grep/Glob streak without an edit.
+    pub d3_search_burst: u32,
+    /// FLAILING: a streak without a Read or an Edit.
+    pub d3_flailing_burst: u32,
+    pub d5_foreground_agent_seconds: u64,
+    pub d6_foreground_command_seconds: u64,
+    /// D1 / THRASH.
+    pub thrash_repeats: u32,
+    pub thrash_reset_calls: u32,
+    /// D14 / LATE SCOPE.
+    pub late_scope_fraction: f64,
+    pub late_scope_min_files: u32,
+    pub d8_poll_repeats: u32,
+    pub d9_context_tokens: i64,
+    pub f_min_sessions: u32,
+    pub f_sequence_len: u32,
+    pub f_window_days: u32,
+}
+
+impl Default for DevtimeThresholdsConfig {
+    fn default() -> Self {
+        Self {
+            d3_search_burst: 6,
+            d3_flailing_burst: 4,
+            d5_foreground_agent_seconds: 120,
+            d6_foreground_command_seconds: 120,
+            thrash_repeats: 3,
+            thrash_reset_calls: 40,
+            late_scope_fraction: 0.30,
+            late_scope_min_files: 3,
+            d8_poll_repeats: 3,
+            d9_context_tokens: 250_000,
+            f_min_sessions: 3,
+            f_sequence_len: 3,
+            f_window_days: 30,
+        }
+    }
+}
+
+/// What counts as an external path, and which file extensions are code.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimePathsConfig {
+    /// Globs, case-insensitive, with `\` read as `/`.
+    pub external: Vec<String>,
+    pub code_extensions: Vec<String>,
+}
+
+impl Default for DevtimePathsConfig {
+    fn default() -> Self {
+        Self {
+            external: owned(&["*/temp/*", "*/tmp/*", "*scratchpad*", "*.log", "*.output"]),
+            code_extensions: owned(&[
+                "rs", "go", "ts", "tsx", "js", "jsx", "mjs", "py", "java", "kt", "cs", "c", "cc",
+                "cpp", "h", "hpp", "swift", "rb", "php", "sql", "sh", "ps1",
+            ]),
+        }
+    }
+}
+
+/// How a rule's precision is judged (spec §7).
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimePrecisionConfig {
+    /// A rule below this precision is flagged out of phase 2.
+    pub floor: f64,
+    /// Fewer judged cases than this and the precision is not trusted.
+    pub min_cases: u32,
+    /// Reported while a rule has fewer than `min_cases` cases.
+    pub prior_default: f64,
+    /// Rule id to its starting precision, when it is not `prior_default`.
+    pub priors: BTreeMap<String, f64>,
+}
+
+impl Default for DevtimePrecisionConfig {
+    fn default() -> Self {
+        let mut priors = BTreeMap::new();
+        // Spec §5: C2 "arranca com precisão baixa".
+        priors.insert("C2".to_string(), 0.2);
+        Self {
+            floor: 0.8,
+            min_cases: 20,
+            prior_default: 0.5,
+            priors,
+        }
+    }
+}
+
+/// When a slow turn that no rule explains is worth listing.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeUnexplainedConfig {
+    pub median_multiple: f64,
+    pub min_turn_seconds: u64,
+    pub max_explained_fraction: f64,
+    /// Main-lane calls per turn that split turns into classes `c0..cN`.
+    pub class_bounds: Vec<u32>,
+    /// A class with fewer turns has no median, and nothing in it is listed.
+    pub min_class_turns: u32,
+    pub window_days: u32,
+}
+
+impl Default for DevtimeUnexplainedConfig {
+    fn default() -> Self {
+        Self {
+            median_multiple: 3.0,
+            min_turn_seconds: 300,
+            max_explained_fraction: 0.2,
+            class_bounds: vec![0, 5, 20],
+            min_class_turns: 10,
+            window_days: 30,
+        }
+    }
+}
+
+/// Where the optional adapter sources live. Empty means absent.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeAdaptersConfig {
+    pub permission_log: String,
+    pub heavy_log: String,
+}
+
+/// What the grammar alone cannot say: a signature for a class the parser does not have, a fraction
+/// outside [0, 1], or a count that must be at least one. A file that fails this is refused whole.
+pub fn validate_devtime(config: &DevtimeConfig) -> Result<(), String> {
+    let rules = &config.rules;
+    for class in rules.vocab.error_signatures.keys() {
+        if !RULES_ERROR_CLASSES.contains(&class.as_str()) {
+            return Err(format!(
+                "rules.vocab.error_signatures names `{class}`, which is not an error class"
+            ));
+        }
+    }
+    let fractions = [
+        (
+            "rules.thresholds.late_scope_fraction",
+            rules.thresholds.late_scope_fraction,
+        ),
+        ("rules.precision.floor", rules.precision.floor),
+        (
+            "rules.precision.prior_default",
+            rules.precision.prior_default,
+        ),
+        (
+            "rules.unexplained.max_explained_fraction",
+            rules.unexplained.max_explained_fraction,
+        ),
+    ];
+    for (name, value) in fractions {
+        if !(0.0..=1.0).contains(&value) {
+            return Err(format!("{name} must be within [0, 1], got {value}"));
+        }
+    }
+    for (rule, prior) in &rules.precision.priors {
+        if !(0.0..=1.0).contains(prior) {
+            return Err(format!(
+                "rules.precision.priors.{rule} must be within [0, 1], got {prior}"
+            ));
+        }
+    }
+    let counts = [
+        (
+            "rules.thresholds.thrash_repeats",
+            rules.thresholds.thrash_repeats,
+        ),
+        (
+            "rules.thresholds.d3_search_burst",
+            rules.thresholds.d3_search_burst,
+        ),
+        (
+            "rules.thresholds.d3_flailing_burst",
+            rules.thresholds.d3_flailing_burst,
+        ),
+        (
+            "rules.thresholds.f_min_sessions",
+            rules.thresholds.f_min_sessions,
+        ),
+        (
+            "rules.thresholds.f_sequence_len",
+            rules.thresholds.f_sequence_len,
+        ),
+        (
+            "rules.thresholds.f_window_days",
+            rules.thresholds.f_window_days,
+        ),
+    ];
+    for (name, value) in counts {
+        if value == 0 {
+            return Err(format!("{name} must be at least 1"));
+        }
+    }
+    Ok(())
 }
 
 /// `~/.nucleos/devtime.yaml`'s grammar, and the only place that decides what a valid one is.
 /// Refuses unknown keys and malformed YAML; [`load_devtime_config`] turns that refusal into defaults.
 pub fn parse_devtime_config(contents: &str) -> Result<DevtimeConfig, String> {
-    serde_yaml::from_str::<DevtimeConfig>(contents).map_err(|error| error.to_string())
+    let config =
+        serde_yaml::from_str::<DevtimeConfig>(contents).map_err(|error| error.to_string())?;
+    validate_devtime(&config)?;
+    Ok(config)
 }
 
 pub fn load_devtime_config(path: &Path) -> DevtimeConfig {
@@ -4671,5 +5102,99 @@ cycle_seconds: 30
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn devtime_rules_config_defaults_match_the_spec() {
+        let rules = DevtimeConfig::default().rules;
+        assert!(rules.enabled);
+        assert_eq!(rules.sessions_per_cycle, 200);
+        assert_eq!(rules.commands.test.len(), 8);
+        assert!(rules.commands.test.contains(&"make test".to_string()));
+        assert!(rules.commands.build.contains(&"make".to_string()));
+        assert!(rules.commands.lint.contains(&"gofmt".to_string()));
+        assert!(rules.commands.mutating.contains(&"git restore".to_string()));
+        assert_eq!(rules.commands.sleep, ["sleep", "Start-Sleep", "timeout"]);
+        assert_eq!(rules.commands.commit, ["git commit"]);
+        assert_eq!(
+            rules.commands.revert_with_paths,
+            ["git checkout", "git restore"]
+        );
+        assert_eq!(rules.commands.revert_pathless, ["git reset", "git stash"]);
+        assert_eq!(rules.commands.shell_tools, ["Bash", "PowerShell"]);
+        assert_eq!(rules.commands.read_tools, ["Read"]);
+        assert_eq!(rules.commands.search_tools, ["Grep", "Glob"]);
+        assert!(rules.commands.per_project.is_empty());
+        assert_eq!(rules.roles.reviewer, ["*review*"]);
+        assert_eq!(
+            rules.roles.implementer,
+            ["*executor*", "*implement*", "general-purpose"]
+        );
+        assert_eq!(rules.vocab.model_strength, ["haiku", "sonnet", "opus"]);
+        assert!(rules.vocab.correction_openers.contains(&"nope".to_string()));
+        let signatures = &rules.vocab.error_signatures;
+        assert_eq!(signatures["wrong_shell"].len(), 5);
+        assert_eq!(signatures["hook_block"].len(), 3);
+        assert_eq!(signatures["edit_not_found"].len(), 2);
+        assert!(signatures["permission_denied"].is_empty());
+        let t = &rules.thresholds;
+        assert_eq!(t.d3_search_burst, 6);
+        assert_eq!(t.d3_flailing_burst, 4);
+        assert_eq!(t.d5_foreground_agent_seconds, 120);
+        assert_eq!(t.d6_foreground_command_seconds, 120);
+        assert_eq!(t.thrash_repeats, 3);
+        assert_eq!(t.thrash_reset_calls, 40);
+        assert_eq!(t.late_scope_fraction, 0.3);
+        assert_eq!(t.late_scope_min_files, 3);
+        assert_eq!(t.d8_poll_repeats, 3);
+        assert_eq!(t.d9_context_tokens, 250_000);
+        assert_eq!(t.f_min_sessions, 3);
+        assert_eq!(t.f_sequence_len, 3);
+        assert_eq!(t.f_window_days, 30);
+        assert_eq!(rules.paths.external.len(), 5);
+        assert!(rules.paths.code_extensions.contains(&"rs".to_string()));
+        assert_eq!(rules.precision.floor, 0.8);
+        assert_eq!(rules.precision.min_cases, 20);
+        assert_eq!(rules.precision.prior_default, 0.5);
+        assert_eq!(rules.precision.priors.get("C2"), Some(&0.2));
+        let u = &rules.unexplained;
+        assert_eq!(u.median_multiple, 3.0);
+        assert_eq!(u.min_turn_seconds, 300);
+        assert_eq!(u.max_explained_fraction, 0.2);
+        assert_eq!(u.class_bounds, [0, 5, 20]);
+        assert_eq!(u.min_class_turns, 10);
+        assert_eq!(u.window_days, 30);
+        assert_eq!(rules.adapters.permission_log, "");
+        assert_eq!(rules.adapters.heavy_log, "");
+        // The shipped defaults are themselves a valid file.
+        assert!(validate_devtime(&DevtimeConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn devtime_rules_partial_nested_file_keeps_other_defaults() {
+        let config =
+            parse_devtime_config("rules:\n  thresholds:\n    d3_search_burst: 8\n").unwrap();
+        let mut expected = DevtimeRulesConfig::default();
+        assert_eq!(config.rules.thresholds.d3_search_burst, 8);
+        expected.thresholds.d3_search_burst = 8;
+        assert_eq!(config.rules, expected);
+        assert_eq!(config.cycle_seconds, 60);
+    }
+
+    #[test]
+    fn devtime_rules_unknown_nested_key_or_bad_class_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devtime.yaml");
+        for bad in [
+            "rules:\n  thresholds:\n    nope: 1\n",
+            "rules:\n  vocab:\n    error_signatures:\n      bogus: [x]\n",
+            "rules:\n  thresholds:\n    late_scope_fraction: 1.5\n",
+            "rules:\n  thresholds:\n    thrash_repeats: 0\n",
+            "rules:\n  precision:\n    floor: -0.1\n",
+        ] {
+            assert!(parse_devtime_config(bad).is_err(), "should refuse: {bad}");
+            std::fs::write(&path, bad).unwrap();
+            assert_eq!(load_devtime_config(&path), DevtimeConfig::default());
+        }
     }
 }

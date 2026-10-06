@@ -475,6 +475,7 @@ async fn apply_event(
                         agent_id: result.agent_id.clone(),
                         model: result.resolved_model.clone(),
                         bg_task_id: result.bg_task_id.clone(),
+                        refs_out: String::new(),
                     },
                 )
                 .await?;
