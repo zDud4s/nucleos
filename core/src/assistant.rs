@@ -354,6 +354,46 @@ impl Drop for LiveChat {
         if let Ok(mut ended) = ENDED_TASKS.lock() {
             ended.remove(&self.process_key());
         }
+        if let Ok(mut barriers) = PROCESS_BARRIERS.lock() {
+            barriers.remove(&self.process_key());
+        }
+    }
+}
+
+/// What the turns a kept process has served say about the barrier it runs under.
+///
+/// The mode is the one STAMPED on the latest turn this process served; `served` is every run id it
+/// served, so `read_untrusted` can be the strictest of them. A spontaneous turn takes its barrier
+/// from here and not from the chat's newest row: that row may be a turn that never reached this
+/// process (stopped before it stamped its mode), and copying it would hand the hook a NULL it reads
+/// as `auto`.
+struct ProcessBarrier {
+    mode: &'static str,
+    served: Vec<i64>,
+}
+
+/// Barriers of the kept processes, by `LiveChat::process_key`. Cleared by `LiveChat`'s `Drop`.
+static PROCESS_BARRIERS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<usize, ProcessBarrier>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Records that the process behind `key` served run `run_id` under `mode`.
+fn note_served(key: usize, run_id: i64, mode: &'static str) {
+    if let Ok(mut barriers) = PROCESS_BARRIERS.lock() {
+        let entry = barriers.entry(key).or_insert_with(|| ProcessBarrier {
+            mode,
+            served: Vec::new(),
+        });
+        entry.mode = mode;
+        entry.served.push(run_id);
+    }
+}
+
+/// `note_served` for the process a conversation has kept, if it kept one.
+fn note_served_by_kept(chat_id: &str, run_id: i64, mode: &'static str) {
+    let kept = LIVE_CHATS.lock().unwrap();
+    if let Some(live) = kept.get(chat_id) {
+        note_served(live.process_key(), run_id, mode);
     }
 }
 
@@ -1064,9 +1104,10 @@ fn watch_between_turns(state: &crate::state::AppState, chat_id: &str) {
 
 /// Records an answer the CLI began on its own as a turn of its own, and gathers the rest of it.
 ///
-/// A run with `origin = 'task'`, whose barrier is the newest cloud turn's, written in the one
-/// statement that creates the row so it is never cleaner than the turn it continues. A row that
-/// cannot be written stops the process rather than let an answer run unaccounted.
+/// A run with `origin = 'task'`, whose barrier is the PROCESS's (the mode stamped on the last turn it
+/// served, the strictest `read_untrusted` of every turn it served), so it is never cleaner than the
+/// turns it continues. A process with no stamped mode, or a row that cannot be written, stops the
+/// process rather than let an answer run unaccounted, and whatever queued meanwhile is drained.
 async fn start_spontaneous_turn(
     state: &crate::state::AppState,
     chat_id: &str,
@@ -1075,24 +1116,60 @@ async fn start_spontaneous_turn(
 ) {
     let prompt = spontaneous_prompt(&live.carried);
     let session_id = live.session_id.lock().unwrap().clone();
-    let inserted = sqlx::query(
-        "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, origin,
-                           read_untrusted, permission_mode, created_at)
-         VALUES (?, 'running', 'assistant', ?, ?, 'cloud', 'task',
-                 COALESCE((SELECT read_untrusted FROM runs WHERE chat_id = ? AND mode = 'assistant'
-                            AND answered_by = 'cloud' ORDER BY id DESC LIMIT 1), 1),
-                 (SELECT permission_mode FROM runs WHERE chat_id = ? AND mode = 'assistant'
-                   AND answered_by = 'cloud' ORDER BY id DESC LIMIT 1),
-                 ?)",
-    )
-    .bind(&prompt)
-    .bind(&session_id)
-    .bind(chat_id)
-    .bind(chat_id)
-    .bind(chat_id)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .execute(&state.pool)
-    .await;
+    // The barrier comes from the PROCESS: the mode stamped on the last turn it served and the
+    // strictest `read_untrusted` of every turn it served. Never the chat's newest row, which may be
+    // a turn that was stopped before it stamped anything.
+    let barrier = PROCESS_BARRIERS
+        .lock()
+        .unwrap()
+        .get(&live.process_key())
+        .map(|held| (held.mode, held.served.clone()));
+    let Some((mode, served)) = barrier else {
+        tracing::warn!(
+            chat_id = %chat_id,
+            "the assistant's unprompted turn has no stamped permission mode to run under; its process was stopped"
+        );
+        drop(live);
+        drop(slot);
+        drain_queued(state, chat_id).await;
+        return;
+    };
+    // Fails closed: a served row that cannot be read or found counts as having read untrusted text.
+    let mut read_untrusted = 0_i64;
+    let mut readable = true;
+    for served_id in &served {
+        match sqlx::query_scalar::<_, i64>("SELECT read_untrusted FROM runs WHERE id = ?")
+            .bind(served_id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(Some(marked)) => read_untrusted = read_untrusted.max(marked),
+            Ok(None) => read_untrusted = 1,
+            Err(error) => {
+                tracing::warn!(chat_id = %chat_id, %error, "could not read a served turn's barrier");
+                readable = false;
+                break;
+            }
+        }
+    }
+    let inserted = if readable {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, origin,
+                               read_untrusted, permission_mode, created_at)
+             VALUES (?, 'running', 'assistant', ?, ?, 'cloud', 'task', ?, ?, ?)",
+        )
+        .bind(&prompt)
+        .bind(&session_id)
+        .bind(chat_id)
+        .bind(read_untrusted)
+        .bind(mode)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .map_err(|error| error.to_string())
+    } else {
+        Err("a served turn's barrier could not be read".to_owned())
+    };
     let id = match inserted {
         Ok(done) => done.last_insert_rowid(),
         Err(error) => {
@@ -1101,6 +1178,11 @@ async fn start_spontaneous_turn(
                 %error,
                 "could not record the assistant's unprompted turn; its process was stopped"
             );
+            // The process goes first and the slot after it, then whatever queued up while the slot
+            // was held is let through: nothing else is going to drain it.
+            drop(live);
+            drop(slot);
+            drain_queued(state, chat_id).await;
             return;
         }
     };
@@ -1135,6 +1217,8 @@ async fn start_spontaneous_turn(
                     .unwrap_or_default();
                 let known = live.session_id.lock().unwrap().clone().unwrap_or_default();
                 let o = gathered(outcome, stdout, known);
+                // The process has now served this turn too, under the same barrier.
+                note_served(live.process_key(), id, mode);
                 // Kept first, so the process is back for the next turn before the row says done.
                 keep_live(&chat, live);
                 record_spontaneous_answer(&pool, id, &chat, &o, &completed_at).await;
@@ -3209,6 +3293,9 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             may_live,
         )
         .await;
+        // The process this turn kept (if any) learns what it has now served, before anything can
+        // read it between turns.
+        note_served_by_kept(&turn.slot.chat_id, id, mode.as_str());
         let completed_at = chrono::Utc::now().to_rfc3339();
 
         // Each terminal write below is guarded on the turn still being `running`. A `/cancel` aborts
@@ -8289,6 +8376,94 @@ mod tests {
                 .unwrap();
         assert_eq!(recorded, 0);
         LIVE_CHATS.lock().unwrap().remove(&chat);
+    }
+
+    /// The spontaneous turn's barrier is the process's, not the newest row's: a newer row for the
+    /// chat that never reached this process (stopped before it stamped its mode) must not reset it.
+    #[tokio::test]
+    async fn a_spontaneous_turn_takes_its_barrier_from_its_process_not_the_newest_row() {
+        let (fake, unprompted) = fake_with_a_background_task();
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("spontaneous-process-barrier");
+        let _root = rooted_chat(&state, &chat).await;
+        crate::chats::set_permission_mode(&state.pool, &chat, crate::chats::PermissionMode::Manual)
+            .await
+            .unwrap();
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        sqlx::query("UPDATE runs SET read_untrusted = 1 WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        // A newer turn that was stopped before it stamped anything.
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, answered_by, read_untrusted,
+                               permission_mode, created_at)
+             VALUES ('parado', 'cancelled', 'assistant', ?, 'cloud', 0, NULL, ?)",
+        )
+        .bind(&chat)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        unprompted.send(ANSWERS_ON_ITS_OWN.to_owned()).unwrap();
+        let task = settled_task_turn(&state.pool, &chat)
+            .await
+            .expect("the unprompted answer was never recorded as a turn of its own");
+
+        assert_eq!(
+            task.6.as_deref(),
+            Some("manual"),
+            "the spontaneous turn took its mode from the newest row instead of its process"
+        );
+        assert_eq!(
+            task.5, 1,
+            "the spontaneous turn was cleaner than the turn its process served"
+        );
+    }
+
+    /// `read_untrusted` is the strictest of every turn the process served, not just the last one.
+    #[tokio::test]
+    async fn a_spontaneous_turn_keeps_read_untrusted_from_any_turn_its_process_served() {
+        let (fake, unprompted) = fake_with_a_background_task();
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("spontaneous-any-untrusted");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        let second = send_message(&state, &chat, "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+        sqlx::query("UPDATE runs SET read_untrusted = 1 WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        unprompted.send(ANSWERS_ON_ITS_OWN.to_owned()).unwrap();
+        let task = settled_task_turn(&state.pool, &chat)
+            .await
+            .expect("the unprompted answer was never recorded as a turn of its own");
+
+        assert_eq!(
+            task.5, 1,
+            "a clean latest turn hid an earlier one that read untrusted text"
+        );
+        assert!(
+            task.6.is_some(),
+            "the spontaneous turn has no permission mode"
+        );
     }
 
     /// A process that dies mid-turn says WHY, in the conversation rather than only in a log.
