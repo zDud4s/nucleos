@@ -77,11 +77,11 @@ pub const LEVERS: [&str; 19] = [
     "script_skill",
     "gotcha",
 ];
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // vocabulary kept for the SP4 endpoint
 pub const LEVELS: [&str; 3] = ["base", "adapter", "deferred"];
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // vocabulary kept for the SP4 endpoint
 pub const VERIFIED: [&str; 3] = ["passed", "failed", "not_measured"];
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)] // vocabulary kept for the SP4 endpoint
 pub const FINDING_SCOPES: [&str; 2] = ["session", "cross"];
 #[cfg_attr(not(test), allow(dead_code))]
 pub const FEEDBACK_VERDICTS: [&str; 2] = ["not_rework", "confirmed"];

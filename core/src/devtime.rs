@@ -1677,4 +1677,322 @@ mod tests {
             }
         }
     }
+
+    // ---- rules end to end (sub-project 2) -------------------------------------------------------
+    //
+    // The transcripts below are built in code and carry structure only: placeholder words, no
+    // project text. One session is a failing check, an edit, the same check passing (A1), then a
+    // human prompt that opens with a correction opener (C2 on the turn before it).
+
+    fn tool_id(name: &str, sid: &str) -> String {
+        format!("toolu_{name}_{sid}")
+    }
+
+    /// The records of one synthetic session, in file order. `hour` keeps two sessions apart in time.
+    fn rules_lines(sid: &str, hour: u32) -> Vec<serde_json::Value> {
+        let at = |second: u32| format!("2026-10-05T{hour:02}:00:{second:02}.000Z");
+        let assistant = |second: u32, mid: &str, content: serde_json::Value| {
+            serde_json::json!({"type": "assistant", "timestamp": at(second), "sessionId": sid,
+                "cwd": ROOT, "entrypoint": "cli",
+                "message": {"id": format!("{mid}-{sid}"), "model": "claude-x",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                    "content": content}})
+        };
+        let result = |second: u32, name: &str, is_error: bool, text: &str| {
+            serde_json::json!({"type": "user", "timestamp": at(second), "sessionId": sid,
+                "cwd": ROOT,
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": tool_id(name, sid),
+                     "is_error": is_error, "content": text}]}})
+        };
+        let prompt = |second: u32, text: &str| {
+            serde_json::json!({"type": "user", "timestamp": at(second), "sessionId": sid,
+                "cwd": ROOT, "entrypoint": "cli", "origin": {"kind": "human"},
+                "message": {"role": "user", "content": text}})
+        };
+        let test_call = |name: &str| {
+            serde_json::json!([{"type": "tool_use", "id": tool_id(name, sid), "name": "Bash",
+                "input": {"command": "cargo test -p fixture"}}])
+        };
+        vec![
+            prompt(0, "make the failing check pass"),
+            assistant(1, "m1", test_call("t1")),
+            result(10, "t1", true, "Exit code 101"),
+            assistant(
+                11,
+                "m2",
+                serde_json::json!([{"type": "tool_use", "id": tool_id("edit", sid), "name": "Edit",
+                    "input": {"file_path": format!("{ROOT}/src/a.rs"),
+                              "old_string": "alpha", "new_string": "beta"}}]),
+            ),
+            result(12, "edit", false, "edited"),
+            assistant(13, "m3", test_call("t3")),
+            result(20, "t3", false, "ok"),
+            assistant(
+                21,
+                "m4",
+                serde_json::json!([{"type": "text", "text": "done"}]),
+            ),
+            prompt(30, "That is not what I asked"),
+            assistant(
+                32,
+                "m5",
+                serde_json::json!([{"type": "text", "text": "redone"}]),
+            ),
+        ]
+    }
+
+    /// Writes one synthetic session into the harness's project directory and returns its file.
+    fn write_rules_session(h: &Harness, sid: &str, hour: u32) -> PathBuf {
+        let dir = h.projects.join("c--fixture-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: String = rules_lines(sid, hour)
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let file = dir.join(format!("{sid}.jsonl"));
+        std::fs::write(&file, body).unwrap();
+        file
+    }
+
+    /// The confidence of a session's finding for a rule, `None` when the rule did not fire.
+    async fn finding_confidence(pool: &SqlitePool, sid: &str, rule: &str) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT confidence FROM devtime_findings WHERE session_id = ? AND rule_id = ?",
+        )
+        .bind(sid)
+        .bind(rule)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// `(rules_version, rules_at, dirty)` of a session row.
+    async fn rules_state(pool: &SqlitePool, sid: &str) -> (Option<String>, Option<String>, i64) {
+        sqlx::query_as(
+            "SELECT rules_version, rules_at, dirty FROM devtime_sessions WHERE session_id = ?",
+        )
+        .bind(sid)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cycle_runs_rules_and_annotates_spans() {
+        let h = harness(&[]).await;
+        let sid = "s-rules-a";
+        write_rules_session(&h, sid, 10);
+        let stats = ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        assert_eq!(stats.lines_failed, 0);
+        assert_eq!(stats.files_failed, 0);
+
+        let flags: Vec<Option<i64>> = sqlx::query_scalar(
+            "SELECT opens_with_correction FROM devtime_turns WHERE session_id = ? ORDER BY seq",
+        )
+        .bind(sid)
+        .fetch_all(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            flags,
+            vec![Some(0), Some(1)],
+            "only the second prompt corrects"
+        );
+
+        assert_eq!(
+            finding_confidence(&h.pool, sid, "A1").await.as_deref(),
+            Some("exact"),
+            "fail, edit, same check passes"
+        );
+        assert_eq!(
+            finding_confidence(&h.pool, sid, "C2").await.as_deref(),
+            Some("inferred"),
+            "the turn before the correction"
+        );
+
+        // Every work span is annotated: the rules left nothing NULL where a verdict is owed.
+        let unannotated: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM devtime_spans WHERE session_id = ?
+               AND kind IN ('model', 'tool', 'subagent', 'wait_background', 'wait_machine')
+               AND waste IS NULL",
+        )
+        .bind(sid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(unannotated, 0, "every work span carries a waste class");
+
+        // The edit that ended the failing loop is claimed by A1 (registry order beats C2).
+        let edit_span: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT waste, rule_id FROM devtime_spans
+             WHERE session_id = ? AND attempt_id =
+                (SELECT attempt_id FROM devtime_attempts WHERE tool_use_id = ?)",
+        )
+        .bind(sid)
+        .bind(tool_id("edit", sid))
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(edit_span.0.as_deref(), Some("rework"));
+        assert_eq!(edit_span.1.as_deref(), Some("A1"));
+
+        // The answer to the correction is nobody's finding: its span is useful.
+        let last_model: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT waste, rule_id FROM devtime_spans
+             WHERE session_id = ? AND lane = 'main' AND kind = 'model'
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(sid)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(last_model.0.as_deref(), Some("useful"));
+        assert_eq!(last_model.1, None, "a useful span names no rule");
+
+        let (version, at, dirty) = rules_state(&h.pool, sid).await;
+        assert!(
+            version.as_deref().is_some_and(|v| !v.is_empty()),
+            "{version:?}"
+        );
+        assert!(at.is_some(), "the pass is stamped");
+        assert_eq!(dirty, 0, "the pass clears the pending flag");
+    }
+
+    #[tokio::test]
+    async fn cycle_with_rules_is_idempotent() {
+        let h = harness(&["background", "parallel", "inline_sidechain", "compaction"]).await;
+        write_rules_session(&h, "s-rules-a", 10);
+        write_rules_session(&h, "s-rules-b", 11);
+        let cfg = cycle_config();
+        ingest_cycle(&h.pool, &cfg, &h.projects).await;
+        let first = dump(&h.pool).await;
+        for table in [
+            "devtime_findings",
+            "devtime_attempt_marks",
+            "devtime_turn_stats",
+        ] {
+            assert!(
+                first
+                    .iter()
+                    .any(|line| line.starts_with(&format!("{table}: "))),
+                "the first cycle wrote {table}"
+            );
+        }
+        assert!(count(&h.pool, "devtime_findings").await > 0);
+
+        let second = ingest_cycle(&h.pool, &cfg, &h.projects).await;
+        assert_eq!(second.lines_read, 0, "nothing new to read");
+        assert_eq!(dump(&h.pool).await, first, "a second cycle changes nothing");
+
+        let third = ingest_cycle(&h.pool, &cfg, &h.projects).await;
+        assert_eq!(third.lines_read, 0);
+        assert_eq!(dump(&h.pool).await, first, "and neither does a third");
+    }
+
+    #[tokio::test]
+    async fn appended_bytes_recompute_only_that_session() {
+        let h = harness(&[]).await;
+        let (a, b) = ("s-rules-a", "s-rules-b");
+        let file_a = write_rules_session(&h, a, 10);
+        write_rules_session(&h, b, 11);
+        let cfg = cycle_config();
+        ingest_cycle(&h.pool, &cfg, &h.projects).await;
+
+        let (version_a, at_a, dirty_a) = rules_state(&h.pool, a).await;
+        let (version_b, at_b, dirty_b) = rules_state(&h.pool, b).await;
+        assert!(at_a.is_some() && at_b.is_some(), "both sessions were ruled");
+        assert!(
+            version_a.is_some() && version_a == version_b,
+            "one fingerprint, one config"
+        );
+        assert_eq!((dirty_a, dirty_b), (0, 0));
+
+        // A marker no pass would write: whichever session still holds it afterwards was not recomputed.
+        sqlx::query("UPDATE devtime_sessions SET rules_at = 'sentinel'")
+            .execute(&h.pool)
+            .await
+            .unwrap();
+
+        let appended = serde_json::json!({"type": "user", "timestamp": "2026-10-05T10:00:40.000Z",
+            "sessionId": a, "cwd": ROOT, "origin": {"kind": "human"},
+            "message": {"role": "user", "content": "all good, thanks"}});
+        let mut line = appended.to_string();
+        line.push('\n');
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file_a)
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+
+        let second = ingest_cycle(&h.pool, &cfg, &h.projects).await;
+        assert_eq!(second.lines_read, 1, "only the appended line is read");
+
+        let (version_a2, at_a2, dirty_a2) = rules_state(&h.pool, a).await;
+        let (version_b2, at_b2, dirty_b2) = rules_state(&h.pool, b).await;
+        assert_ne!(
+            at_a2.as_deref(),
+            Some("sentinel"),
+            "the grown session was recomputed"
+        );
+        assert_eq!(
+            at_b2.as_deref(),
+            Some("sentinel"),
+            "the untouched session was not"
+        );
+        assert_eq!(version_a2, version_a);
+        assert_eq!(version_b2, version_b);
+        assert_eq!((dirty_a2, dirty_b2), (0, 0));
+
+        let turns_a: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM devtime_turns WHERE session_id = ?")
+                .bind(a)
+                .fetch_one(&h.pool)
+                .await
+                .unwrap();
+        assert_eq!(turns_a, 3, "the appended prompt opened a third turn");
+    }
+
+    #[tokio::test]
+    async fn rules_disabled_leaves_spans_unannotated() {
+        let h = harness(&[]).await;
+        let sid = "s-rules-a";
+        write_rules_session(&h, sid, 10);
+        let mut cfg = cycle_config();
+        cfg.rules.enabled = false;
+        ingest_cycle(&h.pool, &cfg, &h.projects).await;
+
+        assert!(
+            count(&h.pool, "devtime_spans").await > 0,
+            "the lanes are still built"
+        );
+        for table in [
+            "devtime_findings",
+            "devtime_attempt_marks",
+            "devtime_turn_stats",
+        ] {
+            assert_eq!(count(&h.pool, table).await, 0, "{table}");
+        }
+        let annotated: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM devtime_spans
+             WHERE waste IS NOT NULL OR rule_id IS NOT NULL OR lever IS NOT NULL
+                OR finding_key IS NOT NULL",
+        )
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(annotated, 0, "no span carries an annotation");
+        let (version, at, dirty) = rules_state(&h.pool, sid).await;
+        assert_eq!((version, at), (None, None), "the session was never ruled");
+        assert_eq!(dirty, 1, "and stays pending");
+
+        // Switching the rules on later finds the pending session on its own, with no new bytes.
+        let on = ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        assert_eq!(on.lines_read, 0);
+        assert!(finding_confidence(&h.pool, sid, "A1").await.is_some());
+        let (version, _, dirty) = rules_state(&h.pool, sid).await;
+        assert!(version.is_some());
+        assert_eq!(dirty, 0);
+    }
 }

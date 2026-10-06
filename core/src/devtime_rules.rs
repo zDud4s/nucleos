@@ -591,8 +591,10 @@ pub struct AttemptFact {
     pub agent_id: Option<String>,
     pub role: Option<Role>,
     pub model: Option<String>,
+    #[allow(dead_code)] // part of the facts contract, no family reads it yet
     pub effort: Option<String>,
     pub started_ms: i64,
+    #[allow(dead_code)] // as above
     pub ended_ms: Option<i64>,
     /// A background attempt's `bg_ended_at`, else `ended_at`, else `started_ms`.
     pub done_ms: i64,
@@ -655,6 +657,7 @@ pub struct MessageFact {
     pub message_id: String,
     pub first_ms: i64,
     pub last_ms: i64,
+    #[allow(dead_code)] // part of the facts contract, no family reads it yet
     pub model: Option<String>,
     pub has_tool_use: bool,
 }

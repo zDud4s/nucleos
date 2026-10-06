@@ -33,7 +33,7 @@ pub struct RulePrecision {
 
 /// Why a mark was refused.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
+#[allow(dead_code)] // SP4's endpoint is the reader
 pub enum MarkError {
     UnknownFinding,
     BadVerdict,

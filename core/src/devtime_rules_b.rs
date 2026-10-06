@@ -33,10 +33,6 @@ pub fn run(facts: &SessionFacts, _cfg: &DevtimeRulesConfig) -> RuleOutput {
     }
 }
 
-fn has_class(a: &AttemptFact, class: &str) -> bool {
-    a.error_class.as_deref() == Some(class)
-}
-
 /// The paths an attempt touched: its recorded edits first, then its written files.
 fn paths_of(a: &AttemptFact) -> Vec<&str> {
     let mut paths: Vec<&str> = a.edits.iter().map(|edit| edit.path.as_str()).collect();
