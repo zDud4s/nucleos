@@ -11057,6 +11057,9 @@ struct ChatProjectOut {
     /// `.claude/` is not committed — so a conversation pointed at one still cannot open a file, and
     /// a window that reported only the directory would be telling the truth and misleading at once.
     tools: bool,
+    /// Whether this conversation's turns use the user's ambient MCP servers. Off until somebody
+    /// opts in.
+    ambient_mcp: bool,
     /// Whether `cwd` is a linked worktree the AI workflow was never copied into while its main
     /// checkout has it — the case "Set up workflow" answers.
     workflow_missing: bool,
@@ -11086,6 +11089,9 @@ async fn read_chat_project(
     let permission_mode = crate::chats::permission_mode_of(&state.pool, &chat_id)
         .await
         .unwrap_or(crate::chats::PermissionMode::Auto);
+    let ambient_mcp = crate::chats::ambient_mcp_of(&state.pool, &chat_id)
+        .await
+        .unwrap_or(false);
 
     let Some(cwd) = opened_in else {
         return Ok(Json(ChatProjectOut {
@@ -11093,6 +11099,7 @@ async fn read_chat_project(
             session,
             permission_mode,
             tools: false,
+            ambient_mcp,
             workflow_missing: false,
         }));
     };
@@ -11129,6 +11136,7 @@ async fn read_chat_project(
         session,
         permission_mode,
         tools,
+        ambient_mcp,
         workflow_missing,
     }))
 }
@@ -13591,6 +13599,11 @@ struct PatchChatRequest {
     /// The whole set every time, like `agents`, and for the same reason.
     #[serde(default, deserialize_with = "sent_even_if_null")]
     denied_tools: Option<Option<Vec<String>>>,
+    /// Whether this conversation's turns may use the user's ambient MCP servers.
+    ///
+    /// Turning it on needs a project: a conversation with no directory is `McpOnly` and never
+    /// reaches those servers, so offering the switch there would promise something it cannot do.
+    ambient_mcp: Option<bool>,
 }
 
 /// What the two doors onto a conversation refuse with. Every path that had no body keeps none
@@ -13678,7 +13691,8 @@ async fn patch_chat(
         || body.model.is_some()
         || body.effort.is_some()
         || body.cwd.is_some()
-        || body.permission_mode.is_some())
+        || body.permission_mode.is_some()
+        || body.ambient_mcp.is_some())
         && crate::assistant::is_busy(&chat_id)
     {
         return Err(StatusCode::CONFLICT.into());
@@ -13889,6 +13903,27 @@ async fn patch_chat(
                 tracing::warn!(%error, "changing what a conversation may do without asking failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+    }
+
+    if let Some(on) = body.ambient_mcp {
+        // Only a conversation with a project can use the ambient servers; one without a
+        // directory is `McpOnly`, which drops them whatever is stored here.
+        if on
+            && crate::chats::cwd_of(&state.pool, &chat_id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .is_none()
+        {
+            return Err(StatusCode::BAD_REQUEST.into());
+        }
+        crate::chats::set_ambient_mcp(&state.pool, &chat_id, on)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "changing a conversation's ambient MCP servers failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        // The next turn respawns with or without `--strict-mcp-config`.
+        crate::assistant::evict_live(&chat_id);
     }
 
     if let Some(title) = body.title.as_deref() {
@@ -38021,5 +38056,44 @@ mod tests {
             rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
             "the exit watchdog died with the runtime that asked for shutdown"
         );
+    }
+
+    /// Ambient MCP servers are offered only where the conversation has a project to govern them in.
+    ///
+    /// 400 and not a silent no-op: an unrooted conversation always runs MCP-only, so a stored "on"
+    /// would be a promise nothing keeps. The read side then reports what was stored.
+    #[tokio::test]
+    async fn ambient_mcp_is_only_offered_to_a_conversation_with_a_project() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &chat_id, r#"{"ambient_mcp":true}"#).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            !crate::chats::ambient_mcp_of(&state.pool, &chat_id)
+                .await
+                .unwrap()
+        );
+
+        let root = tempfile::TempDir::new().unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, root.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            patch_chat_request(state.clone(), &chat_id, r#"{"ambient_mcp":true}"#).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let response = project_request(state.clone(), &chat_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let project: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(project["ambient_mcp"], serde_json::json!(true));
     }
 }

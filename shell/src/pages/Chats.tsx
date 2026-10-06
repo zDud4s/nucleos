@@ -54,6 +54,7 @@ import {
   useIdeSessions,
   useSetChatProject,
   useSetPermissionMode,
+  useSetAmbientMcp,
   useWireChatTools,
   useSeedChatWorkflow,
   useWireIdeSessionTools,
@@ -1531,6 +1532,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
             </span>
           </DropdownMenuItem>
           <ChatDenials chatId={chatId} />
+          <AmbientMcpToggle chatId={chatId} />
           {/* The way back to a terminal, moved in here from the top of the transcript. It is
               a fact about this conversation that never changes and is wanted about twice in
               its life, and it was a line of mono text above every reading of every chat that
@@ -4086,7 +4088,12 @@ function Transcript({
       <ul className="chats-turns" aria-label="Transcript">
         {interleave(turns, notices).map((entry, index, all) =>
           entry.kind === "notice" ? (
-            <DepartmentSaid key={`notice-${entry.notice.id}`} notice={entry.notice} />
+            <NoticeBlock
+              key={`notice-${entry.notice.id}`}
+              notice={entry.notice}
+              chatId={chatId}
+              latest={entry.notice.from_run_id === turns[turns.length - 1]?.id}
+            />
           ) : (
             <TurnBlock
               key={entry.turn.id}
@@ -4181,6 +4188,80 @@ function DepartmentSaid({ notice }: { notice: ChatNotice }) {
       </p>
       <p className="chats-notice-body">{notice.body}</p>
     </li>
+  );
+}
+
+const CONTINUE_MESSAGE = "continue";
+
+/** Who is speaking on a notice: NucleOS itself for a restart or an untrusted mark, else a department. */
+function NoticeBlock({
+  notice,
+  chatId,
+  latest,
+}: {
+  notice: ChatNotice;
+  chatId: string;
+  latest: boolean;
+}) {
+  if (notice.kind === "restart") return <RestartNotice notice={notice} chatId={chatId} latest={latest} />;
+  if (notice.kind === "untrusted") return <NucleosSaid notice={notice} />;
+  return <DepartmentSaid notice={notice} />;
+}
+
+/** NucleOS speaking: no source link, because nothing outside NucleOS said this. */
+function NucleosSaid({ notice }: { notice: ChatNotice }) {
+  return (
+    <li className="chats-notice">
+      <p className="chats-notice-who">NucleOS</p>
+      <p className="chats-notice-body">{notice.body}</p>
+    </li>
+  );
+}
+
+/** A restart cut a turn. Continue is offered only under the latest turn: older ones are history. */
+function RestartNotice({
+  notice,
+  chatId,
+  latest,
+}: {
+  notice: ChatNotice;
+  chatId: string;
+  latest: boolean;
+}) {
+  const send = useSendMessage(chatId);
+  return (
+    <li className="chats-notice">
+      <p className="chats-notice-who">NucleOS</p>
+      <p className="chats-notice-body">{notice.body}</p>
+      {latest && (
+        <Button
+          variant="ghost"
+          disabled={send.isPending}
+          onClick={() => send.mutate({ text: CONTINUE_MESSAGE, images: [] })}
+        >
+          Continue
+        </Button>
+      )}
+      {send.isError && <ErrorNote>the message could not be sent</ErrorNote>}
+    </li>
+  );
+}
+
+/** The per-conversation switch for the user's own MCP servers; only a conversation with tools has one. */
+function AmbientMcpToggle({ chatId }: { chatId: string }) {
+  const project = useChatProject(chatId);
+  const set = useSetAmbientMcp(chatId);
+  if (project.data?.tools !== true) return null;
+  return (
+    <DropdownMenuCheckboxItem
+      checked={project.data.ambient_mcp === true}
+      disabled={set.isPending}
+      onSelect={(event) => event.preventDefault()}
+      onCheckedChange={(on) => set.mutate(on === true)}
+    >
+      Ambient MCP servers
+      <span className="chats-tool-why">your own MCP servers, e.g. context7; off by default</span>
+    </DropdownMenuCheckboxItem>
   );
 }
 

@@ -198,6 +198,8 @@ export interface ChatProject {
    * checkout has it. Optional: an older daemon omits it, and that reads as false.
    */
   workflow_missing?: boolean;
+  /** Whether this rooted conversation's turns keep the user's own MCP servers. Absent reads as false. */
+  ambient_mcp?: boolean;
 }
 
 /**
@@ -380,6 +382,8 @@ export interface ChatNotice {
   from_run_id: number;
   body: string;
   created_at: string;
+  /** Who is speaking. Absent means a department, which is what every notice was before this. */
+  kind?: "department" | "restart" | "untrusted";
 }
 
 /**
@@ -1572,6 +1576,23 @@ export function useSetPermissionMode(chatId: string) {
       apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
         method: "PATCH",
         body: JSON.stringify({ permission_mode: mode }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/** Turn the user's own MCP servers on or off for this conversation's next turns. */
+export function useSetAmbientMcp(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (on: boolean) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ ambient_mcp: on }),
       }),
     retry: false,
     onSettled: () => {

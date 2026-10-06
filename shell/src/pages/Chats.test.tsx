@@ -934,6 +934,155 @@ describe("Chats - what a department said", () => {
   });
 });
 
+describe("Chats - notices from NucleOS", () => {
+  /** A notice as the daemon sends one, `kind` set. */
+  function nucleosNotice(overrides: Partial<ChatNotice> = {}): ChatNotice {
+    return {
+      id: 1,
+      chat_id: "c-1",
+      team_run_id: "",
+      from_agent_id: "",
+      from_run_id: 2,
+      body: "the daemon restarted while this turn was running",
+      created_at: "2026-08-26T10:00:00Z",
+      kind: "restart",
+      ...overrides,
+    };
+  }
+
+  function twoTurns(): AssistantTurnRow[] {
+    return [
+      turnRow({ id: 1, asked: "primeira", answer: "uma", created_at: "2026-08-26T09:00:00Z" }),
+      turnRow({
+        id: 2,
+        asked: "segunda",
+        answer: "",
+        status: "interrupted",
+        created_at: "2026-08-26T11:00:00Z",
+      }),
+    ];
+  }
+
+  it("offers to continue a turn a restart cut", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": twoTurns() }, {
+        notices: { "c-1": [nucleosNotice({ from_run_id: 2 })] },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(
+      within(transcript).getByText("the daemon restarted while this turn was running"),
+    ).toBeDefined();
+    fireEvent.click(await within(transcript).findByRole("button", { name: "Continue" }));
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/message" && call[1]?.method === "POST",
+      );
+      expect(sent).toBeDefined();
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body)).text).toBe("continue");
+    });
+  });
+
+  it("offers no continue under an older turn", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": twoTurns() }, {
+        notices: { "c-1": [nucleosNotice({ from_run_id: 1 })] },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    // The notice itself is drawn; only its button is withheld. Waiting for the text first keeps
+    // the absence below from passing merely because nothing had rendered yet.
+    expect(
+      await within(transcript).findByText("the daemon restarted while this turn was running"),
+    ).toBeDefined();
+    expect(within(transcript).queryByRole("button", { name: "Continue" })).toBeNull();
+    // Still NucleOS speaking, not a department: no source link under an older turn either.
+    expect(within(transcript).queryByRole("link")).toBeNull();
+  });
+
+  it("announces a third-party read without naming a department", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": twoTurns() }, {
+        notices: {
+          "c-1": [
+            nucleosNotice({
+              kind: "untrusted",
+              from_agent_id: "director",
+              team_run_id: "tr-1",
+              body: "this turn read third-party content",
+            }),
+          ],
+        },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText("this turn read third-party content")).toBeDefined();
+    expect(within(transcript).queryByRole("link")).toBeNull();
+    expect(within(transcript).queryByText(/said this while working/)).toBeNull();
+    expect(within(transcript).queryByRole("button", { name: "Continue" })).toBeNull();
+  });
+});
+
+describe("Chats - ambient MCP servers", () => {
+  function projectFor(overrides: Partial<ChatProject> = {}): ChatProject {
+    return {
+      cwd: "C:/Projects/demo",
+      tools: true,
+      session: null,
+      permission_mode: "auto",
+      ambient_mcp: false,
+      ...overrides,
+    };
+  }
+
+  it("is off by default and turns on with one click", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }, {
+        projects: { "c-1": projectFor() },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    const box = await screen.findByRole("menuitemcheckbox", { name: /Ambient MCP servers/ });
+    expect(box.getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(box);
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ ambient_mcp: true }),
+      });
+    });
+  });
+
+  it("is not offered to a conversation without tools", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }, {
+        projects: { "c-1": projectFor({ tools: false }) },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    // The menu is open once its other entries are there; the absence only means something then.
+    await screen.findByRole("menuitem", { name: /standing instructions/i });
+    expect(screen.queryByRole("menuitemcheckbox", { name: /Ambient MCP servers/ })).toBeNull();
+  });
+});
+
 /* ------------------------------------------------------------- A5: cadence -- */
 
 describe("Chats - the transcript's cadence", () => {

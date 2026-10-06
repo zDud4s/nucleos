@@ -318,8 +318,14 @@ fn keep_live(chat_id: &str, mut live: LiveChat) {
     reap_idle_live_chats();
 }
 
+/// Whether a turn runs with the user's ambient MCP servers: only when the conversation opted in
+/// and the turn is not restricted to NucleOS's own tools.
+pub(crate) fn ambient_mcp_for(policy: crate::runner::ToolPolicy, opted_in: bool) -> bool {
+    opted_in && policy == crate::runner::ToolPolicy::Unrestricted
+}
+
 /// Stops a conversation's process for good, if it has one.
-fn evict_live(chat_id: &str) {
+pub(crate) fn evict_live(chat_id: &str) {
     // The removed value is dropped here, which is what aborts it.
     LIVE_CHATS.lock().unwrap().remove(chat_id);
 }
@@ -2877,9 +2883,10 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // `McpOnly` besides, so the surface being argued over is nearly empty.
             classifier_governs_tools: false,
             messages: None,
-            // `McpOnly` already pushes the strict flag unconditionally, so this changes
-            // nothing here — it is the same answer said in the request rather than inferred.
-            ambient_mcp: false,
+            // The owner opts in per conversation (decision 2026-10-05), and only a turn that
+            // is not `McpOnly` can use it: `McpOnly` pushes the strict flag unconditionally,
+            // so an unrooted, Telegram or relayed turn never gets the ambient servers.
+            ambient_mcp: ambient_mcp_for(tool_policy, answering.ambient_mcp),
             // What the conversation was pinned to, or `None` for the runner's configured model.
             //
             // This was `None` unconditionally, with a comment saying an orchestrator turn has no
@@ -8534,5 +8541,20 @@ mod tests {
             stderr.unwrap_or_default().contains("went silent"),
             "the silence line must reach the row"
         );
+    }
+
+    /// The owner's opt-in reaches a turn only where ambient servers can be governed at all.
+    ///
+    /// `McpOnly` is the unrooted, Telegram and relayed shape: its whole point is that nothing but
+    /// the NucleOS server is reachable, so no toggle may widen it. `None` offers no tools to widen.
+    #[test]
+    fn ambient_mcp_never_reaches_an_mcp_only_turn() {
+        use crate::runner::ToolPolicy;
+
+        assert!(ambient_mcp_for(ToolPolicy::Unrestricted, true));
+        assert!(!ambient_mcp_for(ToolPolicy::Unrestricted, false));
+        assert!(!ambient_mcp_for(ToolPolicy::McpOnly, true));
+        assert!(!ambient_mcp_for(ToolPolicy::McpOnly, false));
+        assert!(!ambient_mcp_for(ToolPolicy::None, true));
     }
 }
