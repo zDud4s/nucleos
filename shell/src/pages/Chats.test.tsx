@@ -4877,7 +4877,7 @@ describe("what a turn did", () => {
 /* ------------------------------------------------------ stopping a turn -- */
 
 describe("stopping a turn", () => {
-  it("offers to stop a turn that is running", async () => {
+  it("Stop interrupts the turn through the chat's own route", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1" })], {
         "c-1": [turnRow({ id: 1, status: "running", answer: null })],
@@ -4886,7 +4886,29 @@ describe("stopping a turn", () => {
 
     await renderChats("/chats/c-1");
 
-    fireEvent.click(await screen.findByRole("button", { name: /stop/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /^stop$/i }));
+
+    await waitFor(() =>
+      expect(
+        daemon.apiFetch.mock.calls.some(
+          (call) =>
+            String(call[0]) === "/assistant/turns/1/stop" &&
+            (call[1] as RequestInit | undefined)?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("Kill ends the turn and its process the old way", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: /^kill$/i }));
 
     // `apiText` and not `apiFetch`: cancel answers `200` with an empty body, and a JSON parse of
     // nothing is how that route used to fail.
@@ -4910,6 +4932,60 @@ describe("stopping a turn", () => {
 
     await screen.findByRole("list", { name: "Transcript" });
     expect(screen.queryByRole("button", { name: /stop/i })).toBeNull();
+  });
+});
+
+describe("saying it now", () => {
+  /** `chatsFetch`, answering the say-now route the way the daemon does. */
+  function withSayNow(transcripts: Record<string, AssistantTurnRow[]>) {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], transcripts);
+    return (path: string, init?: RequestInit) =>
+      path === "/assistant/chats/c-1/say-now" ? { said_now: true } : base(path, init);
+  }
+
+  it("sends into the running turn with Send now", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSayNow({ "c-1": [turnRow({ id: 1, status: "running", answer: null })] }) as never,
+    );
+
+    await renderChats("/chats/c-1");
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "use the other approach" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Send now" }));
+
+    await waitFor(() => {
+      const posted = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/chats/c-1/say-now",
+      );
+      expect(posted?.[1]?.method).toBe("POST");
+      expect(JSON.parse(String(posted?.[1]?.body))).toEqual({ text: "use the other approach" });
+    });
+    await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe(""));
+  });
+
+  it("offers no Send now when no turn is running", async () => {
+    daemon.apiFetch.mockImplementation(withSayNow({ "c-1": [turnRow({ id: 1 })] }) as never);
+
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "hello" } });
+    expect(screen.queryByRole("button", { name: "Send now" })).toBeNull();
+  });
+
+  it("draws what was said during a turn as the person's words", async () => {
+    // `said_now` is not on `AssistantTurnRow` until the shell packet lands, hence the cast.
+    const row = turnRow({
+      id: 1,
+      said_now: [{ text: "use the other approach", created_at: "2026-10-06T10:00:00Z" }],
+    } as Partial<AssistantTurnRow>);
+    daemon.apiFetch.mockImplementation(withSayNow({ "c-1": [row] }) as never);
+
+    await renderChats("/chats/c-1");
+
+    const list = await screen.findByRole("list", { name: "Transcript" });
+    expect(await within(list).findByText("use the other approach")).toBeTruthy();
   });
 });
 
