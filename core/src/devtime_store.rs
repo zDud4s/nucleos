@@ -1,4 +1,4 @@
-//! The devtime tables' only SQL (migrations 0164 and 0170): files and offsets, the cwd map, sessions,
+//! The devtime tables' only SQL (migrations 0164 and 0171): files and offsets, the cwd map, sessions,
 //! turns, messages (usage deduped by message id), attempts, spans, markers and the ingest status, and
 //! what the rule engine writes: findings, attempt marks, turn stats and the owner's feedback.
 //!
@@ -51,7 +51,7 @@ pub const OUTCOMES: [&str; 5] = ["ok", "error", "interrupted", "launched", "unkn
 #[allow(dead_code)] // a table column or closed vocabulary that no reader asks for yet
 pub const CONFIDENCE: [&str; 2] = ["exact", "inferred"];
 
-// The rule engine's closed vocabularies (migration 0170). The tables carry no CHECK constraints, so
+// The rule engine's closed vocabularies (migration 0171). The tables carry no CHECK constraints, so
 // the engine and `devtime_precision` check against these before every write.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const WASTES: [&str; 3] = ["useful", "rework", "avoidable"];
@@ -1906,7 +1906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_0170_adds_rule_columns_and_tables() {
+    async fn migration_0171_adds_rule_columns_and_tables() {
         let pool = test_pool().await;
         let added: &[(&str, &[&str])] = &[
             ("devtime_sessions", &["rules_version", "rules_at"]),
