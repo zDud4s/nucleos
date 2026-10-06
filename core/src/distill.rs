@@ -938,6 +938,17 @@ mod tests {
     use sqlx::SqlitePool;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
+    /// One `distill_queue` row as the tests read it back:
+    /// cause, project_id, job_id, item_id, run_id, status.
+    type QueueRow = (
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        String,
+    );
+
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1057,8 +1068,8 @@ mod tests {
         seed_job(&pool, 1, "alpha", 0).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        enqueue_job_ending_in(&mut *conn, 1).await.unwrap();
-        enqueue_job_ending_in(&mut *conn, 1).await.unwrap();
+        enqueue_job_ending_in(&mut conn, 1).await.unwrap();
+        enqueue_job_ending_in(&mut conn, 1).await.unwrap();
         drop(conn);
         assert_eq!(
             queued(&pool, Cause::JobFailed.as_str()).await,
@@ -1109,14 +1120,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.rows_affected(), 1, "the run's own write must succeed");
 
-        let rows: Vec<(
-            String,
-            String,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            String,
-        )> = sqlx::query_as(
+        let rows: Vec<QueueRow> = sqlx::query_as(
             "SELECT cause, project_id, job_id, item_id, run_id, status FROM distill_queue",
         )
         .fetch_all(&pool)
@@ -1201,7 +1205,7 @@ mod tests {
 
         // The job ending is queued with the job's project.
         let mut conn = pool.acquire().await.unwrap();
-        enqueue_job_ending_in(&mut *conn, 3).await.unwrap();
+        enqueue_job_ending_in(&mut conn, 3).await.unwrap();
         drop(conn);
         let ending: Vec<(String, i64)> = sqlx::query_as(
             "SELECT project_id, job_id FROM distill_queue WHERE cause = 'job_failed'",
@@ -1218,13 +1222,13 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         for ordinal in 1..=4 {
-            enqueue_item_verdict_in(&mut *conn, 3, ordinal)
+            enqueue_item_verdict_in(&mut conn, 3, ordinal)
                 .await
                 .unwrap();
         }
         // Writing the same verdict again is not a second cause.
-        enqueue_item_verdict_in(&mut *conn, 3, 1).await.unwrap();
-        enqueue_item_verdict_in(&mut *conn, 3, 2).await.unwrap();
+        enqueue_item_verdict_in(&mut conn, 3, 1).await.unwrap();
+        enqueue_item_verdict_in(&mut conn, 3, 2).await.unwrap();
         drop(conn);
 
         let items_for = |cause: &'static str| {
@@ -1310,7 +1314,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         for id in [not_succeeded, feature, into_nucleos, not_a_merge, foreign] {
-            enqueue_landed_in(&mut *conn, id).await.unwrap();
+            enqueue_landed_in(&mut conn, id).await.unwrap();
         }
         drop(conn);
         assert_eq!(
@@ -1320,8 +1324,8 @@ mod tests {
         );
 
         let mut conn = pool.acquire().await.unwrap();
-        enqueue_landed_in(&mut *conn, landed).await.unwrap();
-        enqueue_landed_in(&mut *conn, landed).await.unwrap();
+        enqueue_landed_in(&mut conn, landed).await.unwrap();
+        enqueue_landed_in(&mut conn, landed).await.unwrap();
         drop(conn);
         let rows: Vec<(String, String, Option<i64>)> =
             sqlx::query_as("SELECT cause, project_id, job_id FROM distill_queue")
