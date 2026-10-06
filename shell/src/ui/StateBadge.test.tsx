@@ -186,11 +186,15 @@ describe("StateBadge — slot", () => {
 describe("StateBadge — vcs", () => {
   it("does not dress a blocked request as a failure", () => {
     // Since round 9, the instruction lives on the Waiting row, not in this badge.
-    assertAllDistinct("vcs", ["succeeded", "failed", "blocked", "escalated"]);
+    assertAllDistinct("vcs", ["succeeded", "failed", "blocked", "escalated", "awaiting_owner"]);
     const blocked = badge("vcs", "blocked");
     expect(blocked?.className).not.toContain("ui-badge-danger");
     expect(blocked?.text).not.toMatch(/fail/i);
     expect(blocked?.text).toBe("blocked");
+  });
+
+  it("labels a merge held for the test map as waiting for your approval", () => {
+    expect(badge("vcs", "awaiting_owner")?.text).toBe("waiting for your approval");
   });
 
   it("presents an escalated request as a normal outcome, not a fault", () => {
