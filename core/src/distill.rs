@@ -575,15 +575,8 @@ async fn gather(pool: &SqlitePool, row: &QueueRow) -> sqlx::Result<Option<Dossie
         return Ok(None);
     };
 
-    let mut owner_context: Vec<String> = sqlx::query_scalar(
-        "SELECT n.note_text FROM owner_notes n
-           JOIN owner_note_links l ON l.note_id = n.id
-          WHERE l.target_kind = 'project' AND l.target_ref = ? AND n.state = 'active'
-          ORDER BY n.id",
-    )
-    .bind(&row.project_id)
-    .fetch_all(pool)
-    .await?;
+    let mut owner_context: Vec<String> =
+        crate::owner_notes::active_note_texts_for_project(pool, &row.project_id).await?;
     let job_notes: Vec<String> =
         sqlx::query_scalar("SELECT body FROM job_notes WHERE job_id = ? ORDER BY id")
             .bind(job_id)
@@ -940,7 +933,7 @@ mod tests {
 
     /// One `distill_queue` row as the tests read it back:
     /// cause, project_id, job_id, item_id, run_id, status.
-    type QueueRow = (
+    type QueuedCause = (
         String,
         String,
         Option<i64>,
@@ -1120,7 +1113,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.rows_affected(), 1, "the run's own write must succeed");
 
-        let rows: Vec<QueueRow> = sqlx::query_as(
+        let rows: Vec<QueuedCause> = sqlx::query_as(
             "SELECT cause, project_id, job_id, item_id, run_id, status FROM distill_queue",
         )
         .fetch_all(&pool)
