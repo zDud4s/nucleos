@@ -1202,6 +1202,10 @@ pub struct ToolCall {
     /// A background call's task: `running`, `completed`, `failed` or `killed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// The CLI's id for this call's task (`task_id` on its task events, `backgroundTaskId` on a
+    /// launch's answer). What `chat_tasks` matches an end event on when it names no tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 impl ToolCall {
@@ -1557,6 +1561,7 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                         .and_then(|r| r.get("backgroundTaskId"))
                         .and_then(|t| t.as_str())
                     {
+                        call.task_id.get_or_insert_with(|| task.to_string());
                         tasks.insert(task.to_string(), index);
                     }
                     let Some(text) = result_text(block.get("content")) else {
@@ -1694,6 +1699,7 @@ fn task_event(
         return;
     };
     let call = &mut did[index];
+    call.task_id.get_or_insert_with(|| task.to_string());
     if subtype == "task_started"
         && value.get("is_backgrounded").and_then(|b| b.as_bool()) == Some(true)
     {
@@ -6221,6 +6227,36 @@ mod tests {
 
         assert_eq!(did[0].status.as_deref(), Some("killed"));
         assert!(did[0].finished_at.is_some());
+    }
+
+    /// A background call carries the CLI's own id for its task, from whichever event names it
+    /// first: the task's start, or the answer to the launch.
+    #[test]
+    fn a_background_call_carries_its_task_id() {
+        let from_the_start = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bg","name":"Bash","input":{"command":"sleep 20","run_in_background":true}}]}}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_bg","is_backgrounded":true}"#,
+        ]
+        .join("
+");
+        assert_eq!(
+            live_from_stream(&from_the_start).did[0].task_id.as_deref(),
+            Some("b1")
+        );
+
+        let from_the_answer = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bg2","name":"Bash","input":{"command":"sleep 20","run_in_background":true}}]}}"#,
+            r#"{"type":"user","parent_tool_use_id":null,"timestamp":"2026-10-03T10:00:06.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bg2","content":"Command running in background with ID: b2"}]},"tool_use_result":{"backgroundTaskId":"b2"}}"#,
+        ]
+        .join("
+");
+        assert_eq!(
+            live_from_stream(&from_the_answer).did[0].task_id.as_deref(),
+            Some("b2")
+        );
+
+        let plain = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_read","name":"Read","input":{"file_path":"a"}}]}}"#;
+        assert_eq!(live_from_stream(plain).did[0].task_id, None);
     }
 
     /// The daemon-clock fallback is fixed by the first parse, so a re-read does not move it.

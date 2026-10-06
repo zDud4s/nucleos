@@ -427,6 +427,8 @@ export const keys = {
     frontCommands: (query: string) => ["chats", "front-commands", query] as const,
     project: (chatId: string) => ["chats", "project", chatId] as const,
     diff: (chatId: string) => ["chats", "diff", chatId] as const,
+    /** `GET /assistant/chats/{id}/tasks` — the work a conversation's turns launched. */
+    tasks: (chatId: string) => ["chats", "tasks", chatId] as const,
     ideSessions: ["chats", "ide-sessions"] as const,
     ideSession: (sessionId: string) => ["chats", "ide-session", sessionId] as const,
     live: (turnId: number) => ["chats", "live", turnId] as const,

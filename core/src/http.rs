@@ -634,6 +634,9 @@ pub fn build_router(state: AppState) -> Router {
         // filesystem question: answering it on the list would be a stat per conversation per poll,
         // for rows nobody is looking at.
         .route("/assistant/chats/{chat_id}/project", get(read_chat_project))
+        // The work this conversation's turns launched, including what outlived them. Control/Admin
+        // like every chat route: no `auth.rs` entry.
+        .route("/assistant/chats/{chat_id}/tasks", get(get_chat_tasks))
         // The act that turns a conversation with a directory into one with tools. The same thing
         // `wire_ide_session_tools` does before a pick-up, reached from the other side.
         .route("/assistant/chats/{chat_id}/tools", post(wire_chat_tools))
@@ -10996,6 +10999,28 @@ async fn get_chat_diff(
         .or_else(|error| match error {
             inspect::InspectError::Io(_) => Ok(String::new()),
             other => Err(inspect_status(other)),
+        })
+}
+
+/// `GET /assistant/chats/{chat_id}/tasks`. The subagents and background tasks this conversation's
+/// turns launched, oldest first; 404 for a conversation that does not exist.
+async fn get_chat_tasks(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<Json<Vec<crate::chat_tasks::ChatTask>>, StatusCode> {
+    crate::chats::opened_in(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading a conversation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    crate::chat_tasks::for_chat(&state.pool, &chat_id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "reading a conversation's tasks failed");
+            StatusCode::INTERNAL_SERVER_ERROR
         })
 }
 
@@ -27943,6 +27968,33 @@ mod tests {
             .await
             .unwrap();
         chat_id
+    }
+
+    /// A conversation's tasks are read on the conversation's own route.
+    #[tokio::test]
+    async fn a_chats_tasks_are_read_on_their_own_route() {
+        let state = test_state().await;
+        let chat_id = seed_chat(&state, "tasks").await;
+        sqlx::query(
+            "INSERT INTO chat_tasks (chat_id, launched_by_run_id, tool_use_id, task_id, kind, status,
+                                     started_at, total_tokens, summary)
+             VALUES (?, 1, 'toolu_a', 'a1', 'subagent', 'completed', '2026-10-06T10:00:00+00:00',
+                     4242, 'done')",
+        )
+        .bind(&chat_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let tasks = get_json(&state, &format!("/assistant/chats/{chat_id}/tasks")).await;
+
+        let rows = tasks.as_array().expect("the route answers an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["tool_use_id"], "toolu_a");
+        assert_eq!(rows[0]["status"], "completed");
+        assert_eq!(rows[0]["total_tokens"], 4242);
+        assert_eq!(rows[0]["summary"], "done");
+        assert_eq!(rows[0]["kind"], "subagent");
     }
 
     /* ------------------------------------------- reading further back -- */

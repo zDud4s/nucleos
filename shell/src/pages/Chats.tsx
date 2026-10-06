@@ -369,6 +369,7 @@ export function Chats() {
               <div className="chats-topbar-actions">
                 <ChatWhere chatId={chatId} />
                 <ChatChips
+                  chatId={chatId}
                   turns={transcript.data?.turns}
                   chatTitle={open.title ?? "Conversation"}
                 />
