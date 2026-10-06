@@ -373,6 +373,31 @@ impl LocalAssistant {
             .to_owned())
     }
 
+    /// One question, one answer, no tools — and the answer's TEXT, whichever shape the chat hands back.
+    ///
+    /// `verdict` reads only `/message/content`, which is the nested shape of an Ollama response; the
+    /// real chats (`runner::OllamaChat` and the hosted one) return the message object itself, `{"role",
+    /// "content"}`, so `verdict` reads a perfectly good answer from either as an empty string. This
+    /// reads the message's own `content` first and falls back to `/message/content`, so a caller
+    /// that wants the text gets it. `verdict` is left as it is: the judge's callers and tests pin it.
+    ///
+    /// No tools for the reason `verdict` gives: the text goes in, the text comes out, and nothing
+    /// that read it can act on it.
+    pub async fn one_shot(&self, prompt: &str) -> std::io::Result<String> {
+        let messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
+        let reply = self.chat.exchange(messages, None).await?;
+        let flat = content_of(&reply);
+        if !flat.is_empty() {
+            return Ok(flat);
+        }
+        Ok(reply
+            .pointer("/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string())
+    }
+
     /// `taint` is the caller's, for the reason `run_turn` gives: the two endings that lose a return
     /// value are the two where losing it writes a tainted turn down as clean.
     pub async fn answer(
@@ -945,5 +970,54 @@ mod tests {
         // and the symptom — a confident answer built on one lookup — looks like a smarter model
         // rather than a broken loop.
         assert_eq!(*chat.tools_offered.lock().unwrap(), vec![true, true]);
+    }
+
+    /// `verdict` reads only `/message/content`, while both real chats hand back the message object
+    /// itself (`{"role", "content"}`). `one_shot` is the entrance that reads either, so a caller
+    /// that wants the text does not get an empty string from a perfectly good answer.
+    #[tokio::test]
+    async fn one_shot_reads_the_answer_in_either_shape_and_offers_no_tools() {
+        /// Lets the test keep a handle on the chat after the assistant has boxed it.
+        struct Shared(std::sync::Arc<ScriptedChat>);
+
+        #[async_trait::async_trait]
+        impl LocalChat for Shared {
+            async fn exchange(
+                &self,
+                messages: Vec<Value>,
+                tools: Option<Vec<Value>>,
+            ) -> std::io::Result<Value> {
+                self.0.exchange(messages, tools).await
+            }
+        }
+
+        let flat = std::sync::Arc::new(ScriptedChat::new(vec![serde_json::json!({
+            "role": "assistant",
+            "content": "x"
+        })]));
+        let assistant = LocalAssistant::new(
+            Box::new(Shared(flat.clone())),
+            Box::new(FakeTools::answering("{}")),
+        );
+        assert_eq!(assistant.one_shot("question").await.unwrap(), "x");
+
+        let nested = std::sync::Arc::new(ScriptedChat::new(vec![serde_json::json!({
+            "message": {"content": "y"}
+        })]));
+        let assistant = LocalAssistant::new(
+            Box::new(Shared(nested.clone())),
+            Box::new(FakeTools::answering("{}")),
+        );
+        assert_eq!(assistant.one_shot("question").await.unwrap(), "y");
+
+        // No tools on either exchange, and exactly one user message carrying the prompt.
+        assert_eq!(*flat.tools_offered.lock().unwrap(), vec![false]);
+        assert_eq!(*nested.tools_offered.lock().unwrap(), vec![false]);
+        let seen = flat.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0],
+            vec![serde_json::json!({"role": "user", "content": "question"})]
+        );
     }
 }

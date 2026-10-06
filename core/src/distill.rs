@@ -903,6 +903,14 @@ pub async fn run_distill_loop(state: crate::state::AppState) {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     loop {
         interval.tick().await;
+        // Read per tick so a change of model needs no restart. A choice this machine cannot serve
+        // leaves the rows pending until it can: the distiller never falls back to the cloud for a
+        // dossier its owner sent somewhere else, and the refusal is logged once by `route_for`.
+        let route = match crate::distill_model::route_for(&state).await {
+            Ok(route) => route,
+            Err(_) => continue,
+        };
+        let asked = route.extractor(state.runner.as_ref(), &state.web.http);
         loop {
             let row = match claim_next(&state.pool, Utc::now()).await {
                 Ok(Some(row)) => row,
@@ -913,13 +921,7 @@ pub async fn run_distill_loop(state: crate::state::AppState) {
                 }
             };
             let (id, cause) = (row.id, row.cause.clone());
-            process_one(
-                &state.pool,
-                Extractor::Cli(state.runner.as_ref()),
-                row,
-                Utc::now(),
-            )
-            .await;
+            process_one(&state.pool, asked, row, Utc::now()).await;
             tracing::info!("distillation: queue row {id} ({cause}) processed");
         }
     }

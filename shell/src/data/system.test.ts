@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isAggregateTimeout, sidecarKeyOf, wantsAttention, type HealthReadout } from "./system";
+import { isAggregateTimeout, sidecarKeyOf, subsystemCounts, wantsAttention, type HealthReadout } from "./system";
 
 function readout(status: HealthReadout["status"], subsystems: HealthReadout["subsystems"] = []): HealthReadout {
   return { status, subsystems };
@@ -67,5 +67,23 @@ describe("sidecarKeyOf", () => {
     ]) {
       expect(sidecarKeyOf(row)).toBeNull();
     }
+  });
+});
+
+describe("subsystemCounts", () => {
+  it("subsystemCounts lists a row's tallies and marks the instant", () => {
+    const row = {
+      name: "distiller",
+      status: "ok" as const,
+      counts: { pending: 3, failed_24h: 1, last_done_unix: 1759000000 },
+    };
+    // Sorted by key, whatever order the daemon wrote them in; a `_unix` key is an instant.
+    expect(subsystemCounts(row)).toEqual([
+      { name: "failed_24h", label: "failed 24h", value: 1, instant: false },
+      { name: "last_done_unix", label: "last done", value: 1759000000, instant: true },
+      { name: "pending", label: "pending", value: 3, instant: false },
+    ]);
+    // A row with no tallies has nothing to list.
+    expect(subsystemCounts({ name: "github", status: "ok" })).toEqual([]);
   });
 });

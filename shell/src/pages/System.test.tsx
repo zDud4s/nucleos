@@ -547,6 +547,26 @@ describe("System - health readout", () => {
     expect(rowFor(list, "telegram_sidecar").textContent).not.toContain("Restart");
   });
 
+  it("a subsystem with counts shows them beside its state", async () => {
+    const world = systemWorld({
+      readout: {
+        status: "ok",
+        subsystems: [
+          { name: "sqlite_pool", status: "ok" },
+          { name: "distiller", status: "ok", counts: { pending: 3 } },
+        ],
+      },
+    });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystem();
+
+    const list = await screen.findByRole("list", { name: "Subsystems" });
+    // The tally sits inside the row it belongs to, and only that row carries one.
+    expect(rowFor(list, "distiller").textContent).toContain("pending 3");
+    expect(rowFor(list, "sqlite_pool").textContent).not.toContain("pending");
+  });
+
   it("presses twice and asks the núcleo to restart the sidecar the row names", async () => {
     const asked: string[] = [];
     const world = systemWorld({

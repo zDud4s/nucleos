@@ -2490,6 +2490,7 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/pii/observations") return PII;
   if (path === "/api-tokens" && init?.method === undefined) return API_TOKENS;
   if (path === "/config/machine" && init?.method === undefined) return MACHINE_CONFIG;
+  if (path === "/config/distiller" && init?.method === undefined) return { model: "cloud" };
   if (path === "/config/secrets" && init?.method === undefined) return { secrets: MACHINE_SECRETS };
   if (path === "/notifications/policy" && init?.method === undefined) return NOTIFY_POLICY;
   if (path === "/notifications/kinds") return NOTIFY_KINDS;

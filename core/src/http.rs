@@ -55,6 +55,12 @@ pub fn build_router(state: AppState) -> Router {
             "/config/machine",
             get(get_machine_config).post(post_machine_config),
         )
+        // In no `auth.rs` table on purpose: Control and Admin only, like `/config/machine`.
+        .route(
+            "/config/distiller",
+            get(crate::distill_model::get_distiller_config)
+                .post(crate::distill_model::post_distiller_config),
+        )
         .route("/config/secrets", get(get_machine_secrets))
         .route(
             "/config/secrets/{key}",
@@ -550,6 +556,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/knowledge/findings", post(post_finding))
         .route("/knowledge/{id}", get(get_knowledge))
         .route("/knowledge/{id}/revert", post(revert_knowledge))
+        // Where each distilled row came from. In no `auth.rs` table on purpose: Control and Admin
+        // only, like `/knowledge` above.
+        .route(
+            "/distill/causes",
+            get(crate::distill_origin::get_distill_causes),
+        )
         // The owner's own notes. In no `auth.rs` table on purpose: the table is default-deny, so a
         // route nobody lists is reachable by Control and Admin alone — the same reasoning as
         // `post_job_note`. No run, service, team or narrower API token reaches them, which is the
@@ -38664,5 +38676,55 @@ mod tests {
             .unwrap();
         let project: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(project["ambient_mcp"], serde_json::json!(true));
+    }
+
+    /// The distiller's model is a setting the owner changes from the shell, so both directions are
+    /// proved over the router: the default is the hosted model, a stored choice is read back, and a
+    /// spelling nobody wrote is refused with 422 and never saved.
+    #[tokio::test]
+    async fn the_distiller_model_is_read_and_written_over_http() {
+        let state = test_state().await;
+
+        let (status, body) = workflow_call(state.clone(), "GET", "/config/distiller", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"model": "cloud"}));
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/config/distiller",
+            Some(serde_json::json!({"model": "local"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = workflow_call(state.clone(), "GET", "/config/distiller", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"model": "local"}));
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/config/distiller",
+            Some(serde_json::json!({"model": "ollama"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, serde_json::json!({"error": "unknown_model"}));
+
+        // The refusal saved nothing: the earlier choice still stands.
+        let (_, body) = workflow_call(state, "GET", "/config/distiller", None).await;
+        assert_eq!(body, serde_json::json!({"model": "local"}));
+    }
+
+    /// `/learned` asks which distilled rows have a cause. On a database where nothing was ever
+    /// distilled the answer is an empty list, not a 404 and not `null`.
+    #[tokio::test]
+    async fn the_distill_causes_route_answers_a_list() {
+        let state = test_state().await;
+
+        let (status, body) = workflow_call(state, "GET", "/distill/causes", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]));
     }
 }
