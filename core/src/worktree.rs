@@ -1323,12 +1323,32 @@ pub async fn record(
 }
 
 pub async fn mark_removed(pool: &SqlitePool, owner: Owner) -> sqlx::Result<()> {
-    sqlx::query("UPDATE worktrees SET removed_at = ? WHERE owner_kind = ? AND owner_id = ?")
-        .bind(Utc::now().to_rfc3339())
-        .bind(owner.kind())
-        .bind(owner.id())
-        .execute(pool)
-        .await?;
+    let removed: Vec<(Option<String>, String)> = sqlx::query_as(
+        "UPDATE worktrees SET removed_at = ? WHERE owner_kind = ? AND owner_id = ?
+         RETURNING project_id, path",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(owner.kind())
+    .bind(owner.id())
+    .fetch_all(pool)
+    .await?;
+    // The verification state kept for this tree is dead weight now. Detached and best-effort: the
+    // executor's periodic sweep removes anything this misses.
+    if let Some(root) = crate::machine_config::root() {
+        for (project_id, path) in removed {
+            let Some(project_id) = project_id else {
+                continue;
+            };
+            let root = root.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) =
+                    crate::warm::forget_worktree(&root, &project_id, Path::new(&path))
+                {
+                    tracing::debug!(%error, path, "could not forget the worktree's warm state");
+                }
+            });
+        }
+    }
     // The collision measurement describes a tree that is no longer on disk. Best-effort: a row left
     // behind is one warning too many, and failing the worktree's removal on account of it would
     // trade a small problem for a large one.

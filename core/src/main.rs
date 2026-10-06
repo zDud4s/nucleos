@@ -126,8 +126,11 @@ mod transcribe;
 mod triage;
 mod trust;
 mod vcs;
+mod verify_exec;
 mod verify_runs;
+mod verify_sched;
 mod voice;
+mod warm;
 mod wave;
 mod web;
 mod web_client;
@@ -1107,6 +1110,16 @@ async fn main() {
     // somebody notices. That is a jam, not untidiness, hence `error!`. But it is one pillar's queue:
     // refusing to boot mail, voice, calendar and runs over it would trade a stuck repository for a
     // stuck machine.
+    // A verification unit left `running` was cut off by the restart, and the agent holding its ticket
+    // is still waiting: put it back in the queue. One that keeps taking the daemon down gives up
+    // after `verify_runs::MAX_INTERRUPTIONS` instead of looping.
+    match verify_runs::requeue_interrupted(&pool).await {
+        Ok((requeued, given_up)) if requeued + given_up > 0 => tracing::warn!(
+            "requeued {requeued} verification unit(s) interrupted by the restart; gave up on {given_up}"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::error!(%error, "verification queue reconciliation failed"),
+    }
     match vcs::reconcile_interrupted(&pool).await {
         Ok(released) if released > 0 => {
             tracing::warn!(
@@ -1313,6 +1326,10 @@ async fn main() {
     let devtime_config = machine_file(machine_config::DEVTIME_FILE)
         .as_deref()
         .map(config::load_devtime_config)
+        .unwrap_or_default();
+    let verify_config = machine_file(machine_config::VERIFY_FILE)
+        .as_deref()
+        .map(config::load_verify_config)
         .unwrap_or_default();
     let web_config = machine_file(machine_config::WEB_FILE)
         .as_deref()
@@ -1988,6 +2005,13 @@ async fn main() {
         devtime_config,
         devtime_projects_dir,
     ));
+    // Nothing submits to it yet (F2a-2 wires `verify`), but an empty queue costs one poll, and
+    // starting it now lets the restart above hand interrupted units straight back to a worker.
+    tokio::spawn(verify_exec::run_executor(verify_exec::Executor::new(
+        state.pool.clone(),
+        verify_config,
+        machine_config_root.clone(),
+    )));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor {
