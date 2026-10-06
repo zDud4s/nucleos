@@ -73,6 +73,9 @@ pub struct SubsystemReadout {
     pub status: HealthState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<FailureCategory>,
+    /// Named tallies a row chooses to show beside its state; absent for the rows that have none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counts: Option<std::collections::BTreeMap<&'static str, i64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -186,6 +189,7 @@ impl SubsystemReadout {
             name,
             status: HealthState::Ok,
             reason: None,
+            counts: None,
         }
     }
 
@@ -194,6 +198,7 @@ impl SubsystemReadout {
             name,
             status: HealthState::Degraded,
             reason: Some(reason),
+            counts: None,
         }
     }
 
@@ -202,6 +207,7 @@ impl SubsystemReadout {
             name,
             status: HealthState::Down,
             reason: Some(reason),
+            counts: None,
         }
     }
 
@@ -210,6 +216,7 @@ impl SubsystemReadout {
             name,
             status: HealthState::Disabled,
             reason: Some(reason),
+            counts: None,
         }
     }
 }
@@ -251,6 +258,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         github,
         hook,
         router,
+        devtime,
     ) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
@@ -294,6 +302,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             hook_interpreter_probe(state.pool.clone()),
         ),
         run_subsystem("llm_router", router_probe()),
+        run_subsystem("devtime_ingest", devtime_probe(state.pool.clone())),
     );
     let subsystems = vec![
         pool,
@@ -311,6 +320,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         github,
         hook,
         router,
+        devtime,
     ];
 
     HealthReadout {
@@ -407,6 +417,43 @@ fn router_plan(text: Option<&str>) -> RouterPlan {
             // Inside the readout's own half-second budget, whatever the file allows a run.
             timeout: Duration::from_millis(config.timeout_ms).min(PROBE_TIMEOUT),
         },
+    }
+}
+
+/// PURE: the devtime ingestion row, from the status the ingestion loop last wrote.
+///
+/// `None` means nothing has run yet, which is green: a daemon that has just started has not failed
+/// at anything. Past the failure rate is `degraded` and never `down`, because ingestion only feeds
+/// a reading and stops nothing else.
+fn devtime_row(status: Option<crate::devtime_store::IngestStatus>) -> SubsystemReadout {
+    let Some(status) = status else {
+        return SubsystemReadout::ok("devtime_ingest");
+    };
+    let mut row = if !status.enabled {
+        SubsystemReadout::disabled("devtime_ingest", FailureCategory::NotConfigured)
+    } else if status.lines_read >= status.failure_min_lines
+        && status.lines_read > 0
+        && status.lines_failed as f64 / status.lines_read as f64 > status.failure_amber_rate
+    {
+        SubsystemReadout::degraded("devtime_ingest", FailureCategory::Unknown)
+    } else {
+        SubsystemReadout::ok("devtime_ingest")
+    };
+    row.counts = Some(std::collections::BTreeMap::from([
+        ("lines_read", status.lines_read),
+        ("lines_failed", status.lines_failed),
+        ("unknown_records", status.unknown_records),
+        ("files_failed", status.files_failed),
+        ("unmapped", status.unmapped_sessions),
+        ("skipped_daemon", status.skipped_daemon_sessions),
+    ]));
+    row
+}
+
+async fn devtime_probe(pool: sqlx::SqlitePool) -> SubsystemReadout {
+    match crate::devtime_store::read_ingest_status(&pool).await {
+        Ok(status) => devtime_row(status),
+        Err(_) => SubsystemReadout::down("devtime_ingest", FailureCategory::Unknown),
     }
 }
 
@@ -1624,5 +1671,79 @@ url: http://127.0.0.1:{port}
             matches!(&free, Ok(bytes) if *bytes > 0),
             "the volume holding the temp directory has free space to report, got {free:?}"
         );
+    }
+
+    fn devtime_status(
+        enabled: bool,
+        lines_read: i64,
+        lines_failed: i64,
+    ) -> crate::devtime_store::IngestStatus {
+        crate::devtime_store::IngestStatus {
+            enabled,
+            cycle_at: "2026-10-04T10:00:00.000Z".to_string(),
+            lines_read,
+            lines_failed,
+            failure_amber_rate: 0.02,
+            failure_min_lines: 200,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn devtime_row_is_disabled_when_ingestion_is_off() {
+        let off = devtime_row(Some(devtime_status(false, 0, 0)));
+        assert_eq!(
+            (off.name, off.status, off.reason),
+            (
+                "devtime_ingest",
+                HealthState::Disabled,
+                Some(FailureCategory::NotConfigured)
+            )
+        );
+        // Nothing has run yet: green, and with nothing to count.
+        let fresh = devtime_row(None);
+        assert_eq!(
+            (fresh.name, fresh.status),
+            ("devtime_ingest", HealthState::Ok)
+        );
+        assert!(fresh.counts.is_none());
+    }
+
+    #[test]
+    fn devtime_row_turns_degraded_past_the_failure_threshold() {
+        // Too few lines to judge a rate, however bad it looks.
+        assert_eq!(
+            devtime_row(Some(devtime_status(true, 100, 100))).status,
+            HealthState::Ok
+        );
+        // Exactly at the rate is not past it; one more failure is.
+        assert_eq!(
+            devtime_row(Some(devtime_status(true, 1000, 20))).status,
+            HealthState::Ok
+        );
+        let bad = devtime_row(Some(devtime_status(true, 1000, 21)));
+        assert_eq!(bad.status, HealthState::Degraded);
+        assert_eq!(bad.reason, Some(FailureCategory::Unknown));
+    }
+
+    #[test]
+    fn devtime_row_carries_the_unmapped_count() {
+        let mut status = devtime_status(true, 10, 1);
+        status.unmapped_sessions = 3;
+        status.skipped_daemon_sessions = 5;
+        status.unknown_records = 2;
+        status.files_failed = 4;
+        let row = devtime_row(Some(status));
+        let counts = row.counts.as_ref().expect("a status gives counts");
+        assert_eq!(counts.get("unmapped"), Some(&3));
+        assert_eq!(counts.get("skipped_daemon"), Some(&5));
+        assert_eq!(counts.get("unknown_records"), Some(&2));
+        assert_eq!(counts.get("files_failed"), Some(&4));
+        assert_eq!(counts.get("lines_read"), Some(&10));
+        assert_eq!(counts.get("lines_failed"), Some(&1));
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["counts"]["unmapped"], 3);
+        let plain = serde_json::to_value(SubsystemReadout::ok("x")).unwrap();
+        assert!(plain.get("counts").is_none());
     }
 }

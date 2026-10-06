@@ -29,6 +29,11 @@ mod contacts;
 mod council;
 mod daemon_client;
 mod detect;
+mod devtime;
+mod devtime_lanes;
+mod devtime_map;
+mod devtime_parse;
+mod devtime_store;
 mod distill;
 mod email;
 mod exclusion;
@@ -1305,6 +1310,10 @@ async fn main() {
         .as_deref()
         .map(config::load_calendar_config)
         .unwrap_or_default();
+    let devtime_config = machine_file(machine_config::DEVTIME_FILE)
+        .as_deref()
+        .map(config::load_devtime_config)
+        .unwrap_or_default();
     let web_config = machine_file(machine_config::WEB_FILE)
         .as_deref()
         .map(config::load_web_config)
@@ -1968,6 +1977,17 @@ async fn main() {
     tokio::spawn(runs::run_retention_loop(state.clone()));
     // The distiller: turns closed jobs queued by the job loop and the vcs queue into learnings.
     tokio::spawn(distill::run_distill_loop(state.clone()));
+    // Its own loop: the cadence is file I/O over the transcripts directory, independent of runs.
+    let devtime_projects_dir = if devtime_config.projects_dir.trim().is_empty() {
+        commands::home().map(|home| home.join(".claude").join("projects"))
+    } else {
+        Some(std::path::PathBuf::from(&devtime_config.projects_dir))
+    };
+    tokio::spawn(devtime::run_ingest_loop(
+        state.pool.clone(),
+        devtime_config,
+        devtime_projects_dir,
+    ));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor {

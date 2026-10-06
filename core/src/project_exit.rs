@@ -41,6 +41,13 @@ const PROJECT_SCOPED: &[&str] = &[
     "browser_writes",
     // Pending distillations are the project's history; a forgotten project must not be distilled later.
     "distill_queue",
+    // Dev time is project history, and it goes with the project. Its file offsets in
+    // `devtime_files` are deliberately KEPT (owner's decision, 2026-10-05): re-adding the folder
+    // then counts time from that moment on, instead of resurrecting the old time from transcripts
+    // that still exist on disk.
+    "devtime_cwd_map",
+    // The parent of five session-keyed tables; those are written out in `remove`, ahead of the loop.
+    "devtime_sessions",
     "feed",
     "fleet_exclusions",
     "jobs",
@@ -110,7 +117,7 @@ const VIA_PARENT: &[(&str, &str, &str)] = &[
 
 /// What a project has on record, in the nouns somebody would recognise.
 ///
-/// Not every one of the twenty-seven tables the forget clears: `scheduler_state` and
+/// Not every one of the forty-two tables the forget clears: `scheduler_state` and
 /// `repo_trigger_state` are bookkeeping nobody has ever seen a screen for, and a count of them
 /// would be a number that makes the decision harder rather than easier. These seven are the ones
 /// this app has surfaces for, so each one is a thing the reader can picture losing.
@@ -240,7 +247,7 @@ where
 /// **`defer_foreign_keys` is what makes the forget expressible at all.** `storage.rs` runs with
 /// `foreign_keys` on, and a project's own history references itself in both directions — a run
 /// naming its successor, a job naming the runs that are its items — so there is no order in which
-/// twenty-seven immediate deletes all succeed. Deferred, the checks all happen at `COMMIT`, by which
+/// forty-two immediate deletes all succeed. Deferred, the checks all happen at `COMMIT`, by which
 /// point everything that had to go has gone. It also means the one failure left is the honest one:
 /// something OUTSIDE this project's history still points into it, and the commit refuses rather than
 /// leaving a dangling reference.
@@ -325,6 +332,29 @@ pub async fn remove(
         .execute(&mut *tx)
         .await?
         .rows_affected();
+
+        // The devtime children hang off `devtime_sessions` by `session_id` (TEXT, no foreign key, and
+        // the parent's key is `session_id`, not `id`), which `VIA_PARENT`'s join cannot express.
+        // BEFORE the `PROJECT_SCOPED` loop for the reason given above: the subquery reads
+        // `devtime_sessions`, which that loop deletes. `devtime_files` and `devtime_ingest_status`
+        // are deliberately not touched: the offsets are what stop a re-added folder from being
+        // re-ingested from the start.
+        for child in [
+            "devtime_turns",
+            "devtime_messages",
+            "devtime_attempts",
+            "devtime_spans",
+            "devtime_markers",
+        ] {
+            forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {child}
+                  WHERE session_id IN (SELECT session_id FROM devtime_sessions WHERE project_id = ?)"
+            )))
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
 
         // Children first. The deferral above means it would work in any order, and doing it in the
         // order the rows actually depend on keeps the statement log readable when one of them fails.
@@ -1014,6 +1044,85 @@ mod tests {
             0,
             "an event row points at knowledge that is gone"
         );
+    }
+
+    /// Dev time is project history and goes with the project; the file offsets are kept on purpose,
+    /// so re-adding the folder does not re-ingest the old time from transcripts that still exist.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_its_devtime_and_keeps_the_offsets() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        register(&pool, "bravo").await;
+        let stamp = "2026-01-01T00:00:00.000Z";
+        for id in ["alpha", "bravo"] {
+            let session = format!("sess-{id}");
+            let statements = [
+                "INSERT INTO devtime_sessions (session_id, project_id, parser_version, updated_at)
+                 VALUES (?1, ?2, 1, ?3)",
+                "INSERT INTO devtime_turns (session_id, seq, started_at, ended_at, parser_version)
+                 VALUES (?1, 0, ?3, ?3, 1)",
+                "INSERT INTO devtime_messages (session_id, lane, message_id, first_at, last_at, parser_version)
+                 VALUES (?1, 'main', 'm1', ?3, ?3, 1)",
+                "INSERT INTO devtime_attempts (attempt_id, session_id, lane, tool_use_id, kind, tool_name, started_at, outcome, parser_version)
+                 VALUES ('att-' || ?1, ?1, 'main', 'tu1', 'tool', 'Bash', ?3, 'ok', 1)",
+                "INSERT INTO devtime_spans (session_id, lane, kind, started_at, ended_at, confidence, parser_version)
+                 VALUES (?1, 'main', 'work', ?3, ?3, 'high', 1)",
+                "INSERT INTO devtime_markers (session_id, lane, ts, kind, parser_version)
+                 VALUES (?1, 'main', ?3, 'note', 1)",
+                "INSERT INTO devtime_cwd_map (cwd, project_id, kind, resolved_at)
+                 VALUES ('/work/' || ?2, ?2, 'project', ?3)",
+                "INSERT INTO devtime_files (path, session_id, offset, parser_version, updated_at)
+                 VALUES ('/t/' || ?1 || '.jsonl', ?1, 4096, 1, ?3)",
+            ];
+            for sql in statements {
+                sqlx::query(sql)
+                    .bind(&session)
+                    .bind(id)
+                    .bind(stamp)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let removed = remove(&pool, "alpha", true).await.unwrap();
+        assert!(matches!(removed, Removed::Done { .. }));
+
+        for (table, key, alpha_left, bravo_left) in [
+            ("devtime_sessions", "session_id", 0, 1),
+            ("devtime_turns", "session_id", 0, 1),
+            ("devtime_messages", "session_id", 0, 1),
+            ("devtime_attempts", "session_id", 0, 1),
+            ("devtime_spans", "session_id", 0, 1),
+            ("devtime_markers", "session_id", 0, 1),
+            ("devtime_cwd_map", "cwd", 0, 1),
+            // Kept on purpose: the offsets are what stop a re-added folder being re-ingested.
+            ("devtime_files", "session_id", 1, 1),
+        ] {
+            for (id, expected) in [("alpha", alpha_left), ("bravo", bravo_left)] {
+                let wanted = if key == "cwd" {
+                    format!("/work/{id}")
+                } else {
+                    format!("sess-{id}")
+                };
+                let left: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM {table} WHERE {key} = ?"
+                )))
+                .bind(wanted)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(left, expected, "{table} rows left for {id}");
+            }
+        }
+
+        let offset: i64 = sqlx::query_scalar(
+            "SELECT offset FROM devtime_files WHERE path = '/t/sess-alpha.jsonl'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(offset, 4096, "the kept offset must be unchanged");
     }
 
     /// And when it IS asked, it takes the lot — including the tables no screen counts.

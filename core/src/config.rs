@@ -1157,6 +1157,61 @@ pub fn load_calendar_config(path: &Path) -> CalendarConfig {
     }
 }
 
+/// The devtime ingestion's settings.
+///
+/// Derives `PartialEq` and not `Eq`, because the amber rate is an `f64`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeConfig {
+    pub enabled: bool,
+    /// Seconds between two ingestion cycles.
+    pub cycle_seconds: u64,
+    /// Minutes of silence after which a session counts as idle.
+    pub idle_minutes: u64,
+    /// Where the transcripts live. Empty means `<home>/.claude/projects`.
+    pub projects_dir: String,
+    /// The share of unparseable lines above which the ingest health goes amber.
+    pub parse_failure_amber_rate: f64,
+    /// Fewer lines than this and the rate above is not judged.
+    pub parse_failure_min_lines: u64,
+}
+
+impl Default for DevtimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cycle_seconds: 60,
+            idle_minutes: 15,
+            projects_dir: String::new(),
+            parse_failure_amber_rate: 0.02,
+            parse_failure_min_lines: 200,
+        }
+    }
+}
+
+/// `~/.nucleos/devtime.yaml`'s grammar, and the only place that decides what a valid one is.
+/// Refuses unknown keys and malformed YAML; [`load_devtime_config`] turns that refusal into defaults.
+pub fn parse_devtime_config(contents: &str) -> Result<DevtimeConfig, String> {
+    serde_yaml::from_str::<DevtimeConfig>(contents).map_err(|error| error.to_string())
+}
+
+pub fn load_devtime_config(path: &Path) -> DevtimeConfig {
+    if !path.exists() {
+        return DevtimeConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| parse_devtime_config(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "devtime config: could not be parsed; defaults apply");
+            DevtimeConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "devtime config: could not be read; defaults apply");
+            DevtimeConfig::default()
+        }
+    }
+}
+
 /// `~/.nucleos/web.yaml`. The web pillar's settings, including the one list in this system that decides
 /// what counts as trustworthy.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -4547,6 +4602,74 @@ resolve_effort: \"  \"
                 .filter(|choice| choice.brain == "local")
                 .any(|choice| choice.installed.is_some()),
             "on Ollama `/api/tags` answers the question and the menu must still say so"
+        );
+    }
+
+    #[test]
+    fn devtime_config_absent_file_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = load_devtime_config(&dir.path().join("devtime.yaml"));
+        assert_eq!(config, DevtimeConfig::default());
+        assert!(config.enabled);
+        assert_eq!(config.cycle_seconds, 60);
+        assert_eq!(config.idle_minutes, 15);
+        assert_eq!(config.projects_dir, "");
+        assert_eq!(config.parse_failure_amber_rate, 0.02);
+        assert_eq!(config.parse_failure_min_lines, 200);
+    }
+
+    #[test]
+    fn devtime_config_partial_file_keeps_other_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devtime.yaml");
+        std::fs::write(
+            &path,
+            "enabled: false
+cycle_seconds: 30
+",
+        )
+        .unwrap();
+        let config = load_devtime_config(&path);
+        assert!(!config.enabled);
+        assert_eq!(config.cycle_seconds, 30);
+        assert_eq!(config.idle_minutes, 15);
+        assert_eq!(config.parse_failure_min_lines, 200);
+        // The parser agrees with the loader, and refuses a key it does not know.
+        assert_eq!(
+            parse_devtime_config(
+                "idle_minutes: 5
+"
+            )
+            .unwrap()
+            .idle_minutes,
+            5
+        );
+        assert!(
+            parse_devtime_config(
+                "no_such_key: 1
+"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn devtime_config_malformed_file_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devtime.yaml");
+        std::fs::write(
+            &path,
+            "cycle_seconds: [not, a, number
+",
+        )
+        .unwrap();
+        assert_eq!(load_devtime_config(&path), DevtimeConfig::default());
+        assert!(
+            parse_devtime_config(
+                "cycle_seconds: [not, a, number
+"
+            )
+            .is_err()
         );
     }
 }
