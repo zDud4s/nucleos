@@ -272,6 +272,37 @@ pub async fn say_now(
 /// megabytes while it waits, and a desktop app is the wrong place to spend that on a conversation
 /// nobody came back to.
 const LIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
+/// How long a DEVELOPMENT conversation's process waits: one whose last turn called `Agent`/`Task` or
+/// ran longer than [`DEV_TURN`] (spec 4.2 item 3; owner 2026-10-05: derived, never a toggle).
+const DEV_IDLE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// A turn longer than this marks its conversation as development work.
+const DEV_TURN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// At most this many conversation processes alive at once, kept or mid-turn (owner 2026-10-05).
+const LIVE_CAP: usize = 5;
+/// The cap `keep_live` enforces. Unbounded under test: `LIVE_CHATS` is one static shared by every
+/// test running in parallel, and a real cap there would evict other tests' processes. `make_room`
+/// is tested directly with `LIVE_CAP`.
+#[cfg(not(test))]
+const ENFORCED_CAP: usize = LIVE_CAP;
+#[cfg(test)]
+const ENFORCED_CAP: usize = usize::MAX;
+
+/// Every `LiveChat` alive, in `LIVE_CHATS` or in a turn's hands. Held by [`LiveCount`].
+static LIVE_PROCESSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one `LiveChat` in [`LIVE_PROCESSES`] for exactly as long as it exists, on every way out.
+struct LiveCount;
+impl LiveCount {
+    fn start() -> Self {
+        LIVE_PROCESSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+impl Drop for LiveCount {
+    fn drop(&mut self) {
+        LIVE_PROCESSES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// One conversation's living CLI, kept between turns instead of started again for each.
 ///
@@ -334,6 +365,10 @@ struct LiveChat {
     cwd: Option<std::path::PathBuf>,
     /// When it last finished a turn, which is what the reaper measures.
     idle_since: std::time::Instant,
+    /// How long it may stay idle before the reaper takes it; set from its last turn by `keep_live`.
+    idle_for: std::time::Duration,
+    /// Its place in `LIVE_PROCESSES`.
+    _counted: LiveCount,
     /// Events read between turns and not yet handed to a turn, oldest first. `gather` drains these
     /// before the channel, so nothing read early is lost or reordered.
     carried: std::collections::VecDeque<crate::runner::TurnEvent>,
@@ -570,10 +605,101 @@ fn take_live(chat_id: &str) -> Option<LiveChat> {
 }
 
 /// Puts a process back, having just finished a turn, for the next one to find.
-fn keep_live(chat_id: &str, mut live: LiveChat) {
+fn keep_live(chat_id: &str, mut live: LiveChat, idle_for: std::time::Duration) {
     live.idle_since = std::time::Instant::now();
-    LIVE_CHATS.lock().unwrap().insert(chat_id.to_owned(), live);
+    live.idle_for = idle_for;
+    let evicted = {
+        let mut kept = LIVE_CHATS.lock().unwrap();
+        kept.insert(chat_id.to_owned(), live);
+        let alive = LIVE_PROCESSES.load(std::sync::atomic::Ordering::SeqCst);
+        make_room(&mut kept, alive, chat_id, ENFORCED_CAP)
+    };
+    // Dropped outside the lock; dropping is what stops them.
+    drop(evicted);
     reap_idle_live_chats();
+}
+
+/// How long a process may idle after this turn: [`DEV_IDLE`] when the turn called `Agent`/`Task` or
+/// lasted longer than [`DEV_TURN`], [`LIVE_IDLE`] otherwise.
+fn idle_for_turn(stdout: &str, lasted: std::time::Duration) -> std::time::Duration {
+    let used_subagents = stdout.lines().any(|line| {
+        if !line.contains("\"tool_use\"") {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        value.get("type").and_then(serde_json::Value::as_str) == Some("assistant")
+            && value
+                .pointer("/message/content")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                            && matches!(
+                                item.get("name").and_then(serde_json::Value::as_str),
+                                Some("Agent" | "Task")
+                            )
+                    })
+                })
+    });
+    if used_subagents || lasted > DEV_TURN {
+        DEV_IDLE
+    } else {
+        LIVE_IDLE
+    }
+}
+
+/// How long a process idles after a SPONTANEOUS turn: the later of what it already had and what the
+/// turn earns. A background answer is usually a short plain reply, and must not drop a development
+/// chat back to [`LIVE_IDLE`] right after its background `Agent` finished. Human turns do not use
+/// this: the last turn decides.
+fn idle_after_spontaneous(
+    current: std::time::Duration,
+    stdout: &str,
+    lasted: std::time::Duration,
+) -> std::time::Duration {
+    current.max(idle_for_turn(stdout, lasted))
+}
+
+/// Takes processes out of `kept` until `alive` fits under `cap`, least recently used first, and
+/// returns them for the caller to drop. Never one with a background task, nor one whose `carried`
+/// still holds an answer no turn has claimed yet (evicting it would lose that answer). The one being
+/// kept goes only when nothing else can (spec 4.2 item 3: when every other is busy, the new one is
+/// not kept).
+fn make_room(
+    kept: &mut HashMap<String, LiveChat>,
+    alive: usize,
+    keeping: &str,
+    cap: usize,
+) -> Vec<LiveChat> {
+    let mut evicted = Vec::new();
+    let mut excess = alive.saturating_sub(cap);
+    while excess > 0 {
+        let oldest = kept
+            .iter()
+            .filter(|(id, live)| {
+                id.as_str() != keeping && live.background.is_empty() && live.carried.is_empty()
+            })
+            .min_by_key(|(_, live)| live.idle_since)
+            .map(|(id, _)| id.clone());
+        let victim = match oldest {
+            Some(id) => id,
+            None if kept
+                .get(keeping)
+                .is_some_and(|live| live.background.is_empty() && live.carried.is_empty()) =>
+            {
+                keeping.to_owned()
+            }
+            None => break,
+        };
+        let Some(live) = kept.remove(&victim) else {
+            break;
+        };
+        evicted.push(live);
+        excess -= 1;
+    }
+    evicted
 }
 
 /// Whether a turn runs with the user's ambient MCP servers: only when the conversation opted in
@@ -622,7 +748,9 @@ fn reap_now() {
         // A background task that has started and not reported its end is work the process is still
         // doing for the conversation (spec 4.2 item 2; spike 2026-10-05 (c): the CLI answers on its
         // own when it ends), so such a process is kept however long it has been idle.
-        still_standing && (!live.background.is_empty() || live.idle_since.elapsed() < LIVE_IDLE)
+        // The idle time is the chat's own, derived from its last turn.
+        still_standing
+            && (!live.background.is_empty() || live.idle_since.elapsed() < live.idle_for)
     });
 }
 
@@ -673,6 +801,7 @@ async fn serve_turn(
             // The steering entry is open for exactly as long as the turn is being gathered, so a
             // line written into the process lands in THIS turn. It is dropped before the process
             // goes back to the registry.
+            let began = std::time::Instant::now();
             let steer = SteerGuard::open(chat_id, &live.messages);
             let served = tokio::time::timeout(
                 deadlines.ceiling,
@@ -691,8 +820,9 @@ async fn serve_turn(
                         .lock()
                         .map(|held| held.clone())
                         .unwrap_or_default();
+                    let idle_for = idle_for_turn(&stdout, began.elapsed());
                     let gathered = gathered(outcome, stdout, session_id);
-                    keep_live(chat_id, live);
+                    keep_live(chat_id, live, idle_for);
                     return Ok(Ok(gathered));
                 }
                 // It heard the turn and died before answering. Starting it again would re-run
@@ -736,6 +866,7 @@ async fn start_live_chat(
     chat_id: &str,
     deadlines: TurnDeadlines,
 ) -> Result<std::io::Result<crate::runner::RunOutcome>, tokio::time::error::Elapsed> {
+    let began = std::time::Instant::now();
     let (messages, incoming) = tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (process_session_tx, mut process_session_rx) =
@@ -843,6 +974,8 @@ async fn start_live_chat(
         permission: was_permission,
         cwd: started_in,
         idle_since: std::time::Instant::now(),
+        idle_for: LIVE_IDLE,
+        _counted: LiveCount::start(),
         carried: Default::default(),
         background: HashSet::new(),
         watcher: 0,
@@ -862,9 +995,10 @@ async fn start_live_chat(
                 .lock()
                 .map(|held| held.clone())
                 .unwrap_or_default();
+            let idle_for = idle_for_turn(&stdout, began.elapsed());
             let known = session_id.lock().unwrap().clone().unwrap_or_default();
             let gathered = gathered(outcome, stdout, known);
-            keep_live(chat_id, live);
+            keep_live(chat_id, live, idle_for);
             Ok(Ok(gathered))
         }
         // A process that fell over without answering. `live` is dropped on the way out, which takes
@@ -1203,6 +1337,7 @@ async fn start_spontaneous_turn(
     let after = state.clone();
     let chat = chat_id.to_owned();
     crate::runs::spawn_registered(state, id, async move {
+        let began = std::time::Instant::now();
         let served = tokio::time::timeout(
             deadlines.ceiling,
             live.gather(&transcript, deadlines.silence),
@@ -1215,12 +1350,13 @@ async fn start_spontaneous_turn(
                     .lock()
                     .map(|held| held.clone())
                     .unwrap_or_default();
+                let idle_for = idle_after_spontaneous(live.idle_for, &stdout, began.elapsed());
                 let known = live.session_id.lock().unwrap().clone().unwrap_or_default();
                 let o = gathered(outcome, stdout, known);
                 // The process has now served this turn too, under the same barrier.
                 note_served(live.process_key(), id, mode);
                 // Kept first, so the process is back for the next turn before the row says done.
-                keep_live(&chat, live);
+                keep_live(&chat, live, idle_for);
                 record_spontaneous_answer(&pool, id, &chat, &o, &completed_at).await;
             }
             Ok(LiveTurn::DiedMidTurn(why)) => {
@@ -7141,6 +7277,8 @@ mod tests {
                 permission: crate::runner::Permission::Default,
                 cwd: None,
                 idle_since: std::time::Instant::now(),
+                idle_for: LIVE_IDLE,
+                _counted: LiveCount::start(),
                 carried: Default::default(),
                 background: HashSet::new(),
                 watcher: 0,
@@ -7233,6 +7371,225 @@ mod tests {
         assert!(LIVE_CHATS.lock().unwrap().contains_key("working-chat"));
         // Taken back out, because this map outlives the test that wrote to it.
         LIVE_CHATS.lock().unwrap().remove("working-chat");
+    }
+
+    // ---- idle time per chat and the cap on live processes ----------------------------------------
+
+    /// An assistant event whose content is a `tool_use` of the named tool.
+    fn idle_lru_tool_use(name: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"tu-1","name":"{name}","input":{{"prompt":"look"}}}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn idle_lru_a_turn_that_called_a_subagent_gets_the_development_idle() {
+        for tool in ["Agent", "Task"] {
+            let stdout = format!("{}\n", idle_lru_tool_use(tool));
+            assert_eq!(
+                idle_for_turn(&stdout, Duration::from_secs(1)),
+                DEV_IDLE,
+                "a turn that called {tool} is development work"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_lru_a_turn_longer_than_five_minutes_gets_the_development_idle() {
+        assert_eq!(
+            idle_for_turn("", DEV_TURN + Duration::from_secs(1)),
+            DEV_IDLE
+        );
+    }
+
+    #[test]
+    fn idle_lru_a_short_plain_turn_keeps_the_conversation_idle() {
+        let mentions = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"ask the Agent"}]}}"#;
+        let reads = idle_lru_tool_use("Read");
+        let stdout = format!("{mentions}\n{reads}\n");
+        assert_eq!(idle_for_turn(&stdout, Duration::from_secs(1)), LIVE_IDLE);
+    }
+
+    #[tokio::test]
+    async fn idle_lru_a_live_turn_that_called_agent_is_kept_for_the_development_idle() {
+        for (prefix, line, expected) in [
+            ("idle-lru-dev", idle_lru_tool_use("Agent"), DEV_IDLE),
+            (
+                "idle-lru-plain",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}"#
+                    .to_owned(),
+                LIVE_IDLE,
+            ),
+        ] {
+            let chat = a_chat(prefix);
+            let (live, _said, events, _why) = live_chat_for_testing();
+            LIVE_CHATS.lock().unwrap().insert(chat.clone(), live);
+            events
+                .send(crate::runner::TurnEvent::Line(line))
+                .unwrap();
+            events
+                .send(crate::runner::TurnEvent::Ended(
+                    crate::runner::TurnOutcome::default(),
+                ))
+                .unwrap();
+            let runner: Arc<dyn crate::runner::CommandRunner> =
+                Arc::new(FakeCommandRunner::default());
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let transcript = Arc::new(Mutex::new(String::new()));
+
+            let served = serve_turn(
+                &runner,
+                silence_request(),
+                tx,
+                &transcript,
+                &chat,
+                TurnDeadlines {
+                    silence: Some(Duration::from_secs(5)),
+                    ceiling: Duration::from_secs(10),
+                },
+                true,
+            )
+            .await;
+            let kept_for = LIVE_CHATS.lock().unwrap().get(&chat).map(|l| l.idle_for);
+            evict_live(&chat);
+
+            served.expect("in time").expect("the process answered");
+            assert_eq!(kept_for, Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_lru_a_development_chat_outlives_ninety_seconds_and_is_reaped_after_fifteen_minutes()
+     {
+        let chat = a_chat("idle-lru-reap");
+        let (mut live, _said, _events, _why) = live_chat_for_testing();
+        live.idle_for = DEV_IDLE;
+        live.idle_since = std::time::Instant::now()
+            .checked_sub(LIVE_IDLE * 2)
+            .expect("a machine that has been up three minutes");
+        LIVE_CHATS.lock().unwrap().insert(chat.clone(), live);
+
+        reap_now();
+        assert!(
+            LIVE_CHATS.lock().unwrap().contains_key(&chat),
+            "a development chat idle for 180 s is still wanted"
+        );
+
+        LIVE_CHATS.lock().unwrap().get_mut(&chat).unwrap().idle_since =
+            std::time::Instant::now()
+                .checked_sub(DEV_IDLE + Duration::from_secs(1))
+                .expect("a machine that has been up sixteen minutes");
+        reap_now();
+        assert!(
+            !LIVE_CHATS.lock().unwrap().contains_key(&chat),
+            "past fifteen minutes it is reaped"
+        );
+    }
+
+    /// Six lives "c0".."c5", c0 the least recently used.
+    fn idle_lru_six() -> (HashMap<String, LiveChat>, Vec<impl Sized>) {
+        let mut kept = HashMap::new();
+        let mut held = Vec::new();
+        for i in 0..6u64 {
+            let (mut live, said, events, why) = live_chat_for_testing();
+            live.idle_since = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(60 - i))
+                .expect("a machine that has been up a minute");
+            kept.insert(format!("c{i}"), live);
+            held.push((said, events, why));
+        }
+        (kept, held)
+    }
+
+    #[tokio::test]
+    async fn idle_lru_keeping_a_sixth_process_evicts_the_least_recently_used_idle_one() {
+        let (mut kept, _held) = idle_lru_six();
+
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(!kept.contains_key("c0"), "the oldest idle one goes");
+        assert_eq!(kept.len(), 5);
+        assert!(kept.contains_key("c5"), "never the one being kept");
+    }
+
+    #[tokio::test]
+    async fn idle_lru_a_process_with_a_background_task_is_never_evicted() {
+        let (mut kept, _held) = idle_lru_six();
+        kept.get_mut("c0").unwrap().background.insert("bg".to_owned());
+
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(kept.contains_key("c0"), "busy: left alone however old");
+        assert!(!kept.contains_key("c1"), "the next-oldest idle one goes");
+    }
+
+    #[test]
+    fn idle_lru_a_background_reply_does_not_lower_a_development_idle() {
+        let plain = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#;
+        assert_eq!(
+            idle_after_spontaneous(DEV_IDLE, plain, Duration::from_secs(1)),
+            DEV_IDLE,
+            "a short plain background reply keeps the development idle"
+        );
+        assert_eq!(
+            idle_after_spontaneous(LIVE_IDLE, plain, Duration::from_secs(1)),
+            LIVE_IDLE
+        );
+        assert_eq!(
+            idle_after_spontaneous(LIVE_IDLE, &idle_lru_tool_use("Agent"), Duration::from_secs(1)),
+            DEV_IDLE,
+            "a background turn may still raise it"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_lru_a_process_holding_an_unclaimed_answer_is_never_evicted() {
+        let (mut kept, _held) = idle_lru_six();
+        kept.get_mut("c0")
+            .unwrap()
+            .carried
+            .push_back(crate::runner::TurnEvent::Line("an answer".to_owned()));
+
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(kept.contains_key("c0"), "its answer is not yet claimed");
+        assert!(!kept.contains_key("c1"), "the next-oldest idle one goes");
+    }
+
+    #[tokio::test]
+    async fn idle_lru_when_every_other_process_is_busy_the_new_one_is_not_kept() {
+        let mut kept: HashMap<String, LiveChat> = HashMap::new();
+        let mut held = Vec::new();
+        for id in ["c0", "c1", "c2", "c3", "new"] {
+            let (mut live, said, events, why) = live_chat_for_testing();
+            if id != "new" {
+                live.background.insert("bg".to_owned());
+            }
+            kept.insert(id.to_owned(), live);
+            held.push((said, events, why));
+        }
+
+        let evicted = make_room(&mut kept, 6, "new", LIVE_CAP);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(!kept.contains_key("new"), "the one being kept is dropped");
+        for id in ["c0", "c1", "c2", "c3"] {
+            assert!(kept.contains_key(id), "{id} is busy and stays");
+        }
+
+        // With a background task of its own it is not dropped either.
+        let (mut live, said, events, why) = live_chat_for_testing();
+        live.background.insert("bg".to_owned());
+        kept.insert("new".to_owned(), live);
+        held.push((said, events, why));
+
+        let evicted = make_room(&mut kept, 6, "new", LIVE_CAP);
+
+        assert!(evicted.is_empty());
+        assert_eq!(kept.len(), 5);
     }
 
     /// The whole point: a conversation's second turn is answered by the process its first one
@@ -7660,6 +8017,8 @@ mod tests {
             permission: crate::runner::Permission::Default,
             cwd: None,
             idle_since: std::time::Instant::now(),
+            idle_for: LIVE_IDLE,
+            _counted: LiveCount::start(),
             carried: Default::default(),
             background: HashSet::new(),
             watcher: 0,
