@@ -3,10 +3,11 @@
 package chrome
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
+	"image/jpeg"
 	"sync"
 	"time"
 
@@ -21,11 +22,44 @@ const ackGap = 100 * time.Millisecond
 type incomingFrame struct {
 	data  string
 	ackID int
+	meta  screencastMeta
+}
+
+// screencastMeta is the metadata Chrome sends beside each screencast frame.
+type screencastMeta struct {
+	OffsetTop       float64 `json:"offsetTop"`
+	PageScaleFactor float64 `json:"pageScaleFactor"`
+	DeviceWidth     float64 `json:"deviceWidth"`
+	DeviceHeight    float64 `json:"deviceHeight"`
+	ScrollOffsetX   float64 `json:"scrollOffsetX"`
+	ScrollOffsetY   float64 `json:"scrollOffsetY"`
+}
+
+// frameDims reads a JPEG's size from its header; zero when it does not decode.
+func frameDims(raw []byte) (int, int) {
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return 0, 0
+	}
+	return cfg.Width, cfg.Height
 }
 
 // viewer holds the newest frame it has not been shown. Capacity one, replace-oldest: a slow viewer
 // sees the latest picture, never a queue of old ones.
-type viewer struct{ slot chan browser.Frame }
+type viewer struct {
+	slot chan browser.Frame
+	// prompts carries the questions put to a person, in order. Unlike slot it is a queue: a prompt is
+	// not superseded by the next one. It is never blocked on; a viewer that falls 32 behind misses one.
+	prompts chan browser.Frame
+}
+
+// sendPrompt queues a prompt for the viewer without ever blocking the caller.
+func (v *viewer) sendPrompt(prompt browser.Prompt) {
+	select {
+	case v.prompts <- browser.Frame{Prompt: &prompt}:
+	default:
+	}
+}
 
 func (v *viewer) put(frame browser.Frame) {
 	select {
@@ -51,6 +85,10 @@ type screencast struct {
 func (c *screencast) end() { c.doneOnce.Do(func() { close(c.done) }) }
 
 // Watch streams the session's page to sink until ctx ends or the session does.
+//
+// It runs in every mode, a person's turn included: the viewer is waiting to see the login, and the
+// screencast only reads the page. It does not take the person gate for that reason, and for another —
+// a stream lasts as long as the viewer does, and a swap would wait on it forever.
 func (d *Driver) Watch(ctx context.Context, id browser.SessionID, sink func(browser.Frame)) error {
 	entry, err := d.lookup(id)
 	if err != nil {
@@ -58,18 +96,23 @@ func (d *Driver) Watch(ctx context.Context, id browser.SessionID, sink func(brow
 	}
 
 	d.castCtl.Lock()
+	// While a person drives, the pending prompts are held still from here until this viewer is
+	// registered, so it is shown every unresolved one exactly once: the ones raised before are
+	// replayed below, and the ones raised after reach it as a viewer.
+	state := d.person.Load()
+	if state != nil {
+		state.pmu.Lock()
+	}
 	d.mu.Lock()
 	if _, ok := d.sessions[id]; !ok {
 		d.mu.Unlock()
+		if state != nil {
+			state.pmu.Unlock()
+		}
 		d.castCtl.Unlock()
 		return browser.ErrNoSuchSession
 	}
-	if entry.mode != browser.ModeAgent {
-		d.mu.Unlock()
-		d.castCtl.Unlock()
-		return fmt.Errorf("%w: the screencast belongs to the agent's browser", browser.ErrPersonIsDriving)
-	}
-	me := &viewer{slot: make(chan browser.Frame, 1)}
+	me := &viewer{slot: make(chan browser.Frame, 1), prompts: make(chan browser.Frame, 32)}
 	cast, running := d.casts[entry.cdp]
 	if !running {
 		cast = &screencast{
@@ -83,6 +126,14 @@ func (d *Driver) Watch(ctx context.Context, id browser.SessionID, sink func(brow
 	}
 	cast.viewers[me] = struct{}{}
 	d.mu.Unlock()
+	if state != nil {
+		for _, pendingID := range state.order {
+			if pending := state.pending[pendingID]; pending != nil && pending.on == entry.cdp {
+				me.sendPrompt(pending.prompt)
+			}
+		}
+		state.pmu.Unlock()
+	}
 
 	if !running {
 		_, startErr := d.conn.Call(ctx, entry.cdp, "Page.startScreencast", map[string]any{
@@ -114,7 +165,7 @@ func (d *Driver) Watch(ctx context.Context, id browser.SessionID, sink func(brow
 		}
 		if json.Unmarshal(shot, &payload) == nil {
 			if raw, decErr := base64.StdEncoding.DecodeString(payload.Data); decErr == nil {
-				me.put(browser.Frame{JPEG: raw})
+				me.put(browser.Frame{JPEG: raw, Meta: d.screenshotMeta(ctx, entry.cdp, raw)})
 			}
 		}
 	}
@@ -125,6 +176,11 @@ func (d *Driver) Watch(ctx context.Context, id browser.SessionID, sink func(brow
 			return ctx.Err()
 		case <-cast.done:
 			return browser.ErrNoSuchSession
+		case frame := <-me.prompts:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			sink(frame)
 		case frame := <-me.slot:
 			// select picks at random between ready cases, so a cancelled ctx or a dead target must be
 			// checked again here: no frame goes to the sink once the watch is over.
@@ -167,6 +223,42 @@ func (d *Driver) leaveScreencast(entry *session, cast *screencast, me *viewer) {
 	_, _ = d.conn.Call(stopCtx, entry.cdp, "Page.stopScreencast", map[string]any{})
 }
 
+// screenshotMeta is the geometry of the first screenshot, which has no screencast metadata of its
+// own: it comes from the page's layout metrics, and falls back to the frame's own size.
+func (d *Driver) screenshotMeta(ctx context.Context, session cdp.SessionID, raw []byte) *browser.FrameMeta {
+	width, height := frameDims(raw)
+	meta := &browser.FrameMeta{
+		FrameWidth: width, FrameHeight: height,
+		DeviceWidth: float64(width), DeviceHeight: float64(height),
+		PageScaleFactor: 1,
+	}
+	reply, err := d.conn.Call(ctx, session, "Page.getLayoutMetrics", map[string]any{})
+	if err != nil {
+		return meta
+	}
+	var metrics struct {
+		Viewport struct {
+			ClientWidth  float64 `json:"clientWidth"`
+			ClientHeight float64 `json:"clientHeight"`
+			PageX        float64 `json:"pageX"`
+			PageY        float64 `json:"pageY"`
+			Scale        float64 `json:"scale"`
+		} `json:"cssVisualViewport"`
+	}
+	if json.Unmarshal(reply, &metrics) != nil {
+		return meta
+	}
+	v := metrics.Viewport
+	if v.ClientWidth > 0 && v.ClientHeight > 0 {
+		meta.DeviceWidth, meta.DeviceHeight = v.ClientWidth, v.ClientHeight
+	}
+	meta.ScrollOffsetX, meta.ScrollOffsetY = v.PageX, v.PageY
+	if v.Scale > 0 {
+		meta.PageScaleFactor = v.Scale
+	}
+	return meta
+}
+
 // onScreencastFrame runs on the connection's one dispatch goroutine, which the fence also answers
 // on, so it only hands the frame over and returns. It must never call out: a call from here waits
 // on a reply that only this goroutine can deliver.
@@ -175,8 +267,9 @@ func (d *Driver) onScreencastFrame(event cdp.Event) {
 		return
 	}
 	var params struct {
-		Data      string `json:"data"`
-		SessionID int    `json:"sessionId"`
+		Data      string         `json:"data"`
+		SessionID int            `json:"sessionId"`
+		Metadata  screencastMeta `json:"metadata"`
 	}
 	if json.Unmarshal(event.Params, &params) != nil {
 		return
@@ -187,7 +280,7 @@ func (d *Driver) onScreencastFrame(event cdp.Event) {
 	if cast == nil {
 		return
 	}
-	frame := incomingFrame{data: params.Data, ackID: params.SessionID}
+	frame := incomingFrame{data: params.Data, ackID: params.SessionID, meta: params.Metadata}
 	select {
 	case <-cast.incoming:
 	default:
@@ -212,7 +305,13 @@ func (d *Driver) pumpScreencast(cast *screencast) {
 		case frame = <-cast.incoming:
 		}
 		if raw, err := base64.StdEncoding.DecodeString(frame.data); err == nil {
-			shown := browser.Frame{JPEG: raw}
+			width, height := frameDims(raw)
+			shown := browser.Frame{JPEG: raw, Meta: &browser.FrameMeta{
+				FrameWidth: width, FrameHeight: height,
+				DeviceWidth: frame.meta.DeviceWidth, DeviceHeight: frame.meta.DeviceHeight,
+				OffsetTop: frame.meta.OffsetTop, PageScaleFactor: frame.meta.PageScaleFactor,
+				ScrollOffsetX: frame.meta.ScrollOffsetX, ScrollOffsetY: frame.meta.ScrollOffsetY,
+			}}
 			d.mu.Lock()
 			for v := range cast.viewers {
 				v.put(shown)

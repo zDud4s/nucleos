@@ -118,9 +118,14 @@ const eraseScript = `(function() {
 // deferred before the first stroke, and it runs against every document that was drawn on rather
 // than against the one that failed.
 func (d *Driver) Look(ctx context.Context, id browser.SessionID) (browser.LookResult, error) {
+	d.gate.RLock()
+	defer d.gate.RUnlock()
 	entry, err := d.lookup(id)
 	if err != nil {
 		return browser.LookResult{}, err
+	}
+	if d.personHolds(id) {
+		return browser.LookResult{}, browser.ErrPersonIsDriving
 	}
 
 	d.mu.Lock()

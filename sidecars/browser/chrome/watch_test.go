@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/jpeg"
 	"sync"
 	"testing"
 	"time"
@@ -360,11 +362,10 @@ func TestWatchFirstFrameArrivesWithoutThePageChanging(t *testing.T) {
 	t.Fatal("no Page.captureScreenshot was made")
 }
 
-// TestWatchAfterHandoffIsRefusedWhileStillAChromeDriver. Once a person has the wheel the agent's
-// browser is the wrong thing to be watching — the person's window is the one that is live — and
-// the driver says so with the same error every other agent verb gives, rather than streaming a
-// headless page that has stopped being the story.
-func TestWatchAfterHandoffIsRefusedWhileStillAChromeDriver(t *testing.T) {
+// TestWatchAfterHandoffStreamsTheAgentsPage. A handoff marks the wheel as the person's, and the
+// person's window is the one a viewer is waiting to see: the screencast keeps running over the same
+// page, so the viewer follows the login instead of being cut off at the moment it matters most.
+func TestWatchAfterHandoffStreamsTheAgentsPage(t *testing.T) {
 	fake, driver, id := watchSession(t)
 	jpegAnswer(fake, []byte("shot"))
 	if _, err := driver.Handoff(context.Background(), id, "the person takes over"); err != nil {
@@ -372,15 +373,15 @@ func TestWatchAfterHandoffIsRefusedWhileStillAChromeDriver(t *testing.T) {
 	}
 
 	var seen collector
-	err := driver.Watch(context.Background(), id, seen.sink)
-	if !errors.Is(err, browser.ErrPersonIsDriving) {
-		t.Fatalf("got %v, want ErrPersonIsDriving", err)
-	}
-	if got := countCalls(fake, "Page.startScreencast"); got != 0 {
-		t.Errorf("a refused watch still started %d screencast(s)", got)
-	}
-	if len(seen.all()) != 0 {
-		t.Errorf("a refused watch still delivered %d frame(s)", len(seen.all()))
+	w := startWatch(t, driver, id, seen.sink)
+	defer w.stop(t)
+
+	eventually(t, "a frame after the handoff", 3*time.Second, func() bool { return len(seen.all()) >= 1 })
+	eventually(t, "Page.startScreencast", 3*time.Second, func() bool { return countCalls(fake, "Page.startScreencast") > 0 })
+	emitFrame(fake, []byte("after-handoff"), 1)
+	eventually(t, "the screencast's own frame", 3*time.Second, func() bool { return len(seen.all()) >= 2 })
+	if got := seen.all()[1]; !bytes.Equal(got, []byte("after-handoff")) {
+		t.Errorf("second frame = %q, want the one the screencast sent", got)
 	}
 }
 
@@ -488,4 +489,131 @@ func TestWatchDeliversNoFrameOnceItsContextIsCancelled(t *testing.T) {
 	if late > 0 {
 		t.Errorf("%d of %d rounds handed the sink a frame after the context was cancelled; want none", late, rounds)
 	}
+}
+
+// tinyJPEG encodes a real 4x3 JPEG, so the driver can read the frame's own dimensions from it.
+func tinyJPEG(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 4, 3)), nil); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// frameLog records whole frames, metadata included.
+type frameLog struct {
+	mu     sync.Mutex
+	frames []browser.Frame
+}
+
+func (l *frameLog) sink(frame browser.Frame) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.frames = append(l.frames, frame)
+}
+
+func (l *frameLog) all() []browser.Frame {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]browser.Frame(nil), l.frames...)
+}
+
+// TestWatchFrameCarriesItsScreencastMetadata. The viewer maps a click on the picture back to the
+// page, and it can only do that with the metadata Chrome sends beside each screencast frame.
+func TestWatchFrameCarriesItsScreencastMetadata(t *testing.T) {
+	fake, driver, id := watchSession(t)
+	shot := tinyJPEG(t)
+	jpegAnswer(fake, shot)
+	var seen frameLog
+	w := startWatch(t, driver, id, seen.sink)
+	defer w.stop(t)
+	eventually(t, "Page.startScreencast", 3*time.Second, func() bool { return countCalls(fake, "Page.startScreencast") > 0 })
+	eventually(t, "the first screenshot", 3*time.Second, func() bool { return len(seen.all()) >= 1 })
+
+	fake.Emit("S1", "Page.screencastFrame", map[string]any{
+		"data":      base64.StdEncoding.EncodeToString(shot),
+		"sessionId": 1,
+		"metadata": map[string]any{
+			"offsetTop":       56,
+			"pageScaleFactor": 1.5,
+			"deviceWidth":     800,
+			"deviceHeight":    600,
+			"scrollOffsetX":   10,
+			"scrollOffsetY":   20,
+		},
+	})
+	eventually(t, "the screencast's own frame", 3*time.Second, func() bool { return len(seen.all()) >= 2 })
+
+	got := seen.all()[1]
+	want := browser.FrameMeta{
+		FrameWidth: 4, FrameHeight: 3,
+		DeviceWidth: 800, DeviceHeight: 600,
+		OffsetTop: 56, PageScaleFactor: 1.5,
+		ScrollOffsetX: 10, ScrollOffsetY: 20,
+	}
+	if got.Meta == nil {
+		t.Fatal("the screencast frame carried no metadata")
+	}
+	if *got.Meta != want {
+		t.Errorf("meta = %+v, want %+v", *got.Meta, want)
+	}
+}
+
+// TestWatchFirstScreenshotCarriesMetadata. The first frame is a screenshot, which has no screencast
+// metadata of its own, so it is read from the page's layout metrics; when that call fails the device
+// size falls back to the frame's own.
+func TestWatchFirstScreenshotCarriesMetadata(t *testing.T) {
+	t.Run("from the layout metrics", func(t *testing.T) {
+		fake, driver, id := watchSession(t)
+		jpegAnswer(fake, tinyJPEG(t))
+		fake.Handle("Page.getLayoutMetrics", func(cdptest.Call) (any, error) {
+			return map[string]any{"cssVisualViewport": map[string]any{
+				"clientWidth": 1024, "clientHeight": 768, "pageX": 5, "pageY": 7, "scale": 2,
+			}}, nil
+		})
+		var seen frameLog
+		w := startWatch(t, driver, id, seen.sink)
+		defer w.stop(t)
+		eventually(t, "the first frame", 3*time.Second, func() bool { return len(seen.all()) >= 1 })
+
+		got := seen.all()[0]
+		want := browser.FrameMeta{
+			FrameWidth: 4, FrameHeight: 3,
+			DeviceWidth: 1024, DeviceHeight: 768,
+			OffsetTop: 0, PageScaleFactor: 2,
+			ScrollOffsetX: 5, ScrollOffsetY: 7,
+		}
+		if got.Meta == nil {
+			t.Fatal("the first screenshot carried no metadata")
+		}
+		if *got.Meta != want {
+			t.Errorf("meta = %+v, want %+v", *got.Meta, want)
+		}
+	})
+
+	t.Run("when the layout metrics fail", func(t *testing.T) {
+		fake, driver, id := watchSession(t)
+		jpegAnswer(fake, tinyJPEG(t))
+		fake.Handle("Page.getLayoutMetrics", func(cdptest.Call) (any, error) {
+			return nil, errors.New("no layout metrics")
+		})
+		var seen frameLog
+		w := startWatch(t, driver, id, seen.sink)
+		defer w.stop(t)
+		eventually(t, "the first frame", 3*time.Second, func() bool { return len(seen.all()) >= 1 })
+
+		got := seen.all()[0]
+		want := browser.FrameMeta{
+			FrameWidth: 4, FrameHeight: 3,
+			DeviceWidth: 4, DeviceHeight: 3,
+			PageScaleFactor: 1,
+		}
+		if got.Meta == nil {
+			t.Fatal("the first screenshot carried no metadata")
+		}
+		if *got.Meta != want {
+			t.Errorf("meta = %+v, want %+v", *got.Meta, want)
+		}
+	})
 }

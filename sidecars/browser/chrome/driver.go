@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nucleosbrowser/browser"
@@ -58,6 +59,20 @@ type Driver struct {
 	refusals     []recordedRefusal
 	refusalTotal int
 
+	// gate is what makes the person's turn a swap and not a race. Every exported agent verb holds it
+	// for READING for as long as it runs; BeginPerson and EndPerson hold it for WRITING, so a verb in
+	// flight finishes first and none starts in the middle of the swap. Taken at exported entry points
+	// only, and no exported method calls another, so it never recurses under a waiting writer.
+	gate sync.RWMutex
+	// person is the person's turn, or nil. Read without a lock by the fence, which answers requests
+	// from goroutines that must never wait on the gate: a paused request nobody answers wedges the
+	// renderer the swap itself is waiting on.
+	person atomic.Pointer[personState]
+	// personBegun is set by BeginPerson inside the same d.mu critical section as its sole-session
+	// check, and Open refuses to insert a session while it is set. Guarded by mu. Unlike person it is
+	// true from the moment the fence is about to lift, so an Open that is mid-flight cannot slip in.
+	personBegun bool
+
 	// swept closes when the profile has been cleared of service workers, and sweepErr says whether
 	// that succeeded. Open waits on it — see waitForSweep. sweepErr is written before the close and
 	// read only after it, which is what makes it safe without a lock.
@@ -76,6 +91,8 @@ type Driver struct {
 	settleWithin time.Duration
 	// movingWithin caps how long a page may hold that wait by redrawing. See movingBound.
 	movingWithin time.Duration
+	// promptTimeout is how long a prompt put to a person waits before it is cancelled.
+	promptTimeout time.Duration
 }
 
 type session struct {
@@ -200,7 +217,8 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 	}
 
 	if _, err := conn.Call(ctx, cdp.BrowserSession, "Fetch.enable", map[string]any{
-		"patterns": []map[string]any{{"urlPattern": "*"}},
+		"patterns":           []map[string]any{{"urlPattern": "*"}},
+		"handleAuthRequests": true,
 	}); err != nil {
 		return nil, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
 	}
@@ -239,9 +257,12 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 		idleGrace:    idleGrace,
 		settleWithin: settleGrace,
 		movingWithin: movingBound,
+
+		promptTimeout: promptTimeoutDefault,
 	}
 	conn.OnEvent(driver.onEvent)
 	conn.OnEvent(driver.onFetchPaused)
+	conn.OnEvent(driver.onAuthRequired)
 	conn.OnEvent(driver.onLogEntry)
 	conn.OnEvent(driver.onRuntimeEvent)
 	// Subscribed here, with the others, and not when a page opens: a dialog that arrives with nobody
@@ -249,6 +270,7 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 	// from which that can be recovered.
 	conn.OnEvent(driver.onDialog)
 	conn.OnEvent(driver.onScreencastFrame)
+	conn.OnEvent(driver.onFileChooser)
 	driver.startSweep()
 	return driver, nil
 }
@@ -419,6 +441,17 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		lastReported: map[string]browser.Element{},
 		// Anything refused before this session existed belongs to the sweep or to another session.
 		reportedUpTo: d.refusalTotal,
+	}
+	if d.personBegun {
+		// A person was handed the browser while this target was being made. The sole-session check
+		// did not see it, so it is refused here, before anything navigates with the fence lifted.
+		d.mu.Unlock()
+		closing, cancel := context.WithTimeout(context.Background(), fenceCallTimeout)
+		defer cancel()
+		_, _ = d.conn.Call(closing, cdp.BrowserSession, "Target.closeTarget", map[string]any{
+			"targetId": target.TargetID,
+		})
+		return browser.Session{}, browser.ErrPersonIsDriving
 	}
 	d.sessions[id] = entry
 	d.targets[target.TargetID] = id
@@ -618,9 +651,15 @@ func (d *Driver) lookup(id browser.SessionID) (*session, error) {
 
 // Screenshot returns PNG bytes.
 func (d *Driver) Screenshot(ctx context.Context, id browser.SessionID) ([]byte, error) {
+	d.gate.RLock()
+	defer d.gate.RUnlock()
 	entry, err := d.lookup(id)
 	if err != nil {
 		return nil, err
+	}
+	// The page in front of a person is theirs, and for a login it is a password half-typed.
+	if d.personHolds(id) {
+		return nil, browser.ErrPersonIsDriving
 	}
 	result, err := d.conn.Call(ctx, entry.cdp, "Page.captureScreenshot", map[string]any{"format": "png"})
 	if err != nil {
@@ -674,6 +713,12 @@ func (d *Driver) Close(ctx context.Context, id browser.SessionID) error {
 	// without this leaves the agent's own words on the disk of a machine it was never asked to
 	// write to.
 	d.forgetAttachments(entry)
+	// A person whose session closes has nothing left to drive: the fence comes back with it.
+	if state := d.person.Load(); state != nil && state.session == id {
+		if d.person.CompareAndSwap(state, nil) && state.unsubscribe != nil {
+			state.unsubscribe()
+		}
+	}
 	d.mu.Lock()
 	delete(d.sessions, id)
 	// Viewers of this session's screencast return ErrNoSuchSession.
