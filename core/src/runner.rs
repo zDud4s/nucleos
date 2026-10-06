@@ -4089,6 +4089,10 @@ pub struct FakeCommandRunner {
     /// tells it to leave the tree uncommitted and `merge_item` is what commits. A double that
     /// committed would put a fixture back to asserting something no code does.
     pub writes: std::sync::Mutex<Vec<(String, String, String)>>,
+    /// Test-only: whole answers the process gives with no line written to its stdin -- what the CLI
+    /// does when a background task ends between turns (spike 2026-10-05 (c)). Each string is one
+    /// answer's stdout; it is split into turn events like any other answer.
+    pub unprompted: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
 }
 
 #[cfg(test)]
@@ -4131,6 +4135,7 @@ impl CommandRunner for FakeCommandRunner {
     ) -> std::io::Result<RunOutcome> {
         // Taken before the request is handed over, because the request is what carries it.
         let mut later = request.messages.take();
+        let mut unprompted = self.unprompted.lock().unwrap().take();
         let outcome = self.run_prompt(request, session_tx, transcript).await?;
 
         let Some(turn_events) = turn_events else {
@@ -4167,7 +4172,32 @@ impl CommandRunner for FakeCommandRunner {
         if let Some(later) = later.as_mut() {
             // Stays alive until its stdin closes, exactly as the process does — which is what makes
             // a test of "the second turn reused the process" mean anything.
-            while let Some(turn) = later.recv().await {
+            loop {
+                // `heard` rather than acting inside the select arm, so nothing borrows `unprompted`
+                // while it is reassigned.
+                let mut heard: Option<Option<String>> = None;
+                let turn = match unprompted.as_mut() {
+                    Some(spoken) => tokio::select! {
+                        turn = later.recv() => turn,
+                        said = spoken.recv() => {
+                            heard = Some(said);
+                            None
+                        }
+                    },
+                    None => later.recv().await,
+                };
+                match heard {
+                    Some(Some(stdout)) => {
+                        answer(&stdout);
+                        continue;
+                    }
+                    Some(None) => {
+                        unprompted = None;
+                        continue;
+                    }
+                    None => {}
+                }
+                let Some(turn) = turn else { break };
                 self.later_turns.lock().unwrap().push(turn);
                 // A process that does not answer instantly, so a test can catch a turn in flight.
                 // The delay is the same knob a hung one-shot run uses.
