@@ -199,6 +199,26 @@ pub async fn recall(
 
 /// Fetch the context's candidates, add their query-local FTS signal, and select without writing.
 pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Result<Brief> {
+    of_with(
+        pool,
+        context,
+        query,
+        crate::embed::installed().as_deref(),
+        crate::embed::EMBED_TIMEOUT,
+    )
+    .await
+}
+
+/// [`of`] with the embedder and its deadline injected. One query embedding per briefing; a
+/// timeout, an error or a missing vector leaves every `s_sim` at zero and the weights as before.
+/// Only the error kind is logged, never the query, a title, a body or a vector.
+pub(crate) async fn of_with(
+    pool: &SqlitePool,
+    context: &Context,
+    query: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+    deadline: std::time::Duration,
+) -> sqlx::Result<Brief> {
     let scope = context.chain.last().unwrap_or(&Scope::Machine);
     let mut known = knowledge::for_scope(pool, scope).await?;
     let candidate_ids: Vec<i64> = known.iter().map(|candidate| candidate.id).collect();
@@ -221,6 +241,44 @@ pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Resu
         .collect();
     for (candidate, s_fts) in known.iter_mut().zip(normalise_fts(&bm25)) {
         candidate.s_fts = s_fts;
+    }
+    let mut query_embedded = false;
+    if let Some(embedder) = embedder {
+        let text = format!("{query}\n{}", context.files.join("\n"));
+        match tokio::time::timeout(deadline, embedder.embed(&text)).await {
+            Ok(Ok(query_vector)) => {
+                match crate::embed::vectors_for(pool, &candidate_ids, embedder.model()).await {
+                    Ok(vectors) => {
+                        query_embedded = true;
+                        for candidate in known.iter_mut() {
+                            candidate.s_sim = vectors
+                                .get(&candidate.id)
+                                .and_then(|row| crate::embed::cosine(&query_vector, row))
+                                .map_or(0.0, |sim| f64::from(sim).clamp(0.0, 1.0));
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            kind = ?std::mem::discriminant(&error),
+                            "knowledge vectors could not be read; continuing without similarity"
+                        );
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(kind = ?error.kind(), "query embedding failed; continuing without it");
+            }
+            Err(_) => {
+                tracing::warn!("query embedding timed out; continuing without it");
+            }
+        }
+    }
+    if query_embedded {
+        let context = Context {
+            query_embedded: true,
+            ..context.clone()
+        };
+        return Ok(knowledge::select(&known, &context, &Budget::default()));
     }
     Ok(knowledge::select(&known, context, &Budget::default()))
 }
@@ -258,15 +316,16 @@ pub async fn record(
     for candidate in trace {
         inserted += sqlx::query(
             "INSERT INTO run_knowledge
-               (run_id, knowledge_id, item_id, shown, s_fts, s_scope, s_structure,
+               (run_id, knowledge_id, item_id, shown, s_fts, s_sim, s_scope, s_structure,
                 s_recency, s_use, at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(run_id)
         .bind(candidate.knowledge_id)
         .bind(item_id)
         .bind(candidate.shown)
         .bind(candidate.s_fts)
+        .bind(candidate.s_sim)
         .bind(candidate.s_scope)
         .bind(candidate.s_structure)
         .bind(candidate.s_recency)
@@ -319,6 +378,7 @@ pub struct TraceItem {
     pub knowledge_id: i64,
     pub shown: bool,
     pub s_fts: f64,
+    pub s_sim: f64,
     pub s_scope: f64,
     pub s_structure: f64,
     pub s_recency: f64,
@@ -348,7 +408,7 @@ pub async fn trace_of(pool: &SqlitePool, run_id: i64) -> sqlx::Result<Option<Run
     };
 
     let items = sqlx::query_as::<_, TraceItem>(
-        "SELECT rk.knowledge_id, rk.shown, rk.s_fts, rk.s_scope, rk.s_structure,
+        "SELECT rk.knowledge_id, rk.shown, rk.s_fts, rk.s_sim, rk.s_scope, rk.s_structure,
                 rk.s_recency, rk.s_use, rk.at, k.layer, k.kind, k.scope_kind, k.scope_id,
                 k.source, k.status, k.observations, k.title, k.body
            FROM run_knowledge rk
@@ -791,6 +851,7 @@ mod tests {
             knowledge_id,
             shown,
             s_fts: 0.0,
+            s_sim: 0.0,
             s_scope: 0.0,
             s_structure: 0.0,
             s_recency: 0.0,
@@ -884,6 +945,7 @@ mod tests {
             communities: vec![],
             node: None,
             gate: None,
+            query_embedded: false,
         }
     }
 
@@ -1073,6 +1135,135 @@ mod tests {
         Ok(())
     }
 
+    /// `(knowledge_id, s_sim, score)` of every candidate, in a stable order.
+    fn sims_and_scores(brief: &crate::knowledge::Brief) -> Vec<(i64, f64, f64)> {
+        let mut rows: Vec<_> = brief
+            .trace
+            .iter()
+            .map(|s| (s.knowledge_id, s.s_sim, s.score))
+            .collect();
+        rows.sort_by_key(|row| row.0);
+        rows
+    }
+
+    async fn seed_vector(pool: &SqlitePool, id: i64, vector: &[f32]) -> sqlx::Result<()> {
+        let mut conn = pool.acquire().await?;
+        crate::embed::store_in(&mut conn, id, "fake", vector).await
+    }
+
+    #[tokio::test]
+    async fn a_briefing_with_a_query_vector_writes_s_sim_to_the_trace() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let id = seed(&pool, "project", Some("p1"), "zanzibar rollout").await?;
+        seed_vector(&pool, id, &[1.0, 0.0]).await?;
+        let run_id = seed_run(&pool, "running", None, None, None).await?;
+        let fake = crate::embed::FakeEmbedder::new("fake", vec![], Some(vec![1.0, 0.0]));
+
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            "zanzibar please",
+            Some(&fake),
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        assert_eq!(record(&pool, run_id, None, &brief.trace).await?, 1);
+
+        let stored: f64 = sqlx::query_scalar(
+            "SELECT s_sim FROM run_knowledge WHERE run_id = ? AND knowledge_id = ?",
+        )
+        .bind(run_id)
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(stored > 0.0);
+        let trace = trace_of(&pool, run_id).await?.expect("the run exists");
+        assert_eq!(trace.items.len(), 1);
+        assert!(trace.items[0].s_sim > 0.0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_embedder_past_its_deadline_leaves_todays_weights() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        seed_three(&pool).await?;
+        for id in 1..=3 {
+            seed_vector(&pool, id, &[1.0, 0.0]).await?;
+        }
+        let slow = crate::embed::FakeEmbedder::slow(std::time::Duration::from_secs(1));
+
+        let late = super::of_with(
+            &pool,
+            &context(),
+            "zanzibar please",
+            Some(&slow),
+            std::time::Duration::from_millis(20),
+        )
+        .await?;
+        let plain = super::of_with(
+            &pool,
+            &context(),
+            "zanzibar please",
+            None,
+            std::time::Duration::from_millis(20),
+        )
+        .await?;
+        let late = sims_and_scores(&late);
+        assert_eq!(late.len(), 3);
+        assert!(late.iter().all(|row| row.1 == 0.0));
+        assert_eq!(late, sims_and_scores(&plain));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failing_embedder_leaves_todays_weights() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        seed_three(&pool).await?;
+        for id in 1..=3 {
+            seed_vector(&pool, id, &[1.0, 0.0]).await?;
+        }
+        let failing = crate::embed::FakeEmbedder::failing();
+        let deadline = std::time::Duration::from_secs(2);
+
+        let broken = super::of_with(
+            &pool,
+            &context(),
+            "zanzibar please",
+            Some(&failing),
+            deadline,
+        )
+        .await?;
+        let plain = super::of_with(&pool, &context(), "zanzibar please", None, deadline).await?;
+        let broken = sims_and_scores(&broken);
+        assert_eq!(broken.len(), 3);
+        assert!(broken.iter().all(|row| row.1 == 0.0));
+        assert_eq!(broken, sims_and_scores(&plain));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_candidate_without_a_vector_gets_zero_similarity() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let with = seed(&pool, "project", Some("p1"), "has a vector").await?;
+        let without = seed(&pool, "project", Some("p1"), "has none").await?;
+        seed_vector(&pool, with, &[1.0, 0.0]).await?;
+        let fake = crate::embed::FakeEmbedder::new("fake", vec![], Some(vec![1.0, 0.0]));
+
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            "anything",
+            Some(&fake),
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        let rows = sims_and_scores(&brief);
+        let sim_of = |id: i64| rows.iter().find(|row| row.0 == id).map(|row| row.1);
+        assert!(sim_of(with).expect("traced") > 0.0);
+        assert_eq!(sim_of(without), Some(0.0));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_run_trace_carries_the_five_signals_apart_and_the_lines_that_lost() -> sqlx::Result<()>
     {
@@ -1085,6 +1276,7 @@ mod tests {
                 knowledge_id: loser,
                 shown: false,
                 s_fts: 0.61,
+                s_sim: 0.0,
                 s_scope: 0.72,
                 s_structure: 0.83,
                 s_recency: 0.94,
@@ -1095,6 +1287,7 @@ mod tests {
                 knowledge_id: shown,
                 shown: true,
                 s_fts: 0.11,
+                s_sim: 0.0,
                 s_scope: 0.22,
                 s_structure: 0.33,
                 s_recency: 0.44,

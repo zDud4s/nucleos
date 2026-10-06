@@ -3942,6 +3942,7 @@ async fn spawn_node(
         communities: Vec::new(),
         node: None,
         gate: None,
+        query_embedded: false,
     };
     let briefing = match crate::brief::of(pool, &context, &task_text).await {
         Ok(briefing) => Some(briefing),
@@ -8360,6 +8361,7 @@ mod tests {
                 knowledge_id,
                 shown: true,
                 s_fts: 0.0,
+                s_sim: 0.0,
                 s_scope: 0.0,
                 s_structure: 0.0,
                 s_recency: 0.0,

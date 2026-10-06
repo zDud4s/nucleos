@@ -36,6 +36,7 @@ mod devtime_parse;
 mod devtime_store;
 mod distill;
 mod email;
+mod embed;
 mod exclusion;
 mod feed;
 mod files;
@@ -1196,6 +1197,10 @@ async fn main() {
             );
             config::ModelsConfig::default()
         });
+    embed::install(Arc::new(embed::OllamaEmbedder::new(
+        runner::OLLAMA_BASE_URL.to_string(),
+        models_config.embedding_model.clone(),
+    )));
     let (triage_runner, local_triage_disabled): (
         Option<Arc<dyn runner::CommandRunner>>,
         Option<String>,

@@ -229,6 +229,10 @@ pub struct Known {
     /// zero for every reader that selects `COLUMNS`, and `brief` sets it after the fetch.
     #[sqlx(default)]
     pub s_fts: f64,
+    /// Cosine against the briefing's query vector, set by `brief`; `0.0` for any other reader.
+    /// Not a column of `knowledge`, so it is not in `COLUMNS`.
+    #[sqlx(default)]
+    pub s_sim: f64,
     pub status: String,
     pub proposal_id: Option<i64>,
     pub supersedes: Option<i64>,
@@ -250,6 +254,7 @@ pub enum NodeKind {
 }
 
 /// What the work is, as far as the selection is allowed to know it.
+#[derive(Clone)]
 pub struct Context {
     /// The scope and its chain (machine -> project -> job).
     pub chain: Vec<Scope>,
@@ -265,6 +270,9 @@ pub struct Context {
     #[cfg_attr(not(test), allow(dead_code))]
     #[cfg_attr(test, expect(dead_code))]
     pub gate: Option<String>,
+    /// Whether this briefing has a query vector (spec 5.2): absence is per briefing, not per row.
+    /// Set only by `brief`.
+    pub query_embedded: bool,
 }
 
 impl Context {
@@ -280,6 +288,7 @@ impl Context {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         }
     }
 }
@@ -307,22 +316,25 @@ pub struct Scored {
     pub knowledge_id: i64,
     pub shown: bool,
     pub s_fts: f64,
+    pub s_sim: f64,
     pub s_scope: f64,
     pub s_structure: f64,
     pub s_recency: f64,
     pub s_use: f64,
-    /// The weighted sum of the five signals above — the one number the order uses, carried so the
+    /// The weighted sum of the signals above — the one number the order uses, carried so the
     /// trace can say why a row won or lost.
     pub score: f64,
 }
 
 impl Scored {
-    fn weighted(&self) -> f64 {
-        self.s_fts * W_FTS
-            + self.s_structure * W_STRUCTURE
-            + self.s_use * W_USE
-            + self.s_scope * W_SCOPE
-            + self.s_recency * W_RECENCY
+    fn weighted(&self, query_embedded: bool) -> f64 {
+        let w = weights(query_embedded);
+        self.s_fts * w.fts
+            + self.s_sim * w.sim
+            + self.s_structure * w.structure
+            + self.s_use * w.use_
+            + self.s_scope * w.scope
+            + self.s_recency * w.recency
     }
 }
 
@@ -342,18 +354,50 @@ const NEUTRAL_UTILITY: f64 = 0.5;
 /// neither end, so the neutral value must favour neither end.
 const NEUTRAL_RECENCY: f64 = 0.5;
 
-/// Confirmed by owner 2026-09-23. The text match against this very work is the most direct evidence of relevance, but it is 0.0 for every row on day one, so it cannot be the whole score.
-const W_FTS: f64 = 0.35;
-/// Confirmed by owner 2026-09-23. Files and map communities overlap: the signal this project has for free because it already builds the map (spec §5.1).
-const W_STRUCTURE: f64 = 0.20;
-/// Confirmed by owner 2026-09-23. Measured outcomes. When the other signals are equal,
-/// `W_USE * NEUTRAL_UTILITY >= W_RECENCY` guarantees that a never-shown row never scores below a
-/// failed row. At the extreme they tie, and `(layer, kind, id)` breaks the tie (spec §5.4).
-const W_USE: f64 = 0.20;
-/// Confirmed by owner 2026-09-23. The chain already decides entitlement; specificity only tips a contradiction towards the most specific scope (spec §3.4).
-const W_SCOPE: f64 = 0.15;
-/// Confirmed by owner 2026-09-23. Decay (spec §8.1) measures less than it seems — run-less contexts leave no trace to refresh it (D15) — so it weighs least.
-const W_RECENCY: f64 = 0.10;
+/// The weight of each signal. Two tables, each summing to 1.0: one for a briefing that has a query
+/// vector and one for a briefing that has none (spec 5.2).
+struct Weights {
+    /// Confirmed by owner 2026-09-23. The text match against this very work is the most direct evidence of relevance, but it is 0.0 for every row on day one, so it cannot be the whole score.
+    fts: f64,
+    /// SIM: confirmed by owner 2026-10-06 (destilador spec 5.2); taken from FTS because both measure relevance to the task.
+    sim: f64,
+    /// Confirmed by owner 2026-09-23. Files and map communities overlap: the signal this project has for free because it already builds the map (spec §5.1).
+    structure: f64,
+    /// Confirmed by owner 2026-09-23. Measured outcomes. When the other signals are equal,
+    /// `use_ * NEUTRAL_UTILITY >= recency` guarantees that a never-shown row never scores below a
+    /// failed row. At the extreme they tie, and `(layer, kind, id)` breaks the tie (spec §5.4).
+    use_: f64,
+    /// Confirmed by owner 2026-09-23. The chain already decides entitlement; specificity only tips a contradiction towards the most specific scope (spec §3.4).
+    scope: f64,
+    /// Confirmed by owner 2026-09-23. Decay (spec §8.1) measures less than it seems — run-less contexts leave no trace to refresh it (D15) — so it weighs least.
+    recency: f64,
+}
+
+const WITH_SIM: Weights = Weights {
+    fts: 0.20,
+    sim: 0.15,
+    structure: 0.20,
+    use_: 0.20,
+    scope: 0.15,
+    recency: 0.10,
+};
+
+const WITHOUT_SIM: Weights = Weights {
+    fts: 0.20 + 0.15,
+    sim: 0.0,
+    structure: 0.20,
+    use_: 0.20,
+    scope: 0.15,
+    recency: 0.10,
+};
+
+fn weights(query_embedded: bool) -> &'static Weights {
+    if query_embedded {
+        &WITH_SIM
+    } else {
+        &WITHOUT_SIM
+    }
+}
 
 /// Score every candidate once. Each signal and their one weighted score are on the unit scale; the
 /// caller follows that score only with stable vocabulary and id tie-breakers.
@@ -370,10 +414,11 @@ fn scored_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<(&'a Know
             let mut scored = Scored {
                 knowledge_id: row.id,
                 shown: false,
-                // Nothing writes `s_fts` today: it is `#[sqlx(default)]`, so every production row
-                // is 0.0 and only tests set it. Task 3.1 will min-max normalise it per pass; until
-                // then and after, this clamp keeps out-of-contract input from outweighing the rest.
+                // `brief::of` sets it from SQLite's bm25, min-max normalised per pass
+                // (`brief::normalise_fts`); the clamp keeps out-of-contract input from
+                // outweighing the rest (spec 5.5).
                 s_fts: finite_or_zero(row.s_fts).clamp(0.0, 1.0),
+                s_sim: finite_or_zero(row.s_sim).clamp(0.0, 1.0),
                 s_scope: scope_specificity(row, context)?,
                 s_structure: structural_overlap(row, context),
                 s_recency: recencies[index],
@@ -387,7 +432,7 @@ fn scored_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<(&'a Know
                 },
                 score: 0.0,
             };
-            scored.score = scored.weighted();
+            scored.score = scored.weighted(context.query_embedded);
             Some((row, scored))
         })
         .collect()
@@ -1342,6 +1387,7 @@ pub async fn propose(
     let mut tx = pool.begin().await?;
     let ids = propose_in(&mut tx, declaration).await?;
     tx.commit().await?;
+    crate::embed::nudge();
     Ok(ids)
 }
 
@@ -1612,7 +1658,67 @@ pub async fn reconfirm_in(
     let Some((id, layer, status, stored)) = row else {
         return Ok(None);
     };
+    reconfirm_row_in(tx, id, &layer, &status, stored, evidence).await?;
+    Ok(Some(id))
+}
 
+/// `reconfirm_in` for a row already identified by its id (a near-identical learning found by
+/// similarity rather than by fingerprint). `false` when no live row has that id.
+pub async fn reconfirm_id_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: i64,
+    evidence: &str,
+) -> sqlx::Result<bool> {
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT layer, status, evidence FROM knowledge
+         WHERE id = ? AND status IN ('active', 'proposed')",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((layer, status, stored)) = row else {
+        return Ok(false);
+    };
+    reconfirm_row_in(tx, id, &layer, &status, stored, evidence).await?;
+    Ok(true)
+}
+
+/// The note of an event that says a new learning resembles an older one without being it.
+pub(crate) const NOTE_NEAR_DUPLICATE: &str = "near_duplicate:";
+
+/// Say, in a same-status event, that `knowledge_id` is a near-duplicate of `of_id`.
+pub async fn note_near_duplicate_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    knowledge_id: i64,
+    of_id: i64,
+) -> sqlx::Result<()> {
+    let status: String = sqlx::query_scalar("SELECT status FROM knowledge WHERE id = ?")
+        .bind(knowledge_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(knowledge_id)
+    .bind(&status)
+    .bind(&status)
+    .bind(format!("{NOTE_NEAR_DUPLICATE}{of_id}"))
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Merge evidence into a live row, renew it when it is an active episode, and log the event.
+async fn reconfirm_row_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: i64,
+    layer: &str,
+    status: &str,
+    stored: Option<String>,
+    evidence: &str,
+) -> sqlx::Result<()> {
     let elements = |raw: Option<&str>| -> Vec<serde_json::Value> {
         raw.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
             .and_then(|value| value.as_array().cloned())
@@ -1649,14 +1755,14 @@ pub async fn reconfirm_in(
          VALUES (?, ?, ?, ?, ?)",
     )
     .bind(id)
-    .bind(&status)
-    .bind(&status)
+    .bind(status)
+    .bind(status)
     .bind(NOTE_RECONFIRMED)
     .bind(&now)
     .execute(&mut **tx)
     .await?;
 
-    Ok(Some(id))
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3474,6 +3580,7 @@ mod tests {
             title: title.into(),
             body: body.into(),
             s_fts: 0.0,
+            s_sim: 0.0,
             status: "active".into(),
             proposal_id: Some(1),
             supersedes: None,
@@ -3495,6 +3602,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         }
     }
 
@@ -3512,6 +3620,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         }
     }
 
@@ -3546,6 +3655,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         };
 
         let left = render(&known, &context("core/src/left.rs")).expect("left node is briefed");
@@ -3577,6 +3687,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         };
 
         let block = render(&[semantic, episodic], &context).expect("both items render");
@@ -3685,6 +3796,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         };
         let ids = |rows: &[Known]| {
             ordered_candidates(rows, &context)
@@ -3737,6 +3849,7 @@ mod tests {
             communities: vec!["core".into()],
             node: None,
             gate: None,
+            query_embedded: false,
         };
         let mut r1 = one(1, "memory", "best", "job");
         r1.scope_kind = "job".into();
@@ -3801,6 +3914,107 @@ mod tests {
         assert_eq!(traced, expected);
     }
 
+    /// Spec 5.2: the six weights (with similarity) and today's five (without) are two tables, and each
+    /// must sum to 1.0 so a score stays on the unit scale. Without similarity the FTS weight absorbs
+    /// the similarity share, so every score a briefing without a query vector produced stays as it was.
+    #[test]
+    fn both_weight_tables_sum_to_one_and_the_absent_one_is_todays_five() {
+        let sum = |w: &Weights| w.fts + w.sim + w.structure + w.use_ + w.scope + w.recency;
+        assert!(
+            (sum(&WITH_SIM) - 1.0).abs() < 1e-9,
+            "WITH_SIM does not sum to 1.0"
+        );
+        assert!(
+            (sum(&WITHOUT_SIM) - 1.0).abs() < 1e-9,
+            "WITHOUT_SIM does not sum to 1.0"
+        );
+
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(near(WITHOUT_SIM.fts, 0.35));
+        assert!(near(WITHOUT_SIM.sim, 0.0));
+        assert!(near(WITHOUT_SIM.structure, 0.20));
+        assert!(near(WITHOUT_SIM.use_, 0.20));
+        assert!(near(WITHOUT_SIM.scope, 0.15));
+        assert!(near(WITHOUT_SIM.recency, 0.10));
+
+        assert!(near(WITH_SIM.fts, 0.20));
+        assert!(near(WITH_SIM.sim, 0.15));
+        assert!(near(WITH_SIM.structure, 0.20));
+        assert!(near(WITH_SIM.use_, 0.20));
+        assert!(near(WITH_SIM.scope, 0.15));
+        assert!(near(WITH_SIM.recency, 0.10));
+
+        // The guarantee the use weight documents must hold in both tables.
+        for (name, w) in [("WITH_SIM", &WITH_SIM), ("WITHOUT_SIM", &WITHOUT_SIM)] {
+            assert!(
+                w.use_ * NEUTRAL_UTILITY >= w.recency,
+                "{name}: a never-shown row could score below a failed row"
+            );
+        }
+    }
+
+    /// When the briefing has a query vector, the row closer to it wins, and the trace says by how much.
+    #[test]
+    fn with_a_query_vector_the_row_closer_to_it_scores_higher_and_the_trace_carries_both() {
+        let mut far = one(1, "memory", "far", "same body");
+        far.s_sim = 0.1;
+        let mut near = one(2, "memory", "near", "same body");
+        near.s_sim = 0.9;
+        let rows = vec![far, near];
+        let mut context = project_context();
+        context.query_embedded = true;
+
+        let brief = select(&rows, &context, &Budget::default());
+        let by_id = |id: i64| {
+            brief
+                .trace
+                .iter()
+                .find(|row| row.knowledge_id == id)
+                .expect("row reaches the trace")
+        };
+        assert_eq!(by_id(1).s_sim, 0.1);
+        assert_eq!(by_id(2).s_sim, 0.9);
+        assert!(
+            by_id(2).score > by_id(1).score,
+            "the closer row does not score higher: {} vs {}",
+            by_id(2).score,
+            by_id(1).score
+        );
+        let block = brief.block.expect("both rows are shown");
+        assert!(
+            block.find("near").expect("near is shown") < block.find("far").expect("far is shown"),
+            "the closer row is not shown first: {block}"
+        );
+    }
+
+    /// Absence is per briefing, not per row (spec 5.2): without a query vector the similarity column
+    /// weighs nothing, so rows that differ only in it score alike.
+    #[test]
+    fn without_a_query_vector_similarity_weighs_nothing() {
+        let mut far = one(1, "memory", "far", "same body");
+        far.s_sim = 0.1;
+        let mut near = one(2, "memory", "near", "same body");
+        near.s_sim = 0.9;
+        let rows = vec![far, near];
+        let mut context = project_context();
+        context.query_embedded = false;
+
+        let brief = select(&rows, &context, &Budget::default());
+        let score = |id: i64| {
+            brief
+                .trace
+                .iter()
+                .find(|row| row.knowledge_id == id)
+                .map(|row| row.score)
+                .expect("row reaches the trace")
+        };
+        assert_eq!(
+            score(1),
+            score(2),
+            "similarity leaked into a briefing without a query vector"
+        );
+    }
+
     /// A new row does not compete from the bottom as if it had failed: the selection treats absence as
     /// absence, and what that is worth as a NUMBER is decided here and tested in a table. Without this,
     /// whoever implements it picks a value by taste and D6's table tests that taste.
@@ -3815,6 +4029,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         };
         let cases = [
             ("odd", vec![(1, 5), (3, 5), (5, 5)], 0.6),
@@ -3854,6 +4069,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         };
         let mut recent_failure = one(1, "memory", "recent failure", "bad");
         recent_failure.shown_count = 4;
@@ -3898,6 +4114,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         };
         let not_measured = one(1, "memory", "not measured", "new");
         let mut failed = one(2, "memory", "failed", "bad");
@@ -3966,6 +4183,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         };
         let budget = Budget {
             render_chars: RENDER_CHARS,
@@ -3999,6 +4217,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         };
         let budget = Budget {
             render_chars: 1_100,
@@ -4047,6 +4266,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         };
         let budget = Budget {
             render_chars: structural_chars,
@@ -4083,6 +4303,7 @@ mod tests {
             communities: Vec::new(),
             node: None,
             gate: None,
+            query_embedded: false,
         };
         let budget = Budget {
             render_chars: RENDER_CHARS,
