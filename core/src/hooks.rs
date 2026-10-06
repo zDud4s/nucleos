@@ -295,10 +295,17 @@ fn session_git_reason(id: i64, kind: &str, ticket: &crate::vcs::Ticket, settled:
         status @ ("failed" | "interrupted") => {
             format!("it {status}: {why}. Check the repository state before asking again.")
         }
+        "rejected" if ticket.failure_reason.as_deref() == Some(crate::vcs::OWNER_REFUSED_REASON) => {
+            "the owner refused the change it makes to the test map, and nothing was performed.              Do not run it again."
+                .to_owned()
+        }
         status @ ("cancelled" | "rejected") => format!(
             "it was {status} and nothing was performed. Run the command again only if you still \
              want it."
         ),
+        "awaiting_owner" => "it changes the test map, so it is held until the owner approves \
+                             it. Do not run it again; the owner's decision is the next step."
+            .to_owned(),
         status => {
             debug_assert!(
                 !settled,
@@ -10714,6 +10721,28 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn a_request_held_for_the_owner_says_so_and_forbids_a_retry() {
+        let text = session_git_reason(7, "merge", &ticket("awaiting_owner", None, None), false);
+
+        assert!(text.contains("held until the owner approves"), "{text}");
+        assert!(text.contains("Do not run it again"), "{text}");
+    }
+
+    #[test]
+    fn a_request_the_owner_refused_says_so_and_forbids_a_retry() {
+        let text = session_git_reason(
+            7,
+            "merge",
+            &ticket("rejected", None, Some(crate::vcs::OWNER_REFUSED_REASON)),
+            true,
+        );
+
+        assert!(text.contains("owner refused"), "{text}");
+        assert!(text.contains("Do not run it again"), "{text}");
+        assert!(!text.contains("only if you still want it"), "{text}");
     }
 
     #[test]

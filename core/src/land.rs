@@ -873,6 +873,245 @@ mod tests {
         );
     }
 
+    /// `master` (with a test map when `map_on_master` is set) and `feat/x`, which changes the map
+    /// to `branch_map`, or deletes it when that is `None`. The main checkout is left on `master`.
+    fn repo_changing_the_map(
+        prefix: &str,
+        map_on_master: Option<&str>,
+        branch_map: Option<&str>,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let container = crate::git_exec::tests::space_free_tempdir(prefix);
+        let repo = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&repo);
+        assert!(git_in(&repo, &["branch", "-M", "master"]));
+        let map = repo.join(crate::tests_map::MAP_FILE);
+        if let Some(text) = map_on_master {
+            std::fs::write(&map, text).expect("write");
+            assert!(git_in(&repo, &["add", "-A"]));
+            assert!(git_in(&repo, &["commit", "-m", "map"]));
+        }
+        assert!(git_in(&repo, &["checkout", "-q", "-b", "feat/x"]));
+        match branch_map {
+            Some(text) => std::fs::write(&map, text).expect("write"),
+            None => std::fs::remove_file(&map).expect("remove"),
+        }
+        std::fs::write(repo.join("feature.txt"), "from the branch\n").expect("write");
+        assert!(git_in(&repo, &["add", "-A"]));
+        assert!(git_in(&repo, &["commit", "-m", "feature"]));
+        assert!(git_in(&repo, &["checkout", "-q", "master"]));
+        (container, repo)
+    }
+
+    async fn status_and_blobs(
+        pool: &sqlx::SqlitePool,
+        id: i64,
+    ) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as(
+            "SELECT status, pending_map_blob, finished_at FROM vcs_requests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Submits `feat/x` for landing and drains once: the first half of every map-approval test.
+    async fn land_feat_x_once(pool: &sqlx::SqlitePool, repo: &Path) -> i64 {
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+        let id = submit(pool, &repo_id, repo, "feat/x", None, deadline())
+            .await
+            .expect("submit the landing");
+        assert!(
+            crate::vcs::drain_once(pool, "alpha", &crate::git_exec::GitExecutor::default()).await
+        );
+        id
+    }
+
+    #[tokio::test]
+    async fn a_landing_that_changes_the_test_map_waits_for_the_owner() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) =
+            repo_changing_the_map("nucleos-map-wait-", None, Some("version: 1\n"));
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-wait-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let master_before = sha_of(&repo, "master");
+
+        let id = land_feat_x_once(&pool, &repo).await;
+
+        let (status, blob, finished_at) = status_and_blobs(&pool, id).await;
+        assert_eq!(status, "awaiting_owner");
+        assert_eq!(
+            blob.as_deref(),
+            Some(sha_of(&repo, "feat/x:nucleos.tests.yaml").as_str())
+        );
+        assert!(finished_at.is_none(), "a pause is not terminal");
+        assert_eq!(
+            sha_of(&repo, "master"),
+            master_before,
+            "master did not move"
+        );
+        assert!(
+            !crate::vcs::drain_once(&pool, "alpha", &crate::git_exec::GitExecutor::default()).await,
+            "a paused request is not claimable"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approved_map_change_lands() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) =
+            repo_changing_the_map("nucleos-map-approve-", None, Some("version: 1\n"));
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-approve-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let id = land_feat_x_once(&pool, &repo).await;
+        assert_eq!(status_and_blobs(&pool, id).await.0, "awaiting_owner");
+
+        crate::vcs::approve_for_owner(&pool, id)
+            .await
+            .expect("approve");
+        assert!(
+            crate::vcs::drain_once(&pool, "alpha", &crate::git_exec::GitExecutor::default()).await
+        );
+
+        assert_eq!(status_and_blobs(&pool, id).await.0, "succeeded");
+        assert_eq!(sha_of(&repo, "master^2"), sha_of(&repo, "feat/x"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_map_change_never_lands() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) =
+            repo_changing_the_map("nucleos-map-refuse-", None, Some("version: 1\n"));
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-refuse-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let master_before = sha_of(&repo, "master");
+        let id = land_feat_x_once(&pool, &repo).await;
+
+        crate::vcs::refuse_for_owner(&pool, id)
+            .await
+            .expect("refuse");
+
+        assert_eq!(status_and_blobs(&pool, id).await.0, "rejected");
+        assert!(
+            !crate::vcs::drain_once(&pool, "alpha", &crate::git_exec::GitExecutor::default()).await
+        );
+        assert_eq!(sha_of(&repo, "master"), master_before);
+    }
+
+    #[tokio::test]
+    async fn a_map_edited_after_approval_waits_again() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) =
+            repo_changing_the_map("nucleos-map-edited-", None, Some("version: 1\n"));
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-edited-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let master_before = sha_of(&repo, "master");
+        let id = land_feat_x_once(&pool, &repo).await;
+        let first_blob = status_and_blobs(&pool, id).await.1.expect("a pending blob");
+        crate::vcs::approve_for_owner(&pool, id)
+            .await
+            .expect("approve");
+
+        assert!(git_in(&repo, &["checkout", "-q", "feat/x"]));
+        std::fs::write(
+            repo.join(crate::tests_map::MAP_FILE),
+            "version: 1\n# edited\n",
+        )
+        .expect("write");
+        assert!(git_in(&repo, &["commit", "-am", "edit the map"]));
+        assert!(git_in(&repo, &["checkout", "-q", "master"]));
+        assert!(
+            crate::vcs::drain_once(&pool, "alpha", &crate::git_exec::GitExecutor::default()).await
+        );
+
+        let (status, blob, _) = status_and_blobs(&pool, id).await;
+        assert_eq!(status, "awaiting_owner");
+        let blob = blob.expect("the new pending blob");
+        assert_ne!(blob, first_blob, "the pause names the NEW content");
+        assert_eq!(blob, sha_of(&repo, "feat/x:nucleos.tests.yaml"));
+        assert_eq!(sha_of(&repo, "master"), master_before);
+    }
+
+    #[tokio::test]
+    async fn deleting_the_test_map_waits_for_the_owner_too() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) =
+            repo_changing_the_map("nucleos-map-delete-", Some("version: 1\n"), None);
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-delete-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+
+        let id = land_feat_x_once(&pool, &repo).await;
+
+        let (status, blob, _) = status_and_blobs(&pool, id).await;
+        assert_eq!(status, "awaiting_owner");
+        assert_eq!(blob.as_deref(), Some(crate::git_exec::DELETED_MAP));
+    }
+
+    #[tokio::test]
+    async fn a_landing_that_leaves_the_map_alone_does_not_wait() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_changing_the_map(
+            "nucleos-map-same-",
+            Some("version: 1\n"),
+            Some("version: 1\n"),
+        );
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-same-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+
+        let id = land_feat_x_once(&pool, &repo).await;
+
+        assert_eq!(status_and_blobs(&pool, id).await.0, "succeeded");
+    }
+
+    /// The guard asks only when the merge publishes into the integration branch. Master merged into
+    /// an agent's branch carries a map the owner already approved.
+    #[tokio::test]
+    async fn merging_master_into_an_agent_branch_does_not_wait() {
+        let _lock = crate::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let container = crate::git_exec::tests::space_free_tempdir("nucleos-map-agent-");
+        let repo = container.path().join("repo");
+        crate::git_exec::tests::initialize_repo(&repo);
+        assert!(git_in(&repo, &["branch", "-M", "master"]));
+        assert!(git_in(&repo, &["checkout", "-q", "-b", "feat/x"]));
+        std::fs::write(repo.join("feature.txt"), "from the branch\n").expect("write");
+        assert!(git_in(&repo, &["add", "-A"]));
+        assert!(git_in(&repo, &["commit", "-m", "feature"]));
+        assert!(git_in(&repo, &["checkout", "-q", "master"]));
+        std::fs::write(repo.join(crate::tests_map::MAP_FILE), "version: 1\n").expect("write");
+        assert!(git_in(&repo, &["add", "-A"]));
+        assert!(git_in(&repo, &["commit", "-m", "map on master"]));
+        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-agent-wt-");
+        let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+        let op = Op::Merge {
+            source: "master".into(),
+            target: "feat/x".into(),
+        };
+        let id = crate::vcs::submit(&pool, &repo_id, &op, Origin::Human)
+            .await
+            .unwrap();
+        assert!(
+            crate::vcs::drain_once(&pool, "alpha", &crate::git_exec::GitExecutor::default()).await
+        );
+
+        assert_eq!(status_and_blobs(&pool, id).await.0, "succeeded");
+    }
+
     /// **The same defect, reached by a delete.** The queue landed `feat/x` on `master` while the main
     /// checkout stood on `chore/other`, and then refused to delete it: `git branch --delete` asked
     /// the parked HEAD, which never saw the landing. Through `drain_once`, because what is being
