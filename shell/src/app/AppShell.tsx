@@ -115,6 +115,7 @@ function Frame() {
             pending: project.open_review_items,
           }))}
           systemAlert={wantsAttention(health.data)}
+          besideSystem={<NotificationsDrawer />}
         >
           {/*
             The connection line used to be here, and it was removed on 2026-09-05
@@ -130,7 +131,8 @@ function Frame() {
             them.
           */}
           {/*
-            Two destinations, then the stop, and nothing else.
+            The update notice, then the stop, and nothing else. The drawer moved
+            up into System's row on 2026-10-05 (see `besideSystem`).
 
             The budget line was the third thing here and came out on 2026-09-05 on
             the owner's call. Unlike the connection line above it, it was not dead —
@@ -145,7 +147,6 @@ function Frame() {
             people already know — the drawer is somewhere you choose to go, which
             is a lower claim on the footer than the emergency stop has.
           */}
-          <NotificationsDrawer />
           <UpdateNotice />
           {/*
             The break this footer actually has. Everything above it is somewhere to

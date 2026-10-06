@@ -47,6 +47,223 @@ impl Drop for ChatSlot {
 static LIVE_CHATS: LazyLock<Mutex<HashMap<String, LiveChat>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// The way into a conversation's process WHILE a turn is running in it: chat id to a clone of
+/// `LiveChat.messages`.
+///
+/// `LIVE_CHATS` holds a process only between turns (a turn takes it out), so a Stop or a Send now
+/// arriving mid-turn has nothing to find there. An entry here is opened by a [`SteerGuard`] for the
+/// length of one turn's gathering and is gone with it. Interrupt is not measured with a foreground
+/// tool running or a background task alive (spike "verify before building"); the grace period in
+/// [`stop_turn`] covers whatever that turns out to be.
+static STEERING: LazyLock<
+    Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::runner::LaterTurn>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Keeps a chat's entry in [`STEERING`] for as long as it is held, on every way out (an aborted
+/// task drops it too, which is why it is a guard and not a trailing call).
+struct SteerGuard {
+    chat_id: String,
+}
+
+impl SteerGuard {
+    fn open(
+        chat_id: &str,
+        messages: &tokio::sync::mpsc::UnboundedSender<crate::runner::LaterTurn>,
+    ) -> Self {
+        STEERING
+            .lock()
+            .unwrap()
+            .insert(chat_id.to_owned(), messages.clone());
+        Self {
+            chat_id: chat_id.to_owned(),
+        }
+    }
+}
+
+impl Drop for SteerGuard {
+    fn drop(&mut self) {
+        STEERING.lock().unwrap().remove(&self.chat_id);
+    }
+}
+
+/// Writes a line into the process running a chat's turn, if one is. False when nothing is steerable.
+fn steer(chat_id: &str, turn: crate::runner::LaterTurn) -> bool {
+    // Cloned out so the lock is not held across the send.
+    let sender = STEERING.lock().unwrap().get(chat_id).cloned();
+    sender.is_some_and(|sender| sender.send(turn).is_ok())
+}
+
+/// Whether a turn is running in this chat's process right now, so a line written would land in it.
+fn is_steerable(chat_id: &str) -> bool {
+    STEERING.lock().unwrap().contains_key(chat_id)
+}
+
+/// How long an interrupt is waited on before the kill path runs.
+///
+/// The CLI ends an interrupted turn in about 30 ms (spike CLI 2.1.280). A line written before the CLI
+/// has started the turn (its start-up takes ~14 s) is never answered, and neither is one the
+/// process cannot hear, so the wait is bounded and ends in what Stop always did.
+const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What Stop did to a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// The CLI was asked to stop and did: the turn is `cancelled`, the process and session live on.
+    Interrupted,
+    /// The turn's task was aborted and its process taken down, as `/runs/{id}/cancel` does.
+    Killed,
+    /// There was no running turn to stop.
+    NotRunning,
+}
+
+/// Stops a chat turn: an interrupt when its process can be spoken to, the kill otherwise.
+pub async fn stop_turn(state: &crate::state::AppState, turn_id: i64) -> Stopped {
+    stop_turn_within(state, turn_id, INTERRUPT_GRACE).await
+}
+
+/// [`stop_turn`] with the wait for the interrupt's answer given, so a test need not wait five seconds.
+async fn stop_turn_within(
+    state: &crate::state::AppState,
+    turn_id: i64,
+    grace: std::time::Duration,
+) -> Stopped {
+    let Ok(Some((chat_id, status))) = sqlx::query_as::<_, (Option<String>, String)>(
+        "SELECT chat_id, status FROM runs WHERE id = ? AND mode = 'assistant'",
+    )
+    .bind(turn_id)
+    .fetch_optional(&state.pool)
+    .await
+    else {
+        return Stopped::NotRunning;
+    };
+
+    let interrupted = status == "running"
+        && chat_id.as_deref().is_some_and(|chat| {
+            steer(
+                chat,
+                crate::runner::LaterTurn {
+                    interrupt: true,
+                    ..Default::default()
+                },
+            )
+        });
+    if interrupted {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            let status: Option<String> = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(turn_id)
+                .fetch_optional(&state.pool)
+                .await
+                .ok()
+                .flatten();
+            if status.as_deref() != Some("running") {
+                return Stopped::Interrupted;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    if crate::runs::finalize_termination(state, turn_id, "cancelled").await {
+        Stopped::Killed
+    } else {
+        Stopped::NotRunning
+    }
+}
+
+/// What became of text said NOW, into a turn that was running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaidNow {
+    /// It went down the running process's stdin and was recorded under the turn.
+    Injected,
+    /// There was nothing to steer, so it went the ordinary way: a turn, or the queue.
+    Sent(Sent),
+}
+
+/// Something said while a turn was running, kept because the CLI folds it into the turn and the
+/// stream never shows it as typed.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub(crate) struct SaidDuring {
+    #[serde(skip)]
+    pub run_id: i64,
+    pub text: String,
+    pub created_at: String,
+}
+
+/// Everything said into a chat's turns, oldest first.
+pub(crate) async fn said_during(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<SaidDuring>> {
+    sqlx::query_as::<_, SaidDuring>(
+        "SELECT run_id, text, created_at FROM chat_said_now WHERE chat_id = ? ORDER BY id",
+    )
+    .bind(chat_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Says `text` into the turn that is running, or sends it the ordinary way when there is none to say
+/// it into.
+///
+/// Never touches `chat_queue` on the steering path: a queued copy would be sent a second time when
+/// the turn ended. Only from the shell and text only, and only while the chat still holds the
+/// permission mode the running turn was launched under — words written into it after the person moved
+/// the chat to another rung would be acted on under the old one.
+pub async fn say_now(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    text: &str,
+) -> Result<SaidNow, String> {
+    let running: Option<(i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, permission_mode FROM runs
+         WHERE chat_id = ? AND mode = 'assistant' AND status = 'running'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(chat_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let mode = crate::chats::permission_mode_of(&state.pool, chat_id).await;
+
+    if let (Some((run_id, snapshot)), Ok(mode)) = (running, mode)
+        && is_steerable(chat_id)
+        && Some(mode.as_str()) == snapshot.as_deref()
+    {
+        let row = sqlx::query(
+            "INSERT INTO chat_said_now (chat_id, run_id, text, origin, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(chat_id)
+        .bind(run_id)
+        .bind(text)
+        .bind(Origin::Shell.as_wire())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let delivered = steer(
+            chat_id,
+            crate::runner::LaterTurn {
+                text: text.to_owned(),
+                images: Vec::new(),
+                interrupt: false,
+            },
+        );
+        if delivered {
+            return Ok(SaidNow::Injected);
+        }
+        // The turn ended between the check and the write: forget the record and fall through.
+        let _ = sqlx::query("DELETE FROM chat_said_now WHERE id = ?")
+            .bind(row.last_insert_rowid())
+            .execute(&state.pool)
+            .await;
+    }
+
+    send_or_queue(state, chat_id, text, &[], Origin::Shell)
+        .await
+        .map(SaidNow::Sent)
+}
+
 /// How long a conversation's process waits for a turn that may never come.
 ///
 /// Short on purpose. What it buys is a BURST — the turns somebody takes while they are working on
@@ -117,6 +334,14 @@ struct LiveChat {
     cwd: Option<std::path::PathBuf>,
     /// When it last finished a turn, which is what the reaper measures.
     idle_since: std::time::Instant,
+    /// Events read between turns and not yet handed to a turn, oldest first. `gather` drains these
+    /// before the channel, so nothing read early is lost or reordered.
+    carried: std::collections::VecDeque<crate::runner::TurnEvent>,
+    /// Background tasks seen starting in this process and not yet seen ending. Non-empty pins the
+    /// process against the reaper (spec 4.2 item 2, before `chat_tasks` exists).
+    background: HashSet<String>,
+    /// The between-turns reader that owns this process, by token; 0 for none.
+    watcher: u64,
 }
 
 impl Drop for LiveChat {
@@ -126,8 +351,59 @@ impl Drop for LiveChat {
     /// future, whose `TreeKiller` takes the process and everything it spawned down with it.
     fn drop(&mut self) {
         self.abort.abort();
+        if let Ok(mut ended) = ENDED_TASKS.lock() {
+            ended.remove(&self.process_key());
+        }
+        if let Ok(mut barriers) = PROCESS_BARRIERS.lock() {
+            barriers.remove(&self.process_key());
+        }
     }
 }
+
+/// What the turns a kept process has served say about the barrier it runs under.
+///
+/// The mode is the one STAMPED on the latest turn this process served; `served` is every run id it
+/// served, so `read_untrusted` can be the strictest of them. A spontaneous turn takes its barrier
+/// from here and not from the chat's newest row: that row may be a turn that never reached this
+/// process (stopped before it stamped its mode), and copying it would hand the hook a NULL it reads
+/// as `auto`.
+struct ProcessBarrier {
+    mode: &'static str,
+    served: Vec<i64>,
+}
+
+/// Barriers of the kept processes, by `LiveChat::process_key`. Cleared by `LiveChat`'s `Drop`.
+static PROCESS_BARRIERS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<usize, ProcessBarrier>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Records that the process behind `key` served run `run_id` under `mode`.
+fn note_served(key: usize, run_id: i64, mode: &'static str) {
+    if let Ok(mut barriers) = PROCESS_BARRIERS.lock() {
+        let entry = barriers.entry(key).or_insert_with(|| ProcessBarrier {
+            mode,
+            served: Vec::new(),
+        });
+        entry.mode = mode;
+        entry.served.push(run_id);
+    }
+}
+
+/// `note_served` for the process a conversation has kept, if it kept one.
+fn note_served_by_kept(chat_id: &str, run_id: i64, mode: &'static str) {
+    let kept = LIVE_CHATS.lock().unwrap();
+    if let Some(live) = kept.get(chat_id) {
+        note_served(live.process_key(), run_id, mode);
+    }
+}
+
+/// Background tasks each kept process has seen END, by `LiveChat::process_key`.
+///
+/// Kept beside the struct rather than in it. A task id is unique within a process and never starts
+/// again once it ended, so a start line naming one that already ended is a replay and not new work:
+/// without this, such a line would pin the process against the reaper for good.
+static ENDED_TASKS: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, HashSet<String>>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// What happened when a conversation's living process was spoken to.
 ///
@@ -148,6 +424,29 @@ enum LiveTurn {
 }
 
 impl LiveChat {
+    /// Identifies this process while it lives: the address of its shared session slot, which is
+    /// allocated once per process and released with it (`Drop` clears what is keyed by it).
+    fn process_key(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.session_id) as *const () as usize
+    }
+
+    /// `track_background` over this process, remembering which tasks ended and never letting an
+    /// ended one back in.
+    fn track(&mut self, line: &str) {
+        if !is_task_bookkeeping(line) {
+            return;
+        }
+        let before = self.background.clone();
+        track_background(line, &mut self.background);
+        let key = self.process_key();
+        let Ok(mut ended) = ENDED_TASKS.lock() else {
+            return;
+        };
+        let gone = ended.entry(key).or_default();
+        gone.extend(before.difference(&self.background).cloned());
+        self.background.retain(|id| !gone.contains(id));
+    }
+
     /// Says something to this process and gathers the one turn it answers with.
     async fn turn(
         &mut self,
@@ -159,6 +458,7 @@ impl LiveChat {
         let said = crate::runner::LaterTurn {
             text: text.to_owned(),
             images: images.to_vec(),
+            interrupt: false,
         };
         if self.messages.send(said).is_err() {
             return LiveTurn::NotWritten;
@@ -188,16 +488,27 @@ impl LiveChat {
         silence: Option<std::time::Duration>,
     ) -> LiveTurn {
         loop {
-            let next = match silence {
-                Some(d) => match tokio::time::timeout(d, self.events.recv()).await {
-                    Ok(event) => event,
-                    Err(_) => return LiveTurn::WentSilent(d),
-                },
-                None => self.events.recv().await,
+            // What the between-turns reader already took off the channel comes first, in order.
+            let (next, fresh) = match self.carried.pop_front() {
+                Some(event) => (Some(event), false),
+                None => {
+                    let next = match silence {
+                        Some(d) => match tokio::time::timeout(d, self.events.recv()).await {
+                            Ok(event) => event,
+                            Err(_) => return LiveTurn::WentSilent(d),
+                        },
+                        None => self.events.recv().await,
+                    };
+                    (next, true)
+                }
             };
             let Some(event) = next else { break };
             match event {
                 crate::runner::TurnEvent::Line(line) => {
+                    // Carried lines were tracked when they were read; only a fresh one is new.
+                    if fresh {
+                        self.track(&line);
+                    }
                     // The same accumulation the runner does for a one-turn process, so a turn served
                     // this way leaves the transcript a turn served the other way would have.
                     if let Ok(mut shared) = transcript.lock() {
@@ -209,6 +520,28 @@ impl LiveChat {
             }
         }
         LiveTurn::DiedMidTurn(self.why_it_stopped().await)
+    }
+
+    /// Reads whatever the process said since the last turn into `carried`, without waiting.
+    ///
+    /// Returns whether that includes something a turn of its own should answer: a line that is not
+    /// task bookkeeping, or the end of an answer.
+    fn drain_idle(&mut self) -> bool {
+        let was_working = !self.background.is_empty();
+        while let Ok(event) = self.events.try_recv() {
+            if let crate::runner::TurnEvent::Line(line) = &event {
+                self.track(line);
+            }
+            self.carried.push_back(event);
+        }
+        if was_working && self.background.is_empty() {
+            // The last task just ended: the idle clock starts now, not when the turn before it did.
+            self.idle_since = std::time::Instant::now();
+        }
+        self.carried.iter().any(|event| match event {
+            crate::runner::TurnEvent::Line(line) => !is_task_bookkeeping(line),
+            crate::runner::TurnEvent::Ended(_) => true,
+        })
     }
 
     /// What the process said on its way out, if it manages to say it in time.
@@ -243,8 +576,14 @@ fn keep_live(chat_id: &str, mut live: LiveChat) {
     reap_idle_live_chats();
 }
 
+/// Whether a turn runs with the user's ambient MCP servers: only when the conversation opted in
+/// and the turn is not restricted to NucleOS's own tools.
+pub(crate) fn ambient_mcp_for(policy: crate::runner::ToolPolicy, opted_in: bool) -> bool {
+    opted_in && policy == crate::runner::ToolPolicy::Unrestricted
+}
+
 /// Stops a conversation's process for good, if it has one.
-fn evict_live(chat_id: &str) {
+pub(crate) fn evict_live(chat_id: &str) {
     // The removed value is dropped here, which is what aborts it.
     LIVE_CHATS.lock().unwrap().remove(chat_id);
 }
@@ -280,7 +619,10 @@ fn reap_now() {
         // next turn survives finding one, because writing to it fails and it starts a process
         // instead, but on a conversation nobody returns to it sits there for good.
         let still_standing = !live.messages.is_closed();
-        still_standing && live.idle_since.elapsed() < LIVE_IDLE
+        // A background task that has started and not reported its end is work the process is still
+        // doing for the conversation (spec 4.2 item 2; spike 2026-10-05 (c): the CLI answers on its
+        // own when it ends), so such a process is kept however long it has been idle.
+        still_standing && (!live.background.is_empty() || live.idle_since.elapsed() < LIVE_IDLE)
     });
 }
 
@@ -327,6 +669,11 @@ async fn serve_turn(
             let _ = session_tx.send(session_id.clone());
             // Bound before the match, not inside its scrutinee: a temporary there would hold the
             // borrow of `live` through every arm, and one of them has to hand it back.
+            //
+            // The steering entry is open for exactly as long as the turn is being gathered, so a
+            // line written into the process lands in THIS turn. It is dropped before the process
+            // goes back to the registry.
+            let steer = SteerGuard::open(chat_id, &live.messages);
             let served = tokio::time::timeout(
                 deadlines.ceiling,
                 live.turn(
@@ -339,6 +686,7 @@ async fn serve_turn(
             .await;
             match served {
                 Ok(LiveTurn::Answered(outcome)) => {
+                    drop(steer);
                     let stdout = transcript
                         .lock()
                         .map(|held| held.clone())
@@ -495,8 +843,13 @@ async fn start_live_chat(
         permission: was_permission,
         cwd: started_in,
         idle_since: std::time::Instant::now(),
+        carried: Default::default(),
+        background: HashSet::new(),
+        watcher: 0,
     };
 
+    // Open while the opening turn is gathered, exactly as in `serve_turn`.
+    let steer = SteerGuard::open(chat_id, &live.messages);
     let served = tokio::time::timeout(
         deadlines.ceiling,
         live.opening(transcript, deadlines.silence),
@@ -504,6 +857,7 @@ async fn start_live_chat(
     .await;
     match served {
         Ok(LiveTurn::Answered(outcome)) => {
+            drop(steer);
             let stdout = transcript
                 .lock()
                 .map(|held| held.clone())
@@ -582,6 +936,407 @@ fn went_silent(
         cache_creation_tokens: None,
         num_turns: None,
         compacted: false,
+    }
+}
+
+/// Whether a stream line is the CLI's bookkeeping about background tasks rather than speech.
+fn is_task_bookkeeping(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return false;
+    };
+    value.get("type").and_then(serde_json::Value::as_str) == Some("system")
+        && value
+            .get("subtype")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|subtype| {
+                subtype.starts_with("task_") || subtype == "background_tasks_changed"
+            })
+}
+
+/// Keeps `running` equal to the background tasks the stream has started and not yet ended.
+fn track_background(line: &str, running: &mut HashSet<String>) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("system") {
+        return;
+    }
+    let task_id = value.get("task_id").and_then(serde_json::Value::as_str);
+    match value.get("subtype").and_then(serde_json::Value::as_str) {
+        // An authoritative snapshot: whatever it lists is running and nothing else is.
+        Some("background_tasks_changed") => {
+            if let Some(tasks) = value.get("tasks").and_then(serde_json::Value::as_array) {
+                running.clear();
+                running.extend(
+                    tasks
+                        .iter()
+                        .filter_map(|task| task.get("task_id").and_then(serde_json::Value::as_str))
+                        .map(str::to_owned),
+                );
+            }
+        }
+        // A foreground task is part of its own turn; only a backgrounded one outlives it.
+        Some("task_started")
+            if value
+                .get("is_backgrounded")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true) =>
+        {
+            if let Some(id) = task_id {
+                running.insert(id.to_owned());
+            }
+        }
+        Some("task_notification") => {
+            if let Some(id) = task_id {
+                running.remove(id);
+            }
+        }
+        Some("task_updated")
+            if matches!(
+                value
+                    .pointer("/patch/status")
+                    .and_then(serde_json::Value::as_str),
+                Some("completed" | "failed" | "killed" | "stopped")
+            ) =>
+        {
+            if let Some(id) = task_id {
+                running.remove(id);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What a turn the assistant started on its own is recorded as having been asked: the task
+/// notifications that woke it, one per line.
+fn spontaneous_prompt(carried: &std::collections::VecDeque<crate::runner::TurnEvent>) -> String {
+    let notices: Vec<String> = carried
+        .iter()
+        .filter_map(|event| {
+            let crate::runner::TurnEvent::Line(line) = event else {
+                return None;
+            };
+            let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+            if value.get("type").and_then(serde_json::Value::as_str) != Some("system")
+                || value.get("subtype").and_then(serde_json::Value::as_str)
+                    != Some("task_notification")
+            {
+                return None;
+            }
+            let id = value
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let status = value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("ended");
+            Some(
+                match value.get("summary").and_then(serde_json::Value::as_str) {
+                    Some(summary) => format!("[background task {id} {status}]: {summary}"),
+                    None => format!("[background task {id} {status}]"),
+                },
+            )
+        })
+        .collect();
+    if notices.is_empty() {
+        "[the assistant continued on its own]".to_owned()
+    } else {
+        notices.join("\n")
+    }
+}
+
+/// How often a kept process is looked at between turns.
+const BETWEEN_TURNS_TICK: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Hands out the tokens that say which reader owns a process.
+static NEXT_WATCHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Starts the one reader of a kept process between turns, replacing any earlier one.
+///
+/// Without it nothing reads a kept process's stream while no turn is in flight, so when a background
+/// task ends and the CLI answers on its own, those lines wait for the NEXT person's turn, who reads
+/// them as the reply to their own question and is billed for them. The reader notices such an answer
+/// beginning and gives it a turn of its own. A conversation with no kept process has nothing to read.
+fn watch_between_turns(state: &crate::state::AppState, chat_id: &str) {
+    let token = NEXT_WATCHER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut kept = LIVE_CHATS.lock().unwrap();
+        match kept.get_mut(chat_id) {
+            Some(live) => live.watcher = token,
+            None => return,
+        }
+    }
+    let state = state.clone();
+    let chat_id = chat_id.to_owned();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(BETWEEN_TURNS_TICK).await;
+            // No lock is held across an await: the guard lives only in this block. An entry that is
+            // gone (a turn took it) or owned by a newer reader ends this one.
+            let begun = {
+                let mut kept = LIVE_CHATS.lock().unwrap();
+                match kept.get_mut(&chat_id) {
+                    Some(live) if live.watcher == token => live.drain_idle(),
+                    _ => return,
+                }
+            };
+            if !begun {
+                continue;
+            }
+            // A person's turn owns the slot, and its `gather` reads `carried` first.
+            let Some(slot) = ChatSlot::acquire(&chat_id) else {
+                continue;
+            };
+            let live = {
+                let mut kept = LIVE_CHATS.lock().unwrap();
+                let ours = kept.get(&chat_id).is_some_and(|live| live.watcher == token);
+                if ours { kept.remove(&chat_id) } else { None }
+            };
+            let Some(live) = live else {
+                return;
+            };
+            start_spontaneous_turn(&state, &chat_id, slot, live).await;
+            return;
+        }
+    });
+}
+
+/// Records an answer the CLI began on its own as a turn of its own, and gathers the rest of it.
+///
+/// A run with `origin = 'task'`, whose barrier is the PROCESS's (the mode stamped on the last turn it
+/// served, the strictest `read_untrusted` of every turn it served), so it is never cleaner than the
+/// turns it continues. A process with no stamped mode, or a row that cannot be written, stops the
+/// process rather than let an answer run unaccounted, and whatever queued meanwhile is drained.
+async fn start_spontaneous_turn(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    slot: ChatSlot,
+    mut live: LiveChat,
+) {
+    let prompt = spontaneous_prompt(&live.carried);
+    let session_id = live.session_id.lock().unwrap().clone();
+    // The barrier comes from the PROCESS: the mode stamped on the last turn it served and the
+    // strictest `read_untrusted` of every turn it served. Never the chat's newest row, which may be
+    // a turn that was stopped before it stamped anything.
+    let barrier = PROCESS_BARRIERS
+        .lock()
+        .unwrap()
+        .get(&live.process_key())
+        .map(|held| (held.mode, held.served.clone()));
+    let Some((mode, served)) = barrier else {
+        tracing::warn!(
+            chat_id = %chat_id,
+            "the assistant's unprompted turn has no stamped permission mode to run under; its process was stopped"
+        );
+        drop(live);
+        drop(slot);
+        drain_queued(state, chat_id).await;
+        return;
+    };
+    // Fails closed: a served row that cannot be read or found counts as having read untrusted text.
+    let mut read_untrusted = 0_i64;
+    let mut readable = true;
+    for served_id in &served {
+        match sqlx::query_scalar::<_, i64>("SELECT read_untrusted FROM runs WHERE id = ?")
+            .bind(served_id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(Some(marked)) => read_untrusted = read_untrusted.max(marked),
+            Ok(None) => read_untrusted = 1,
+            Err(error) => {
+                tracing::warn!(chat_id = %chat_id, %error, "could not read a served turn's barrier");
+                readable = false;
+                break;
+            }
+        }
+    }
+    let inserted = if readable {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, answered_by, origin,
+                               read_untrusted, permission_mode, created_at)
+             VALUES (?, 'running', 'assistant', ?, ?, 'cloud', 'task', ?, ?, ?)",
+        )
+        .bind(&prompt)
+        .bind(&session_id)
+        .bind(chat_id)
+        .bind(read_untrusted)
+        .bind(mode)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .map_err(|error| error.to_string())
+    } else {
+        Err("a served turn's barrier could not be read".to_owned())
+    };
+    let id = match inserted {
+        Ok(done) => done.last_insert_rowid(),
+        Err(error) => {
+            tracing::warn!(
+                chat_id = %chat_id,
+                %error,
+                "could not record the assistant's unprompted turn; its process was stopped"
+            );
+            // The process goes first and the slot after it, then whatever queued up while the slot
+            // was held is let through: nothing else is going to drain it.
+            drop(live);
+            drop(slot);
+            drain_queued(state, chat_id).await;
+            return;
+        }
+    };
+
+    // Published before the body is spawned, for the reason `spawn_assistant_turn` gives.
+    let transcript = std::sync::Arc::new(Mutex::new(String::new()));
+    state
+        .run_tails
+        .lock()
+        .unwrap()
+        .insert(id, std::sync::Arc::clone(&transcript));
+    let deadlines = turn_deadlines(
+        state.run_timeout,
+        state.progress_timeout,
+        crate::runner::ToolPolicy::Unrestricted,
+    );
+    let pool = state.pool.clone();
+    let after = state.clone();
+    let chat = chat_id.to_owned();
+    crate::runs::spawn_registered(state, id, async move {
+        let served = tokio::time::timeout(
+            deadlines.ceiling,
+            live.gather(&transcript, deadlines.silence),
+        )
+        .await;
+        let completed_at = chrono::Utc::now().to_rfc3339();
+        match served {
+            Ok(LiveTurn::Answered(outcome)) => {
+                let stdout = transcript
+                    .lock()
+                    .map(|held| held.clone())
+                    .unwrap_or_default();
+                let known = live.session_id.lock().unwrap().clone().unwrap_or_default();
+                let o = gathered(outcome, stdout, known);
+                // The process has now served this turn too, under the same barrier.
+                note_served(live.process_key(), id, mode);
+                // Kept first, so the process is back for the next turn before the row says done.
+                keep_live(&chat, live);
+                record_spontaneous_answer(&pool, id, &chat, &o, &completed_at).await;
+            }
+            Ok(LiveTurn::DiedMidTurn(why)) => {
+                drop(live);
+                let stderr = match why {
+                    Some(why) => {
+                        format!(
+                            "the conversation's process ended in the middle of this turn: {why}"
+                        )
+                    }
+                    None => {
+                        "the conversation's process ended in the middle of this turn".to_owned()
+                    }
+                };
+                close_spontaneous(&pool, id, "failed", &stderr, &completed_at).await;
+            }
+            Ok(LiveTurn::NotWritten) => {
+                drop(live);
+                close_spontaneous(
+                    &pool,
+                    id,
+                    "failed",
+                    "the conversation's process ended without answering",
+                    &completed_at,
+                )
+                .await;
+            }
+            Ok(LiveTurn::WentSilent(quiet)) => {
+                drop(live);
+                let stderr =
+                    format!("nucleos: run went silent for {quiet:?}; progress deadline expired");
+                close_spontaneous(&pool, id, "timed_out", &stderr, &completed_at).await;
+            }
+            Err(_) => {
+                drop(live);
+                let stderr = "nucleos: run went silent; progress deadline expired";
+                close_spontaneous(&pool, id, "timed_out", stderr, &completed_at).await;
+            }
+        }
+        // Released before the drain, which goes back through `send_message` and needs the slot.
+        drop(slot);
+        watch_between_turns(&after, &chat);
+        drain_queued(&after, &chat).await;
+    });
+}
+
+/// Ends a spontaneous turn that produced no answer. Guarded on `running`: first writer wins.
+async fn close_spontaneous(pool: &SqlitePool, id: i64, status: &str, stderr: &str, at: &str) {
+    let written = sqlx::query(
+        "UPDATE runs SET status = ?, stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind(status)
+    .bind(stderr)
+    .bind(at)
+    .bind(id)
+    .execute(pool)
+    .await;
+    crate::runs::warn_on_terminal_write_err(&written, id, status);
+}
+
+/// Writes a spontaneous turn's answer the way a person's turn writes its own, without sharing the
+/// block: the numbers are the turn's, taken off the outcome the splitter built for it.
+async fn record_spontaneous_answer(
+    pool: &SqlitePool,
+    id: i64,
+    chat_id: &str,
+    o: &crate::runner::RunOutcome,
+    completed_at: &str,
+) {
+    let Some(reply) = extract_reply(&o.stdout) else {
+        close_spontaneous(
+            pool,
+            id,
+            "failed",
+            "the assistant's unprompted turn ended without an answer",
+            completed_at,
+        )
+        .await;
+        return;
+    };
+    let stream = crate::runner::live_from_stream(&o.stdout);
+    let tools_used = serde_json::to_string(&stream.did).unwrap_or_else(|_| "[]".to_string());
+    let thought = serde_json::to_string(&stream.thought).unwrap_or_else(|_| "[]".to_string());
+    let model = crate::runner::model_from_stream(&o.stdout);
+    let completed = sqlx::query(
+        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, compacted = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind(o.exit_code)
+    .bind(&reply)
+    .bind(&o.session_id)
+    .bind(o.cost_usd)
+    .bind(o.input_tokens)
+    .bind(o.output_tokens)
+    .bind(o.cache_read_tokens)
+    .bind(o.cache_creation_tokens)
+    .bind(o.num_turns)
+    .bind(&tools_used)
+    .bind(&thought)
+    .bind(stream.thought_tokens)
+    .bind(o.compacted)
+    .bind(&model)
+    .bind(completed_at)
+    .bind(id)
+    .execute(pool)
+    .await;
+    crate::runs::warn_on_terminal_write_err(&completed, id, "completed");
+    if let Some(session_id) = o.session_id.as_deref() {
+        // The same rule as a person's turn: a session that read third-party text is not resumable.
+        match crate::runs::read_untrusted_context(pool, id).await {
+            Ok(false) => {
+                let _ = upsert_session(pool, chat_id, session_id, completed_at).await;
+            }
+            _ => {
+                let _ = forget_session(pool, chat_id).await;
+            }
+        }
     }
 }
 
@@ -2439,9 +3194,10 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // `McpOnly` besides, so the surface being argued over is nearly empty.
             classifier_governs_tools: false,
             messages: None,
-            // `McpOnly` already pushes the strict flag unconditionally, so this changes
-            // nothing here — it is the same answer said in the request rather than inferred.
-            ambient_mcp: false,
+            // The owner opts in per conversation (decision 2026-10-05), and only a turn that
+            // is not `McpOnly` can use it: `McpOnly` pushes the strict flag unconditionally,
+            // so an unrooted, Telegram or relayed turn never gets the ambient servers.
+            ambient_mcp: ambient_mcp_for(tool_policy, answering.ambient_mcp),
             // What the conversation was pinned to, or `None` for the runner's configured model.
             //
             // This was `None` unconditionally, with a comment saying an orchestrator turn has no
@@ -2537,6 +3293,13 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             may_live,
         )
         .await;
+        // The process this turn kept (if any) learns what it has now served, before anything can
+        // read it between turns.
+        // Only a turn that could have run in the kept process: a one-shot turn never touched it, and
+        // its mode is not one that process served.
+        if may_live {
+            note_served_by_kept(&turn.slot.chat_id, id, mode.as_str());
+        }
         let completed_at = chrono::Utc::now().to_rfc3339();
 
         // Each terminal write below is guarded on the turn still being `running`. A `/cancel` aborts
@@ -2544,6 +3307,11 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         // already wrote its status can still be followed by one last wake-up here, and an unguarded
         // write would report a completed turn for a CLI that was killed. First writer wins; no rows
         // means the turn was finalised elsewhere, which is an outcome, not an error.
+        //
+        // Set when the person stopped the turn through its interrupt, which is the one terminal
+        // state that is not followed by a drain (assumption A2: Stop does not start the next
+        // queued message).
+        let mut stopped_softly = false;
         match result {
             // A turn's product is the `result` event, and a CLI that exited without one answered
             // nothing. That is a failed turn, not a completed one — and emphatically not a turn
@@ -2556,8 +3324,9 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             // The reader gets the stderr instead, which is where the CLI says why it stopped. When
             // the tool-policy barrier kills a turn that line names the offending tools, so the chat
             // shows the actual fault rather than a wall of JSON.
-            Ok(Ok(o)) => match extract_reply(&o.stdout) {
-                Some(reply) => {
+            Ok(Ok(o)) => match settled_reply(&o.stdout) {
+                Some((status, reply)) => {
+                    stopped_softly = status == "cancelled";
                     // Read out of the same stream the reply came from, and stored beside it. The
                     // live tail is taken away the instant this turn ends, so without this the
                     // actions are visible while the turn runs and gone for ever afterwards.
@@ -2602,8 +3371,9 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // core already takes off the outcome and this one did not: a chat turn read back
                     // "none recorded" under numbers the runner had measured and handed it.
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, cache_ttl = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, cache_ttl = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
                     )
+                    .bind(status)
                     .bind(o.exit_code)
                     .bind(&reply)
                     .bind(&o.stderr)
@@ -2625,7 +3395,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .bind(id)
                     .execute(&pool)
                     .await;
-                    crate::runs::warn_on_terminal_write_err(&completed, id, "completed");
+                    crate::runs::warn_on_terminal_write_err(&completed, id, status);
                     if let Some(session_id) = o.session_id.as_deref() {
                         // `get_session` would refuse to resume this session anyway, by looking at the
                         // runs that produced it. Dropping the row here as well closes the one case that
@@ -2715,8 +3485,34 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         // below goes back through `send_message`, which takes the same chat slot this guard is
         // holding. One line later and it refuses itself, silently, and what waited waits for ever.
         drop(turn);
-        drain_queued(&after, &drained_chat).await;
+        // The process this turn kept is read from here on, so a background task's own answer is not
+        // left waiting for the next person's turn.
+        watch_between_turns(&after, &drained_chat);
+        // Not after a soft stop (assumption A2): somebody who pressed Stop has not asked for the
+        // next queued message to start, and a cancel has never reached the drain either.
+        if !stopped_softly {
+            drain_queued(&after, &drained_chat).await;
+        }
     });
+}
+
+/// How a turn that came back from the CLI is recorded: its status and what it answered.
+///
+/// A `result` text is a completed turn. Without one, a turn the person interrupted is `cancelled`
+/// and keeps what it had already said (`None` when it had said nothing); anything else answered
+/// nothing, and the caller records it as the failure it is.
+fn settled_reply(stdout: &str) -> Option<(&'static str, Option<String>)> {
+    if let Some(reply) = extract_reply(stdout) {
+        return Some(("completed", Some(reply)));
+    }
+    if crate::runner::interrupted_by_user(stdout) {
+        let partial = crate::runner::live_from_stream(stdout).text;
+        return Some((
+            "cancelled",
+            Some(partial).filter(|text| !text.trim().is_empty()),
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -3032,9 +3828,11 @@ mod tests {
     /// [`is_busy`] is the answer to the right question, and its own doc already says why the row is
     /// not: asking `runs` is "wrong in both directions". The chat is read OFF the row rather than
     /// passed in, so that no call site can forget to wait for it.
+    ///
+    /// A turn the fake delays (up to 2 s) must fit inside the first loop's budget.
     async fn settled_turn(pool: &SqlitePool, id: i64) -> (String, Option<String>) {
         let mut settled = None;
-        for _ in 0..100 {
+        for _ in 0..500 {
             let row: (String, Option<String>, Option<String>) =
                 sqlx::query_as("SELECT status, stdout, chat_id FROM runs WHERE id = ?")
                     .bind(id)
@@ -6343,6 +7141,9 @@ mod tests {
                 permission: crate::runner::Permission::Default,
                 cwd: None,
                 idle_since: std::time::Instant::now(),
+                carried: Default::default(),
+                background: HashSet::new(),
+                watcher: 0,
             },
             said,
             events_tx,
@@ -6859,6 +7660,9 @@ mod tests {
             permission: crate::runner::Permission::Default,
             cwd: None,
             idle_since: std::time::Instant::now(),
+            carried: Default::default(),
+            background: HashSet::new(),
+            watcher: 0,
         };
 
         drop(live);
@@ -6932,6 +7736,779 @@ mod tests {
         assert!(
             *fake.stopped_early.lock().unwrap(),
             "the process was left running for a turn nobody is waiting for"
+        );
+    }
+
+    /// The opening turn launches a background task and answers.
+    const LAUNCHES_A_TASK: &str = concat!(
+        r#"{"type":"system","subtype":"task_started","task_id":"bg1","is_backgrounded":true}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","result":"fake output"}"#
+    );
+    /// What the CLI says on its own when that task ends (spike 2026-10-05 (c)).
+    const ANSWERS_ON_ITS_OWN: &str = concat!(
+        r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#,
+        "\n",
+        r#"{"type":"system","subtype":"task_notification","task_id":"bg1","status":"completed"}"#,
+        "\n",
+        r#"{"type":"system","subtype":"init","session_id":"fake-session-id"}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","result":"task follow-up","total_cost_usd":0.25}"#
+    );
+
+    /// A fake whose process launches a background task, and the sender that makes it answer
+    /// unprompted.
+    fn fake_with_a_background_task() -> (
+        Arc<FakeCommandRunner>,
+        tokio::sync::mpsc::UnboundedSender<String>,
+    ) {
+        let fake = Arc::new(FakeCommandRunner::default());
+        *fake.canned.lock().unwrap() = Some(crate::runner::RunOutcome {
+            exit_code: 0,
+            stdout: LAUNCHES_A_TASK.to_owned(),
+            stderr: String::new(),
+            session_id: Some("fake-session-id".into()),
+            cost_usd: Some(0.0),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        });
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        *fake.unprompted.lock().unwrap() = Some(rx);
+        (fake, tx)
+    }
+
+    type TaskTurnRow = (
+        i64,
+        String,
+        Option<String>,
+        Option<f64>,
+        String,
+        i64,
+        Option<String>,
+    );
+
+    /// The chat's `origin = 'task'` turn once it has settled, or `None` if none appeared in ~6 s.
+    async fn settled_task_turn(pool: &SqlitePool, chat_id: &str) -> Option<TaskTurnRow> {
+        for _ in 0..300 {
+            let row: Option<TaskTurnRow> = sqlx::query_as(
+                "SELECT id, status, stdout, cost_usd, prompt, read_untrusted, permission_mode
+                   FROM runs WHERE chat_id = ? AND origin = 'task' ORDER BY id LIMIT 1",
+            )
+            .bind(chat_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+            if let Some(row) = row.filter(|row| row.1 != "running") {
+                for _ in 0..100 {
+                    if !is_busy(chat_id) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                return Some(row);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// Background tasks are followed from the stream: a backgrounded start adds one, a foreground
+    /// one is ignored, a snapshot replaces the set, and a notification or a terminal update ends one.
+    #[test]
+    fn background_tasks_are_tracked_from_the_stream() {
+        let mut running = HashSet::new();
+        let started =
+            r#"{"type":"system","subtype":"task_started","task_id":"a","is_backgrounded":true}"#;
+        track_background(started, &mut running);
+        assert!(running.contains("a"));
+
+        let foreground =
+            r#"{"type":"system","subtype":"task_started","task_id":"fg","is_backgrounded":false}"#;
+        track_background(foreground, &mut running);
+        assert!(!running.contains("fg"), "a foreground task was tracked");
+
+        let snapshot = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a"},{"task_id":"b"}]}"#;
+        track_background(snapshot, &mut running);
+        assert_eq!(
+            running,
+            HashSet::from(["a".to_owned(), "b".to_owned()]),
+            "a snapshot is the whole truth"
+        );
+
+        let ended =
+            r#"{"type":"system","subtype":"task_notification","task_id":"a","status":"completed"}"#;
+        track_background(ended, &mut running);
+        assert_eq!(running, HashSet::from(["b".to_owned()]));
+
+        let killed = r#"{"type":"system","subtype":"task_updated","task_id":"b","patch":{"status":"killed"}}"#;
+        track_background(killed, &mut running);
+        assert!(running.is_empty());
+
+        for line in [started, foreground, snapshot, ended, killed] {
+            assert!(is_task_bookkeeping(line), "not bookkeeping: {line}");
+        }
+        assert!(!is_task_bookkeeping(
+            r#"{"type":"result","subtype":"success","result":"hi"}"#
+        ));
+    }
+
+    /// A process with a background task still running is the one thing the reaper must not take, however
+    /// long it has been idle; once the task is over the ordinary idle rule applies again.
+    #[tokio::test]
+    async fn a_process_with_a_background_task_running_is_not_reaped() {
+        let (mut live, _said, _events, _why) = live_chat_for_testing();
+        live.background.insert("bg1".to_owned());
+        live.idle_since = std::time::Instant::now()
+            .checked_sub(LIVE_IDLE * 2)
+            .expect("a machine that has been up two minutes");
+        let chat = a_chat("pinned");
+        LIVE_CHATS.lock().unwrap().insert(chat.clone(), live);
+
+        reap_now();
+        assert!(
+            LIVE_CHATS.lock().unwrap().contains_key(&chat),
+            "a process with a task running was reaped"
+        );
+
+        LIVE_CHATS
+            .lock()
+            .unwrap()
+            .get_mut(&chat)
+            .unwrap()
+            .background
+            .clear();
+        reap_now();
+        assert!(!LIVE_CHATS.lock().unwrap().contains_key(&chat));
+    }
+
+    /// A background task that ends AFTER its turn makes the CLI answer on its own. That answer is
+    /// the task's, recorded as a turn of its own between the two human ones — not handed to
+    /// whoever types next, who would read it as the reply to their question and pay for it.
+    #[tokio::test]
+    async fn a_spontaneous_answer_between_turns_is_its_own_turn_and_not_the_next_ones() {
+        let (fake, unprompted) = fake_with_a_background_task();
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("spontaneous");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        assert!(
+            LIVE_CHATS
+                .lock()
+                .unwrap()
+                .get(&chat)
+                .is_some_and(|live| live.background.contains("bg1")),
+            "the background task the opening turn launched was not tracked"
+        );
+
+        unprompted.send(ANSWERS_ON_ITS_OWN.to_owned()).unwrap();
+        // Not unwrapped yet: the assertion about the person's turn comes first, so a failure names
+        // the harm and not just the absence of a row.
+        let task = settled_task_turn(&state.pool, &chat).await;
+
+        let second = send_message(&state, &chat, "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        let (_, answer) = settled_turn(&state.pool, second).await;
+
+        assert_eq!(
+            answer.as_deref(),
+            Some("fake output"),
+            "the person's turn was answered with the assistant's unprompted reply"
+        );
+        let task = task.expect("the unprompted answer was never recorded as a turn of its own");
+        assert_eq!(
+            LIVE_CHATS
+                .lock()
+                .unwrap()
+                .get(&chat)
+                .map(|live| live.background.is_empty()),
+            Some(true),
+            "the task's end was not tracked, or its process was not kept"
+        );
+        assert_eq!(task.1, "completed");
+        assert_eq!(task.2.as_deref(), Some("task follow-up"));
+        assert_eq!(task.3, Some(0.25));
+        assert!(
+            task.4.contains("bg1"),
+            "the turn's prompt should name the notification, got: {}",
+            task.4
+        );
+        assert!(
+            first < task.0 && task.0 < second,
+            "the spontaneous turn must sit between the two human ones: {first} < {} < {second}",
+            task.0
+        );
+        let (second_cost,): (Option<f64>,) =
+            sqlx::query_as("SELECT cost_usd FROM runs WHERE id = ?")
+                .bind(second)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_ne!(
+            second_cost,
+            Some(0.25),
+            "the person was billed for the task's answer"
+        );
+    }
+
+    /// The spontaneous turn runs the same process the person's last turn did, so it carries that
+    /// turn's barrier: the strictest `read_untrusted` and the same `permission_mode`.
+    #[tokio::test]
+    async fn a_spontaneous_turn_inherits_the_barrier_of_the_turn_before_it() {
+        let (fake, unprompted) = fake_with_a_background_task();
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("spontaneous-barrier");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        sqlx::query("UPDATE runs SET read_untrusted = 1 WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (mode,): (Option<String>,) =
+            sqlx::query_as("SELECT permission_mode FROM runs WHERE id = ?")
+                .bind(first)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+
+        unprompted.send(ANSWERS_ON_ITS_OWN.to_owned()).unwrap();
+        let task = settled_task_turn(&state.pool, &chat)
+            .await
+            .expect("the unprompted answer was never recorded as a turn of its own");
+
+        assert_eq!(task.5, 1, "the spontaneous turn dropped the read barrier");
+        assert!(
+            mode.is_some(),
+            "the opening turn recorded no permission mode"
+        );
+        assert_eq!(
+            task.6, mode,
+            "the spontaneous turn changed the permission mode"
+        );
+    }
+
+    /// Waits until a turn's task is registered, which is what `finalize_termination` needs to find.
+    ///
+    /// A stop that lands before the handle exists has nothing to abort, and the test would then be
+    /// measuring a race instead of the stop.
+    async fn the_turn_has_its_handle(state: &AppState, id: i64) {
+        for _ in 0..300 {
+            if state.run_handles.lock().unwrap().contains_key(&id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("turn {id} never registered its task");
+    }
+
+    /// Waits until a conversation's process is reachable mid-turn: taken from the registry of idle
+    /// ones, and listed with the ones that can be written to.
+    async fn the_process_is_steerable(chat_id: &str) {
+        for _ in 0..300 {
+            if !LIVE_CHATS.lock().unwrap().contains_key(chat_id) && is_steerable(chat_id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{chat_id} never became steerable");
+    }
+
+    /// A conversation with no directory of its own, so its turns keep no process.
+    async fn unrooted_chat(state: &AppState, chat_id: &str) {
+        sqlx::query("INSERT INTO chats (chat_id, brain, created_at) VALUES (?, 'cloud', ?)")
+            .bind(chat_id)
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    async fn run_status(pool: &SqlitePool, id: i64) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, stdout FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Stop on a turn running in a live process asks the CLI to stop and leaves the process alone.
+    ///
+    /// Spike CLI 2.1.280: a `control_request` interrupt ends the turn in about 30 ms, with the
+    /// partial answer already streamed, and the process and its session survive. So the turn is
+    /// recorded `cancelled` WITH what it had said, the process goes back to the registry, and
+    /// nothing was killed — `stopped_early` is the double's way of saying the process was dropped.
+    #[tokio::test]
+    async fn stopping_a_live_turn_interrupts_it_and_keeps_the_process() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("interrupted-chat");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        assert!(LIVE_CHATS.lock().unwrap().contains_key(&chat));
+
+        *fake.delay.lock().unwrap() = Some(Duration::from_secs(30));
+        let second = send_message(&state, &chat, "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        the_process_is_steerable(&chat).await;
+
+        let stopped = stop_turn(&state, second).await;
+        assert!(
+            matches!(stopped, Stopped::Interrupted),
+            "a live turn is interrupted, not killed"
+        );
+        settled_turn(&state.pool, second).await;
+
+        let (status, stdout) = run_status(&state.pool, second).await;
+        assert_eq!(status, "cancelled");
+        assert_eq!(
+            stdout.as_deref(),
+            Some("half an answer"),
+            "the partial answer is kept"
+        );
+        assert!(
+            LIVE_CHATS.lock().unwrap().contains_key(&chat),
+            "the process went back to the registry"
+        );
+        assert!(
+            !*fake.stopped_early.lock().unwrap(),
+            "an interrupt must not take the process with it"
+        );
+        LIVE_CHATS.lock().unwrap().remove(&chat);
+    }
+
+    /// An interrupt nobody answers is not waited on forever: the kill path runs.
+    ///
+    /// The line may have been written before the CLI started the turn (its start-up takes ~14 s), in
+    /// which case nothing ever answers it. A hand-opened registry entry stands in for that process:
+    /// it takes the interrupt and says nothing back.
+    #[tokio::test]
+    async fn an_interrupt_nobody_answers_falls_back_to_the_kill() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("unanswered-chat");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        *fake.delay.lock().unwrap() = Some(Duration::from_secs(30));
+        let second = send_message(&state, &chat, "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        the_process_is_steerable(&chat).await;
+
+        // Replaces the turn's own entry, so the interrupt goes to a channel nobody reads for the
+        // double. The receiver is kept to see what was written.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
+        let _guard = SteerGuard::open(&chat, &tx);
+
+        let stopped = stop_turn_within(&state, second, Duration::from_millis(200)).await;
+
+        assert!(
+            matches!(stopped, Stopped::Killed),
+            "an unanswered interrupt must end in the kill"
+        );
+        let written = rx.try_recv().expect("the interrupt was written");
+        assert!(written.interrupt);
+        settled_turn(&state.pool, second).await;
+        assert_eq!(run_status(&state.pool, second).await.0, "cancelled");
+        for _ in 0..200 {
+            if *fake.stopped_early.lock().unwrap() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            *fake.stopped_early.lock().unwrap(),
+            "the kill path stops the process"
+        );
+        LIVE_CHATS.lock().unwrap().remove(&chat);
+    }
+
+    /// A turn with no process of its own to talk to is cancelled exactly as it always was.
+    #[tokio::test]
+    async fn stopping_a_turn_without_a_live_process_cancels_as_before() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("one-shot-stop");
+        unrooted_chat(&state, &chat).await;
+
+        *fake.delay.lock().unwrap() = Some(Duration::from_secs(30));
+        let turn = send_message(&state, &chat, "devagar", Origin::Shell)
+            .await
+            .unwrap();
+        the_turn_has_its_handle(&state, turn).await;
+        assert!(!is_steerable(&chat), "an unrooted chat keeps no process");
+
+        let stopped = stop_turn(&state, turn).await;
+
+        assert!(matches!(stopped, Stopped::Killed));
+        settled_turn(&state.pool, turn).await;
+        assert_eq!(run_status(&state.pool, turn).await.0, "cancelled");
+    }
+
+    /// Send now goes into the turn that is running, and nowhere else.
+    ///
+    /// The text reaches the process's stdin as a plain user line, a `chat_said_now` row remembers
+    /// where it was said, and the queue is never involved — a queued copy would be sent a second
+    /// time when the turn ended.
+    #[tokio::test]
+    async fn saying_now_writes_into_the_running_turn_and_never_queues() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("said-now-chat");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        *fake.delay.lock().unwrap() = Some(Duration::from_secs(2));
+        let second = send_message(&state, &chat, "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        the_process_is_steerable(&chat).await;
+
+        let said = say_now(&state, &chat, "e também isto").await;
+        assert!(
+            matches!(said, Ok(SaidNow::Injected)),
+            "a live steerable turn takes the text"
+        );
+
+        let (run_id, text, origin): (i64, String, String) =
+            sqlx::query_as("SELECT run_id, text, origin FROM chat_said_now WHERE chat_id = ?")
+                .bind(&chat)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(run_id, second);
+        assert_eq!(text, "e também isto");
+        assert_eq!(origin, Origin::Shell.as_wire());
+
+        for _ in 0..300 {
+            let arrived = fake
+                .later_turns
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|turn| turn.text == "e também isto" && !turn.interrupt);
+            if arrived {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            fake.later_turns
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|turn| turn.text == "e também isto" && !turn.interrupt),
+            "the text reached the process as an ordinary line, not an interrupt"
+        );
+
+        let (status, _) = settled_turn(&state.pool, second).await;
+        assert_eq!(status, "completed");
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_queue WHERE chat_id = ?")
+            .bind(&chat)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0, "Send now never touches the queue");
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ?")
+            .bind(&chat)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            runs, 2,
+            "the text was not sent a second time as a turn of its own"
+        );
+        LIVE_CHATS.lock().unwrap().remove(&chat);
+    }
+
+    /// With nothing to steer, Send now is just a message: sent, or queued behind a busy turn.
+    #[tokio::test]
+    async fn saying_now_without_a_live_turn_queues_as_before() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("said-now-unrooted");
+        unrooted_chat(&state, &chat).await;
+
+        *fake.delay.lock().unwrap() = Some(Duration::from_secs(30));
+        let turn = send_message(&state, &chat, "devagar", Origin::Shell)
+            .await
+            .unwrap();
+        the_turn_has_its_handle(&state, turn).await;
+
+        let said = say_now(&state, &chat, "agora").await;
+
+        assert!(
+            matches!(said, Ok(SaidNow::Sent(Sent::Queued))),
+            "a turn with no process behind it cannot be steered"
+        );
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_queue WHERE chat_id = ?")
+            .bind(&chat)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 1);
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chat_said_now WHERE chat_id = ?")
+                .bind(&chat)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded, 0, "nothing was said into a turn");
+
+        crate::runs::finalize_termination(&state, turn, "cancelled").await;
+    }
+
+    /// Send now does not carry a message across a change of permission mode.
+    ///
+    /// The running turn was launched under the mode it snapshot into `runs.permission_mode`. Words
+    /// written into it after the person moved the chat to another rung would be acted on under the
+    /// old one, so the message waits for a turn that launches under the new one.
+    #[tokio::test]
+    async fn saying_now_does_not_cross_a_changed_permission_mode() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("said-now-mode");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        *fake.delay.lock().unwrap() = Some(Duration::from_secs(2));
+        let second = send_message(&state, &chat, "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        the_process_is_steerable(&chat).await;
+        crate::chats::set_permission_mode(&state.pool, &chat, crate::chats::PermissionMode::Plan)
+            .await
+            .unwrap();
+
+        let said = say_now(&state, &chat, "agora").await;
+
+        assert!(
+            matches!(said, Ok(SaidNow::Sent(Sent::Queued))),
+            "the turn runs under another mode than the chat now holds"
+        );
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chat_said_now WHERE chat_id = ?")
+                .bind(&chat)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded, 0);
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_queue WHERE chat_id = ?")
+            .bind(&chat)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 1);
+        // When turn 2 ends the queued message is drained and starts as a turn of its own.
+        let mut third: Option<i64> = None;
+        for _ in 0..500 {
+            third = sqlx::query_scalar(
+                "SELECT id FROM runs WHERE chat_id = ? AND id > ? ORDER BY id LIMIT 1",
+            )
+            .bind(&chat)
+            .bind(second)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+            if third.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let third = third.expect("the queued message launched as a turn of its own");
+        // The row is inserted before the turn's task stamps its permission mode, so let it settle.
+        settled_turn(&state.pool, third).await;
+        let third_mode: Option<String> =
+            sqlx::query_scalar("SELECT permission_mode FROM runs WHERE id = ?")
+                .bind(third)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            third_mode.as_deref(),
+            Some(crate::chats::PermissionMode::Plan.as_str())
+        );
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_queue WHERE chat_id = ?")
+            .bind(&chat)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0);
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chat_said_now WHERE chat_id = ?")
+                .bind(&chat)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded, 0);
+        LIVE_CHATS.lock().unwrap().remove(&chat);
+    }
+
+    /// The spontaneous turn's barrier is the process's, not the newest row's: a newer row for the
+    /// chat that never reached this process (stopped before it stamped its mode) must not reset it.
+    #[tokio::test]
+    async fn a_spontaneous_turn_takes_its_barrier_from_its_process_not_the_newest_row() {
+        let (fake, unprompted) = fake_with_a_background_task();
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("spontaneous-process-barrier");
+        let _root = rooted_chat(&state, &chat).await;
+        crate::chats::set_permission_mode(&state.pool, &chat, crate::chats::PermissionMode::Manual)
+            .await
+            .unwrap();
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        sqlx::query("UPDATE runs SET read_untrusted = 1 WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        // A newer turn that was stopped before it stamped anything.
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, answered_by, read_untrusted,
+                               permission_mode, created_at)
+             VALUES ('parado', 'cancelled', 'assistant', ?, 'cloud', 0, NULL, ?)",
+        )
+        .bind(&chat)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        unprompted.send(ANSWERS_ON_ITS_OWN.to_owned()).unwrap();
+        let task = settled_task_turn(&state.pool, &chat)
+            .await
+            .expect("the unprompted answer was never recorded as a turn of its own");
+
+        assert_eq!(
+            task.6.as_deref(),
+            Some("manual"),
+            "the spontaneous turn took its mode from the newest row instead of its process"
+        );
+        assert_eq!(
+            task.5, 1,
+            "the spontaneous turn was cleaner than the turn its process served"
+        );
+    }
+
+    /// A one-shot turn (here a Telegram one, which runs `McpOnly` and so never touches the kept
+    /// process) must not stamp its own, wider mode onto the barrier of the process kept from an
+    /// earlier turn: that process never served it.
+    #[tokio::test]
+    async fn a_one_shot_turn_does_not_change_the_barrier_of_a_kept_process() {
+        let (fake, unprompted) = fake_with_a_background_task();
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("one-shot-barrier");
+        let _root = rooted_chat(&state, &chat).await;
+        crate::chats::set_brain(&state.pool, &chat, crate::chats::Brain::Cloud)
+            .await
+            .unwrap();
+        crate::chats::set_permission_mode(&state.pool, &chat, crate::chats::PermissionMode::Manual)
+            .await
+            .unwrap();
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        crate::chats::set_permission_mode(&state.pool, &chat, crate::chats::PermissionMode::Bypass)
+            .await
+            .unwrap();
+        let one_shot = send_message(&state, &chat, "de fora", Origin::Telegram)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, one_shot).await;
+
+        unprompted.send(ANSWERS_ON_ITS_OWN.to_owned()).unwrap();
+        let task = settled_task_turn(&state.pool, &chat)
+            .await
+            .expect("the unprompted answer was never recorded as a turn of its own");
+
+        assert_eq!(
+            task.6.as_deref(),
+            Some("manual"),
+            "a one-shot turn's mode leaked into the barrier of a process that never served it"
+        );
+    }
+
+    /// `read_untrusted` is the strictest of every turn the process served, not just the last one.
+    #[tokio::test]
+    async fn a_spontaneous_turn_keeps_read_untrusted_from_any_turn_its_process_served() {
+        let (fake, unprompted) = fake_with_a_background_task();
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("spontaneous-any-untrusted");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        let second = send_message(&state, &chat, "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+        sqlx::query("UPDATE runs SET read_untrusted = 1 WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        unprompted.send(ANSWERS_ON_ITS_OWN.to_owned()).unwrap();
+        let task = settled_task_turn(&state.pool, &chat)
+            .await
+            .expect("the unprompted answer was never recorded as a turn of its own");
+
+        assert_eq!(
+            task.5, 1,
+            "a clean latest turn hid an earlier one that read untrusted text"
+        );
+        assert!(
+            task.6.is_some(),
+            "the spontaneous turn has no permission mode"
         );
     }
 
@@ -7824,5 +9401,20 @@ mod tests {
             stderr.unwrap_or_default().contains("went silent"),
             "the silence line must reach the row"
         );
+    }
+
+    /// The owner's opt-in reaches a turn only where ambient servers can be governed at all.
+    ///
+    /// `McpOnly` is the unrooted, Telegram and relayed shape: its whole point is that nothing but
+    /// the NucleOS server is reachable, so no toggle may widen it. `None` offers no tools to widen.
+    #[test]
+    fn ambient_mcp_never_reaches_an_mcp_only_turn() {
+        use crate::runner::ToolPolicy;
+
+        assert!(ambient_mcp_for(ToolPolicy::Unrestricted, true));
+        assert!(!ambient_mcp_for(ToolPolicy::Unrestricted, false));
+        assert!(!ambient_mcp_for(ToolPolicy::McpOnly, true));
+        assert!(!ambient_mcp_for(ToolPolicy::McpOnly, false));
+        assert!(!ambient_mcp_for(ToolPolicy::None, true));
     }
 }

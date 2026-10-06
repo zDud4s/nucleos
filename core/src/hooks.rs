@@ -295,10 +295,17 @@ fn session_git_reason(id: i64, kind: &str, ticket: &crate::vcs::Ticket, settled:
         status @ ("failed" | "interrupted") => {
             format!("it {status}: {why}. Check the repository state before asking again.")
         }
+        "rejected" if ticket.failure_reason.as_deref() == Some(crate::vcs::OWNER_REFUSED_REASON) => {
+            "the owner refused the change it makes to the test map, and nothing was performed.              Do not run it again."
+                .to_owned()
+        }
         status @ ("cancelled" | "rejected") => format!(
             "it was {status} and nothing was performed. Run the command again only if you still \
              want it."
         ),
+        "awaiting_owner" => "it changes the test map, so it is held until the owner approves \
+                             it. Do not run it again; the owner's decision is the next step."
+            .to_owned(),
         status => {
             debug_assert!(
                 !settled,
@@ -2362,7 +2369,14 @@ async fn rooted_decision(
     // rather than the one a living process was spawned for.
     let run_id = payload.run_id;
     if payload.tool_name.starts_with("mcp__") {
-        return assistant_decision(state, payload).await;
+        // An opted-in ambient tool falls through to the classifier, the read_untrusted barrier and
+        // the rung, exactly like a built-in tool. Anything under the `mcp__nucleos__` prefix keeps
+        // the strict NucleOS-only path.
+        let ambient = !payload.tool_name.starts_with("mcp__nucleos__")
+            && crate::chats::ambient_mcp_for_run(&state.pool, run_id).await;
+        if !ambient {
+            return assistant_decision(state, payload).await;
+        }
     }
 
     // The project comes down from the caller, off the same `runs` row that gave it `mode` — NOT out
@@ -10717,6 +10731,28 @@ mod tests {
     }
 
     #[test]
+    fn a_request_held_for_the_owner_says_so_and_forbids_a_retry() {
+        let text = session_git_reason(7, "merge", &ticket("awaiting_owner", None, None), false);
+
+        assert!(text.contains("held until the owner approves"), "{text}");
+        assert!(text.contains("Do not run it again"), "{text}");
+    }
+
+    #[test]
+    fn a_request_the_owner_refused_says_so_and_forbids_a_retry() {
+        let text = session_git_reason(
+            7,
+            "merge",
+            &ticket("rejected", None, Some(crate::vcs::OWNER_REFUSED_REASON)),
+            true,
+        );
+
+        assert!(text.contains("owner refused"), "{text}");
+        assert!(text.contains("Do not run it again"), "{text}");
+        assert!(!text.contains("only if you still want it"), "{text}");
+    }
+
+    #[test]
     fn an_unsettled_request_names_its_id_and_no_route_the_session_cannot_read() {
         let text = session_git_reason(7, "push", &ticket("queued", None, None), false);
 
@@ -11098,5 +11134,71 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// An ambient MCP tool is the owner's to allow per conversation, and once allowed it is judged
+    /// like any other tool: classifier, rung and the third-party barrier all still apply.
+    #[tokio::test]
+    async fn an_ambient_mcp_tool_is_judged_like_any_tool_once_the_conversation_opts_in() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::DontAsk,
+        )
+        .await;
+        let chat_id: String = sqlx::query_scalar("SELECT chat_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let ambient = probe(
+            run_id,
+            "mcp__context7__resolve-library-id",
+            serde_json::json!({"libraryName": "tokio"}),
+        );
+
+        // (a) Off, which is where every conversation starts: only NucleOS tools exist.
+        let off = decide(&app, &ambient).await;
+        assert_eq!(off.decision, "deny");
+        assert_eq!(
+            off.reason,
+            "the orchestrator is restricted to NucleOS tools"
+        );
+
+        // (b) On: the classifier now answers. It does not know the tool, and `dont_ask` turns the
+        // question into a refusal that says so.
+        crate::chats::set_ambient_mcp(&state.pool, &chat_id, true)
+            .await
+            .unwrap();
+        let on = decide(&app, &ambient).await;
+        assert_eq!(on.decision, "deny");
+        assert!(
+            on.reason.contains("unrecognized tool"),
+            "the classifier should have judged it, got: {}",
+            on.reason
+        );
+
+        // (c) The NucleOS server keeps its strict path whatever the toggle says.
+        let ours = decide(
+            &app,
+            &probe(run_id, "mcp__nucleos__a__b", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(ours.decision, "deny");
+        assert!(
+            !ours.reason.contains("unrecognized tool"),
+            "a lookalike under the nucleos prefix must not reach the classifier: {}",
+            ours.reason
+        );
+
+        // (d) The barrier still stands in front of an opted-in tool.
+        crate::runs::mark_untrusted_context(&state.pool, run_id)
+            .await
+            .unwrap();
+        let barred = decide(&app, &ambient).await;
+        assert_eq!(barred.decision, "deny");
+        assert_eq!(barred.reason, UNTRUSTED_CONTEXT_DENY_REASON);
     }
 }

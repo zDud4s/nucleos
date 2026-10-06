@@ -210,9 +210,10 @@
   min-width: 0;
 }
 
-/* Initials in a disc, on the sunken ground with a hairline so it reads in both
-   themes. Not the accent: cyan is reserved for links, and `.ui-who-leads` left
-   it on 2026-09-06 for the same reason. */
+/* Initials in a cyan disc — the owner's call (2026-10-05), and a deliberate
+   exception to the accent being kept for the wordmark, links and focus: the
+   disc is the contact's mark, not a state. `--accent-ink` is the token made for
+   text on an accent fill, and both are redefined for the light theme. */
 .contacts-avatar {
   flex: none;
   display: inline-flex;
@@ -221,9 +222,8 @@
   width: 2.5rem;
   height: 2.5rem;
   border-radius: var(--radius-pill);
-  background: var(--surface-sunken);
-  border: 1px solid var(--border);
-  color: var(--text);
+  background: var(--accent);
+  color: var(--accent-ink);
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   letter-spacing: 0.02em;

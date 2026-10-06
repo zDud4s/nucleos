@@ -19,7 +19,9 @@ import {
   useContactMerges,
   useDecideContactMerge,
   useDismissProposal,
+  useApproveVcsRequest,
   useDismissVcsRequest,
+  useRefuseVcsRequest,
   useExclusionRequests,
   useOpenTeamActions,
   useRecruitProposals,
@@ -1954,6 +1956,8 @@ function GitQueuePanel({
   waiting: Reading<VcsRequestSummary>;
 }) {
   const dismiss = useDismissVcsRequest();
+  const approve = useApproveVcsRequest();
+  const refuse = useRefuseVcsRequest();
   const rows = view.rows ?? [];
   // What wants a person comes from `/waiting/git`, never from filtering the history: that listing
   // is capped at 200 and keeps every escalation that has since been settled.
@@ -1974,10 +1978,11 @@ function GitQueuePanel({
       says="nothing has been through the git queue"
       why={
         <>
-          Every push, merge and rebase the núcleo has been asked to make. Two of
-          the states want a person — escalated, which means somebody owns a
-          conflict now, and blocked, which the queue will not retry — and
-          neither is a failure. One stops waiting once it is settled: a later
+          Every push, merge and rebase the núcleo has been asked to make. Three
+          of the states want a person — escalated, which means somebody owns a
+          conflict now, blocked, which the queue will not retry, and held for
+          your approval, a merge that changes the test map — and none is a
+          failure. One stops waiting once it is settled: a later
           identical request succeeded, a resolution took it, its branch is
           already in the target or gone, or you put it away. It stays in the
           history either way.
@@ -1987,7 +1992,15 @@ function GitQueuePanel({
         <DecisionNotes
           outcome={undefined}
           approveError={null}
-          refuseError={dismiss.isError ? dismiss.error : null}
+          refuseError={
+            approve.isError
+              ? approve.error
+              : refuse.isError
+                ? refuse.error
+                : dismiss.isError
+                  ? dismiss.error
+                  : null
+          }
         />
       }
     >
@@ -1998,14 +2011,43 @@ function GitQueuePanel({
           {wanted.map((row) => (
             <VcsRow key={row.id} row={row} count={wanted.length}>
               <div className="waiting-actions">
-                <ConfirmButton
-                  label={`Put ${row.op} #${row.id} away`}
-                  confirmLabel="Nobody needs to act"
-                  subject={`#${row.id}`}
-                  variant="quiet"
-                  disabled={dismiss.isPending}
-                  onConfirm={() => dismiss.mutate(row.id)}
-                />
+                {row.status === "awaiting_owner" ? (
+                  <>
+                    <ConfirmButton
+                      label={`Approve ${row.op} #${row.id}`}
+                      confirmLabel="Approve the map change"
+                      subject={`#${row.id}`}
+                      variant="approve"
+                      disabled={approve.isPending || refuse.isPending}
+                      onConfirm={() => {
+                        refuse.reset();
+                        dismiss.reset();
+                        approve.mutate(row.id);
+                      }}
+                    />
+                    <ConfirmButton
+                      label={`Refuse ${row.op} #${row.id}`}
+                      confirmLabel="Refuse the map change"
+                      subject={`#${row.id}`}
+                      variant="ghost"
+                      disabled={approve.isPending || refuse.isPending}
+                      onConfirm={() => {
+                        approve.reset();
+                        dismiss.reset();
+                        refuse.mutate(row.id);
+                      }}
+                    />
+                  </>
+                ) : (
+                  <ConfirmButton
+                    label={`Put ${row.op} #${row.id} away`}
+                    confirmLabel="Nobody needs to act"
+                    subject={`#${row.id}`}
+                    variant="quiet"
+                    disabled={dismiss.isPending}
+                    onConfirm={() => dismiss.mutate(row.id)}
+                  />
+                )}
               </div>
             </VcsRow>
           ))}
@@ -2063,6 +2105,8 @@ function VcsRow({
       {/* And what to do about it is its own line, not a third clause on the faint mono one. */}
       {row.status === "blocked" ? (
         <p className="waiting-hint">submit it again</p>
+      ) : row.status === "awaiting_owner" ? (
+        <p className="waiting-hint">changes the test map — approve to let it land</p>
       ) : null}
       {children}
     </Row>

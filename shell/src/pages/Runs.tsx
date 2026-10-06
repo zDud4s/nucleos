@@ -101,7 +101,7 @@ export function Runs() {
     q: search.q,
   };
 
-  const runs = useRuns(filters);
+  const runs = useRuns({ ...filters, group: "chat" });
   const projects = useProjects();
   const [composing, setComposing] = useState(false);
   const panelId = useId();
@@ -182,6 +182,7 @@ export function Runs() {
       <RunList
         rows={rows}
         filtered={isFiltered(filters)}
+        filters={filters}
         onCompose={composing ? undefined : () => setComposing(true)}
       />
     </>
@@ -369,10 +370,12 @@ function isFiltered(filters: RunFilters): boolean {
 function RunList({
   rows,
   filtered,
+  filters,
   onCompose,
 }: {
   rows: RunSearchResult[] | undefined;
   filtered: boolean;
+  filters: RunFilters;
   /** Opens the New run panel; absent while it is already open. */
   onCompose: (() => void) | undefined;
 }) {
@@ -411,31 +414,124 @@ function RunList({
   return (
     <>
       <Rows label="Runs">
-        {rows.map((row) => (
-          <Row key={row.id} className="runs-row">
-            <span className="runs-row-state">
-              <RunState status={row.status} />
-            </span>
-            <Link to={`/runs/${row.id}`} className="runs-row-name">
-              {row.prompt_excerpt}
-            </Link>
-            <p className="runs-row-meta">
-              <span className="runs-row-id">run {row.id}</span>
-              <span className="runs-row-mode">{row.mode}</span>
-              <span className="runs-row-project">
-                {row.project_id ?? "no project"}
-              </span>
-              <RelativeTime at={row.created_at} />
-              <span className="runs-row-cost">{costOf(row)}</span>
-            </p>
-            <RouteNote row={row} />
-          </Row>
-        ))}
+        {rows.map((row) =>
+          row.chat_id != null && row.turns != null ? (
+            <ConversationRow key={`chat-${row.chat_id}`} row={row} filters={filters} />
+          ) : (
+            <RunRow key={row.id} row={row} />
+          ),
+        )}
       </Rows>
       {rows.length >= RUN_LIST_LIMIT && (
         <p className="runs-ceiling">
           showing the newest {RUN_LIST_LIMIT} — there may be more behind these;
           narrow the filters to reach them
+        </p>
+      )}
+    </>
+  );
+}
+
+/** One run as a row: the old list's row, now also what a conversation's turns are drawn with. */
+function RunRow({ row }: { row: RunSearchResult }) {
+  return (
+    <Row className="runs-row">
+      <span className="runs-row-state">
+        <RunState status={row.status} />
+      </span>
+      <Link to={`/runs/${row.id}`} className="runs-row-name">
+        {row.prompt_excerpt}
+      </Link>
+      <p className="runs-row-meta">
+        <span className="runs-row-id">run {row.id}</span>
+        <span className="runs-row-mode">{row.mode}</span>
+        <span className="runs-row-project">
+          {row.project_id ?? "no project"}
+        </span>
+        <RelativeTime at={row.created_at} />
+        <span className="runs-row-cost">{costOf(row)}</span>
+      </p>
+      <RouteNote row={row} />
+    </Row>
+  );
+}
+
+/**
+ * One row per conversation, its turns one click away (owner's open question 5).
+ * The row is the folded `GET /runs?group=chat` row; the turns are not fetched
+ * until it is opened.
+ */
+function ConversationRow({ row, filters }: { row: RunSearchResult; filters: RunFilters }) {
+  const [open, setOpen] = useState(false);
+  const turnsId = useId();
+  const chatId = row.chat_id ?? "";
+  const turns = row.turns ?? 0;
+  const running = row.running_turns ?? 0;
+  const name = row.chat_title ?? row.prompt_excerpt;
+  return (
+    <Row className="runs-row">
+      <span className="runs-row-state">
+        <RunState status={running > 0 ? "running" : row.status} />
+      </span>
+      <Link to={`/chats/${chatId}`} className="runs-row-name">
+        {name}
+      </Link>
+      <p className="runs-row-meta">
+        <span className="runs-row-id">{turns === 1 ? "1 turn" : `${turns} turns`}</span>
+        <span className="runs-row-mode">chat</span>
+        <span className="runs-row-project">{row.project_id ?? "no project"}</span>
+        <RelativeTime at={row.created_at} />
+        <span className="runs-row-cost">
+          {row.cost_usd === null ? "cost not recorded" : money(row.cost_usd)}
+        </span>
+      </p>
+      <p className="runs-row-turns">
+        {running > 0 && <span className="runs-row-running">{`${running} running`}</span>}
+        <Button
+          variant="quiet"
+          aria-expanded={open}
+          aria-controls={turnsId}
+          onClick={() => setOpen(!open)}
+        >
+          {open ? "Hide turns" : "Show turns"}
+        </Button>
+      </p>
+      <div id={turnsId} className="runs-turns" hidden={!open}>
+        {open && <ConversationTurns chatId={chatId} filters={filters} name={name} total={turns} />}
+      </div>
+    </Row>
+  );
+}
+
+/**
+ * The turns of one conversation, fetched with the page's own filters so the
+ * count on the row and the list under it agree.
+ */
+function ConversationTurns({
+  chatId,
+  filters,
+  name,
+  total,
+}: {
+  chatId: string;
+  filters: RunFilters;
+  name: string;
+  total: number;
+}) {
+  const turns = useRuns({ ...filters, chat: chatId });
+  if (turns.data === undefined) {
+    return turns.isError ? <ListError error={turns.error} /> : <Quiet says="reading the turns…" />;
+  }
+  return (
+    <>
+      <Rows label={`Turns of ${name}`}>
+        {turns.data.map((turn) => (
+          <RunRow key={turn.id} row={turn} />
+        ))}
+      </Rows>
+      {total > turns.data.length && (
+        <p className="runs-ceiling">
+          showing the newest {turns.data.length} of {total} turns
         </p>
       )}
     </>

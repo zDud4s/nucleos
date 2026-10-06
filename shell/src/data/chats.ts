@@ -193,6 +193,13 @@ export interface ChatProject {
    * what it will choose not to.
    */
   permission_mode: PermissionMode;
+  /**
+   * Whether `cwd` is a linked worktree the AI workflow was never copied into while its main
+   * checkout has it. Optional: an older daemon omits it, and that reads as false.
+   */
+  workflow_missing?: boolean;
+  /** Whether this rooted conversation's turns keep the user's own MCP servers. Absent reads as false. */
+  ambient_mcp?: boolean;
 }
 
 /**
@@ -375,6 +382,8 @@ export interface ChatNotice {
   from_run_id: number;
   body: string;
   created_at: string;
+  /** Who is speaking. Absent means a department, which is what every notice was before this. */
+  kind?: "department" | "restart" | "untrusted";
 }
 
 /**
@@ -1576,6 +1585,23 @@ export function useSetPermissionMode(chatId: string) {
   });
 }
 
+/** Turn the user's own MCP servers on or off for this conversation's next turns. */
+export function useSetAmbientMcp(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (on: boolean) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ ambient_mcp: on }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
 /**
  * Wire the classifier hook in this conversation's project, which is what turns talk into tools.
  *
@@ -1587,6 +1613,27 @@ export function useWireChatTools(chatId: string) {
   return useMutation({
     mutationFn: () =>
       apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/tools`, { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+    },
+  });
+}
+
+/**
+ * Copy the AI workflow from the main checkout into this conversation's worktree.
+ *
+ * Always sends `confirm: true`: the daemon refuses anything else, and the window only reaches this
+ * through a `ConfirmButton`.
+ */
+export function useSeedChatWorkflow(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/workflow`, {
+        method: "POST",
+        body: JSON.stringify({ confirm: true }),
+      }),
     retry: false,
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
@@ -1621,10 +1668,10 @@ export function useAnswerAsk(chatId: string) {
 /**
  * Stop a turn that is running.
  *
- * `POST /runs/{id}/cancel`, because a turn IS a run and that route has always
- * existed — what was missing was anywhere to press it from. The daemon aborts
- * the task, which drops the guard that holds the conversation's turn slot, so
- * the chat is answerable again immediately rather than after the run timeout.
+ * `POST /assistant/turns/{id}/stop`. The daemon first asks the live process to interrupt the
+ * turn, which keeps the process, the session and the partial answer; if nothing answers within
+ * about five seconds it falls back to the kill (`useKillTurn`). Either way the turn's row ends
+ * `cancelled`.
  *
  * Both the transcript and the list are invalidated: the turn's row becomes
  * `cancelled`, and the list carries the ordering and the unread count, which
@@ -1633,7 +1680,50 @@ export function useAnswerAsk(chatId: string) {
 export function useStopTurn(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
+    mutationFn: (turnId: number) =>
+      apiFetch<{ stopped: string }>(`/assistant/turns/${turnId}/stop`, { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * End a turn and its process the old way.
+ *
+ * `POST /runs/{id}/cancel`, because a turn IS a run. The daemon aborts the task, which drops the
+ * guard that holds the conversation's turn slot and kills the process tree, so the next message
+ * starts cold. It is what Stop used to be, kept for a turn that interrupting cannot reach.
+ */
+export function useKillTurn(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
     mutationFn: (turnId: number) => apiText(`/runs/${turnId}/cancel`, { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    },
+  });
+}
+
+/**
+ * Say something INTO the turn that is running, instead of waiting behind it.
+ *
+ * The daemon writes the text to the live process and records it under that turn; with no
+ * steerable turn it queues the text as a normal message, which is why the answer carries either
+ * `said_now`, `turn_id` or `queued`.
+ */
+export function useSayNow(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (text: string) =>
+      apiFetch<{ said_now?: boolean; turn_id?: number; queued?: boolean }>(
+        `/assistant/chats/${encodeURIComponent(chatId)}/say-now`,
+        { method: "POST", body: JSON.stringify({ text }) },
+      ),
     retry: false,
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });

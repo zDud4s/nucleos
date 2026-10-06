@@ -54,7 +54,9 @@ import {
   useIdeSessions,
   useSetChatProject,
   useSetPermissionMode,
+  useSetAmbientMcp,
   useWireChatTools,
+  useSeedChatWorkflow,
   useWireIdeSessionTools,
   useAnswerAsk,
   useChatCommands,
@@ -76,6 +78,8 @@ import {
   useSendMessage,
   useStartConversation,
   useStopTurn,
+  useKillTurn,
+  useSayNow,
   type Attachment,
   type ChatSummary,
   type PermissionMode,
@@ -117,7 +121,14 @@ import {
   type Span as RichSpan,
 } from "../lib/rich";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { commandAt, mentionAt, withCommand, withMention } from "../lib/mention";
+import {
+  commandAt,
+  mentionAt,
+  orchestratePrompt,
+  orchestrateTask,
+  withCommand,
+  withMention,
+} from "../lib/mention";
 import { fetchFileBlob } from "../data/files";
 import { attachmentFrom, isPicture } from "../lib/picture";
 import { PlusMenu } from "../chats/PlusMenu";
@@ -984,6 +995,7 @@ function ChatDetail({
         chat={summary}
         reuse={reuse}
         onNeedsProject={() => setPicking(true)}
+        turnRunning={(transcript.data?.turns ?? []).some((t) => turnIsLive(t.status))}
       />
     </section>
   );
@@ -1523,6 +1535,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
             </span>
           </DropdownMenuItem>
           <ChatDenials chatId={chatId} />
+          <AmbientMcpToggle chatId={chatId} />
           {/* The way back to a terminal, moved in here from the top of the transcript. It is
               a fact about this conversation that never changes and is wanted about twice in
               its life, and it was a line of mono text above every reading of every chat that
@@ -1573,7 +1586,7 @@ function Project({
   // Nothing at all until it is known. A conversation is not "without a project" because the answer
   // has not arrived yet, and a note that appears and then retracts itself is worse than a late one.
   if (project.data === undefined) return null;
-  const { cwd, tools } = project.data;
+  const { cwd, tools, workflow_missing } = project.data;
 
   return (
     <>
@@ -1584,7 +1597,10 @@ function Project({
       {cwd === null && (
         <NoProject chatId={chatId} picking={picking} onPicking={onPicking} />
       )}
-      {cwd !== null && !tools && (
+      {cwd !== null && workflow_missing === true && (
+        <WorkflowMissing chatId={chatId} cwd={cwd} tools={tools} />
+      )}
+      {cwd !== null && !tools && workflow_missing !== true && (
         <ProjectWithoutTools chatId={chatId} cwd={cwd} />
       )}
       {/* `CarryOn` was here, above every transcript. It is behind the `⋯` now — see
@@ -1871,6 +1887,68 @@ function ProjectWithoutTools({ chatId, cwd }: { chatId: string; cwd: string }) {
       </Button>
       {wire.isError && <WireRefusal error={wire.error} cwd={cwd} />}
     </div>
+  );
+}
+
+/**
+ * A worktree the AI workflow was never copied into: no orchestrate skill, no phase agents, and —
+ * because `.claude/` is not committed either — usually no tools. One confirmed act answers both.
+ */
+function WorkflowMissing({
+  chatId,
+  cwd,
+  tools,
+}: {
+  chatId: string;
+  cwd: string;
+  tools: boolean;
+}) {
+  const seed = useSeedChatWorkflow(chatId);
+
+  return (
+    <div className="chats-project">
+      <p className="chats-new-warning" role="status">
+        this conversation is about {cwd}, a worktree the AI workflow was never
+        copied into — it has no orchestrate skill and no phase agents
+        {tools ? (
+          ""
+        ) : (
+          <>
+            , and it <b>cannot read or change any file</b> or run anything
+          </>
+        )}
+      </p>
+      <ConfirmButton
+        label="Set up workflow"
+        confirmLabel="Set up workflow — copy it from the main checkout, overwriting this worktree's copy"
+        variant="ghost"
+        disabled={seed.isPending}
+        onConfirm={() => seed.mutate()}
+      />
+      {seed.isError && <SeedRefusal error={seed.error} />}
+    </div>
+  );
+}
+
+function SeedRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error)) {
+    return (
+      <ErrorNote>
+        the núcleo did not answer — the worktree was left as it was
+      </ErrorNote>
+    );
+  }
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{
+        bad_request:
+          "the núcleo wants an explicit confirmation before it copies anything",
+        conflict:
+          "this folder is not a worktree whose main checkout has the workflow — nothing was copied",
+        not_found: "that conversation is no longer here",
+      }}
+    />
   );
 }
 
@@ -4013,7 +4091,12 @@ function Transcript({
       <ul className="chats-turns" aria-label="Transcript">
         {interleave(turns, notices).map((entry, index, all) =>
           entry.kind === "notice" ? (
-            <DepartmentSaid key={`notice-${entry.notice.id}`} notice={entry.notice} />
+            <NoticeBlock
+              key={`notice-${entry.notice.id}`}
+              notice={entry.notice}
+              chatId={chatId}
+              latest={entry.notice.from_run_id === turns[turns.length - 1]?.id}
+            />
           ) : (
             <TurnBlock
               key={entry.turn.id}
@@ -4111,6 +4194,80 @@ function DepartmentSaid({ notice }: { notice: ChatNotice }) {
   );
 }
 
+const CONTINUE_MESSAGE = "continue";
+
+/** Who is speaking on a notice: NucleOS itself for a restart or an untrusted mark, else a department. */
+function NoticeBlock({
+  notice,
+  chatId,
+  latest,
+}: {
+  notice: ChatNotice;
+  chatId: string;
+  latest: boolean;
+}) {
+  if (notice.kind === "restart") return <RestartNotice notice={notice} chatId={chatId} latest={latest} />;
+  if (notice.kind === "untrusted") return <NucleosSaid notice={notice} />;
+  return <DepartmentSaid notice={notice} />;
+}
+
+/** NucleOS speaking: no source link, because nothing outside NucleOS said this. */
+function NucleosSaid({ notice }: { notice: ChatNotice }) {
+  return (
+    <li className="chats-notice">
+      <p className="chats-notice-who">NucleOS</p>
+      <p className="chats-notice-body">{notice.body}</p>
+    </li>
+  );
+}
+
+/** A restart cut a turn. Continue is offered only under the latest turn: older ones are history. */
+function RestartNotice({
+  notice,
+  chatId,
+  latest,
+}: {
+  notice: ChatNotice;
+  chatId: string;
+  latest: boolean;
+}) {
+  const send = useSendMessage(chatId);
+  return (
+    <li className="chats-notice">
+      <p className="chats-notice-who">NucleOS</p>
+      <p className="chats-notice-body">{notice.body}</p>
+      {latest && (
+        <Button
+          variant="ghost"
+          disabled={send.isPending}
+          onClick={() => send.mutate({ text: CONTINUE_MESSAGE, images: [] })}
+        >
+          Continue
+        </Button>
+      )}
+      {send.isError && <ErrorNote>the message could not be sent</ErrorNote>}
+    </li>
+  );
+}
+
+/** The per-conversation switch for the user's own MCP servers; only a conversation with tools has one. */
+function AmbientMcpToggle({ chatId }: { chatId: string }) {
+  const project = useChatProject(chatId);
+  const set = useSetAmbientMcp(chatId);
+  if (project.data?.tools !== true) return null;
+  return (
+    <DropdownMenuCheckboxItem
+      checked={project.data.ambient_mcp === true}
+      disabled={set.isPending}
+      onSelect={(event) => event.preventDefault()}
+      onCheckedChange={(on) => set.mutate(on === true)}
+    >
+      Ambient MCP servers
+      <span className="chats-tool-why">your own MCP servers, e.g. context7; off by default</span>
+    </DropdownMenuCheckboxItem>
+  );
+}
+
 /**
  * Memoised: the transcript polls every 1.5–3 s and holds up to a hundred turns a page, each one
  * parsing its answer's markdown when it renders. A settled turn is the same object from one poll to
@@ -4177,9 +4334,18 @@ const TurnBlock = memo(function TurnBlock({
             same. Moving the question to the right made it obvious. */}
         <TurnPictures paths={turn.images} />
       </div>
+      {/* What was said INTO the turn while it worked ("Send now"): the person's own words, drawn
+          the way the question is, under the turn they were folded into. */}
+      {(turn.saidNow ?? []).map((said, i) => (
+        <div className="chats-turn-said" key={`${said.created_at}-${i}`}>
+          <p className="chats-turn-asked">{said.text}</p>
+          <p className="chats-turn-said-now-note">said while it was working</p>
+        </div>
+      ))}
       <p className="chats-turn-who">núcleo</p>
       {live && <LiveAnswer turnId={turn.id} since={turn.createdAt} />}
       {live && <StopTurn chatId={chatId} turnId={turn.id} />}
+      {live && <KillTurn chatId={chatId} turnId={turn.id} />}
       {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
       {!live && <Plan todos={planOf(turn.did)} />}
       {!live && <WhatItDid did={turn.did} turnId={turn.id} settled />}
@@ -4467,6 +4633,9 @@ function ContextFill({
  * Offered only while the turn is live, because that is the only time it means anything: cancelling
  * a run that has already landed would be asking the daemon to un-bill it.
  *
+ * Stop interrupts the turn and keeps the conversation's process and session, so the next message
+ * continues warm; `KillTurn` beside it is the old, harder way out.
+ *
  * It is not a refusal of the answer — the turn is a run and stays in the history, cancelled, with
  * whatever it cost up to that point. That is the honest record and it is why this says "stop"
  * rather than "undo".
@@ -4481,6 +4650,25 @@ function StopTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
       onClick={() => stop.mutate(turnId)}
     >
       Stop
+    </Button>
+  );
+}
+
+/**
+ * The hard way out: ends the turn AND the conversation's process, so the next message starts cold.
+ * For a turn that Stop cannot reach.
+ */
+function KillTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
+  const kill = useKillTurn(chatId);
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      disabled={kill.isPending}
+      title="end the turn and stop this conversation's process"
+      onClick={() => kill.mutate(turnId)}
+    >
+      Kill
     </Button>
   );
 }
@@ -5287,6 +5475,7 @@ function Composer({
   chat,
   reuse,
   onNeedsProject,
+  turnRunning,
 }: {
   chatId: string;
   /** The row, or undefined while the list is still being read. */
@@ -5295,6 +5484,8 @@ function Composer({
   reuse?: { text: string; at: number } | null;
   /** Open the project picker: something was said to a conversation that has nowhere to run. */
   onNeedsProject?: () => void;
+  /** A turn of this conversation is running now: the box may offer "Send now". */
+  turnRunning?: boolean;
 }) {
   const [text, setText] = useState("");
   const [caret, setCaret] = useState(0);
@@ -5304,12 +5495,18 @@ function Composer({
   const [dismissed, setDismissed] = useState<string | null>(null);
   const [highlight, setHighlight] = useState(0);
   const [attached, setAttached] = useState<Attachment[]>([]);
+  // `/orchestrate` was typed where the workflow or the tools are missing: not sent, and said why.
+  const [orchestrateBlocked, setOrchestrateBlocked] = useState(false);
+  useEffect(() => setOrchestrateBlocked(false), [text]);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const send = useSendMessage(chatId);
+  const sayNow = useSayNow(chatId);
   const project = useChatProject(chatId);
   // Sendable only once the conversation is KNOWN to have a directory. Unknown is not "none", but
   // it is not "some" either, and what is said while it is being read waits the half-second.
   const rooted = project.data !== undefined && project.data.cwd !== null;
+  // Send now steers a running turn of a rooted conversation, and carries text only.
+  const steerable = turnRunning === true && rooted && attached.length === 0;
   const held = useHeldMessage(chatId);
   // Held here rather than inside the toggle, because the toggle and the line below the box are two
   // views of ONE microphone. Two `useDictation` calls would be two recordings.
@@ -5425,18 +5622,35 @@ function Composer({
   // typed, and refusing it because the box is empty would be the window deciding what counts.
   const sayable =
     (text.trim() !== "" || attached.length > 0) && !send.isPending;
+  const sayItNow = () => {
+    const outgoing = text.trim();
+    if (outgoing === "" || sayNow.isPending) return;
+    sayNow.mutate(outgoing, { onSuccess: () => setText("") });
+  };
   const say = () => {
     if (!sayable) return;
+    // `/orchestrate <task>` goes out as a request to run the skill, not as raw text: the CLI's own
+    // slash expansion was only measured for `claude -p`.
+    const task = orchestrateTask(text);
+    const outgoing = task === null ? text.trim() : orchestratePrompt(task);
+    if (
+      task !== null &&
+      rooted &&
+      (project.data?.tools !== true || project.data?.workflow_missing === true)
+    ) {
+      setOrchestrateBlocked(true);
+      return;
+    }
     if (!rooted) {
       // Not sent: a conversation does not start before it knows where it runs. See `held.ts`.
-      holdMessage(chatId, { text: text.trim(), images: attached }, MAX_PICTURES);
+      holdMessage(chatId, { text: outgoing, images: attached }, MAX_PICTURES);
       setText("");
       setAttached([]);
       if (project.data !== undefined) onNeedsProject?.();
       return;
     }
     send.mutate(
-      { text: text.trim(), images: attached },
+      { text: outgoing, images: attached },
       {
         onSuccess: () => {
           setText("");
@@ -5507,6 +5721,12 @@ ${was}`));
       {nowhere && (
         <p className="chats-mentions-none">
           this conversation has no directory, so there are no files to name here
+        </p>
+      )}
+      {orchestrateBlocked && (
+        <p className="chats-mentions-none" role="status">
+          /orchestrate needs this conversation's project to have the workflow and
+          its tools — set them up above, then send again
         </p>
       )}
       {choices.length > 0 && (
@@ -5650,6 +5870,17 @@ ${was}`));
           {/* Last before send, because it is the answer most likely to be changed in the moment of
               sending — "actually, plan this one" — and the hand is already on that corner. */}
           <PermissionMenu chatId={chatId} />
+          {steerable && (
+            <Button
+              type="button"
+              variant="quiet"
+              disabled={text.trim() === "" || sayNow.isPending}
+              onClick={sayItNow}
+              title="say it to the running turn instead of waiting"
+            >
+              Send now
+            </Button>
+          )}
           <button
             type="submit"
             className="chats-send"
@@ -5661,6 +5892,7 @@ ${was}`));
         </div>
       </div>
       {send.isError && <MessageRefusal error={send.error} />}
+      {sayNow.isError && <MessageRefusal error={sayNow.error} />}
     </form>
   );
 }

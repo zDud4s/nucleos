@@ -59,7 +59,7 @@ export interface VcsRequestSummary {
  * is red; `ui/state-map.ts` holds the tones. This serves both the page and the
  * shared waiting count.
  */
-export const VCS_WANTS_A_PERSON = ["escalated", "blocked"];
+export const VCS_WANTS_A_PERSON = ["escalated", "blocked", "awaiting_owner"];
 
 /** A worktree run parked on `awaiting_approval`, as `runs::AwaitingRun` serialises. */
 export interface AwaitingRun {
@@ -412,6 +412,24 @@ export function useDismissProposal() {
 export function useDismissVcsRequest() {
   return useDecision((id: number) =>
     apiFetch<void>(`/vcs/requests/${id}/dismiss`, { method: "POST" }),
+  );
+}
+
+/**
+ * Approve the test map change a held merge carries: the daemon puts it back in the queue, and it
+ * lands if the map it merges is still the one you approved. 204, 409 when it is not held, 404 for
+ * an unknown id.
+ */
+export function useApproveVcsRequest() {
+  return useDecision((id: number) =>
+    apiFetch<void>(`/vcs/requests/${id}/approve`, { method: "POST" }),
+  );
+}
+
+/** Refuse it: the merge ends rejected and the target never sees the change. */
+export function useRefuseVcsRequest() {
+  return useDecision((id: number) =>
+    apiFetch<void>(`/vcs/requests/${id}/refuse`, { method: "POST" }),
   );
 }
 

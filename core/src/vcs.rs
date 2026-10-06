@@ -1480,9 +1480,15 @@ pub struct ClaimedRequest {
     /// held. `run_id` travels with the claim so the feed entry `drain_once` writes for it reports the
     /// run this operation was really performed for, not a row that may since have moved on.
     pub run_id: Option<i64>,
+    /// The map blob the owner approved for this request, if any. The executor compares it with
+    /// the map in the merge it computes, and anything else makes the row wait again (see
+    /// `Outcome::AwaitingOwner`). Carried with the claim for the reason `from_resolution` is:
+    /// the executor's behaviour differs on it.
+    pub approved_map_blob: Option<String>,
     /// What a `BranchDelete` is judged against: the project's integration branch, resolved by
-    /// `land::integration_branch` once the request is claimed. `None` for every other operation, and
-    /// for a delete whose project has no integration branch that can be resolved.
+    /// `land::integration_branch` once the request is claimed (for a `Merge` too, where the test-map
+    /// guard reads it). `None` for every other operation, and for a delete or merge whose project
+    /// has no integration branch that can be resolved.
     ///
     /// **It travels with the claim because the executor's behaviour differs on it.** `git branch
     /// --delete` asks whether a branch is merged into its upstream, or into HEAD when it has none,
@@ -1563,6 +1569,15 @@ pub enum Outcome {
         exit_code: Option<i32>,
         output_tail: String,
     },
+    /// Computed, and it changes `nucleos.tests.yaml` to content the owner has not approved.
+    ///
+    /// **Not terminal, unlike every other variant.** The map decides which tests guard every
+    /// merge, so a merge that changes it cannot be judged by the gate it is about to change
+    /// (spec 2026-10-05 §3.4, defence 1). The row waits in `awaiting_owner`. The owner's approval
+    /// puts it back to `queued` and records `map_blob`; the next execution passes only if the
+    /// merge it computes carries exactly that blob, so a map edited after the approval waits
+    /// again. Nothing is published and the computed merge is dropped, as for `Blocked`.
+    AwaitingOwner { map_blob: String, reason: String },
     /// Never reached an argv — the row itself was unexecutable, which is a defect in the row and not
     /// a result of the operation.
     ///
@@ -1595,6 +1610,7 @@ impl Outcome {
             Outcome::Succeeded { .. } => "succeeded",
             Outcome::Blocked { .. } => "blocked",
             Outcome::Escalated { .. } => "escalated",
+            Outcome::AwaitingOwner { .. } => "awaiting_owner",
             Outcome::Failed { .. } | Outcome::Unexecutable { .. } => "failed",
         }
     }
@@ -1647,7 +1663,16 @@ pub async fn claim_next(
     // lines, which turn it into `ClaimedRequest`. Naming a struct for it would put the column order
     // in two places and invite them to drift; carrying `run_id` is what pushed it past the lint.
     #[allow(clippy::type_complexity)]
-    let claimed: Option<(i64, String, String, String, String, bool, Option<i64>)> = sqlx::query_as(
+    let claimed: Option<(
+        i64,
+        String,
+        String,
+        String,
+        String,
+        bool,
+        Option<i64>,
+        Option<String>,
+    )> = sqlx::query_as(
         "UPDATE vcs_requests
             SET status = 'running', started_at = ?1
           WHERE id = (
@@ -1658,14 +1683,17 @@ pub async fn claim_next(
             AND NOT EXISTS (
               SELECT 1 FROM vcs_requests WHERE repo_key = ?2 AND status = 'running'
             )
-         RETURNING id, op, args, project_id, project_root, from_resolution, run_id",
+         RETURNING id, op, args, project_id, project_root, from_resolution, run_id,
+                   approved_map_blob",
     )
     .bind(started_at)
     .bind(repo_key)
     .fetch_optional(&mut *transaction)
     .await?;
 
-    let Some((id, op, args, project_id, project_root, from_resolution, run_id)) = claimed else {
+    let Some((id, op, args, project_id, project_root, from_resolution, run_id, approved_map_blob)) =
+        claimed
+    else {
         // Nothing was changed, so the rollback this drop performs is the same as a commit.
         return Ok(None);
     };
@@ -1686,6 +1714,7 @@ pub async fn claim_next(
                 project_root,
                 from_resolution,
                 run_id,
+                approved_map_blob,
                 integration_branch: None,
             }))
         }
@@ -1753,6 +1782,10 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
     // Read before the match below consumes the outcome, and from `status()` rather than restated in
     // each arm — see its doc comment for why there is only one place that names a status.
     let status = outcome.status();
+    let pending_map_blob = match &outcome {
+        Outcome::AwaitingOwner { map_blob, .. } => Some(map_blob.clone()),
+        _ => None,
+    };
     let (result_sha, failure_reason, exit_code, output_tail) = match outcome {
         Outcome::Succeeded { sha, output_tail } => (sha, None, None, Some(output_tail)),
         Outcome::Blocked {
@@ -1774,12 +1807,16 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
             output_tail,
         } => (None, Some(reason), exit_code, Some(output_tail)),
         Outcome::Unexecutable { reason } => (None, Some(reason), None, None),
+        // Not terminal: `finished_at` stays NULL below, and no output was produced to keep.
+        Outcome::AwaitingOwner { reason, .. } => (None, Some(reason), None, None),
     };
     let finished = sqlx::query(
         "UPDATE vcs_requests
-            SET status = ?, finished_at = ?, result_sha = ?, failure_reason = ?,
-                exit_code = ?, output_tail = ?
-          WHERE id = ? AND status = 'running'",
+            SET status = ?1,
+                finished_at = CASE WHEN ?1 = 'awaiting_owner' THEN NULL ELSE ?2 END,
+                result_sha = ?3, failure_reason = ?4, exit_code = ?5, output_tail = ?6,
+                pending_map_blob = COALESCE(?8, pending_map_blob)
+          WHERE id = ?7 AND status = 'running'",
     )
     .bind(status)
     .bind(finished_at)
@@ -1788,6 +1825,7 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
     .bind(exit_code)
     .bind(output_tail)
     .bind(id)
+    .bind(pending_map_blob)
     .execute(executor)
     .await?;
     if finished.rows_affected() != 1 {
@@ -1905,7 +1943,15 @@ pub async fn list(
 /// they cannot disagree about what is open.
 pub const WANTS_A_PERSON_SQL: &str = "status IN ('escalated','blocked') AND settled_at IS NULL";
 
-/// Every request that still wants a person, newest first, with no limit.
+/// A merge paused because it changes the test map, until the owner approves or refuses it.
+/// Kept apart from `WANTS_A_PERSON_SQL` on purpose: that one also drives `settle_moot` and
+/// `dismiss`, which settle terminal rows, and this row is not terminal and is not dismissed but
+/// decided.
+pub const OWNER_DECISION_SQL: &str = "status = 'awaiting_owner'";
+
+/// Every request that still wants a person, newest first, with no limit: the rows
+/// `WANTS_A_PERSON_SQL` names plus the merges waiting for the owner's decision on the test map
+/// (`OWNER_DECISION_SQL`).
 ///
 /// `list` is capped at `LIST_LIMIT`, so a count taken from it silently stopped at the cap. This is
 /// the uncapped read, and it carries the same columns so the shell draws both the same way.
@@ -1913,7 +1959,7 @@ pub async fn waiting_on_a_person(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<Re
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT id, op, project_id, repo_key, origin, status, created_at
            FROM vcs_requests
-          WHERE {WANTS_A_PERSON_SQL}
+          WHERE ({WANTS_A_PERSON_SQL}) OR {OWNER_DECISION_SQL}
           ORDER BY id DESC"
     )))
     .fetch_all(pool)
@@ -2028,8 +2074,8 @@ pub async fn settle_by_record(pool: &sqlx::SqlitePool) -> sqlx::Result<u64> {
 pub enum DismissError {
     /// No request has this id.
     NotFound,
-    /// It exists, but is not an open `escalated`/`blocked` row: succeeded, still running, or
-    /// already settled.
+    /// It exists, but is not open for this decision: succeeded, still running, already settled,
+    /// or (for an owner decision) not paused for the owner.
     NotOpen,
     Db(sqlx::Error),
 }
@@ -2043,6 +2089,55 @@ impl From<sqlx::Error> for DismissError {
 /// A person putting an open request away: settles it as `dismissed`.
 pub async fn dismiss(pool: &sqlx::SqlitePool, id: i64) -> Result<(), DismissError> {
     if settle(pool, id, "dismissed").await? {
+        return Ok(());
+    }
+    let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM vcs_requests WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Err(match exists {
+        None => DismissError::NotFound,
+        Some(_) => DismissError::NotOpen,
+    })
+}
+
+/// The owner approves the map change a paused merge carries: back to `queued`, with the blob it
+/// paused on recorded as the one approved. 404/409 as for `dismiss`.
+pub async fn approve_for_owner(pool: &sqlx::SqlitePool, id: i64) -> Result<(), DismissError> {
+    let approved = sqlx::query(
+        "UPDATE vcs_requests
+            SET status = 'queued', approved_map_blob = pending_map_blob, started_at = NULL
+          WHERE id = ? AND status = 'awaiting_owner'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    owner_decided(pool, id, approved.rows_affected()).await
+}
+
+/// The `failure_reason` `refuse_for_owner` records; the session hook matches on it to tell the
+/// session not to retry.
+pub const OWNER_REFUSED_REASON: &str = "the owner refused the change to the test map";
+
+/// The owner refuses it: `rejected`, terminal, and the target never sees the change.
+pub async fn refuse_for_owner(pool: &sqlx::SqlitePool, id: i64) -> Result<(), DismissError> {
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    let refused = sqlx::query(
+        "UPDATE vcs_requests
+            SET status = 'rejected', finished_at = ?,
+                failure_reason = ?
+          WHERE id = ? AND status = 'awaiting_owner'",
+    )
+    .bind(finished_at)
+    .bind(OWNER_REFUSED_REASON)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    owner_decided(pool, id, refused.rows_affected()).await
+}
+
+async fn owner_decided(pool: &sqlx::SqlitePool, id: i64, changed: u64) -> Result<(), DismissError> {
+    if changed == 1 {
         return Ok(());
     }
     let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM vcs_requests WHERE id = ?")
@@ -2288,6 +2383,9 @@ pub async fn reconcile_interrupted(pool: &sqlx::SqlitePool) -> sqlx::Result<u64>
 ///
 /// The feed write is best-effort per row, this crate's convention for observational writes: a feed
 /// row that cannot be written must not undo the cancellation it is only reporting on.
+///
+/// `approved_map_blob IS NULL` spares a row the owner approved while it waited: the owner's decision,
+/// not the run's end, settles it. Only `approve_for_owner` ever sets that column.
 pub async fn cancel_for_run(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<u64> {
     let finished_at = chrono::Utc::now().to_rfc3339();
     let cancelled: Vec<(i64, String)> = sqlx::query_as(
@@ -2295,6 +2393,7 @@ pub async fn cancel_for_run(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Resul
             SET status = 'cancelled', finished_at = ?,
                 failure_reason = 'the run that asked for this ended before it started'
           WHERE run_id = ? AND status IN ('queued', 'awaiting_approval')
+            AND approved_map_blob IS NULL
          RETURNING id, project_id",
     )
     .bind(finished_at)
@@ -2381,11 +2480,14 @@ pub async fn reap_requests_of_ended_runs(
     // `NOT EXISTS (… alive …)` rather than `EXISTS (… ended …)`: see this function's doc comment.
     // The two differ on exactly one row shape — a `run_id` naming a run row that is gone — and this
     // is the direction that retires it instead of queueing a merge for it for ever.
+    // `approved_map_blob IS NULL` spares a request the owner approved while it waited (it is back
+    // to `queued` with its run_id intact): the owner's decision, not the run's end, settles it.
     let sql = format!(
         "UPDATE vcs_requests
             SET status = 'cancelled', finished_at = ?,
                 failure_reason = 'the run that asked for this had already ended when the queue reached it'
           WHERE repo_key = ? AND status IN ('queued', 'awaiting_approval')
+            AND approved_map_blob IS NULL
             AND run_id IS NOT NULL
             AND NOT EXISTS (SELECT 1 FROM runs
                              WHERE runs.id = vcs_requests.run_id
@@ -2684,12 +2786,13 @@ pub async fn drain_once(
             return false;
         }
     };
+    // A `BranchDelete` is judged against it, and a `Merge` reads it for the test-map guard.
     // Resolved here rather than in `claim_next`: it runs git, and a claim is one transaction that
     // has no business holding the database while a subprocess starts. An unresolvable project keeps
     // `None`, which leaves git judging against HEAD as it always did, and git still refuses anything
     // unmerged either way. So the fallback costs a refusal and never a lost commit.
     let mut claimed = claimed;
-    if matches!(claimed.op, Op::BranchDelete { .. }) {
+    if matches!(claimed.op, Op::BranchDelete { .. } | Op::Merge { .. }) {
         match crate::land::integration_branch(
             pool,
             &claimed.project_id,
@@ -2702,8 +2805,9 @@ pub async fn drain_once(
             Err(reason) => tracing::warn!(
                 vcs_request_id = claimed.id,
                 %reason,
-                "vcs: a branch delete has no integration branch to be judged against, so git \
-                 judges it against the main checkout's HEAD"
+                "vcs: a branch delete or merge has no integration branch to be judged against: \
+                 git judges a delete against the main checkout's HEAD, and a merge is held for \
+                 the owner's approval whenever it changes the test map"
             ),
         }
     }
@@ -2745,7 +2849,22 @@ pub async fn drain_once(
     // Cloned rather than moved so the failure paths below can still name it. `finish` consumes the
     // outcome, and a refused write would otherwise drop the only copy of a sha that git really
     // produced — leaving a commit the daemon caused recorded nowhere in the system at all.
-    match finish(pool, id, outcome.clone()).await {
+    //
+    // The terminal write now rides a transaction so a land's distillation cause is queued with it.
+    // `finish` still goes FIRST, which keeps the deferred-begin write-first argument above, and the
+    // queueing is best effort: its failure is logged and never fails or rolls back the write.
+    let finished = async {
+        let mut tx = pool.begin().await?;
+        finish(&mut *tx, id, outcome.clone()).await?;
+        if matches!(outcome, Outcome::Succeeded { .. })
+            && let Err(error) = crate::distill::enqueue_landed_in(&mut tx, id).await
+        {
+            tracing::warn!(request_id = id, %error, "distill: could not queue a landed job");
+        }
+        tx.commit().await
+    }
+    .await;
+    match finished {
         // Spec §6.4's fifth step, and spec §2.1's whole argument for this pillar having no view of
         // its own: every transition writes to `feed.rs`, which the shell already shows. Without this
         // row, a merge the daemon performed is invisible to the person who asked for it.
@@ -2793,6 +2912,9 @@ pub async fn drain_once(
             let summary = match &outcome {
                 Outcome::Escalated { reason, .. } => {
                     format!("vcs request {id} escalated — {reason}")
+                }
+                Outcome::AwaitingOwner { .. } => {
+                    format!("vcs request {id} changes the test map and waits for your approval")
                 }
                 other => format!("vcs request {id} {}", other.status()),
             };
@@ -5483,6 +5605,50 @@ mod tests {
         assert_eq!(lines[0].1, Some(format!("vcs:{id}")));
     }
 
+    /// A merge of a job's own branch into a branch outside `nucleos/` is the land the distiller
+    /// learns from; any other merge is not, and queues nothing.
+    #[tokio::test]
+    async fn a_landed_job_branch_is_queued_for_distillation() {
+        let pool = test_pool().await;
+        // `repo()` resolves to project `alpha`, so the job has to live in the same project.
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at)
+             VALUES (7, 'alpha', 'C:/repo', 'completed', 5, '2026-10-05T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A feature branch landing is not a job landing.
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
+        let none: Vec<(String, Option<i64>)> =
+            sqlx::query_as("SELECT cause, job_id FROM distill_queue")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(none.is_empty(), "a feature-branch merge queued: {none:?}");
+
+        let op = Op::Merge {
+            source: "nucleos/job-7".into(),
+            target: "master".into(),
+        };
+        submit(&pool, &repo(), &op, Origin::Human).await.unwrap();
+        drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("def456")).await;
+
+        let rows: Vec<(String, String, Option<i64>, Option<i64>)> =
+            sqlx::query_as("SELECT cause, project_id, job_id, item_id FROM distill_queue")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![("job_landed".to_string(), "alpha".to_string(), Some(7), None)]
+        );
+    }
+
     /// An escalation is the one outcome whose reason has to reach the feed, and the one whose
     /// reader did not ask for it.
     ///
@@ -6271,6 +6437,35 @@ mod tests {
         assert_eq!(status_of(&pool, id).await, "queued");
     }
 
+    /// An owner-approved merge outlives the run that asked for it: approving put it back to
+    /// `queued` with its `run_id` intact, and neither sweep may then cancel it.
+    #[tokio::test]
+    async fn an_owner_approved_request_survives_both_run_end_sweeps() {
+        let pool = test_pool().await;
+        insert_run(&pool, 7, "running").await;
+        let id = queued_request_for_run(&pool, 7).await;
+        sqlx::query(
+            "UPDATE vcs_requests SET status = 'awaiting_owner', pending_map_blob = 'abc' WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE runs SET status = ? WHERE id = 7")
+            .bind(crate::runs::ENDED_RUN_STATUSES[0])
+            .execute(&pool)
+            .await
+            .unwrap();
+        approve_for_owner(&pool, id).await.expect("approve it");
+
+        assert_eq!(
+            reap_requests_of_ended_runs(&pool, "alpha").await.unwrap(),
+            0
+        );
+        assert_eq!(cancel_for_run(&pool, 7).await.unwrap(), 0);
+        assert_eq!(status_of(&pool, id).await, "queued");
+    }
+
     /// A request nobody's run owns is nobody's to reap.
     #[tokio::test]
     async fn a_humans_request_is_never_reaped() {
@@ -6997,5 +7192,145 @@ mod tests {
             waiting.windows(2).all(|w| w[0].id > w[1].id),
             "newest first, like the history listing"
         );
+    }
+
+    async fn map_blobs_of(pool: &sqlx::SqlitePool, id: i64) -> (Option<String>, Option<String>) {
+        sqlx::query_as("SELECT pending_map_blob, approved_map_blob FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn finished_at_of(pool: &sqlx::SqlitePool, id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT finished_at FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn paused_row(pool: &sqlx::SqlitePool, source: &str, blob: &str) -> i64 {
+        let id = row_in_status(pool, "alpha", source, "awaiting_owner").await;
+        sqlx::query("UPDATE vcs_requests SET pending_map_blob = ? WHERE id = ?")
+            .bind(blob)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn the_table_admits_a_request_waiting_for_its_owner() {
+        let pool = test_pool().await;
+        let id = paused_row(&pool, "feat/x", "abc").await;
+        assert_eq!(status_of(&pool, id).await, "awaiting_owner");
+        assert_eq!(
+            map_blobs_of(&pool, id).await,
+            (Some("abc".to_owned()), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_a_paused_request_queues_it_with_the_blob_it_saw() {
+        let pool = test_pool().await;
+        let id = paused_row(&pool, "feat/x", "abc").await;
+        approve_for_owner(&pool, id).await.expect("approve it");
+        assert_eq!(status_of(&pool, id).await, "queued");
+        assert_eq!(
+            map_blobs_of(&pool, id).await.1,
+            Some("abc".to_owned()),
+            "the approved blob is the one the row paused on"
+        );
+        assert!(matches!(
+            approve_for_owner(&pool, id).await,
+            Err(DismissError::NotOpen)
+        ));
+    }
+
+    #[tokio::test]
+    async fn refusing_a_paused_request_ends_it_as_rejected() {
+        let pool = test_pool().await;
+        let id = paused_row(&pool, "feat/x", "abc").await;
+        refuse_for_owner(&pool, id).await.expect("refuse it");
+        assert_eq!(status_of(&pool, id).await, "rejected");
+        assert!(finished_at_of(&pool, id).await.is_some());
+        assert!(failure_reason_of(&pool, id).await.contains("refused"));
+        assert!(matches!(
+            refuse_for_owner(&pool, id).await,
+            Err(DismissError::NotOpen)
+        ));
+    }
+
+    #[tokio::test]
+    async fn owner_decisions_answer_only_a_paused_request() {
+        let pool = test_pool().await;
+        assert!(matches!(
+            approve_for_owner(&pool, 999_999).await,
+            Err(DismissError::NotFound)
+        ));
+        assert!(matches!(
+            refuse_for_owner(&pool, 999_999).await,
+            Err(DismissError::NotFound)
+        ));
+        let queued = row_in_status(&pool, "alpha", "feat/q", "queued").await;
+        let escalated = row_in_status(&pool, "alpha", "feat/e", "escalated").await;
+        for id in [queued, escalated] {
+            assert!(matches!(
+                approve_for_owner(&pool, id).await,
+                Err(DismissError::NotOpen)
+            ));
+            assert!(matches!(
+                refuse_for_owner(&pool, id).await,
+                Err(DismissError::NotOpen)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_waiting_for_its_owner_is_waiting_on_a_person() {
+        let pool = test_pool().await;
+        let paused = paused_row(&pool, "feat/p", "abc").await;
+        let escalated = row_in_status(&pool, "alpha", "feat/e", "escalated").await;
+        let queued = row_in_status(&pool, "alpha", "feat/q", "queued").await;
+        let ids: std::collections::BTreeSet<i64> = waiting_on_a_person(&pool)
+            .await
+            .expect("list the waiting")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, std::collections::BTreeSet::from([paused, escalated]));
+        assert!(!ids.contains(&queued));
+    }
+
+    #[test]
+    fn a_pause_for_the_owner_is_its_own_status() {
+        let outcome = Outcome::AwaitingOwner {
+            map_blob: "abc".to_owned(),
+            reason: "r".to_owned(),
+        };
+        assert_eq!(outcome.status(), "awaiting_owner");
+        assert!(!TERMINAL_STATUSES.contains(&"awaiting_owner"));
+    }
+
+    #[tokio::test]
+    async fn finishing_with_a_pause_records_the_blob_and_no_end() {
+        let pool = test_pool().await;
+        let id = row_in_status(&pool, "alpha", "feat/x", "running").await;
+        finish(
+            &pool,
+            id,
+            Outcome::AwaitingOwner {
+                map_blob: "abc".into(),
+                reason: "r".into(),
+            },
+        )
+        .await
+        .expect("finish with a pause");
+        assert_eq!(status_of(&pool, id).await, "awaiting_owner");
+        assert_eq!(map_blobs_of(&pool, id).await.0, Some("abc".to_owned()));
+        assert_eq!(finished_at_of(&pool, id).await, None);
+        assert_eq!(failure_reason_of(&pool, id).await, "r");
     }
 }

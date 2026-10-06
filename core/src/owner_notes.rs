@@ -3,7 +3,9 @@
 //! **Owner only.** Like `notes.rs` (`job_notes`, see its module doc at lines 19-22), this is not a
 //! channel an agent can write to, and it goes further: nothing in the agent's memory reads this
 //! module. `brief`, `knowledge` and `mcp_tools` never touch these tables, so a note reaches no
-//! prompt unless a person deliberately teaches it (a separate, proposal-gated step).
+//! prompt unless a person deliberately teaches it (a separate, proposal-gated step). The one
+//! exception is `distill.rs`, which reads project-linked notes as dossier context only
+//! (`.ai/specs/2026-10-05-destilador-design.md` D4).
 //!
 //! This module owns the `owner_notes*` SQL. The vocabularies below are checked here, before the
 //! write, because the migration carries no CHECK constraints (the house rule of 0143).
@@ -555,6 +557,28 @@ fn sql_table(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// The text of every ACTIVE note linked to a project, oldest first.
+///
+/// This exists solely for the distiller's dossier, under D4 of
+/// `.ai/specs/2026-10-05-destilador-design.md` - the one sanctioned exception to the rule that
+/// agents never read owner notes. The text is context for the dossier and must never be injected
+/// into a prompt run or quoted into knowledge; the only direct note -> knowledge door stays
+/// `teach`.
+pub(crate) async fn active_note_texts_for_project(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT n.note_text FROM owner_notes n
+           JOIN owner_note_links l ON l.note_id = n.id
+          WHERE l.target_kind = 'project' AND l.target_ref = ? AND n.state = 'active'
+          ORDER BY n.id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
 /// Whether a target exists, for the kinds this module can answer from SQL. `None` for `project` and
 /// `file` (and anything unknown): the HTTP layer resolves those.
 pub async fn target_exists(
@@ -1092,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn no_core_module_but_three_mentions_owner_notes() {
+    fn no_core_module_but_four_mentions_owner_notes() {
         // Same guard as `redact.rs`: refuse to scan another checkout's sources.
         let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let running_in = std::env::current_dir().expect("the working directory must be readable");
@@ -1104,12 +1128,14 @@ mod tests {
             built_in.display(),
             running_in.display(),
         );
-        let allowed = ["owner_notes.rs", "http.rs", "main.rs"];
+        // `distill.rs` is the one sanctioned exception: D4 of `.ai/specs/2026-10-05-destilador-design.md`
+        // lets the distiller's dossier read the notes linked to a project, as context only.
+        let allowed = ["owner_notes.rs", "http.rs", "main.rs", "distill.rs"];
         let needle = ["owner", "note"].join("_");
         let src = running_in.join("src");
         let mut scanned = 0;
         // Recursive: a module directory (`council/`, `judge/`) is as much the agent's memory as
-        // a top-level file. Only the three top-level files are allowed, so a `http.rs` nested in
+        // a top-level file. Only the four top-level files are allowed, so a `http.rs` nested in
         // some module directory is scanned like any other.
         let mut pending = vec![src.clone()];
         while let Some(dir) = pending.pop() {
@@ -1131,7 +1157,8 @@ mod tests {
                 assert!(
                     !source.contains(&needle),
                     "{} mentions `{needle}`: the owner's notes are reachable from owner_notes.rs, \
-                     http.rs and main.rs only, so that nothing in the agent's memory can read them",
+                     http.rs, main.rs and distill.rs (spec D4) only, so that nothing in the \
+                     agent's memory can read them",
                     path.display()
                 );
             }

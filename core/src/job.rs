@@ -1821,6 +1821,7 @@ pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Resul
             "retiring a job into a status the worktree GC does not collect"
         );
     }
+    let mut tx = pool.begin().await?;
     let retired = sqlx::query(concat!(
         "UPDATE jobs SET status = ?, completed_at = ?, wait_reason = NULL, resume_status = NULL
          WHERE id = ? AND status IN ",
@@ -1829,8 +1830,17 @@ pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Resul
     .bind(status)
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(job_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    // Queued in the retirement's own transaction, but best effort: a queueing failure is logged
+    // and never fails or rolls back the retirement.
+    if retired.rows_affected() > 0
+        && status != "completed"
+        && let Err(error) = crate::distill::enqueue_job_ending_in(&mut tx, job_id).await
+    {
+        tracing::warn!(job_id, %error, "distill: could not queue a job ending");
+    }
+    tx.commit().await?;
     // Closed and released whichever way the write went. A job that was already over has no live
     // findings and holds no slot, so both are no-ops for it — and a backstop if something left one
     // behind.
@@ -4403,7 +4413,14 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
     if matches!(set_live_status(pool, job.id, "gating").await, Ok(false)) {
         return Step::Stopped;
     }
-    let outcome = crate::gate::run_gate(
+    let outcome = crate::verify_runs::timed_gate(
+        Some(pool),
+        crate::verify_runs::GateContext {
+            project_id: Some(&job.project_id),
+            origin: crate::verify_runs::ORIGIN_JOB_ITEM,
+            origin_id: Some(job.id),
+            ordinal: Some(ordinal as i64),
+        },
         &worktree,
         Path::new(&job.project_root),
         &command,
@@ -4616,6 +4633,15 @@ fn gate_output_tail(output: &str) -> &str {
     &output[start..]
 }
 
+/// Queue what an item verdict just written may have caused (a recovery or an exhaustion), inside
+/// the verdict's own transaction. Best effort: a failure is logged with ids only and never fails
+/// or rolls back the verdict.
+async fn queue_the_verdict(conn: &mut sqlx::SqliteConnection, job_id: i64, ordinal: i64) {
+    if let Err(error) = crate::distill::enqueue_item_verdict_in(conn, job_id, ordinal).await {
+        tracing::warn!(job_id, ordinal, %error, "distill: could not queue an item verdict");
+    }
+}
+
 async fn record_gate(
     state: &AppState,
     job: &JobRow,
@@ -4797,14 +4823,20 @@ async fn record_gate(
             // Mark the item first — a red gate is a fact whatever happened next — then stop. The
             // queue must not advance onto a tree still holding work the gate rejected, and this is
             // the one branch where continuing is worse than ending the job early.
-            let _ = sqlx::query(
-                "UPDATE job_items SET status = ?, gate_status = ? WHERE job_id = ? AND ordinal = ?",
-            )
-            .bind(item_status)
-            .bind(gate_status)
-            .bind(job.id)
-            .bind(ordinal as i64)
-            .execute(pool)
+            let _ = async {
+                let mut tx = pool.begin().await?;
+                sqlx::query(
+                    "UPDATE job_items SET status = ?, gate_status = ? WHERE job_id = ? AND ordinal = ?",
+                )
+                .bind(item_status)
+                .bind(gate_status)
+                .bind(job.id)
+                .bind(ordinal as i64)
+                .execute(&mut *tx)
+                .await?;
+                queue_the_verdict(&mut tx, job.id, ordinal as i64).await;
+                tx.commit().await
+            }
             .await;
             credit_the_briefing(pool, job, ordinal).await;
             say(
@@ -4822,16 +4854,22 @@ async fn record_gate(
         }
     }
 
-    let written = sqlx::query(
-        "UPDATE job_items SET status = ?, gate_status = ?, checkpoint_sha = ?
-         WHERE job_id = ? AND ordinal = ?",
-    )
-    .bind(item_status)
-    .bind(gate_status)
-    .bind(checkpoint_sha.as_deref())
-    .bind(job.id)
-    .bind(ordinal as i64)
-    .execute(pool)
+    let written = async {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "UPDATE job_items SET status = ?, gate_status = ?, checkpoint_sha = ?
+             WHERE job_id = ? AND ordinal = ?",
+        )
+        .bind(item_status)
+        .bind(gate_status)
+        .bind(checkpoint_sha.as_deref())
+        .bind(job.id)
+        .bind(ordinal as i64)
+        .execute(&mut *tx)
+        .await?;
+        queue_the_verdict(&mut tx, job.id, ordinal as i64).await;
+        tx.commit().await
+    }
     .await;
     if let Err(error) = written {
         tracing::warn!(job_id = job.id, ordinal, %error, "could not record a gate verdict");
@@ -11338,6 +11376,54 @@ mod tests {
             crate::worktree::remove(&repo, &root.path().join(format!("job-{job_id}")), &[]).await;
     }
 
+    /// Every gate the walk ran left one `verify_runs` row naming the job and the item.
+    #[tokio::test(flavor = "current_thread")]
+    async fn each_item_gate_is_recorded_in_verify_runs() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) =
+            walkable_repo("nucleos-job-verify-", "git rev-parse --verify no-such-ref");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
+
+        let job_id = start_job_for(
+            &state,
+            &runner,
+            &repo,
+            r#"{"items":[{"description":"first"},{"description":"second"}]}"#,
+        )
+        .await;
+        walk(&state, job_id).await;
+
+        let gated: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_items WHERE job_id = ? AND gate_status IS NOT NULL",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let rows: Vec<(String, Option<i64>, String, Option<String>)> = sqlx::query_as(
+            "SELECT origin, ordinal, status, project_id FROM verify_runs              WHERE origin = 'job_item' AND origin_id = ? ORDER BY ordinal",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            gated > 0,
+            "the walk must have gated something for this test to mean anything"
+        );
+        assert_eq!(rows.len() as i64, gated);
+        for (origin, ordinal, status, project_id) in &rows {
+            assert_eq!(origin, crate::verify_runs::ORIGIN_JOB_ITEM);
+            assert!(ordinal.is_some());
+            assert_eq!(status, crate::verify_runs::STATUS_FAILED);
+            assert!(project_id.is_some());
+        }
+    }
+
     /// Walked rather than asserted against a seeded row: a red gate no longer ends the night.
     ///
     /// This test used to pin the opposite, and the sentence it carried — *"Never started. The
@@ -13791,6 +13877,121 @@ mod tests {
         record_gate(&state, &job, 0, crate::gate::GateOutcome::Passed).await;
 
         assert_eq!(knowledge_counts(&pool, knowledge_id).await, (1, 1, 1));
+    }
+
+    /// Every `distill_queue` row as `(cause, job_id, item_id, project_id)`, oldest first.
+    async fn distill_rows(
+        pool: &sqlx::SqlitePool,
+    ) -> Vec<(String, Option<i64>, Option<i64>, String)> {
+        sqlx::query_as("SELECT cause, job_id, item_id, project_id FROM distill_queue ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A job that ends without completing is queued for the distiller, once; a completed one is
+    /// not, because it is the land that carries it there.
+    #[tokio::test]
+    async fn a_job_that_does_not_complete_is_queued_for_distillation_once() {
+        let pool = test_pool().await;
+        let failed = seed_job(&pool, "project-a", "implementing").await.unwrap();
+
+        assert!(retire(&pool, failed, "failed").await.unwrap());
+        assert!(!retire(&pool, failed, "failed").await.unwrap());
+
+        let completed = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        assert!(retire(&pool, completed, "completed").await.unwrap());
+
+        assert_eq!(
+            distill_rows(&pool).await,
+            vec![(
+                "job_failed".to_string(),
+                Some(failed),
+                None,
+                "project-a".to_string()
+            )],
+            "one row for the job that did not complete, none for the one that did"
+        );
+    }
+
+    /// A green gate on an item that had gone red before is a recovery worth learning from.
+    #[tokio::test]
+    async fn a_gate_that_passes_after_a_red_queues_a_recovery() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["implemented"]).await;
+        sqlx::query(
+            "UPDATE job_items SET gate_attempts = 1, gate_status = 'failed'
+             WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let item_id: i64 =
+            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = 0")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+
+        record_gate(&state, &job, 0, crate::gate::GateOutcome::Passed).await;
+
+        assert_eq!(
+            distill_rows(&pool).await,
+            vec![(
+                "gate_recovered".to_string(),
+                Some(job_id),
+                Some(item_id),
+                "project-a".to_string()
+            )]
+        );
+    }
+
+    /// A red gate that takes an item past the job's retries is an exhaustion; the first red of a
+    /// job with a retry left is not.
+    #[tokio::test]
+    async fn an_item_out_of_gate_retries_queues_its_exhaustion() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        sqlx::query("UPDATE jobs SET gate_retries = 0 WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_items(&pool, job_id, &["implemented"]).await;
+        let item_id: i64 =
+            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = 0")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+
+        let step = record_gate(
+            &state,
+            &job,
+            0,
+            crate::gate::GateOutcome::Failed {
+                exit_code: 1,
+                output: "boom".into(),
+            },
+        )
+        .await;
+
+        assert_eq!(step, Step::Stopped);
+        assert_eq!(
+            distill_rows(&pool).await,
+            vec![(
+                "run_exhausted".to_string(),
+                Some(job_id),
+                Some(item_id),
+                "project-a".to_string()
+            )]
+        );
     }
 
     #[tokio::test]

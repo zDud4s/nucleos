@@ -162,6 +162,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/map", get(get_project_map))
+        .route("/projects/{id}/tests-map", get(get_project_tests_map))
         // Which specs a project has, so the extraction button offers a list and not a text box.
         // Beside `map` because it answers about the same tree, read the same way.
         .route("/projects/{id}/map/specs", get(get_project_map_specs))
@@ -636,6 +637,11 @@ pub fn build_router(state: AppState) -> Router {
         // The act that turns a conversation with a directory into one with tools. The same thing
         // `wire_ide_session_tools` does before a pick-up, reached from the other side.
         .route("/assistant/chats/{chat_id}/tools", post(wire_chat_tools))
+        // Copies the AI workflow into a conversation's worktree; only ever on an explicit confirm.
+        .route(
+            "/assistant/chats/{chat_id}/workflow",
+            post(seed_chat_workflow),
+        )
         // Taking back something that has not been sent. A segment deeper than the chat, and named
         // for the thing it removes rather than for the chat it removes it from.
         .route(
@@ -672,6 +678,10 @@ pub fn build_router(state: AppState) -> Router {
         // turn, because the answers are large and the transcript is polled: see `ToolCall::result`
         // for why they are stripped from the turn list and fetched only when somebody opens one.
         .route("/assistant/turns/{turn_id}/tools", get(get_turn_tools))
+        // Stop on a chat turn: an interrupt that keeps the process and the session, falling back to
+        // the kill `/runs/{id}/cancel` performs. A route of the chat's own so that route stays as it
+        // is for Kill and for every other kind of run.
+        .route("/assistant/turns/{turn_id}/stop", post(post_stop_turn))
         // Finding a sentence rather than a conversation. The window's own palette matches titles,
         // which is the right first answer and a useless second one: what people come back for is
         // something that was SAID, and a title is a summary written by a model.
@@ -684,6 +694,8 @@ pub fn build_router(state: AppState) -> Router {
         // cannot name a conversation to relay FROM any more than `POST /assistant/message` lets one
         // name who is typing.
         .route("/assistant/chats/{chat_id}/relay", post(relay_send_to_chat))
+        // Send now: text written into the turn that is running. See `assistant::say_now`.
+        .route("/assistant/chats/{chat_id}/say-now", post(post_say_now))
         // The same hop, asked for by the person instead of by the model. A route of its own and not
         // a flag on the one above, because the two differ in the one thing that matters: where the
         // sending turn's identity comes from. `/relay` reads it off a header this process wrote
@@ -738,6 +750,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/vcs/requests/{id}", get(get_vcs_request))
         .route("/vcs/requests/{id}/wait", get(wait_vcs_request))
         .route("/vcs/requests/{id}/dismiss", post(post_vcs_request_dismiss))
+        .route("/vcs/requests/{id}/approve", post(post_vcs_request_approve))
+        .route("/vcs/requests/{id}/refuse", post(post_vcs_request_refuse))
         // Admin-only by construction: absent from BOTH scope tables in `auth.rs`, for the
         // `POST /email/send` reason rather than the `POST /runs` one. It is not out of a scoped
         // key's reach because it is expensive; it is out of reach because it LEAVES THE MACHINE.
@@ -1394,6 +1408,10 @@ struct RunsQuery {
     ///
     /// Absent, the answer is byte for byte today's — which is what leaves the Runs tab as it is.
     live: Option<bool>,
+    /// Only one conversation's turns.
+    chat_id: Option<String>,
+    /// `chat` folds every chat turn into one row per conversation; anything else is a 400.
+    group: Option<String>,
 }
 
 /// One run's checkout, as the shell needs it to open a door to the editor.
@@ -6683,6 +6701,45 @@ async fn get_project_blame(
         .map_err(inspect_status)
 }
 
+/// What `GET /projects/{id}/tests-map` answers: the state of the project's `nucleos.tests.yaml`
+/// and, always, what this daemon would propose — beside a valid map too, so the owner can see
+/// what a new build file would add.
+#[derive(Debug, Serialize)]
+struct TestsMapView {
+    /// `absent`, `invalid` or `valid`.
+    state: &'static str,
+    errors: Vec<String>,
+    groups: Vec<String>,
+    proposal: crate::detect::TestsMapProposal,
+}
+
+fn tests_map_view(root: &std::path::Path) -> TestsMapView {
+    let (state, errors, groups) = match crate::tests_map::load(root) {
+        crate::tests_map::MapState::Absent => ("absent", Vec::new(), Vec::new()),
+        crate::tests_map::MapState::Invalid(errors) => ("invalid", errors, Vec::new()),
+        crate::tests_map::MapState::Valid(map) => {
+            ("valid", Vec::new(), map.tests.groups.into_keys().collect())
+        }
+    };
+    TestsMapView {
+        state,
+        errors,
+        groups,
+        proposal: crate::detect::propose_tests_map(root),
+    }
+}
+
+async fn get_project_tests_map(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TestsMapView>, StatusCode> {
+    let root = resolve_project_root(&state, &id).await?;
+    tokio::task::spawn_blocking(move || tests_map_view(&root))
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 /// What one run has changed, and how big the tree it changed it in is.
 ///
 /// `run` is required here, unlike the readers: "what changed" has no meaning against a project root
@@ -9919,6 +9976,13 @@ async fn get_runs(
     Query(query): Query<RunsQuery>,
 ) -> Result<Json<Vec<runs::RunSearchResult>>, StatusCode> {
     let live = query.live == Some(true);
+    // One grouping exists. Anything else is refused, not ignored: a caller that asked for a
+    // grouping and got the flat list would read turns as conversations.
+    let group_by_chat = match query.group.as_deref() {
+        None => false,
+        Some("chat") => true,
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+    };
     // A live listing with no explicit limit inherits the ceiling of live listings, not search's 50.
     // Without this the daemon would promise a shared constant and hand back the search window — and
     // the client would be the only thing guaranteeing the number, which is no guarantee at all.
@@ -9938,6 +10002,8 @@ async fn get_runs(
             until: parse_time_bound(query.until)?,
             limit,
             live,
+            chat_id: query.chat_id,
+            group_by_chat,
         },
     )
     .await
@@ -10563,6 +10629,7 @@ async fn post_run_message(
         .send(crate::runner::LaterTurn {
             text: body.message,
             images: Vec::new(),
+            interrupt: false,
         })
         .map_err(|_| StatusCode::CONFLICT)?;
     Ok(StatusCode::ACCEPTED)
@@ -10749,6 +10816,10 @@ struct AssistantTurnOut {
     /// shipped alone: the conversation certain to be watched by the person who caused a relay was
     /// the one that could not say what it had done.
     relayed_to: Vec<RelaySent>,
+    /// What was said INTO this turn while it ran ("Send now"), oldest first. Empty for almost every
+    /// turn. The CLI folds such a line into the running turn, so the stream never shows it as
+    /// typed and this is the only record.
+    said_now: Vec<crate::assistant::SaidDuring>,
 }
 
 /// A conversation as it is read back: its turns, and whatever it was handed before the first one.
@@ -11020,6 +11091,12 @@ struct ChatProjectOut {
     /// `.claude/` is not committed — so a conversation pointed at one still cannot open a file, and
     /// a window that reported only the directory would be telling the truth and misleading at once.
     tools: bool,
+    /// Whether this conversation's turns use the user's ambient MCP servers. Off until somebody
+    /// opts in.
+    ambient_mcp: bool,
+    /// Whether `cwd` is a linked worktree the AI workflow was never copied into while its main
+    /// checkout has it — the case "Set up workflow" answers.
+    workflow_missing: bool,
 }
 
 /// Where a conversation runs, and whether that gives it tools.
@@ -11046,6 +11123,9 @@ async fn read_chat_project(
     let permission_mode = crate::chats::permission_mode_of(&state.pool, &chat_id)
         .await
         .unwrap_or(crate::chats::PermissionMode::Auto);
+    let ambient_mcp = crate::chats::ambient_mcp_of(&state.pool, &chat_id)
+        .await
+        .unwrap_or(false);
 
     let Some(cwd) = opened_in else {
         return Ok(Json(ChatProjectOut {
@@ -11053,14 +11133,24 @@ async fn read_chat_project(
             session,
             permission_mode,
             tools: false,
+            ambient_mcp,
+            workflow_missing: false,
         }));
     };
 
+    // An unreadable roster offers nothing: the setup runs a script, so it fails closed.
+    let roots = crate::autopilot::rostered_roots(&state.pool)
+        .await
+        .unwrap_or_default();
     let dir = std::path::PathBuf::from(&cwd);
-    let wired =
-        tokio::task::spawn_blocking(move || crate::autopilot::classifier_hook_is_wired(&dir))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (wired, workflow_missing) = tokio::task::spawn_blocking(move || {
+        (
+            crate::autopilot::classifier_hook_is_wired(&dir),
+            crate::autopilot::workflow_missing(&dir, &roots),
+        )
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Asked of the same function the turn path asks, rather than restated here. A second copy of
     // this rule would be a second thing to keep true, and the one that answers the window is the
@@ -11080,6 +11170,8 @@ async fn read_chat_project(
         session,
         permission_mode,
         tools,
+        ambient_mcp,
+        workflow_missing,
     }))
 }
 
@@ -11109,6 +11201,58 @@ async fn wire_chat_tools(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct SeedWorkflowIn {
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// Copies the AI workflow into a conversation's worktree from its main checkout, then wires the
+/// hook. Overwrites the worktree's workflow core, so it runs only on an explicit `confirm: true`.
+async fn seed_chat_workflow(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Json(body): Json<SeedWorkflowIn>,
+) -> Result<StatusCode, StatusCode> {
+    // Checked first: nothing below runs on anything but an explicit yes.
+    if !body.confirm {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let cwd = crate::chats::opened_in(&state.pool, &chat_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading a conversation's project failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?
+        .ok_or(StatusCode::CONFLICT)?;
+
+    let roots = crate::autopilot::rostered_roots(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading the project roster failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    match crate::autopilot::seed_workflow(std::path::Path::new(&cwd), &roots).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(
+            crate::autopilot::SeedRefusal::NotAWorktree
+            | crate::autopilot::SeedRefusal::NoWorkflowInMain
+            | crate::autopilot::SeedRefusal::MainNotRostered,
+        ) => Err(StatusCode::CONFLICT),
+        // Same answer `wire_chat_tools` gives when the hook cannot be written.
+        Err(crate::autopilot::SeedRefusal::NotWired(error)) => {
+            tracing::warn!(%error, cwd = %cwd, "could not wire a conversation's project after seeding it");
+            Err(StatusCode::CONFLICT)
+        }
+        Err(crate::autopilot::SeedRefusal::Failed(error)) => {
+            tracing::warn!(%error, cwd = %cwd, "could not set up the workflow in a conversation's worktree");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// Takes a message back off a conversation's queue before it is sent.
@@ -11295,6 +11439,11 @@ async fn get_assistant_chat(
     let sent = relays_sent_by(&state.pool, &turns)
         .await
         .unwrap_or_default();
+    // Empty on a failure, for the same trade: losing the note about what was said mid-turn is a
+    // smaller loss than a conversation that will not open.
+    let said = crate::assistant::said_during(&state.pool, &chat_id)
+        .await
+        .unwrap_or_default();
     // Read through `assistant::handed_over` rather than parsed here: that function is already the
     // one reader of the column's shape, and a second one is a second thing to change the day the
     // shape does. A chat that was handed nothing comes back empty, which is the honest answer for
@@ -11363,6 +11512,11 @@ async fn get_assistant_chat(
                         sending_run_id: relay.sending_run_id,
                     })
                     .collect();
+                let said_now = said
+                    .iter()
+                    .filter(|said| said.run_id == turn.id)
+                    .cloned()
+                    .collect();
                 AssistantTurnOut {
                     turn,
                     did,
@@ -11370,10 +11524,63 @@ async fn get_assistant_chat(
                     thought,
                     context_window,
                     relayed_to,
+                    said_now,
                 }
             })
             .collect(),
     }))
+}
+
+/// Stops a chat turn: interrupts it when its process can be spoken to, kills it otherwise.
+///
+/// Uncancellable for the reason `runs::cancel_run` is: the kill removes the turn's handle before it
+/// writes the status, so a request dropped in the middle would leave a `running` row nothing reaches.
+async fn post_stop_turn(
+    State(state): State<AppState>,
+    Path(turn_id): Path<i64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match uncancellable(async move { crate::assistant::stop_turn(&state, turn_id).await }).await? {
+        crate::assistant::Stopped::Interrupted => {
+            Ok(Json(serde_json::json!({ "stopped": "interrupted" })))
+        }
+        crate::assistant::Stopped::Killed => Ok(Json(serde_json::json!({ "stopped": "killed" }))),
+        crate::assistant::Stopped::NotRunning => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+#[derive(Deserialize)]
+struct SayNowRequest {
+    text: String,
+}
+
+/// Says something into the turn that is running, or sends it the ordinary way when none is.
+async fn post_say_now(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Json(body): Json<SayNowRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if body.text.trim().is_empty() {
+        return Err(refusal(StatusCode::BAD_REQUEST, "empty"));
+    }
+    let said =
+        uncancellable(async move { crate::assistant::say_now(&state, &chat_id, &body.text).await })
+            .await
+            .map_err(|status| refusal(status, "internal"))?;
+    match said {
+        Ok(crate::assistant::SaidNow::Injected) => {
+            Ok(Json(serde_json::json!({ "said_now": true })))
+        }
+        Ok(crate::assistant::SaidNow::Sent(crate::assistant::Sent::Turn(id))) => {
+            Ok(Json(serde_json::json!({ "turn_id": id })))
+        }
+        Ok(crate::assistant::SaidNow::Sent(crate::assistant::Sent::Queued)) => {
+            Ok(Json(serde_json::json!({ "queued": true })))
+        }
+        Err(error) => {
+            tracing::warn!(%error, "saying something into a running turn failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
 }
 
 /// What one turn's tools answered.
@@ -13489,6 +13696,11 @@ struct PatchChatRequest {
     /// The whole set every time, like `agents`, and for the same reason.
     #[serde(default, deserialize_with = "sent_even_if_null")]
     denied_tools: Option<Option<Vec<String>>>,
+    /// Whether this conversation's turns may use the user's ambient MCP servers.
+    ///
+    /// Turning it on needs a project: a conversation with no directory is `McpOnly` and never
+    /// reaches those servers, so offering the switch there would promise something it cannot do.
+    ambient_mcp: Option<bool>,
 }
 
 /// What the two doors onto a conversation refuse with. Every path that had no body keeps none
@@ -13576,7 +13788,8 @@ async fn patch_chat(
         || body.model.is_some()
         || body.effort.is_some()
         || body.cwd.is_some()
-        || body.permission_mode.is_some())
+        || body.permission_mode.is_some()
+        || body.ambient_mcp.is_some())
         && crate::assistant::is_busy(&chat_id)
     {
         return Err(StatusCode::CONFLICT.into());
@@ -13787,6 +14000,27 @@ async fn patch_chat(
                 tracing::warn!(%error, "changing what a conversation may do without asking failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+    }
+
+    if let Some(on) = body.ambient_mcp {
+        // Only a conversation with a project can use the ambient servers; one without a
+        // directory is `McpOnly`, which drops them whatever is stored here.
+        if on
+            && crate::chats::cwd_of(&state.pool, &chat_id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .is_none()
+        {
+            return Err(StatusCode::BAD_REQUEST.into());
+        }
+        crate::chats::set_ambient_mcp(&state.pool, &chat_id, on)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "changing a conversation's ambient MCP servers failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        // The next turn respawns with or without `--strict-mcp-config`.
+        crate::assistant::evict_live(&chat_id);
     }
 
     if let Some(title) = body.title.as_deref() {
@@ -14135,6 +14369,44 @@ async fn post_vcs_request_dismiss(
         Err(vcs::DismissError::NotOpen) => Err(StatusCode::CONFLICT),
         Err(vcs::DismissError::Db(error)) => {
             tracing::warn!(request_id = id, %error, "dismissing a git request failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// The owner approves the test map change a paused merge carries (spec 2026-10-05 §3.4): 204,
+/// 404 for an unknown id, 409 for a row that is not waiting for the owner. Admin-only by
+/// default-deny, like `/dismiss`.
+async fn post_vcs_request_approve(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    owner_decision_status(
+        id,
+        "approving",
+        vcs::approve_for_owner(&state.pool, id).await,
+    )
+}
+
+/// The owner refuses it; the row ends `rejected`. Same answers as approving.
+async fn post_vcs_request_refuse(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    owner_decision_status(id, "refusing", vcs::refuse_for_owner(&state.pool, id).await)
+}
+
+fn owner_decision_status(
+    id: i64,
+    verb: &str,
+    decided: Result<(), vcs::DismissError>,
+) -> Result<StatusCode, StatusCode> {
+    match decided {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(vcs::DismissError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(vcs::DismissError::NotOpen) => Err(StatusCode::CONFLICT),
+        Err(vcs::DismissError::Db(error)) => {
+            tracing::warn!(request_id = id, %error, "{verb} a paused git request failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -16143,6 +16415,32 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
+    #[test]
+    fn the_tests_map_view_reports_the_map_and_always_a_proposal() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let view = tests_map_view(temp.path());
+        assert_eq!(view.state, "absent");
+        assert!(view.proposal.yaml.contains("cargo test -p x"));
+
+        std::fs::write(
+            temp.path().join(crate::tests_map::MAP_FILE),
+            "version: 9\ntests: {}\n",
+        )
+        .unwrap();
+        let view = tests_map_view(temp.path());
+        assert_eq!(view.state, "invalid");
+        assert!(view.errors[0].contains("version 9"));
+
+        std::fs::write(
+            temp.path().join(crate::tests_map::MAP_FILE),
+            "version: 1\ntests:\n  groups:\n    x:\n      paths: [src/]\n      command: cargo test\n",
+        )
+        .unwrap();
+        let view = tests_map_view(temp.path());
+        assert_eq!((view.state, view.groups), ("valid", vec!["x".to_string()]));
+    }
+
     /// A state whose database is a real file, handed back inside a [`crate::storage::TempDb`] rather
     /// than a bare `TempDir` — which is the whole reason that type exists. `TempDir`'s drop cannot
     /// remove a directory SQLite still has open, and on Windows it fails silently, so every test
@@ -16327,6 +16625,63 @@ mod tests {
             live.iter().any(|run| run.id == parked),
             "the live ceiling did not replace search's"
         );
+
+        db.close().await;
+    }
+
+    /// `group=chat` folds a conversation's turns into one row, and only when asked; `chat_id`
+    /// lists one conversation's turns; any other grouping is refused rather than ignored.
+    #[tokio::test]
+    async fn the_runs_route_groups_by_chat_only_when_asked_and_refuses_an_unknown_grouping() {
+        let (state, db) = file_test_state().await;
+        for created_at in ["2026-10-01T00:00:01Z", "2026-10-01T00:00:02Z"] {
+            sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+                 VALUES ('a turn', 'completed', 'assistant', 'c-1', ?)",
+            )
+            .bind(created_at)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let autopilot = seed_run_row(
+            &state.pool,
+            "project-a",
+            "completed",
+            "2026-10-01T00:00:00Z",
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/runs", get(get_runs))
+            .layer(Extension(Scope::Control))
+            .with_state(state);
+
+        assert_eq!(runs_at(&app, "/runs").await.len(), 3);
+
+        let folded = runs_at(&app, "/runs?group=chat").await;
+        assert_eq!(folded.len(), 2);
+        let plain = folded.iter().find(|run| run.id == autopilot).unwrap();
+        assert!(plain.turns.is_none());
+        let conversation = folded
+            .iter()
+            .find(|run| run.chat_id.as_deref() == Some("c-1"))
+            .unwrap();
+        assert_eq!(conversation.turns, Some(2));
+
+        assert_eq!(runs_at(&app, "/runs?chat_id=c-1").await.len(), 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/runs?group=project")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         db.close().await;
     }
@@ -28853,6 +29208,204 @@ mod tests {
             .status()
     }
 
+    async fn seed_workflow_request(state: AppState, chat_id: &str, confirm: bool) -> StatusCode {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{chat_id}/workflow"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "confirm": confirm }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Puts the main checkout of the worktree `wt` on the project roster, as the daemon knows a
+    /// project it was told about.
+    async fn roster_main_of(state: &AppState, wt: &std::path::Path) {
+        let main = crate::autopilot::main_checkout_of(wt).unwrap();
+        let root = main.to_str().unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
+        )
+        .bind(root)
+        .bind(root)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A worktree whose main checkout the daemon has never heard of is not offered the workflow, and
+    /// the confirmed POST is refused with the main's script never run.
+    #[tokio::test]
+    async fn a_worktree_whose_main_is_not_a_known_project_is_not_offered_the_workflow() {
+        let state = test_state().await;
+        let (_container, main, wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+        std::fs::write(
+            main.join(".ai/scripts/seed_worktree.py"),
+            "import sys\nfrom pathlib import Path\nPath(sys.argv[1], 'ran.marker').write_text('ran')\n",
+        )
+        .unwrap();
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let body = json_body(project_request(state.clone(), &chat_id).await).await;
+        let status = seed_workflow_request(state.clone(), &chat_id, true).await;
+
+        assert_eq!(body["workflow_missing"], false);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!wt.join("ran.marker").exists());
+        assert!(!wt.join(".ai").exists());
+    }
+
+    /// The main's script exiting non-zero answers the failure status, and the project read still
+    /// offers the workflow afterwards.
+    #[tokio::test]
+    async fn a_failing_seed_script_answers_a_failure_and_the_workflow_stays_missing() {
+        let state = test_state().await;
+        let (_container, main, wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+        std::fs::write(
+            main.join(".ai/scripts/seed_worktree.py"),
+            "import sys\nsys.exit(3)\n",
+        )
+        .unwrap();
+        roster_main_of(&state, &wt).await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let status = seed_workflow_request(state.clone(), &chat_id, true).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let after = json_body(project_request(state.clone(), &chat_id).await).await;
+        assert_eq!(after["workflow_missing"], true);
+    }
+
+    /// A conversation in a linked worktree that was never seeded says its workflow is missing —
+    /// the reason it has no tools — while one in the main checkout says nothing of the kind.
+    #[tokio::test]
+    async fn a_conversation_in_an_unseeded_worktree_is_told_its_workflow_is_missing() {
+        let state = test_state().await;
+        let (_container, main, wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+        roster_main_of(&state, &wt).await;
+        let in_worktree = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &in_worktree, wt.to_str().unwrap())
+            .await
+            .unwrap();
+        let in_main = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &in_main, main.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let worktree_body = json_body(project_request(state.clone(), &in_worktree).await).await;
+        let main_body = json_body(project_request(state.clone(), &in_main).await).await;
+
+        assert_eq!(worktree_body["workflow_missing"], true);
+        assert_eq!(worktree_body["tools"], false);
+        assert_eq!(main_body["workflow_missing"], false);
+    }
+
+    /// Seeding overwrites a worktree's workflow core, so it runs only on an explicit yes: anything
+    /// else is refused and nothing is written.
+    #[tokio::test]
+    async fn seeding_the_workflow_refuses_without_confirmation() {
+        let state = test_state().await;
+        let (_container, _main, wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let status = seed_workflow_request(state.clone(), &chat_id, false).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!wt.join(".ai").exists());
+    }
+
+    /// A conversation in the main checkout has no worktree to seed, and one in a worktree whose main
+    /// checkout holds no workflow has nothing to seed it from: both are told so, and nothing is written.
+    #[tokio::test]
+    async fn seeding_the_workflow_refuses_a_conversation_without_a_worktree_and_a_workflow_behind_it()
+     {
+        let state = test_state().await;
+        let (_container, main, _wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+        let in_main = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &in_main, main.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seed_workflow_request(state.clone(), &in_main, true).await,
+            StatusCode::CONFLICT
+        );
+
+        let (_bare_container, _bare_main, bare_wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", false);
+        roster_main_of(&state, &bare_wt).await;
+        let in_bare = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &in_bare, bare_wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seed_workflow_request(state.clone(), &in_bare, true).await,
+            StatusCode::CONFLICT
+        );
+        assert!(!bare_wt.join(".ai").exists());
+    }
+
+    /// The end-to-end of "Set up workflow": after a confirmed seed the project read no longer says
+    /// the workflow is missing, and says the conversation has tools.
+    #[tokio::test]
+    async fn seeding_the_workflow_into_a_conversations_worktree_clears_the_flag_and_gives_it_tools()
+    {
+        let state = test_state().await;
+        let (_container, _main, wt) =
+            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+        roster_main_of(&state, &wt).await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, wt.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let status = seed_workflow_request(state.clone(), &chat_id, true).await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let after = json_body(project_request(state.clone(), &chat_id).await).await;
+        assert_eq!(after["workflow_missing"], false);
+        assert_eq!(after["tools"], true);
+    }
+
     /// A conversation can be told which project it is about, which is the only way one started here
     /// ever gets tools.
     ///
@@ -31943,6 +32496,71 @@ mod tests {
 
         let body = json_body(response).await;
         assert_eq!(body["turns"][0]["images"][0], "chats/7-0.png");
+    }
+
+    /// What was said into a running turn reaches the window under THAT turn.
+    ///
+    /// Send now writes into the process and leaves no turn of its own, so without this field the
+    /// words would vanish from the conversation the moment the page was reloaded.
+    #[tokio::test]
+    async fn the_transcript_carries_what_was_said_during_a_turn() {
+        let state = test_state().await;
+        let (turn, other): (i64, i64) = {
+            let first = sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, chat_id, stdout, created_at)
+                 VALUES ('corre os testes', 'completed', 'assistant', 'steered', 'feito', '2026-08-20T10:00:00Z')",
+            )
+            .execute(&state.pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            let second = sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, chat_id, stdout, created_at)
+                 VALUES ('e agora?', 'completed', 'assistant', 'steered', 'ok', '2026-08-20T10:05:00Z')",
+            )
+            .execute(&state.pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            (first, second)
+        };
+        sqlx::query(
+            "INSERT INTO chat_said_now (chat_id, run_id, text, origin, created_at)
+             VALUES ('steered', ?, 'e tambem o lint', 'shell', '2026-08-20T10:00:30Z')",
+        )
+        .bind(turn)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/steered")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        let turns = body["turns"].as_array().unwrap();
+        let of = |id: i64| {
+            turns
+                .iter()
+                .find(|t| t["id"] == id)
+                .unwrap_or_else(|| panic!("turn {id} in the transcript"))
+        };
+        assert_eq!(of(turn)["said_now"][0]["text"], "e tambem o lint");
+        assert_eq!(
+            of(turn)["said_now"][0]["created_at"],
+            "2026-08-20T10:00:30Z"
+        );
+        assert_eq!(of(turn)["said_now"].as_array().map(Vec::len), Some(1));
+        // Under its own turn only; the run id is how it is matched and is not sent.
+        assert!(of(turn)["said_now"][0].get("run_id").is_none());
+        assert_eq!(of(other)["said_now"].as_array().map(Vec::len), Some(0));
     }
 
     /// The measurement reaches the window, or the column that stores it is write-only.
@@ -35455,6 +36073,82 @@ mod tests {
         assert_eq!(row["status"], "escalated");
     }
 
+    async fn vcs_status_of(pool: &sqlx::SqlitePool, id: i64) -> String {
+        sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_owner_approves_a_paused_merge_once() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let paused = vcs_row_in(&pool, "feat/a", "awaiting_owner").await;
+        let escalated = vcs_row_in(&pool, "feat/b", "escalated").await;
+
+        let uri = format!("/vcs/requests/{paused}/approve");
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(vcs_status_of(&pool, paused).await, "queued");
+
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(status, StatusCode::CONFLICT, "a second approval is refused");
+        let (status, _) = waiting_call(&state, "POST", "/vcs/requests/999999/approve").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = waiting_call(
+            &state,
+            "POST",
+            &format!("/vcs/requests/{escalated}/approve"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "an escalated row is not waiting for the owner"
+        );
+        assert_eq!(vcs_status_of(&pool, escalated).await, "escalated");
+    }
+
+    #[tokio::test]
+    async fn the_owner_refuses_a_paused_merge() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let paused = vcs_row_in(&pool, "feat/a", "awaiting_owner").await;
+
+        let uri = format!("/vcs/requests/{paused}/refuse");
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(vcs_status_of(&pool, paused).await, "rejected");
+
+        let (status, _) = waiting_call(&state, "POST", &uri).await;
+        assert_eq!(status, StatusCode::CONFLICT, "a second refusal is refused");
+    }
+
+    #[tokio::test]
+    async fn a_paused_merge_is_on_the_waiting_page() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let paused = vcs_row_in(&pool, "feat/a", "awaiting_owner").await;
+
+        let (status, listing) = waiting_call(&state, "GET", "/waiting/git").await;
+        assert_eq!(status, StatusCode::OK);
+        let found = listing
+            .as_array()
+            .expect("a JSON array of request summaries")
+            .iter()
+            .any(|row| row["id"].as_i64() == Some(paused) && row["status"] == "awaiting_owner");
+        assert!(found, "the paused row is listed with its status");
+
+        let (status, counted) = waiting_call(&state, "GET", "/waiting/count").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            counted["git"], 1,
+            "the paused row counts as a person wanted"
+        );
+    }
+
     #[tokio::test]
     async fn list_proposals_returns_pending_action_approvals() {
         let state = test_state().await;
@@ -37879,5 +38573,44 @@ mod tests {
             after.status, "pending",
             "the decision must not have been made"
         );
+    }
+
+    /// Ambient MCP servers are offered only where the conversation has a project to govern them in.
+    ///
+    /// 400 and not a silent no-op: an unrooted conversation always runs MCP-only, so a stored "on"
+    /// would be a promise nothing keeps. The read side then reports what was stored.
+    #[tokio::test]
+    async fn ambient_mcp_is_only_offered_to_a_conversation_with_a_project() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &chat_id, r#"{"ambient_mcp":true}"#).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            !crate::chats::ambient_mcp_of(&state.pool, &chat_id)
+                .await
+                .unwrap()
+        );
+
+        let root = tempfile::TempDir::new().unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, root.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            patch_chat_request(state.clone(), &chat_id, r#"{"ambient_mcp":true}"#).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let response = project_request(state.clone(), &chat_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let project: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(project["ambient_mcp"], serde_json::json!(true));
     }
 }

@@ -43,12 +43,48 @@ pub struct ChatNotice {
     pub from_agent_id: String,
     pub from_run_id: i64,
     pub body: String,
+    /// `department` (the default), `restart` or `untrusted`.
+    pub kind: String,
     pub created_at: String,
 }
 
+/// A chat turn the daemon's restart cut short.
+pub const KIND_RESTART: &str = "restart";
+/// A rooted turn that has just read third-party text and is read-only from here on.
+pub const KIND_UNTRUSTED: &str = "untrusted";
+/// What a `restart` notice says.
+pub const RESTART_NOTICE: &str = "The daemon restarted during this turn; the session is intact.";
+/// What an `untrusted` notice says.
+pub const UNTRUSTED_NOTICE: &str = "This turn read third-party text. From now on only reads are allowed in it, and the session will be rotated when the turn ends.";
+
 /// Named once so the readers below cannot drift into selecting different shapes of the same row.
 const NOTICE_COLUMNS: &str =
-    "id, chat_id, team_run_id, from_agent_id, from_run_id, body, created_at";
+    "id, chat_id, team_run_id, from_agent_id, from_run_id, body, kind, created_at";
+
+/// Files a note from NucleOS itself (not a department) in a conversation.
+///
+/// `team_run_id` is empty, so `team.rs`, which counts by it, never counts one as a department's.
+pub async fn post_system(
+    pool: &SqlitePool,
+    chat_id: &str,
+    kind: &str,
+    from_run_id: i64,
+    body: &str,
+) -> sqlx::Result<i64> {
+    Ok(sqlx::query(
+        "INSERT INTO chat_notices
+             (chat_id, team_run_id, from_agent_id, from_run_id, body, kind, created_at)
+         VALUES (?, '', 'nucleos', ?, ?, ?, ?)",
+    )
+    .bind(chat_id)
+    .bind(from_run_id)
+    .bind(body)
+    .bind(kind)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?
+    .last_insert_rowid())
+}
 
 /// Files the words in a conversation. Nothing is woken and nothing is spent.
 ///
@@ -205,5 +241,111 @@ mod tests {
 
         assert_eq!(unread(&pool, "c-1").await, 0);
         assert!(for_chat(&pool, "c-1").await.unwrap().is_empty());
+    }
+
+    /// A running turn row for a chat (mode `assistant`) or any other run; returns its id.
+    async fn a_running_run(pool: &SqlitePool, mode: &str, chat_id: Option<&str>) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('p', 'running', ?, ?, ?)",
+        )
+        .bind(mode)
+        .bind(chat_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// A restart tells the chat which turn it cut, exactly once, and tells no chat about a run
+    /// that never belonged to one.
+    #[tokio::test]
+    async fn a_restart_leaves_a_continue_notice_on_the_chat_turn_it_cut() {
+        let pool = test_pool().await;
+        a_chat(&pool, "c-1").await;
+        let turn = a_running_run(&pool, "assistant", Some("c-1")).await;
+        let other = a_running_run(&pool, "worktree", None).await;
+
+        crate::runs::reconcile_orphaned_runs(&pool).await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(turn)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "interrupted");
+
+        let told = for_chat(&pool, "c-1").await.unwrap();
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].kind, KIND_RESTART);
+        assert_eq!(told[0].from_run_id, turn);
+        assert_eq!(told[0].body, RESTART_NOTICE);
+
+        let notices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_notices")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            notices, 1,
+            "the non-chat run {other} must not be announced anywhere"
+        );
+    }
+
+    /// The first read of third-party text in a rooted turn is announced; the second is not.
+    #[tokio::test]
+    async fn a_rooted_turn_reading_third_party_text_is_told_once() {
+        let pool = test_pool().await;
+        a_chat(&pool, "c-1").await;
+        crate::chats::set_cwd(&pool, "c-1", "C:/x").await.unwrap();
+        let turn = a_running_run(&pool, "assistant", Some("c-1")).await;
+
+        crate::runs::mark_untrusted_context(&pool, turn)
+            .await
+            .unwrap();
+        crate::runs::mark_untrusted_context(&pool, turn)
+            .await
+            .unwrap();
+
+        let told = for_chat(&pool, "c-1").await.unwrap();
+        assert_eq!(told.len(), 1, "only the first mark of a turn notifies");
+        assert_eq!(told[0].kind, KIND_UNTRUSTED);
+        assert_eq!(told[0].from_run_id, turn);
+        assert_eq!(told[0].body, UNTRUSTED_NOTICE);
+    }
+
+    /// An unrooted conversation has no barrier to announce, so it gets no notice.
+    #[tokio::test]
+    async fn an_unrooted_turn_reading_third_party_text_gets_no_notice() {
+        let pool = test_pool().await;
+        a_chat(&pool, "c-1").await;
+        let turn = a_running_run(&pool, "assistant", Some("c-1")).await;
+
+        crate::runs::mark_untrusted_context(&pool, turn)
+            .await
+            .unwrap();
+
+        assert!(for_chat(&pool, "c-1").await.unwrap().is_empty());
+        let marked: i64 = sqlx::query_scalar("SELECT read_untrusted FROM runs WHERE id = ?")
+            .bind(turn)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(marked, 1, "the mark itself is still written");
+    }
+
+    /// A department's notice keeps reading back as a department's, whatever kinds exist beside it.
+    #[tokio::test]
+    async fn a_departments_notice_reads_back_as_a_department() {
+        let pool = test_pool().await;
+        a_chat(&pool, "c-1").await;
+
+        post(&pool, "c-1", "tr-1", "director", 4, "a word from the team")
+            .await
+            .unwrap();
+
+        let told = for_chat(&pool, "c-1").await.unwrap();
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].kind, "department");
     }
 }

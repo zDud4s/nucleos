@@ -472,6 +472,26 @@ pub struct LaterTurn {
     pub text: String,
     /// Empty for almost every turn, and the reason this is a struct rather than a `String`.
     pub images: Vec<Attachment>,
+    /// True writes a `control_request` interrupt instead of a user turn; text and images are ignored.
+    pub interrupt: bool,
+}
+
+/// One line of `--input-format stream-json` stdin that interrupts the running turn.
+///
+/// Measured in `.ai/spikes/2026-10-05-chat-cli-control.md` (a): the CLI ends the turn in about 30 ms
+/// and the process and session survive. Every request carries an id of its own, because
+/// `control_response` echoes it and two interrupts sharing one could not be told apart.
+pub(crate) fn interrupt_line() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut line = serde_json::json!({
+        "type": "control_request",
+        "request_id": format!("nucleos-interrupt-{n}"),
+        "request": { "subtype": "interrupt" },
+    })
+    .to_string();
+    line.push('\n');
+    line
 }
 
 /// One line of `--input-format stream-json` stdin: a single user turn.
@@ -1003,6 +1023,62 @@ fn final_api_error(stdout: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 pub(crate) const REVIEW_THAT_NEVER_REACHED_THE_API: &str = r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":614,"error_status":null,"error":"unknown","session_id":"f4a94b9c-f0fe-484b-9514-9fefa640a6b6"}
 {"stop_reason":"stop_sequence","session_id":"f4a94b9c-f0fe-484b-9514-9fefa640a6b6","total_cost_usd":0,"terminal_reason":"api_error","is_error":true,"num_turns":1,"subtype":"success","api_error_status":null,"result":"API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)","type":"result","duration_ms":172362}"#;
+
+/// The text of the user line the CLI writes into the stream when a turn is interrupted.
+pub(crate) const INTERRUPT_MARKER: &str = "[Request interrupted by user]";
+
+/// Whether a stream-json transcript ended on a turn the person interrupted, as opposed to one that
+/// failed.
+///
+/// Both halves are needed and neither is enough alone: the CLI writes a user line carrying
+/// [`INTERRUPT_MARKER`], and the LAST `result` event says `error_during_execution`. A failed turn
+/// has the second without the first; an earlier interrupt followed by a later failure has the first
+/// but a different last result.
+pub(crate) fn interrupted_by_user(stdout: &str) -> bool {
+    // The marker only counts when it sits AFTER the previous result line and before the last one,
+    // so it is cleared whenever a result closes a turn.
+    let mut marked = false;
+    let mut last_result: Option<String> = None;
+    let mut marked_before_last = false;
+    for line in stdout.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match event.get("type").and_then(|kind| kind.as_str()) {
+            Some("user") => {
+                let said = event
+                    .pointer("/message/content")
+                    .and_then(|content| content.as_array())
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block.get("text").and_then(|text| text.as_str())
+                                == Some(INTERRUPT_MARKER)
+                        })
+                    });
+                marked = marked || said;
+            }
+            Some("result") => {
+                marked_before_last = marked;
+                marked = false;
+                last_result = event
+                    .get("subtype")
+                    .and_then(|subtype| subtype.as_str())
+                    .map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+    marked_before_last && last_result.as_deref() == Some("error_during_execution")
+}
+
+/// A turn interrupted half way, as the CLI 2.1.280 wrote it in the spike: the partial answer, the
+/// `control_response` to the request, the user line carrying the marker, and an
+/// `error_during_execution` result. Shared with `assistant.rs`, whose fake answers with it.
+#[cfg(test)]
+pub(crate) const INTERRUPTED_TURN: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"half an answer"}]}}
+{"type":"control_response","response":{"subtype":"success","request_id":"nucleos-interrupt-1"}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}
+{"type":"result","subtype":"error_during_execution","is_error":true,"stop_reason":null,"num_turns":2,"errors":["[ede_diagnostic] result_type=user"],"total_cost_usd":0}"#;
 
 /// A turn as it stands PART WAY THROUGH: what has been written, and what is being done.
 #[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -3040,11 +3116,14 @@ impl CommandRunner for ClaudeCliRunner {
                     // Its own pictures, not none. The opening turn is no longer the only one
                     // anybody attaches anything to: a conversation that keeps its process makes
                     // every turn after the first arrive here.
-                    if stdin
-                        .write_all(user_message_line(&turn.text, &turn.images).as_bytes())
-                        .await
-                        .is_err()
-                    {
+                    //
+                    // An interrupt is not a turn: it is one control line and carries no text.
+                    let line = if turn.interrupt {
+                        interrupt_line()
+                    } else {
+                        user_message_line(&turn.text, &turn.images)
+                    };
+                    if stdin.write_all(line.as_bytes()).await.is_err() {
                         return;
                     }
                 }
@@ -4089,6 +4168,10 @@ pub struct FakeCommandRunner {
     /// tells it to leave the tree uncommitted and `merge_item` is what commits. A double that
     /// committed would put a fixture back to asserting something no code does.
     pub writes: std::sync::Mutex<Vec<(String, String, String)>>,
+    /// Test-only: whole answers the process gives with no line written to its stdin -- what the CLI
+    /// does when a background task ends between turns (spike 2026-10-05 (c)). Each string is one
+    /// answer's stdout; it is split into turn events like any other answer.
+    pub unprompted: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
 }
 
 #[cfg(test)]
@@ -4131,6 +4214,7 @@ impl CommandRunner for FakeCommandRunner {
     ) -> std::io::Result<RunOutcome> {
         // Taken before the request is handed over, because the request is what carries it.
         let mut later = request.messages.take();
+        let mut unprompted = self.unprompted.lock().unwrap().take();
         let outcome = self.run_prompt(request, session_tx, transcript).await?;
 
         let Some(turn_events) = turn_events else {
@@ -4167,13 +4251,63 @@ impl CommandRunner for FakeCommandRunner {
         if let Some(later) = later.as_mut() {
             // Stays alive until its stdin closes, exactly as the process does — which is what makes
             // a test of "the second turn reused the process" mean anything.
-            while let Some(turn) = later.recv().await {
+            'turns: loop {
+                // `heard` rather than acting inside the select arm, so nothing borrows `unprompted`
+                // while it is reassigned.
+                let mut heard: Option<Option<String>> = None;
+                let turn = match unprompted.as_mut() {
+                    Some(spoken) => tokio::select! {
+                        turn = later.recv() => turn,
+                        said = spoken.recv() => {
+                            heard = Some(said);
+                            None
+                        }
+                    },
+                    None => later.recv().await,
+                };
+                match heard {
+                    Some(Some(stdout)) => {
+                        answer(&stdout);
+                        continue;
+                    }
+                    Some(None) => {
+                        unprompted = None;
+                        continue;
+                    }
+                    None => {}
+                }
+                let Some(turn) = turn else { break };
+                let interrupt = turn.interrupt;
                 self.later_turns.lock().unwrap().push(turn);
+                // An interrupt with no turn in flight is recorded and answers nothing, as the
+                // real CLI does for one that arrives between turns.
+                if interrupt {
+                    continue;
+                }
                 // A process that does not answer instantly, so a test can catch a turn in flight.
                 // The delay is the same knob a hung one-shot run uses.
                 let waiting = *self.delay.lock().unwrap();
                 if let Some(waiting) = waiting {
-                    tokio::time::sleep(waiting).await;
+                    let sleep = tokio::time::sleep(waiting);
+                    tokio::pin!(sleep);
+                    loop {
+                        tokio::select! {
+                            () = &mut sleep => break,
+                            next = later.recv() => match next {
+                                // A line written mid-turn is folded into it: recorded, no answer.
+                                Some(next) if !next.interrupt => {
+                                    self.later_turns.lock().unwrap().push(next);
+                                }
+                                // An interrupt ends the turn in flight with the interrupted result.
+                                Some(next) => {
+                                    self.later_turns.lock().unwrap().push(next);
+                                    answer(INTERRUPTED_TURN);
+                                    continue 'turns;
+                                }
+                                None => break 'turns,
+                            },
+                        }
+                    }
                 }
                 answer(&outcome.stdout);
             }
@@ -5274,6 +5408,7 @@ mod tests {
                     .send(LaterTurn {
                         text: "Reply with the single word two.".to_owned(),
                         images: Vec::new(),
+                        interrupt: false,
                     })
                     .unwrap();
             } else {
@@ -5742,6 +5877,66 @@ mod tests {
             value.pointer("/message/content").unwrap(),
             "arranja o parser"
         );
+    }
+
+    /// An interrupt is ONE `control_request` line, and every one carries an id of its own.
+    ///
+    /// The id is how the CLI answers a request (`control_response` echoes it), so two interrupts
+    /// sharing one would make the second unanswerable. One line, because stdin is newline-delimited.
+    #[test]
+    fn the_interrupt_is_one_control_request_line_with_its_own_id() {
+        let first = interrupt_line();
+        let second = interrupt_line();
+
+        assert!(first.ends_with('\n'));
+        assert_eq!(first.trim_end().lines().count(), 1);
+
+        let a: serde_json::Value = serde_json::from_str(first.trim()).unwrap();
+        let b: serde_json::Value = serde_json::from_str(second.trim()).unwrap();
+        assert_eq!(a["type"], "control_request");
+        assert_eq!(a.pointer("/request/subtype").unwrap(), "interrupt");
+        assert_eq!(b["type"], "control_request");
+        assert_eq!(b.pointer("/request/subtype").unwrap(), "interrupt");
+
+        let id_a = a["request_id"].as_str().expect("a request_id");
+        let id_b = b["request_id"].as_str().expect("a request_id");
+        assert!(id_a.starts_with("nucleos-interrupt-"));
+        assert!(id_b.starts_with("nucleos-interrupt-"));
+        assert_ne!(id_a, id_b);
+    }
+
+    /// A turn that ended because the person stopped it reads differently from one that failed.
+    ///
+    /// Both end in `error_during_execution`; what separates them is the user line the CLI writes
+    /// first, `[Request interrupted by user]`. Neither alone is enough.
+    #[test]
+    fn an_interrupted_turn_is_told_apart_from_a_failed_one() {
+        let marker = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": INTERRUPT_MARKER}]}
+        })
+        .to_string();
+        let answer = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"half an answer"}]}}"#;
+        let interrupted_result = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"stop_reason":null,"num_turns":2,"total_cost_usd":0}"#;
+        let failed_result = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"total_cost_usd":0}"#;
+        let ok_result =
+            r#"{"type":"result","subtype":"success","result":"done","total_cost_usd":0}"#;
+
+        // The marker followed by the error result: stopped by the person.
+        assert!(interrupted_by_user(&format!(
+            "{answer}\n{marker}\n{interrupted_result}"
+        )));
+        // The same error with no marker: a failure.
+        assert!(!interrupted_by_user(&format!("{answer}\n{failed_result}")));
+        // The marker, but the turn went on to succeed: not a stop.
+        assert!(!interrupted_by_user(&format!("{marker}\n{ok_result}")));
+        // The marker with no result at all: nothing has ended yet.
+        assert!(!interrupted_by_user(&format!("{answer}\n{marker}")));
+        // The LAST result decides: an earlier interrupted turn does not colour a later failure.
+        assert!(!interrupted_by_user(&format!(
+            "{marker}\n{interrupted_result}\n{failed_result}"
+        )));
+        assert!(!interrupted_by_user(""));
     }
 
     /// One line of a `--include-partial-messages` stream: a slice of text as it is typed.

@@ -47,6 +47,7 @@ import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, StateBadge } from
 export function MachineSettings() {
   const config = useMachineConfig();
   const secrets = useMachineSecrets();
+  const [chosen, setChosen] = useState<string | null>(null);
 
   if (config.isPending) return <p className="sy-loading">reading this machine's settings…</p>;
   if (config.error) {
@@ -54,30 +55,70 @@ export function MachineSettings() {
     return <ErrorNote>the núcleo did not answer — nothing is known about this machine's settings</ErrorNote>;
   }
 
+  const area = chosen ?? config.data.settings[0]?.area ?? null;
+
   return (
     <>
-      <Panel title="This machine">
-        <p className="sy-note">
-          These files belong to the daemon rather than to any project, and they live in your{" "}
-          <code>{config.data.root_display}</code> folder. Every one of them is validated before a byte is written: a
-          file that would not parse is refused with the parser's own words, and what is on disk is
-          left alone.
-        </p>
-        <dl className="sy-config-facts">
-          <div className="sy-fact">
-            <dt>folder</dt>
-            <dd>{config.data.root}</dd>
-          </div>
-        </dl>
-      </Panel>
+      {/* The folder, as one line above the files rather than a panel of its own. */}
+      <p className="sy-machine-intro">
+        These files belong to the daemon rather than to any project, and live in{" "}
+        <code className="sy-machine-root" title={config.data.root}>
+          {config.data.root}
+        </code>
+        . Each is validated before a byte is written: a file that would not parse is refused with
+        the parser's own words, and what is on disk is left alone.
+      </p>
 
-      {config.data.settings.map((setting) => (
-        <SettingPanel
-          key={setting.path}
-          setting={setting}
-          secrets={(secrets.data?.secrets ?? []).filter((row) => row.area === setting.area)}
-        />
-      ))}
+      {/*
+        A list of the files and one of them open, rather than nine editors stacked. Every panel
+        stays mounted and only the chosen one is shown, so a half-written file survives a look
+        at another one.
+      */}
+      <div className="sy-settings">
+        <ul className="sy-settings-list" aria-label="Settings files">
+          {config.data.settings.map((setting) => {
+            const own = (secrets.data?.secrets ?? []).filter((row) => row.area === setting.area);
+            const current = setting.area === area;
+            return (
+              <li key={setting.path}>
+                <button
+                  type="button"
+                  className={current ? "sy-settings-item sy-settings-item-current" : "sy-settings-item"}
+                  aria-current={current ? "true" : undefined}
+                  onClick={() => setChosen(setting.area)}
+                >
+                  <span className="sy-settings-item-name">{setting.area}</span>
+                  {/* Two dots, file and credential: filled when there is one, hollow when not. */}
+                  <span className="sy-settings-item-marks">
+                    <span
+                      className={setting.exists ? "sy-mark sy-mark-on" : "sy-mark"}
+                      title={setting.exists ? "file written" : "file never written"}
+                    />
+                    {own.map((secret) => (
+                      <span
+                        key={secret.key}
+                        className={secret.present === true ? "sy-mark sy-mark-key sy-mark-on" : "sy-mark sy-mark-key"}
+                        title={`${secret.key}: ${secret.present === true ? "set" : secret.present === false ? "not set" : "unknown"}`}
+                      />
+                    ))}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+
+        <div className="sy-settings-detail">
+          {config.data.settings.map((setting) => (
+            <div key={setting.path} hidden={setting.area !== area}>
+              <SettingPanel
+                setting={setting}
+                secrets={(secrets.data?.secrets ?? []).filter((row) => row.area === setting.area)}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
     </>
   );
 }
@@ -111,10 +152,6 @@ function SettingPanel({
     >
       <p className="sy-note">{setting.what}</p>
 
-      {secrets.map((secret) => (
-        <SecretControl key={secret.key} secret={secret} />
-      ))}
-
       <dl className="sy-config-facts">
         <div className="sy-fact">
           <dt>file</dt>
@@ -133,7 +170,7 @@ function SettingPanel({
         id={`setting-${setting.area}`}
         className="sy-setting-editor"
         spellCheck={false}
-        rows={8}
+        rows={14}
         value={draft}
         placeholder={
           setting.exists
@@ -170,6 +207,12 @@ function SettingPanel({
         ) : (
           <ErrorNote>the núcleo did not answer — nothing was written</ErrorNote>
         ))}
+
+      {/* After the file, not before it: the credential is the second half of the same
+          decision, and above the file it pushed every editor in the grid out of line. */}
+      {secrets.map((secret) => (
+        <SecretControl key={secret.key} secret={secret} />
+      ))}
     </Panel>
   );
 }
@@ -195,7 +238,9 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
   return (
     <div className="sy-secret">
       <div className="sy-secret-head">
-        <span className="sy-secret-key">{secret.key}</span>
+        <span className="sy-secret-key" title={secret.what}>
+          {secret.key}
+        </span>
         {/* "unknown" is not the same as "not set", and acting on the two differs: one wants a
             credential pasted, the other wants somebody to look at the store. */}
         <StateBadge
@@ -203,7 +248,7 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
           state={secret.present === true ? "set" : secret.present === false ? "unset" : "unknown"}
         />
       </div>
-      <p className="sy-note">{secret.what}</p>
+      <p className="sy-field-hint">{secret.what}</p>
       <div className="sy-setting-controls">
         <input
           type="password"
@@ -237,7 +282,9 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
             intent="stop"
             label="Forget"
             confirmLabel="Forget it"
-            subject={secret.key}
+            /* Said, not drawn: the key is on the line above, and drawn into the armed
+               label it made the button wider than the box it is for. */
+            sayAs={`Forget ${secret.key}`}
             onConfirm={() => {
               forget.mutate(secret.key);
             }}

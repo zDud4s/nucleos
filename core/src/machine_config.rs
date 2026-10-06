@@ -87,6 +87,7 @@ pub const TELEGRAM_FILE: &str = "telegram.yaml";
 pub const GITHUB_FILE: &str = "github.yaml";
 pub const COUNCIL_FILE: &str = "council.yaml";
 pub const ROUTER_FILE: &str = "router.yaml";
+pub const DEVTIME_FILE: &str = "devtime.yaml";
 
 /// One of this machine's settings files, with everything a caller needs to act on it safely.
 ///

@@ -453,6 +453,11 @@ pub struct Answering {
     /// arrives carrying context somebody else's session filled, and a window smaller than what it
     /// already holds is a window that compacts its past away on the very first turn.
     pub context_window: Option<i64>,
+    /// Whether this conversation's turns may use the MCP servers the user's own CLI config names.
+    ///
+    /// Off by default, and only ever turned on for a conversation with a project: a rooted chat
+    /// always runs `--strict-mcp-config`, so the ambient servers are missing unless somebody opts in.
+    pub ambient_mcp: bool,
 }
 
 /// Which model answers this conversation, and how hard it is asked to think.
@@ -534,20 +539,32 @@ type AnsweringRow = (
     Option<String>, // denied_tools
     Option<String>, // title
     Option<i64>,    // context_window
+    i64,            // ambient_mcp
 );
 
 pub async fn answering(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Answering> {
     let found: Option<AnsweringRow> = sqlx::query_as(
         "SELECT model, effort, fallback_model, extra_dirs, turn_budget_usd, agents,
-                system_prompt, denied_tools, title, context_window
+                system_prompt, denied_tools, title, context_window, ambient_mcp
            FROM chats WHERE chat_id = ?",
     )
     .bind(chat_id)
     .fetch_optional(pool)
     .await?;
 
-    let Some((model, effort, fallback, dirs, ceiling, agents, instructions, denied, title, window)) =
-        found
+    let Some((
+        model,
+        effort,
+        fallback,
+        dirs,
+        ceiling,
+        agents,
+        instructions,
+        denied,
+        title,
+        window,
+        ambient,
+    )) = found
     else {
         return Ok(Answering::default());
     };
@@ -590,7 +607,44 @@ pub async fn answering(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Answeri
         // By characters and not bytes, because a cut mid-character is not a shorter name.
         session_name: title.map(|name| name.chars().take(120).collect::<String>()),
         context_window: window,
+        ambient_mcp: ambient != 0,
     })
+}
+
+/// Whether this conversation has opted in to the user's ambient MCP servers. Off when unknown.
+pub async fn ambient_mcp_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<bool> {
+    let found: Option<bool> =
+        sqlx::query_scalar::<_, bool>("SELECT ambient_mcp FROM chats WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(found.unwrap_or(false))
+}
+
+/// Turns the ambient MCP servers on or off for this conversation.
+pub async fn set_ambient_mcp(pool: &SqlitePool, chat_id: &str, on: bool) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chats SET ambient_mcp = ? WHERE chat_id = ?")
+        .bind(on)
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Whether the conversation a run belongs to has opted in to ambient MCP servers.
+///
+/// Read by the hook at call time. A missing run, a run with no conversation or a failed read all
+/// answer off, which is the fail-closed direction.
+pub async fn ambient_mcp_for_run(pool: &SqlitePool, run_id: i64) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT c.ambient_mcp FROM runs r JOIN chats c ON c.chat_id = r.chat_id WHERE r.id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
 }
 
 /// Widens this conversation's context window to hold what it is about to be given.
@@ -1976,5 +2030,37 @@ mod tests {
             refused.is_err(),
             "a cloud judge would launch a CLI whose tool calls re-enter the hook that asked"
         );
+    }
+
+    /// Ambient MCP servers are the owner's per-conversation choice and start off.
+    ///
+    /// Read three ways because three readers exist: the per-turn `answering`, the plain
+    /// `ambient_mcp_of`, and the by-run lookup the hook uses at call time.
+    #[tokio::test]
+    async fn ambient_mcp_is_off_until_a_conversation_turns_it_on() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+        seed_run(&pool, &id, "running", None).await;
+        let run_id: i64 = sqlx::query_scalar("SELECT id FROM runs WHERE chat_id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert!(!answering(&pool, &id).await.unwrap().ambient_mcp);
+        assert!(!ambient_mcp_of(&pool, &id).await.unwrap());
+        assert!(!ambient_mcp_for_run(&pool, run_id).await);
+
+        set_ambient_mcp(&pool, &id, true).await.unwrap();
+        assert!(answering(&pool, &id).await.unwrap().ambient_mcp);
+        assert!(ambient_mcp_of(&pool, &id).await.unwrap());
+        assert!(ambient_mcp_for_run(&pool, run_id).await);
+
+        set_ambient_mcp(&pool, &id, false).await.unwrap();
+        assert!(!answering(&pool, &id).await.unwrap().ambient_mcp);
+        assert!(!ambient_mcp_for_run(&pool, run_id).await);
+
+        // A run that belongs to no conversation reads as off, which is the fail-closed answer.
+        assert!(!ambient_mcp_for_run(&pool, 999_999).await);
     }
 }

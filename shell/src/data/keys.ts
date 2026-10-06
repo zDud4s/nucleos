@@ -209,6 +209,8 @@ export const keys = {
     mapSilenced: (projectId: string) => ["projects", projectId, "map", "silenced"] as const,
     /** The write boundary. Under the roster prefix, so one write invalidates it with everything else. */
     ownership: (projectId: string) => ["projects", projectId, "ownership"] as const,
+    /** The project's `nucleos.tests.yaml` and the map the daemon proposes. */
+    testsMap: (projectId: string) => ["projects", projectId, "tests-map"] as const,
     /**
      * The text of one file inside that boundary, read from wherever the daemon keeps it. Under the
      * same prefix, so the write that changes it invalidates it.

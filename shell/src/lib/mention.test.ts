@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { commandAt, mentionAt, withCommand, withMention } from "./mention";
+import { commandAt, mentionAt, orchestrateTask, withCommand, withMention } from "./mention";
 
 /* ------------------------------------------------------------- mentionAt -- */
 
@@ -131,5 +131,20 @@ describe("withCommand", () => {
 
     expect(next.text).toBe("/commit  tudo");
     expect(next.caret).toBe(8);
+  });
+});
+
+/* ------------------------------------------------------- orchestrateTask -- */
+
+describe("orchestrateTask", () => {
+  it("reads the task out of /orchestrate <task> and nothing else", () => {
+    expect(orchestrateTask("/orchestrate fix the login")).toBe("fix the login");
+    expect(orchestrateTask("  /orchestrate   fix it\nand the logout  ")).toBe("fix it\nand the logout");
+    // No task is not a request, and a longer command name is another command.
+    expect(orchestrateTask("/orchestrate")).toBeNull();
+    expect(orchestrateTask("/orchestrate   ")).toBeNull();
+    expect(orchestrateTask("/orchestrated fix")).toBeNull();
+    expect(orchestrateTask("please /orchestrate fix")).toBeNull();
+    expect(orchestrateTask("fix the login")).toBeNull();
   });
 });

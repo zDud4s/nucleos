@@ -101,3 +101,19 @@ export function withCommand(text: string, at: Mentioning, name: string): Written
     caret: at.from + written.length,
   };
 }
+
+/**
+ * The task out of `/orchestrate <task>`, or null for anything else (an empty task included).
+ */
+export function orchestrateTask(text: string): string | null {
+  const found = /^\/orchestrate(?:\s+([\s\S]*))?$/.exec(text.trim());
+  const task = found?.[1]?.trim() ?? "";
+  return task === "" ? null : task;
+}
+
+/** The request a rooted chat sends for an `/orchestrate` task. */
+export function orchestratePrompt(task: string): string {
+  return `Use the orchestrate skill to run this task:
+
+${task}`;
+}

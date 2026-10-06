@@ -254,6 +254,13 @@ export interface RunSearchResult {
   advised_model?: string | null;
   advised_effort?: string | null;
   route_failed?: string | null;
+  chat_id?: string | null;
+  /** Only on a row `GET /runs?group=chat` folded: the conversation's title. */
+  chat_title?: string | null;
+  /** Only on a folded row: how many turns the conversation has. */
+  turns?: number | null;
+  /** Only on a folded row: how many of those turns are running now. */
+  running_turns?: number | null;
 }
 
 /**

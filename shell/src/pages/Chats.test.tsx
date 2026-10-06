@@ -330,7 +330,18 @@ function chatsFetch(
       if (told !== undefined) told.tools = true;
       return undefined;
     }
-    const files = /^\/assistant\/chats\/([^/?]+)\/files\?q=(.*)$/.exec(path);
+    const seedChat = /^\/assistant\/chats\/([^/?]+)\/workflow$/.exec(path);
+    if (seedChat !== null && init?.method === "POST") {
+      // What the daemon does: the workflow is copied in and the hook wired, so the next read says
+      // both.
+      const told = opts.projects?.[decodeURIComponent(seedChat[1])];
+      if (told !== undefined) {
+        (told as { workflow_missing?: boolean }).workflow_missing = false;
+        told.tools = true;
+      }
+      return undefined;
+    }
+    const files =/^\/assistant\/chats\/([^/?]+)\/files\?q=(.*)$/.exec(path);
     if (files !== null) {
       const offered = opts.files?.[decodeURIComponent(files[1])];
       if (offered === undefined) return { rooted: false, hits: [], truncated: false };
@@ -920,6 +931,155 @@ describe("Chats - what a department said", () => {
     // The count of turns is untouched by it: two unread answers are still two, not three.
     expect(screen.getByRole("link", { name: /aqui, cloud, .+, 2 unread, 1 from a team$/ })).toBeDefined();
     expect(screen.getByRole("link", { name: /ali, cloud, .+, 2 unread$/ })).toBeDefined();
+  });
+});
+
+describe("Chats - notices from NucleOS", () => {
+  /** A notice as the daemon sends one, `kind` set. */
+  function nucleosNotice(overrides: Partial<ChatNotice> = {}): ChatNotice {
+    return {
+      id: 1,
+      chat_id: "c-1",
+      team_run_id: "",
+      from_agent_id: "",
+      from_run_id: 2,
+      body: "the daemon restarted while this turn was running",
+      created_at: "2026-08-26T10:00:00Z",
+      kind: "restart",
+      ...overrides,
+    };
+  }
+
+  function twoTurns(): AssistantTurnRow[] {
+    return [
+      turnRow({ id: 1, asked: "primeira", answer: "uma", created_at: "2026-08-26T09:00:00Z" }),
+      turnRow({
+        id: 2,
+        asked: "segunda",
+        answer: "",
+        status: "interrupted",
+        created_at: "2026-08-26T11:00:00Z",
+      }),
+    ];
+  }
+
+  it("offers to continue a turn a restart cut", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": twoTurns() }, {
+        notices: { "c-1": [nucleosNotice({ from_run_id: 2 })] },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(
+      within(transcript).getByText("the daemon restarted while this turn was running"),
+    ).toBeDefined();
+    fireEvent.click(await within(transcript).findByRole("button", { name: "Continue" }));
+
+    await waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/message" && call[1]?.method === "POST",
+      );
+      expect(sent).toBeDefined();
+      expect(JSON.parse(String((sent?.[1] as RequestInit).body)).text).toBe("continue");
+    });
+  });
+
+  it("offers no continue under an older turn", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": twoTurns() }, {
+        notices: { "c-1": [nucleosNotice({ from_run_id: 1 })] },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    // The notice itself is drawn; only its button is withheld. Waiting for the text first keeps
+    // the absence below from passing merely because nothing had rendered yet.
+    expect(
+      await within(transcript).findByText("the daemon restarted while this turn was running"),
+    ).toBeDefined();
+    expect(within(transcript).queryByRole("button", { name: "Continue" })).toBeNull();
+    // Still NucleOS speaking, not a department: no source link under an older turn either.
+    expect(within(transcript).queryByRole("link")).toBeNull();
+  });
+
+  it("announces a third-party read without naming a department", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": twoTurns() }, {
+        notices: {
+          "c-1": [
+            nucleosNotice({
+              kind: "untrusted",
+              from_agent_id: "director",
+              team_run_id: "tr-1",
+              body: "this turn read third-party content",
+            }),
+          ],
+        },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(transcript).getByText("this turn read third-party content")).toBeDefined();
+    expect(within(transcript).queryByRole("link")).toBeNull();
+    expect(within(transcript).queryByText(/said this while working/)).toBeNull();
+    expect(within(transcript).queryByRole("button", { name: "Continue" })).toBeNull();
+  });
+});
+
+describe("Chats - ambient MCP servers", () => {
+  function projectFor(overrides: Partial<ChatProject> = {}): ChatProject {
+    return {
+      cwd: "C:/Projects/demo",
+      tools: true,
+      session: null,
+      permission_mode: "auto",
+      ambient_mcp: false,
+      ...overrides,
+    };
+  }
+
+  it("is off by default and turns on with one click", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }, {
+        projects: { "c-1": projectFor() },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    const box = await screen.findByRole("menuitemcheckbox", { name: /Ambient MCP servers/ });
+    expect(box.getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(box);
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
+        method: "PATCH",
+        body: JSON.stringify({ ambient_mcp: true }),
+      });
+    });
+  });
+
+  it("is not offered to a conversation without tools", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }, {
+        projects: { "c-1": projectFor({ tools: false }) },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    // The menu is open once its other entries are there; the absence only means something then.
+    await screen.findByRole("menuitem", { name: /standing instructions/i });
+    expect(screen.queryByRole("menuitemcheckbox", { name: /Ambient MCP servers/ })).toBeNull();
   });
 });
 
@@ -2965,6 +3125,167 @@ describe("Chats - giving a conversation a project", () => {
     });
   });
 
+  // A worktree nobody seeded has neither the tools nor the workflow. Wiring the hook alone would
+  // leave the orchestrate skill missing, so the offer is the whole setup, and it overwrites, so it
+  // waits for a second click.
+  it("says a worktree without the workflow cannot use tools, and sets it up only after confirming", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/fresh-worktree",
+              tools: false,
+              session: null,
+              permission_mode: "auto",
+              workflow_missing: true,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByText(/never copied into/i)).toBeTruthy();
+    const seeded = () =>
+      daemon.apiFetch.mock.calls.some(
+        (call) =>
+          String(call[0]) === "/assistant/chats/c-1/workflow" && call[1]?.method === "POST",
+      );
+
+    fireEvent.click(screen.getByRole("button", { name: "Set up workflow" }));
+    expect(seeded()).toBe(false);
+
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: /copy it from the main checkout/i }));
+
+    await waitFor(() => expect(seeded()).toBe(true));
+    const post = daemon.apiFetch.mock.calls.find(
+      (call) => String(call[0]) === "/assistant/chats/c-1/workflow" && call[1]?.method === "POST",
+    );
+    expect(JSON.parse(String((post?.[1] as RequestInit).body))).toEqual({ confirm: true });
+    await waitFor(() => expect(screen.queryByText(/never copied into/i)).toBeNull());
+  });
+
+  // `/orchestrate x` is a shortcut, and the CLI's own slash expansion was only measured for
+  // `claude -p`, so the window says in words what it wants.
+  it("sends /orchestrate <task> as a request to run the orchestrate skill", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: null,
+              permission_mode: "auto",
+              workflow_missing: false,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    fireEvent.change(await screen.findByLabelText("Message"), {
+      target: { value: "/orchestrate fix the login" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(sentMessages()).toEqual([
+        { chat_id: "c-1", text: "Use the orchestrate skill to run this task:\n\nfix the login" },
+      ]),
+    );
+  });
+
+  it("does not send /orchestrate where the workflow or the tools are missing, and says why", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/fresh-worktree",
+              tools: false,
+              session: null,
+              permission_mode: "auto",
+              workflow_missing: true,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    // The project read has to land first: the guard reads it, and a send before it would pass.
+    expect(await screen.findByText(/never copied into/i)).toBeTruthy();
+    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "/orchestrate x" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(/orchestrate needs this conversation/i)).toBeTruthy();
+    expect(sentMessages()).toEqual([]);
+  });
+
+  it("does not send /orchestrate where the project has no tools even though its workflow is present", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/unwired" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/unwired",
+              tools: false,
+              session: null,
+              permission_mode: "auto",
+              workflow_missing: false,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    // The project read has to land first: the guard reads it, and a send before it would pass.
+    expect(await screen.findByRole("button", { name: "Give it the tools" })).toBeTruthy();
+    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "/orchestrate x" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(/orchestrate needs this conversation/i)).toBeTruthy();
+    expect(sentMessages()).toEqual([]);
+  });
+
+  it("says nothing about the workflow for a conversation in the main checkout", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+        {
+          projects: {
+            "c-1": {
+              cwd: "C:/Projects/nucleos",
+              tools: true,
+              session: null,
+              permission_mode: "auto",
+              workflow_missing: false,
+            },
+          },
+        },
+      ),
+    );
+    await renderChats("/chats/c-1");
+
+    expect(await screen.findByRole("list", { name: "Transcript" })).toBeTruthy();
+    expect(screen.queryByText(/never copied into/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Set up workflow" })).toBeNull();
+  });
+
   // The loop closes both ways and always did — the id simply appeared nowhere a person could read,
   // which made the way back one only somebody who reads the daemon could find.
   it("says how to carry the conversation on at a terminal", async () => {
@@ -4556,7 +4877,7 @@ describe("what a turn did", () => {
 /* ------------------------------------------------------ stopping a turn -- */
 
 describe("stopping a turn", () => {
-  it("offers to stop a turn that is running", async () => {
+  it("Stop interrupts the turn through the chat's own route", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1" })], {
         "c-1": [turnRow({ id: 1, status: "running", answer: null })],
@@ -4565,7 +4886,29 @@ describe("stopping a turn", () => {
 
     await renderChats("/chats/c-1");
 
-    fireEvent.click(await screen.findByRole("button", { name: /stop/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /^stop$/i }));
+
+    await waitFor(() =>
+      expect(
+        daemon.apiFetch.mock.calls.some(
+          (call) =>
+            String(call[0]) === "/assistant/turns/1/stop" &&
+            (call[1] as RequestInit | undefined)?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("Kill ends the turn and its process the old way", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: /^kill$/i }));
 
     // `apiText` and not `apiFetch`: cancel answers `200` with an empty body, and a JSON parse of
     // nothing is how that route used to fail.
@@ -4589,6 +4932,60 @@ describe("stopping a turn", () => {
 
     await screen.findByRole("list", { name: "Transcript" });
     expect(screen.queryByRole("button", { name: /stop/i })).toBeNull();
+  });
+});
+
+describe("saying it now", () => {
+  /** `chatsFetch`, answering the say-now route the way the daemon does. */
+  function withSayNow(transcripts: Record<string, AssistantTurnRow[]>) {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], transcripts);
+    return (path: string, init?: RequestInit) =>
+      path === "/assistant/chats/c-1/say-now" ? { said_now: true } : base(path, init);
+  }
+
+  it("sends into the running turn with Send now", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSayNow({ "c-1": [turnRow({ id: 1, status: "running", answer: null })] }) as never,
+    );
+
+    await renderChats("/chats/c-1");
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "use the other approach" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Send now" }));
+
+    await waitFor(() => {
+      const posted = daemon.apiFetch.mock.calls.find(
+        (call) => String(call[0]) === "/assistant/chats/c-1/say-now",
+      );
+      expect(posted?.[1]?.method).toBe("POST");
+      expect(JSON.parse(String(posted?.[1]?.body))).toEqual({ text: "use the other approach" });
+    });
+    await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe(""));
+  });
+
+  it("offers no Send now when no turn is running", async () => {
+    daemon.apiFetch.mockImplementation(withSayNow({ "c-1": [turnRow({ id: 1 })] }) as never);
+
+    await renderChats("/chats/c-1");
+
+    await screen.findByRole("list", { name: "Transcript" });
+    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "hello" } });
+    expect(screen.queryByRole("button", { name: "Send now" })).toBeNull();
+  });
+
+  it("draws what was said during a turn as the person's words", async () => {
+    // `said_now` is not on `AssistantTurnRow` until the shell packet lands, hence the cast.
+    const row = turnRow({
+      id: 1,
+      said_now: [{ text: "use the other approach", created_at: "2026-10-06T10:00:00Z" }],
+    } as Partial<AssistantTurnRow>);
+    daemon.apiFetch.mockImplementation(withSayNow({ "c-1": [row] }) as never);
+
+    await renderChats("/chats/c-1");
+
+    const list = await screen.findByRole("list", { name: "Transcript" });
+    expect(await within(list).findByText("use the other approach")).toBeTruthy();
   });
 });
 

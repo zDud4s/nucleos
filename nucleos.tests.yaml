@@ -1,0 +1,69 @@
+# Which tests each change in this repository needs, read by the NucleOS daemon
+# (spec .ai/specs/2026-10-05-selecao-de-testes-design.md §3.1).
+# Changing this file runs every group, and a direct edit by an agent asks the owner.
+version: 1
+tests:
+  groups:
+    core:
+      paths: [core/, Cargo.toml, Cargo.lock, rust-toolchain.toml]
+      check: cargo clippy -p nucleos-core --all-targets -- -D warnings
+      command: bash scripts/gates.sh core
+    sidecars:
+      paths: [sidecars/, scripts/build-sidecars.sh]
+      command: bash scripts/gates.sh sidecars
+    shell:
+      paths: [shell/, scripts/csp-gate.mjs]
+      command: bash scripts/gates.sh shell
+    tauri:
+      paths: [shell/src-tauri/]
+      command: bash scripts/gates.sh tauri
+    hooks:
+      paths:
+        - core/hooks/
+        # A byte copy of core/hooks/ask_daemon.py, held equal by test-hook-filter.py.
+        - .claude/hooks/ask_daemon.py
+        - scripts/test-hook-filter.py
+        - scripts/test-gates-summary.py
+        - scripts/own-cargo-target.sh
+        - scripts/test-own-cargo-target.py
+        - scripts/build-slot.sh
+        - scripts/test-build-slot.py
+        - scripts/run-daemon.ps1
+        - scripts/test-run-daemon.py
+        - scripts/refresh-models.py
+        - scripts/test-refresh-models.py
+      command: bash scripts/gates.sh hooks
+  gate_entrypoints: [scripts/gates.sh, scripts/gate-diff.sh]
+  tools:
+    cargo: { allow: [fmt, metadata, tree, add, remove, update, search] }
+    rustc: {}
+    go: { allow: [mod, list, env, version, fmt] }
+    tsc: {}
+    vitest: {}
+    npm: { allow: [install, ci, ls, view, outdated] }
+    npx: {}
+  warm:
+    CARGO_TARGET_DIR: { dir: target }
+    GOCACHE: { dir: 'shared:gocache' }
+  full_sweep: [scripts/gates.sh, scripts/gate-diff.sh, .github/workflows/]
+  no_test:
+    # Its tests live in the local workflow (.ai/), which is not versioned.
+    - scripts/heavy.py
+    - scripts/stage-bundle-bins.sh
+    - scripts/css-contract.mjs
+    - scripts/preview-shots.mjs
+    - scripts/preview-why.mjs
+    - scripts/csp-in-the-window.mjs
+    - scripts/tool-surface.mjs
+    - scripts/doctor.sh
+    - scripts/install-hooks.sh
+    - scripts/leave-nothing-behind.mjs
+    - scripts/update-shell.ps1
+    - docs/
+    - .gitignore
+    - .gitattributes
+    - .gitleaksignore
+    - LICENSE
+    - CONTRIBUTING.md
+    - README.md
+    - THREAT_MODEL.md

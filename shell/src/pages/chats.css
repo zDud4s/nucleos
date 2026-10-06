@@ -1524,6 +1524,12 @@
   min-width: 0;
 }
 
+/* The note under words said into a running turn; the muted voice of `.chats-held-why`. */
+.chats-turn-said-now-note {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 /* The label goes with the words it names. Only this one: `núcleo` stays where its answer is. */
 .chats-turn-who-you,
 .chats-said-who-you {

@@ -539,13 +539,16 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * `escalated` is a *normal outcome*: a person owns the conflict now, which is
    * the queue working, not the queue breaking. Dressing either as `failed`
    * sends somebody to debug a merge that behaved exactly as designed. `succeeded` is terminal
-   * success, so it is Stated Blue rather than Acting Green.
+   * success, so it is Stated Blue rather than Acting Green. `awaiting_owner` is a merge that
+   * changes the test map, held until you approve it; pending, like escalated, because it is yours
+   * to act on.
    */
   vcs: {
     succeeded: { tone: "info", label: "landed" },
     failed: { tone: "danger", label: "failed" },
     blocked: { tone: "paused", label: "blocked" },
     escalated: { tone: "pending", label: "escalated to you" },
+    awaiting_owner: { tone: "pending", label: "waiting for your approval" },
     rejected: { tone: "off", label: "rejected" },
     cancelled: { tone: "off", label: "cancelled" },
     interrupted: { tone: "paused", label: "interrupted" },

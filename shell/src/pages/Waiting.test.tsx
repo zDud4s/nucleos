@@ -428,6 +428,41 @@ describe("Waiting - git requests", () => {
       expect(daemon.apiFetch).toHaveBeenCalledWith("/vcs/requests/62/dismiss", { method: "POST" });
     });
   });
+
+  async function decideHeld(button: string, confirm: string, path: string) {
+    const world = waitingWorld({ vcsWaiting: [vcsRow({ id: 63, status: "awaiting_owner" })] });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    fireEvent.click(await screen.findByRole("button", { name: button }));
+    await waitFor(() => {
+      const armed = screen.queryByRole("button", { name: confirm });
+      if (armed !== null) fireEvent.click(armed);
+      expect(screen.queryByRole("button", { name: confirm })).toBeNull();
+    });
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith(path, { method: "POST" });
+    });
+  }
+
+  it("a merge held for the test map can be approved", async () => {
+    await decideHeld("Approve push #63", "Approve the map change · #63", "/vcs/requests/63/approve");
+  });
+
+  it("a merge held for the test map can be refused", async () => {
+    await decideHeld("Refuse push #63", "Refuse the map change · #63", "/vcs/requests/63/refuse");
+  });
+
+  it("a held merge is decided, not dismissed", async () => {
+    const world = waitingWorld({ vcsWaiting: [vcsRow({ id: 63, status: "awaiting_owner" })] });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    expect(await screen.findByText(/changes the test map/)).toBeDefined();
+    expect(screen.queryByRole("button", { name: /away/ })).toBeNull();
+  });
 });
 
 /* ------------------------------------------------------- the empty morning -- */
