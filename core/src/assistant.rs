@@ -1070,17 +1070,40 @@ fn watch_between_turns(state: &crate::state::AppState, chat_id: &str) {
     let state = state.clone();
     let chat_id = chat_id.to_owned();
     tokio::spawn(async move {
+        // How many of the process's carried events were already written to `chat_tasks`. Valid for
+        // this reader's life: `carried` only grows while no turn holds the process, and a turn
+        // taking the process ends this reader.
+        let mut recorded = 0_usize;
         loop {
             tokio::time::sleep(BETWEEN_TURNS_TICK).await;
             // No lock is held across an await: the guard lives only in this block. An entry that is
             // gone (a turn took it) or owned by a newer reader ends this one.
-            let begun = {
+            let (begun, task_lines) = {
                 let mut kept = LIVE_CHATS.lock().unwrap();
                 match kept.get_mut(&chat_id) {
-                    Some(live) if live.watcher == token => live.drain_idle(),
+                    Some(live) if live.watcher == token => {
+                        let begun = live.drain_idle();
+                        let fresh: Vec<String> = live
+                            .carried
+                            .iter()
+                            .skip(recorded)
+                            .filter_map(|event| match event {
+                                crate::runner::TurnEvent::Line(line) if is_task_bookkeeping(line) => {
+                                    Some(line.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        recorded = live.carried.len();
+                        (begun, fresh)
+                    }
                     _ => return,
                 }
             };
+            // A task that ends between turns is recorded now, not when a later turn reads the line.
+            for line in &task_lines {
+                crate::chat_tasks::apply_line(&state.pool, &chat_id, line).await;
+            }
             if !begun {
                 continue;
             }
@@ -1327,6 +1350,7 @@ async fn record_spontaneous_answer(
     .execute(pool)
     .await;
     crate::runs::warn_on_terminal_write_err(&completed, id, "completed");
+    crate::chat_tasks::record_turn(pool, chat_id, id, &o.stdout).await;
     if let Some(session_id) = o.session_id.as_deref() {
         // The same rule as a person's turn: a session that read third-party text is not resumable.
         match crate::runs::read_untrusted_context(pool, id).await {
@@ -3396,6 +3420,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .execute(&pool)
                     .await;
                     crate::runs::warn_on_terminal_write_err(&completed, id, status);
+                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
                     if let Some(session_id) = o.session_id.as_deref() {
                         // `get_session` would refuse to resume this session anyway, by looking at the
                         // runs that produced it. Dropping the row here as well closes the one case that
@@ -3456,6 +3481,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .execute(&pool)
                     .await;
                     crate::runs::warn_on_terminal_write_err(&failed, id, status);
+                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
                 }
             },
             Ok(Err(e)) => {
@@ -7958,6 +7984,83 @@ mod tests {
             Some(0.25),
             "the person was billed for the task's answer"
         );
+    }
+
+    /// A task the opening turn launched is a durable row from that turn's end, and its end event
+    /// arriving between turns closes the row with status, tokens and summary.
+    #[tokio::test]
+    async fn a_background_task_is_recorded_from_its_launch_to_its_end_between_turns() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        *fake.canned.lock().unwrap() = Some(crate::runner::RunOutcome {
+            exit_code: 0,
+            stdout: concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bg","name":"Bash","input":{"command":"sleep 20","run_in_background":true}}]}}"#,
+                "
+",
+                r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bg","is_backgrounded":true}"#,
+                "
+",
+                r#"{"type":"result","subtype":"success","result":"fake output"}"#
+            )
+            .to_owned(),
+            stderr: String::new(),
+            session_id: Some("fake-session-id".into()),
+            cost_usd: Some(0.0),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        });
+        let (unprompted, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        *fake.unprompted.lock().unwrap() = Some(rx);
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("task-row");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "lança", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        let mut rows = Vec::new();
+        for _ in 0..300 {
+            rows = crate::chat_tasks::for_chat(&state.pool, &chat).await.unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let [launched] = rows.as_slice() else {
+            panic!("expected one task row after the launching turn, got {rows:?}");
+        };
+        assert_eq!(launched.status, "running");
+        assert_eq!(launched.kind, "background_bash");
+        assert_eq!(launched.launched_by_run_id, first);
+        assert_eq!(launched.task_id.as_deref(), Some("bg1"));
+
+        unprompted
+            .send(
+                r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bg","status":"completed","summary":"(exit code 0)","usage":{"total_tokens":321}}"#
+                    .to_owned(),
+            )
+            .unwrap();
+        for _ in 0..300 {
+            rows = crate::chat_tasks::for_chat(&state.pool, &chat).await.unwrap();
+            if rows.first().is_some_and(|row| row.status != "running") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let [ended] = rows.as_slice() else {
+            panic!("expected one task row, got {rows:?}");
+        };
+        assert_eq!(ended.status, "completed");
+        assert_eq!(ended.total_tokens, Some(321));
+        assert_eq!(ended.summary.as_deref(), Some("(exit code 0)"));
+        assert!(ended.finished_at.is_some());
     }
 
     /// The spontaneous turn runs the same process the person's last turn did, so it carries that

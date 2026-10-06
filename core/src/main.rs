@@ -17,6 +17,7 @@ mod calendar;
 mod capabilities;
 mod chat_groups;
 mod chat_notices;
+mod chat_tasks;
 mod chats;
 mod classifier;
 mod collision;
@@ -1052,6 +1053,14 @@ async fn main() {
         tracing::warn!(
             "reconciled {interrupted} run(s) left 'running' by a previous crash -> 'interrupted'"
         );
+    }
+
+    // Spec 2026-10-04 §4.2 item 5: a task caught mid-flight by a restart is `orphaned`, beside the
+    // turns marked `interrupted` above. Best effort: a stale task row must not stop the daemon.
+    match chat_tasks::orphan_running(&pool).await {
+        Ok(0) => {}
+        Ok(orphaned) => tracing::warn!(orphaned, "chat tasks left running by a restart -> 'orphaned'"),
+        Err(error) => tracing::warn!(%error, "could not mark chat tasks left running"),
     }
 
     let stranded = runs::reconcile_stranded_approvals(&pool)

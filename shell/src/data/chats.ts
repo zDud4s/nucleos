@@ -1148,6 +1148,36 @@ export function useChatProject(chatId: string) {
   });
 }
 
+/** One row of `GET /assistant/chats/{id}/tasks`: work a turn launched, which may outlive it. */
+export interface ChatTask {
+  id: number;
+  chat_id: string;
+  launched_by_run_id: number;
+  tool_use_id: string;
+  task_id: string | null;
+  kind: "subagent" | "background_bash" | "background_agent";
+  subagent_type: string | null;
+  model: string | null;
+  status: "running" | "completed" | "failed" | "stopped" | "orphaned";
+  started_at: string;
+  finished_at: string | null;
+  total_tokens: number | null;
+  cost_usd: number | null;
+  summary: string | null;
+}
+
+/** A conversation's tasks; polled while one runs or a turn is live (rows land at turn end). */
+export function useChatTasks(chatId: string, enabled: boolean, live: boolean) {
+  return useQuery({
+    queryKey: keys.chats.tasks(chatId),
+    queryFn: async () =>
+      (await apiFetch<ChatTask[] | undefined>(`/assistant/chats/${encodeURIComponent(chatId)}/tasks`)) ?? [],
+    enabled,
+    refetchInterval: (query) =>
+      live || (query.state.data ?? []).some((t) => t.status === "running") ? POLL.fast : false,
+  });
+}
+
 /**
  * What was said in the conversation this one was picked up from, oldest first.
  *

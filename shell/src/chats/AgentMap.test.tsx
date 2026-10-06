@@ -2,8 +2,27 @@ import { describe, expect, it } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { AgentMapBody, durationText, groupAgents } from "./AgentMap";
 import type { ToolCall, Turn } from "../lib/turns";
+import type { ChatTask } from "../data/chats";
 
 const call = (over: Partial<ToolCall>): ToolCall => ({ name: "Bash", detail: null, todos: [], ...over });
+
+const task = (over: Partial<ChatTask>): ChatTask => ({
+  id: 1,
+  chat_id: "c",
+  launched_by_run_id: 1,
+  tool_use_id: "b",
+  task_id: null,
+  kind: "background_bash",
+  subagent_type: null,
+  model: null,
+  status: "running",
+  started_at: "2026-10-03T10:00:00Z",
+  finished_at: null,
+  total_tokens: null,
+  cost_usd: null,
+  summary: null,
+  ...over,
+});
 
 function turn(did: ToolCall[], status = "completed"): Turn {
   return {
@@ -43,6 +62,15 @@ describe("groupAgents", () => {
     expect(g.running).toBe(1);
   });
 
+  it("keeps a settled turn's task working while its row says running", () => {
+    const settled = [turn([call({ id: "b", name: "Bash", background: true, status: "running" })])];
+    const live = groupAgents(settled, [task({ tool_use_id: "b" })]);
+    expect(live.running).toBe(1);
+    expect(live.background[0].working).toBe(true);
+    const cut = groupAgents(settled, [task({ tool_use_id: "b", status: "orphaned" })]);
+    expect(cut.running).toBe(0);
+  });
+
   it("has nothing for a daemon that sends none of the new fields", () => {
     expect(groupAgents([turn([call({ name: "Read" })])]).total).toBe(0);
     expect(groupAgents(undefined).total).toBe(0);
@@ -76,5 +104,22 @@ describe("AgentMapBody", () => {
     expect(screen.getByText(/Explore/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Back to the map" }));
     expect(screen.getByText("1 background task")).toBeTruthy();
+  });
+
+  it("shows a settled subagent's final text and tokens from its row", () => {
+    const settled = [turn([call({ id: "a", name: "Task", detail: "explore" })])];
+    const rows = [
+      task({
+        tool_use_id: "a",
+        kind: "subagent",
+        status: "completed",
+        total_tokens: 4242,
+        summary: "the callers are in parser.rs",
+      }),
+    ];
+    render(<AgentMapBody turns={settled} tasks={rows} chatTitle="My chat" now={Date.parse("2026-10-03T10:23:50Z")} />);
+    expect(screen.getByText(/4\.2k tokens/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /explore — completed/ }));
+    expect(screen.getByText("the callers are in parser.rs")).toBeTruthy();
   });
 });
