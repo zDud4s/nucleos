@@ -1105,11 +1105,6 @@ async fn main() {
     // Neither fatal like the run reconciliations above nor mere hygiene like the worktree sweep
     // below: louder than the sweep, quieter than the panics.
     //
-    // A `vcs_requests` row left `running` holds its repository's only slot — the partial unique
-    // index sees to that — so failing to clear it means no git operation for that project until
-    // somebody notices. That is a jam, not untidiness, hence `error!`. But it is one pillar's queue:
-    // refusing to boot mail, voice, calendar and runs over it would trade a stuck repository for a
-    // stuck machine.
     // A verification unit left `running` was cut off by the restart, and the agent holding its ticket
     // is still waiting: put it back in the queue. One that keeps taking the daemon down gives up
     // after `verify_runs::MAX_INTERRUPTIONS` instead of looping.
@@ -1120,6 +1115,12 @@ async fn main() {
         Ok(_) => {}
         Err(error) => tracing::error!(%error, "verification queue reconciliation failed"),
     }
+
+    // A `vcs_requests` row left `running` holds its repository's only slot — the partial unique
+    // index sees to that — so failing to clear it means no git operation for that project until
+    // somebody notices. That is a jam, not untidiness, hence `error!`. But it is one pillar's queue:
+    // refusing to boot mail, voice, calendar and runs over it would trade a stuck repository for a
+    // stuck machine.
     match vcs::reconcile_interrupted(&pool).await {
         Ok(released) if released > 0 => {
             tracing::warn!(

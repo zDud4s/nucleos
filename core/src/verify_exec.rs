@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -26,7 +27,9 @@ use crate::warm;
 /// A project's warm-state ceiling when its `autopilot.yaml` sets none.
 pub(crate) const DEFAULT_PROJECT_DISK_CAP_GB: u64 = 30;
 const POLL: Duration = Duration::from_millis(500);
-const SWEEP_EVERY: Duration = Duration::from_secs(600);
+const SWEEP_EVERY: Duration = Duration::from_secs(30 * 60);
+/// How often a unit looks again at a warm dir the sweep is removing.
+const REMOVING_POLL: Duration = Duration::from_millis(100);
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Weight of a unit: what the heavy-command broker charges for the same program.
@@ -91,6 +94,8 @@ struct InFlight {
     counter: u64,
     /// Warm worktree dirs in use, with how many units hold each.
     in_use: HashMap<PathBuf, usize>,
+    /// Warm worktree dirs the sweep is removing right now; no unit may hold one.
+    removing: HashSet<PathBuf>,
 }
 
 pub(crate) struct Executor {
@@ -99,6 +104,8 @@ pub(crate) struct Executor {
     pub machine_root: Option<PathBuf>,
     pub wake: Arc<Notify>,
     in_flight: Mutex<InFlight>,
+    /// A warm sweep is running; the next tick skips rather than overlap it.
+    sweeping: AtomicBool,
 }
 
 /// Holds a unit's weight and warm dirs; gives them back on drop, whatever path ended the unit.
@@ -109,8 +116,18 @@ struct Reservation {
 }
 
 impl Reservation {
-    fn hold_dir(&mut self, dir: PathBuf) {
-        *self.executor.lock().in_use.entry(dir.clone()).or_insert(0) += 1;
+    /// Holds `dir` for this unit, first waiting out a sweep that is removing it.
+    async fn hold_dir(&mut self, dir: PathBuf) {
+        loop {
+            {
+                let mut state = self.executor.lock();
+                if !state.removing.contains(&dir) {
+                    *state.in_use.entry(dir.clone()).or_insert(0) += 1;
+                    break;
+                }
+            }
+            tokio::time::sleep(REMOVING_POLL).await;
+        }
         self.dirs.push(dir);
     }
 }
@@ -145,6 +162,7 @@ impl Executor {
             machine_root,
             wake: Arc::new(Notify::new()),
             in_flight: Mutex::new(InFlight::default()),
+            sweeping: AtomicBool::new(false),
         })
     }
 
@@ -157,6 +175,21 @@ impl Executor {
 
     fn capacity(&self) -> i64 {
         i64::from(self.config.capacity).max(1)
+    }
+
+    /// The sweep's guard: grants `dir` for removal unless a unit holds it, and keeps units off it
+    /// until [`Self::release_removal`].
+    fn try_reserve_removal(&self, dir: &Path) -> bool {
+        let mut state = self.lock();
+        if state.in_use.contains_key(dir) {
+            return false;
+        }
+        state.removing.insert(dir.to_path_buf());
+        true
+    }
+
+    fn release_removal(&self, dir: &Path) {
+        self.lock().removing.remove(dir);
     }
 
     /// Queues (or joins) a unit and wakes the worker.
@@ -194,23 +227,28 @@ impl Executor {
             // Pick and reserve under one short lock, so two passes never overcommit.
             let picked = {
                 let mut state = self.lock();
+                let capacity = self.capacity();
+                // A row queued under a larger capacity would never fit: charge it the whole
+                // capacity instead. Picked, reserved and released with this same value.
+                let charge = |weight: i64| weight.clamp(1, capacity);
                 let candidates: Vec<Candidate> = queued
                     .iter()
                     .map(|q| Candidate {
                         id: q.id,
                         project: q.project_id.as_deref(),
                         priority: q.priority,
-                        weight: q.weight,
+                        weight: charge(q.weight),
                         enqueued_ms: q.enqueued_ms,
                     })
                     .collect();
-                let free = self.capacity() - state.used;
+                let free = capacity - state.used;
                 let chosen =
                     verify_sched::pick(&candidates, free, &state.last_start, now_ms(), aging_ms)
                         .and_then(|id| queued.iter().find(|q| q.id == id));
                 chosen.map(|chosen| {
-                    state.used += chosen.weight;
-                    (chosen.id, chosen.weight, chosen.project_id.clone())
+                    let weight = charge(chosen.weight);
+                    state.used += weight;
+                    (chosen.id, weight, chosen.project_id.clone())
                 })
             };
             let Some((id, weight, project)) = picked else {
@@ -285,14 +323,10 @@ impl Executor {
 
 /// Runs one claimed unit to its terminal row. The reservation is released when it drops.
 async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Reservation) {
-    if let (Some(root), Some(project)) = (executor.machine_root.clone(), claimed.project_id.clone())
-    {
-        let worktree = PathBuf::from(&claimed.worktree);
-        let dir =
-            tokio::task::spawn_blocking(move || warm::worktree_dir(&root, &project, &worktree))
-                .await;
-        if let Ok(dir) = dir {
-            reservation.hold_dir(dir);
+    if let (Some(root), Some(project)) = (&executor.machine_root, &claimed.project_id) {
+        // Lexical, no filesystem access; an invalid project id has no warm state to hold.
+        if let Ok(dir) = warm::worktree_dir(root, project, Path::new(&claimed.worktree)) {
+            reservation.hold_dir(dir).await;
         }
     }
     let env = executor.warm_env(&claimed).await;
@@ -356,16 +390,41 @@ fn sweep_caps(root: &Path, config: &VerifyConfig) -> warm::Caps {
     }
 }
 
-/// One warm-state sweep, off the async threads.
-async fn sweep_once(executor: Arc<Executor>) {
+/// Marks a sweep as running; clears the mark when dropped, a panic included.
+struct Sweeping(Arc<Executor>);
+
+impl Sweeping {
+    /// `None` while another sweep is still running.
+    fn start(executor: &Arc<Executor>) -> Option<Self> {
+        executor
+            .sweeping
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(Arc::clone(executor)))
+    }
+}
+
+impl Drop for Sweeping {
+    fn drop(&mut self) {
+        self.0.sweeping.store(false, Ordering::Release);
+    }
+}
+
+/// One warm-state sweep, off the async threads. `_running` is released when it ends.
+async fn sweep_once(executor: Arc<Executor>, _running: Sweeping) {
     let Some(root) = executor.machine_root.clone() else {
         return;
     };
-    let in_use: HashSet<PathBuf> = executor.lock().in_use.keys().cloned().collect();
     let config = executor.config.clone();
+    let guard = Arc::clone(&executor);
     let result = tokio::task::spawn_blocking(move || {
         let caps = sweep_caps(&root, &config);
-        warm::sweep(&root, &caps, &in_use)
+        warm::sweep(
+            &root,
+            &caps,
+            &|dir| guard.try_reserve_removal(dir),
+            &|dir| guard.release_removal(dir),
+        )
     })
     .await;
     match result {
@@ -390,7 +449,10 @@ pub(crate) async fn run_executor(executor: Arc<Executor>) {
             _ = executor.wake.notified() => {}
             _ = tokio::time::sleep(POLL) => {}
             _ = sweep.tick() => {
-                tokio::spawn(sweep_once(Arc::clone(&executor)));
+                // A sweep still walking from the last tick is left to finish.
+                if let Some(running) = Sweeping::start(&executor) {
+                    tokio::spawn(sweep_once(Arc::clone(&executor), running));
+                }
             }
         }
         executor.start_ready().await;
@@ -549,18 +611,91 @@ mod tests {
         assert_eq!(rows, 1);
     }
 
+    /// Parks every unit of `wt` before it runs, its weight held, until `release_removal`: the
+    /// unit waits on a warm dir the sweep is "removing".
+    fn park(ex: &Arc<Executor>, root: &Path, wt: &Path) -> PathBuf {
+        let dir = warm::worktree_dir(root, "proj", wt).unwrap();
+        assert!(ex.try_reserve_removal(&dir));
+        dir
+    }
+
     #[tokio::test]
     async fn capacity_holds_back_what_does_not_fit() {
         let root = tempfile::tempdir().unwrap();
         let wt = tempfile::tempdir().unwrap();
         let ex = executor(2, root.path()).await;
+        let parked = park(&ex, root.path(), wt.path());
         let argv = ["git", "--version"];
         let first = ex.submit(request(wt.path(), &argv, None, 2)).await.unwrap();
         let second = ex.submit(request(wt.path(), &argv, None, 2)).await.unwrap();
+        // The first cannot finish (and give its weight back) while parked, so this is exact.
         assert_eq!(ex.start_ready().await, 1);
+        assert_eq!(ex.lock().used, 2);
         let waiting = ex.get(second.id).await.unwrap().unwrap();
         assert_eq!(waiting.status, verify_runs::STATUS_QUEUED);
+        ex.release_removal(&parked);
         wait_terminal(&ex, first.id).await;
+    }
+
+    #[tokio::test]
+    async fn a_row_heavier_than_the_capacity_still_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(2, root.path()).await;
+        let parked = park(&ex, root.path(), wt.path());
+        // Queued straight to the table, as if under an older, larger capacity.
+        let row = request(wt.path(), &["git", "--version"], None, 4);
+        let queued = verify_runs::enqueue(&ex.pool, &row, now_ms())
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+        assert_eq!(ex.lock().used, 2);
+        ex.release_removal(&parked);
+        wait_terminal(&ex, queued.id).await;
+    }
+
+    #[tokio::test]
+    async fn a_unit_waits_while_its_warm_dir_is_being_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let parked = park(&ex, root.path(), wt.path());
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 0))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let state = ex.get(submitted.id).await.unwrap().unwrap();
+        assert_eq!(state.status, verify_runs::STATUS_RUNNING);
+        assert!(!ex.lock().in_use.contains_key(&parked));
+        ex.release_removal(&parked);
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_PASSED);
+    }
+
+    #[tokio::test]
+    async fn a_dir_in_use_cannot_be_reserved_for_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let dir = root.path().join("warm/proj/abc");
+        ex.lock().in_use.insert(dir.clone(), 1);
+        assert!(!ex.try_reserve_removal(&dir));
+        assert!(!ex.lock().removing.contains(&dir));
+        ex.lock().in_use.clear();
+        assert!(ex.try_reserve_removal(&dir));
+        ex.release_removal(&dir);
+        assert!(ex.lock().removing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sweep_does_not_overlap_another() {
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let running = Sweeping::start(&ex).expect("the first sweep starts");
+        assert!(Sweeping::start(&ex).is_none());
+        drop(running);
+        assert!(Sweeping::start(&ex).is_some());
     }
 
     #[test]
@@ -598,7 +733,9 @@ mod tests {
             timeout_ms: 1000,
         };
         let env = ex.warm_env(&claimed).await;
-        let expected = warm::worktree_dir(root.path(), "proj", wt.path()).join("probe");
+        let expected = warm::worktree_dir(root.path(), "proj", wt.path())
+            .unwrap()
+            .join("probe");
         let value = env
             .iter()
             .find(|(var, _)| var == "NUCLEOS_PROBE_DIR")

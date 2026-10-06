@@ -8,7 +8,7 @@
 // clippy's `dead_code` would otherwise fail the gate.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,15 +22,17 @@ pub(crate) const MARKER_USED: &str = ".last_used";
 const SHARED: &str = "shared";
 const SHARED_PREFIX: &str = "shared:";
 
-/// Stable id of a worktree path: first 16 hex of sha256 of its canonical, lowercase,
-/// '/'-separated form.
+/// A worktree path in lexical form: no `\\?\` prefix, '/'-separated, no trailing '/'.
+/// No filesystem access, so it is the same before and after the tree is deleted.
+fn lexical(worktree: &Path) -> String {
+    let text = worktree.to_string_lossy().replace('\\', "/");
+    let text = text.strip_prefix("//?/").unwrap_or(&text);
+    text.trim_end_matches('/').to_string()
+}
+
+/// Stable id of a worktree path: first 16 hex of sha256 of its lexical, lowercase form.
 pub(crate) fn worktree_id(worktree: &Path) -> String {
-    let canon = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
-    let mut text = canon.to_string_lossy().replace('\\', "/").to_lowercase();
-    if let Some(rest) = text.strip_prefix("//?/") {
-        text = rest.to_string();
-    }
-    let digest = Sha256::digest(text.as_bytes());
+    let digest = Sha256::digest(lexical(worktree).to_lowercase().as_bytes());
     let mut hex = String::with_capacity(16);
     for byte in digest.iter().take(8) {
         hex.push_str(&format!("{byte:02x}"));
@@ -42,12 +44,12 @@ fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg.to_string())
 }
 
+/// A project id is one plain path segment: `[A-Za-z0-9._-]+`, never `.` or `..`.
 fn check_project_id(project_id: &str) -> io::Result<()> {
-    if project_id.is_empty()
-        || project_id.contains('/')
-        || project_id.contains('\\')
-        || project_id.contains("..")
-    {
+    let plain = project_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if project_id.is_empty() || !plain || project_id == "." || project_id == ".." {
         return Err(invalid("invalid project id"));
     }
     Ok(())
@@ -72,10 +74,8 @@ fn project_dir(root: &Path, project_id: &str) -> io::Result<PathBuf> {
 }
 
 /// The per-worktree directory (the unit the LRU and cleanup delete).
-pub(crate) fn worktree_dir(root: &Path, project_id: &str, worktree: &Path) -> PathBuf {
-    root.join("warm")
-        .join(project_id)
-        .join(worktree_id(worktree))
+pub(crate) fn worktree_dir(root: &Path, project_id: &str, worktree: &Path) -> io::Result<PathBuf> {
+    Ok(project_dir(root, project_id)?.join(worktree_id(worktree)))
 }
 
 fn now_ms() -> u128 {
@@ -114,19 +114,15 @@ pub(crate) fn prepare(
         env.push((var.clone(), path));
     }
     std::fs::create_dir_all(&wt_dir)?;
-    let canon = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
-    std::fs::write(
-        wt_dir.join(MARKER_WORKTREE),
-        canon.to_string_lossy().replace('\\', "/"),
-    )?;
+    // Case is kept: the sweep checks this path exists, and Linux paths are case-sensitive.
+    std::fs::write(wt_dir.join(MARKER_WORKTREE), lexical(worktree))?;
     std::fs::write(wt_dir.join(MARKER_USED), now_ms().to_string())?;
     Ok(env)
 }
 
 /// Deletes one worktree's state. Missing is fine.
 pub(crate) fn forget_worktree(root: &Path, project_id: &str, worktree: &Path) -> io::Result<()> {
-    check_project_id(project_id)?;
-    match std::fs::remove_dir_all(worktree_dir(root, project_id, worktree)) {
+    match std::fs::remove_dir_all(worktree_dir(root, project_id, worktree)?) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
@@ -205,10 +201,38 @@ fn remove(path: &Path) -> bool {
     }
 }
 
+/// Removes `path` only if `try_reserve` grants it and it was not used since the sweep started;
+/// `release` follows every granted reservation, whether the removal happened or not.
+fn try_remove(
+    path: &Path,
+    started_ms: u128,
+    try_reserve: &dyn Fn(&Path) -> bool,
+    release: &dyn Fn(&Path),
+) -> bool {
+    if !try_reserve(path) {
+        return false;
+    }
+    // Read under the reservation, so a unit that touched it meanwhile is seen.
+    let removed = last_used(path) < started_ms && remove(path);
+    release(path);
+    removed
+}
+
 /// Removes worktree dirs whose `.worktree` path no longer exists, then enforces the caps,
-/// least recently used first, never touching a dir in `in_use`. `shared/` counts, never deleted.
-/// Returns the dirs removed.
-pub(crate) fn sweep(root: &Path, caps: &Caps, in_use: &HashSet<PathBuf>) -> Vec<PathBuf> {
+/// least recently used first. `shared/` counts, never deleted. Returns the dirs removed.
+///
+/// The walk can take minutes, so nothing is decided from a snapshot of what is in use: right
+/// before each removal `try_reserve(dir)` must return true (the caller then keeps the dir from
+/// being taken until `release(dir)`), and a dir whose `.last_used` is not older than the sweep's
+/// start is skipped.
+pub(crate) fn sweep(
+    root: &Path,
+    caps: &Caps,
+    try_reserve: &dyn Fn(&Path) -> bool,
+    release: &dyn Fn(&Path),
+) -> Vec<PathBuf> {
+    let started_ms = now_ms();
+    let gone = |path: &Path| try_remove(path, started_ms, try_reserve, release);
     let mut removed = Vec::new();
     let warm_root = root.join("warm");
     let Ok(projects) = std::fs::read_dir(&warm_root) else {
@@ -239,7 +263,7 @@ pub(crate) fn sweep(root: &Path, caps: &Caps, in_use: &HashSet<PathBuf>) -> Vec<
             let orphan = std::fs::read_to_string(cpath.join(MARKER_WORKTREE))
                 .map(|s| !Path::new(s.trim()).exists())
                 .unwrap_or(false);
-            if orphan && !in_use.contains(&cpath) && remove(&cpath) {
+            if orphan && gone(&cpath) {
                 removed.push(cpath);
                 continue;
             }
@@ -265,7 +289,7 @@ pub(crate) fn sweep(root: &Path, caps: &Caps, in_use: &HashSet<PathBuf>) -> Vec<
         entries.sort_by_key(|e| e.used);
         let mut i = 0;
         while total > cap && i < entries.len() {
-            if in_use.contains(&entries[i].path) || !remove(&entries[i].path) {
+            if !gone(&entries[i].path) {
                 i += 1;
                 continue;
             }
@@ -287,7 +311,7 @@ pub(crate) fn sweep(root: &Path, caps: &Caps, in_use: &HashSet<PathBuf>) -> Vec<
             if total <= caps.machine_bytes {
                 break;
             }
-            if in_use.contains(&e.path) || !remove(&e.path) {
+            if !gone(&e.path) {
                 continue;
             }
             total = total.saturating_sub(e.size);
@@ -327,6 +351,11 @@ mod tests {
         d
     }
 
+    /// A sweep where nothing is in use.
+    fn sweep_all(root: &Path, caps: &Caps) -> Vec<PathBuf> {
+        sweep(root, caps, &|_| true, &|_| {})
+    }
+
     fn caps(machine: u64, default_project: u64) -> Caps {
         Caps {
             machine_bytes: machine,
@@ -352,6 +381,23 @@ mod tests {
     }
 
     #[test]
+    fn the_id_does_not_depend_on_slashes_or_case() {
+        let id = worktree_id(Path::new("C:/Projects/Repo"));
+        for same in [
+            r"C:\Projects\Repo",
+            "c:/projects/repo/",
+            r"\\?\C:\Projects\Repo",
+            "//?/C:/Projects/Repo",
+        ] {
+            assert_eq!(worktree_id(Path::new(same)), id, "{same:?}");
+        }
+        // Lexical only: a path that does not exist still gets an id, the same every time.
+        let gone = Path::new("Z:/no/such/tree");
+        assert_eq!(worktree_id(gone), worktree_id(gone));
+        assert_ne!(worktree_id(gone), id);
+    }
+
+    #[test]
     fn prepare_creates_the_declared_dirs_and_returns_their_env() {
         let root = tempfile::tempdir().unwrap();
         let wt = tempfile::tempdir().unwrap();
@@ -360,7 +406,7 @@ mod tests {
         w.insert("npm_config_cache".to_string(), warm("shared:npm"));
         let env = prepare(root.path(), "proj", wt.path(), &w).unwrap();
         let get = |k: &str| env.iter().find(|(n, _)| n == k).unwrap().1.clone();
-        let wt_dir = worktree_dir(root.path(), "proj", wt.path());
+        let wt_dir = worktree_dir(root.path(), "proj", wt.path()).unwrap();
         assert_eq!(get("CARGO_TARGET_DIR"), wt_dir.join("target"));
         assert_eq!(
             get("npm_config_cache"),
@@ -377,7 +423,7 @@ mod tests {
         let mut w = BTreeMap::new();
         w.insert("X".to_string(), warm("target"));
         prepare(root.path(), "proj", wt.path(), &w).unwrap();
-        let d = worktree_dir(root.path(), "proj", wt.path());
+        let d = worktree_dir(root.path(), "proj", wt.path()).unwrap();
         let marked = std::fs::read_to_string(d.join(MARKER_WORKTREE)).unwrap();
         assert!(Path::new(&marked).exists());
         let used: u128 = std::fs::read_to_string(d.join(MARKER_USED))
@@ -399,8 +445,16 @@ mod tests {
         prepare(root.path(), "proj", a.path(), &w).unwrap();
         prepare(root.path(), "proj", b.path(), &w).unwrap();
         forget_worktree(root.path(), "proj", a.path()).unwrap();
-        assert!(!worktree_dir(root.path(), "proj", a.path()).exists());
-        assert!(worktree_dir(root.path(), "proj", b.path()).exists());
+        assert!(
+            !worktree_dir(root.path(), "proj", a.path())
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            worktree_dir(root.path(), "proj", b.path())
+                .unwrap()
+                .exists()
+        );
         assert!(root.path().join("warm/proj/shared/npm").exists());
         // Missing is fine.
         forget_worktree(root.path(), "proj", a.path()).unwrap();
@@ -413,7 +467,7 @@ mod tests {
         let gone = root.path().join("no-such-worktree");
         let d_live = mk(root.path(), "p", "aaaa", live.path(), Some("5"), 10);
         let d_gone = mk(root.path(), "p", "bbbb", &gone, Some("5"), 10);
-        let removed = sweep(root.path(), &caps(u64::MAX, u64::MAX), &HashSet::new());
+        let removed = sweep_all(root.path(), &caps(u64::MAX, u64::MAX));
         assert_eq!(removed, vec![d_gone.clone()]);
         assert!(d_live.exists());
         assert!(!d_gone.exists());
@@ -426,7 +480,7 @@ mod tests {
         let old = mk(root.path(), "p", "d1", wt.path(), Some("10"), 1000);
         let mid = mk(root.path(), "p", "d2", wt.path(), Some("20"), 1000);
         let new = mk(root.path(), "p", "d3", wt.path(), Some("30"), 1000);
-        let removed = sweep(root.path(), &caps(u64::MAX, 2500), &HashSet::new());
+        let removed = sweep_all(root.path(), &caps(u64::MAX, 2500));
         assert_eq!(removed, vec![old.clone()]);
         assert!(mid.exists() && new.exists());
 
@@ -435,7 +489,7 @@ mod tests {
         let none = mk(root.path(), "p", "d1", wt.path(), None, 1000);
         let a = mk(root.path(), "p", "d2", wt.path(), Some("20"), 1000);
         let junk = mk(root.path(), "p", "d3", wt.path(), Some("garbage"), 1000);
-        let removed = sweep(root.path(), &caps(u64::MAX, 1500), &HashSet::new());
+        let removed = sweep_all(root.path(), &caps(u64::MAX, 1500));
         assert_eq!(removed.len(), 2);
         assert!(removed.contains(&none) && removed.contains(&junk));
         assert!(a.exists());
@@ -447,11 +501,28 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let old = mk(root.path(), "p", "d1", wt.path(), Some("10"), 1000);
         let new = mk(root.path(), "p", "d2", wt.path(), Some("30"), 1000);
-        let in_use: HashSet<PathBuf> = [old.clone()].into_iter().collect();
-        let removed = sweep(root.path(), &caps(u64::MAX, 1500), &in_use);
+        let released = std::cell::RefCell::new(Vec::new());
+        let removed = sweep(
+            root.path(),
+            &caps(u64::MAX, 1500),
+            &|dir| dir != old.as_path(),
+            &|dir| released.borrow_mut().push(dir.to_path_buf()),
+        );
         assert_eq!(removed, vec![new.clone()]);
+        assert_eq!(released.into_inner(), vec![new.clone()]);
         assert!(old.exists());
         assert!(!new.exists());
+    }
+
+    #[test]
+    fn a_sweep_skips_a_dir_used_since_it_started() {
+        let root = tempfile::tempdir().unwrap();
+        let gone = root.path().join("no-such-worktree");
+        let later = (now_ms() + 3_600_000).to_string();
+        let fresh = mk(root.path(), "p", "d1", &gone, Some(&later), 1000);
+        let removed = sweep_all(root.path(), &caps(0, 0));
+        assert!(removed.is_empty());
+        assert!(fresh.exists());
     }
 
     #[test]
@@ -462,7 +533,7 @@ mod tests {
         let a_new = mk(root.path(), "a", "d2", wt.path(), Some("40"), 1000);
         let b_mid = mk(root.path(), "b", "d1", wt.path(), Some("20"), 1000);
         let b_new = mk(root.path(), "b", "d2", wt.path(), Some("30"), 1000);
-        let removed = sweep(root.path(), &caps(3500, u64::MAX), &HashSet::new());
+        let removed = sweep_all(root.path(), &caps(3500, u64::MAX));
         assert_eq!(removed, vec![a_old.clone()]);
         assert!(a_new.exists() && b_mid.exists() && b_new.exists());
     }
@@ -475,7 +546,7 @@ mod tests {
         std::fs::create_dir_all(&shared).unwrap();
         std::fs::write(shared.join("blob"), vec![0u8; 5000]).unwrap();
         let d = mk(root.path(), "p", "d1", wt.path(), Some("10"), 1000);
-        let removed = sweep(root.path(), &caps(100, 100), &HashSet::new());
+        let removed = sweep_all(root.path(), &caps(100, 100));
         assert_eq!(removed, vec![d]);
         assert!(shared.join("blob").exists());
     }
@@ -486,11 +557,19 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let mut w = BTreeMap::new();
         w.insert("X".to_string(), warm("target"));
-        for bad in ["", "..", "a/b", "a\\b", "../x"] {
+        for bad in ["", ".", "..", "a/b", "a\\b", "../x", "C:", "a b"] {
             let e = prepare(root.path(), bad, wt.path(), &w).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
             let e = forget_worktree(root.path(), bad, wt.path()).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+            let e = worktree_dir(root.path(), bad, wt.path()).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        for good in ["proj", "my-proj_1.2", "a..b"] {
+            assert!(
+                worktree_dir(root.path(), good, wt.path()).is_ok(),
+                "{good:?}"
+            );
         }
         // A dir that escapes is refused too.
         let mut w = BTreeMap::new();
