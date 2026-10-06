@@ -678,6 +678,10 @@ pub fn build_router(state: AppState) -> Router {
         // turn, because the answers are large and the transcript is polled: see `ToolCall::result`
         // for why they are stripped from the turn list and fetched only when somebody opens one.
         .route("/assistant/turns/{turn_id}/tools", get(get_turn_tools))
+        // Stop on a chat turn: an interrupt that keeps the process and the session, falling back to
+        // the kill `/runs/{id}/cancel` performs. A route of the chat's own so that route stays as it
+        // is for Kill and for every other kind of run.
+        .route("/assistant/turns/{turn_id}/stop", post(post_stop_turn))
         // Finding a sentence rather than a conversation. The window's own palette matches titles,
         // which is the right first answer and a useless second one: what people come back for is
         // something that was SAID, and a title is a summary written by a model.
@@ -690,6 +694,8 @@ pub fn build_router(state: AppState) -> Router {
         // cannot name a conversation to relay FROM any more than `POST /assistant/message` lets one
         // name who is typing.
         .route("/assistant/chats/{chat_id}/relay", post(relay_send_to_chat))
+        // Send now: text written into the turn that is running. See `assistant::say_now`.
+        .route("/assistant/chats/{chat_id}/say-now", post(post_say_now))
         // The same hop, asked for by the person instead of by the model. A route of its own and not
         // a flag on the one above, because the two differ in the one thing that matters: where the
         // sending turn's identity comes from. `/relay` reads it off a header this process wrote
@@ -10602,6 +10608,7 @@ async fn post_run_message(
         .send(crate::runner::LaterTurn {
             text: body.message,
             images: Vec::new(),
+            interrupt: false,
         })
         .map_err(|_| StatusCode::CONFLICT)?;
     Ok(StatusCode::ACCEPTED)
@@ -10788,6 +10795,10 @@ struct AssistantTurnOut {
     /// shipped alone: the conversation certain to be watched by the person who caused a relay was
     /// the one that could not say what it had done.
     relayed_to: Vec<RelaySent>,
+    /// What was said INTO this turn while it ran ("Send now"), oldest first. Empty for almost every
+    /// turn. The CLI folds such a line into the running turn, so the stream never shows it as
+    /// typed and this is the only record.
+    said_now: Vec<crate::assistant::SaidDuring>,
 }
 
 /// A conversation as it is read back: its turns, and whatever it was handed before the first one.
@@ -11059,6 +11070,9 @@ struct ChatProjectOut {
     /// `.claude/` is not committed — so a conversation pointed at one still cannot open a file, and
     /// a window that reported only the directory would be telling the truth and misleading at once.
     tools: bool,
+    /// Whether this conversation's turns use the user's ambient MCP servers. Off until somebody
+    /// opts in.
+    ambient_mcp: bool,
     /// Whether `cwd` is a linked worktree the AI workflow was never copied into while its main
     /// checkout has it — the case "Set up workflow" answers.
     workflow_missing: bool,
@@ -11088,6 +11102,9 @@ async fn read_chat_project(
     let permission_mode = crate::chats::permission_mode_of(&state.pool, &chat_id)
         .await
         .unwrap_or(crate::chats::PermissionMode::Auto);
+    let ambient_mcp = crate::chats::ambient_mcp_of(&state.pool, &chat_id)
+        .await
+        .unwrap_or(false);
 
     let Some(cwd) = opened_in else {
         return Ok(Json(ChatProjectOut {
@@ -11095,6 +11112,7 @@ async fn read_chat_project(
             session,
             permission_mode,
             tools: false,
+            ambient_mcp,
             workflow_missing: false,
         }));
     };
@@ -11131,6 +11149,7 @@ async fn read_chat_project(
         session,
         permission_mode,
         tools,
+        ambient_mcp,
         workflow_missing,
     }))
 }
@@ -11399,6 +11418,11 @@ async fn get_assistant_chat(
     let sent = relays_sent_by(&state.pool, &turns)
         .await
         .unwrap_or_default();
+    // Empty on a failure, for the same trade: losing the note about what was said mid-turn is a
+    // smaller loss than a conversation that will not open.
+    let said = crate::assistant::said_during(&state.pool, &chat_id)
+        .await
+        .unwrap_or_default();
     // Read through `assistant::handed_over` rather than parsed here: that function is already the
     // one reader of the column's shape, and a second one is a second thing to change the day the
     // shape does. A chat that was handed nothing comes back empty, which is the honest answer for
@@ -11467,6 +11491,11 @@ async fn get_assistant_chat(
                         sending_run_id: relay.sending_run_id,
                     })
                     .collect();
+                let said_now = said
+                    .iter()
+                    .filter(|said| said.run_id == turn.id)
+                    .cloned()
+                    .collect();
                 AssistantTurnOut {
                     turn,
                     did,
@@ -11474,10 +11503,63 @@ async fn get_assistant_chat(
                     thought,
                     context_window,
                     relayed_to,
+                    said_now,
                 }
             })
             .collect(),
     }))
+}
+
+/// Stops a chat turn: interrupts it when its process can be spoken to, kills it otherwise.
+///
+/// Uncancellable for the reason `runs::cancel_run` is: the kill removes the turn's handle before it
+/// writes the status, so a request dropped in the middle would leave a `running` row nothing reaches.
+async fn post_stop_turn(
+    State(state): State<AppState>,
+    Path(turn_id): Path<i64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match uncancellable(async move { crate::assistant::stop_turn(&state, turn_id).await }).await? {
+        crate::assistant::Stopped::Interrupted => {
+            Ok(Json(serde_json::json!({ "stopped": "interrupted" })))
+        }
+        crate::assistant::Stopped::Killed => Ok(Json(serde_json::json!({ "stopped": "killed" }))),
+        crate::assistant::Stopped::NotRunning => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+#[derive(Deserialize)]
+struct SayNowRequest {
+    text: String,
+}
+
+/// Says something into the turn that is running, or sends it the ordinary way when none is.
+async fn post_say_now(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Json(body): Json<SayNowRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if body.text.trim().is_empty() {
+        return Err(refusal(StatusCode::BAD_REQUEST, "empty"));
+    }
+    let said =
+        uncancellable(async move { crate::assistant::say_now(&state, &chat_id, &body.text).await })
+            .await
+            .map_err(|status| refusal(status, "internal"))?;
+    match said {
+        Ok(crate::assistant::SaidNow::Injected) => {
+            Ok(Json(serde_json::json!({ "said_now": true })))
+        }
+        Ok(crate::assistant::SaidNow::Sent(crate::assistant::Sent::Turn(id))) => {
+            Ok(Json(serde_json::json!({ "turn_id": id })))
+        }
+        Ok(crate::assistant::SaidNow::Sent(crate::assistant::Sent::Queued)) => {
+            Ok(Json(serde_json::json!({ "queued": true })))
+        }
+        Err(error) => {
+            tracing::warn!(%error, "saying something into a running turn failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
 }
 
 /// What one turn's tools answered.
@@ -13593,6 +13675,11 @@ struct PatchChatRequest {
     /// The whole set every time, like `agents`, and for the same reason.
     #[serde(default, deserialize_with = "sent_even_if_null")]
     denied_tools: Option<Option<Vec<String>>>,
+    /// Whether this conversation's turns may use the user's ambient MCP servers.
+    ///
+    /// Turning it on needs a project: a conversation with no directory is `McpOnly` and never
+    /// reaches those servers, so offering the switch there would promise something it cannot do.
+    ambient_mcp: Option<bool>,
 }
 
 /// What the two doors onto a conversation refuse with. Every path that had no body keeps none
@@ -13680,7 +13767,8 @@ async fn patch_chat(
         || body.model.is_some()
         || body.effort.is_some()
         || body.cwd.is_some()
-        || body.permission_mode.is_some())
+        || body.permission_mode.is_some()
+        || body.ambient_mcp.is_some())
         && crate::assistant::is_busy(&chat_id)
     {
         return Err(StatusCode::CONFLICT.into());
@@ -13891,6 +13979,27 @@ async fn patch_chat(
                 tracing::warn!(%error, "changing what a conversation may do without asking failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+    }
+
+    if let Some(on) = body.ambient_mcp {
+        // Only a conversation with a project can use the ambient servers; one without a
+        // directory is `McpOnly`, which drops them whatever is stored here.
+        if on
+            && crate::chats::cwd_of(&state.pool, &chat_id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .is_none()
+        {
+            return Err(StatusCode::BAD_REQUEST.into());
+        }
+        crate::chats::set_ambient_mcp(&state.pool, &chat_id, on)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "changing a conversation's ambient MCP servers failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        // The next turn respawns with or without `--strict-mcp-config`.
+        crate::assistant::evict_live(&chat_id);
     }
 
     if let Some(title) = body.title.as_deref() {
@@ -32321,6 +32430,71 @@ mod tests {
         assert_eq!(body["turns"][0]["images"][0], "chats/7-0.png");
     }
 
+    /// What was said into a running turn reaches the window under THAT turn.
+    ///
+    /// Send now writes into the process and leaves no turn of its own, so without this field the
+    /// words would vanish from the conversation the moment the page was reloaded.
+    #[tokio::test]
+    async fn the_transcript_carries_what_was_said_during_a_turn() {
+        let state = test_state().await;
+        let (turn, other): (i64, i64) = {
+            let first = sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, chat_id, stdout, created_at)
+                 VALUES ('corre os testes', 'completed', 'assistant', 'steered', 'feito', '2026-08-20T10:00:00Z')",
+            )
+            .execute(&state.pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            let second = sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, chat_id, stdout, created_at)
+                 VALUES ('e agora?', 'completed', 'assistant', 'steered', 'ok', '2026-08-20T10:05:00Z')",
+            )
+            .execute(&state.pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            (first, second)
+        };
+        sqlx::query(
+            "INSERT INTO chat_said_now (chat_id, run_id, text, origin, created_at)
+             VALUES ('steered', ?, 'e tambem o lint', 'shell', '2026-08-20T10:00:30Z')",
+        )
+        .bind(turn)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/steered")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = json_body(response).await;
+        let turns = body["turns"].as_array().unwrap();
+        let of = |id: i64| {
+            turns
+                .iter()
+                .find(|t| t["id"] == id)
+                .unwrap_or_else(|| panic!("turn {id} in the transcript"))
+        };
+        assert_eq!(of(turn)["said_now"][0]["text"], "e tambem o lint");
+        assert_eq!(
+            of(turn)["said_now"][0]["created_at"],
+            "2026-08-20T10:00:30Z"
+        );
+        assert_eq!(of(turn)["said_now"].as_array().map(Vec::len), Some(1));
+        // Under its own turn only; the run id is how it is matched and is not sent.
+        assert!(of(turn)["said_now"][0].get("run_id").is_none());
+        assert_eq!(of(other)["said_now"].as_array().map(Vec::len), Some(0));
+    }
+
     /// The measurement reaches the window, or the column that stores it is write-only.
     #[tokio::test]
     async fn a_transcript_carries_how_much_each_turn_thought() {
@@ -38137,5 +38311,44 @@ mod tests {
             rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
             "the exit watchdog died with the runtime that asked for shutdown"
         );
+    }
+
+    /// Ambient MCP servers are offered only where the conversation has a project to govern them in.
+    ///
+    /// 400 and not a silent no-op: an unrooted conversation always runs MCP-only, so a stored "on"
+    /// would be a promise nothing keeps. The read side then reports what was stored.
+    #[tokio::test]
+    async fn ambient_mcp_is_only_offered_to_a_conversation_with_a_project() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            patch_chat_request(state.clone(), &chat_id, r#"{"ambient_mcp":true}"#).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            !crate::chats::ambient_mcp_of(&state.pool, &chat_id)
+                .await
+                .unwrap()
+        );
+
+        let root = tempfile::TempDir::new().unwrap();
+        crate::chats::set_cwd(&state.pool, &chat_id, root.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            patch_chat_request(state.clone(), &chat_id, r#"{"ambient_mcp":true}"#).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let response = project_request(state.clone(), &chat_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let project: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(project["ambient_mcp"], serde_json::json!(true));
     }
 }

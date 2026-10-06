@@ -187,6 +187,19 @@ export interface AssistantTurnRow {
    * the column sends no such key.
    */
   relayed_to?: RelaySent[];
+  /**
+   * What the person said to this turn WHILE it was working ("Send now").
+   *
+   * Optional on the wire for the reason the keys above are: an older daemon
+   * sends no such key.
+   */
+  said_now?: SaidDuring[];
+}
+
+/** One line said into a running turn, as the daemon recorded it. */
+export interface SaidDuring {
+  text: string;
+  created_at: string;
 }
 
 /**
@@ -284,6 +297,8 @@ export interface Turn {
    * the one that could not say what it had done.
    */
   relayedTo: RelaySent[];
+  /** What the person said into this turn while it was running, oldest first. */
+  saidNow?: SaidDuring[];
 }
 
 /** Whether a turn's status means the daemon is still working it. */
@@ -353,6 +368,7 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     // Defaulted for the reason `did` and `images` are: a daemon older than the column sends no
     // such key, and a turn drawn without the note beats a page that refuses to draw the turn.
     relayedTo: row.relayed_to ?? [],
+    saidNow: row.said_now ?? [],
   };
 }
 

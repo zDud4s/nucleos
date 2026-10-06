@@ -667,12 +667,51 @@ pub(crate) async fn mint_run_token(pool: &sqlx::SqlitePool, id: i64) -> String {
 /// decides the next tool call, `assistant.rs` decides whether the turn may leave a resumable
 /// session behind — and because a daemon restart in between must not lose it. A resumed session
 /// carries the same words whether or not the process that read them is still alive.
+///
+/// Only the FIRST mark of a turn notifies: the UPDATE matches a row that is not yet marked, so a
+/// second call changes nothing and posts nothing.
 pub(crate) async fn mark_untrusted_context(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<()> {
-    sqlx::query("UPDATE runs SET read_untrusted = 1 WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await
-        .map(|_| ())
+    let newly: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "UPDATE runs SET read_untrusted = 1 WHERE id = ? AND read_untrusted = 0
+         RETURNING chat_id, mode",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    if let Some((Some(chat_id), Some(mode))) = newly
+        && mode == "assistant"
+    {
+        notify_untrusted(pool, id, &chat_id).await;
+    }
+    Ok(())
+}
+
+/// Tells a ROOTED conversation (`chats.cwd` set, the test `hooks.rs::rooted_turn` uses) that its
+/// turn is now read-only. Fail-closed stays with the UPDATE: an error here is only logged.
+async fn notify_untrusted(pool: &sqlx::SqlitePool, run_id: i64, chat_id: &str) {
+    match crate::chats::cwd_of(pool, chat_id).await {
+        Ok(Some(_)) => {
+            if let Err(error) = crate::chat_notices::post_system(
+                pool,
+                chat_id,
+                crate::chat_notices::KIND_UNTRUSTED,
+                run_id,
+                crate::chat_notices::UNTRUSTED_NOTICE,
+            )
+            .await
+            {
+                tracing::warn!(
+                    run_id,
+                    %error,
+                    "could not announce the read-only mark to its conversation"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(run_id, %error, "could not tell whether the conversation is rooted");
+        }
+    }
 }
 
 /// Writes down WHICH stranger, once [`mark_untrusted_context`] has recorded that there was one.
@@ -5032,18 +5071,21 @@ pub async fn cancel_run(State(state): State<AppState>, Path(id): Path<i64>) -> S
     }
 }
 
+/// A run recovered from orphaned state: (id, project_id, chat_id, mode)
+type ReconcileRow = (i64, Option<String>, Option<String>, Option<String>);
+
 /// Marks every run still `"running"` as `"interrupted"` — called once at startup to recover from a
 /// daemon crash that left in-flight runs' rows stuck (spec §3.2). Returns how many rows it changed.
 pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sqlx::Error> {
     let now = chrono::Utc::now().to_rfc3339();
-    let reconciled: Vec<(i64, Option<String>)> = sqlx::query_as(
+    let reconciled: Vec<ReconcileRow> = sqlx::query_as(
         "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE status = 'running'
-         RETURNING id, project_id",
+         RETURNING id, project_id, chat_id, mode",
     )
     .bind(&now)
     .fetch_all(pool)
     .await?;
-    for (id, project_id) in &reconciled {
+    for (id, project_id, chat_id, mode) in &reconciled {
         let _ = crate::feed::append(
             pool,
             project_id.as_deref(),
@@ -5053,6 +5095,24 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
             Some(&crate::feed::run_subject(pool, *id).await),
         )
         .await;
+        // A chat turn the restart cut says so in its conversation. A failed post never fails the
+        // reconcile: the run is already `interrupted` and the notice is only a courtesy.
+        if let (Some(chat_id), Some("assistant")) = (chat_id.as_deref(), mode.as_deref())
+            && let Err(error) = crate::chat_notices::post_system(
+                pool,
+                chat_id,
+                crate::chat_notices::KIND_RESTART,
+                *id,
+                crate::chat_notices::RESTART_NOTICE,
+            )
+            .await
+        {
+            tracing::warn!(
+                run_id = *id,
+                %error,
+                "could not tell a conversation its turn was cut by the restart"
+            );
+        }
     }
     Ok(reconciled.len() as u64)
 }
