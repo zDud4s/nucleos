@@ -22,6 +22,22 @@ pub const REQUESTED_BY_GATE: &str = "gate";
 pub const STATUS_PASSED: &str = "passed";
 pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_ERRORED: &str = "errored";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const STATUS_QUEUED: &str = "queued";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const STATUS_RUNNING: &str = "running";
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub const PRIORITY_INTERACTIVE: i64 = 0;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const PRIORITY_AUTONOMOUS: i64 = 1;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const PRIORITY_POSTGATE: i64 = 2;
+
+/// A row interrupted by this many daemon restarts is given up on, so a request that brings the
+/// daemon down does not loop forever.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_INTERRUPTIONS: i64 = 3;
 
 /// The gate's output is already capped at 1 MiB (`gate::GATE_OUTPUT_CAP`); a row keeps only what a
 /// person reads to see why it went red.
@@ -49,7 +65,10 @@ pub struct Row<'a> {
     pub origin_id: Option<i64>,
     pub ordinal: Option<i64>,
     pub requested_by: &'a str,
+    pub group_name: Option<&'a str>,
+    pub kind: Option<&'a str>,
     pub argv: &'a str,
+    pub fingerprint: Option<&'a str>,
     pub status: &'a str,
     pub exit_code: Option<i64>,
     pub duration_ms: i64,
@@ -61,8 +80,9 @@ pub struct Row<'a> {
 pub async fn record(pool: &SqlitePool, row: &Row<'_>) -> Result<i64, sqlx::Error> {
     let id = sqlx::query(
         "INSERT INTO verify_runs (project_id, worktree, sha, scope, origin, origin_id, ordinal, \
-         requested_by, argv, status, exit_code, duration_ms, started_at, finished_at, output_tail) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         requested_by, group_name, kind, argv, fingerprint, status, exit_code, duration_ms, \
+         started_at, finished_at, output_tail) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(row.project_id)
     .bind(row.worktree)
@@ -72,7 +92,10 @@ pub async fn record(pool: &SqlitePool, row: &Row<'_>) -> Result<i64, sqlx::Error
     .bind(row.origin_id)
     .bind(row.ordinal)
     .bind(row.requested_by)
+    .bind(row.group_name)
+    .bind(row.kind)
     .bind(row.argv)
+    .bind(row.fingerprint)
     .bind(row.status)
     .bind(row.exit_code)
     .bind(row.duration_ms)
@@ -129,7 +152,10 @@ pub async fn timed_gate(
         origin_id: ctx.origin_id,
         ordinal: ctx.ordinal,
         requested_by: REQUESTED_BY_GATE,
+        group_name: None,
+        kind: None,
         argv: command,
+        fingerprint: None,
         status,
         exit_code,
         duration_ms,
@@ -166,6 +192,253 @@ fn tail(text: &str) -> String {
     text.chars()
         .skip(count.saturating_sub(OUTPUT_TAIL_CHARS))
         .collect()
+}
+
+/// A unit of verification a caller asks the executor to run.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Request {
+    pub project_id: Option<String>,
+    pub worktree: String,
+    pub scope: String,
+    pub origin: String,
+    pub origin_id: Option<i64>,
+    pub requested_by: String,
+    pub group_name: Option<String>,
+    pub kind: Option<String>,
+    pub argv: Vec<String>,
+    pub fingerprint: Option<String>,
+    pub priority: i64,
+    pub weight: i64,
+    pub timeout_ms: i64,
+}
+
+/// What `enqueue` answers: the row's id, and whether it joined one already in flight.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Submitted {
+    pub id: i64,
+    pub joined: bool,
+}
+
+/// A queued row as the scheduler needs it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Queued {
+    pub id: i64,
+    pub project_id: Option<String>,
+    pub priority: i64,
+    pub weight: i64,
+    pub enqueued_ms: i64,
+}
+
+/// A row the executor claimed and must now run.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Claimed {
+    pub id: i64,
+    pub project_id: Option<String>,
+    pub worktree: String,
+    pub argv: Vec<String>,
+    pub weight: i64,
+    pub timeout_ms: i64,
+}
+
+/// What a reader sees of one row.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct State {
+    pub id: i64,
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub output_tail: Option<String>,
+    pub interruptions: i64,
+}
+
+/// Queues a request, or joins an equal one that is still queued or running.
+///
+/// Joining needs a `fingerprint`: without one two requests are never known to be the same. A join
+/// creates no row and raises the queued row's priority if the new request is more urgent. The
+/// origin of the joined request is not recorded (v1 limitation).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn enqueue(
+    pool: &SqlitePool,
+    request: &Request,
+    now_ms: i64,
+) -> sqlx::Result<Submitted> {
+    let argv = serde_json::to_string(&request.argv).unwrap_or_else(|_| "[]".to_owned());
+    let mut tx = pool.begin().await?;
+    if let Some(fingerprint) = &request.fingerprint {
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM verify_runs WHERE status IN ('queued', 'running') \
+             AND project_id IS ? AND worktree = ? AND group_name IS ? AND kind IS ? \
+             AND argv = ? AND fingerprint = ? ORDER BY id LIMIT 1",
+        )
+        .bind(&request.project_id)
+        .bind(&request.worktree)
+        .bind(&request.group_name)
+        .bind(&request.kind)
+        .bind(&argv)
+        .bind(fingerprint)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(id) = existing {
+            sqlx::query(
+                "UPDATE verify_runs SET priority = MIN(priority, ?) \
+                 WHERE id = ? AND status = 'queued'",
+            )
+            .bind(request.priority)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(Submitted { id, joined: true });
+        }
+    }
+    let id = sqlx::query(
+        "INSERT INTO verify_runs (project_id, worktree, scope, origin, origin_id, requested_by, \
+         group_name, kind, argv, fingerprint, status, priority, weight, timeout_ms, enqueued_ms) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+    )
+    .bind(&request.project_id)
+    .bind(&request.worktree)
+    .bind(&request.scope)
+    .bind(&request.origin)
+    .bind(request.origin_id)
+    .bind(&request.requested_by)
+    .bind(&request.group_name)
+    .bind(&request.kind)
+    .bind(&argv)
+    .bind(&request.fingerprint)
+    .bind(request.priority)
+    .bind(request.weight)
+    .bind(request.timeout_ms)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await?
+    .last_insert_rowid();
+    tx.commit().await?;
+    Ok(Submitted { id, joined: false })
+}
+
+/// Every queued row, oldest first, for the scheduler to choose from.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn queued(pool: &SqlitePool) -> sqlx::Result<Vec<Queued>> {
+    let rows: Vec<(i64, Option<String>, i64, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT id, project_id, priority, weight, enqueued_ms FROM verify_runs \
+         WHERE status = 'queued' ORDER BY enqueued_ms, id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, project_id, priority, weight, enqueued_ms)| Queued {
+            id,
+            project_id,
+            priority,
+            weight,
+            enqueued_ms: enqueued_ms.unwrap_or(0),
+        })
+        .collect())
+}
+
+/// Takes a queued row for running. `None` when it is no longer queued.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn claim(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Claimed>> {
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let row: Option<(i64, Option<String>, String, String, i64, Option<i64>)> = sqlx::query_as(
+        "UPDATE verify_runs SET status = 'running', started_at = ? \
+         WHERE id = ? AND status = 'queued' \
+         RETURNING id, project_id, worktree, argv, weight, timeout_ms",
+    )
+    .bind(started_at)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(id, project_id, worktree, argv, weight, timeout_ms)| Claimed {
+            id,
+            project_id,
+            worktree,
+            argv: serde_json::from_str(&argv).unwrap_or_default(),
+            weight,
+            timeout_ms: timeout_ms.unwrap_or(0),
+        },
+    ))
+}
+
+/// Records how a running row ended.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn finish(
+    pool: &SqlitePool,
+    id: i64,
+    status: &str,
+    exit_code: Option<i64>,
+    duration_ms: i64,
+    output_tail: Option<&str>,
+) -> sqlx::Result<()> {
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    let output_tail = output_tail.map(tail);
+    sqlx::query(
+        "UPDATE verify_runs SET status = ?, exit_code = ?, duration_ms = ?, finished_at = ?, \
+         output_tail = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind(status)
+    .bind(exit_code)
+    .bind(duration_ms)
+    .bind(finished_at)
+    .bind(output_tail)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One row as a reader sees it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<State>> {
+    let row: Option<(i64, String, Option<i64>, Option<i64>, Option<String>, i64)> = sqlx::query_as(
+        "SELECT id, status, exit_code, duration_ms, output_tail, interruptions \
+             FROM verify_runs WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(id, status, exit_code, duration_ms, output_tail, interruptions)| State {
+            id,
+            status,
+            exit_code,
+            duration_ms,
+            output_tail,
+            interruptions,
+        },
+    ))
+}
+
+/// At daemon start, rows still `running` were cut off by the restart: they go back to the queue,
+/// or are given up on once they have been interrupted `MAX_INTERRUPTIONS` times. Returns
+/// `(requeued, given_up)`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn requeue_interrupted(pool: &SqlitePool) -> sqlx::Result<(u64, u64)> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let given_up = sqlx::query(
+        "UPDATE verify_runs SET status = 'errored', finished_at = ?, \
+         output_tail = ?, interruptions = interruptions + 1 \
+         WHERE status = 'running' AND interruptions + 1 >= ?",
+    )
+    .bind(now)
+    .bind(format!(
+        "interrupted by daemon restarts {MAX_INTERRUPTIONS} times"
+    ))
+    .bind(MAX_INTERRUPTIONS)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let requeued = sqlx::query(
+        "UPDATE verify_runs SET status = 'queued', started_at = NULL, \
+         interruptions = interruptions + 1 WHERE status = 'running'",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok((requeued, given_up))
 }
 
 #[cfg(test)]
@@ -342,6 +615,227 @@ mod tests {
         .await;
         let (.., sha) = only_row(&pool).await;
         assert_eq!(sha.as_deref(), Some(head.trim()));
+    }
+
+    fn request(fingerprint: Option<&str>, priority: i64) -> Request {
+        Request {
+            project_id: Some("alpha".to_owned()),
+            worktree: "/wt".to_owned(),
+            scope: SCOPE_FULL.to_owned(),
+            origin: ORIGIN_RUN.to_owned(),
+            origin_id: Some(1),
+            requested_by: "agent".to_owned(),
+            group_name: Some("core".to_owned()),
+            kind: Some("test".to_owned()),
+            argv: vec!["cargo".to_owned(), "test".to_owned()],
+            fingerprint: fingerprint.map(str::to_owned),
+            priority,
+            weight: 2,
+            timeout_ms: 60_000,
+        }
+    }
+
+    async fn row_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM verify_runs")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_queued_request_is_claimed_once() {
+        let pool = test_pool().await;
+        let submitted = enqueue(&pool, &request(None, 1), 100).await.unwrap();
+        assert!(!submitted.joined);
+        let claimed = claim(&pool, submitted.id).await.unwrap().unwrap();
+        assert_eq!(claimed.argv, vec!["cargo", "test"]);
+        assert_eq!((claimed.weight, claimed.timeout_ms), (2, 60_000));
+        assert!(claim(&pool, submitted.id).await.unwrap().is_none());
+        let state = get(&pool, submitted.id).await.unwrap().unwrap();
+        assert_eq!(state.status, STATUS_RUNNING);
+    }
+
+    #[tokio::test]
+    async fn finishing_records_the_outcome() {
+        let pool = test_pool().await;
+        let id = enqueue(&pool, &request(None, 1), 100).await.unwrap().id;
+        claim(&pool, id).await.unwrap().unwrap();
+        finish(&pool, id, STATUS_PASSED, Some(0), 1234, Some("ok"))
+            .await
+            .unwrap();
+        let state = get(&pool, id).await.unwrap().unwrap();
+        assert_eq!(state.status, STATUS_PASSED);
+        assert_eq!(state.exit_code, Some(0));
+        assert_eq!(state.duration_ms, Some(1234));
+        assert_eq!(state.output_tail.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn an_equal_request_joins_the_one_in_flight() {
+        let pool = test_pool().await;
+        let first = enqueue(&pool, &request(Some("fp"), 1), 100).await.unwrap();
+        let second = enqueue(&pool, &request(Some("fp"), 1), 200).await.unwrap();
+        assert!(!first.joined);
+        assert!(second.joined);
+        assert_eq!(first.id, second.id);
+        assert_eq!(row_count(&pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn joining_raises_the_priority_of_a_queued_row() {
+        let pool = test_pool().await;
+        let first = enqueue(&pool, &request(Some("fp"), 1), 100).await.unwrap();
+        enqueue(&pool, &request(Some("fp"), PRIORITY_INTERACTIVE), 200)
+            .await
+            .unwrap();
+        let priority: i64 = sqlx::query_scalar("SELECT priority FROM verify_runs WHERE id = ?")
+            .bind(first.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(priority, PRIORITY_INTERACTIVE);
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_fingerprint_never_joins() {
+        let pool = test_pool().await;
+        let first = enqueue(&pool, &request(None, 1), 100).await.unwrap();
+        let second = enqueue(&pool, &request(None, 1), 200).await.unwrap();
+        assert!(!second.joined);
+        assert_ne!(first.id, second.id);
+        assert_eq!(row_count(&pool).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_different_fingerprint_does_not_join() {
+        let pool = test_pool().await;
+        let first = enqueue(&pool, &request(Some("a"), 1), 100).await.unwrap();
+        let second = enqueue(&pool, &request(Some("b"), 1), 200).await.unwrap();
+        assert!(!second.joined);
+        assert_ne!(first.id, second.id);
+    }
+
+    #[tokio::test]
+    async fn a_finished_row_is_not_joined() {
+        let pool = test_pool().await;
+        let first = enqueue(&pool, &request(Some("fp"), 1), 100).await.unwrap();
+        claim(&pool, first.id).await.unwrap().unwrap();
+        finish(&pool, first.id, STATUS_PASSED, Some(0), 5, None)
+            .await
+            .unwrap();
+        let second = enqueue(&pool, &request(Some("fp"), 1), 200).await.unwrap();
+        assert!(!second.joined);
+        assert_ne!(first.id, second.id);
+    }
+
+    #[tokio::test]
+    async fn a_restart_requeues_running_rows() {
+        let pool = test_pool().await;
+        let id = enqueue(&pool, &request(None, 1), 100).await.unwrap().id;
+        claim(&pool, id).await.unwrap().unwrap();
+        assert_eq!(requeue_interrupted(&pool).await.unwrap(), (1, 0));
+        let state = get(&pool, id).await.unwrap().unwrap();
+        assert_eq!(state.status, STATUS_QUEUED);
+        assert_eq!(state.interruptions, 1);
+        let started: Option<String> =
+            sqlx::query_scalar("SELECT started_at FROM verify_runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(started, None);
+    }
+
+    #[tokio::test]
+    async fn a_row_interrupted_three_times_gives_up() {
+        let pool = test_pool().await;
+        let id = enqueue(&pool, &request(None, 1), 100).await.unwrap().id;
+        for cycle in 1..=MAX_INTERRUPTIONS {
+            claim(&pool, id).await.unwrap().unwrap();
+            let counts = requeue_interrupted(&pool).await.unwrap();
+            if cycle < MAX_INTERRUPTIONS {
+                assert_eq!(counts, (1, 0));
+            } else {
+                assert_eq!(counts, (0, 1));
+            }
+        }
+        let state = get(&pool, id).await.unwrap().unwrap();
+        assert_eq!(state.status, STATUS_ERRORED);
+        assert_eq!(
+            state.output_tail.as_deref(),
+            Some("interrupted by daemon restarts 3 times")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gate_log_is_not_in_the_queue() {
+        let pool = test_pool().await;
+        let row = Row {
+            project_id: Some("alpha"),
+            worktree: "/wt",
+            sha: None,
+            scope: SCOPE_FULL,
+            origin: ORIGIN_RUN,
+            origin_id: Some(1),
+            ordinal: None,
+            requested_by: REQUESTED_BY_GATE,
+            group_name: None,
+            kind: None,
+            argv: "x",
+            fingerprint: None,
+            status: STATUS_PASSED,
+            exit_code: Some(0),
+            duration_ms: 1,
+            started_at: "2026-01-01T00:00:00Z",
+            finished_at: "2026-01-01T00:00:01Z",
+            output_tail: None,
+        };
+        record(&pool, &row).await.unwrap();
+        assert!(queued(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_rebuild_keeps_existing_rows() {
+        let pool = crate::testdb::pool_migrated_through(166).await;
+        sqlx::query(
+            "INSERT INTO verify_runs (id, project_id, worktree, sha, scope, origin, origin_id, \
+             ordinal, requested_by, argv, status, exit_code, duration_ms, started_at, finished_at, \
+             output_tail) VALUES (7, 'alpha', '/wt', 'abc', 'full', 'run', 3, 2, 'gate', 'make', \
+             'failed', 1, 99, '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z', 'boom')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::testdb::apply_migrations_after(&pool, 166).await;
+        let row: (
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            String,
+            String,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            "SELECT status, argv, exit_code, duration_ms, started_at, finished_at, \
+                 interruptions, output_tail FROM verify_runs WHERE id = 7",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                "failed".to_owned(),
+                "make".to_owned(),
+                Some(1),
+                Some(99),
+                "2026-01-01T00:00:00Z".to_owned(),
+                "2026-01-01T00:00:01Z".to_owned(),
+                0,
+                "boom".to_owned()
+            )
+        );
     }
 
     #[test]

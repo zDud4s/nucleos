@@ -165,14 +165,14 @@ pub async fn run_gate(
         Ok(words) => words,
         Err(reason) => return GateOutcome::Errored { reason },
     };
-    // Before `split_first`, so the program is the first word that is not an assignment. `words` from
+    // Before the emptiness check, so the program is the first word that is not an assignment. `words` from
     // here on is the command proper, which is also what the tamper check below must see.
     let (environment, words) = split_environment(words);
-    let Some((program, arguments)) = words.split_first() else {
+    if words.is_empty() {
         return GateOutcome::Errored {
             reason: "gate command is empty".to_owned(),
         };
-    };
+    }
 
     // Before anything is spawned: a gate the measured run rewrote is not a measurement. `Errored`,
     // not `Failed` — the code may be perfectly fine; what broke is our ability to tell.
@@ -181,11 +181,71 @@ pub async fn run_gate(
         return GateOutcome::Errored { reason };
     }
 
+    let outcome = run_argv(&words, worktree, &environment, timeout).await;
+    if outcome.timed_out {
+        return GateOutcome::Errored {
+            reason: format!("gate command timed out after {timeout:?}"),
+        };
+    }
+    if let Some(reason) = outcome.error {
+        return GateOutcome::Errored { reason };
+    }
+
+    match classify_exit(outcome.exit_code) {
+        ExitVerdict::Passed => GateOutcome::Passed,
+        ExitVerdict::Failed(exit_code) => GateOutcome::Failed {
+            exit_code,
+            output: outcome.tail,
+        },
+        ExitVerdict::Signalled => GateOutcome::Errored {
+            reason: format!(
+                "gate command was killed by a signal before it could report a result; captured output: {}",
+                outcome.tail
+            ),
+        },
+    }
+}
+
+/// What a child run produced, before anyone decides what it means.
+#[derive(Debug)]
+pub(crate) struct ArgvOutcome {
+    /// `None` when the process was signalled, timed out, or never started.
+    pub exit_code: Option<i32>,
+    pub tail: String,
+    pub duration: Duration,
+    pub timed_out: bool,
+    /// Spawn or wait failure, already phrased for a person.
+    pub error: Option<String>,
+}
+
+/// Runs `argv` in `cwd` with `env` added to the inherited environment and returns what happened.
+///
+/// This is the spawn-and-drain half of [`run_gate`], with no tamper check and no verdict: callers
+/// that run something other than the project's gate command (the verification executor) share the
+/// same process-tree kill, output cap and drain deadline.
+pub(crate) async fn run_argv(
+    argv: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+    timeout: Duration,
+) -> ArgvOutcome {
+    let started = std::time::Instant::now();
+    let failed = |error: String| ArgvOutcome {
+        exit_code: None,
+        tail: String::new(),
+        duration: started.elapsed(),
+        timed_out: false,
+        error: Some(error),
+    };
+    let Some((program, arguments)) = argv.split_first() else {
+        return failed("empty command".to_owned());
+    };
+
     let mut command = Command::new(program);
     command
         .args(arguments)
-        .envs(environment)
-        .current_dir(worktree)
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -193,11 +253,7 @@ pub async fn run_gate(
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => {
-            return GateOutcome::Errored {
-                reason: format!("failed to start gate command: {error}"),
-            };
-        }
+        Err(error) => return failed(format!("failed to start gate command: {error}")),
     };
 
     // Declared after the child so it drops first, while the process handle still pins the pid — the
@@ -211,7 +267,6 @@ pub async fn run_gate(
     let stdout_task = tokio::spawn(drain_output(stdout, Arc::clone(&output)));
     let stderr_task = tokio::spawn(drain_output(stderr, Arc::clone(&output)));
 
-    let started = std::time::Instant::now();
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         // Deliberately NOT disarming the killer here. `child.wait()` returning says the direct child
         // exited, not that its pipes closed, and the drain below still needs a way to take down
@@ -223,9 +278,7 @@ pub async fn run_gate(
             }
             stdout_task.abort();
             stderr_task.abort();
-            return GateOutcome::Errored {
-                reason: format!("failed while waiting for gate command: {error}"),
-            };
+            return failed(format!("failed while waiting for gate command: {error}"));
         }
         Err(_) => {
             if let Some(killer) = tree_killer.as_mut() {
@@ -235,8 +288,12 @@ pub async fn run_gate(
             let _ = child.wait().await;
             stdout_task.abort();
             stderr_task.abort();
-            return GateOutcome::Errored {
-                reason: format!("gate command timed out after {timeout:?}"),
+            return ArgvOutcome {
+                exit_code: None,
+                tail: output.lock().await.render(),
+                duration: started.elapsed(),
+                timed_out: true,
+                error: None,
             };
         }
     };
@@ -264,9 +321,9 @@ pub async fn run_gate(
                 killer.disarm();
             }
         }
-        Ok(Err(reason)) => return GateOutcome::Errored { reason },
+        Ok(Err(reason)) => return failed(reason),
         // The verdict survives a stuck drain. The command ran and its status is known; only the tail
-        // is short. Returning `Errored` here would throw away a real measurement because a leftover
+        // is short. Returning an error here would throw away a real measurement because a leftover
         // process would not let go of a pipe. The killer stays armed, so dropping it takes the
         // subtree down on the way out.
         Err(_) => {
@@ -277,18 +334,12 @@ pub async fn run_gate(
         }
     }
 
-    match classify_exit(status.code()) {
-        ExitVerdict::Passed => GateOutcome::Passed,
-        ExitVerdict::Failed(exit_code) => GateOutcome::Failed {
-            exit_code,
-            output: output.lock().await.render(),
-        },
-        ExitVerdict::Signalled => GateOutcome::Errored {
-            reason: format!(
-                "gate command was killed by a signal before it could report a result; captured output: {}",
-                output.lock().await.render()
-            ),
-        },
+    ArgvOutcome {
+        exit_code: status.code(),
+        tail: output.lock().await.render(),
+        duration: started.elapsed(),
+        timed_out: false,
+        error: None,
     }
 }
 
@@ -375,8 +426,58 @@ where
 #[rustfmt::skip]
 #[cfg(test)]
 mod tests {
-    use super::{ExitVerdict, GateOutcome, classify_exit, run_gate, split_environment};
+    use super::{ExitVerdict, GateOutcome, classify_exit, run_argv, run_gate, split_environment};
     use std::time::Duration;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn run_argv_reports_the_exit_code_and_the_tail() {
+        let cwd = tempfile::tempdir().expect("create temporary directory");
+        let outcome = run_argv(&argv(&["git", "--version"]), cwd.path(), &[], Duration::from_secs(30)).await;
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.tail.contains("git version"), "tail was: {}", outcome.tail);
+        assert!(!outcome.timed_out);
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_argv_reports_a_failing_exit_code() {
+        let cwd = tempfile::tempdir().expect("create temporary directory");
+        let outcome = run_argv(&argv(&["git", "definitely-not-a-subcommand"]), cwd.path(), &[], Duration::from_secs(30)).await;
+        assert!(matches!(outcome.exit_code, Some(code) if code != 0), "got {:?}", outcome.exit_code);
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_argv_passes_the_environment() {
+        let cwd = tempfile::tempdir().expect("create temporary directory");
+        let env = vec![
+            ("GIT_CONFIG_COUNT".to_owned(), "1".to_owned()),
+            ("GIT_CONFIG_KEY_0".to_owned(), "nucleos.probe".to_owned()),
+            ("GIT_CONFIG_VALUE_0".to_owned(), "warm-ok".to_owned()),
+        ];
+        let outcome = run_argv(&argv(&["git", "config", "--get", "nucleos.probe"]), cwd.path(), &env, Duration::from_secs(30)).await;
+        assert!(outcome.tail.contains("warm-ok"), "tail was: {}", outcome.tail);
+    }
+
+    #[tokio::test]
+    async fn run_argv_refuses_an_empty_argv() {
+        let cwd = tempfile::tempdir().expect("create temporary directory");
+        let outcome = run_argv(&[], cwd.path(), &[], Duration::from_secs(5)).await;
+        assert!(outcome.error.is_some());
+        assert!(outcome.exit_code.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_argv_names_a_program_that_does_not_exist() {
+        let cwd = tempfile::tempdir().expect("create temporary directory");
+        let outcome = run_argv(&argv(&["nucleos-no-such-program-xyz"]), cwd.path(), &[], Duration::from_secs(5)).await;
+        assert!(outcome.error.is_some());
+        assert!(outcome.exit_code.is_none());
+    }
 
     #[tokio::test]
     async fn a_missing_binary_is_not_a_failing_gate() {
