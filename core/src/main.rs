@@ -111,8 +111,10 @@ mod storage;
 mod team;
 mod team_notes;
 mod team_trigger;
+mod test_select;
 #[cfg(test)]
 mod testdb;
+mod tests_map;
 mod token_efficiency;
 mod transcribe;
 mod triage;

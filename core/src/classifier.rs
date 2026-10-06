@@ -117,6 +117,10 @@ const SELF_GOVERNING_FILES: &[&str] = &[
     ".ai/github.yaml",
     ".claude/settings.json",
     ".claude/settings.local.json",
+    // The project's test map: which tests a change needs and which tools only the daemon runs. An
+    // agent that edits it decides what verifies its own work. A direct edit asks the owner; a
+    // write by Bash or a merge is caught at landing (spec §3.4, defences 1 and 4).
+    "nucleos.tests.yaml",
 ];
 
 /// Directories where every file is the agent's own operating instructions, matched as a whole path
@@ -4416,6 +4420,21 @@ mod tests {
                 classify(
                     tool,
                     &json!({"file_path": ".ai/voice.yaml"}),
+                    Some(Path::new(r"C:\work\repo")),
+                ),
+                "pending_approval",
+                "self-governing-file",
+            );
+        }
+    }
+
+    #[test]
+    fn tests_map_is_self_governing() {
+        for tool in ["Edit", "Write"] {
+            assert_classification(
+                classify(
+                    tool,
+                    &json!({"file_path": "nucleos.tests.yaml"}),
                     Some(Path::new(r"C:\work\repo")),
                 ),
                 "pending_approval",
