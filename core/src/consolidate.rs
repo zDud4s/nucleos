@@ -135,7 +135,8 @@ pub async fn run_pass(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Pas
              UNION
              SELECT DISTINCT scope_id AS project_id FROM knowledge
               WHERE scope_kind = 'project' AND scope_id IS NOT NULL
-                AND source = 'consolidator' AND layer = 'episodic' AND status = 'active'
+                AND (source = 'consolidator' OR source = 'distiller')
+                AND layer = 'episodic' AND status = 'active'
          ) ORDER BY project_id",
     )
     .fetch_all(pool)
@@ -627,7 +628,8 @@ async fn expire_unconfirmed(
     let mut transaction = pool.begin().await?;
     let ids: Vec<i64> = sqlx::query_scalar(
         "SELECT id FROM knowledge
-          WHERE scope_kind = 'project' AND scope_id = ? AND source = 'consolidator'
+          WHERE scope_kind = 'project' AND scope_id = ?
+            AND (source = 'consolidator' OR source = 'distiller')
             AND layer = 'episodic' AND status = 'active' AND expires_after_runs IS NOT NULL
             AND last_confirmed_at IS NOT NULL
             AND (SELECT COUNT(*) FROM runs
@@ -644,8 +646,8 @@ async fn expire_unconfirmed(
     for id in ids {
         let updated = sqlx::query(
             "UPDATE knowledge SET status = 'expired', ended_at = ?
-              WHERE id = ? AND source = 'consolidator' AND layer = 'episodic'
-                AND status = 'active'",
+              WHERE id = ? AND (source = 'consolidator' OR source = 'distiller')
+                AND layer = 'episodic' AND status = 'active'",
         )
         .bind(&now)
         .bind(id)
@@ -1093,9 +1095,69 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!updates.is_empty());
         for update in updates {
-            assert!(update.contains("source = 'consolidator'"), "{update}");
+            if update.contains("source = 'distiller'") {
+                // The distiller's rows may be touched here only to expire them -- never to
+                // renew, merge or rewrite what the distiller wrote.
+                assert!(update.contains("status = 'expired'"), "{update}");
+            } else {
+                assert!(update.contains("source = 'consolidator'"), "{update}");
+            }
             assert!(update.contains("layer = 'episodic'"), "{update}");
         }
+    }
+
+    /// A distilled episodic that nobody reconfirmed ages out like a measurement does, in a project
+    /// the consolidator never wrote to; a distilled rule never ages out.
+    #[tokio::test]
+    async fn a_distilled_episode_nobody_reconfirms_expires_and_a_distilled_rule_does_not() {
+        let pool = test_pool().await;
+        let episode = seed_knowledge(
+            &pool,
+            "episodic",
+            "project",
+            PROJECT,
+            "distiller",
+            None,
+            "title:an old episode",
+            "active",
+            None,
+        )
+        .await;
+        let rule = seed_knowledge(
+            &pool,
+            "semantic",
+            "project",
+            PROJECT,
+            "distiller",
+            None,
+            "title:an old rule",
+            "active",
+            None,
+        )
+        .await;
+        for id in [episode, rule] {
+            sqlx::query(
+                "UPDATE knowledge SET expires_after_runs = 1, last_confirmed_at = ? WHERE id = ?",
+            )
+            .bind(at(1).to_rfc3339())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for _ in 0..3 {
+            seed_run_at(&pool, PROJECT, Some("passed"), None, at(2)).await;
+        }
+
+        let report = run_pass(&pool, at(3)).await.unwrap();
+
+        assert_eq!(report.expired, 1);
+        let episode = known(&pool, episode).await;
+        assert_eq!(episode["status"], "expired");
+        assert!(!episode["ended_at"].is_null());
+        let rule = known(&pool, rule).await;
+        assert_eq!(rule["status"], "active");
+        assert!(rule["ended_at"].is_null());
     }
 
     /// Consolidation may add its own measured row but may never mutate a person's assertion.

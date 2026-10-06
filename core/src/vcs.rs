@@ -2849,7 +2849,22 @@ pub async fn drain_once(
     // Cloned rather than moved so the failure paths below can still name it. `finish` consumes the
     // outcome, and a refused write would otherwise drop the only copy of a sha that git really
     // produced — leaving a commit the daemon caused recorded nowhere in the system at all.
-    match finish(pool, id, outcome.clone()).await {
+    //
+    // The terminal write now rides a transaction so a land's distillation cause is queued with it.
+    // `finish` still goes FIRST, which keeps the deferred-begin write-first argument above, and the
+    // queueing is best effort: its failure is logged and never fails or rolls back the write.
+    let finished = async {
+        let mut tx = pool.begin().await?;
+        finish(&mut *tx, id, outcome.clone()).await?;
+        if matches!(outcome, Outcome::Succeeded { .. })
+            && let Err(error) = crate::distill::enqueue_landed_in(&mut tx, id).await
+        {
+            tracing::warn!(request_id = id, %error, "distill: could not queue a landed job");
+        }
+        tx.commit().await
+    }
+    .await;
+    match finished {
         // Spec §6.4's fifth step, and spec §2.1's whole argument for this pillar having no view of
         // its own: every transition writes to `feed.rs`, which the shell already shows. Without this
         // row, a merge the daemon performed is invisible to the person who asked for it.
@@ -5588,6 +5603,50 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].0.contains("succeeded"), "got: {}", lines[0].0);
         assert_eq!(lines[0].1, Some(format!("vcs:{id}")));
+    }
+
+    /// A merge of a job's own branch into a branch outside `nucleos/` is the land the distiller
+    /// learns from; any other merge is not, and queues nothing.
+    #[tokio::test]
+    async fn a_landed_job_branch_is_queued_for_distillation() {
+        let pool = test_pool().await;
+        // `repo()` resolves to project `alpha`, so the job has to live in the same project.
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at)
+             VALUES (7, 'alpha', 'C:/repo', 'completed', 5, '2026-10-05T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A feature branch landing is not a job landing.
+        submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
+        let none: Vec<(String, Option<i64>)> =
+            sqlx::query_as("SELECT cause, job_id FROM distill_queue")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(none.is_empty(), "a feature-branch merge queued: {none:?}");
+
+        let op = Op::Merge {
+            source: "nucleos/job-7".into(),
+            target: "master".into(),
+        };
+        submit(&pool, &repo(), &op, Origin::Human).await.unwrap();
+        drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("def456")).await;
+
+        let rows: Vec<(String, String, Option<i64>, Option<i64>)> =
+            sqlx::query_as("SELECT cause, project_id, job_id, item_id FROM distill_queue")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![("job_landed".to_string(), "alpha".to_string(), Some(7), None)]
+        );
     }
 
     /// An escalation is the one outcome whose reason has to reach the feed, and the one whose

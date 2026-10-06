@@ -715,8 +715,13 @@ fn select_pass<'a>(
 ///
 /// Consolidator measurements count only when they have both their episodic shape and a measured
 /// observation count. `recall` shares this rule with briefing admission rather than inventing a
-/// second meaning for `active`. The other named exception is not approval: `admitted` separately
-/// requires a same-job working row with well-tagged evidence.
+/// second meaning for `active`. A third exception is opened deliberately, by owner decision D3: a
+/// distilled episode (`source = 'distiller'`, active on trial) reaches a node unapproved, spec
+/// `.ai/specs/2026-10-05-destilador-design.md` section 4.6. This function must NOT be narrowed to
+/// say so: a distilled semantic or procedural row a person approved is `active` with
+/// `source = 'distiller'` too, and it is approved. A proposed one never gets here. The other named
+/// exception is not approval: `admitted` separately requires a same-job working row with
+/// well-tagged evidence.
 pub(crate) fn approved(row: &Known) -> bool {
     match row.status.as_str() {
         "active" if row.source == "consolidator" => {
@@ -730,9 +735,11 @@ pub(crate) fn approved(row: &Known) -> bool {
 // Only what a person approved. Filtered here rather than trusted from the caller's query:
 // `select` is the last thing between a `proposed` row and a node's prompt, and something that
 // reaches a prompt unapproved makes the approval decorative, which is the entire mechanism.
-// The only named exceptions are a measured consolidator observation and a working fact with
-// well-tagged evidence read inside the same job; spelling their complete shapes here keeps a third
-// one out.
+// The named exceptions are a measured consolidator observation, a working fact with well-tagged
+// evidence read inside the same job, and -- opened deliberately by owner decision D3, spec
+// `.ai/specs/2026-10-05-destilador-design.md` section 4.6 -- a distilled episode (`source =
+// 'distiller'`) active on trial, which `approved` already lets through; spelling their complete
+// shapes here keeps a fourth one out.
 fn admitted(row: &Known, context: &Context) -> bool {
     match row.status.as_str() {
         "active" => approved(row),
@@ -1344,6 +1351,36 @@ pub async fn propose_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     declaration: Declaration<'_>,
 ) -> Result<(i64, i64), ProposeError> {
+    propose_in_with(tx, declaration, &Provenance::default()).await
+}
+
+/// Where a learning came from, when somebody other than a run or the owner is writing it.
+///
+/// Kept beside [`Declaration`] and not inside it: a struct literal cannot gain fields without
+/// editing every literal, and the callers that exist must stay as they are. `None` everywhere is
+/// today's behaviour - each field overrides exactly one value the door would otherwise derive.
+#[derive(Default)]
+pub struct Provenance<'a> {
+    /// Replaces the `run`/`owner` derivation (the distiller writes `distiller`).
+    pub source: Option<&'a str>,
+    /// Which cause queued the distillation this row came out of.
+    pub distill_cause: Option<&'a str>,
+    /// Tagged evidence, stored as given.
+    pub evidence: Option<&'a str>,
+    pub points_at: Option<&'a str>,
+    /// Replaces the `gate:` signature derived from the body.
+    pub fingerprint: Option<&'a str>,
+    /// Replaces the layer derived from the kind.
+    pub layer: Option<Layer>,
+}
+
+/// `propose_in` with the provenance a caller other than a run or the owner brings. Nothing is
+/// committed here.
+pub async fn propose_in_with(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    declaration: Declaration<'_>,
+    provenance: &Provenance<'_>,
+) -> Result<(i64, i64), ProposeError> {
     let Declaration {
         project_id,
         origin_run_id,
@@ -1356,8 +1393,12 @@ pub async fn propose_in(
 
     let scope = Scope::of_project(project_id);
     let (scope_kind, scope_id) = scope.columns();
-    let fingerprint =
+    let derived_fingerprint =
         failure_signature(body).map(|signature| format!("gate:{}", signature.fingerprint));
+    let fingerprint = provenance
+        .fingerprint
+        .map(str::to_owned)
+        .or(derived_fingerprint);
 
     // Checked before anything is written, and checked here rather than left to the foreign key:
     // SQLite would accept a link to another scope's row without a word, and the failure would
@@ -1379,19 +1420,19 @@ pub async fn propose_in(
     let knowledge_id = sqlx::query(
         "INSERT INTO knowledge
            (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, status, supersedes,
-            origin_run_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?)",
+            origin_run_id, created_at, evidence, points_at, distill_cause)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?)",
     )
-    .bind(kind.layer().as_str())
+    .bind(provenance.layer.unwrap_or_else(|| kind.layer()).as_str())
     .bind(scope_kind)
     .bind(scope_id.as_deref())
     // Never read from the body: who knocked at the door is a fact the door has and the text does
     // not.
-    .bind(if origin_run_id.is_some() {
+    .bind(provenance.source.unwrap_or(if origin_run_id.is_some() {
         "run"
     } else {
         "owner"
-    })
+    }))
     .bind(kind.as_str())
     .bind(title)
     .bind(body)
@@ -1399,6 +1440,9 @@ pub async fn propose_in(
     .bind(supersedes)
     .bind(origin_run_id)
     .bind(&now)
+    .bind(provenance.evidence)
+    .bind(provenance.points_at)
+    .bind(provenance.distill_cause)
     .execute(&mut **tx)
     .await?
     .last_insert_rowid();
@@ -1408,7 +1452,9 @@ pub async fn propose_in(
          VALUES (?, NULL, 'proposed', ?, ?)",
     )
     .bind(knowledge_id)
-    .bind(if origin_run_id.is_some() {
+    .bind(if provenance.source == Some("distiller") {
+        "distilled from a job"
+    } else if origin_run_id.is_some() {
         "declared by a run"
     } else {
         "declared by the owner"
@@ -1468,6 +1514,149 @@ pub async fn propose_in(
         .await?;
 
     Ok((knowledge_id, proposal_id))
+}
+
+/// How many runs a distilled episode may go unconfirmed before it expires - the consolidator's
+/// trial, spec `destilador` section 3.
+pub(crate) const DISTILLED_TRIAL_RUNS: i64 = 50;
+
+/// The note of an event that renews a row without changing its status.
+pub(crate) const NOTE_RECONFIRMED: &str = "reconfirmed";
+
+/// The identity of a learning for deduplication: its title lowercased, whitespace collapsed and
+/// final punctuation stripped. `None` when nothing is left to identify it by.
+pub fn title_fingerprint(title: &str) -> Option<String> {
+    let lowered = title.to_lowercase();
+    let collapsed = lowered.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed
+        .trim_end_matches(|c: char| ".!?:;,\u{2026}".contains(c) || c.is_whitespace())
+        .trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(format!("title:{trimmed}"))
+    }
+}
+
+/// Record an episode a job taught: believed from the start, on trial.
+///
+/// Active, episodic and the distiller's, expiring unless somebody reconfirms it. `observations`
+/// and `generator` stay NULL - they are the consolidator's measurement and a distilled row has
+/// none. Nothing is committed here.
+pub async fn record_distilled(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    declaration: &Declaration<'_>,
+    provenance: &Provenance<'_>,
+) -> sqlx::Result<i64> {
+    let scope = Scope::of_project(declaration.project_id);
+    let (scope_kind, scope_id) = scope.columns();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let id = sqlx::query(
+        "INSERT INTO knowledge
+           (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, evidence,
+            points_at, distill_cause, expires_after_runs, last_confirmed_at, status,
+            created_at, activated_at)
+         VALUES ('episodic', ?, ?, 'distiller', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+    )
+    .bind(scope_kind)
+    .bind(scope_id.as_deref())
+    .bind(declaration.kind.as_str())
+    .bind(declaration.title)
+    .bind(declaration.body)
+    .bind(provenance.fingerprint)
+    .bind(provenance.evidence)
+    .bind(provenance.points_at)
+    .bind(provenance.distill_cause)
+    .bind(DISTILLED_TRIAL_RUNS)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?
+    .last_insert_rowid();
+
+    sqlx::query(
+        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'active', 'created', ?)",
+    )
+    .bind(id)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(id)
+}
+
+/// A learning seen again: merge the new evidence into the project's newest live row with the same
+/// fingerprint, renew it when it is an active episode, and say so in a same-status event.
+///
+/// `None` when the project has no such row. Project-scoped on purpose - the same title in another
+/// project is another learning. Nothing is committed here.
+pub async fn reconfirm_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project_id: &str,
+    fingerprint: &str,
+    evidence: &str,
+) -> sqlx::Result<Option<i64>> {
+    let row: Option<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, layer, status, evidence FROM knowledge
+         WHERE scope_kind = 'project' AND scope_id = ? AND fingerprint = ?
+           AND status IN ('active', 'proposed')
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(fingerprint)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((id, layer, status, stored)) = row else {
+        return Ok(None);
+    };
+
+    let elements = |raw: Option<&str>| -> Vec<serde_json::Value> {
+        raw.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(known_element)
+            .collect()
+    };
+    let mut merged = elements(stored.as_deref());
+    for element in elements(Some(evidence)) {
+        let key = |value: &serde_json::Value| (value.get("t").cloned(), value.get("id").cloned());
+        if !merged.iter().any(|kept| key(kept) == key(&element)) {
+            merged.push(element);
+        }
+    }
+    let merged = tagged_evidence(&serde_json::Value::Array(merged));
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let renews = layer == "episodic" && status == "active";
+    sqlx::query(
+        "UPDATE knowledge SET evidence = ?,
+           last_confirmed_at = CASE WHEN ? THEN ? ELSE last_confirmed_at END
+         WHERE id = ?",
+    )
+    .bind(merged.as_deref())
+    .bind(renews)
+    .bind(&now)
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(&status)
+    .bind(&status)
+    .bind(NOTE_RECONFIRMED)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(Some(id))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1776,7 +1965,8 @@ async fn fetch(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Known>> {
 }
 
 /// The complete vocabulary a run may use to point at the source of a finding.
-pub(crate) const EVIDENCE_TAGS: [&str; 7] = [
+pub(crate) const EVIDENCE_TAGS: [&str; 8] = [
+    "job",
     "run",
     "job_item",
     "proposal",
@@ -2781,6 +2971,413 @@ mod tests {
         assert_eq!((knowledge, proposals), (0, 0));
     }
 
+    fn distilled<'a>(title: &'a str, body: &'a str, kind: Kind) -> Declaration<'a> {
+        Declaration {
+            project_id: Some("p"),
+            origin_run_id: None,
+            kind,
+            title,
+            body,
+            reasoning: "distilled from a closed job",
+            supersedes: None,
+        }
+    }
+
+    /// The same sentence typed twice must be one learning: case, spacing and a final full stop are
+    /// the differences a model makes from one answer to the next.
+    #[test]
+    fn a_title_fingerprint_ignores_case_spacing_and_final_punctuation() {
+        let canonical = title_fingerprint("Run cargo fmt before the gate").unwrap();
+        assert_eq!(canonical, "title:run cargo fmt before the gate");
+        for variant in [
+            "RUN CARGO FMT BEFORE THE GATE",
+            "  Run   cargo\tfmt\nbefore  the gate  ",
+            "Run cargo fmt before the gate.",
+            "Run cargo fmt before the gate!?",
+            "Run cargo fmt before the gate ...",
+            "Run cargo fmt before the gate:",
+        ] {
+            assert_eq!(
+                title_fingerprint(variant).as_deref(),
+                Some(canonical.as_str())
+            );
+        }
+        assert_ne!(
+            title_fingerprint("Run cargo clippy before the gate").unwrap(),
+            canonical
+        );
+        assert_eq!(title_fingerprint(""), None);
+        assert_eq!(title_fingerprint("   \n\t "), None);
+        assert_eq!(title_fingerprint(" ... "), None);
+    }
+
+    /// An episode a job taught is believed from the start, on trial: active, episodic, the
+    /// distiller's, expiring unless somebody reconfirms it, with its evidence and its cause. It
+    /// leaves the consolidator's two columns alone.
+    #[tokio::test]
+    async fn a_distilled_episode_is_recorded_active_on_trial() {
+        let pool = test_pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        let id = record_distilled(
+            &mut tx,
+            &distilled(
+                "The linker lock",
+                "The gate failed on a locked exe.",
+                Kind::Memory,
+            ),
+            &Provenance {
+                distill_cause: Some("gate_recovered"),
+                evidence: Some(r#"[{"t":"job","id":7},{"t":"run","id":3}]"#),
+                points_at: Some("core/src/main.rs"),
+                fingerprint: Some("title:the linker lock"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let row = fetch(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.layer, "episodic");
+        assert_eq!(row.source, "distiller");
+        assert_eq!(row.status, "active");
+        assert_eq!(row.kind, "memory");
+        assert_eq!(row.scope_kind, "project");
+        assert_eq!(row.scope_id.as_deref(), Some("p"));
+        assert_eq!(row.expires_after_runs, Some(DISTILLED_TRIAL_RUNS));
+        assert_eq!(DISTILLED_TRIAL_RUNS, 50);
+        assert_eq!(row.fingerprint.as_deref(), Some("title:the linker lock"));
+        assert_eq!(
+            row.evidence.as_deref(),
+            Some(r#"[{"t":"job","id":7},{"t":"run","id":3}]"#)
+        );
+        assert_eq!(row.points_at.as_deref(), Some("core/src/main.rs"));
+        assert!(row.last_confirmed_at.is_some());
+        assert!(row.activated_at.is_some());
+        assert_eq!(row.observations, None);
+        assert_eq!(row.generator, None);
+        assert_eq!(row.proposal_id, None);
+        assert_eq!(row.origin_run_id, None);
+        let cause: Option<String> =
+            sqlx::query_scalar("SELECT distill_cause FROM knowledge WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cause.as_deref(), Some("gate_recovered"));
+
+        let events: Vec<(Option<String>, String, Option<String>)> = sqlx::query_as(
+            "SELECT from_status, to_status, note FROM knowledge_events WHERE knowledge_id = ?",
+        )
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, None);
+        assert_eq!(events[0].1, "active");
+        assert_eq!(events[0].2.as_deref(), Some("created"));
+    }
+
+    /// A rule a job taught is a question for a person, not a belief: it goes through the same door
+    /// as any declaration and carries where it came from.
+    #[tokio::test]
+    async fn a_distilled_rule_is_proposed_with_its_provenance() {
+        let pool = test_pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        let (id, proposal_id) = propose_in_with(
+            &mut tx,
+            distilled("Format before gating", "Run fmt first.", Kind::Memory),
+            &Provenance {
+                source: Some("distiller"),
+                distill_cause: Some("job_failed"),
+                evidence: Some(r#"[{"t":"job","id":9}]"#),
+                points_at: Some("scripts/gates.sh"),
+                fingerprint: Some("title:format before gating"),
+                layer: Some(Layer::Procedural),
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let row = fetch(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "proposed");
+        assert_eq!(row.source, "distiller");
+        assert_eq!(row.layer, "procedural");
+        assert_eq!(
+            row.fingerprint.as_deref(),
+            Some("title:format before gating")
+        );
+        assert_eq!(row.evidence.as_deref(), Some(r#"[{"t":"job","id":9}]"#));
+        assert_eq!(row.points_at.as_deref(), Some("scripts/gates.sh"));
+        assert_eq!(row.proposal_id, Some(proposal_id));
+        assert_eq!(row.observations, None);
+        assert_eq!(row.generator, None);
+        let cause: Option<String> =
+            sqlx::query_scalar("SELECT distill_cause FROM knowledge WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cause.as_deref(), Some("job_failed"));
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM knowledge_events WHERE knowledge_id = ? AND to_status = 'proposed'",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(note, "distilled from a job");
+        let kind: String = sqlx::query_scalar("SELECT kind FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kind, "refinement");
+    }
+
+    /// `propose_in` is `propose_in_with` and a default provenance: what the door wrote before this
+    /// change, byte for byte, for a declaration that names no provenance.
+    #[tokio::test]
+    async fn a_declaration_without_provenance_writes_what_it_always_wrote() {
+        let pool = test_pool().await;
+        let gate_body = "error: build failed because the linker refused output.exe";
+        let expected = failure_signature(gate_body)
+            .map(|signature| format!("gate:{}", signature.fingerprint))
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let (by_owner, _) = propose_in(&mut tx, distilled("A", gate_body, Kind::Memory))
+            .await
+            .unwrap();
+        let (plain_id, _) = propose_in(&mut tx, distilled("B", "plain words", Kind::Skill))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let owner = fetch(&pool, by_owner).await.unwrap().unwrap();
+        assert_eq!(owner.source, "owner");
+        assert_eq!(owner.layer, "semantic");
+        assert_eq!(owner.status, "proposed");
+        assert_eq!(owner.fingerprint.as_deref(), Some(expected.as_str()));
+        assert_eq!(owner.evidence, None);
+        assert_eq!(owner.points_at, None);
+        let cause: Option<String> =
+            sqlx::query_scalar("SELECT distill_cause FROM knowledge WHERE id = ?")
+                .bind(by_owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cause, None);
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM knowledge_events WHERE knowledge_id = ? AND to_status = 'proposed'",
+        )
+        .bind(by_owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(note, "declared by the owner");
+
+        let plain = fetch(&pool, plain_id).await.unwrap().unwrap();
+        let plain_expected = failure_signature("plain words")
+            .map(|signature| format!("gate:{}", signature.fingerprint))
+            .unwrap();
+        assert_eq!(plain.fingerprint.as_deref(), Some(plain_expected.as_str()));
+        assert_eq!(plain.layer, "procedural");
+    }
+
+    /// The same learning twice is one row that was seen again: an active episode is renewed, a
+    /// proposed rule is not (nobody has believed it yet), and both gain the new evidence and a
+    /// same-status event that says so.
+    #[tokio::test]
+    async fn the_same_title_is_reconfirmed_not_repeated() {
+        let pool = test_pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        let episode = record_distilled(
+            &mut tx,
+            &distilled("Seen twice", "An episode.", Kind::Memory),
+            &Provenance {
+                distill_cause: Some("job_landed"),
+                evidence: Some(r#"[{"t":"job","id":7},{"t":"run","id":3}]"#),
+                fingerprint: Some("title:seen twice"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (rule, _) = propose_in_with(
+            &mut tx,
+            distilled("A pending rule", "A rule.", Kind::Memory),
+            &Provenance {
+                source: Some("distiller"),
+                distill_cause: Some("job_landed"),
+                evidence: Some(r#"[{"t":"job","id":7}]"#),
+                fingerprint: Some("title:a pending rule"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query(
+            "UPDATE knowledge SET last_confirmed_at = '2020-01-01T00:00:00+00:00' WHERE id = ?",
+        )
+        .bind(episode)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let again = reconfirm_in(
+            &mut tx,
+            "p",
+            "title:seen twice",
+            r#"[{"t":"run","id":3},{"t":"run","id":4},{"t":"vibes","id":1}]"#,
+        )
+        .await
+        .unwrap();
+        let again_rule = reconfirm_in(
+            &mut tx,
+            "p",
+            "title:a pending rule",
+            r#"[{"t":"job","id":8}]"#,
+        )
+        .await
+        .unwrap();
+        let nothing = reconfirm_in(&mut tx, "p", "title:never written", "[]")
+            .await
+            .unwrap();
+        let other_project = reconfirm_in(&mut tx, "q", "title:seen twice", "[]")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(again, Some(episode));
+        assert_eq!(again_rule, Some(rule));
+        assert_eq!(nothing, None);
+        assert_eq!(other_project, None);
+
+        let renewed = fetch(&pool, episode).await.unwrap().unwrap();
+        assert_ne!(
+            renewed.last_confirmed_at.as_deref(),
+            Some("2020-01-01T00:00:00+00:00"),
+            "an active episode seen again must be renewed"
+        );
+        let merged: serde_json::Value =
+            serde_json::from_str(renewed.evidence.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            merged,
+            serde_json::json!([
+                {"t":"job","id":7},
+                {"t":"run","id":3},
+                {"t":"run","id":4},
+            ])
+        );
+        let reconfirmed: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT from_status, to_status, note FROM knowledge_events
+             WHERE knowledge_id = ? AND note = ?",
+        )
+        .bind(episode)
+        .bind(NOTE_RECONFIRMED)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reconfirmed.len(), 1);
+        assert_eq!(reconfirmed[0].0, "active");
+        assert_eq!(reconfirmed[0].1, "active");
+
+        let proposed = fetch(&pool, rule).await.unwrap().unwrap();
+        assert_eq!(proposed.status, "proposed");
+        assert_eq!(
+            proposed.last_confirmed_at, None,
+            "a proposed row is not renewed"
+        );
+        let merged: serde_json::Value =
+            serde_json::from_str(proposed.evidence.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            merged,
+            serde_json::json!([{"t":"job","id":7},{"t":"job","id":8}])
+        );
+        let events: Vec<(String, String)> = sqlx::query_as(
+            "SELECT from_status, to_status FROM knowledge_events
+             WHERE knowledge_id = ? AND note = ?",
+        )
+        .bind(rule)
+        .bind(NOTE_RECONFIRMED)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![("proposed".to_string(), "proposed".to_string())]
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2, "reconfirming must never insert");
+    }
+
+    /// A closed job is a thing a finding can point at.
+    #[test]
+    fn a_job_is_evidence() {
+        assert!(EVIDENCE_TAGS.contains(&"job"));
+        assert!(known_element(&serde_json::json!({"t": "job", "id": 7})));
+        assert!(known_element(&serde_json::json!({"t": "job", "id": "7"})));
+        assert!(!known_element(&serde_json::json!({"t": "job", "id": 0})));
+        assert_eq!(
+            tagged_evidence(&serde_json::json!([{"t": "job", "id": 7}])).as_deref(),
+            Some(r#"[{"t":"job","id":7}]"#)
+        );
+    }
+
+    /// Spec 4.6, in the four cases that matter: what the distiller wrote reaches a node exactly
+    /// when it is `active` -- an episode on trial, or a rule a person approved -- and never while a
+    /// rule is `proposed` or once an episode has expired.
+    #[test]
+    fn distilled_rows_reach_a_node_only_as_the_amendment_allows() {
+        let context = project_context();
+        let reaches = |layer: &str, status: &str, proposal_id: Option<i64>| {
+            let mut row = one(1, "memory", "distilled", "learned from a job");
+            row.source = "distiller".into();
+            row.layer = layer.into();
+            row.status = status.into();
+            row.proposal_id = proposal_id;
+            row.observations = None;
+            row.generator = None;
+            select(std::slice::from_ref(&row), &context, &Budget::default())
+                .block
+                .is_some()
+        };
+
+        assert!(
+            reaches("episodic", "active", None),
+            "an active distilled episode is the owner's D3 exception"
+        );
+        assert!(
+            !reaches("semantic", "proposed", Some(1)),
+            "a proposed distilled rule reached a node"
+        );
+        assert!(
+            !reaches("procedural", "proposed", Some(1)),
+            "a proposed distilled procedure reached a node"
+        );
+        assert!(
+            reaches("semantic", "active", Some(1)),
+            "an approved distilled rule must be read"
+        );
+        assert!(
+            reaches("procedural", "active", Some(1)),
+            "an approved distilled procedure must be read"
+        );
+        assert!(
+            !reaches("episodic", "expired", None),
+            "an expired distilled episode reached a node"
+        );
+    }
+
     /// The whole mechanism, end to end and in the order it happens: a run declares, nothing reaches
     /// a prompt, a person says yes, and only then does it. The middle assertion is the one that
     /// matters — it is what "the agent declares and the core activates" means when it is true.
@@ -3515,7 +4112,7 @@ mod tests {
     fn nothing_that_a_person_has_not_approved_reaches_a_node() {
         let context = job_context(77);
         let statuses = ["active", "proposed", "live", "rejected", "reverted"];
-        let sources = ["owner", "run", "consolidator"];
+        let sources = ["owner", "run", "consolidator", "distiller"];
         let layers = ["semantic", "episodic", "procedural", "working"];
         let mut id = 0;
 

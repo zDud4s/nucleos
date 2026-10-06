@@ -29,6 +29,7 @@ mod contacts;
 mod council;
 mod daemon_client;
 mod detect;
+mod distill;
 mod email;
 mod exclusion;
 mod feed;
@@ -1965,6 +1966,8 @@ async fn main() {
     // grew for as long as the daemon was ever used — and a transcript is stored twice and indexed a
     // third time, so they grew at three times the obvious rate.
     tokio::spawn(runs::run_retention_loop(state.clone()));
+    // The distiller: turns closed jobs queued by the job loop and the vcs queue into learnings.
+    tokio::spawn(distill::run_distill_loop(state.clone()));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor {
