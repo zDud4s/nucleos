@@ -9,7 +9,85 @@
 //! to need them move them somewhere neutral rather than copy them. `0129`'s backfill is the second
 //! module; this is that somewhere.
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteOwnedBuf, SqlitePoolOptions};
+use tokio::sync::OnceCell;
+
+static MIGRATED_SCHEMA: OnceCell<Vec<u8>> = OnceCell::const_new();
+
+/// A fresh, isolated in-memory database with the current schema.
+///
+/// The migrator runs once per test process. Each caller receives a separate writable
+/// SQLite allocation, including its own copy of `_sqlx_migrations`.
+pub(crate) async fn fresh_pool() -> sqlx::SqlitePool {
+    let schema = MIGRATED_SCHEMA
+        .get_or_init(|| async {
+            let pool = empty_memory_pool().await;
+            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            let mut connection = pool.acquire().await.unwrap();
+            let bytes = connection.serialize(None).await.unwrap().to_vec();
+            drop(connection);
+            pool.close().await;
+            bytes
+        })
+        .await;
+
+    let pool = empty_memory_pool().await;
+    let mut connection = pool.acquire().await.unwrap();
+    connection
+        .deserialize(
+            None,
+            SqliteOwnedBuf::try_from(schema.as_slice()).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    drop(connection);
+    pool
+}
+
+async fn empty_memory_pool() -> sqlx::SqlitePool {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(":memory:")
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap()
+}
+
+#[cfg(test)]
+mod fresh_pool_tests {
+    #[tokio::test]
+    async fn fresh_pools_have_the_full_schema_and_do_not_share_rows() {
+        let first = super::fresh_pool().await;
+        let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&first)
+            .await
+            .unwrap();
+        assert_eq!(
+            migrations as usize,
+            sqlx::migrate!("./migrations").iter().count()
+        );
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at) VALUES ('only-first', 'running', 'now')",
+        )
+        .execute(&first)
+        .await
+        .unwrap();
+
+        let second = super::fresh_pool().await;
+        let copied: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE prompt = 'only-first'")
+                .fetch_one(&second)
+                .await
+                .unwrap();
+        assert_eq!(copied, 0);
+        first.close().await;
+        second.close().await;
+    }
+}
 
 /// A database with every migration up to and including `version` applied, and none after.
 ///
