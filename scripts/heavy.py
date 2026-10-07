@@ -275,6 +275,38 @@ def assign_to_job(job, proc) -> bool:
     return bool(k32.AssignProcessToJobObject(job, int(proc._handle)))
 
 
+def job_cpu_seconds(job) -> float | None:
+    """User + kernel CPU of every process the job has held, those already gone included
+    (rustc, a test binary, tsc's node): the work done so far, whatever the wall clock did."""
+    if job is None or os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class ACCOUNTING(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_int64),
+            ("TotalKernelTime", ctypes.c_int64),
+            ("ThisPeriodTotalUserTime", ctypes.c_int64),
+            ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        ]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+    k32.QueryInformationJobObject.restype = wintypes.BOOL
+    info = ACCOUNTING()
+    JobObjectBasicAccountingInformation = 1
+    if not k32.QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+                                         ctypes.byref(info), ctypes.sizeof(info), None):
+        return None
+    return (info.TotalUserTime + info.TotalKernelTime) / 1e7  # 100 ns units
+
+
 # ----------------------------------------------------------------------------- queue
 
 
@@ -619,6 +651,9 @@ _NX_START = re.compile(rb"^\s*Starting (\d+) tests? across (\d+) binar")
 _NX_DONE = re.compile(
     rb"^\s*(TRY \d+ )?([A-Z][A-Z-]+)\s+\[[^\]]*\]\s+\(\s*(\d+)/(\d+)\)\s+(.+?)\s*$")
 _NX_SUMMARY = re.compile(rb"^\s*Summary \[")
+# What cargo says before it builds anything, shown as the prepare phase's current step.
+_STEP = re.compile(rb"^\s*(Blocking waiting for file lock on .*|Updating .*|Locking \d+ packages?.*"
+                   rb"|Downloading crates.*|Downloaded \d+ crates?.*)$")
 
 
 def _new_stats() -> dict:
@@ -633,6 +668,7 @@ def _note_progress(seg: bytes, prog: dict) -> bool:
     if m:
         prog.update(units_done=int(m.group(1)), units_total=int(m.group(2)),
                     building=(m.group(3) or b"").decode("utf-8", "replace"))
+        prog.pop("step", None)
         return True
     if seg.endswith(b"\r") and not text.strip():
         return True
@@ -656,6 +692,10 @@ def _note_progress(seg: bytes, prog: dict) -> bool:
         prog["last_test"] = m.group(1).decode("utf-8", "replace")
         if m.group(2) == b"FAILED":
             prog["failed"] = prog.get("failed", 0) + 1
+        return False
+    m = _STEP.match(text)
+    if m and not prog.get("units_total"):
+        prog["step"] = m.group(1).decode("utf-8", "replace").strip()
         return False
     if _FINISHED.match(text) and prog.get("units_total"):
         # cargo erases its bar without ever drawing the last unit.
@@ -743,13 +783,21 @@ def _pump(src, dst, stats: dict, show_bar: bool = True) -> None:
             pass
 
 
-def _write_progress(path: Path, stats: dict, stop: threading.Event) -> None:
+def _write_progress(path: Path, stats: dict, stop: threading.Event, cpu=None) -> None:
     """Publish stats["progress"] to `path` (read by scripts/heavy_watch.py) while the child
-    runs, at most once a second and only when it changed; remove it at the end."""
+    runs, at most once a second and only when it changed; remove it at the end. With `cpu`
+    (seconds used so far by the child's tree) it goes along as `cpu_s`, and the value at the
+    first sign of building or testing is kept as stats["prep_cpu_s"]: what preparing cost."""
     last = None
     try:
         while True:
             snap = dict(stats.get("progress") or {})
+            used = cpu() if cpu is not None else None
+            if used is not None:
+                snap["cpu_s"] = round(used, 1)
+                if "prep_cpu_s" not in stats and any(
+                        snap.get(k) for k in ("units_total", "binary", "runner")):
+                    stats["prep_cpu_s"] = round(used, 1)
             if snap and snap != last:
                 try:
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -768,6 +816,19 @@ def _write_progress(path: Path, stats: dict, stop: threading.Event) -> None:
             pass
 
 
+def _progress_step(directory: Path, step: str) -> None:
+    """Name what the broker itself is doing before the child starts (the child's progress
+    file replaces this one); best effort."""
+    try:
+        path = directory / "progress" / str(os.getpid())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"step": step, "pid": os.getpid()}), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def _isatty(stream) -> bool:
     try:
         return bool(stream.isatty())
@@ -779,8 +840,8 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
               progress: Path | None = None) -> tuple[int, dict]:
     """Run argv, streaming stdout/stderr through; return (exit, stats). `low` runs it at
     below-normal CPU priority (Windows) with no console window of its own. With `progress`,
-    a cargo child is asked to draw its bar into the pipe, and what the output says about
-    units and tests is kept in that file while it runs."""
+    that file holds, while it runs, the CPU its tree has used and what the output says about
+    units and tests; a cargo child is asked to draw its bar into the pipe for that."""
     stats = _new_stats()
     # CreateProcess finds only `.exe` without an extension, so `npm`/`npx` (`.cmd` shims)
     # failed with WinError 2: resolve argv[0] through PATH and PATHEXT the way a shell would.
@@ -797,8 +858,7 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
         show_bar = "CARGO_TERM_PROGRESS_WHEN" in env or _isatty(err)
         env.setdefault("CARGO_TERM_PROGRESS_WHEN", "always")
         env.setdefault("CARGO_TERM_PROGRESS_WIDTH", "100")
-    else:
-        progress = None
+    before = os.times()
     flags = 0
     if low and os.name == "nt":
         flags = 0x00004000 | 0x08000000  # BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW
@@ -806,9 +866,10 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
         argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags
     )
     try:
-        assign_to_job(job, proc)
+        in_job = assign_to_job(job, proc)
     except Exception:
-        pass
+        in_job = False
+    cpu = (lambda: job_cpu_seconds(job)) if in_job else None
     threads = [
         threading.Thread(target=_pump, args=(proc.stdout, out, stats, show_bar), daemon=True),
         threading.Thread(target=_pump, args=(proc.stderr, err, stats, show_bar), daemon=True),
@@ -816,7 +877,7 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     stop = threading.Event()
     writer = None
     if progress is not None:
-        writer = threading.Thread(target=_write_progress, args=(progress, stats, stop),
+        writer = threading.Thread(target=_write_progress, args=(progress, stats, stop, cpu),
                                   daemon=True)
         writer.start()
     for t in threads:
@@ -827,6 +888,13 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     stop.set()
     if writer is not None:
         writer.join(timeout=5)
+    used = cpu() if cpu is not None else None
+    if used is None and os.name != "nt":
+        after = os.times()
+        used = (after.children_user - before.children_user
+                + after.children_system - before.children_system)
+    if used is not None:
+        stats["cpu_s"] = round(used, 1)
     return code, stats
 
 
@@ -1150,6 +1218,7 @@ def prepare_slot(directory: Path, lease, worktree: str, program: str, cwd: str,
     _, path, prev = lease
     if not prev or _same_wt(prev, worktree):
         return  # first use, or the same worktree coming back to its own slot
+    _progress_step(directory, f"cleaning the target slot after {Path(prev).name}")
     registry_forget(directory, _real(path))
     cargs = _cargo_args(argv or [])
     prof: list[str] = []
@@ -1628,6 +1697,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
         raise
     row.update({
         "run_s": round(time.time() - t_run, 3), "compiled": stats["compiled"],
+        **{k: stats[k] for k in ("cpu_s", "prep_cpu_s") if k in stats},
         "fp_hit": hit, "fp_miss": hit and stats["compiled"], "exit": code,
         "argv0": argv[0], "argv": _log_argv(argv),
     })
