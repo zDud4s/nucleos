@@ -1194,6 +1194,61 @@ impl DaemonClient {
             .await
             .map_err(|e| e.to_string())
     }
+
+    /// Ask the daemon to verify a worktree. The answer is a ticket: finished when the daemon's wait
+    /// ceiling allowed, otherwise with progress to be read back through `verify_status`.
+    pub async fn verify(
+        &self,
+        kind: &str,
+        scope: &str,
+        worktree: Option<&str>,
+        files: Option<&[String]>,
+        base: Option<&str>,
+    ) -> Result<Value, String> {
+        self.verify_request(
+            "/verify",
+            &serde_json::json!({
+                "kind": kind,
+                "scope": scope,
+                "worktree": worktree,
+                "files": files,
+                "base": base,
+                "wait": true,
+            }),
+        )
+        .await
+    }
+
+    /// One verification ticket's state; `wait` holds the line up to the daemon's ceiling.
+    pub async fn verify_status(&self, ticket: i64, wait: bool) -> Result<Value, String> {
+        self.verify_request(
+            "/verify/status",
+            &serde_json::json!({ "ticket": ticket, "wait": wait }),
+        )
+        .await
+    }
+
+    /// The one request both verify calls make. A refusal carries its reason in the body (the
+    /// handlers answer `(StatusCode, String)`), so the body is read first and the status is only
+    /// the fallback, as in `github_request`.
+    async fn verify_request(&self, path: &str, body: &Value) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, path)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(if text.trim().is_empty() {
+                format!("the daemon refused the request: {status}")
+            } else {
+                text
+            });
+        }
+        serde_json::from_str(&text).map_err(|error| error.to_string())
+    }
 }
 
 /// The body of an answer, or the status it was refused with.

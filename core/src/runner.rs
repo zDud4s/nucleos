@@ -7702,7 +7702,7 @@ mod tests {
     }
 
     #[test]
-    fn a_job_node_request_allows_exactly_note_finding() {
+    fn a_job_node_request_allows_exactly_the_finding_and_verify_tools() {
         let mut request = baseline_run_request();
         request.mcp_config = Some(PathBuf::from("C:/tmp/job-node.json"));
         request.allowed_mcp_tools = Some(crate::mcp_tools::JOB_NODE_TOOLS);
@@ -7713,7 +7713,10 @@ mod tests {
             .find(|pair| pair[0] == "--allowedTools")
             .map(|pair| pair[1].as_str())
             .expect("a configured server must carry an allow-list");
-        assert_eq!(allowed, "mcp__nucleos__note_finding");
+        assert_eq!(
+            allowed,
+            "mcp__nucleos__note_finding,mcp__nucleos__verify,mcp__nucleos__verify_status"
+        );
         assert_ne!(allowed, "mcp__nucleos__*");
         assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
     }

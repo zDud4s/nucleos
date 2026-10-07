@@ -5529,6 +5529,23 @@ mod tests {
         assert_eq!(verdict.decision, "allow");
     }
 
+    /// `verify` and `verify_status` ride the same branch as `note_finding`: an unattended job node
+    /// verifies its own worktree, and nothing else widens.
+    #[tokio::test]
+    async fn an_unattended_job_run_may_call_verify() {
+        let state = test_state().await;
+        let (_job_id, run_id) = in_flight_job_node(&state).await;
+        let app = test_router(state);
+        for tool in ["mcp__nucleos__verify", "mcp__nucleos__verify_status"] {
+            let verdict = decide(&app, &call(run_id, tool, serde_json::json!({}))).await;
+            assert_eq!(verdict.decision, "allow", "{tool}");
+        }
+        for tool in ["mcp__nucleos__verify__x", "mcp__other__verify"] {
+            let verdict = decide(&app, &call(run_id, tool, serde_json::json!({}))).await;
+            assert_eq!(verdict.decision, "deny", "{tool}");
+        }
+    }
+
     #[tokio::test]
     async fn a_job_run_is_still_refused_every_other_mcp_tool() {
         let state = test_state().await;

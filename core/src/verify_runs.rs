@@ -15,6 +15,8 @@ use crate::gate::GateOutcome;
 pub const ORIGIN_JOB_ITEM: &str = "job_item";
 pub const ORIGIN_RUN: &str = "run";
 pub const ORIGIN_MERGE: &str = "merge";
+/// A unit asked for through `verify`; `origin_id` is the `verify_requests` id (spec section 7).
+pub const ORIGIN_VERIFY: &str = "verify";
 
 pub const SCOPE_FULL: &str = "full";
 pub const REQUESTED_BY_GATE: &str = "gate";
@@ -22,6 +24,8 @@ pub const REQUESTED_BY_GATE: &str = "gate";
 pub const STATUS_PASSED: &str = "passed";
 pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_ERRORED: &str = "errored";
+/// A unit that did not run because a green with the same fingerprint is still fresh (spec section 5.3).
+pub const STATUS_SKIPPED_CACHED: &str = "skipped_cached";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const STATUS_QUEUED: &str = "queued";
 #[cfg_attr(not(test), allow(dead_code))]
@@ -29,10 +33,7 @@ pub const STATUS_RUNNING: &str = "running";
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub const PRIORITY_INTERACTIVE: i64 = 0;
-// Used from F2a-2 (verify); until then only the tests build them.
-#[allow(dead_code)]
 pub const PRIORITY_AUTONOMOUS: i64 = 1;
-#[allow(dead_code)]
 pub const PRIORITY_POSTGATE: i64 = 2;
 
 /// A row interrupted by this many daemon restarts is given up on, so a request that brings the

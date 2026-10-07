@@ -755,6 +755,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/vcs/requests/{id}/dismiss", post(post_vcs_request_dismiss))
         .route("/vcs/requests/{id}/approve", post(post_vcs_request_approve))
         .route("/vcs/requests/{id}/refuse", post(post_vcs_request_refuse))
+        // POST for both, status included: `Scope::Run` passes only literal POST paths, and a run's
+        // key is the main caller of these two.
+        .route("/verify", post(crate::verify::post_verify))
+        .route("/verify/status", post(crate::verify::post_verify_status))
         // Admin-only by construction: absent from BOTH scope tables in `auth.rs`, for the
         // `POST /email/send` reason rather than the `POST /runs` one. It is not out of a scoped
         // key's reach because it is expensive; it is out of reach because it LEAVES THE MACHINE.
