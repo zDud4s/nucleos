@@ -71,6 +71,7 @@ pub mod distill_model;
 pub mod distill_origin;
 pub mod door;
 pub mod email;
+pub mod embed;
 pub mod exclusion;
 pub use nucleos_base::feed;
 pub mod files;

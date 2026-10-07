@@ -307,8 +307,25 @@ pub async fn remove(
         // TEXT, so comparing them without it matches NOTHING — the same silent nothing as the wrong
         // position above, arriving by a different route.
         //
-        // `machine` appears in neither statement, and that is correct: machine rows are not a
+        // `knowledge_embeddings` first of the three: a vector derives from the text of its row and
+        // cannot outlive it, and it reads `knowledge` to find its rows, so it goes before that
+        // table does.
+        //
+        // `machine` appears in none of the statements, and that is correct: machine rows are not a
         // project's.
+        forgotten += sqlx::query(
+            "DELETE FROM knowledge_embeddings
+              WHERE knowledge_id IN (
+                    SELECT id FROM knowledge
+                     WHERE (scope_kind = 'project' AND scope_id = ?1)
+                        OR (scope_kind = 'job'
+                            AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1)))",
+        )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
         forgotten += sqlx::query(
             "DELETE FROM knowledge_events
               WHERE knowledge_id IN (
@@ -1014,6 +1031,93 @@ mod tests {
             vec![bravo_job.to_string()],
             "what a forgotten project's jobs knew is still on record, or another project's went \
              with it (the forgotten job was {alpha_job})"
+        );
+    }
+
+    /// One row of `knowledge_embeddings` for `knowledge_id`. Written here rather than through
+    /// `embed::store_in`, which lives in nucleos-core above this crate; the vector's bytes do not
+    /// matter to a forget, only that the row exists.
+    async fn store_vector(pool: &SqlitePool, knowledge_id: i64) {
+        sqlx::query(
+            "INSERT INTO knowledge_embeddings (knowledge_id, model, dim, vector, created_at)
+             VALUES (?, 'test-model', 3, zeroblob(12), '2026-10-06T12:00:00+00:00')",
+        )
+        .bind(knowledge_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A vector derives from the text of its knowledge row and cannot outlive it: the table has no
+    /// `project_id` and no FK, so nothing but the forget itself removes it.
+    #[tokio::test]
+    async fn forgetting_a_project_deletes_the_vectors_of_its_knowledge() {
+        let pool = pool().await;
+        briefed_project(&pool, "alpha").await;
+        briefed_project(&pool, "bravo").await;
+
+        let alpha_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM knowledge WHERE scope_kind = 'project' AND scope_id = 'alpha'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let bravo_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM knowledge WHERE scope_kind = 'project' AND scope_id = 'bravo'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        store_vector(&pool, alpha_id).await;
+        store_vector(&pool, bravo_id).await;
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        let left: Vec<i64> =
+            sqlx::query_scalar("SELECT knowledge_id FROM knowledge_embeddings ORDER BY 1")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            left,
+            vec![bravo_id],
+            "the vector of a forgotten project's knowledge outlived it, or bravo's went with it"
+        );
+    }
+
+    /// The job-scope arm of the vector DELETE: a job's knowledge has `scope_kind='job'` and a TEXT
+    /// `scope_id`, so only the CAST subquery reaches its vector.
+    #[tokio::test]
+    async fn forgetting_a_project_deletes_the_vectors_of_its_jobs_knowledge() {
+        let pool = pool().await;
+        let (alpha_job, _) = briefed_project(&pool, "alpha").await;
+        let (bravo_job, _) = briefed_project(&pool, "bravo").await;
+
+        let mut ids = Vec::new();
+        for job in [alpha_job, bravo_job] {
+            let id: i64 = sqlx::query_scalar(
+                "SELECT id FROM knowledge WHERE scope_kind = 'job' AND scope_id = ?",
+            )
+            .bind(job.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        store_vector(&pool, ids[0]).await;
+        store_vector(&pool, ids[1]).await;
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        let left: Vec<i64> =
+            sqlx::query_scalar("SELECT knowledge_id FROM knowledge_embeddings ORDER BY 1")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            left,
+            vec![ids[1]],
+            "the vector of a forgotten project's job knowledge outlived it, or bravo's job's went with it"
         );
     }
 
