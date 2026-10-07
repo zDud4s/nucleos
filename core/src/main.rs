@@ -128,13 +128,9 @@ mod transcribe;
 mod triage;
 mod trust;
 mod vcs;
-mod verify;
 mod verify_exec;
-mod verify_fingerprint;
-mod verify_plan;
 mod verify_runs;
 mod verify_sched;
-mod verify_store;
 mod voice;
 mod warm;
 mod wave;
@@ -1067,10 +1063,7 @@ async fn main() {
     // turns marked `interrupted` above. Best effort: a stale task row must not stop the daemon.
     match chat_tasks::orphan_running(&pool).await {
         Ok(0) => {}
-        Ok(orphaned) => tracing::warn!(
-            orphaned,
-            "chat tasks left running by a restart -> 'orphaned'"
-        ),
+        Ok(orphaned) => tracing::warn!(orphaned, "chat tasks left running by a restart -> 'orphaned'"),
         Err(error) => tracing::warn!(%error, "could not mark chat tasks left running"),
     }
 
@@ -2024,16 +2017,13 @@ async fn main() {
         devtime_config,
         devtime_projects_dir,
     ));
-    // `POST /verify` submits to it, so the handlers need the very instance the worker drains: it is
-    // parked in `verify::install` (an `OnceLock`, because `AppState` is built literally in dozens of
-    // places) before the worker starts. The restart above hands interrupted units straight back to it.
-    let verify_executor = verify_exec::Executor::new(
+    // Nothing submits to it yet (F2a-2 wires `verify`), but an empty queue costs one poll, and
+    // starting it now lets the restart above hand interrupted units straight back to a worker.
+    tokio::spawn(verify_exec::run_executor(verify_exec::Executor::new(
         state.pool.clone(),
         verify_config,
         machine_config_root.clone(),
-    );
-    verify::install(verify_executor.clone());
-    tokio::spawn(verify_exec::run_executor(verify_executor));
+    )));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor {
