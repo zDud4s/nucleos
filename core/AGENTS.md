@@ -251,7 +251,9 @@ On Windows, keep the Rust toolchain on a path without spaces: a user profile wit
 breaks the GNU linker, so point `RUSTUP_HOME` and `CARGO_HOME` at a space-free directory and put its
 `bin` on PATH. Then, from the repo root:
 
-- Gate: `cargo test -p nucleos-core` (**NOT** `--lib` — this is a bin-only crate; `--lib` errors)
+- Gate: `cargo test -p nucleos-core` (every target). One test, one target: `--lib <name>` for a test in
+  the library (every module but `http.rs`/`main.rs`), `--bin nucleos-core <name>` for one in `http.rs`
+  or `main.rs` — each builds only that test binary.
 - `cargo build` · `cargo fmt --all` (check: `cargo fmt --all -- --check`) · `cargo clippy --all-targets`
 - After a `claude update`: run `node scripts/tool-surface.mjs`. It measures the CLI's own advertised
   tool set against `runner.rs`'s `BUILTIN_TOOLS` blocklist and exits non-zero naming any tool the CLI

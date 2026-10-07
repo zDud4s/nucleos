@@ -288,7 +288,7 @@ gofmt_gate() {
 if [ "$target" = core ] || [ "$target" = all ]; then
   run "core: fmt"    . cargo fmt --all -- --check
   run "core: clippy" . cargo clippy --all-targets -- -D warnings
-  # NOT `--lib`: nucleos-core is a bin-only crate and `--lib` errors out (core/AGENTS.md).
+  # Every target (lib, bin, tests/): `--lib` alone would skip the binary's http.rs tests.
   run "core: test"   . cargo test -p nucleos-core
 fi
 
