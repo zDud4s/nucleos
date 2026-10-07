@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::tests_map::{Seed, Warm};
 
-pub(crate) const MARKER_WORKTREE: &str = ".worktree";
-pub(crate) const MARKER_USED: &str = ".last_used";
+pub const MARKER_WORKTREE: &str = ".worktree";
+pub const MARKER_USED: &str = ".last_used";
 const SHARED: &str = "shared";
 const SHARED_PREFIX: &str = "shared:";
 
@@ -31,7 +31,7 @@ fn lexical(worktree: &Path) -> String {
 }
 
 /// Stable id of a worktree path: first 16 hex of sha256 of its lexical, lowercase form.
-pub(crate) fn worktree_id(worktree: &Path) -> String {
+pub fn worktree_id(worktree: &Path) -> String {
     let digest = Sha256::digest(lexical(worktree).to_lowercase().as_bytes());
     let mut hex = String::with_capacity(16);
     for byte in digest.iter().take(8) {
@@ -74,7 +74,7 @@ fn project_dir(root: &Path, project_id: &str) -> io::Result<PathBuf> {
 }
 
 /// The per-worktree directory (the unit the LRU and cleanup delete).
-pub(crate) fn worktree_dir(root: &Path, project_id: &str, worktree: &Path) -> io::Result<PathBuf> {
+pub fn worktree_dir(root: &Path, project_id: &str, worktree: &Path) -> io::Result<PathBuf> {
     Ok(project_dir(root, project_id)?.join(worktree_id(worktree)))
 }
 
@@ -87,7 +87,7 @@ fn now_ms() -> u128 {
 
 /// Creates (if needed) the directories `warm:` declares and returns the env to hand the child.
 /// Touches `.last_used`, writes `.worktree`. `seed: copy` is treated as `none` with a warning.
-pub(crate) fn prepare(
+pub fn prepare(
     root: &Path,
     project_id: &str,
     worktree: &Path,
@@ -121,14 +121,14 @@ pub(crate) fn prepare(
 }
 
 /// Deletes one worktree's state. Missing is fine.
-pub(crate) fn forget_worktree(root: &Path, project_id: &str, worktree: &Path) -> io::Result<()> {
+pub fn forget_worktree(root: &Path, project_id: &str, worktree: &Path) -> io::Result<()> {
     match std::fs::remove_dir_all(worktree_dir(root, project_id, worktree)?) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
 }
 
-pub(crate) struct Caps {
+pub struct Caps {
     pub machine_bytes: u64,
     pub project_bytes: HashMap<String, u64>,
     pub default_project_bytes: u64,
@@ -225,7 +225,7 @@ fn try_remove(
 /// before each removal `try_reserve(dir)` must return true (the caller then keeps the dir from
 /// being taken until `release(dir)`), and a dir whose `.last_used` is not older than the sweep's
 /// start is skipped.
-pub(crate) fn sweep(
+pub fn sweep(
     root: &Path,
     caps: &Caps,
     try_reserve: &dyn Fn(&Path) -> bool,

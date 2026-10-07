@@ -208,7 +208,7 @@ pub async fn run_gate(
 
 /// What a child run produced, before anyone decides what it means.
 #[derive(Debug)]
-pub(crate) struct ArgvOutcome {
+pub struct ArgvOutcome {
     /// `None` when the process was signalled, timed out, or never started.
     pub exit_code: Option<i32>,
     pub tail: String,
@@ -223,7 +223,7 @@ pub(crate) struct ArgvOutcome {
 /// This is the spawn-and-drain half of [`run_gate`], with no tamper check and no verdict: callers
 /// that run something other than the project's gate command (the verification executor) share the
 /// same process-tree kill, output cap and drain deadline.
-pub(crate) async fn run_argv(
+pub async fn run_argv(
     argv: &[String],
     cwd: &Path,
     env: &[(String, String)],
@@ -350,7 +350,7 @@ pub(crate) async fn run_argv(
 ///
 /// This is not a shell parser: operators such as `&&` have no special meaning. Use an explicit
 /// shell command such as `bash -c "cargo test && cargo clippy"` when shell evaluation is required.
-pub(crate) fn split_command(command: &str) -> Result<Vec<String>, String> {
+pub fn split_command(command: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quote = None;

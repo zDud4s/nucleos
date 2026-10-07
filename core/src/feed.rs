@@ -439,7 +439,7 @@ pub async fn mark_seen(
 pub const DEFAULT_RETENTION_DAYS: i64 = 90;
 
 /// The window, overridable the same way `runs` and `worktree` allow theirs to be.
-pub(crate) fn retention_days() -> i64 {
+pub fn retention_days() -> i64 {
     std::env::var("NUCLEOS_FEED_RETENTION_DAYS")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())

@@ -564,7 +564,7 @@ fn sql_table(kind: &str) -> Option<&'static str> {
 /// agents never read owner notes. The text is context for the dossier and must never be injected
 /// into a prompt run or quoted into knowledge; the only direct note -> knowledge door stays
 /// `teach`.
-pub(crate) async fn active_note_texts_for_project(
+pub async fn active_note_texts_for_project(
     pool: &SqlitePool,
     project_id: &str,
 ) -> sqlx::Result<Vec<String>> {
@@ -1130,7 +1130,14 @@ mod tests {
         );
         // `distill.rs` is the one sanctioned exception: D4 of `.ai/specs/2026-10-05-destilador-design.md`
         // lets the distiller's dossier read the notes linked to a project, as context only.
-        let allowed = ["owner_notes.rs", "http.rs", "main.rs", "distill.rs"];
+        // `lib.rs` only declares the module (`pub mod owner_notes;`) since the core lib/bin split.
+        let allowed = [
+            "owner_notes.rs",
+            "http.rs",
+            "main.rs",
+            "distill.rs",
+            "lib.rs",
+        ];
         let needle = ["owner", "note"].join("_");
         let src = running_in.join("src");
         let mut scanned = 0;

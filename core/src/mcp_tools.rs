@@ -2647,7 +2647,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
 /// `cfg(test)` because only tests ask, and they ask from more than one module: enumerating the
 /// router is how an assertion covers a tool added tomorrow instead of one added by the person who
 /// remembered to edit the test.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub fn every_tool_name() -> Vec<String> {
     NucleosTools::tool_router()
         .list_all()
@@ -2686,7 +2686,7 @@ pub fn tool_effect(tool: &str) -> ToolEffect {
 ///
 /// Unreadable arguments resolve to `ReadsUntrusted` and never to an error: "I could not tell" is
 /// not "no" when the question is whether a stranger's words are about to enter the turn.
-pub(crate) async fn effect_of_call(
+pub async fn effect_of_call(
     pool: &sqlx::SqlitePool,
     tool: &str,
     arguments: &serde_json::Value,
@@ -3877,7 +3877,7 @@ mod tests {
         let response = axum::Router::new()
             .route(
                 "/knowledge",
-                axum::routing::post(crate::http::post_knowledge),
+                axum::routing::post(crate::door::post_knowledge),
             )
             .with_state(declaration_test_state(pool.clone()))
             .oneshot(
@@ -3929,7 +3929,7 @@ mod tests {
         let response = axum::Router::new()
             .route(
                 "/knowledge/recall",
-                axum::routing::post(crate::http::recall_knowledge),
+                axum::routing::post(crate::door::recall_knowledge),
             )
             .with_state(declaration_test_state(pool.clone()))
             .oneshot(
@@ -3957,7 +3957,7 @@ mod tests {
         let response = axum::Router::new()
             .route(
                 "/knowledge/findings",
-                axum::routing::post(crate::http::post_finding),
+                axum::routing::post(crate::door::post_finding),
             )
             .layer(axum::Extension(scope))
             .with_state(declaration_test_state(pool.clone()))

@@ -384,7 +384,7 @@ impl Speaker for HttpSpeaker {
 }
 
 /// What a `FakeSpeaker` will do when asked.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub enum FakeOutcome {
     Audio(Vec<u8>),
     Failure(std::io::ErrorKind, String),
@@ -394,7 +394,7 @@ pub enum FakeOutcome {
 ///
 /// `#[cfg(test)]` for the reason `FakeTranscriber` is: building it into the daemon would ship
 /// something that can fabricate audio.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub struct FakeSpeaker {
     outcome: FakeOutcome,
     /// Real synthesis takes time. Zero here for every test so far; kept because a test about what
@@ -405,7 +405,7 @@ pub struct FakeSpeaker {
     said: std::sync::Mutex<Vec<String>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 impl FakeSpeaker {
     pub fn returning(audio: &[u8]) -> Self {
         Self {
@@ -436,7 +436,7 @@ impl FakeSpeaker {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 #[async_trait]
 impl Speaker for FakeSpeaker {
     async fn speak(&self, text: &str) -> std::io::Result<Vec<u8>> {

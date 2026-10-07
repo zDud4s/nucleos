@@ -240,7 +240,6 @@ pub struct Known {
 
 /// The kind of node whose work is being briefed, in the order the job graph uses them.
 #[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(test, expect(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     Plan,
@@ -259,11 +258,9 @@ pub struct Context {
     /// has for free because it already builds the map.
     pub communities: Vec<String>,
     #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(test, expect(dead_code))]
     pub node: Option<NodeKind>,
     /// The normalised signature of the red gate, when there is one.
     #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(test, expect(dead_code))]
     pub gate: Option<String>,
 }
 
@@ -722,7 +719,7 @@ fn select_pass<'a>(
 /// `source = 'distiller'` too, and it is approved. A proposed one never gets here. The other named
 /// exception is not approval: `admitted` separately requires a same-job working row with
 /// well-tagged evidence.
-pub(crate) fn approved(row: &Known) -> bool {
+pub fn approved(row: &Known) -> bool {
     match row.status.as_str() {
         "active" if row.source == "consolidator" => {
             row.layer == "episodic" && row.observations.is_some()
@@ -1246,7 +1243,7 @@ pub async fn for_scope(pool: &SqlitePool, scope: &Scope) -> sqlx::Result<Vec<Kno
 }
 
 /// How many approved rows are read before rendering ever begins.
-pub(crate) const MAX_READ: usize = 200;
+pub const MAX_READ: usize = 200;
 
 /// Everything the store holds, in every status, newest first.
 ///
@@ -1518,10 +1515,10 @@ pub async fn propose_in_with(
 
 /// How many runs a distilled episode may go unconfirmed before it expires - the consolidator's
 /// trial, spec `destilador` section 3.
-pub(crate) const DISTILLED_TRIAL_RUNS: i64 = 50;
+pub const DISTILLED_TRIAL_RUNS: i64 = 50;
 
 /// The note of an event that renews a row without changing its status.
-pub(crate) const NOTE_RECONFIRMED: &str = "reconfirmed";
+pub const NOTE_RECONFIRMED: &str = "reconfirmed";
 
 /// The identity of a learning for deduplication: its title lowercased, whitespace collapsed and
 /// final punctuation stripped. `None` when nothing is left to identify it by.
@@ -1965,7 +1962,7 @@ async fn fetch(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Known>> {
 }
 
 /// The complete vocabulary a run may use to point at the source of a finding.
-pub(crate) const EVIDENCE_TAGS: [&str; 8] = [
+pub const EVIDENCE_TAGS: [&str; 8] = [
     "job",
     "run",
     "job_item",
@@ -1994,7 +1991,7 @@ fn known_element(value: &serde_json::Value) -> bool {
 }
 
 /// Keep only shaped, known referents and serialise them in the daemon's own JSON form.
-pub(crate) fn tagged_evidence(raw: &serde_json::Value) -> Option<String> {
+pub fn tagged_evidence(raw: &serde_json::Value) -> Option<String> {
     struct Tagged<'a>(&'a serde_json::Map<String, serde_json::Value>);
 
     impl Serialize for Tagged<'_> {
@@ -2034,7 +2031,7 @@ pub(crate) fn tagged_evidence(raw: &serde_json::Value) -> Option<String> {
 }
 
 /// Whether stored evidence still has at least one shaped, known referent.
-pub(crate) fn evidence_is_tagged(stored: &str) -> bool {
+pub fn evidence_is_tagged(stored: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(stored)
         .ok()
         .and_then(|value| value.as_array().cloned())

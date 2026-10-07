@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 /// A queued request, as far as scheduling cares.
-pub(crate) struct Candidate<'a> {
+pub struct Candidate<'a> {
     pub id: i64,
     pub project: Option<&'a str>,
     pub priority: i64,
@@ -16,7 +16,7 @@ pub(crate) struct Candidate<'a> {
 }
 
 /// The priority a candidate competes at: one level better once it waited `aging_ms`.
-pub(crate) fn effective_priority(c: &Candidate, now_ms: i64, aging_ms: i64) -> i64 {
+pub fn effective_priority(c: &Candidate, now_ms: i64, aging_ms: i64) -> i64 {
     if now_ms.saturating_sub(c.enqueued_ms) >= aging_ms {
         (c.priority - 1).max(0)
     } else {
@@ -29,7 +29,7 @@ pub(crate) fn effective_priority(c: &Candidate, now_ms: i64, aging_ms: i64) -> i
 /// Order: best effective priority, then the project whose last start is oldest (never started
 /// goes first), then FIFO by `enqueued_ms`, then `id`. A head that does not fit blocks the
 /// queue: nothing behind it jumps ahead, so heavy units are not starved.
-pub(crate) fn pick(
+pub fn pick(
     candidates: &[Candidate],
     free: i64,
     last_start: &HashMap<Option<String>, u64>,

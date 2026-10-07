@@ -244,8 +244,8 @@ pub fn migrate_legacy(
 /// Writes `contents` as `name` in `project_id`'s state directory under `machine_root`, creating
 /// the directories on the way. For tests, which point `machine_root` at a temporary directory
 /// standing in for `~/.nucleos` — never at a real home.
-#[cfg(test)]
-pub(crate) fn write_for_test(
+#[cfg(any(test, feature = "testkit"))]
+pub fn write_for_test(
     machine_root: &Path,
     project_id: &str,
     name: &str,

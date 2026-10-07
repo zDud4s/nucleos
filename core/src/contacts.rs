@@ -345,7 +345,7 @@ async fn merge_in_transaction(
 /// transaction. A standalone version is a second, non-atomic way to reach the same tables, so
 /// `#[cfg(test)]` keeps it available to the tests that exercise the join directly and unavailable
 /// to anything that would use it to merge without an approval.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn merge(pool: &SqlitePool, keep_id: i64, absorb_id: i64) -> sqlx::Result<MergeOutcome> {
     let at = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;

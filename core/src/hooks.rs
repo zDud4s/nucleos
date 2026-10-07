@@ -1930,7 +1930,7 @@ async fn rooted_turn(state: &AppState, run_id: i64) -> Option<String> {
 ///
 /// Long enough for somebody looking at the window to read a command and decide; short enough that
 /// stepping away costs one refused tool call rather than a conversation that hangs.
-pub(crate) const ASK_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
+pub const ASK_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// One tool call a conversation is waiting to be allowed.
 ///
@@ -1965,7 +1965,7 @@ static ASKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Stri
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Records that this turn is waiting to be allowed something, and returns the question's name.
-pub(crate) fn ask_about(chat_id: &str, run_id: i64, tool: &str, detail: Option<String>) -> String {
+pub fn ask_about(chat_id: &str, run_id: i64, tool: &str, detail: Option<String>) -> String {
     let id = crate::auth::generate_uuid_v4();
     let (answer, heard) = tokio::sync::oneshot::channel();
     ASKS.lock().unwrap().insert(
@@ -2018,7 +2018,7 @@ pub fn answer_ask(id: &str, allow: bool) -> bool {
 ///
 /// The question is taken down either way. A turn whose call was refused has moved on, and a
 /// question still standing in the window would be about something that is no longer happening.
-pub(crate) async fn wait_for_run(run_id: i64, window: std::time::Duration) -> Option<bool> {
+pub async fn wait_for_run(run_id: i64, window: std::time::Duration) -> Option<bool> {
     let (id, heard) = {
         let mut asks = ASKS.lock().unwrap();
         let (id, pending) = asks
@@ -2035,7 +2035,7 @@ pub(crate) async fn wait_for_run(run_id: i64, window: std::time::Duration) -> Op
 }
 
 /// What the owner is told when a rooted turn asks for something that would need approving.
-pub(crate) const ROOTED_APPROVAL_DENY_REASON: &str = "this needs approving, and a conversation is not where that happens — do it in the window, or \
+pub const ROOTED_APPROVAL_DENY_REASON: &str = "this needs approving, and a conversation is not where that happens — do it in the window, or \
      say what you want and let it start a run";
 
 /// A rooted turn's tool call: the NucleOS tools as ever, and the machine through the classifier.
@@ -2310,7 +2310,7 @@ const BYPASS_STILL_ASKS: &str =
 const DONT_ASK_CLAUSE: &str = " — and this conversation asks nobody";
 
 /// Spec B D12, word for word: a person already answered this exact action for this task.
-pub(crate) const A_PERSON_DECLINED_THIS: &str = "A person already declined this exact action for this task. It was not run. Do not try it again. Carry on with the task another way if there is one, or finish what you can and say what is missing in your final message.";
+pub const A_PERSON_DECLINED_THIS: &str = "A person already declined this exact action for this task. It was not run. Do not try it again. Carry on with the task another way if there is one, or finish what you can and say what is missing in your final message.";
 
 /// Which of the classifier's `allow`s survive this rung.
 ///
@@ -3028,7 +3028,7 @@ const DENIAL_LIMIT: i64 = 3;
 /// the enum" is held: a caller that means to ignore it has to say `let _ =`, in view.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DenialCount {
+pub enum DenialCount {
     /// Counted, and the run is still below `DENIAL_LIMIT` — the only case spec B's E1 may ask the
     /// judge about: the judge may stop a run BEFORE the limit, never after it.
     Counted(i64),
@@ -10317,8 +10317,8 @@ mod tests {
 
     /// A repository on the roster, and the path a session would be standing in.
     async fn rostered_repo(state: &AppState, prefix: &str) -> tempfile::TempDir {
-        let dir = crate::git_exec::tests::space_free_tempdir(prefix);
-        crate::git_exec::tests::initialize_repo(dir.path());
+        let dir = crate::git_exec::testkit::space_free_tempdir(prefix);
+        crate::git_exec::testkit::initialize_repo(dir.path());
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
         )
@@ -10998,8 +10998,8 @@ mod tests {
     #[tokio::test]
     async fn a_repository_no_project_claims_is_refused_rather_than_waved_through() {
         let state = test_state().await;
-        let dir = crate::git_exec::tests::space_free_tempdir("hook-session-unclaimed");
-        crate::git_exec::tests::initialize_repo(dir.path());
+        let dir = crate::git_exec::testkit::space_free_tempdir("hook-session-unclaimed");
+        crate::git_exec::testkit::initialize_repo(dir.path());
 
         let decision = session_decision(&state, "git merge feature", dir.path()).await;
 

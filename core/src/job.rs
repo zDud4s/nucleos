@@ -525,7 +525,7 @@ pub enum ItemState {
 /// A hand-kept list, held to the enum by `every_item_state_covers_the_enum`. The alternative is a
 /// derive macro for the sake of one array, and the alternative to both — tests that enumerate the
 /// states inline — is what lets a new variant be born untested everywhere at once.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 const EVERY_ITEM_STATE: [ItemState; 15] = [
     ItemState::Pending,
     ItemState::Running,
@@ -842,7 +842,7 @@ pub struct ItemView {
 impl ItemView {
     /// A view of an item that waits for nobody and declares nothing, which is what a job without a
     /// team has.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     fn plain(state: ItemState) -> Self {
         Self {
             state,
@@ -1400,7 +1400,7 @@ impl Outcome {
 /// is a verdict about the code and is worth another attempt; a gate that would not run measured
 /// nothing, so there is nothing to attempt again, and buying past it with a retry would mean
 /// building on work nothing has looked at.
-pub(crate) fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> ItemState {
+pub fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> ItemState {
     match status {
         "running" => ItemState::Running,
         "implemented" => ItemState::Implemented,
@@ -2407,7 +2407,7 @@ pub const LIVE_STATUSES: [&str; 6] = [
 /// budget — arithmetic [`item_state_from`] owns — and restating it in SQL would be the same rule in
 /// a second dialect. Sparing it costs a slot held until the job ends; getting it wrong the other way
 /// deletes a tree out from under work that was going to continue in it.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub const LIVE_ITEM_STATUSES: [&str; 7] = [
     "pending",
     "running",

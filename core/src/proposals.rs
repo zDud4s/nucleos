@@ -391,7 +391,7 @@ pub async fn create_github_action(
 /// deliberate: `wip::open_review_items` filters by project, so these never reach the per-project
 /// ceiling. The ceiling that governs them is `teams.max_open_actions`, which is per team, because a
 /// department has no project to be counted against.
-pub(crate) async fn create_team_action_in_transaction(
+pub async fn create_team_action_in_transaction(
     transaction: &mut Transaction<'_, Sqlite>,
     kind: &str,
     why: &str,
@@ -799,7 +799,7 @@ pub async fn transition(
     Ok(true)
 }
 
-pub(crate) async fn transition_in_transaction(
+pub async fn transition_in_transaction(
     transaction: &mut Transaction<'_, Sqlite>,
     id: i64,
     to_status: &str,
@@ -934,7 +934,7 @@ pub async fn reject_proposal(pool: &SqlitePool, id: i64) -> Result<(), RejectErr
 /// row, and the proposal's approval. A standalone helper is a second, non-atomic way to do the same
 /// thing, so `#[cfg(test)]` keeps it available to the tests that need to mint a grant while making
 /// it unavailable to anything else.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn grant_action(
     pool: &SqlitePool,
     resume_run_id: i64,

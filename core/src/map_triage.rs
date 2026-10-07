@@ -197,7 +197,7 @@ const MAX_QUOTED_VERDICT: usize = 120;
 /// character-boundary rule for all three. Shared rather than respelled for `map_intent::json_object`'s
 /// reason: two spellings of *cut this visibly and do not panic doing it* would agree only while
 /// somebody kept them agreeing, and the one that drifted would be found by a daemon dying.
-pub(crate) fn clipped(text: &str, ceiling: usize) -> String {
+pub fn clipped(text: &str, ceiling: usize) -> String {
     if text.len() <= ceiling {
         return text.to_owned();
     }

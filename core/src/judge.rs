@@ -43,12 +43,12 @@ pub const JUDGE_QUESTIONS: &[Question] = &[
 ];
 
 mod client;
-pub(crate) mod correction;
-pub(crate) mod resolve;
-pub(crate) mod resolve_review;
+pub mod correction;
+pub mod resolve;
+pub mod resolve_review;
 mod review;
-#[cfg(test)]
-pub(crate) use client::ScriptedJudge;
+#[cfg(any(test, feature = "testkit"))]
+pub use client::ScriptedJudge;
 pub use client::{Answers, JevJudge, Judge, JudgeError, TYPESAFE_KEY};
 pub use review::{
     JudgeOpinion, JudgeReadiness, JudgeVerdictView, list_unreviewed, opinions_for_decisions,
@@ -65,10 +65,10 @@ pub const GATE_JUDGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The judge as the daemon holds it: the occupant and the permits. One per process, in
 /// `AppState`, like `quota::QuotaRuntime`.
 pub struct JudgeRuntime {
-    pub(crate) occupant: Arc<dyn Judge>,
+    pub occupant: Arc<dyn Judge>,
     /// Spec B D10: the same Jev with a 10 s client, for questions no hook is waiting on.
-    pub(crate) background: Arc<dyn Judge>,
-    pub(crate) permits: Arc<tokio::sync::Semaphore>,
+    pub background: Arc<dyn Judge>,
+    pub permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl JudgeRuntime {
@@ -94,7 +94,7 @@ impl JudgeRuntime {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn with_permits(occupant: Arc<dyn Judge>, permits: usize) -> Self {
         Self {
             background: occupant.clone(),
@@ -105,7 +105,7 @@ impl JudgeRuntime {
 
     /// For the many test `AppState`s that never turn the judge on (`runs.judge` defaults to
     /// `off`). Named and `#[cfg(test)]` for the reasons `QuotaRuntime::disabled` gives.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn disabled() -> Self {
         Self::with(ScriptedJudge::failing(JudgeError::NoKey(
             "no judge in this test".to_owned(),
@@ -435,7 +435,7 @@ const AUTH_SCHEMES: [&str; 7] = [
 /// the judge adds the shapes a shell line carries secrets in (named assignments, authorization
 /// headers, URL credentials) and the owner's home path. A false positive costs the judge some
 /// context, never a leak.
-pub(crate) fn redact_for_judge(text: &str) -> String {
+pub fn redact_for_judge(text: &str) -> String {
     let home = crate::commands::home();
     redact_for_judge_with_home(text, home.as_deref())
 }
@@ -671,7 +671,7 @@ fn match_path(chars: &[char], at: usize, needle: &[char]) -> Option<usize> {
 /// the resolver's `<<<GATE_OUTPUT ... GATE_OUTPUT>>>`) are only fences if the data cannot write
 /// one. Any marker inside the data is broken (`GATE_OUTPUT>>>` becomes `GATE_OUTPUT> >>`), so the
 /// real closing marker is the only one the state contains. Text without a marker is unchanged.
-pub(crate) fn break_fence_markers(text: &str) -> String {
+pub fn break_fence_markers(text: &str) -> String {
     text.replace("GATE_OUTPUT>>>", "GATE_OUTPUT> >>")
         .replace("TOOL_INPUT>>>", "TOOL_INPUT> >>")
         .replace("<<<GATE_OUTPUT", "<< <GATE_OUTPUT")
@@ -818,13 +818,13 @@ pub fn tool_input_digest(tool_input: &Value) -> String {
     format!("{:x}", Sha256::digest(tool_input.to_string().as_bytes()))
 }
 
-pub(crate) fn charged(tokens: i64) -> f64 {
+pub fn charged(tokens: i64) -> f64 {
     tokens as f64 * client::PRICE_PER_MILLION_INPUT_TOKENS_USD / 1_000_000.0
 }
 
 /// When TypeSafe did not report usage, four characters a token — rather than zero, for the rule
 /// `budget.rs` lives by: failing to measure a cost cannot mean treating it as free.
-pub(crate) fn estimated_tokens(state_chars: usize) -> i64 {
+pub fn estimated_tokens(state_chars: usize) -> i64 {
     (state_chars as i64 + 3) / 4
 }
 
@@ -981,10 +981,7 @@ async fn thresholds_for(
 
 /// Review item G: why this project's thresholds cannot be read, if they cannot - the same read the
 /// hook makes, so the panel says exactly what the hook will do (fall back to the classifier).
-pub(crate) async fn rules_problem(
-    machine_root: Option<PathBuf>,
-    project_id: &str,
-) -> Option<String> {
+pub async fn rules_problem(machine_root: Option<PathBuf>, project_id: &str) -> Option<String> {
     thresholds_for(machine_root, Some(project_id)).await.err()
 }
 
@@ -997,7 +994,7 @@ async fn state_for(pool: &SqlitePool, asked: &Asked) -> sqlx::Result<String> {
 
 /// Spec B D10: spec A's state with one optional fixed sentence after the ACTION section. With
 /// `None`, byte for byte what spec A measured.
-pub(crate) async fn state_with_note(
+pub async fn state_with_note(
     pool: &SqlitePool,
     asked: &Asked,
     note: Option<&str>,
@@ -1047,7 +1044,7 @@ pub(crate) async fn state_with_note(
 /// D7/D9: everything the call needs from this machine. An unreadable rules file is an error (the
 /// defaults may be looser than what the project wrote down), and so is a database that will not
 /// answer.
-pub(crate) async fn prepare(pool: &SqlitePool, asked: &Asked) -> Result<Prepared, String> {
+pub async fn prepare(pool: &SqlitePool, asked: &Asked) -> Result<Prepared, String> {
     let thresholds = thresholds_for(asked.machine_root.clone(), asked.project_id.as_deref())
         .await
         .map_err(|error| format!("config: {error}"))?;
@@ -1060,7 +1057,7 @@ pub(crate) async fn prepare(pool: &SqlitePool, asked: &Asked) -> Result<Prepared
 /// D10/D11: a permit, then the occupant. The permit is held for the call and no longer; with none
 /// available the call is never made (`JudgeError::Busy`). The occupant reads its key inside
 /// `ask`, so the deadline around this call bounds the credential store too.
-pub(crate) async fn ask(
+pub async fn ask(
     runtime: &JudgeRuntime,
     state: &str,
     questions: &[Question],
@@ -1073,7 +1070,7 @@ pub(crate) async fn ask(
 
 /// Spec B D10: `ask`, through the background occupant. The same permits: four calls in flight
 /// across the machine, whoever makes them.
-pub(crate) async fn ask_in_background(
+pub async fn ask_in_background(
     runtime: &JudgeRuntime,
     state: &str,
     questions: &[Question],
@@ -1166,7 +1163,7 @@ impl VerdictRow {
 
 /// D10/D11/D12: puts one call to the judge within `JUDGE_DEADLINE`, writes down what came of it
 /// and, in `enforce`, returns what the hook must do (D7).
-pub(crate) async fn judge_call(
+pub async fn judge_call(
     pool: &SqlitePool,
     runtime: &JudgeRuntime,
     asked: &Asked,
@@ -1176,7 +1173,7 @@ pub(crate) async fn judge_call(
 }
 
 /// `judge_call` with the budget the caller can spare, `JUDGE_DEADLINE` being the most it ever is.
-pub(crate) async fn judge_call_within(
+pub async fn judge_call_within(
     pool: &SqlitePool,
     runtime: &JudgeRuntime,
     asked: &Asked,
@@ -1231,7 +1228,7 @@ pub(crate) async fn judge_call_within(
 
 /// D11: asks in parallel and changes nothing. Detached, so the hook never waits for it - "nao se
 /// acrescenta latencia nenhuma".
-pub(crate) fn observe_if_asked(pool: &SqlitePool, runtime: &Arc<JudgeRuntime>, asked: Asked) {
+pub fn observe_if_asked(pool: &SqlitePool, runtime: &Arc<JudgeRuntime>, asked: Asked) {
     if !judge_is_asked(
         &asked.tool_name,
         asked.action_class,
@@ -1248,7 +1245,7 @@ pub(crate) fn observe_if_asked(pool: &SqlitePool, runtime: &Arc<JudgeRuntime>, a
 
 /// D4/D7: asks and waits - at most `deadline`, itself capped at `JUDGE_DEADLINE` - and returns
 /// what the hook must do. The hook computes `deadline` from what is left of its own budget.
-pub(crate) async fn enforce_if_asked(
+pub async fn enforce_if_asked(
     pool: &SqlitePool,
     runtime: &JudgeRuntime,
     asked: Asked,
@@ -1265,8 +1262,8 @@ pub(crate) async fn enforce_if_asked(
 }
 
 /// Fixtures the judge's two test modules share: a migrated in-memory database and a running run.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "testkit"))]
+pub mod test_support {
     pub async fn pool() -> sqlx::SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)

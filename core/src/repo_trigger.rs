@@ -114,7 +114,7 @@ struct GateRefusal {
 }
 
 #[derive(Debug)]
-pub(crate) enum TriggerFireOutcome {
+pub enum TriggerFireOutcome {
     Fired(i64),
     Deferred { reason: String, stop_tick: bool },
     Busy,
@@ -189,7 +189,7 @@ async fn governance_permits_repo_trigger(
 }
 
 /// Fire one already-resolved configured repo trigger through the shared autonomy brakes.
-pub(crate) async fn fire_configured_trigger(
+pub async fn fire_configured_trigger(
     state: &crate::state::AppState,
     now: chrono::DateTime<chrono::Utc>,
     project_id: &str,
@@ -277,7 +277,7 @@ pub async fn run_repo_poller(state: crate::state::AppState) {
 /// One pass of the repo-event poller: for each autopilot project, fetch and read each watched branch,
 /// arm first-seen triggers without firing, and fire a run for any trigger whose branch SHA changed —
 /// gated by the same global/scoped kill switches and budget as the scheduler.
-pub(crate) async fn poll_tick(state: &crate::state::AppState, now: chrono::DateTime<chrono::Utc>) {
+pub async fn poll_tick(state: &crate::state::AppState, now: chrono::DateTime<chrono::Utc>) {
     let projects = match crate::autopilot::autopilot_projects(&state.pool).await {
         Ok(projects) => projects,
         Err(error) => {

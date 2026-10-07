@@ -232,7 +232,7 @@ pub async fn request(state: &AppState, session_id: i64, reason: &str) -> Result<
 /// who won a concurrent approve is the one that hands over the wheel.
 ///
 /// This is the seat-less form the tests use; production goes through `accept_with_seat`.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn accept(state: &AppState, session_id: i64) -> Result<SessionRow, WheelError> {
     accept_with_seat(state, session_id, None)
         .await

@@ -180,7 +180,7 @@ pub fn citations(source: &str) -> BTreeSet<Citation> {
 /// needs it to report the same fact to whoever is looking at the map. Written twice, the two would
 /// be free to disagree about a file with two headers — and about that file the disagreement is
 /// silent, which is the shape of divergence this module refuses everywhere else.
-pub(crate) fn declared_document(source: &str) -> Option<String> {
+pub fn declared_document(source: &str) -> Option<String> {
     match declaration(source) {
         Declaration::Absent => None,
         Declaration::Named(slug) => Some(slug),
@@ -288,7 +288,7 @@ pub fn declaration(source: &str) -> Declaration {
 /// — which finds `§6.44` and quotes the wrong sentence under the right number. Two answers to *what
 /// is a citation* is the one divergence this feature cannot afford, so the second caller borrows
 /// this rather than approximating it.
-pub(crate) fn leading_number(text: &str) -> Option<(String, usize)> {
+pub fn leading_number(text: &str) -> Option<(String, usize)> {
     let mut number = String::new();
     let mut end = 0;
     let mut after_digit = false;
@@ -680,7 +680,7 @@ pub struct Counts {
 /// is one the file's header will never govern, so it is exempt from the veto — and a second spelling
 /// there would be a second, quietly different answer to *is this a document of this project*
 /// governing the only state the map may present as confirmed.
-pub(crate) fn names_document(candidate: &str, spec_slug: &str) -> bool {
+pub fn names_document(candidate: &str, spec_slug: &str) -> bool {
     if !could_name_a_document(candidate) {
         return false;
     }
@@ -701,7 +701,7 @@ pub(crate) fn names_document(candidate: &str, spec_slug: &str) -> bool {
 /// present disagree about what counts as naming a section — which is precisely the divergence
 /// the guard exists to refuse, reopened inside the guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Evidence {
+pub enum Evidence {
     /// This file says nothing about that section. Not the same as saying nothing at all.
     Nothing,
     /// It names the section without saying which document, or names it after a word that is no
@@ -739,7 +739,7 @@ pub(crate) enum Evidence {
 /// The decision then reads [`Anchor::Silent`] rather than [`Anchor::Ambiguous`], which is an
 /// under-report and the direction this module errs in on purpose — but it will look like the map
 /// forgot something, so it is written down here before it happens.
-pub(crate) fn evidence(
+pub fn evidence(
     cites: &[Citation],
     section: &str,
     spec_slug: &str,

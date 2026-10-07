@@ -347,7 +347,7 @@ impl Transcriber for HttpTranscriber {
 /// asked for, in a config field that names one program.
 /// `pub(crate)` so `health.rs` probes the SAME program this spawns. A second parser for one config
 /// string is how a probe comes to disagree with the thing it is probing.
-pub(crate) fn split_command(command: &str) -> Vec<String> {
+pub fn split_command(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
@@ -379,7 +379,7 @@ pub(crate) fn split_command(command: &str) -> Vec<String> {
 }
 
 /// What a `FakeTranscriber` will do when asked.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub enum FakeOutcome {
     Text(String),
     Failure(std::io::ErrorKind, String),
@@ -389,7 +389,7 @@ pub enum FakeOutcome {
 ///
 /// `#[cfg(test)]` because every user of it is a test, and for the same reason `FakeCommandRunner` is:
 /// building it into the daemon would ship something that can fabricate a transcript.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub struct FakeTranscriber {
     outcome: FakeOutcome,
     /// How long to take before answering. Real transcription takes seconds, and a test about what
@@ -399,7 +399,7 @@ pub struct FakeTranscriber {
     calls: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 impl FakeTranscriber {
     pub fn returning(text: &str) -> Self {
         Self {
@@ -430,7 +430,7 @@ impl FakeTranscriber {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 #[async_trait]
 impl Transcriber for FakeTranscriber {
     async fn transcribe(

@@ -14,13 +14,17 @@ use crate::auth::{ApiTokenLevel, Scope, mint_api_token, require_token};
 use crate::autopilot::{self, ActivationError, Mode, ProjectSummary, ScopedKill};
 use crate::backup;
 use crate::budget;
+use crate::door::{
+    files_root, post_finding, post_knowledge, recall_knowledge, refusal, sending_run_id_of,
+    uncancellable,
+};
 use crate::feed::{self, FeedEntry};
 use crate::health;
 use crate::hooks::{posttooluse_outcome, pretooluse_decision};
 use crate::inspect;
 use crate::notify_policy;
 use crate::presets;
-use crate::runs::{self, AwaitingRun, CreateRunError, cancel_run, create_run, get_run};
+use crate::runs::{self, AwaitingRun, cancel_run, create_run, get_run};
 use crate::shadow::{self, ClassTally, ShadowDecision};
 use crate::state::AppState;
 use crate::vcs;
@@ -2270,19 +2274,6 @@ fn folder_status(error: crate::files::PathError) -> StatusCode {
     }
 }
 
-/// The folder root, or a refusal when startup could not create it.
-///
-/// `pub(crate)` because a second pillar with a loop of its own now reads the same root, and the one
-/// thing worth sharing is the 503: an installation with no files folder must answer the same way
-/// whichever route asked. The field itself lives on `AppState` rather than in any one pillar's
-/// runtime — see the doc there for why it stopped being the mail pillar's.
-pub(crate) fn files_root(state: &AppState) -> Result<&std::path::Path, StatusCode> {
-    state
-        .files_root
-        .as_deref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
-}
-
 /// The trash beside the root, or the same 503 when startup could not make it. A delete with no
 /// trash refuses rather than removing for good — see `AppState::files_trash`.
 fn files_trash(state: &AppState) -> Result<&std::path::Path, StatusCode> {
@@ -2703,23 +2694,6 @@ async fn post_email_requeue(
         })
 }
 
-/// A refusal, named so the caller can answer it.
-///
-/// The status code is the coarse signal and stays honest for anything between here and the caller;
-/// the slug is the fine one, because this route has more refusals than HTTP has codes that fit
-/// them. Four, against three — 403 is spent by `auth.rs` on token level and would read as a
-/// rejected token, which is the one thing this never is.
-///
-/// A slug and not the sentence, for the reason `assistant.rs` records around `NO_LOCAL_MODEL`: a
-/// refusal recognised by its prose stops being recognised the day somebody improves the wording,
-/// and it fails silently — a deliberate refusal starts reading as a crash. And the sentence is not
-/// this crate's to write anyway. What undoes a pause is `/retomar`, a Telegram command; the
-/// núcleo says which refusal happened and whoever is talking to the person says what to do about
-/// it, in the language they are being spoken to in.
-fn refusal(status: StatusCode, name: &'static str) -> (StatusCode, Json<serde_json::Value>) {
-    (status, Json(serde_json::json!({ "refusal": name })))
-}
-
 async fn post_assistant_message(
     State(state): State<AppState>,
     Json(body): Json<AssistantMessageRequest>,
@@ -2826,19 +2800,6 @@ struct RelayMessageRequest {
 struct ForwardRequest {
     from_turn_id: i64,
     text: String,
-}
-
-/// The run asking for this relay, read the one place a caller cannot simply state it: the header
-/// `daemon_client::RUN_ID_HEADER` puts on every request a run's own tool calls make, set from an
-/// environment variable that process has no tool able to read or alter — see that constant's own
-/// doc, and `DaemonClient::send_to_chat`'s. Absent or unparseable answers `None` rather than a
-/// guess: a relay with no run behind it has nothing for `relay::admit` to walk a chain from, so the
-/// request is refused rather than attributed to whichever run the caller happened to be.
-fn sending_run_id_of(headers: &axum::http::HeaderMap) -> Option<i64> {
-    headers
-        .get(crate::daemon_client::RUN_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok())
 }
 
 /// Which conversation `run_id` is answering, and which client sent the message it is answering —
@@ -9812,70 +9773,6 @@ async fn get_project_diff(
         .map_err(inspect_status)
 }
 
-/// Runs `work` in its own task so a request that goes away cannot abandon it half-done.
-///
-/// A client that disconnects cancels the request it was making, and the handler's future is dropped
-/// — the same mechanism `abort()` uses on a run's task, with the same consequence: everything
-/// sequenced after the drop point is silently never done. That is only a missing reply when the
-/// handler reads; when it mutates durable state across awaits, it strands the half it had finished,
-/// and the half-states here (a `running` or `awaiting_approval` worktree run) hold one of their
-/// project's concurrency slots until something notices (`concurrency.rs`).
-///
-/// Awaiting the JoinHandle leaves the response exactly as it was; dropping a JoinHandle only
-/// detaches its task, so the work still runs to the end. A panicking task becomes a 500 — the task
-/// is gone, so there is no result left to return.
-pub(crate) async fn uncancellable<T, F>(work: F) -> Result<T, StatusCode>
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::spawn(work)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-pub(crate) fn create_run_status(error: &CreateRunError) -> StatusCode {
-    match error {
-        CreateRunError::Invalid(_) => StatusCode::BAD_REQUEST,
-        // The same 409 as a held slot: both are conditions that pass, and a caller that retries
-        // on one should retry on the other. What tells them apart is the sentence below.
-        CreateRunError::Busy | CreateRunError::NoRoomOnDisk(_) => StatusCode::CONFLICT,
-        CreateRunError::Worktree(_) | CreateRunError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
-/// What the caller is told, beside the status `create_run_status` gives.
-///
-/// Written here rather than in the route for the reason the function above it is: two places
-/// deciding what one refusal is CALLED would drift, and a status and a sentence that disagree is
-/// worse than either alone.
-///
-/// **`Invalid`'s and `NoRoomOnDisk`'s own words travel, and the internal errors' do not**, and that
-/// split is the whole of this function. `Invalid` is a `&'static str` this codebase wrote about the
-/// request — "worktree mode requires project_id and cwd" — and it was being thrown away, so a caller
-/// got a bare 400 for a mistake it could have fixed in a second. `NoRoomOnDisk` is about the machine,
-/// not the daemon: how much room there is and how much a checkout asks for. A `sqlx::Error` and an
-/// `io::Error` are about the inside of this daemon: they go to the log, where whoever can act on them
-/// is reading, and the caller gets the fact rather than the internals.
-pub(crate) fn create_run_reason(error: &CreateRunError) -> String {
-    match error {
-        CreateRunError::Invalid(reason) => (*reason).to_owned(),
-        CreateRunError::Busy => {
-            "this project has no free slot right now, so nothing was started".to_owned()
-        }
-        // Its words travel, like `Invalid`'s, because they are about the machine rather than the
-        // daemon's internals — how much room there is and how much a checkout asks for — and a
-        // caller told "no free slot" instead goes looking for a run that is not there.
-        CreateRunError::NoRoomOnDisk(refusal) => {
-            format!("the disk is too full for another checkout, so nothing was started: {refusal}")
-        }
-        CreateRunError::Worktree(_) => {
-            "the run's checkout could not be provisioned; the daemon logged why".to_owned()
-        }
-        CreateRunError::Db(_) => "the run could not be recorded; the daemon logged why".to_owned(),
-    }
-}
-
 /// The search endpoints never return more than this many rows, even when a caller requests more.
 const SEARCH_LIMIT_MAX: i64 = 200;
 
@@ -15505,239 +15402,6 @@ struct LeaveNoteResponse {
     note_id: i64,
 }
 
-/// Scope comes from the run, and a `project_id` key is accepted and ignored.
-#[derive(serde::Deserialize)]
-pub(crate) struct ProposeKnowledgeRequest {
-    kind: String,
-    title: String,
-    body: String,
-    /// Why this is worth telling every later run. Carried onto the proposal, because a person
-    /// deciding at a glance needs the argument beside the text and not a screen away from it.
-    reasoning: Option<String>,
-    /// The refinement this one replaces, if it is a correction of something already in force.
-    ///
-    /// Optional, and the difference matters: without it the layer only grows, and the answer to
-    /// "this note is wrong now" is a second note contradicting the first with both still in force.
-    supersedes: Option<i64>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct RecallRequest {
-    query: String,
-    layer: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FindingRequest {
-    fact: String,
-    evidence: serde_json::Value,
-}
-
-/// The run-key-only door for one evidenced working fact in the caller's own live job.
-pub(crate) async fn post_finding(
-    State(state): State<AppState>,
-    Extension(scope): Extension<crate::auth::Scope>,
-    Json(request): Json<FindingRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), axum::response::Response> {
-    let crate::auth::Scope::Run(run_id) = scope else {
-        return Err((StatusCode::FORBIDDEN, "only a run may leave a finding").into_response());
-    };
-    let knowledge_id =
-        crate::knowledge::note_finding(&state.pool, run_id, &request.fact, &request.evidence)
-            .await
-            .map_err(|error| match error {
-                crate::knowledge::FindingError::EmptyFact
-                | crate::knowledge::FindingError::FactTooLong
-                | crate::knowledge::FindingError::NoEvidence
-                | crate::knowledge::FindingError::EvidenceTooLong => {
-                    (StatusCode::BAD_REQUEST, error.to_string()).into_response()
-                }
-                crate::knowledge::FindingError::NoJob
-                | crate::knowledge::FindingError::JobEnded => {
-                    (StatusCode::CONFLICT, error.to_string()).into_response()
-                }
-                crate::knowledge::FindingError::TooMany => {
-                    (StatusCode::TOO_MANY_REQUESTS, error.to_string()).into_response()
-                }
-                crate::knowledge::FindingError::Db(error) => {
-                    tracing::warn!(%error, run_id, "writing a finding failed");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "the finding could not be written",
-                    )
-                        .into_response()
-                }
-            })?;
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({"knowledge_id": knowledge_id})),
-    ))
-}
-
-/// The one door a run declares through.
-///
-/// It still goes through the proposal, rather than inserting an `active` row: the review trail is
-/// what makes the layer safe to have at all, and a second way in that skipped it would be the way
-/// everything eventually got written.
-pub(crate) async fn post_knowledge(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(request): Json<ProposeKnowledgeRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), axum::response::Response> {
-    // These are the relay's named slugs for the same header, rather than sentences, for the reason
-    // on `refusal`. A model reads the body verbatim through `declare_refinement`. By owner scope,
-    // 2026-09-24, every other refusal in this handler stays prose.
-    let Some(origin_run_id) = sending_run_id_of(&headers) else {
-        return Err(refusal(StatusCode::BAD_REQUEST, "missing_run_id").into_response());
-    };
-    let kind = crate::knowledge::Kind::parse(request.kind.trim()).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "kind must be one of prompt, memory, skill, subagent".to_owned(),
-        )
-            .into_response()
-    })?;
-    let title = request.title.trim();
-    let body = request.body.trim();
-    // A refinement with no words is an empty heading in every later prompt, for ever.
-    if title.is_empty() || body.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "a refinement needs both a title and a body".to_owned(),
-        )
-            .into_response());
-    }
-    let project_id = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT project_id FROM runs WHERE id = ?",
-    )
-    .bind(origin_run_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|error| {
-        tracing::warn!(%error, run_id = origin_run_id, "reading a declaration's run scope failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "the refinement's scope could not be determined".to_owned(),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "unknown_sender").into_response())?;
-    let (knowledge_id, proposal_id) = crate::knowledge::propose(
-        &state.pool,
-        crate::knowledge::Declaration {
-            project_id: project_id.as_deref(),
-            // Off the header and never off the body: `RUN_ID_HEADER` is set from an environment
-            // variable the run's own tools have nothing able to read or alter, so a run can name
-            // itself and cannot name anybody else.
-            origin_run_id: Some(origin_run_id),
-            kind,
-            title,
-            body,
-            reasoning: request
-                .reasoning
-                .as_deref()
-                .unwrap_or("declared by a run with no reason given"),
-            supersedes: request.supersedes,
-        },
-    )
-    .await
-    // Which precondition failed, rather than a bare status: a caller told only "409" has to guess
-    // between "that id is not there" and "that id is not yours", and the two have different fixes.
-    .map_err(|error| match error {
-        crate::knowledge::ProposeError::UnknownPredecessor(_) => {
-            (StatusCode::NOT_FOUND, error.to_string()).into_response()
-        }
-        crate::knowledge::ProposeError::ForeignPredecessor(_) => {
-            (StatusCode::CONFLICT, error.to_string()).into_response()
-        }
-        crate::knowledge::ProposeError::Db(error) => {
-            tracing::warn!(%error, "proposing a refinement failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the refinement could not be written".to_owned(),
-            )
-                .into_response()
-        }
-    })?;
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "knowledge_id": knowledge_id,
-            "proposal_id": proposal_id,
-        })),
-    ))
-}
-
-pub(crate) async fn recall_knowledge(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(request): Json<RecallRequest>,
-) -> Result<Json<Vec<crate::brief::Recalled>>, axum::response::Response> {
-    let query = request.query.trim();
-    if query.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "recall needs a query").into_response());
-    }
-    let layer = match request.layer.as_deref().map(str::trim) {
-        None => None,
-        Some(layer) => match crate::knowledge::Layer::parse(layer) {
-            Some(layer) => Some(layer),
-            None => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "layer must be one of semantic, episodic, procedural",
-                )
-                    .into_response());
-            }
-        },
-    };
-    if layer == Some(crate::knowledge::Layer::Working) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "the working layer is never recalled: it reaches a node only through its briefing",
-        )
-            .into_response());
-    }
-
-    let scope = match sending_run_id_of(&headers) {
-        None => crate::knowledge::Scope::Machine,
-        Some(run_id) => {
-            let project_id =
-                sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM runs WHERE id = ?")
-                    .bind(run_id)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(%error, run_id, "reading a recall's run scope failed");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "recall's scope could not be determined",
-                        )
-                            .into_response()
-                    })?
-                    .ok_or_else(|| {
-                        refusal(StatusCode::BAD_REQUEST, "unknown_sender").into_response()
-                    })?;
-            project_id.map_or(
-                crate::knowledge::Scope::Machine,
-                crate::knowledge::Scope::Project,
-            )
-        }
-    };
-
-    crate::brief::recall(&state.pool, &scope, query, layer)
-        .await
-        .map(Json)
-        .map_err(|error| {
-            tracing::warn!(%error, "recalling approved knowledge failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "known facts could not be recalled",
-            )
-                .into_response()
-        })
-}
-
 /// Everything the layer holds, in every status.
 ///
 /// Not filtered to `active`, deliberately: the reviewable history IS the feature, and a screen that
@@ -16736,9 +16400,9 @@ mod tests {
     #[tokio::test]
     async fn landing_a_worktree_queues_its_branch_into_the_declared_integration_branch() {
         let (state, _db) = file_test_state().await;
-        let container = crate::git_exec::tests::space_free_tempdir("http-land-");
+        let container = crate::git_exec::testkit::space_free_tempdir("http-land-");
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         // Not `master`, on purpose — see the doc comment. The main checkout is left standing HERE
         // for the whole test, never on the declared branch, which is what proves the target came
         // from the column and not from this checkout's HEAD.
@@ -16823,9 +16487,9 @@ mod tests {
     #[tokio::test]
     async fn a_named_target_reaches_the_queued_row_and_an_undeclared_one_is_refused() {
         let (state, _db) = file_test_state().await;
-        let container = crate::git_exec::tests::space_free_tempdir("http-land-named-");
+        let container = crate::git_exec::testkit::space_free_tempdir("http-land-named-");
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         // Same shape as the test above — the main checkout stands on `trunk` and stays there —
         // with one addition: `release`, a second destination this project admits.
         assert!(git_in(&repo, &["checkout", "-q", "-b", "trunk"]));
@@ -16919,9 +16583,9 @@ mod tests {
     #[tokio::test]
     async fn an_empty_target_is_the_integration_branch_and_not_a_refusal() {
         let (state, _db) = file_test_state().await;
-        let container = crate::git_exec::tests::space_free_tempdir("http-land-empty-");
+        let container = crate::git_exec::testkit::space_free_tempdir("http-land-empty-");
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         assert!(git_in(&repo, &["checkout", "-q", "-b", "trunk"]));
         assert!(git_in(&repo, &["branch", "feature"]));
         let worktree = container.path().join("wt");
@@ -17002,7 +16666,7 @@ mod tests {
     async fn a_vcs_request_submitted_over_http_is_readable_as_a_ticket() {
         let (state, db) = file_test_state().await;
         let (_container, repo) =
-            crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-http-vcs-");
+            crate::git_exec::testkit::repo_with_a_branch_to_merge("nucleos-http-vcs-");
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
              VALUES ('alpha', 'active', ?)",
@@ -17192,7 +16856,7 @@ mod tests {
     async fn a_dashed_branch_in_the_request_body_is_refused_and_queues_nothing() {
         let (state, db) = file_test_state().await;
         let (_container, repo) =
-            crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-http-vcs-dashed-");
+            crate::git_exec::testkit::repo_with_a_branch_to_merge("nucleos-http-vcs-dashed-");
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
              VALUES ('alpha', 'active', ?)",
@@ -17843,8 +17507,8 @@ mod tests {
 
     /// A repository on the roster, and the checkout a controller would stand in.
     async fn rostered_checkout(state: &AppState) -> tempfile::TempDir {
-        let dir = crate::git_exec::tests::space_free_tempdir("nucleos-wave-");
-        crate::git_exec::tests::initialize_repo(dir.path());
+        let dir = crate::git_exec::testkit::space_free_tempdir("nucleos-wave-");
+        crate::git_exec::testkit::initialize_repo(dir.path());
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'shadow', ?)",
         )
@@ -17897,8 +17561,8 @@ mod tests {
     #[tokio::test]
     async fn a_wave_outside_every_rostered_repository_finds_no_authority() {
         let state = test_state().await;
-        let stranger = crate::git_exec::tests::space_free_tempdir("nucleos-wave-");
-        crate::git_exec::tests::initialize_repo(stranger.path());
+        let stranger = crate::git_exec::testkit::space_free_tempdir("nucleos-wave-");
+        crate::git_exec::testkit::initialize_repo(stranger.path());
 
         let response = api_token_request(
             state,
@@ -18780,13 +18444,13 @@ mod tests {
             ("decline-action", Some("explain")),
             ("reject", None),
         ] {
-            let (state, _runner) = crate::runs::tests::test_state_with_runner(
+            let (state, _runner) = crate::runs::testkit::test_state_with_runner(
                 Some(std::time::Duration::from_secs(5)),
                 std::time::Duration::from_secs(600),
             )
             .await;
             let (proposal_id, _branch, _container) =
-                crate::runs::tests::seed_real_worktree_approval(
+                crate::runs::testkit::seed_real_worktree_approval(
                     &state,
                     "cargo test --workspace | tee t.log",
                 )
@@ -29302,7 +28966,7 @@ mod tests {
     async fn a_worktree_whose_main_is_not_a_known_project_is_not_offered_the_workflow() {
         let state = test_state().await;
         let (_container, main, wt) =
-            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+            crate::autopilot::testkit::repo_with_an_unseeded_worktree("nucleos-seed-", true);
         std::fs::write(
             main.join(".ai/scripts/seed_worktree.py"),
             "import sys\nfrom pathlib import Path\nPath(sys.argv[1], 'ran.marker').write_text('ran')\n",
@@ -29330,7 +28994,7 @@ mod tests {
     async fn a_failing_seed_script_answers_a_failure_and_the_workflow_stays_missing() {
         let state = test_state().await;
         let (_container, main, wt) =
-            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+            crate::autopilot::testkit::repo_with_an_unseeded_worktree("nucleos-seed-", true);
         std::fs::write(
             main.join(".ai/scripts/seed_worktree.py"),
             "import sys\nsys.exit(3)\n",
@@ -29357,7 +29021,7 @@ mod tests {
     async fn a_conversation_in_an_unseeded_worktree_is_told_its_workflow_is_missing() {
         let state = test_state().await;
         let (_container, main, wt) =
-            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+            crate::autopilot::testkit::repo_with_an_unseeded_worktree("nucleos-seed-", true);
         roster_main_of(&state, &wt).await;
         let in_worktree = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
@@ -29386,7 +29050,7 @@ mod tests {
     async fn seeding_the_workflow_refuses_without_confirmation() {
         let state = test_state().await;
         let (_container, _main, wt) =
-            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+            crate::autopilot::testkit::repo_with_an_unseeded_worktree("nucleos-seed-", true);
         let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
@@ -29407,7 +29071,7 @@ mod tests {
      {
         let state = test_state().await;
         let (_container, main, _wt) =
-            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+            crate::autopilot::testkit::repo_with_an_unseeded_worktree("nucleos-seed-", true);
         let in_main = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
@@ -29421,7 +29085,7 @@ mod tests {
         );
 
         let (_bare_container, _bare_main, bare_wt) =
-            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", false);
+            crate::autopilot::testkit::repo_with_an_unseeded_worktree("nucleos-seed-", false);
         roster_main_of(&state, &bare_wt).await;
         let in_bare = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
@@ -29444,7 +29108,7 @@ mod tests {
     {
         let state = test_state().await;
         let (_container, _main, wt) =
-            crate::autopilot::tests::repo_with_an_unseeded_worktree("nucleos-seed-", true);
+            crate::autopilot::testkit::repo_with_an_unseeded_worktree("nucleos-seed-", true);
         roster_main_of(&state, &wt).await;
         let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
@@ -38717,5 +38381,149 @@ mod tests {
         let (status, body) = workflow_call(state, "GET", "/distill/causes", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!([]));
+    }
+}
+
+/// The hook-barrier tests that need the real router. They lived in `triage.rs` beside the check they
+/// exercise; the router is the binary's since the core split, and the library cannot reach it.
+#[cfg(test)]
+mod triage_barrier_tests {
+    use super::build_router;
+    use crate::triage::{
+        BarrierError, ensure_sandbox, interpret_barrier_probe, probe_hook, verify_hook_barrier,
+    };
+
+    async fn test_state() -> crate::state::AppState {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::state::AppState {
+            token: crate::auth::Token("verification-token".into()),
+            pool,
+            telegram_doctrine: None,
+            runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
+            run_handles: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            run_messages: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            files_root: None,
+            files_trash: None,
+            workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
+            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
+            run_tails: Default::default(),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        }
+    }
+
+    /// Serves `router` on an ephemeral port and returns its base URL. The port is the injection
+    /// point that makes the negative cases expressible.
+    async fn serve(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn the_barrier_verifies_against_the_real_router() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_sandbox(dir.path()).unwrap();
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let url = serve(build_router(state)).await;
+
+        assert_eq!(
+            verify_hook_barrier(&pool, dir.path(), &url, "verification-token").await,
+            Ok(())
+        );
+    }
+
+    /// The verification's own bookkeeping: it must not leave the row it invented behind, or every
+    /// restart adds one to a table the triage loop counts over.
+    #[tokio::test]
+    async fn verification_leaves_no_row_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_sandbox(dir.path()).unwrap();
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let url = serve(build_router(state)).await;
+
+        verify_hook_barrier(&pool, dir.path(), &url, "verification-token")
+            .await
+            .unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[tokio::test]
+    async fn a_probe_without_a_run_id_fails_the_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_sandbox(dir.path()).unwrap();
+        let state = test_state().await;
+        let url = serve(build_router(state)).await;
+
+        let probe = probe_hook(
+            dir.path(),
+            &[
+                ("NUCLEOS_DAEMON_URL", url),
+                ("NUCLEOS_DAEMON_TOKEN", "verification-token".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            interpret_barrier_probe(&probe),
+            Err(BarrierError::NoOpinion)
+        );
+    }
+
+    /// An id no run carries falls through to `mode = "real"`, where the classifier ALLOWS `Read`.
+    /// So a verification that forgot to insert its row would be testing the classifier, not the
+    /// barrier — and would fail for a reason that has nothing to do with the hook.
+    #[tokio::test]
+    async fn a_probe_naming_an_unknown_run_fails_the_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_sandbox(dir.path()).unwrap();
+        let state = test_state().await;
+        let url = serve(build_router(state)).await;
+
+        let probe = probe_hook(
+            dir.path(),
+            &[
+                ("NUCLEOS_RUN_ID", "424242".to_string()),
+                ("NUCLEOS_DAEMON_URL", url),
+                ("NUCLEOS_DAEMON_TOKEN", "verification-token".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            interpret_barrier_probe(&probe),
+            Err(BarrierError::NotBlocked)
+        );
     }
 }

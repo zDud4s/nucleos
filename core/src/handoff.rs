@@ -6,7 +6,7 @@
 /// The run hands off once four fifths of the model's context window is occupied.
 const HANDOFF_THRESHOLD_FRACTION: (i64, i64) = (4, 5);
 
-pub(crate) fn should_hand_off(fill: i64, context_limit: i64, already_handed_off: bool) -> bool {
+pub fn should_hand_off(fill: i64, context_limit: i64, already_handed_off: bool) -> bool {
     if already_handed_off || context_limit <= 0 {
         return false;
     }
@@ -15,7 +15,7 @@ pub(crate) fn should_hand_off(fill: i64, context_limit: i64, already_handed_off:
     fill.saturating_mul(denominator) >= context_limit.saturating_mul(numerator)
 }
 
-pub(crate) async fn record_handoff(
+pub async fn record_handoff(
     pool: &sqlx::SqlitePool,
     run_id: i64,
     successor_run_id: i64,

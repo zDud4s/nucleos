@@ -460,7 +460,7 @@ pub fn chunk_transcript(text: &str, budget: usize) -> Vec<String> {
 /// byte-arithmetic version of this would panic on the first accented word.
 /// `pub(crate)` so `speak.rs` cuts an over-long answer with the SAME logic that cuts an over-long
 /// transcript. Two implementations of one cut is how the two come to disagree about where a word ends.
-pub(crate) fn split_oversized(sentence: &str, budget: usize) -> Vec<&str> {
+pub fn split_oversized(sentence: &str, budget: usize) -> Vec<&str> {
     if sentence.chars().count() <= budget {
         return vec![sentence];
     }
@@ -1030,7 +1030,7 @@ pub async fn post_capture(
     // A dictation is the opposite. Nobody wants the transcript of an utterance they walked away from,
     // and letting it die with its request stops paying a model for an answer with nowhere to go.
     let outcome = match query.kind {
-        Kind::Memo => match crate::http::uncancellable(work).await {
+        Kind::Memo => match crate::door::uncancellable(work).await {
             Ok(outcome) => outcome,
             Err(status) => return status.into_response(),
         },
@@ -1859,7 +1859,7 @@ mod tests {
             Duration::from_secs(3),
         );
         assert!(
-            tokio::time::timeout(abandon, crate::http::uncancellable(memo))
+            tokio::time::timeout(abandon, crate::door::uncancellable(memo))
                 .await
                 .is_err(),
             "the request must be gone before transcription could finish"

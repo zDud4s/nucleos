@@ -604,7 +604,7 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
 
 /// The hook script that makes a project's tool calls reach this daemon. Written with forward
 /// slashes because it is compared against a JSON command string, where that is the spelling.
-pub(crate) const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
+pub const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
 
 /// This daemon's classifier hook, carried inside the binary so it can be installed anywhere.
 ///
@@ -631,7 +631,7 @@ const HOOK_SOURCE: &str = include_str!("../hooks/ask_daemon.py");
 /// `python` on Windows and NOT `python3`: on a default install `python3` is the Microsoft Store's
 /// App Execution Alias, which opens the Store instead of running the script — the same hole from
 /// the other side. Existing entries are recognised by script path, so changing this orphans none.
-pub(crate) const HOOK_INTERPRETER: &str = if cfg!(windows) { "python" } else { "python3" };
+pub const HOOK_INTERPRETER: &str = if cfg!(windows) { "python" } else { "python3" };
 
 /// How the hook is registered, spelled exactly as `classifier_hook_is_wired` looks for it.
 ///
@@ -704,13 +704,13 @@ fn wire_event(
 /// Nothing is written until the existing settings have been read AND parsed. A file this cannot
 /// understand is somebody's work in progress, or a version of the CLI this daemon has never seen,
 /// and the cost of guessing at it is settings nobody asked to lose.
-pub(crate) fn wire_classifier_hook(dir: &Path) -> Result<(), String> {
+pub fn wire_classifier_hook(dir: &Path) -> Result<(), String> {
     wire_hook(dir, true)
 }
 
 /// Like `wire_classifier_hook`, but a hook script already present in `dir` is left as it is:
 /// a provisioned worktree may check out a script the project tracks, and that copy wins.
-pub(crate) fn wire_classifier_hook_keeping_script(dir: &Path) -> Result<(), String> {
+pub fn wire_classifier_hook_keeping_script(dir: &Path) -> Result<(), String> {
     wire_hook(dir, false)
 }
 
@@ -795,7 +795,7 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
 /// already wired before this pair existed, refusing activation to a project whose actual barrier
 /// is intact until its `.claude/settings.json` happens to be rewritten. Do not "complete" this
 /// check without re-reading this paragraph first.
-pub(crate) fn classifier_hook_is_wired(dir: &Path) -> bool {
+pub fn classifier_hook_is_wired(dir: &Path) -> bool {
     let Ok(settings) = std::fs::read_to_string(dir.join(".claude/settings.json")) else {
         return false;
     };
@@ -858,7 +858,7 @@ fn fold(path: &Path) -> std::path::PathBuf {
 /// its git dir, whose `commondir` names the shared one, and that one's parent is the main checkout.
 /// No git process, so it is cheap enough for every project read. `None` for a main checkout (its
 /// `.git` is a directory), a plain directory, or anything unreadable.
-pub(crate) fn main_checkout_of(dir: &Path) -> Option<std::path::PathBuf> {
+pub fn main_checkout_of(dir: &Path) -> Option<std::path::PathBuf> {
     let link = std::fs::read_to_string(dir.join(".git")).ok()?;
     let gitdir = dir.join(link.lines().next()?.strip_prefix("gitdir:")?.trim());
     let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
@@ -876,7 +876,7 @@ fn seeds_from(main: &Path) -> bool {
 }
 
 /// The roots of the projects this daemon knows: every `autopilot_state` row that carries one.
-pub(crate) async fn rostered_roots(pool: &SqlitePool) -> sqlx::Result<Vec<std::path::PathBuf>> {
+pub async fn rostered_roots(pool: &SqlitePool) -> sqlx::Result<Vec<std::path::PathBuf>> {
     let roots = sqlx::query_scalar::<_, String>(
         "SELECT project_root FROM autopilot_state WHERE project_root IS NOT NULL",
     )
@@ -904,7 +904,7 @@ fn is_rostered(main: &Path, roots: &[std::path::PathBuf]) -> bool {
 /// Whether `dir` is a linked worktree the workflow was never copied into, while its main checkout
 /// (a rostered project) has it. False elsewhere: offering a setup that has nothing to copy would be
 /// a button that fails.
-pub(crate) fn workflow_missing(dir: &Path, roots: &[std::path::PathBuf]) -> bool {
+pub fn workflow_missing(dir: &Path, roots: &[std::path::PathBuf]) -> bool {
     main_checkout_of(dir).is_some_and(|main| {
         is_rostered(&main, roots) && seeds_from(&main) && !carries_workflow(dir)
     })
@@ -912,7 +912,7 @@ pub(crate) fn workflow_missing(dir: &Path, roots: &[std::path::PathBuf]) -> bool
 
 /// Why `seed_workflow` wrote nothing.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum SeedRefusal {
+pub enum SeedRefusal {
     NotAWorktree,
     NoWorkflowInMain,
     /// The worktree's main checkout is not a project the daemon knows, so its script is not run.
@@ -926,10 +926,7 @@ pub(crate) enum SeedRefusal {
 /// wires the classifier hook: the script does not copy `.claude/settings.json`, and without the
 /// hook the conversation would still have no tools. `dir` is used exactly as given, never
 /// canonicalised.
-pub(crate) async fn seed_workflow(
-    dir: &Path,
-    roots: &[std::path::PathBuf],
-) -> Result<(), SeedRefusal> {
+pub async fn seed_workflow(dir: &Path, roots: &[std::path::PathBuf]) -> Result<(), SeedRefusal> {
     // Blocking file reads, kept off the async runtime.
     let (probe_dir, probe_roots) = (dir.to_path_buf(), roots.to_vec());
     let main = tokio::task::spawn_blocking(move || {
@@ -1066,8 +1063,59 @@ pub async fn list_scoped_kills(pool: &SqlitePool) -> sqlx::Result<Vec<ScopedKill
         .collect())
 }
 
+/// Fixtures the test module below uses and the binary's tests (`http.rs`) reach for too —
+/// lifted out of `mod tests` by the lib/bin split so the `testkit` feature can expose them.
+#[cfg(any(test, feature = "testkit"))]
+#[allow(unused_imports)]
+pub mod testkit {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// A stand-in for the main checkout's `seed_worktree.py`: copies the two workflow entries the
+    /// detection looks for. The real script is gitignored and lives only in the main checkout, so a
+    /// test repository cannot carry it; what matters here is that the daemon INVOKES the script
+    /// that sits beside the repository, with the worktree as its one argument.
+    pub const STUB_SEED: &str = "import shutil, sys\nfrom pathlib import Path\nroot = Path(__file__).resolve().parents[2]\ntarget = Path(sys.argv[1])\nfor entry in (\".ai/workflow\", \".claude/skills\"):\n    shutil.copytree(root / entry, target / entry, dirs_exist_ok=True)\n";
+
+    /// A real repository with a real linked worktree named `wt` that was never seeded. With
+    /// `workflow` the main checkout holds the (untracked, as in reality) workflow and the stub
+    /// script. Returns `(container, main, wt)`; keep `container` alive for the test's duration.
+    pub fn repo_with_an_unseeded_worktree(
+        prefix: &str,
+        workflow: bool,
+    ) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let container = crate::git_exec::testkit::space_free_tempdir(prefix);
+        let main = container.path().join("main");
+        crate::git_exec::testkit::initialize_repo(&main);
+        if workflow {
+            fs::create_dir_all(main.join(".ai/workflow")).unwrap();
+            fs::write(main.join(".ai/workflow/workflow.md"), "# workflow\n").unwrap();
+            fs::create_dir_all(main.join(".claude/skills/orchestrate")).unwrap();
+            fs::write(
+                main.join(".claude/skills/orchestrate/SKILL.md"),
+                "# orchestrate\n",
+            )
+            .unwrap();
+            fs::create_dir_all(main.join(".ai/scripts")).unwrap();
+            fs::write(main.join(".ai/scripts/seed_worktree.py"), STUB_SEED).unwrap();
+        }
+        let wt = container.path().join("wt");
+        let added = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", "-b", "wt"])
+            .arg(&wt)
+            .status()
+            .expect("run git worktree add");
+        assert!(added.success(), "git worktree add failed");
+        (container, main, wt)
+    }
+}
+
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
+    pub use super::testkit::*;
     use super::*;
 
     /// The script the daemon SHIPS knows the verdict the daemon GIVES.
@@ -1092,46 +1140,6 @@ pub(crate) mod tests {
     }
     use std::fs;
     use tempfile::TempDir;
-
-    /// A stand-in for the main checkout's `seed_worktree.py`: copies the two workflow entries the
-    /// detection looks for. The real script is gitignored and lives only in the main checkout, so a
-    /// test repository cannot carry it; what matters here is that the daemon INVOKES the script
-    /// that sits beside the repository, with the worktree as its one argument.
-    pub(crate) const STUB_SEED: &str = "import shutil, sys\nfrom pathlib import Path\nroot = Path(__file__).resolve().parents[2]\ntarget = Path(sys.argv[1])\nfor entry in (\".ai/workflow\", \".claude/skills\"):\n    shutil.copytree(root / entry, target / entry, dirs_exist_ok=True)\n";
-
-    /// A real repository with a real linked worktree named `wt` that was never seeded. With
-    /// `workflow` the main checkout holds the (untracked, as in reality) workflow and the stub
-    /// script. Returns `(container, main, wt)`; keep `container` alive for the test's duration.
-    pub(crate) fn repo_with_an_unseeded_worktree(
-        prefix: &str,
-        workflow: bool,
-    ) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
-        let container = crate::git_exec::tests::space_free_tempdir(prefix);
-        let main = container.path().join("main");
-        crate::git_exec::tests::initialize_repo(&main);
-        if workflow {
-            fs::create_dir_all(main.join(".ai/workflow")).unwrap();
-            fs::write(main.join(".ai/workflow/workflow.md"), "# workflow\n").unwrap();
-            fs::create_dir_all(main.join(".claude/skills/orchestrate")).unwrap();
-            fs::write(
-                main.join(".claude/skills/orchestrate/SKILL.md"),
-                "# orchestrate\n",
-            )
-            .unwrap();
-            fs::create_dir_all(main.join(".ai/scripts")).unwrap();
-            fs::write(main.join(".ai/scripts/seed_worktree.py"), STUB_SEED).unwrap();
-        }
-        let wt = container.path().join("wt");
-        let added = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&main)
-            .args(["worktree", "add", "-b", "wt"])
-            .arg(&wt)
-            .status()
-            .expect("run git worktree add");
-        assert!(added.success(), "git worktree add failed");
-        (container, main, wt)
-    }
 
     /// An unseeded linked worktree is the one case "Set up workflow" answers: its own tree has no
     /// workflow, and the main checkout it hangs off does. The main checkout itself, a seeded

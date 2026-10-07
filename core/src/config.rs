@@ -728,7 +728,8 @@ pub const MODELS_CONFIG_DISPLAY_PATH: &str = "~/.nucleos/nucleos-models.yaml";
 /// Resolving it now would hand those tests whatever this machine's owner has configured — a local
 /// model in one place, none in another — and a unit test must not read a real `~/.nucleos`.
 pub fn models_config_path() -> Option<std::path::PathBuf> {
-    if cfg!(test) {
+    // `testkit` too: the binary's tests (`http.rs`) build this library without `cfg(test)`.
+    if cfg!(any(test, feature = "testkit")) {
         return None;
     }
     crate::machine_config::root().map(|root| root.join(MODELS_CONFIG_FILE))
