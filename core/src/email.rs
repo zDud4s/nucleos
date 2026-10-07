@@ -740,7 +740,7 @@ mod tests {
     /// aimed at a non-existent `emails.id` for over a week, and no test could fail on it because no
     /// test had the constraint switched on. Matching production here is what lets the regression
     /// test underneath actually regress.
-    pub(crate) async fn test_pool() -> sqlx::SqlitePool {
+    pub async fn test_pool() -> sqlx::SqlitePool {
         // The URL form, not `SqliteConnectOptions::new().filename(":memory:")`. The two are not the
         // same database: built from the filename, every connection in the pool gets a private
         // in-memory database of its own, so the migrations run on one connection and the next query
@@ -749,7 +749,7 @@ mod tests {
         let pool = sqlx::SqlitePool::connect_with(options.foreign_keys(true))
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 

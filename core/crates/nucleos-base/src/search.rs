@@ -23,7 +23,7 @@
 ///
 /// Returns an empty string for input with no searchable words. Callers must treat that as "no FTS
 /// clause" rather than passing it to `MATCH`, which errors on an empty query.
-pub(crate) fn fts_query(raw: &str) -> String {
+pub fn fts_query(raw: &str) -> String {
     raw.split_whitespace()
         .map(|term| term.replace('"', ""))
         .filter(|term| !term.is_empty())
@@ -40,7 +40,7 @@ pub(crate) fn fts_query(raw: &str) -> String {
 ///
 /// The same shape as `fts_query` and here for the same reason: it existed twice, in `runs.rs` and
 /// `feed.rs`, and a third caller made that two copies too many.
-pub(crate) fn escape_like(query: &str) -> String {
+pub fn escape_like(query: &str) -> String {
     query
         .replace('\\', "\\\\")
         .replace('%', "\\%")

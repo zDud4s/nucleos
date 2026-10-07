@@ -1,148 +1,6 @@
-mod agent;
-mod assistant;
-mod assistants;
-mod attention;
-mod auth;
-mod autopilot;
-mod autostart;
-mod backup;
-mod brief;
-mod browser;
-mod browser_client;
-mod browser_live;
-mod browser_policy;
-mod browser_seat;
-mod browser_wheel;
-mod budget;
-mod calendar;
-mod capabilities;
-mod chat_groups;
-mod chat_notices;
-mod chat_tasks;
-mod chats;
-mod classifier;
-mod collision;
-mod command_reader;
-mod commands;
-mod concurrency;
-mod config;
-mod consolidate;
-mod contacts;
-mod council;
-mod daemon_client;
-mod detect;
-mod devtime;
-mod devtime_lanes;
-mod devtime_map;
-mod devtime_parse;
-mod devtime_store;
-mod distill;
-mod email;
-mod exclusion;
-mod feed;
-mod files;
-mod gate;
-mod git_exec;
-mod github;
-mod handoff;
-mod health;
-mod hooks;
 mod http;
-mod inspect;
-mod job;
-mod join;
-mod judge;
-mod knowledge;
-mod land;
-mod local_agent;
-mod logging;
-mod machine_config;
-mod mailsend;
-mod map_anchor;
-mod map_intent;
-mod map_items;
-mod map_join;
-mod map_orphan;
-mod map_recency;
-mod map_seam;
-mod map_stamp;
-mod map_store;
-mod map_triage;
-mod mcp_tools;
-mod mentions;
-mod model_catalog;
-mod notes;
-mod notify;
-mod notify_policy;
-mod onboarding;
-mod openai_compatible;
-mod owner_notes;
-mod ownership;
-mod pii_shadow;
-mod presets;
-mod pressure;
-mod priority;
-mod process_tree;
-mod project_commands;
-mod project_exit;
-mod project_map;
-mod project_policy;
-mod project_readings;
-mod project_state;
-mod prompt_budget;
-mod proposals;
-mod quota;
-mod quota_client;
-mod recurrence;
-mod redact;
-mod relay;
-mod repo_trigger;
-mod resolver;
-mod route_advice;
-mod route_report;
-mod router_client;
-mod run_stop;
-mod runner;
-mod runs;
-mod scheduler;
-mod search;
-mod seat_advice;
-mod secrets;
-mod seed;
-mod sessions;
-mod shadow;
-mod sidecar;
-mod speak;
-mod speed;
-mod state;
-mod storage;
-mod team;
-mod team_notes;
-mod team_trigger;
-mod test_select;
-#[cfg(test)]
-mod testdb;
-mod tests_map;
-mod token_efficiency;
-mod transcribe;
-mod triage;
-mod trust;
-mod vcs;
-mod verify_exec;
-mod verify_runs;
-mod verify_sched;
-mod voice;
-mod warm;
-mod wave;
-mod web;
-mod web_client;
-mod webhook;
-mod wip;
-mod workflow_graph;
-mod workflow_materialize;
-mod workflow_package;
-mod workflows;
-mod worktree;
+
+use nucleos_core::*;
 
 use auth::Token;
 use state::AppState;
@@ -1063,7 +921,10 @@ async fn main() {
     // turns marked `interrupted` above. Best effort: a stale task row must not stop the daemon.
     match chat_tasks::orphan_running(&pool).await {
         Ok(0) => {}
-        Ok(orphaned) => tracing::warn!(orphaned, "chat tasks left running by a restart -> 'orphaned'"),
+        Ok(orphaned) => tracing::warn!(
+            orphaned,
+            "chat tasks left running by a restart -> 'orphaned'"
+        ),
         Err(error) => tracing::warn!(%error, "could not mark chat tasks left running"),
     }
 
@@ -1220,6 +1081,10 @@ async fn main() {
             );
             config::ModelsConfig::default()
         });
+    embed::install(Arc::new(embed::OllamaEmbedder::new(
+        runner::OLLAMA_BASE_URL.to_string(),
+        models_config.embedding_model.clone(),
+    )));
     let (triage_runner, local_triage_disabled): (
         Option<Arc<dyn runner::CommandRunner>>,
         Option<String>,

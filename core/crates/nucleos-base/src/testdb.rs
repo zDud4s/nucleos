@@ -9,7 +9,82 @@
 //! to need them move them somewhere neutral rather than copy them. `0129`'s backfill is the second
 //! module; this is that somewhere.
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteOwnedBuf, SqlitePoolOptions};
+use tokio::sync::OnceCell;
+
+static MIGRATED_SCHEMA: OnceCell<Vec<u8>> = OnceCell::const_new();
+
+/// A fresh, isolated in-memory database with the current schema.
+///
+/// The migrator runs once per test process. Each caller receives a separate writable
+/// SQLite allocation, including its own copy of `_sqlx_migrations`.
+pub async fn fresh_pool() -> sqlx::SqlitePool {
+    let schema = MIGRATED_SCHEMA
+        .get_or_init(|| async {
+            let pool = empty_memory_pool().await;
+            crate::storage::MIGRATOR.run(&pool).await.unwrap();
+            let mut connection = pool.acquire().await.unwrap();
+            let bytes = connection.serialize(None).await.unwrap().to_vec();
+            drop(connection);
+            pool.close().await;
+            bytes
+        })
+        .await;
+
+    let pool = empty_memory_pool().await;
+    let mut connection = pool.acquire().await.unwrap();
+    connection
+        .deserialize(
+            None,
+            SqliteOwnedBuf::try_from(schema.as_slice()).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+    drop(connection);
+    pool
+}
+
+async fn empty_memory_pool() -> sqlx::SqlitePool {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(":memory:")
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap()
+}
+
+#[cfg(test)]
+mod fresh_pool_tests {
+    #[tokio::test]
+    async fn fresh_pools_have_the_full_schema_and_do_not_share_rows() {
+        let first = super::fresh_pool().await;
+        let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&first)
+            .await
+            .unwrap();
+        assert_eq!(migrations as usize, crate::storage::MIGRATOR.iter().count());
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at) VALUES ('only-first', 'running', 'now')",
+        )
+        .execute(&first)
+        .await
+        .unwrap();
+
+        let second = super::fresh_pool().await;
+        let copied: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE prompt = 'only-first'")
+                .fetch_one(&second)
+                .await
+                .unwrap();
+        assert_eq!(copied, 0);
+        first.close().await;
+        second.close().await;
+    }
+}
 
 /// A database with every migration up to and including `version` applied, and none after.
 ///
@@ -17,7 +92,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 /// from what ships: the SQL is the SQL that will run on the real database, in the order it will
 /// run there. Nothing is written to `_sqlx_migrations` — the bookkeeping is not what is under
 /// test, and a caller finishes the chain with `apply_migrations_after`.
-pub(crate) async fn pool_migrated_through(version: i64) -> sqlx::SqlitePool {
+pub async fn pool_migrated_through(version: i64) -> sqlx::SqlitePool {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
@@ -32,18 +107,18 @@ pub(crate) async fn pool_migrated_through(version: i64) -> sqlx::SqlitePool {
 }
 
 /// Finishes the chain a `pool_migrated_through` stopped, running everything above `version`.
-pub(crate) async fn apply_migrations_after(pool: &sqlx::SqlitePool, version: i64) {
+pub async fn apply_migrations_after(pool: &sqlx::SqlitePool, version: i64) {
     apply_migrations(pool, |candidate| candidate > version).await;
 }
 
 /// Runs exactly one migration, for a test whose claim is about that file alone and must not see
 /// what later migrations add on top of it.
-pub(crate) async fn apply_migration(pool: &sqlx::SqlitePool, version: i64) {
+pub async fn apply_migration(pool: &sqlx::SqlitePool, version: i64) {
     apply_migrations(pool, |candidate| candidate == version).await;
 }
 
 async fn apply_migrations(pool: &sqlx::SqlitePool, wanted: impl Fn(i64) -> bool) {
-    for migration in sqlx::migrate!("./migrations").iter() {
+    for migration in crate::storage::MIGRATOR.iter() {
         if !wanted(migration.version) {
             continue;
         }
@@ -66,7 +141,7 @@ async fn apply_migrations(pool: &sqlx::SqlitePool, wanted: impl Fn(i64) -> bool)
 #[test]
 fn no_two_migrations_share_a_version() {
     let mut seen = std::collections::BTreeMap::new();
-    for migration in sqlx::migrate!("./migrations").iter() {
+    for migration in crate::storage::MIGRATOR.iter() {
         if let Some(first) = seen.insert(migration.version, migration.description.clone()) {
             panic!(
                 "migrations '{first}' and '{}' both carry version {} — renumber the one the \

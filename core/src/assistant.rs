@@ -185,7 +185,7 @@ pub enum SaidNow {
 /// Something said while a turn was running, kept because the CLI folds it into the turn and the
 /// stream never shows it as typed.
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
-pub(crate) struct SaidDuring {
+pub struct SaidDuring {
     #[serde(skip)]
     pub run_id: i64,
     pub text: String,
@@ -193,7 +193,7 @@ pub(crate) struct SaidDuring {
 }
 
 /// Everything said into a chat's turns, oldest first.
-pub(crate) async fn said_during(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<SaidDuring>> {
+pub async fn said_during(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<SaidDuring>> {
     sqlx::query_as::<_, SaidDuring>(
         "SELECT run_id, text, created_at FROM chat_said_now WHERE chat_id = ? ORDER BY id",
     )
@@ -282,9 +282,9 @@ const LIVE_CAP: usize = 5;
 /// The cap `keep_live` enforces. Unbounded under test: `LIVE_CHATS` is one static shared by every
 /// test running in parallel, and a real cap there would evict other tests' processes. `make_room`
 /// is tested directly with `LIVE_CAP`.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testkit")))]
 const ENFORCED_CAP: usize = LIVE_CAP;
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 const ENFORCED_CAP: usize = usize::MAX;
 
 /// Every `LiveChat` alive, in `LIVE_CHATS` or in a turn's hands. Held by [`LiveCount`].
@@ -389,10 +389,75 @@ impl Drop for LiveChat {
         if let Ok(mut ended) = ENDED_TASKS.lock() {
             ended.remove(&self.process_key());
         }
-        if let Ok(mut barriers) = PROCESS_BARRIERS.lock() {
-            barriers.remove(&self.process_key());
+        let ended = PROCESS_BARRIERS
+            .lock()
+            .ok()
+            .and_then(|mut held| held.remove(&self.process_key()));
+        if let Some(ended) = ended {
+            stop_tasks_of(ended);
         }
     }
+}
+
+/// Closes what a dropped process's turns launched. Spawned because `Drop` cannot await; with no
+/// runtime (daemon shutting down) startup's `chat_tasks::orphan_running` closes them instead.
+fn stop_tasks_of(ended: ProcessBarrier) {
+    let ProcessBarrier {
+        chat_id,
+        served,
+        pool,
+        ..
+    } = ended;
+    let (Some(pool), Ok(runtime)) = (pool, tokio::runtime::Handle::try_current()) else {
+        return;
+    };
+    runtime.spawn(async move {
+        if let Err(error) = crate::chat_tasks::stop_launched_by(&pool, &chat_id, &served).await {
+            tracing::warn!(chat_id = %chat_id, %error, "could not close the tasks of a conversation's ended process");
+        }
+    });
+}
+
+/// Whether a kept process of `chat_id`, alive now, served run `run_id`. This, not the
+/// `chat_tasks` row, is what lets a task act after its turn: a row can be written `running` after
+/// its process is gone.
+pub(crate) fn live_process_served(chat_id: &str, run_id: i64) -> bool {
+    PROCESS_BARRIERS.lock().is_ok_and(|held| {
+        held.values()
+            .any(|p| p.chat_id == chat_id && p.served.contains(&run_id))
+    })
+}
+
+/// Test-only stand-in for a kept process that served `run_id`; dropping it ends the vouching.
+#[cfg(test)]
+pub(crate) struct HeldProcess(usize);
+
+#[cfg(test)]
+impl Drop for HeldProcess {
+    fn drop(&mut self) {
+        if let Ok(mut held) = PROCESS_BARRIERS.lock() {
+            held.remove(&self.0);
+        }
+    }
+}
+
+/// Keys are odd, so they never equal a real (aligned) `process_key`.
+#[cfg(test)]
+pub(crate) fn hold_process_serving(chat_id: &str, run_id: i64) -> HeldProcess {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    let key = NEXT.fetch_add(2, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut held) = PROCESS_BARRIERS.lock() {
+        held.insert(
+            key,
+            ProcessBarrier {
+                mode: "auto",
+                served: vec![run_id],
+                chat_id: chat_id.to_owned(),
+                pool: None,
+            },
+        );
+    }
+    HeldProcess(key)
 }
 
 /// What the turns a kept process has served say about the barrier it runs under.
@@ -405,6 +470,10 @@ impl Drop for LiveChat {
 struct ProcessBarrier {
     mode: &'static str,
     served: Vec<i64>,
+    /// The conversation this process belongs to.
+    chat_id: String,
+    /// To close its tasks when it ends. `None` only for the test holder.
+    pool: Option<SqlitePool>,
 }
 
 /// Barriers of the kept processes, by `LiveChat::process_key`. Cleared by `LiveChat`'s `Drop`.
@@ -413,11 +482,13 @@ static PROCESS_BARRIERS: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 /// Records that the process behind `key` served run `run_id` under `mode`.
-fn note_served(key: usize, run_id: i64, mode: &'static str) {
+fn note_served(key: usize, chat_id: &str, run_id: i64, mode: &'static str, pool: &SqlitePool) {
     if let Ok(mut barriers) = PROCESS_BARRIERS.lock() {
         let entry = barriers.entry(key).or_insert_with(|| ProcessBarrier {
             mode,
             served: Vec::new(),
+            chat_id: chat_id.to_owned(),
+            pool: Some(pool.clone()),
         });
         entry.mode = mode;
         entry.served.push(run_id);
@@ -425,10 +496,10 @@ fn note_served(key: usize, run_id: i64, mode: &'static str) {
 }
 
 /// `note_served` for the process a conversation has kept, if it kept one.
-fn note_served_by_kept(chat_id: &str, run_id: i64, mode: &'static str) {
+fn note_served_by_kept(chat_id: &str, run_id: i64, mode: &'static str, pool: &SqlitePool) {
     let kept = LIVE_CHATS.lock().unwrap();
     if let Some(live) = kept.get(chat_id) {
-        note_served(live.process_key(), run_id, mode);
+        note_served(live.process_key(), chat_id, run_id, mode, pool);
     }
 }
 
@@ -704,12 +775,12 @@ fn make_room(
 
 /// Whether a turn runs with the user's ambient MCP servers: only when the conversation opted in
 /// and the turn is not restricted to NucleOS's own tools.
-pub(crate) fn ambient_mcp_for(policy: crate::runner::ToolPolicy, opted_in: bool) -> bool {
+pub fn ambient_mcp_for(policy: crate::runner::ToolPolicy, opted_in: bool) -> bool {
     opted_in && policy == crate::runner::ToolPolicy::Unrestricted
 }
 
 /// Stops a conversation's process for good, if it has one.
-pub(crate) fn evict_live(chat_id: &str) {
+pub fn evict_live(chat_id: &str) {
     // The removed value is dropped here, which is what aborts it.
     LIVE_CHATS.lock().unwrap().remove(chat_id);
 }
@@ -749,8 +820,7 @@ fn reap_now() {
         // doing for the conversation (spec 4.2 item 2; spike 2026-10-05 (c): the CLI answers on its
         // own when it ends), so such a process is kept however long it has been idle.
         // The idle time is the chat's own, derived from its last turn.
-        still_standing
-            && (!live.background.is_empty() || live.idle_since.elapsed() < live.idle_for)
+        still_standing && (!live.background.is_empty() || live.idle_since.elapsed() < live.idle_for)
     });
 }
 
@@ -1222,7 +1292,9 @@ fn watch_between_turns(state: &crate::state::AppState, chat_id: &str) {
                             .iter()
                             .skip(recorded)
                             .filter_map(|event| match event {
-                                crate::runner::TurnEvent::Line(line) if is_task_bookkeeping(line) => {
+                                crate::runner::TurnEvent::Line(line)
+                                    if is_task_bookkeeping(line) =>
+                                {
                                     Some(line.clone())
                                 }
                                 _ => None,
@@ -1377,7 +1449,7 @@ async fn start_spontaneous_turn(
                 let known = live.session_id.lock().unwrap().clone().unwrap_or_default();
                 let o = gathered(outcome, stdout, known);
                 // The process has now served this turn too, under the same barrier.
-                note_served(live.process_key(), id, mode);
+                note_served(live.process_key(), &chat, id, mode, &pool);
                 // Kept first, so the process is back for the next turn before the row says done.
                 keep_live(&chat, live, idle_for);
                 record_spontaneous_answer(&pool, id, &chat, &o, &completed_at).await;
@@ -1464,6 +1536,8 @@ async fn record_spontaneous_answer(
     let tools_used = serde_json::to_string(&stream.did).unwrap_or_else(|_| "[]".to_string());
     let thought = serde_json::to_string(&stream.thought).unwrap_or_else(|_| "[]".to_string());
     let model = crate::runner::model_from_stream(&o.stdout);
+    // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
+    crate::chat_tasks::record_turn(pool, chat_id, id, &o.stdout).await;
     let completed = sqlx::query(
         "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, compacted = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
     )
@@ -1486,7 +1560,6 @@ async fn record_spontaneous_answer(
     .execute(pool)
     .await;
     crate::runs::warn_on_terminal_write_err(&completed, id, "completed");
-    crate::chat_tasks::record_turn(pool, chat_id, id, &o.stdout).await;
     if let Some(session_id) = o.session_id.as_deref() {
         // The same rule as a person's turn: a session that read third-party text is not resumable.
         match crate::runs::read_untrusted_context(pool, id).await {
@@ -1506,8 +1579,8 @@ async fn record_spontaneous_answer(
 /// Beside the guard rather than reached for through a second copy of `BUSY_CHATS`: what makes the
 /// slot mean anything is that there is exactly one set of busy chats, and a test that inserted into
 /// its own would be testing a set nothing reads.
-#[cfg(test)]
-pub(crate) fn take_the_slot_for_testing(chat_id: &str) -> impl Drop {
+#[cfg(any(test, feature = "testkit"))]
+pub fn take_the_slot_for_testing(chat_id: &str) -> impl Drop {
     ChatSlot::acquire(chat_id).expect("the chat should have been free")
 }
 
@@ -1547,7 +1620,7 @@ impl Drop for TurnGuard {
 /// refuses anything: it is handed to the CLI as `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, and the CLI
 /// compacts its own context inside the same session rather than the daemon minting a new one. See
 /// `0116_chats_context_window.sql` for why that swap is both gentler and cheaper.
-pub(crate) const CONTEXT_WINDOW_TOKENS: i64 = 140_000;
+pub const CONTEXT_WINDOW_TOKENS: i64 = 140_000;
 
 /// The largest window there is any point asking for.
 ///
@@ -1559,14 +1632,14 @@ pub(crate) const CONTEXT_WINDOW_TOKENS: i64 = 140_000;
 /// Only the pick-up path ever reaches for it: a conversation continued from the editor may arrive
 /// carrying more than the default window can hold, and raising its window to fit is what lets it be
 /// resumed instead of stumped.
-pub(crate) const LARGEST_WINDOW_TOKENS: i64 = 200_000;
+pub const LARGEST_WINDOW_TOKENS: i64 = 200_000;
 
 /// The headroom the CLI keeps below the window before it compacts.
 ///
 /// Read out of the CLI's own binary — its threshold is `window - 13000` — rather than guessed, and
 /// named here because the pick-up path has to answer "will this session fit" and the honest answer
 /// is "does it fit under the line the CLI will actually draw", not "under the window".
-pub(crate) const COMPACTION_HEADROOM: i64 = 13_000;
+pub const COMPACTION_HEADROOM: i64 = 13_000;
 
 /// The window this conversation runs in: its own if it asked for one, the default otherwise.
 ///
@@ -1574,7 +1647,7 @@ pub(crate) const COMPACTION_HEADROOM: i64 = 13_000;
 /// by a pick-up whose ceiling has since changed — is not something a turn should refuse over. The
 /// CLI clamps this again at its own end; agreeing with it here means the number the window SHOWS is
 /// the number the CLI will actually use.
-pub(crate) fn window_of(asked: Option<i64>) -> i64 {
+pub fn window_of(asked: Option<i64>) -> i64 {
     asked
         .unwrap_or(CONTEXT_WINDOW_TOKENS)
         .clamp(CONTEXT_WINDOW_TOKENS, LARGEST_WINDOW_TOKENS)
@@ -2071,7 +2144,7 @@ pub const IMAGE_TOO_LARGE: &str = "one of those pictures is too large to send";
 
 /// Sends a message with nothing attached. Only the tests send without pictures through this
 /// shorthand; production callers go through `send_message_with`.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn send_message(
     state: &crate::state::AppState,
     chat_id: &str,
@@ -2552,7 +2625,7 @@ núcleo: ",
 ///
 /// A failure to read or parse it is empty, not an error. A turn answering without its predecessor's
 /// tail is worse than one answering with it, and better than one that refuses.
-pub(crate) async fn handed_over(pool: &SqlitePool, chat_id: &str) -> Vec<(String, String)> {
+pub async fn handed_over(pool: &SqlitePool, chat_id: &str) -> Vec<(String, String)> {
     let stored = match crate::chats::handover_of(pool, chat_id).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return Vec::new(),
@@ -2586,7 +2659,7 @@ pub(crate) async fn handed_over(pool: &SqlitePool, chat_id: &str) -> Vec<(String
 /// own `cleared_after_run_id` (0114). They are separate because they mean different things: one is
 /// a safety property this daemon imposes, the other is somebody asking to start again, and either
 /// alone must still hold when the other is absent.
-pub(crate) async fn recent_exchanges(
+pub async fn recent_exchanges(
     pool: &SqlitePool,
     chat_id: &str,
 ) -> sqlx::Result<Vec<(String, String)>> {
@@ -2649,7 +2722,7 @@ const LOCAL_AGENT_ANSWERED_BY: &[&str] = &["local", "openrouter"];
 /// added here without a matching edit at every call site would repeat. Checking against
 /// `LOCAL_AGENT_ANSWERED_BY` instead of the two literals directly means a future third entry needs
 /// only ONE new line, not a search for every place someone once wrote `"local"`.
-pub(crate) fn answered_by_a_local_agent_loop(answered_by: &str) -> bool {
+pub fn answered_by_a_local_agent_loop(answered_by: &str) -> bool {
     LOCAL_AGENT_ANSWERED_BY.contains(&answered_by)
 }
 
@@ -2903,7 +2976,7 @@ async fn spawn_local_turn(
 /// Every failing arm falls to `McpOnly`, which is what every chat turn has always used: the
 /// conversation still continues and still resumes its session, and what it loses is the ability to
 /// touch the machine.
-pub(crate) fn tool_policy_for(
+pub fn tool_policy_for(
     cwd: Option<&str>,
     origin: Origin,
     hook_is_wired: bool,
@@ -2918,10 +2991,7 @@ pub(crate) fn tool_policy_for(
 }
 
 /// Chooses the CLI that should answer a conversation turn.
-pub(crate) fn answering_cli(
-    config: &crate::config::ModelsConfig,
-    pinned: Option<&str>,
-) -> &'static str {
+pub fn answering_cli(config: &crate::config::ModelsConfig, pinned: Option<&str>) -> &'static str {
     pinned
         .and_then(|id| {
             config
@@ -2938,7 +3008,7 @@ pub(crate) fn answering_cli(
 }
 
 /// Chooses a runner for a turn without replacing the daemon's default unnecessarily.
-pub(crate) fn runner_for_turn(
+pub fn runner_for_turn(
     daemon: &std::sync::Arc<dyn crate::runner::CommandRunner>,
     assistants: &dyn crate::assistants::Assistants,
     config: &crate::config::ModelsConfig,
@@ -2961,7 +3031,7 @@ pub(crate) fn runner_for_turn(
 }
 
 /// Whether this turn may retain a live CLI process for a later turn.
-pub(crate) fn may_keep_process(policy: crate::runner::ToolPolicy, cli: &str) -> bool {
+pub fn may_keep_process(policy: crate::runner::ToolPolicy, cli: &str) -> bool {
     matches!(policy, crate::runner::ToolPolicy::Unrestricted) && cli == "claude"
 }
 
@@ -3009,7 +3079,7 @@ fn system_prompt_with_knowledge(
 }
 
 /// Whether a rooted shell conversation may answer through Codex.
-pub(crate) fn may_answer_on_codex(cwd: Option<&str>) -> bool {
+pub fn may_answer_on_codex(cwd: Option<&str>) -> bool {
     tool_policy_for(
         cwd,
         Origin::Shell,
@@ -3458,7 +3528,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         // Only a turn that could have run in the kept process: a one-shot turn never touched it, and
         // its mode is not one that process served.
         if may_live {
-            note_served_by_kept(&turn.slot.chat_id, id, mode.as_str());
+            note_served_by_kept(&turn.slot.chat_id, id, mode.as_str(), &pool);
         }
         let completed_at = chrono::Utc::now().to_rfc3339();
 
@@ -3530,6 +3600,8 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // The tokens and the turn count too, which every other terminal write in the
                     // core already takes off the outcome and this one did not: a chat turn read back
                     // "none recorded" under numbers the runner had measured and handed it.
+                    // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
+                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
                     let completed = sqlx::query(
                         "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, cache_ttl = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
                     )
@@ -3556,7 +3628,6 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .execute(&pool)
                     .await;
                     crate::runs::warn_on_terminal_write_err(&completed, id, status);
-                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
                     if let Some(session_id) = o.session_id.as_deref() {
                         // `get_session` would refuse to resume this session anyway, by looking at the
                         // runs that produced it. Dropping the row here as well closes the one case that
@@ -3599,6 +3670,8 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     } else {
                         "failed"
                     };
+                    // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
+                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
                     let failed = sqlx::query(
                         "UPDATE runs SET status = ?, exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
@@ -3617,7 +3690,6 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .execute(&pool)
                     .await;
                     crate::runs::warn_on_terminal_write_err(&failed, id, status);
-                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
                 }
             },
             Ok(Err(e)) => {
@@ -3814,7 +3886,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 
@@ -4382,7 +4454,7 @@ mod tests {
         let door = axum::Router::new()
             .route(
                 "/knowledge",
-                axum::routing::post(crate::http::post_knowledge),
+                axum::routing::post(crate::door::post_knowledge),
             )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7450,9 +7522,7 @@ mod tests {
             let chat = a_chat(prefix);
             let (live, _said, events, _why) = live_chat_for_testing();
             LIVE_CHATS.lock().unwrap().insert(chat.clone(), live);
-            events
-                .send(crate::runner::TurnEvent::Line(line))
-                .unwrap();
+            events.send(crate::runner::TurnEvent::Line(line)).unwrap();
             events
                 .send(crate::runner::TurnEvent::Ended(
                     crate::runner::TurnOutcome::default(),
@@ -7501,10 +7571,14 @@ mod tests {
             "a development chat idle for 180 s is still wanted"
         );
 
-        LIVE_CHATS.lock().unwrap().get_mut(&chat).unwrap().idle_since =
-            std::time::Instant::now()
-                .checked_sub(DEV_IDLE + Duration::from_secs(1))
-                .expect("a machine that has been up sixteen minutes");
+        LIVE_CHATS
+            .lock()
+            .unwrap()
+            .get_mut(&chat)
+            .unwrap()
+            .idle_since = std::time::Instant::now()
+            .checked_sub(DEV_IDLE + Duration::from_secs(1))
+            .expect("a machine that has been up sixteen minutes");
         reap_now();
         assert!(
             !LIVE_CHATS.lock().unwrap().contains_key(&chat),
@@ -7542,7 +7616,10 @@ mod tests {
     #[tokio::test]
     async fn idle_lru_a_process_with_a_background_task_is_never_evicted() {
         let (mut kept, _held) = idle_lru_six();
-        kept.get_mut("c0").unwrap().background.insert("bg".to_owned());
+        kept.get_mut("c0")
+            .unwrap()
+            .background
+            .insert("bg".to_owned());
 
         let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP);
 
@@ -7564,7 +7641,11 @@ mod tests {
             LIVE_IDLE
         );
         assert_eq!(
-            idle_after_spontaneous(LIVE_IDLE, &idle_lru_tool_use("Agent"), Duration::from_secs(1)),
+            idle_after_spontaneous(
+                LIVE_IDLE,
+                &idle_lru_tool_use("Agent"),
+                Duration::from_secs(1)
+            ),
             DEV_IDLE,
             "a background turn may still raise it"
         );
@@ -7938,7 +8019,7 @@ mod tests {
     }
 
     /// One turn of a rooted conversation, in the shape `send_message_with` builds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     fn seam_request(
         prompt: &str,
         cwd: &std::path::Path,
@@ -8060,6 +8141,70 @@ mod tests {
             .await
             .expect("dropping the handle must stop the process, not leave it running");
         assert!(stopped.unwrap_err().is_cancelled());
+    }
+
+    /// A kept process that ends stops vouching for its turns' tasks, and closes their rows.
+    ///
+    /// Authority comes from the process being alive (`live_process_served`), so it must end the
+    /// instant the handle drops; the `running` rows are closed by a spawned task, so those are
+    /// polled for. Its own chat id: `PROCESS_BARRIERS` is shared by every test in the process.
+    #[tokio::test]
+    async fn a_dropped_process_closes_its_tasks_and_stops_vouching_for_them() {
+        let state = test_state().await;
+        let (messages, _said) = tokio::sync::mpsc::unbounded_channel();
+        let (_events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let running = tokio::spawn(std::future::pending::<()>());
+        let live = LiveChat {
+            messages,
+            events,
+            session_id: std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
+            abort: running.abort_handle(),
+            stopped_because: tokio::sync::watch::channel(None).1,
+            permission: crate::runner::Permission::Default,
+            cwd: None,
+            idle_since: std::time::Instant::now(),
+            idle_for: LIVE_IDLE,
+            _counted: LiveCount::start(),
+            carried: Default::default(),
+            background: HashSet::new(),
+            watcher: 0,
+        };
+        note_served(
+            live.process_key(),
+            "drop-vouch-chat",
+            4242,
+            "auto",
+            &state.pool,
+        );
+        sqlx::query(
+            "INSERT INTO chat_tasks (chat_id, launched_by_run_id, tool_use_id, kind, status, started_at)
+             VALUES ('drop-vouch-chat', 4242, 'toolu_drop', 'background_agent', 'running', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        assert!(live_process_served("drop-vouch-chat", 4242));
+
+        drop(live);
+
+        assert!(
+            !live_process_served("drop-vouch-chat", 4242),
+            "a dropped process must stop vouching at once"
+        );
+        let mut status = String::new();
+        for _ in 0..250 {
+            status = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM chat_tasks WHERE chat_id = 'drop-vouch-chat' AND tool_use_id = 'toolu_drop'",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+            if status == "stopped" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status, "stopped");
     }
 
     /// Cancelling a turn takes its conversation's process with it.
@@ -8386,7 +8531,9 @@ mod tests {
 
         let mut rows = Vec::new();
         for _ in 0..300 {
-            rows = crate::chat_tasks::for_chat(&state.pool, &chat).await.unwrap();
+            rows = crate::chat_tasks::for_chat(&state.pool, &chat)
+                .await
+                .unwrap();
             if !rows.is_empty() {
                 break;
             }
@@ -8407,7 +8554,9 @@ mod tests {
             )
             .unwrap();
         for _ in 0..300 {
-            rows = crate::chat_tasks::for_chat(&state.pool, &chat).await.unwrap();
+            rows = crate::chat_tasks::for_chat(&state.pool, &chat)
+                .await
+                .unwrap();
             if rows.first().is_some_and(|row| row.status != "running") {
                 break;
             }

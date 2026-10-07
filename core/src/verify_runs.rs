@@ -198,7 +198,7 @@ fn tail(text: &str) -> String {
 
 /// A unit of verification a caller asks the executor to run.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct Request {
+pub struct Request {
     pub project_id: Option<String>,
     pub worktree: String,
     pub scope: String,
@@ -216,14 +216,14 @@ pub(crate) struct Request {
 
 /// What `enqueue` answers: the row's id, and whether it joined one already in flight.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct Submitted {
+pub struct Submitted {
     pub id: i64,
     pub joined: bool,
 }
 
 /// A queued row as the scheduler needs it.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct Queued {
+pub struct Queued {
     pub id: i64,
     pub project_id: Option<String>,
     pub priority: i64,
@@ -233,7 +233,7 @@ pub(crate) struct Queued {
 
 /// A row the executor claimed and must now run.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct Claimed {
+pub struct Claimed {
     pub id: i64,
     pub project_id: Option<String>,
     pub worktree: String,
@@ -244,7 +244,7 @@ pub(crate) struct Claimed {
 
 /// What a reader sees of one row.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct State {
+pub struct State {
     // Read from F2a-2 (verify); until then nothing reads it.
     #[allow(dead_code)]
     pub id: i64,
@@ -261,11 +261,7 @@ pub(crate) struct State {
 /// creates no row and raises the queued row's priority if the new request is more urgent. The
 /// origin of the joined request is not recorded (v1 limitation).
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn enqueue(
-    pool: &SqlitePool,
-    request: &Request,
-    now_ms: i64,
-) -> sqlx::Result<Submitted> {
+pub async fn enqueue(pool: &SqlitePool, request: &Request, now_ms: i64) -> sqlx::Result<Submitted> {
     let argv = serde_json::to_string(&request.argv).unwrap_or_else(|_| "[]".to_owned());
     // IMMEDIATE takes the write lock up front: in a deferred transaction two equal submits could
     // both run the join SELECT, both miss, and both insert (or the second would get SQLITE_BUSY).
@@ -325,7 +321,7 @@ pub(crate) async fn enqueue(
 
 /// Every queued row, oldest first, for the scheduler to choose from.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn queued(pool: &SqlitePool) -> sqlx::Result<Vec<Queued>> {
+pub async fn queued(pool: &SqlitePool) -> sqlx::Result<Vec<Queued>> {
     // The tuple is the `SELECT`'s own shape and lives only until the `map` below builds `Queued`;
     // a named struct would repeat the column order in two places.
     #[allow(clippy::type_complexity)]
@@ -349,7 +345,7 @@ pub(crate) async fn queued(pool: &SqlitePool) -> sqlx::Result<Vec<Queued>> {
 
 /// Takes a queued row for running. `None` when it is no longer queued.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn claim(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Claimed>> {
+pub async fn claim(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Claimed>> {
     let started_at = chrono::Utc::now().to_rfc3339();
     // The tuple is the `RETURNING` clause's own shape and lives only until the `map` below builds
     // `Claimed`; a named struct would repeat the column order in two places.
@@ -377,7 +373,7 @@ pub(crate) async fn claim(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Cla
 
 /// Records how a running row ended.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn finish(
+pub async fn finish(
     pool: &SqlitePool,
     id: i64,
     status: &str,
@@ -404,7 +400,7 @@ pub(crate) async fn finish(
 
 /// One row as a reader sees it.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<State>> {
+pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<State>> {
     // The tuple is the `SELECT`'s own shape and lives only until the `map` below builds `State`;
     // a named struct would repeat the column order in two places.
     #[allow(clippy::type_complexity)]
@@ -431,7 +427,7 @@ pub(crate) async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<State
 /// or are given up on once they have been interrupted `MAX_INTERRUPTIONS` times. Returns
 /// `(requeued, given_up)`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn requeue_interrupted(pool: &SqlitePool) -> sqlx::Result<(u64, u64)> {
+pub async fn requeue_interrupted(pool: &SqlitePool) -> sqlx::Result<(u64, u64)> {
     let now = chrono::Utc::now().to_rfc3339();
     let given_up = sqlx::query(
         "UPDATE verify_runs SET status = 'errored', finished_at = ?, \
@@ -471,7 +467,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 

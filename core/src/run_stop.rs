@@ -38,7 +38,7 @@ pub enum Kind {
 /// Returns `None` for a status this route has never seen: an eighth real status appearing here means
 /// `runs.rs` grew a status this table does not know about yet, which is a bug to surface rather than
 /// a kind to guess at.
-pub(crate) fn derive_kind(status: &str) -> Option<Kind> {
+pub fn derive_kind(status: &str) -> Option<Kind> {
     if status == "awaiting_approval" {
         return Some(Kind::Gate);
     }
@@ -105,7 +105,7 @@ pub struct TimeoutPayload {
 /// reached it either, and the wall clock is ruled out — `"silence"`. Once the majorant reaches or
 /// passes the wall ceiling, either clock could have fired, and nothing here can tell them apart —
 /// `"undetermined"`. There is no third case.
-pub(crate) fn derive_timeout_verdict(elapsed_seconds: i64, mode: &str) -> TimeoutPayload {
+pub fn derive_timeout_verdict(elapsed_seconds: i64, mode: &str) -> TimeoutPayload {
     let wall_ceiling_seconds =
         crate::runs::run_timeout_for_mode(crate::state::DEFAULT_RUN_TIMEOUT, mode).as_secs() as i64;
     let silence_ceiling_seconds =
@@ -133,14 +133,14 @@ pub(crate) fn derive_timeout_verdict(elapsed_seconds: i64, mode: &str) -> Timeou
 /// of it was ever written", and the second is what is actually true for a `real` run: the gate saw
 /// every tool call and recorded none of them. `decisions_recorded` exists so the UI can say that,
 /// instead of reading an empty `leading_up` as "this run's gate did nothing".
-pub(crate) fn decisions_recorded(mode: &str) -> bool {
+pub fn decisions_recorded(mode: &str) -> bool {
     mode != "real"
 }
 
 /// Whether `kind` is one of the two the response carries `leading_up` for (spec §5.1): only `gate`
 /// and `timeout` bring the decisions leading up to the stop; every other kind's `leading_up` is
 /// `null`, not an omitted field and not an empty array standing in for "not applicable".
-pub(crate) fn kind_shows_leading_up(kind: Kind) -> bool {
+pub fn kind_shows_leading_up(kind: Kind) -> bool {
     matches!(kind, Kind::Gate | Kind::Timeout)
 }
 
@@ -150,7 +150,7 @@ pub(crate) fn kind_shows_leading_up(kind: Kind) -> bool {
 /// decision the way a pending gate is, so nothing is singled out of `leading_up` for it: `gate`
 /// stays `null` and every fetched decision — not `leading_up.len() + 1` of them — lands in
 /// `leading_up`.
-pub(crate) fn kind_shows_gate(kind: Kind) -> bool {
+pub fn kind_shows_gate(kind: Kind) -> bool {
     matches!(kind, Kind::Gate)
 }
 
@@ -228,7 +228,7 @@ fn tail_of(value: String) -> String {
 /// PURE: builds one [`GateDecisionView`] from a `shadow_decisions` row's own columns, applying the
 /// §5.2 truncation. The HTTP handler reads the row; this is the shaping of it into the response.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn gate_decision_view(
+pub fn gate_decision_view(
     tool_name: String,
     action_class: String,
     decision: String,
@@ -291,7 +291,7 @@ fn summary_for(kind: Kind) -> &'static str {
 /// `leading` remain), `leading` rows for `kind: timeout` (all become `leading_up`) — otherwise
 /// `leading_up`'s length silently drifts from what `?leading=` promised.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_response(
+pub fn build_response(
     run_id: i64,
     status: String,
     kind: Kind,

@@ -465,7 +465,7 @@ const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
 /// still decided only here; being readable from a test is what makes forgetting to add a route
 /// fail somewhere other than production.
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
+pub fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
     grants(scope, method, path, Target::Path)
 }
 
@@ -478,7 +478,7 @@ pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
 /// the search, the IDE sessions), and a council or team key holding `/runs/{id}` reached
 /// `/runs/awaiting-approval`. The template the router chose carries no such ambiguity: a `{param}`
 /// in a table matches only a `{param}` in the template, and a literal only the same literal.
-pub(crate) fn permits_route(scope: &Scope, method: &Method, route: &str) -> bool {
+pub fn permits_route(scope: &Scope, method: &Method, route: &str) -> bool {
     grants(scope, method, route, Target::Route)
 }
 
@@ -516,7 +516,7 @@ fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
 
 /// Whether a concrete path is listed. The tests' table assertions ask this, the loosest reading,
 /// so an absence they assert holds under the stricter template reading as well.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 fn route_is_listed(routes: &[(Method, &str)], method: &Method, path: &str) -> bool {
     route_is_listed_as(routes, method, path, Target::Path)
 }
@@ -810,7 +810,8 @@ async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
             .ok()??;
         // The secret first, and the conversation's state only after it matches. Resolving the run
         // first would answer a caller holding no secret at all — whether this conversation is
-        // busy — by how long the refusal took.
+        // busy — by how long the refusal took. The task lookup below is chat state too, so it also
+        // comes after the secret.
         if !bool::from(secret.as_bytes().ct_eq(stored.as_bytes())) {
             return None;
         }
@@ -819,16 +820,34 @@ async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
         // naming the turn that spawned it would still name that turn five turns later — wrong
         // attribution, and a run key that never dies.
         //
-        // Nothing running means nothing to name. That is the rule `runs.token` already follows,
-        // kept rather than weakened: between turns this opens no door.
-        return sqlx::query_scalar::<_, i64>(
+        // A running turn first. Otherwise the newest live task's launcher, and only while a live
+        // process of THIS chat served it: a `running` row alone is never enough, because the row can
+        // outlive the process that held the task. Between turns with no live task, nothing — that is
+        // the rule `runs.token` already follows, kept rather than weakened. Every failure is `None`.
+        let running = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM runs WHERE chat_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
         )
         .bind(chat_id)
         .fetch_optional(&state.pool)
         .await
-        .ok()?
-        .map(Scope::Run);
+        .ok()?;
+        if let Some(turn) = running {
+            return Some(Scope::Run(turn));
+        }
+        let launchers = sqlx::query_scalar::<_, i64>(
+            "SELECT DISTINCT t.launched_by_run_id FROM chat_tasks t
+               JOIN runs r ON r.id = t.launched_by_run_id AND r.chat_id = t.chat_id
+              WHERE t.chat_id = ? AND t.status = 'running'
+              ORDER BY t.launched_by_run_id DESC",
+        )
+        .bind(chat_id)
+        .fetch_all(&state.pool)
+        .await
+        .ok()?;
+        return launchers
+            .into_iter()
+            .find(|&launcher| crate::assistant::live_process_served(chat_id, launcher))
+            .map(Scope::Run);
     }
 
     let (prefix, secret) = presented.split_once('.')?;
@@ -990,7 +1009,7 @@ mod tests {
             .await
             .unwrap();
         // Run tokens are resolved against the `runs` table, so this can no longer be a bare pool.
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         AppState {
             token: Token(token.to_string()),
             pool,
@@ -3520,5 +3539,149 @@ mod tests {
             resolve(&state, &format!("{run_id}.nos_run_{bare}")).await,
             None
         );
+    }
+
+    /// Marks a turn finished, the way its `result` does.
+    async fn finish_turn(state: &AppState, run_id: i64) {
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    /// A background task the turn `launcher` started and that is still `running`.
+    async fn live_task_of(state: &AppState, chat_id: &str, launcher: i64, tool_use_id: &str) {
+        sqlx::query(
+            "INSERT INTO chat_tasks (chat_id, launched_by_run_id, tool_use_id, kind, status, started_at)
+             VALUES (?, ?, ?, 'background_agent', 'running', '2026-01-01T00:00:00Z')",
+        )
+        .bind(chat_id)
+        .bind(launcher)
+        .bind(tool_use_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// After the launching turn's `result`, the kept process is still there and so is its task: the
+    /// task's tool calls present the conversation's key and must be attributed to the launcher.
+    /// Every test below uses a chat id of its own, because the process registry is process-wide.
+    #[tokio::test]
+    async fn a_chat_key_reaches_a_live_task_after_its_turn_ends() {
+        let state = test_state("control-token").await;
+        let chat = "live-task-reaches-chat";
+        let key = mint_chat_token(&state.pool, chat).await.unwrap();
+        let turn = running_turn_of(&state, chat).await;
+        live_task_of(&state, chat, turn, "toolu_live").await;
+        let _held = crate::assistant::hold_process_serving(chat, turn);
+        finish_turn(&state, turn).await;
+
+        assert_eq!(resolve(&state, &key).await, Some(Scope::Run(turn)));
+    }
+
+    /// A task that ended, or whose process is gone, opens nothing. The row alone is not enough:
+    /// one can be written `running` after its process died.
+    #[tokio::test]
+    async fn a_chat_key_stops_reaching_a_task_once_it_ends() {
+        let state = test_state("control-token").await;
+        let chat = "live-task-ends-chat";
+        let key = mint_chat_token(&state.pool, chat).await.unwrap();
+        let turn = running_turn_of(&state, chat).await;
+        live_task_of(&state, chat, turn, "toolu_ends").await;
+        let held = crate::assistant::hold_process_serving(chat, turn);
+        finish_turn(&state, turn).await;
+        assert_eq!(resolve(&state, &key).await, Some(Scope::Run(turn)));
+
+        for ended in ["completed", "failed", "stopped", "orphaned"] {
+            sqlx::query("UPDATE chat_tasks SET status = ? WHERE chat_id = ?")
+                .bind(ended)
+                .bind(chat)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            assert_eq!(resolve(&state, &key).await, None, "a {ended} task");
+        }
+
+        sqlx::query("UPDATE chat_tasks SET status = 'running' WHERE chat_id = ?")
+            .bind(chat)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(resolve(&state, &key).await, Some(Scope::Run(turn)));
+        drop(held);
+        assert_eq!(
+            resolve(&state, &key).await,
+            None,
+            "a `running` row with no live process vouches for nothing"
+        );
+    }
+
+    /// Between turns, with nothing launched, the key opens no door.
+    #[tokio::test]
+    async fn a_chat_key_opens_nothing_when_the_chat_has_no_live_task() {
+        let state = test_state("control-token").await;
+        let chat = "no-live-task-chat";
+        let key = mint_chat_token(&state.pool, chat).await.unwrap();
+        let turn = running_turn_of(&state, chat).await;
+        let _held = crate::assistant::hold_process_serving(chat, turn);
+        finish_turn(&state, turn).await;
+
+        assert_eq!(resolve(&state, &key).await, None);
+    }
+
+    /// A turn that is running is what the process is doing now, so it wins over an older task.
+    #[tokio::test]
+    async fn a_running_turn_takes_precedence_over_a_live_task() {
+        let state = test_state("control-token").await;
+        let chat = "running-beats-task-chat";
+        let key = mint_chat_token(&state.pool, chat).await.unwrap();
+        let first = running_turn_of(&state, chat).await;
+        live_task_of(&state, chat, first, "toolu_first").await;
+        let _held = crate::assistant::hold_process_serving(chat, first);
+        finish_turn(&state, first).await;
+        let second = running_turn_of(&state, chat).await;
+
+        assert_eq!(resolve(&state, &key).await, Some(Scope::Run(second)));
+    }
+
+    /// Another conversation's task is not reachable with this one's key, and a row that names a
+    /// launcher belonging to another conversation is ignored even when this chat's process is held.
+    #[tokio::test]
+    async fn a_chat_key_cannot_reach_another_conversations_task() {
+        let state = test_state("control-token").await;
+        let (mine, theirs) = ("task-isolation-mine", "task-isolation-theirs");
+        let my_key = mint_chat_token(&state.pool, mine).await.unwrap();
+        let their_turn = running_turn_of(&state, theirs).await;
+        live_task_of(&state, theirs, their_turn, "toolu_theirs").await;
+        let _their_process = crate::assistant::hold_process_serving(theirs, their_turn);
+        finish_turn(&state, their_turn).await;
+        assert_eq!(resolve(&state, &my_key).await, None);
+
+        live_task_of(&state, mine, their_turn, "toolu_crossed").await;
+        let _my_process = crate::assistant::hold_process_serving(mine, their_turn);
+        assert_eq!(
+            resolve(&state, &my_key).await,
+            None,
+            "the launcher belongs to another conversation"
+        );
+    }
+
+    /// The secret is compared before any state is read, so a live task answers a wrong one nothing.
+    #[tokio::test]
+    async fn a_wrong_secret_reaches_no_live_task() {
+        let state = test_state("control-token").await;
+        let chat = "wrong-secret-task-chat";
+        let key = mint_chat_token(&state.pool, chat).await.unwrap();
+        let turn = running_turn_of(&state, chat).await;
+        live_task_of(&state, chat, turn, "toolu_secret").await;
+        let _held = crate::assistant::hold_process_serving(chat, turn);
+        finish_turn(&state, turn).await;
+
+        assert_eq!(
+            resolve(&state, &format!("chat:{chat}.nos_chat_wrong")).await,
+            None
+        );
+        assert_eq!(resolve(&state, &key).await, Some(Scope::Run(turn)));
     }
 }

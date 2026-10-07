@@ -55,7 +55,7 @@ impl WebRuntime {
     /// `#[cfg(test)]` because production always builds a real one from `~/.nucleos/web.yaml`; this is what
     /// the fourteen `test_state()` fixtures hold. Left ungated it is dead code in the daemon, and
     /// this repository answers that warning rather than silencing it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn disabled() -> Self {
         Self {
             enabled: false,

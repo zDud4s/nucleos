@@ -369,7 +369,7 @@ pub async fn declare_shell_rule(
 /// rows, and reporting a delete that never happened. `declared_shell_rules` makes the same choice
 /// on the way out and cannot share this helper — it holds an `Option<String>` rather than an
 /// `Option<&str>` and its comment says why the choice is made there at all.
-pub(crate) fn fold_for(tool: Option<&str>, prefix: &str) -> String {
+pub fn fold_for(tool: Option<&str>, prefix: &str) -> String {
     match tool {
         None => fold_prefix(prefix),
         Some(_) => fold_path_prefix(prefix),
@@ -950,7 +950,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 

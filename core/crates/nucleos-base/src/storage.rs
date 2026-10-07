@@ -1,6 +1,12 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
+/// The daemon's schema, embedded once. Every caller — `open` below, `testdb` and the tests that
+/// migrate a pool of their own — goes through this one static instead of expanding
+/// `sqlx::migrate!()` where it stands: each expansion embeds every migration again, and a bare
+/// `migrate!()` resolves against whichever crate it is expanded in, which a crate split would move.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
 /// A write that has been made durable but is not yet visible at its destination.
 #[must_use = "a staged write does nothing until it is committed"]
 pub struct Staged {
@@ -87,7 +93,7 @@ pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         .max_connections(5)
         .connect_with(options)
         .await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    crate::storage::MIGRATOR.run(&pool).await?;
     Ok(pool)
 }
 
@@ -106,13 +112,13 @@ pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
 /// starve the very task being waited for. `close` is therefore explicit and consuming — the value
 /// cannot be used afterwards, and `a_closed_temp_db_leaves_nothing_behind` is what notices if
 /// someone drops the call.
-#[cfg(test)]
-pub(crate) struct TempDb {
+#[cfg(any(test, feature = "testkit"))]
+pub struct TempDb {
     pub pool: SqlitePool,
     dir: tempfile::TempDir,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 impl TempDb {
     pub async fn new() -> Self {
         let dir = tempfile::tempdir().expect("create database tempdir");
@@ -152,7 +158,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut claimed: BTreeMap<i64, String> = BTreeMap::new();
-        for migration in sqlx::migrate!("./migrations").iter() {
+        for migration in crate::storage::MIGRATOR.iter() {
             let description = migration.description.to_string();
             if let Some(first) = claimed.insert(migration.version, description.clone()) {
                 panic!(

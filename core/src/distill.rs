@@ -468,16 +468,42 @@ pub fn retry_at(
 
 // ---- P4: the worker ----
 
+use crate::embed::Embedder;
 use crate::map_intent::Extractor;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
+
+/// Cosine at or above which a new learning is the same as a stored one. A guess until real data
+/// exists (spec 5.3).
+pub const SIM_SAME: f32 = 0.92;
+/// Cosine at or above which a new learning is written but noted as resembling a stored one. A
+/// guess until real data exists (spec 5.3).
+pub const SIM_NEAR: f32 = 0.80;
+/// Rows embedded per idle tick once the queue is served.
+pub(crate) const BACKFILL_PER_TICK: i64 = 20;
+
+/// What the nearest stored vector says about a new learning.
+pub enum Dedup {
+    Same(i64),
+    Near(i64),
+    New,
+}
+
+/// The pure threshold split over the best `(id, cosine)` match, if any.
+pub fn dedup_verdict(best: Option<(i64, f32)>) -> Dedup {
+    match best {
+        Some((id, similarity)) if similarity >= SIM_SAME => Dedup::Same(id),
+        Some((id, similarity)) if similarity >= SIM_NEAR => Dedup::Near(id),
+        _ => Dedup::New,
+    }
+}
 
 /// How often the worker looks for a due row when the last drain found none.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One claimed row of `distill_queue`; `attempts` is the stored count, not yet incremented.
 #[derive(Debug, sqlx::FromRow)]
-pub(crate) struct QueueRow {
+pub struct QueueRow {
     pub id: i64,
     pub cause: String,
     pub project_id: String,
@@ -488,7 +514,7 @@ pub(crate) struct QueueRow {
 }
 
 /// Put every row a dead daemon left `running` back in line. Returns the rows changed.
-pub(crate) async fn recover_running(pool: &SqlitePool) -> sqlx::Result<u64> {
+pub async fn recover_running(pool: &SqlitePool) -> sqlx::Result<u64> {
     let changed = sqlx::query("UPDATE distill_queue SET status = ? WHERE status = ?")
         .bind(STATUS_PENDING)
         .bind(STATUS_RUNNING)
@@ -499,10 +525,7 @@ pub(crate) async fn recover_running(pool: &SqlitePool) -> sqlx::Result<u64> {
 
 /// Take the oldest due row, marking it `running` in the same statement. A row whose cause this
 /// build does not know is failed on the spot and the next one is tried.
-pub(crate) async fn claim_next(
-    pool: &SqlitePool,
-    now: DateTime<Utc>,
-) -> sqlx::Result<Option<QueueRow>> {
+pub async fn claim_next(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Option<QueueRow>> {
     loop {
         let row: Option<QueueRow> = sqlx::query_as(
             "UPDATE distill_queue SET status = ?
@@ -755,7 +778,9 @@ async fn fail(
     }
 }
 
-/// Write the extracted items and close the row, all in one transaction.
+/// Write the extracted items and close the row, all in one transaction. `vectors` is parallel to
+/// `items`; an item without one takes the fingerprint path alone.
+#[allow(clippy::too_many_arguments)]
 async fn write_items(
     pool: &SqlitePool,
     row: &QueueRow,
@@ -763,6 +788,8 @@ async fn write_items(
     job_id: i64,
     runs: &[i64],
     items: &[Item],
+    vectors: &[Option<Vec<f32>>],
+    model: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     let mut evidence_list = vec![serde_json::json!({"t": "job", "id": job_id})];
@@ -774,7 +801,7 @@ async fn write_items(
     let reasoning = format!("distilled from job #{job_id} ({})", cause.as_str());
 
     let mut tx = pool.begin().await?;
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         let Some(fingerprint) = crate::knowledge::title_fingerprint(&item.title) else {
             continue;
         };
@@ -783,6 +810,23 @@ async fn write_items(
             .is_some()
         {
             continue;
+        }
+        let embedded = match (vectors.get(index), model) {
+            (Some(Some(vector)), Some(model)) => Some((vector.as_slice(), model)),
+            _ => None,
+        };
+        let mut near: Option<i64> = None;
+        if let Some((vector, model)) = embedded {
+            let best = crate::embed::nearest_in(&mut tx, &row.project_id, model, vector).await?;
+            match dedup_verdict(best) {
+                Dedup::Same(id) => {
+                    if crate::knowledge::reconfirm_id_in(&mut tx, id, &evidence).await? {
+                        continue;
+                    }
+                }
+                Dedup::Near(id) => near = Some(id),
+                Dedup::New => {}
+            }
         }
         let points_at = if item.files.is_empty() {
             None
@@ -807,9 +851,9 @@ async fn write_items(
             fingerprint: Some(&fingerprint),
             layer: Some(item.layer),
         };
-        match how {
+        let new_id = match how {
             Door::Record => {
-                crate::knowledge::record_distilled(&mut tx, &declaration, &provenance).await?;
+                crate::knowledge::record_distilled(&mut tx, &declaration, &provenance).await?
             }
             Door::Propose => {
                 crate::knowledge::propose_in_with(&mut tx, declaration, &provenance)
@@ -817,7 +861,14 @@ async fn write_items(
                     .map_err(|e| match e {
                         crate::knowledge::ProposeError::Db(db) => db,
                         _ => sqlx::Error::Protocol("a distilled learning was refused".into()),
-                    })?;
+                    })?
+                    .0
+            }
+        };
+        if let Some((vector, model)) = embedded {
+            crate::embed::store_in(&mut tx, new_id, model, vector).await?;
+            if let Some(of_id) = near {
+                crate::knowledge::note_near_duplicate_in(&mut tx, new_id, of_id).await?;
             }
         }
     }
@@ -835,9 +886,21 @@ async fn write_items(
 }
 
 /// Distil one claimed row. Every failure ends in [`fail`]; nothing is returned.
-pub(crate) async fn process_one(
+pub async fn process_one(
     pool: &SqlitePool,
     asked: Extractor<'_>,
+    row: QueueRow,
+    now: DateTime<Utc>,
+) {
+    process_one_with(pool, asked, crate::embed::installed().as_deref(), row, now).await;
+}
+
+/// [`process_one`] with the embedder given: items are embedded, deduplicated by similarity and
+/// stored with their vector.
+pub(crate) async fn process_one_with(
+    pool: &SqlitePool,
+    asked: Extractor<'_>,
+    embedder: Option<&dyn Embedder>,
     row: QueueRow,
     now: DateTime<Utc>,
 ) {
@@ -882,9 +945,44 @@ pub(crate) async fn process_one(
         }
     };
     let job_id = row.job_id.unwrap_or_default();
-    if write_items(pool, &row, cause, job_id, &built.runs, &items, now)
-        .await
-        .is_err()
+    // The first embedding error ends embedding for the rest: those items take the fingerprint path.
+    let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(items.len());
+    if let Some(embedder) = embedder {
+        let mut failed = false;
+        for item in &items {
+            if failed {
+                vectors.push(None);
+                continue;
+            }
+            match embedder
+                .embed(&crate::embed::text_of(&item.title, &item.body))
+                .await
+            {
+                Ok(vector) => vectors.push(Some(vector)),
+                Err(error) => {
+                    tracing::warn!("distillation: embedding failed: {:?}", error.kind());
+                    failed = true;
+                    vectors.push(None);
+                }
+            }
+        }
+    } else {
+        vectors.resize(items.len(), None);
+    }
+    let model = embedder.map(|e| e.model());
+    if write_items(
+        pool,
+        &row,
+        cause,
+        job_id,
+        &built.runs,
+        &items,
+        &vectors,
+        model,
+        now,
+    )
+    .await
+    .is_err()
     {
         fail(pool, &row, "db", "writing the learnings failed", now).await;
     }
@@ -902,26 +1000,43 @@ pub async fn run_distill_loop(state: crate::state::AppState) {
     }
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     loop {
-        interval.tick().await;
-        loop {
-            let row = match claim_next(&state.pool, Utc::now()).await {
-                Ok(Some(row)) => row,
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!("distillation: could not read its queue: {error}");
-                    break;
-                }
-            };
-            let (id, cause) = (row.id, row.cause.clone());
-            process_one(
-                &state.pool,
-                Extractor::Cli(state.runner.as_ref()),
-                row,
-                Utc::now(),
-            )
-            .await;
-            tracing::info!("distillation: queue row {id} ({cause}) processed");
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = crate::embed::nudged() => {}
         }
+        // Read per tick so a change of model needs no restart. A choice this machine cannot serve
+        // leaves the rows pending until it can: the distiller never falls back to the cloud for a
+        // dossier its owner sent somewhere else, and the refusal is logged once by `route_for`.
+        let route = match crate::distill_model::route_for(&state).await {
+            Ok(route) => route,
+            Err(_) => continue,
+        };
+        let asked = route.extractor(state.runner.as_ref(), &state.web.http);
+        tick(&state.pool, asked, crate::embed::installed().as_deref()).await;
+    }
+}
+
+/// One pass of the worker: drain the queue, and only when it ended empty spend the idle time
+/// embedding rows that lack a vector.
+pub(crate) async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Option<&dyn Embedder>) {
+    let drained = loop {
+        let row = match claim_next(pool, Utc::now()).await {
+            Ok(Some(row)) => row,
+            Ok(None) => break true,
+            Err(error) => {
+                tracing::warn!("distillation: could not read its queue: {error}");
+                break false;
+            }
+        };
+        let (id, cause) = (row.id, row.cause.clone());
+        process_one_with(pool, asked, embedder, row, Utc::now()).await;
+        tracing::info!("distillation: queue row {id} ({cause}) processed");
+    };
+    if drained
+        && let Some(embedder) = embedder
+        && let Err(error) = crate::embed::backfill(pool, embedder, BACKFILL_PER_TICK).await
+    {
+        tracing::warn!("distillation: embedding backfill failed: {error}");
     }
 }
 
@@ -952,7 +1067,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 
@@ -1985,5 +2100,311 @@ mod tests {
             items_format(),
             "the grammar is the array of items"
         );
+    }
+
+    // ---- phase B: cosine dedup, stored vectors, backfill ----
+
+    use super::{Dedup, SIM_NEAR, SIM_SAME, dedup_verdict, process_one_with, tick};
+    use crate::embed::{Embedder, FakeEmbedder};
+
+    /// Claim the next due queue row and process it with `answer` as the brain's reply.
+    async fn distil(pool: &SqlitePool, answer: &str, embedder: Option<&dyn Embedder>) {
+        let runner = fake_answering(answer);
+        let row = claim_next(pool, noon()).await.unwrap().expect("a due row");
+        process_one_with(pool, Extractor::Cli(&runner), embedder, row, noon()).await;
+    }
+
+    async fn embedding_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_embeddings")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn events_noted(pool: &SqlitePool, note: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_events WHERE note = ?")
+            .bind(note)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn id_of(pool: &SqlitePool, title: &str) -> i64 {
+        sqlx::query_scalar("SELECT id FROM knowledge WHERE title = ?")
+            .bind(title)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn dedup_thresholds_split_same_near_and_new() {
+        const { assert!(SIM_SAME > SIM_NEAR, "same sits above near") };
+        assert!(matches!(
+            dedup_verdict(Some((7, SIM_SAME + 0.01))),
+            Dedup::Same(7)
+        ));
+        assert!(
+            matches!(dedup_verdict(Some((7, SIM_SAME))), Dedup::Same(7)),
+            "the same threshold is inclusive"
+        );
+        assert!(matches!(
+            dedup_verdict(Some((8, SIM_SAME - 0.01))),
+            Dedup::Near(8)
+        ));
+        assert!(
+            matches!(dedup_verdict(Some((8, SIM_NEAR))), Dedup::Near(8)),
+            "the near threshold is inclusive"
+        );
+        assert!(matches!(
+            dedup_verdict(Some((9, SIM_NEAR - 0.01))),
+            Dedup::New
+        ));
+        assert!(matches!(dedup_verdict(None), Dedup::New));
+    }
+
+    #[tokio::test]
+    async fn a_learning_close_enough_reconfirms_the_existing_row() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        seed_queue(&pool, "job_landed", 1, None, "pending", 0, None).await;
+        // Two different titles, one meaning: the fake maps both to the same vector.
+        let embedder = FakeEmbedder::new("fake-model", Vec::new(), Some(vec![1.0, 0.0]));
+        let embedder: &dyn Embedder = &embedder;
+
+        distil(
+            &pool,
+            r#"[{"layer":"episodic","title":"The gate failed on CRLF","body":"b1"}]"#,
+            Some(embedder),
+        )
+        .await;
+        assert_eq!(learnings(&pool).await, 1);
+        sqlx::query("UPDATE knowledge SET last_confirmed_at = '2020-01-01T00:00:00+00:00'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        distil(
+            &pool,
+            r#"[{"layer":"episodic","title":"CRLF endings break the gate on Windows","body":"b2"}]"#,
+            Some(embedder),
+        )
+        .await;
+
+        assert_eq!(learnings(&pool).await, 1, "no second row for a paraphrase");
+        assert_eq!(events_noted(&pool, "reconfirmed").await, 1);
+        let (confirmed, expires): (String, Option<i64>) = sqlx::query_as(
+            "SELECT last_confirmed_at, expires_after_runs FROM knowledge WHERE scope_id = 'alpha'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_ne!(
+            confirmed, "2020-01-01T00:00:00+00:00",
+            "the row was renewed"
+        );
+        assert_eq!(expires, Some(crate::knowledge::DISTILLED_TRIAL_RUNS));
+    }
+
+    #[tokio::test]
+    async fn a_near_learning_is_written_with_a_near_duplicate_event() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        seed_queue(&pool, "job_landed", 1, None, "pending", 0, None).await;
+        // cosine([1, 0], [0.85, 0.5268]) is about 0.85: between SIM_NEAR and SIM_SAME.
+        let embedder = FakeEmbedder::new(
+            "fake-model",
+            vec![
+                ("First lesson".to_string(), vec![1.0, 0.0]),
+                ("Second lesson".to_string(), vec![0.85, 0.5268]),
+            ],
+            None,
+        );
+        let embedder: &dyn Embedder = &embedder;
+
+        distil(
+            &pool,
+            r#"[{"layer":"episodic","title":"First lesson","body":"b1"}]"#,
+            Some(embedder),
+        )
+        .await;
+        distil(
+            &pool,
+            r#"[{"layer":"episodic","title":"Second lesson","body":"b2"}]"#,
+            Some(embedder),
+        )
+        .await;
+
+        assert_eq!(
+            learnings(&pool).await,
+            2,
+            "a near learning is still written"
+        );
+        let first = id_of(&pool, "First lesson").await;
+        let second = id_of(&pool, "Second lesson").await;
+        let event: (String, String, String) = sqlx::query_as(
+            "SELECT from_status, to_status, note FROM knowledge_events
+              WHERE knowledge_id = ? AND note LIKE 'near_duplicate:%'",
+        )
+        .bind(second)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event.0, "active");
+        assert_eq!(event.1, "active", "a same-status event");
+        assert_eq!(
+            event.2,
+            format!("{}{first}", crate::knowledge::NOTE_NEAR_DUPLICATE)
+        );
+        assert_eq!(events_noted(&pool, "reconfirmed").await, 0);
+        assert_eq!(embedding_count(&pool).await, 2, "both rows keep a vector");
+    }
+
+    #[tokio::test]
+    async fn without_a_vector_only_the_fingerprint_dedups() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        seed_queue(&pool, "job_landed", 1, None, "pending", 0, None).await;
+
+        // No embedder at all: today's path, and no vector is stored.
+        distil(
+            &pool,
+            r#"[{"layer":"episodic","title":"Alpha lesson","body":"b1"},
+                {"layer":"episodic","title":"Beta lesson","body":"b2"}]"#,
+            None,
+        )
+        .await;
+        assert_eq!(learnings(&pool).await, 2);
+        assert_eq!(embedding_count(&pool).await, 0);
+
+        // An embedder that fails: the same, and the fingerprint still catches a repeat.
+        let failing = FakeEmbedder::failing();
+        distil(
+            &pool,
+            r#"[{"layer":"episodic","title":"alpha  lesson.","body":"b3"},
+                {"layer":"episodic","title":"Gamma lesson","body":"b4"}]"#,
+            Some(&failing as &dyn Embedder),
+        )
+        .await;
+        assert_eq!(
+            learnings(&pool).await,
+            3,
+            "the repeat reconfirmed, gamma is new"
+        );
+        assert_eq!(events_noted(&pool, "reconfirmed").await, 1);
+        assert_eq!(embedding_count(&pool).await, 0);
+        let (status, _, _, error) = queue_state(&pool, 2).await;
+        assert_eq!(
+            status, "done",
+            "a failing embedder never fails the row: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_distilled_row_is_stored_with_its_vector() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        // Orthogonal vectors (cosine 0), keyed by the text prefix (the title): identical vectors
+        // would make the second item a reconfirmation of the first, which is correct dedup.
+        let embedder = FakeEmbedder::new(
+            "fake-model",
+            vec![
+                ("Stored lesson".to_string(), vec![1.0, 0.0, 0.0]),
+                ("Stored rule".to_string(), vec![0.0, 1.0, 0.0]),
+            ],
+            None,
+        );
+
+        distil(
+            &pool,
+            r#"[{"layer":"episodic","title":"Stored lesson","body":"Kept with a vector."},
+                {"layer":"semantic","title":"Stored rule","body":"A rule waits proposed."}]"#,
+            Some(&embedder as &dyn Embedder),
+        )
+        .await;
+
+        assert_eq!(learnings(&pool).await, 2);
+        let ids = [
+            id_of(&pool, "Stored lesson").await,
+            id_of(&pool, "Stored rule").await,
+        ];
+        let vectors = crate::embed::vectors_for(&pool, &ids, "fake-model")
+            .await
+            .unwrap();
+        let expected = [vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]];
+        for (id, want) in ids.into_iter().zip(expected.iter()) {
+            assert_eq!(
+                vectors.get(&id),
+                Some(want),
+                "row {id} carries its own vector"
+            );
+        }
+        let calls = embedder.calls.lock().unwrap().clone();
+        assert!(
+            calls.contains(&crate::embed::text_of(
+                "Stored lesson",
+                "Kept with a vector."
+            )),
+            "the embedded text is title and body: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tick_serves_the_queue_before_backfilling() {
+        let pool = test_pool().await;
+        let (row_id, _) = seeded_cause(&pool, "job_failed").await;
+        // A live row that predates the embedder and has no vector.
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let declaration = crate::knowledge::Declaration {
+                project_id: Some("alpha"),
+                origin_run_id: None,
+                kind: crate::knowledge::Kind::Memory,
+                title: "Old rule",
+                body: "Never embedded.",
+                reasoning: "seeded",
+                supersedes: None,
+            };
+            let provenance = crate::knowledge::Provenance {
+                source: Some("distiller"),
+                distill_cause: Some("job_failed"),
+                evidence: None,
+                points_at: None,
+                fingerprint: Some("title:old rule"),
+                layer: Some(crate::knowledge::Layer::Episodic),
+            };
+            crate::knowledge::record_distilled(&mut tx, &declaration, &provenance)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let old = id_of(&pool, "Old rule").await;
+        let embedder = FakeEmbedder::new("fake-model", Vec::new(), Some(vec![1.0, 0.0]));
+        let runner = fake_answering(
+            r#"[{"layer":"episodic","title":"Queue lesson","body":"From the queue."}]"#,
+        );
+
+        tick(
+            &pool,
+            Extractor::Cli(&runner),
+            Some(&embedder as &dyn Embedder),
+        )
+        .await;
+
+        assert_eq!(queue_state(&pool, row_id).await.0, "done");
+        let vectors = crate::embed::vectors_for(&pool, &[old], "fake-model")
+            .await
+            .unwrap();
+        assert!(vectors.contains_key(&old), "the idle tick backfilled it");
+        let calls = embedder.calls.lock().unwrap().clone();
+        let item = calls
+            .iter()
+            .position(|c| c == &crate::embed::text_of("Queue lesson", "From the queue."))
+            .expect("the queue item was embedded");
+        let backfilled = calls
+            .iter()
+            .position(|c| c == &crate::embed::text_of("Old rule", "Never embedded."))
+            .expect("the old row was embedded");
+        assert!(item < backfilled, "queue first, backfill after: {calls:?}");
     }
 }

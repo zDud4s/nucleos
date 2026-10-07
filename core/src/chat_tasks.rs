@@ -72,7 +72,11 @@ fn launched(call: &crate::runner::ToolCall) -> Option<Launch> {
             _ => "running",
         }
     } else if call.finished_at.is_some() {
-        if call.result_failed { "failed" } else { "completed" }
+        if call.result_failed {
+            "failed"
+        } else {
+            "completed"
+        }
     } else {
         // A foreground subagent whose turn ended before it answered ended with that turn.
         "stopped"
@@ -85,10 +89,18 @@ fn launched(call: &crate::runner::ToolCall) -> Option<Launch> {
         model: call.model.clone(),
         status,
         started_at: call.started_at.clone(),
-        finished_at: if status == "running" { None } else { call.finished_at.clone() },
+        finished_at: if status == "running" {
+            None
+        } else {
+            call.finished_at.clone()
+        },
         total_tokens: call.tokens.and_then(|t| i64::try_from(t).ok()),
         // A background call's answer only acknowledges the launch; its end event says the rest.
-        summary: if call.background { None } else { call.result.as_deref().map(cut) },
+        summary: if call.background {
+            None
+        } else {
+            call.result.as_deref().map(cut)
+        },
     })
 }
 
@@ -113,7 +125,10 @@ fn task_update(line: &str) -> Option<TaskUpdate> {
     if !subtype.starts_with("task_") {
         return None;
     }
-    let task_id = value.get("task_id").and_then(serde_json::Value::as_str)?.to_owned();
+    let task_id = value
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)?
+        .to_owned();
     let word = match subtype {
         "task_updated" => value.pointer("/patch/status"),
         "task_notification" => value.get("status"),
@@ -240,6 +255,29 @@ pub async fn orphan_running(pool: &SqlitePool) -> sqlx::Result<u64> {
     Ok(done.rows_affected())
 }
 
+/// A kept process ended: every task its turns launched and that is still `running` ended with it.
+pub async fn stop_launched_by(
+    pool: &SqlitePool,
+    chat_id: &str,
+    run_ids: &[i64],
+) -> sqlx::Result<u64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut closed = 0;
+    for run_id in run_ids {
+        closed += sqlx::query(
+            "UPDATE chat_tasks SET status = 'stopped', finished_at = COALESCE(finished_at, ?)
+              WHERE chat_id = ? AND launched_by_run_id = ? AND status = 'running'",
+        )
+        .bind(&now)
+        .bind(chat_id)
+        .bind(run_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+    Ok(closed)
+}
+
 /// A chat's tasks, oldest first (at most `READ_LIMIT`, the newest).
 pub async fn for_chat(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<ChatTask>> {
     sqlx::query_as::<_, ChatTask>(
@@ -270,7 +308,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 
@@ -312,11 +350,17 @@ mod tests {
         assert_eq!(task.kind, "subagent");
         assert_eq!(task.status, "completed");
         assert_eq!(task.total_tokens, Some(4242));
-        assert_eq!(task.summary.as_deref(), Some("the callers are in parser.rs"));
+        assert_eq!(
+            task.summary.as_deref(),
+            Some("the callers are in parser.rs")
+        );
         assert_eq!(task.subagent_type.as_deref(), Some("Explore"));
         assert_eq!(task.model.as_deref(), Some("haiku"));
         assert_eq!(task.launched_by_run_id, 7);
-        assert_eq!(task.finished_at.as_deref(), Some("2026-10-06T10:00:05.000Z"));
+        assert_eq!(
+            task.finished_at.as_deref(),
+            Some("2026-10-06T10:00:05.000Z")
+        );
         let bash = row(&pool, "toolu_bg").await;
         assert_eq!(bash.kind, "background_bash");
         assert_eq!(bash.status, "running");
@@ -390,5 +434,31 @@ mod tests {
             assert!(task.finished_at.is_some(), "{call}");
         }
         assert_eq!(row(&pool, "toolu_task").await.status, "completed");
+    }
+
+    #[tokio::test]
+    async fn stopping_a_process_closes_only_the_tasks_it_launched() {
+        let pool = test_pool().await;
+        record_turn(&pool, "chat-1", 7, LAUNCHES).await;
+        sqlx::query(
+            "INSERT INTO chat_tasks (chat_id, launched_by_run_id, tool_use_id, kind, status, started_at)
+             VALUES ('chat-1', 8, 'toolu_other', 'background_bash', 'running', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(stop_launched_by(&pool, "chat-1", &[7]).await.unwrap(), 2);
+
+        for call in ["toolu_bg", "toolu_agent"] {
+            let task = row(&pool, call).await;
+            assert_eq!(task.status, "stopped", "{call}");
+            assert!(task.finished_at.is_some(), "{call}");
+        }
+        assert_eq!(row(&pool, "toolu_task").await.status, "completed");
+        assert_eq!(row(&pool, "toolu_other").await.status, "running");
+
+        assert_eq!(stop_launched_by(&pool, "chat-2", &[8]).await.unwrap(), 0);
+        assert_eq!(row(&pool, "toolu_other").await.status, "running");
     }
 }

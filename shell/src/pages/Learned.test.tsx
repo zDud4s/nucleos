@@ -49,8 +49,13 @@ function known(over: Partial<Known> = {}): Known {
 }
 
 /** A daemon holding exactly this much, and answering the detail route from it. */
-function daemonWith(rows: Known[], history?: Partial<KnowledgeHistory>) {
+function daemonWith(
+  rows: Known[],
+  history?: Partial<KnowledgeHistory>,
+  causes: { id: number; cause: string }[] = [],
+) {
   return (path: string) => {
+    if (path === "/distill/causes") return Promise.resolve(causes);
     if (path === "/knowledge") return Promise.resolve(rows);
     if (path.startsWith("/knowledge/")) {
       const id = Number(path.split("/")[2]);
@@ -523,5 +528,30 @@ describe("Learned", () => {
 
     expect(await screen.findByText("older evidence")).toBeDefined();
     expect(daemon.apiFetch).toHaveBeenCalledWith("/knowledge/2");
+  });
+
+  it("a distilled row says which job it came from, why, and links its runs", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith(
+        [
+          known({
+            id: 5,
+            source: "distiller",
+            evidence: '[{"t":"job","id":7},{"t":"run","id":3}]',
+          }),
+        ],
+        undefined,
+        [{ id: 5, cause: "job_failed" }],
+      ),
+    );
+
+    await renderWithRouter(<Learned />);
+
+    expect(await screen.findByText(/distilled from/)).toBeDefined();
+    const jobLink = await screen.findAllByRole("link", { name: "job #7" });
+    expect(jobLink[0].getAttribute("href")).toContain("/fleet");
+    expect(await screen.findByText(/the job failed/)).toBeDefined();
+    const runLink = await screen.findByRole("link", { name: "run 3" });
+    expect(runLink.getAttribute("href")).toContain("/runs/3");
   });
 });

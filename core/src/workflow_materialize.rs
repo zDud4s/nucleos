@@ -204,7 +204,7 @@ pub fn owns_entries(owns: &[String]) -> Vec<String> {
 
 /// Whether `file` (a bundle-relative path) is provided by `entries`: named exactly, or under a
 /// directory one of them names.
-pub(crate) fn provided(entries: &[String], file: &str) -> bool {
+pub fn provided(entries: &[String], file: &str) -> bool {
     entries
         .iter()
         .any(|entry| file == entry || file.starts_with(&format!("{entry}/")))
@@ -328,7 +328,7 @@ struct OfferedBlock {
 /// `None` unless its first line is the begin marker, its last the end marker, and neither marker
 /// appears anywhere else — a marker inside would make the written region end where the next run
 /// cannot tell it does. Packaging refuses such a source with the same test (`workflow_package`).
-pub(crate) fn render_block(source: &str) -> Option<String> {
+pub fn render_block(source: &str) -> Option<String> {
     let text = source.trim_start_matches('\u{feff}').replace("\r\n", "\n");
     let body = text.trim_end_matches('\n');
     let lines: Vec<&str> = body.split('\n').collect();
@@ -1416,7 +1416,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("worktree");
         std::fs::create_dir_all(&worktree).unwrap();
@@ -1530,7 +1530,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let tree = temp
             .path()

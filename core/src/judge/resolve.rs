@@ -351,7 +351,7 @@ pub fn hard_deny_note(action_class: &str) -> String {
 
 /// What a question is about: a tool call (E1/E3) or a failed gate (E4).
 #[derive(Debug, Clone)]
-pub(crate) enum Subject {
+pub enum Subject {
     Call {
         tool_name: String,
         tool_input: Value,
@@ -366,7 +366,7 @@ pub(crate) enum Subject {
 
 /// One block put to the judge. Owned, so an observation can outlive the hook's request.
 #[derive(Debug, Clone)]
-pub(crate) struct Asked {
+pub struct Asked {
     pub run_id: i64,
     pub lineage_root_id: i64,
     pub event: Event,
@@ -381,7 +381,7 @@ pub(crate) struct Asked {
 
 /// D13: one row per question, whatever came of it.
 #[derive(Debug, Clone)]
-pub(crate) struct ResolutionRow {
+pub struct ResolutionRow {
     pub run_id: i64,
     pub lineage_root_id: i64,
     pub event: Event,
@@ -455,7 +455,7 @@ async fn thresholds_for(
 /// D10's E4 state: the task, and the gate's output as DATA (the agent may have written what the
 /// tests print). Redacted, and cut to the LAST `GATE_TAIL_CHARS` characters, where a failure says
 /// what failed.
-pub(crate) fn render_gate_state(task: &str, exit_code: i32, output: &str) -> String {
+pub fn render_gate_state(task: &str, exit_code: i32, output: &str) -> String {
     let redact = crate::judge::redact_for_judge;
     let task = crate::judge::trim_two_thirds(&redact(task), crate::judge::TASK_CAP_CHARS);
     let tail = last_chars(
@@ -467,7 +467,7 @@ pub(crate) fn render_gate_state(task: &str, exit_code: i32, output: &str) -> Str
     )
 }
 
-pub(crate) fn last_chars(text: &str, cap: usize) -> String {
+pub fn last_chars(text: &str, cap: usize) -> String {
     let count = text.chars().count();
     text.chars().skip(count.saturating_sub(cap)).collect()
 }
@@ -535,7 +535,7 @@ enum Failure {
 /// D10/D11/D13: prepares and asks within the event's deadline, the way spec A's `judge_call`
 /// does, and returns the row, recorded by the CALLER, off the response path, once it knows the
 /// final outcome. Every failure leaves `judge_outcome` empty and the default in place (D1).
-pub(crate) async fn ask(pool: &SqlitePool, runtime: &JudgeRuntime, asked: &Asked) -> ResolutionRow {
+pub async fn ask(pool: &SqlitePool, runtime: &JudgeRuntime, asked: &Asked) -> ResolutionRow {
     ask_within(pool, runtime, asked, deadline_for(asked.event)).await
 }
 
@@ -606,7 +606,7 @@ async fn ask_within(
     row
 }
 
-pub(crate) async fn record(pool: &SqlitePool, row: &ResolutionRow) -> sqlx::Result<i64> {
+pub async fn record(pool: &SqlitePool, row: &ResolutionRow) -> sqlx::Result<i64> {
     sqlx::query(
         "INSERT INTO judge_resolutions
          (run_id, lineage_root_id, event, event_ref, tool_input_digest, p_off_task, p_needed,
@@ -639,7 +639,7 @@ pub(crate) async fn record(pool: &SqlitePool, row: &ResolutionRow) -> sqlx::Resu
 }
 
 /// D13: written off the response path, like spec A's `record_later`, and logged rather than lost.
-pub(crate) fn record_later(pool: &SqlitePool, row: ResolutionRow) {
+pub fn record_later(pool: &SqlitePool, row: ResolutionRow) {
     let pool = pool.clone();
     tokio::spawn(async move {
         if let Err(error) = record(&pool, &row).await {
@@ -653,7 +653,7 @@ pub(crate) fn record_later(pool: &SqlitePool, row: ResolutionRow) {
 /// The lineage read (D2/S1) happens HERE, inside the spawned task, and not in the hook: in observe
 /// nothing the judge says changes the answer, so a database read on the hook's response path would
 /// be latency bought for nothing (D10: observing never delays the hook).
-pub(crate) fn observe(pool: &SqlitePool, runtime: &std::sync::Arc<JudgeRuntime>, asked: Asked) {
+pub fn observe(pool: &SqlitePool, runtime: &std::sync::Arc<JudgeRuntime>, asked: Asked) {
     let pool = pool.clone();
     let runtime = runtime.clone();
     tokio::spawn(async move {
@@ -670,7 +670,7 @@ pub(crate) fn observe(pool: &SqlitePool, runtime: &std::sync::Arc<JudgeRuntime>,
 /// `resolution_run_id` names one run and only the resume and the handoff move it (spec B 1.3,
 /// bug 2): the question has to find a successor that the column does not name. An error reads
 /// as "a resolution", the direction that leaves the run as it is today.
-pub(crate) async fn is_resolution_lineage(pool: &SqlitePool, root: i64) -> bool {
+pub async fn is_resolution_lineage(pool: &SqlitePool, root: i64) -> bool {
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM vcs_requests v JOIN runs r ON r.id = v.resolution_run_id
                         WHERE r.id = ?1 OR r.lineage_root_id = ?1)",
@@ -685,7 +685,7 @@ pub(crate) async fn is_resolution_lineage(pool: &SqlitePool, root: i64) -> bool 
 /// handoff, which is what happens to `denials`. Soft: count, then write, with no lock around it
 /// (D5 says why that is acceptable), and the write is off the response path. A read that fails
 /// counts as the ceiling spent, and the run parks: today's direction.
-pub(crate) async fn redirects_in_lineage(pool: &SqlitePool, root: i64) -> i64 {
+pub async fn redirects_in_lineage(pool: &SqlitePool, root: i64) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM judge_resolutions
          WHERE lineage_root_id = ? AND event = 'park' AND final_outcome = 'explain' AND enforced = 1",
@@ -699,13 +699,13 @@ pub(crate) async fn redirects_in_lineage(pool: &SqlitePool, root: i64) -> i64 {
 /// Spec B D13: a resolver answer taken at spec A's point and carried to the E3 point. If the hook
 /// returns in between, the question was paid for and no park happened: dropping this records the
 /// row as `moot`, so its cost still counts and it never enters the review queue.
-pub(crate) struct PendingPark {
+pub struct PendingPark {
     pool: SqlitePool,
     row: Option<ResolutionRow>,
 }
 
 impl PendingPark {
-    pub(crate) fn new(pool: &SqlitePool, row: ResolutionRow) -> Self {
+    pub fn new(pool: &SqlitePool, row: ResolutionRow) -> Self {
         Self {
             pool: pool.clone(),
             row: Some(row),
@@ -713,7 +713,7 @@ impl PendingPark {
     }
 
     /// The answer, for the E3 point, which records it itself.
-    pub(crate) fn take(mut self) -> Option<ResolutionRow> {
+    pub fn take(mut self) -> Option<ResolutionRow> {
         self.row.take()
     }
 }
@@ -743,7 +743,7 @@ impl Drop for PendingPark {
 /// today (E1: the refusal; E3: the park): a resolution lineage, a read that failed
 /// (`is_resolution_lineage` reads an error as a resolution), or a read that did not come back in
 /// time. Never an allow.
-pub(crate) async fn ask_unless_resolution(
+pub async fn ask_unless_resolution(
     pool: &SqlitePool,
     runtime: &JudgeRuntime,
     asked: &Asked,

@@ -49,6 +49,7 @@ tests:
   no_test:
     # Its tests live in the local workflow (.ai/), which is not versioned.
     - scripts/heavy.py
+    - scripts/heavy_watch.py
     - scripts/stage-bundle-bins.sh
     - scripts/css-contract.mjs
     - scripts/preview-shots.mjs

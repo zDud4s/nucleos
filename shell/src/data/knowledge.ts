@@ -78,6 +78,7 @@ export type KnownStatus =
 
 export const EVIDENCE_TAGS = [
   "run",
+  "job",
   "job_item",
   "proposal",
   "knowledge",
@@ -101,7 +102,7 @@ export interface Known {
   /** `null` only for `machine`: a lesson about the house rather than about a repo. */
   scope_id: string | null;
   /** Who knocked at the door — never read from the body. */
-  source: "owner" | "run" | "consolidator";
+  source: "owner" | "run" | "consolidator" | "distiller";
   generator: string | null;
   kind: KnownKind;
   title: string;
@@ -150,6 +151,48 @@ export function parseEvidence(raw: string | null): EvidenceRef[] {
     if (typeof candidate.id !== "string" && typeof candidate.id !== "number") return [];
     return [{ t: candidate.t as EvidenceTag, id: candidate.id }];
   });
+}
+
+/** Why the distiller wrote a row, in the words /learned shows — `distill::Cause`'s wire names. */
+export const DISTILL_CAUSE_LABELS: Record<string, string> = {
+  job_landed: "the job landed",
+  job_failed: "the job failed",
+  gate_recovered: "a red gate recovered",
+  review_blocking: "a review blocked it",
+  run_exhausted: "a run ran out of attempts",
+};
+
+/** Where a distilled row came from: its job, the runs behind it, and why it was written. */
+export interface DistilledOrigin {
+  job: number | string | null;
+  runs: (number | string)[];
+  /** The raw cause as the daemon answered it, `null` when none is on record. */
+  cause: string | null;
+  /** The cause in words; the raw cause itself when this shell does not know it. */
+  causeLabel: string | null;
+}
+
+/**
+ * The origin of a row the distiller wrote, `null` for every other row.
+ *
+ * Pure: the causes arrive as a map because `Known` does not carry `distill_cause`
+ * (`GET /distill/causes` serves it apart). An unknown cause shows as itself, so a
+ * cause a newer daemon invents is readable rather than hidden.
+ */
+export function distilledOrigin(
+  row: Known,
+  causes: ReadonlyMap<number, string>,
+): DistilledOrigin | null {
+  if (row.source !== "distiller") return null;
+
+  const refs = parseEvidence(row.evidence);
+  const cause = causes.get(row.id) ?? null;
+  return {
+    job: refs.find((ref) => ref.t === "job")?.id ?? null,
+    runs: refs.filter((ref) => ref.t === "run").map((ref) => ref.id),
+    cause,
+    causeLabel: cause === null ? null : (DISTILL_CAUSE_LABELS[cause] ?? cause),
+  };
 }
 
 export interface MeasuredScope {
@@ -254,6 +297,18 @@ export function useKnowledge() {
     queryKey: keys.knowledge.all,
     queryFn: () => apiFetch<Known[]>("/knowledge"),
     refetchInterval: POLL.queue,
+  });
+}
+
+/** The cause of every distilled row, by row id — `GET /distill/causes`. */
+export function useDistillCauses() {
+  return useQuery({
+    queryKey: keys.knowledge.distillCauses,
+    queryFn: () => apiFetch<{ id: number; cause: string }[]>("/distill/causes"),
+    refetchInterval: POLL.queue,
+    // A daemon that does not serve the route answers nothing usable: no causes, not an error.
+    select: (rows): ReadonlyMap<number, string> =>
+      new Map(Array.isArray(rows) ? rows.map((row) => [row.id, row.cause] as const) : []),
   });
 }
 
