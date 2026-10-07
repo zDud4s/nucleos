@@ -18,6 +18,11 @@ const (
 	RecordFrame byte = 'F'
 	// RecordEnd carries `{"reason":"closed|wheel|gone"}` and is the last record of a stream.
 	RecordEnd byte = 'E'
+	// RecordMeta carries the frame geometry as JSON; it precedes the first frame and any frame whose
+	// geometry differs from the last one written.
+	RecordMeta byte = 'M'
+	// RecordPrompt carries a prompt for the viewer to answer, as JSON.
+	RecordPrompt byte = 'P'
 )
 
 // MaxRecord bounds what ReadRecord will allocate for one record.

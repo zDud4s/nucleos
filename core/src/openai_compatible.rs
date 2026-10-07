@@ -57,8 +57,7 @@ pub struct OpenAiCompatibleChat {
 /// local disk here, but OpenRouter's own routing can retry a request across more than one upstream
 /// provider before answering, and a request that times out mid-route reads exactly like a hung
 /// server rather than what it actually is.
-pub(crate) const OPENROUTER_EXCHANGE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(120);
+pub const OPENROUTER_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl OpenAiCompatibleChat {
     /// Builds the client, or refuses.

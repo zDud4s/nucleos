@@ -65,6 +65,8 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 	watcher, _ := driver.(browser.Watcher)
 	mux.HandleFunc("/watch", authorized(cfg.DaemonToken, watchHandler(watcher)))
 
+	personRoutes(mux, cfg.DaemonToken, driver)
+
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           mux,
@@ -482,9 +484,24 @@ func watchHandler(watcher browser.Watcher) http.HandlerFunc {
 				cancel()
 			}
 		}
+		var last *browser.FrameMeta
 		sink := func(f browser.Frame) {
 			mu.Lock()
 			defer mu.Unlock()
+			if f.Prompt != nil {
+				// A question for the viewer, and nothing else: it has no picture and no geometry.
+				if body, err := json.Marshal(f.Prompt); err == nil {
+					write(RecordPrompt, body)
+				}
+				return
+			}
+			if f.Meta != nil && (last == nil || *f.Meta != *last) {
+				copied := *f.Meta
+				last = &copied
+				if body, err := json.Marshal(copied); err == nil {
+					write(RecordMeta, body)
+				}
+			}
 			write(RecordFrame, f.JPEG)
 		}
 

@@ -503,7 +503,7 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One claimed row of `distill_queue`; `attempts` is the stored count, not yet incremented.
 #[derive(Debug, sqlx::FromRow)]
-pub(crate) struct QueueRow {
+pub struct QueueRow {
     pub id: i64,
     pub cause: String,
     pub project_id: String,
@@ -514,7 +514,7 @@ pub(crate) struct QueueRow {
 }
 
 /// Put every row a dead daemon left `running` back in line. Returns the rows changed.
-pub(crate) async fn recover_running(pool: &SqlitePool) -> sqlx::Result<u64> {
+pub async fn recover_running(pool: &SqlitePool) -> sqlx::Result<u64> {
     let changed = sqlx::query("UPDATE distill_queue SET status = ? WHERE status = ?")
         .bind(STATUS_PENDING)
         .bind(STATUS_RUNNING)
@@ -525,10 +525,7 @@ pub(crate) async fn recover_running(pool: &SqlitePool) -> sqlx::Result<u64> {
 
 /// Take the oldest due row, marking it `running` in the same statement. A row whose cause this
 /// build does not know is failed on the spot and the next one is tried.
-pub(crate) async fn claim_next(
-    pool: &SqlitePool,
-    now: DateTime<Utc>,
-) -> sqlx::Result<Option<QueueRow>> {
+pub async fn claim_next(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Option<QueueRow>> {
     loop {
         let row: Option<QueueRow> = sqlx::query_as(
             "UPDATE distill_queue SET status = ?
@@ -889,8 +886,7 @@ async fn write_items(
 }
 
 /// Distil one claimed row. Every failure ends in [`fail`]; nothing is returned.
-#[cfg_attr(not(test), allow(dead_code))] // Tests only; production goes through `tick`.
-pub(crate) async fn process_one(
+pub async fn process_one(
     pool: &SqlitePool,
     asked: Extractor<'_>,
     row: QueueRow,
@@ -1008,12 +1004,15 @@ pub async fn run_distill_loop(state: crate::state::AppState) {
             _ = interval.tick() => {}
             _ = crate::embed::nudged() => {}
         }
-        tick(
-            &state.pool,
-            Extractor::Cli(state.runner.as_ref()),
-            crate::embed::installed().as_deref(),
-        )
-        .await;
+        // Read per tick so a change of model needs no restart. A choice this machine cannot serve
+        // leaves the rows pending until it can: the distiller never falls back to the cloud for a
+        // dossier its owner sent somewhere else, and the refusal is logged once by `route_for`.
+        let route = match crate::distill_model::route_for(&state).await {
+            Ok(route) => route,
+            Err(_) => continue,
+        };
+        let asked = route.extractor(state.runner.as_ref(), &state.web.http);
+        tick(&state.pool, asked, crate::embed::installed().as_deref()).await;
     }
 }
 
@@ -1068,7 +1067,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 

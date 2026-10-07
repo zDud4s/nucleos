@@ -65,7 +65,7 @@ const UNTRACED_MODES: [&str; 4] = [
 ];
 
 /// The trace window, overridable independently from the other hourly retention sweeps.
-pub(crate) fn retention_days() -> i64 {
+pub fn retention_days() -> i64 {
     std::env::var("NUCLEOS_KNOWLEDGE_TRACE_RETENTION_DAYS")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
@@ -448,14 +448,14 @@ pub async fn trace_of(pool: &SqlitePool, run_id: i64) -> sqlx::Result<Option<Run
 
 /// What the work that received a briefing ultimately proved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Verdict {
+pub enum Verdict {
     Green,
     NotGreen,
     NoOutcome,
 }
 
 /// Map a final run to the signal it contributes to the knowledge it was shown.
-pub(crate) fn run_verdict(
+pub fn run_verdict(
     status: &str,
     exit_code: Option<i64>,
     gate_status: Option<&str>,
@@ -476,7 +476,7 @@ pub(crate) fn run_verdict(
 }
 
 /// Map an item state and its stored gate/run evidence to a final verdict.
-pub(crate) fn item_verdict(
+pub fn item_verdict(
     state: crate::job::ItemState,
     gate_status: Option<&str>,
     job_ended: bool,
@@ -680,7 +680,7 @@ async fn credit_item_by_id(pool: &SqlitePool, item_id: i64) -> sqlx::Result<u64>
 }
 
 /// Credit one job item once its item-level verdict is final.
-pub(crate) async fn credit_item(pool: &SqlitePool, job_id: i64, ordinal: i64) -> sqlx::Result<u64> {
+pub async fn credit_item(pool: &SqlitePool, job_id: i64, ordinal: i64) -> sqlx::Result<u64> {
     let item_id: Option<i64> =
         sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
             .bind(job_id)
@@ -694,7 +694,7 @@ pub(crate) async fn credit_item(pool: &SqlitePool, job_id: i64, ordinal: i64) ->
 }
 
 /// Credit one standalone run by the final run at the end of its handoff or resume chain.
-pub(crate) async fn credit_run(pool: &SqlitePool, run_id: i64) -> sqlx::Result<u64> {
+pub async fn credit_run(pool: &SqlitePool, run_id: i64) -> sqlx::Result<u64> {
     let owner: Option<(Option<i64>,)> = sqlx::query_as("SELECT job_id FROM runs WHERE id = ?")
         .bind(run_id)
         .fetch_optional(pool)
@@ -786,7 +786,7 @@ async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
     Ok(total)
 }
 
-pub(crate) async fn sweep(pool: &SqlitePool) -> sqlx::Result<u64> {
+pub async fn sweep(pool: &SqlitePool) -> sqlx::Result<u64> {
     sweep_at_most(pool, SWEEP_BATCH).await
 }
 
@@ -822,7 +822,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 
@@ -2030,10 +2030,8 @@ mod tests {
             running_in.display(),
         );
 
-        let mut sources = fs::read_dir(running_in.join("src"))
-            .expect("core source directory must be readable")
-            .map(|entry| entry.expect("core source entry must be readable").path())
-            .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("rs"))
+        let mut sources = crate::source_scan::top_level_rust_files()
+            .into_iter()
             .map(|path| {
                 let name = path
                     .file_name()

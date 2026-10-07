@@ -3,7 +3,7 @@
 //! error, never an answer.
 
 use std::collections::BTreeMap;
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -79,7 +79,7 @@ impl std::fmt::Display for JudgeError {
 impl JudgeError {
     /// Whether the request may have reached TypeSafe, and may be billed. A missing key and a
     /// missing permit are certain not to have; every other failure happened on or after the wire.
-    pub(crate) fn may_have_been_billed(&self) -> bool {
+    pub fn may_have_been_billed(&self) -> bool {
         !matches!(self, Self::NoKey(_) | Self::Busy)
     }
 }
@@ -127,11 +127,11 @@ fn parse_answers(payload: &Value, questions: &[Question]) -> Result<Answers, Jud
     })
 }
 
-pub(crate) enum KeySource {
+pub enum KeySource {
     /// D3: the keyring, read per call with `spawn_blocking` (the keyring is synchronous), the way
     /// `github.rs` reads its token. `secrets.rs` refuses files and environment variables.
     Keyring,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     Fixed(Option<String>),
 }
 
@@ -152,7 +152,7 @@ impl JevJudge {
         Self::with(base_url, KeySource::Keyring, CLIENT_TIMEOUT)
     }
 
-    pub(crate) fn with(base_url: &str, key: KeySource, timeout: Duration) -> Self {
+    pub fn with(base_url: &str, key: KeySource, timeout: Duration) -> Self {
         Self {
             client: OnceLock::new(),
             timeout,
@@ -161,8 +161,8 @@ impl JevJudge {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_tests(base_url: &str, key: Option<&str>, timeout: Duration) -> Self {
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn for_tests(base_url: &str, key: Option<&str>, timeout: Duration) -> Self {
         Self::with(base_url, KeySource::Fixed(key.map(str::to_owned)), timeout)
     }
 
@@ -193,7 +193,7 @@ impl JevJudge {
                     Err(error) => Err(JudgeError::NoKey(error.to_string())),
                 }
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testkit"))]
             KeySource::Fixed(key) => key
                 .clone()
                 .ok_or_else(|| JudgeError::NoKey("no TypeSafe key is stored".to_owned())),
@@ -241,18 +241,18 @@ impl Judge for JevJudge {
 /// A judge that answers what it was told to, counts its calls and keeps the last `state` it saw.
 /// No network: this is the D1 seam the hook's tests use; `JevJudge`'s own tests use a fake HTTP
 /// server instead.
-#[cfg(test)]
-pub(crate) struct ScriptedJudge {
+#[cfg(any(test, feature = "testkit"))]
+pub struct ScriptedJudge {
     /// Every key's answer; a key not here is answered 0.5, as before.
     reply: Result<BTreeMap<&'static str, f64>, JudgeError>,
     delay: Option<Duration>,
     calls: std::sync::atomic::AtomicUsize,
-    pub(crate) last_state: std::sync::Mutex<Option<String>>,
+    pub last_state: std::sync::Mutex<Option<String>>,
     /// Spec B: the keys of each call, in order - how a test proves a question was NOT asked.
     asked: std::sync::Mutex<Vec<Vec<&'static str>>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 impl ScriptedJudge {
     fn build(
         reply: Result<BTreeMap<&'static str, f64>, JudgeError>,
@@ -268,39 +268,36 @@ impl ScriptedJudge {
     }
 
     /// Answers A's two questions; any other question is answered 0.5.
-    pub(crate) fn answering(p_in_scope: f64, p_safe: f64) -> Arc<Self> {
+    pub fn answering(p_in_scope: f64, p_safe: f64) -> Arc<Self> {
         Self::answering_keys(&[(super::IN_SCOPE, p_in_scope), (super::SAFE, p_safe)])
     }
 
-    pub(crate) fn answering_keys(answers: &[(&'static str, f64)]) -> Arc<Self> {
+    pub fn answering_keys(answers: &[(&'static str, f64)]) -> Arc<Self> {
         Self::build(Ok(answers.iter().copied().collect()), None)
     }
 
-    pub(crate) fn answering_keys_slowly(
-        delay: Duration,
-        answers: &[(&'static str, f64)],
-    ) -> Arc<Self> {
+    pub fn answering_keys_slowly(delay: Duration, answers: &[(&'static str, f64)]) -> Arc<Self> {
         Self::build(Ok(answers.iter().copied().collect()), Some(delay))
     }
 
-    pub(crate) fn failing(error: JudgeError) -> Arc<Self> {
+    pub fn failing(error: JudgeError) -> Arc<Self> {
         Self::build(Err(error), None)
     }
 
-    pub(crate) fn slow(delay: Duration) -> Arc<Self> {
+    pub fn slow(delay: Duration) -> Arc<Self> {
         Self::answering_keys_slowly(delay, &[(super::IN_SCOPE, 0.99), (super::SAFE, 0.99)])
     }
 
-    pub(crate) fn calls(&self) -> usize {
+    pub fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(crate) fn asked_keys(&self) -> Vec<Vec<&'static str>> {
+    pub fn asked_keys(&self) -> Vec<Vec<&'static str>> {
         self.asked.lock().unwrap().clone()
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 #[async_trait::async_trait]
 impl Judge for ScriptedJudge {
     fn model(&self) -> &str {

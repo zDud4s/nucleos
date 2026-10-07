@@ -12,10 +12,10 @@ use crate::state::AppState;
 
 /// A push notification is tiny: identifiers plus one SHA. This route-specific ceiling prevents the
 /// daemon's only inbound trigger from inheriting axum's much larger default body allowance.
-pub(crate) const WEBHOOK_BODY_LIMIT: usize = 16 * 1024;
+pub const WEBHOOK_BODY_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct Delivery {
+pub struct Delivery {
     pub project_id: String,
     pub branch: String,
     pub sha: String,
@@ -25,14 +25,14 @@ pub(crate) struct Delivery {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub(crate) enum DeliveryOutcome {
+pub enum DeliveryOutcome {
     Fired { run_ids: Vec<i64> },
     Duplicate,
     Deferred { reason: String },
 }
 
 #[derive(Debug)]
-pub(crate) enum DeliveryError {
+pub enum DeliveryError {
     Invalid,
     Unconfigured,
     Storage(sqlx::Error),
@@ -91,7 +91,7 @@ async fn release_claim(state: &AppState, key: &str) -> Result<(), DeliveryError>
 
 /// Resolve an untrusted delivery against the managed-project roster and that project's configured
 /// repo triggers, then ask `repo_trigger` to start work through its shared governance path.
-pub(crate) async fn deliver(
+pub async fn deliver(
     state: &AppState,
     delivery: Delivery,
     now: chrono::DateTime<chrono::Utc>,
@@ -192,7 +192,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         let state = AppState {
             token: Token("test-token".into()),
             pool,

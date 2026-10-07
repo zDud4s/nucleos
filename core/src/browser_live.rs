@@ -1,6 +1,6 @@
-//! `GET /browser/sessions/{id}/live`: the sidecar's record stream, proxied to the shell for
-//! agent-mode sessions only and cut at a record boundary the moment the mode leaves `agent`
-//! (spec §3.2, browser-ao-vivo).
+//! `GET /browser/sessions/{id}/live`: the sidecar's record stream, proxied to the shell in agent
+//! mode, in wheel-requested and in human/shell, and cut at a record boundary the moment the
+//! (mode, seat) pair stops showing pixels (spec §3.2, browser-ao-vivo; never in window).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -100,27 +100,58 @@ impl RecordReader {
 /// while somebody watches: `publish` to a session nobody subscribed to creates nothing, and
 /// `release` forgets an entry once its last receiver is gone.
 #[derive(Debug, Default)]
-pub struct ModeChannels(pub Mutex<HashMap<i64, watch::Sender<String>>>);
+pub struct ModeChannels(pub Mutex<HashMap<i64, watch::Sender<LiveMode>>>);
+
+/// What decides whether pixels may flow: the mode and, for `human`, the seat. Both travel together
+/// because `human` with seat `shell` shows pixels and `human` with seat `window` must not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveMode {
+    pub mode: String,
+    pub seat: Option<String>,
+}
+
+impl LiveMode {
+    /// Agent and wheel-requested stream, and so does a person driving in the shell; a person in the
+    /// real window has nothing to show here.
+    pub fn shows_pixels(&self) -> bool {
+        self.mode == mode::AGENT
+            || self.mode == mode::WHEEL_REQUESTED
+            || (self.mode == mode::HUMAN && self.seat.as_deref() == Some("shell"))
+    }
+}
+
+/// A mode-only comparison, so callers that only care about the mode can compare to a mode constant.
+impl PartialEq<&str> for LiveMode {
+    fn eq(&self, other: &&str) -> bool {
+        self.mode == *other
+    }
+}
 
 impl ModeChannels {
-    pub fn subscribe(&self, id: i64) -> watch::Receiver<String> {
+    pub fn subscribe(&self, id: i64) -> watch::Receiver<LiveMode> {
         let mut channels = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         channels
             .entry(id)
-            .or_insert_with(|| watch::channel(mode::AGENT.to_owned()).0)
+            .or_insert_with(|| {
+                watch::channel(LiveMode {
+                    mode: mode::AGENT.to_owned(),
+                    seat: None,
+                })
+                .0
+            })
             .subscribe()
     }
 
-    pub fn publish(&self, id: i64, to: &str) {
+    pub fn publish(&self, id: i64, to: LiveMode) {
         let channels = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(sender) = channels.get(&id) {
-            sender.send_replace(to.to_owned());
+            sender.send_replace(to);
         }
     }
 
@@ -142,7 +173,7 @@ impl ModeChannels {
 struct LiveGuard {
     runtime: Arc<BrowserRuntime>,
     id: i64,
-    rx: Option<watch::Receiver<String>>,
+    rx: Option<watch::Receiver<LiveMode>>,
 }
 
 impl LiveGuard {
@@ -151,7 +182,7 @@ impl LiveGuard {
         Self { runtime, id, rx }
     }
 
-    fn rx(&mut self) -> &mut watch::Receiver<String> {
+    fn rx(&mut self) -> &mut watch::Receiver<LiveMode> {
         self.rx.as_mut().expect("the receiver lives until drop")
     }
 }
@@ -166,6 +197,22 @@ impl Drop for LiveGuard {
 
 pub async fn get_live(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     start(&state, id, async {}).await
+}
+
+/// The routed `/live` handler. A run requester is refused in EVERY mode, exactly as `/take`,
+/// `/input` and `/answer` refuse it, BEFORE any session lookup or the sidecar. A run that opened
+/// the stream while the session was in agent mode would otherwise keep receiving the person's
+/// pixels after an approval, and no pixels ever go to an agent or MCP.
+pub async fn get_live_checked(
+    State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if state.browser.enabled && crate::browser_seat::from_a_run(&scope, &headers) {
+        return crate::browser_seat::seat_error(crate::browser_seat::SeatError::RunRequester);
+    }
+    get_live(State(state), Path(id)).await
 }
 
 /// `after_read` runs between the row being read as `agent` and the sidecar being asked: a test
@@ -190,15 +237,22 @@ async fn start(
     let Some(row) = browser::live_session(state, id).await else {
         return browser::gone();
     };
-    if row.mode != mode::AGENT {
+    let at_read = LiveMode {
+        mode: row.mode.clone(),
+        seat: row.seat.clone(),
+    };
+    if !at_read.shows_pixels() {
+        let detail = format!(
+            "this session is {} in {}, so there are no pixels to show",
+            row.mode,
+            row.seat.as_deref().unwrap_or("no seat"),
+        );
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "refusal": "not_agent",
-                "detail": format!(
-                    "this session is {}, so what is on its screen is theirs",
-                    row.mode
-                ),
+                "refusal": "no_pixels",
+                "error": "no_pixels",
+                "detail": detail,
             })),
         )
             .into_response();
@@ -232,7 +286,7 @@ async fn pump(
         let chunk = tokio::select! {
             biased;
             changed = guard.rx().changed() => {
-                if changed.is_err() || *guard.rx().borrow() != mode::AGENT {
+                if changed.is_err() || !guard.rx().borrow().shows_pixels() {
                     let _ = out.write_all(&end_record("wheel").to_wire()).await;
                     ended = true;
                     break 'outer;
@@ -244,7 +298,7 @@ async fn pump(
         match chunk {
             Ok(Some(bytes)) => {
                 for record in reader.push(&bytes) {
-                    if *guard.rx().borrow() != mode::AGENT {
+                    if !guard.rx().borrow().shows_pixels() {
                         let _ = out.write_all(&end_record("wheel").to_wire()).await;
                         ended = true;
                         break 'outer;
@@ -295,7 +349,13 @@ mod tests {
         HalfThenStall,
         /// One whole frame, then half of a second one, then the stream ends.
         HalfThenEof,
+        /// A meta record `M`, a prompt record `P` and a frame `F`, then the stream ends.
+        MetaPromptFrame,
     }
+
+    const META: &[u8] = br#"{"url":"https://jira.example.org/login","title":"Sign in"}"#;
+    const PROMPT: &[u8] = br#"{"kind":"alert","message":"Leave this page?"}"#;
+    const FRAME: &[u8] = b"\xff\xd8\xff\xe0 jpeg-bytes";
 
     /// One record as the sidecar writes it: kind byte, u32 big-endian length, body.
     fn wire(kind: u8, body: &[u8]) -> Vec<u8> {
@@ -374,6 +434,17 @@ mod tests {
                                         tokio::time::sleep(Duration::from_millis(20)).await;
                                     }
                                 }
+                                Script::MetaPromptFrame => {
+                                    for (kind, body) in
+                                        [(b'M', META), (b'P', PROMPT), (b'F', FRAME)]
+                                    {
+                                        if writer.write_all(&wire(kind, body)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    let _ = writer.flush().await;
+                                    // Dropping the writer is the end of the stream.
+                                }
                                 Script::HalfThenStall | Script::HalfThenEof => {
                                     let whole = wire(b'F', b"whole-frame");
                                     let second = wire(b'F', b"0123456789");
@@ -411,6 +482,7 @@ mod tests {
                 enabled: true,
                 client: BrowserClient::new(&address.to_string(), "tok".into()),
                 modes: Default::default(),
+                seats: Default::default(),
             }),
             watches,
         )
@@ -477,17 +549,18 @@ mod tests {
         row.id
     }
 
-    /// Moves the session out of `agent` the way the wheel does, which publishes on the channel.
-    async fn leave_agent(state: &AppState, id: i64) {
-        let moved = crate::browser::set_mode(
+    /// Moves the session to a person driving a real window, which publishes on the channel.
+    async fn to_window(state: &AppState, id: i64) {
+        let moved = crate::browser::set_mode_seat(
             &state.pool,
             &state.browser.modes,
             id,
             crate::browser::mode::AGENT,
-            crate::browser::mode::WHEEL_REQUESTED,
+            crate::browser::mode::HUMAN,
+            Some("window"),
         )
         .await
-        .expect("set_mode");
+        .expect("set_mode_seat");
         assert!(moved, "the session was in agent mode");
     }
 
@@ -500,31 +573,6 @@ mod tests {
         .expect("the proxy must close the stream")
         .expect("body")
         .to_vec()
-    }
-
-    #[tokio::test]
-    async fn live_refuses_a_session_that_is_not_agent() {
-        let (_db, state, watches) = live(Script::Frames, true).await;
-        let id = an_agent_session(&state).await;
-        leave_agent(&state, id).await;
-
-        let response = start(&state, id, async {}).await;
-
-        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
-        assert_eq!(body["refusal"], "not_agent");
-        assert!(
-            body["detail"].as_str().unwrap().contains("wheel-requested"),
-            "the detail names the mode: {body}"
-        );
-        assert_eq!(
-            watches.load(Ordering::SeqCst),
-            0,
-            "a refused session must never reach the sidecar's /watch"
-        );
     }
 
     #[tokio::test]
@@ -571,7 +619,7 @@ mod tests {
         let flipper = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(120)).await;
-            leave_agent(&flipper, id).await;
+            to_window(&flipper, id).await;
         });
         let records = records_of(&collect(response).await);
 
@@ -599,7 +647,7 @@ mod tests {
         // window a check-then-act proxy loses.
         let hook_state = state.clone();
         let response = start(&state, id, async move {
-            leave_agent(&hook_state, id).await;
+            to_window(&hook_state, id).await;
         })
         .await;
 
@@ -617,7 +665,7 @@ mod tests {
         let flipper = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
-            leave_agent(&flipper, id).await;
+            to_window(&flipper, id).await;
         });
         let records = records_of(&collect(response).await);
 
@@ -682,14 +730,24 @@ mod tests {
         let modes = ModeChannels::default();
 
         // Publishing to a session nobody subscribed to creates nothing.
-        modes.publish(7, "human");
+        modes.publish(
+            7,
+            LiveMode {
+                mode: "human".into(),
+                seat: Some("window".into()),
+            },
+        );
         assert!(modes.0.lock().unwrap().is_empty());
 
         let first = modes.subscribe(7);
         let second = modes.subscribe(7);
-        modes.publish(7, "wheel-requested");
-        assert_eq!(*first.borrow(), "wheel-requested");
-        assert_eq!(*second.borrow(), "wheel-requested");
+        let requested = LiveMode {
+            mode: "wheel-requested".into(),
+            seat: None,
+        };
+        modes.publish(7, requested.clone());
+        assert_eq!(*first.borrow(), requested);
+        assert_eq!(*second.borrow(), requested);
 
         // One watcher left: the entry stays.
         drop(first);
@@ -703,5 +761,172 @@ mod tests {
             modes.0.lock().unwrap().is_empty(),
             "a registry that never forgets grows with every session ever watched"
         );
+    }
+
+    #[tokio::test]
+    async fn volante_live_serves_wheel_requested_and_human_shell() {
+        use crate::browser::mode;
+        let (_db, state, watches) = live(Script::Frames, true).await;
+        let id = an_agent_session(&state).await;
+
+        // wheel-requested: the agent's screen is still the only screen, so it is served.
+        assert!(
+            crate::browser::set_mode(
+                &state.pool,
+                &state.browser.modes,
+                id,
+                mode::AGENT,
+                mode::WHEEL_REQUESTED,
+            )
+            .await
+            .expect("set_mode")
+        );
+        let response = start(&state, id, async {}).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(watches.load(Ordering::SeqCst), 1);
+        drop(response);
+
+        // human on the shell seat: the pixels go to the shell, so they are served.
+        assert!(
+            crate::browser::set_mode_seat(
+                &state.pool,
+                &state.browser.modes,
+                id,
+                mode::WHEEL_REQUESTED,
+                mode::HUMAN,
+                Some("shell"),
+            )
+            .await
+            .expect("set_mode_seat")
+        );
+        let response = start(&state, id, async {}).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(watches.load(Ordering::SeqCst), 2);
+        drop(response);
+    }
+
+    #[tokio::test]
+    async fn volante_live_refuses_window_with_no_pixels() {
+        use crate::browser::mode;
+        let (_db, state, watches) = live(Script::Frames, true).await;
+        let id = an_agent_session(&state).await;
+        to_window(&state, id).await;
+
+        let response = start(&state, id, async {}).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(body["refusal"], "no_pixels");
+        assert_eq!(body["error"], "no_pixels");
+        assert!(
+            body["detail"].is_string(),
+            "a refusal explains itself: {body}"
+        );
+
+        // delivery-failed has no pixels either.
+        let (_db2, state2, watches2) = live(Script::Frames, true).await;
+        let id2 = an_agent_session(&state2).await;
+        assert!(
+            crate::browser::set_mode(
+                &state2.pool,
+                &state2.browser.modes,
+                id2,
+                mode::AGENT,
+                mode::DELIVERY_FAILED,
+            )
+            .await
+            .expect("set_mode")
+        );
+        let response = start(&state2, id2, async {}).await;
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(body["refusal"], "no_pixels");
+        assert_eq!(
+            watches.load(Ordering::SeqCst) + watches2.load(Ordering::SeqCst),
+            0,
+            "a refused session must never reach the sidecar's /watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn volante_live_cuts_when_the_session_goes_to_window() {
+        use crate::browser::mode;
+        let (_db, state, _watches) = live(Script::Frames, true).await;
+        let id = an_agent_session(&state).await;
+
+        let response = get_live(axum::extract::State(state.clone()), axum::extract::Path(id)).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let flipper = state.clone();
+        tokio::spawn(async move {
+            // agent -> wheel-requested -> human/shell: pixels still flow, nothing cuts.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            crate::browser::set_mode(
+                &flipper.pool,
+                &flipper.browser.modes,
+                id,
+                mode::AGENT,
+                mode::WHEEL_REQUESTED,
+            )
+            .await
+            .expect("set_mode");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            crate::browser::set_mode_seat(
+                &flipper.pool,
+                &flipper.browser.modes,
+                id,
+                mode::WHEEL_REQUESTED,
+                mode::HUMAN,
+                Some("shell"),
+            )
+            .await
+            .expect("set_mode_seat");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // human/shell -> human/window: the person's own screen, so the stream is cut.
+            crate::browser::set_mode_seat(
+                &flipper.pool,
+                &flipper.browser.modes,
+                id,
+                mode::HUMAN,
+                mode::HUMAN,
+                Some("window"),
+            )
+            .await
+            .expect("set_mode_seat");
+        });
+        let records = records_of(&collect(response).await);
+
+        let (last, frames) = records.split_last().unwrap();
+        assert_eq!(end_reason(last), "wheel");
+        assert!(
+            frames.len() >= 8,
+            "frames kept flowing through wheel-requested and human/shell: {}",
+            frames.len()
+        );
+        assert!(frames.iter().all(|record| record.kind == b'F'));
+    }
+
+    #[tokio::test]
+    async fn volante_live_passes_m_and_p_records_whole() {
+        let (_db, state, _watches) = live(Script::MetaPromptFrame, true).await;
+        let id = an_agent_session(&state).await;
+
+        let response = get_live(axum::extract::State(state.clone()), axum::extract::Path(id)).await;
+        let records = records_of(&collect(response).await);
+
+        assert_eq!(records.len(), 4, "M, P, F, then the end");
+        assert_eq!((records[0].kind, records[0].body.as_slice()), (b'M', META));
+        assert_eq!(
+            (records[1].kind, records[1].body.as_slice()),
+            (b'P', PROMPT)
+        );
+        assert_eq!((records[2].kind, records[2].body.as_slice()), (b'F', FRAME));
+        assert_eq!(end_reason(&records[3]), "gone");
     }
 }

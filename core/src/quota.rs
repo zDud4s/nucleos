@@ -191,7 +191,7 @@ impl QuotaRuntime {
     /// `web::WebRuntime::disabled` gives: a derived default would invent a client pointing at
     /// nothing, so "off" should be a thing somebody chose — and production always builds a real
     /// one, so left ungated this is dead code in the daemon.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn disabled() -> Self {
         Self {
             client: None,
@@ -1100,8 +1100,8 @@ pub async fn warn(
     Ok(spoken)
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "testkit"))]
+pub mod test_support {
     use super::*;
 
     pub async fn stub_sidecar(answer: serde_json::Value) -> String {
@@ -1171,7 +1171,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 

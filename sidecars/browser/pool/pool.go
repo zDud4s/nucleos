@@ -140,6 +140,9 @@ type entry struct {
 	// BROWSER, because that is what spec §4.1 bounds: one process per profile, and while it is the
 	// headful one there is nowhere for an agent session on that profile to be put.
 	human bool
+	// person marks a browser whose one session a person is driving with the fence lifted. Like human
+	// it belongs to the BROWSER, and it is read and written under Pool.mu.
+	person bool
 
 	sessions map[browser.SessionID]struct{}
 }
@@ -190,6 +193,14 @@ func (p *Pool) Open(ctx context.Context, req browser.OpenRequest) (browser.Sessi
 	}
 
 	p.mu.Lock()
+	if holder.person {
+		// A person took the browser while this navigation was in flight, and the fence is down for
+		// as long as they drive: this session must not exist.
+		p.mu.Unlock()
+		_ = holder.driver.Close(ctx, session.ID)
+		p.release(ctx, holder, "")
+		return browser.Session{}, fmt.Errorf("%w: %s", browser.ErrPersonIsDriving, req.Placement.Profile)
+	}
 	p.counter++
 	outer := browser.SessionID(fmt.Sprintf("s%d", p.counter))
 	holder.sessions[outer] = struct{}{}
@@ -242,11 +253,9 @@ func (p *Pool) Handoff(ctx context.Context, id browser.SessionID, reason string)
 	if err != nil {
 		return browser.HandoffTicket{}, err
 	}
-	// The page a viewer is looking at is about to be a person's. Ended before the driver moves, and
-	// once more after, which catches a Watch that registered in between.
-	p.endWatchers(browser.EndWheel, id)
+	// The viewer is NOT ended: a handoff keeps the same browser on the same page, so what it watches
+	// is still there.
 	ticket, err := session.holder.driver.Handoff(ctx, session.inner, reason)
-	p.endWatchers(browser.EndWheel, id)
 	if err != nil {
 		return browser.HandoffTicket{}, err
 	}
@@ -262,6 +271,11 @@ func (p *Pool) Close(ctx context.Context, id browser.SessionID) error {
 	}
 	p.endWatchers(browser.EndClosed, id)
 	closeErr := session.holder.driver.Close(ctx, session.inner)
+	// A session closed while a person held it (core gives up on them) must not leave the profile
+	// marked, or every later open would be refused.
+	p.mu.Lock()
+	session.holder.person = false
+	p.mu.Unlock()
 	p.release(ctx, session.holder, id)
 	return closeErr
 }
@@ -344,7 +358,10 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 			// rather than reporting somebody else's failure as this caller's.
 			continue
 		}
-		if existing.human {
+		p.mu.Lock()
+		personDriving := existing.person
+		p.mu.Unlock()
+		if existing.human || personDriving {
 			// Spec §4.1 and §4.4: while a person is driving this profile, the agent does not get a
 			// browser in it. Refused rather than queued or relaunched — relaunching would take the
 			// window out from under someone mid-login, and queueing would hold an HTTP request open

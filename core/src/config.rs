@@ -740,7 +740,8 @@ pub const MODELS_CONFIG_DISPLAY_PATH: &str = "~/.nucleos/nucleos-models.yaml";
 /// Resolving it now would hand those tests whatever this machine's owner has configured — a local
 /// model in one place, none in another — and a unit test must not read a real `~/.nucleos`.
 pub fn models_config_path() -> Option<std::path::PathBuf> {
-    if cfg!(test) {
+    // `testkit` too: the binary's tests (`http.rs`) build this library without `cfg(test)`.
+    if cfg!(any(test, feature = "testkit")) {
         return None;
     }
     crate::machine_config::root().map(|root| root.join(MODELS_CONFIG_FILE))
@@ -1220,6 +1221,79 @@ pub fn load_devtime_config(path: &Path) -> DevtimeConfig {
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "devtime config: could not be read; defaults apply");
             DevtimeConfig::default()
+        }
+    }
+}
+
+/// The verification executor's machine settings, `~/.nucleos/verify.yaml`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct VerifyConfig {
+    /// Weight units that may run at once across the whole machine.
+    pub capacity: u32,
+    /// A queued request that has waited this long moves up one priority level.
+    pub aging_seconds: u64,
+    /// The wall clock one unit may take before it is killed.
+    pub unit_timeout_seconds: u64,
+    /// The ceiling, in GB, on the whole machine's warm state.
+    pub disk_cap_gb: u64,
+    /// The argv prefixed to every unit when it runs (a machine's broker). Empty means none.
+    pub broker_prefix: Vec<String>,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 4,
+            aging_seconds: 300,
+            unit_timeout_seconds: 1800,
+            disk_cap_gb: 60,
+            broker_prefix: Vec::new(),
+        }
+    }
+}
+
+/// `~/.nucleos/verify.yaml`'s grammar, and the only place that decides what a valid one is.
+/// Refuses unknown keys, malformed YAML and a zero capacity, aging or timeout;
+/// [`load_verify_config`] turns that refusal into defaults.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_verify_config(contents: &str) -> Result<VerifyConfig, String> {
+    // An empty file (or only comments) is "say nothing", which is the defaults.
+    if contents.trim().is_empty() {
+        return Ok(VerifyConfig::default());
+    }
+    let config =
+        serde_yaml::from_str::<VerifyConfig>(contents).map_err(|error| error.to_string())?;
+    if config.capacity < 1 {
+        return Err("capacity must be at least 1".to_string());
+    }
+    if config.aging_seconds < 1 {
+        return Err("aging_seconds must be at least 1".to_string());
+    }
+    if config.unit_timeout_seconds < 1 {
+        return Err("unit_timeout_seconds must be at least 1".to_string());
+    }
+    if config.disk_cap_gb < 1 {
+        return Err("disk_cap_gb must be at least 1".to_string());
+    }
+    Ok(config)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn load_verify_config(path: &Path) -> VerifyConfig {
+    if !path.exists() {
+        return VerifyConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| parse_verify_config(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "verify config: could not be parsed; defaults apply");
+            VerifyConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "verify config: could not be read; defaults apply");
+            VerifyConfig::default()
         }
     }
 }
@@ -2211,6 +2285,10 @@ pub struct AutopilotRules {
     /// gives: a caller reading the raw numbers would honour a loosening the daemon never honours.
     #[serde(default)]
     pub judge_resolve: JudgeResolveConfig,
+    /// This project's ceiling, in GB, on the warm state the verify executor keeps for it. Absent
+    /// means the executor's own default.
+    #[serde(default)]
+    pub verify_disk_cap_gb: Option<u64>,
 }
 
 impl AutopilotRules {
@@ -2331,6 +2409,13 @@ pub fn parse_schedule_rules(contents: &str) -> std::io::Result<AutopilotRules> {
 ///   that can never be reached is not a ceiling, and a rule that wants no ceiling of its own says so
 ///   by leaving the key out, which is what `None` already means.
 fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
+    if rules.verify_disk_cap_gb == Some(0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "verify_disk_cap_gb must be at least 1; a zero cap would evict all warm state on \
+             every unit — leave the key out to use the machine default",
+        ));
+    }
     for rule in &rules.schedules {
         let Some(budget) = rule.graph.as_ref().and_then(|graph| graph.budget_usd) else {
             continue;
@@ -4662,6 +4747,77 @@ cycle_seconds: 30
 "
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn an_empty_verify_file_takes_the_defaults() {
+        assert_eq!(parse_verify_config("").unwrap(), VerifyConfig::default());
+        assert_eq!(
+            parse_verify_config("# nothing\n").unwrap(),
+            VerifyConfig::default()
+        );
+        let defaults = VerifyConfig::default();
+        assert_eq!(defaults.capacity, 4);
+        assert_eq!(defaults.aging_seconds, 300);
+        assert_eq!(defaults.unit_timeout_seconds, 1800);
+        assert_eq!(defaults.disk_cap_gb, 60);
+        assert!(defaults.broker_prefix.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_verify_config(&dir.path().join("verify.yaml")),
+            VerifyConfig::default()
+        );
+    }
+
+    #[test]
+    fn verify_settings_are_read() {
+        let config = parse_verify_config(
+            "capacity: 2\naging_seconds: 60\nunit_timeout_seconds: 900\ndisk_cap_gb: 10\nbroker_prefix: [python, heavy.py, --, x]\n",
+        )
+        .unwrap();
+        assert_eq!(config.capacity, 2);
+        assert_eq!(config.aging_seconds, 60);
+        assert_eq!(config.unit_timeout_seconds, 900);
+        assert_eq!(config.disk_cap_gb, 10);
+        assert_eq!(config.broker_prefix, vec!["python", "heavy.py", "--", "x"]);
+    }
+
+    #[test]
+    fn a_verify_capacity_of_zero_is_refused() {
+        assert!(parse_verify_config("capacity: 0\n").is_err());
+        assert!(parse_verify_config("aging_seconds: 0\n").is_err());
+        assert!(parse_verify_config("unit_timeout_seconds: 0\n").is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.yaml");
+        std::fs::write(&path, "capacity: 0\n").unwrap();
+        assert_eq!(load_verify_config(&path), VerifyConfig::default());
+    }
+
+    #[test]
+    fn a_verify_disk_cap_of_zero_is_refused() {
+        assert!(parse_verify_config("disk_cap_gb: 0\n").is_err());
+    }
+
+    #[test]
+    fn a_project_verify_disk_cap_of_zero_is_refused() {
+        assert!(parse_schedule_rules("verify_disk_cap_gb: 0\n").is_err());
+    }
+
+    #[test]
+    fn an_unknown_verify_key_is_refused() {
+        assert!(parse_verify_config("no_such_key: 1\n").is_err());
+    }
+
+    #[test]
+    fn the_project_verify_disk_cap_is_read_from_autopilot() {
+        let rules = parse_schedule_rules("verify_disk_cap_gb: 12\n").unwrap();
+        assert_eq!(rules.verify_disk_cap_gb, Some(12));
+        assert_eq!(
+            parse_schedule_rules("gate_command: x\n")
+                .unwrap()
+                .verify_disk_cap_gb,
+            None
         );
     }
 

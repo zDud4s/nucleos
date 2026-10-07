@@ -458,7 +458,7 @@ const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
 /// still decided only here; being readable from a test is what makes forgetting to add a route
 /// fail somewhere other than production.
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
+pub fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
     grants(scope, method, path, Target::Path)
 }
 
@@ -471,7 +471,7 @@ pub(crate) fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
 /// the search, the IDE sessions), and a council or team key holding `/runs/{id}` reached
 /// `/runs/awaiting-approval`. The template the router chose carries no such ambiguity: a `{param}`
 /// in a table matches only a `{param}` in the template, and a literal only the same literal.
-pub(crate) fn permits_route(scope: &Scope, method: &Method, route: &str) -> bool {
+pub fn permits_route(scope: &Scope, method: &Method, route: &str) -> bool {
     grants(scope, method, route, Target::Route)
 }
 
@@ -507,7 +507,7 @@ fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
 
 /// Whether a concrete path is listed. The tests' table assertions ask this, the loosest reading,
 /// so an absence they assert holds under the stricter template reading as well.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 fn route_is_listed(routes: &[(Method, &str)], method: &Method, path: &str) -> bool {
     route_is_listed_as(routes, method, path, Target::Path)
 }
@@ -981,7 +981,7 @@ mod tests {
             .await
             .unwrap();
         // Run tokens are resolved against the `runs` table, so this can no longer be a bare pool.
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         AppState {
             token: Token(token.to_string()),
             pool,

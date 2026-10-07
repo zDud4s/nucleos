@@ -9,6 +9,7 @@ import {
 import {
   isAggregateTimeout,
   sidecarKeyOf,
+  subsystemCounts,
   useApiTokens,
   useBackups,
   useBudget,
@@ -274,6 +275,7 @@ function HealthReadoutPanel({
 
 function SubsystemRow({ row }: { row: SubsystemReadout }) {
   const key = sidecarKeyOf(row.name);
+  const counts = subsystemCounts(row);
   return (
     <li className="sy-subsystem">
       <div className="sy-subsystem-head">
@@ -285,6 +287,20 @@ function SubsystemRow({ row }: { row: SubsystemReadout }) {
         <span className="sy-meta sy-subsystem-reason">
           {row.reason !== undefined && <>reason: {row.reason}</>}
         </span>
+        {counts.length > 0 && (
+          <span className="sy-meta sy-subsystem-counts">
+            {counts.map((count) => (
+              <span key={count.name}>
+                {count.label}{" "}
+                {count.instant ? (
+                  <RelativeTime at={new Date(count.value * 1000).toISOString()} />
+                ) : (
+                  count.value
+                )}
+              </span>
+            ))}
+          </span>
+        )}
         {key !== null && row.status === "down" && (
           <div className="sy-subsystem-action">
             <RestartSidecar name={key} />

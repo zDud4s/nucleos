@@ -38,6 +38,29 @@ fn package_root() -> PathBuf {
     running_in
 }
 
+/// Every directory of top-level modules in this package, each with the prefix its files carry in
+/// the map: `src/` bare (`runs.rs`), and each crate under `crates/` by its path from here
+/// (`crates/nucleos-base/src/storage.rs`), so two crate roots both called `lib.rs` stay two rows.
+/// Without the crates a module that moved down would vanish from this check rather than fail it.
+fn source_dirs(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut dirs = vec![(String::new(), root.join("src"))];
+    if let Ok(crates) = fs::read_dir(root.join("crates")) {
+        let mut names = crates
+            .map(|entry| entry.expect("crate directory entries should be readable"))
+            .filter(|entry| entry.path().join("src").is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            dirs.push((
+                format!("crates/{name}/src/"),
+                root.join("crates").join(&name).join("src"),
+            ));
+        }
+    }
+    dirs
+}
+
 #[test]
 fn the_module_map_matches_the_files_on_disk() {
     let manifest_dir = package_root();
@@ -66,17 +89,23 @@ fn the_module_map_matches_the_files_on_disk() {
         })
         .collect::<BTreeSet<_>>();
 
-    let source_files = fs::read_dir(manifest_dir.join("src"))
-        .expect("the source directory should be readable")
-        .map(|entry| entry.expect("source directory entries should be readable"))
-        .filter_map(|entry| {
-            entry
-                .file_type()
-                .expect("source file types should be readable")
-                .is_file()
-                .then_some(entry.file_name().to_string_lossy().into_owned())
+    let source_files = source_dirs(&manifest_dir)
+        .into_iter()
+        .flat_map(|(prefix, dir)| {
+            fs::read_dir(dir)
+                .expect("the source directory should be readable")
+                .map(|entry| entry.expect("source directory entries should be readable"))
+                .filter_map(|entry| {
+                    entry
+                        .file_type()
+                        .expect("source file types should be readable")
+                        .is_file()
+                        .then_some(entry.file_name().to_string_lossy().into_owned())
+                })
+                .filter(|file_name| file_name.ends_with(".rs"))
+                .map(move |file_name| format!("{prefix}{file_name}"))
+                .collect::<Vec<_>>()
         })
-        .filter(|file_name| file_name.ends_with(".rs"))
         .collect::<BTreeSet<_>>();
 
     let on_disk_not_in_map = source_files
@@ -126,10 +155,13 @@ fn nothing_sets_the_worktree_root_without_restoring_it() {
     // so this test would not have gone red on a binary built elsewhere — it would have read the
     // other checkout's modules and reported on those. Quieter than the map check's failure and the
     // same defect.
-    let src = package_root().join("src");
+    let entries = source_dirs(&package_root())
+        .into_iter()
+        .flat_map(|(_, dir)| fs::read_dir(dir).expect("the source directory should be readable"))
+        .collect::<Vec<_>>();
     let mut offenders = Vec::new();
 
-    for entry in fs::read_dir(&src).expect("the source directory should be readable") {
+    for entry in entries {
         let entry = entry.expect("source directory entries should be readable");
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.ends_with(".rs") {

@@ -328,7 +328,7 @@ async fn start_job(
     .await
 }
 
-pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
+pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
     if crate::autopilot::kill_switch_engaged(&state.pool)
         .await
         .unwrap_or(true)
@@ -936,7 +936,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
 
         let state = AppState {
             token: Token("test-token".into()),

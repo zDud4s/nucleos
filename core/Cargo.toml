@@ -4,7 +4,20 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 
+# Library + binary in one package: `http.rs` and `main.rs` are the binary, everything else is the
+# library (see src/lib.rs). No doctests: prose in doc comments was never written to compile.
+[lib]
+name = "nucleos_core"
+path = "src/lib.rs"
+doctest = false
+
+# `testkit` exposes test doubles and fixtures to the binary's tests; the self dev-dependency
+# below turns it on for every test build and never for a release build.
+[features]
+testkit = ["dep:tempfile", "nucleos-base/testkit"]
+
 [dependencies]
+nucleos-base = { path = "crates/nucleos-base" }
 async-trait = "0.1.89"
 axum = "0.8.9"
 base64 = "0.23.0"
@@ -60,6 +73,10 @@ url = "2.5"
 # grandchild whose parent link the MSYS `fork` emulation severed (measured; see that module). Already
 # in the lock file as tokio's own dependency, so this declares what is already built rather than
 # adding a tree.
+# Only for `testkit`: the fixtures it exposes build their temporary databases and repositories
+# with it. Tests still get it from [dev-dependencies].
+tempfile = { version = "3.27.0", optional = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
@@ -79,4 +96,6 @@ windows-sys = { version = "0.61.2", features = [
 libc = "0.2"
 
 [dev-dependencies]
+nucleos-core = { path = ".", features = ["testkit"] }
 tempfile = "3.27.0"
+sqlx = { version = "0.9.0", features = ["sqlite-deserialize"] }

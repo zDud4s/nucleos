@@ -10,7 +10,9 @@ import {
   useBrowserWrites,
   useKeepChain,
   useMakeReadonly,
+  useOpenRealWindow,
   useOpenWindow,
+  useTakeWheel,
   useRevokeSite,
   useReturnWheel,
   type BrowserSession,
@@ -18,6 +20,7 @@ import {
   type SubsystemReadout,
   type Written,
 } from "../data/browser";
+import { useSeatNonce } from "../data/seat";
 import { useProjects } from "../data/system";
 import { LiveView } from "./LiveView";
 import {
@@ -204,14 +207,15 @@ function LiveSessions({
               session={session}
               onClose={() => closeSession.mutate(session.id)}
               closePending={closeSession.isPending}
-              onReturn={() =>
-                returnWheel.mutate(session.id, {
+              onReturn={(to) =>
+                returnWheel.mutate(to === undefined ? session.id : { sessionId: session.id, to }, {
                   onSuccess: (result) => onReturned(session.id, result.chain),
                 })
               }
               returnPending={returnWheel.isPending}
               watching={watching === session.id}
               onWatch={() => setWatching(watching === session.id ? null : session.id)}
+              onOpenView={() => setWatching(session.id)}
             />
           ))}
         </Rows>
@@ -230,15 +234,21 @@ function SessionRow({
   returnPending,
   watching,
   onWatch,
+  onOpenView,
 }: {
   session: BrowserSession;
   onClose: () => void;
   closePending: boolean;
-  onReturn: () => void;
+  onReturn: (to?: "agent" | "close") => void;
   returnPending: boolean;
   watching: boolean;
   onWatch: () => void;
+  onOpenView: () => void;
 }) {
+  const takeWheel = useTakeWheel();
+  const openRealWindow = useOpenRealWindow();
+  const nonce = useSeatNonce(session.id);
+  const shellSeat = session.mode === "human" && session.seat === "shell";
   const redirected = session.final_url !== session.requested_url && session.final_url !== "";
 
   return (
@@ -276,19 +286,66 @@ function SessionRow({
         </p>
       )}
       <div className="browser-actions">
-        {session.mode === "human" && (
+        {session.mode === "human" && !shellSeat && (
           <ConfirmButton
             label="Give the wheel back"
             confirmLabel="Close the window and bring the chain back"
             variant="approve"
             disabled={returnPending}
-            onConfirm={onReturn}
+            onConfirm={() => onReturn()}
           />
         )}
-        {session.mode === "agent" && (
+        {shellSeat && (
+          <>
+            <Button variant="ghost" aria-pressed={watching} onClick={onWatch}>
+              {watching ? "Stop driving" : "Drive"}
+            </Button>
+            {nonce === undefined && (
+              // The shell lost its nonce (restart, reload, a Telegram approval): the core re-issues one.
+              <ConfirmButton
+                label="Drive here"
+                confirmLabel="Take the wheel again and drive it here"
+                variant="approve"
+                disabled={takeWheel.isPending}
+                onConfirm={() => takeWheel.mutate(session.id, { onSuccess: () => onOpenView() })}
+              />
+            )}
+            <ConfirmButton
+              label="Give back to the agent"
+              confirmLabel="Restore the fence and hand it back"
+              variant="approve"
+              disabled={returnPending}
+              onConfirm={() => onReturn("agent")}
+            />
+            <ConfirmButton
+              label="Close"
+              confirmLabel="Close it and bring the chain back"
+              variant="quiet"
+              disabled={returnPending}
+              onConfirm={() => onReturn("close")}
+            />
+            <ConfirmButton
+              label="Open real window"
+              confirmLabel="Swap to a real window here"
+              variant="ghost"
+              disabled={openRealWindow.isPending}
+              onConfirm={() => openRealWindow.mutate(session.id)}
+            />
+          </>
+        )}
+        {(session.mode === "agent" || session.mode === "wheel-requested") && (
           <Button variant="ghost" aria-pressed={watching} onClick={onWatch}>
             {watching ? "Stop watching" : "Watch"}
           </Button>
+        )}
+        {session.mode === "agent" && session.shell_eligible && (
+          <ConfirmButton
+            label="Take the wheel"
+            confirmLabel="Stop the agent and drive it here"
+            variant="approve"
+            disabled={takeWheel.isPending}
+            onConfirm={() => takeWheel.mutate(session.id, { onSuccess: () => onOpenView() })}
+          />
         )}
         {(session.mode === "agent" || session.mode === "delivery-failed") && (
           <ConfirmButton
@@ -300,7 +357,9 @@ function SessionRow({
           />
         )}
       </div>
-      {watching && <LiveView sessionId={session.id} />}
+      {takeWheel.isError && <MutationNote error={takeWheel.error} what="the wheel could not be taken" />}
+      {openRealWindow.isError && <MutationNote error={openRealWindow.error} what="the real window could not be opened" />}
+      {watching && <LiveView sessionId={session.id} nonce={shellSeat ? (nonce ?? null) : (nonce ?? undefined)} driven={shellSeat} />}
     </Row>
   );
 }

@@ -36,7 +36,7 @@ use crate::vcs::{Branch, Op, Origin, ResolvedRepo};
 /// Decision #7's feed kind: a conflict resolution the agent could not produce, or that admission
 /// otherwise refused. Named so it reads as this module's own line among `vcs_request_finished` and
 /// the rest, rather than blending into them.
-pub(crate) const RESOLUTION_FAILED_KIND: &str = "land_resolution_failed";
+pub const RESOLUTION_FAILED_KIND: &str = "land_resolution_failed";
 
 /// Why a landing could not be submitted.
 ///
@@ -746,7 +746,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 
@@ -793,9 +793,9 @@ mod tests {
     /// checkout is left standing on. Every test below that does not care about the conflict shape
     /// starts here.
     fn repo_parked_off_target(prefix: &str, parked: &str) -> (tempfile::TempDir, PathBuf) {
-        let container = crate::git_exec::tests::space_free_tempdir(prefix);
+        let container = crate::git_exec::testkit::space_free_tempdir(prefix);
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         assert!(git_in(&repo, &["branch", "-M", "master"]));
         assert!(git_in(&repo, &["checkout", "-q", "-b", parked]));
         assert!(git_in(&repo, &["checkout", "-q", "master"]));
@@ -810,9 +810,9 @@ mod tests {
     /// `master` and `feat/x`, each touching `seed.txt` differently, so merging one into the other
     /// conflicts. The main checkout is left on `master`.
     fn repo_with_a_conflict(prefix: &str) -> (tempfile::TempDir, PathBuf) {
-        let container = crate::git_exec::tests::space_free_tempdir(prefix);
+        let container = crate::git_exec::testkit::space_free_tempdir(prefix);
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         assert!(git_in(&repo, &["branch", "-M", "master"]));
         assert!(git_in(&repo, &["checkout", "-q", "-b", "feat/x"]));
         std::fs::write(repo.join("seed.txt"), "theirs\n").expect("write");
@@ -833,7 +833,7 @@ mod tests {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
         let (_container, repo) = repo_parked_off_target("nucleos-land-regression-", "chore/other");
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
         let feat_sha = sha_of(&repo, "feat/x");
@@ -880,9 +880,9 @@ mod tests {
         map_on_master: Option<&str>,
         branch_map: Option<&str>,
     ) -> (tempfile::TempDir, PathBuf) {
-        let container = crate::git_exec::tests::space_free_tempdir(prefix);
+        let container = crate::git_exec::testkit::space_free_tempdir(prefix);
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         assert!(git_in(&repo, &["branch", "-M", "master"]));
         let map = repo.join(crate::tests_map::MAP_FILE);
         if let Some(text) = map_on_master {
@@ -933,7 +933,7 @@ mod tests {
         let pool = test_pool().await;
         let (_container, repo) =
             repo_changing_the_map("nucleos-map-wait-", None, Some("version: 1\n"));
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-wait-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-map-wait-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
         let master_before = sha_of(&repo, "master");
@@ -964,7 +964,7 @@ mod tests {
         let pool = test_pool().await;
         let (_container, repo) =
             repo_changing_the_map("nucleos-map-approve-", None, Some("version: 1\n"));
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-approve-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-map-approve-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
         let id = land_feat_x_once(&pool, &repo).await;
@@ -987,7 +987,7 @@ mod tests {
         let pool = test_pool().await;
         let (_container, repo) =
             repo_changing_the_map("nucleos-map-refuse-", None, Some("version: 1\n"));
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-refuse-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-map-refuse-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
         let master_before = sha_of(&repo, "master");
@@ -1010,7 +1010,7 @@ mod tests {
         let pool = test_pool().await;
         let (_container, repo) =
             repo_changing_the_map("nucleos-map-edited-", None, Some("version: 1\n"));
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-edited-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-map-edited-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
         let master_before = sha_of(&repo, "master");
@@ -1046,7 +1046,7 @@ mod tests {
         let pool = test_pool().await;
         let (_container, repo) =
             repo_changing_the_map("nucleos-map-delete-", Some("version: 1\n"), None);
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-delete-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-map-delete-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
 
@@ -1066,7 +1066,7 @@ mod tests {
             Some("version: 1\n"),
             Some("version: 1\n"),
         );
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-same-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-map-same-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
 
@@ -1081,9 +1081,9 @@ mod tests {
     async fn merging_master_into_an_agent_branch_does_not_wait() {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
-        let container = crate::git_exec::tests::space_free_tempdir("nucleos-map-agent-");
+        let container = crate::git_exec::testkit::space_free_tempdir("nucleos-map-agent-");
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         assert!(git_in(&repo, &["branch", "-M", "master"]));
         assert!(git_in(&repo, &["checkout", "-q", "-b", "feat/x"]));
         std::fs::write(repo.join("feature.txt"), "from the branch\n").expect("write");
@@ -1093,7 +1093,7 @@ mod tests {
         std::fs::write(repo.join(crate::tests_map::MAP_FILE), "version: 1\n").expect("write");
         assert!(git_in(&repo, &["add", "-A"]));
         assert!(git_in(&repo, &["commit", "-m", "map on master"]));
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-map-agent-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-map-agent-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, Some("master")).await;
 
@@ -1335,9 +1335,9 @@ mod tests {
     async fn a_declared_branch_that_no_longer_exists_is_refused_by_name() {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
-        let container = crate::git_exec::tests::space_free_tempdir("nucleos-land-dangling-");
+        let container = crate::git_exec::testkit::space_free_tempdir("nucleos-land-dangling-");
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         assert!(git_in(&repo, &["branch", "-M", "master"]));
         seed_project(&pool, "alpha", &repo, Some("ramo-fantasma")).await;
 
@@ -1394,7 +1394,7 @@ mod tests {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
         let (_container, repo) = repo_parked_off_target("nucleos-land-declared-", "chore/other");
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, Some("master")).await;
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
@@ -1415,16 +1415,16 @@ mod tests {
     async fn an_admitted_target_lands_in_a_project_with_no_derivable_default() {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
-        let container = crate::git_exec::tests::space_free_tempdir("nucleos-land-trunk-");
+        let container = crate::git_exec::testkit::space_free_tempdir("nucleos-land-trunk-");
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         assert!(git_in(&repo, &["branch", "-M", "trunk"]));
         assert!(git_in(&repo, &["branch", "release", "trunk"]));
         assert!(git_in(&repo, &["checkout", "-q", "-b", "feat/x"]));
         std::fs::write(repo.join("feature.txt"), "from the branch\n").expect("write");
         assert!(git_in(&repo, &["add", "-A"]));
         assert!(git_in(&repo, &["commit", "-m", "feature"]));
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
         crate::project_policy::declare_land_target(&pool, "alpha", "release")
@@ -1495,7 +1495,7 @@ mod tests {
         let pool = test_pool().await;
         let (_container, repo) = repo_parked_off_target("nucleos-land-pinned-", "chore/other");
         assert!(git_in(&repo, &["branch", "release", "master"]));
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, Some("master")).await;
         crate::project_policy::declare_land_target(&pool, "alpha", "release")
@@ -1544,7 +1544,7 @@ mod tests {
         let pool = test_pool().await;
         let (_container, repo) = repo_parked_off_target("nucleos-land-nowrite-", "chore/other");
         assert!(git_in(&repo, &["branch", "release", "master"]));
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
         crate::project_policy::declare_land_target(&pool, "alpha", "release")
@@ -1587,7 +1587,7 @@ mod tests {
         let pool = test_pool().await;
         let (container, repo) = repo_parked_off_target("nucleos-land-gate-", "chore/other");
         assert!(git_in(&repo, &["checkout", "-q", "master"]));
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         // Where the queue reads `alpha`'s rules: a temporary stand-in for `~/.nucleos`.
         let machine_root = container.path().join("nucleos-home");
@@ -1643,7 +1643,7 @@ mod tests {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
         let (_container, repo) = repo_with_a_conflict("nucleos-land-resolution-");
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, Some("master")).await;
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
@@ -1836,9 +1836,9 @@ mod tests {
     /// the integration branch, or every landing refuses on a branch that never existed here.
     #[tokio::test]
     async fn an_origin_head_without_a_local_branch_falls_back_to_master() {
-        let container = crate::git_exec::tests::space_free_tempdir("nucleos-land-originhead-");
+        let container = crate::git_exec::testkit::space_free_tempdir("nucleos-land-originhead-");
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         assert!(git_in(&repo, &["branch", "-M", "master"]));
         assert!(git_in(
             &repo,
@@ -1916,7 +1916,7 @@ mod tests {
 
     #[test]
     fn only_the_derived_target_dir_is_removed() {
-        let parent = crate::git_exec::tests::space_free_tempdir("nucleos-target-rm-");
+        let parent = crate::git_exec::testkit::space_free_tempdir("nucleos-target-rm-");
         let derived = parent.path().join(".cargo-target-feat-x");
         let other = parent.path().join(".cargo-target-other");
         let shared = parent.path().join(".cargo-target-test");
@@ -1942,7 +1942,7 @@ mod tests {
 
     #[test]
     fn an_absent_target_dir_is_a_quiet_no_op() {
-        let parent = crate::git_exec::tests::space_free_tempdir("nucleos-target-absent-");
+        let parent = crate::git_exec::testkit::space_free_tempdir("nucleos-target-absent-");
         let results = remove_landed_target_dirs(parent.path(), "feat/x", &[]);
         assert_eq!(results.len(), 2);
         assert!(
@@ -1966,7 +1966,7 @@ mod tests {
 
     #[test]
     fn a_linked_target_dir_is_never_followed() {
-        let parent = crate::git_exec::tests::space_free_tempdir("nucleos-target-link-");
+        let parent = crate::git_exec::testkit::space_free_tempdir("nucleos-target-link-");
         let elsewhere = parent.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::fs::write(elsewhere.join("sentinel"), "precious").unwrap();
@@ -2016,7 +2016,7 @@ mod tests {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
         let (container, repo) = repo_parked_off_target("nucleos-land-cleanup-", "chore/other");
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
         let target_dir = container.path().join(".cargo-target-x");
@@ -2050,7 +2050,7 @@ mod tests {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
         let (container, repo) = repo_parked_off_target("nucleos-land-nocleanup-", "chore/other");
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-land-wt-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
         let target_dir = container.path().join(".cargo-target-master");

@@ -185,7 +185,7 @@ pub enum SaidNow {
 /// Something said while a turn was running, kept because the CLI folds it into the turn and the
 /// stream never shows it as typed.
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
-pub(crate) struct SaidDuring {
+pub struct SaidDuring {
     #[serde(skip)]
     pub run_id: i64,
     pub text: String,
@@ -193,7 +193,7 @@ pub(crate) struct SaidDuring {
 }
 
 /// Everything said into a chat's turns, oldest first.
-pub(crate) async fn said_during(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<SaidDuring>> {
+pub async fn said_during(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<SaidDuring>> {
     sqlx::query_as::<_, SaidDuring>(
         "SELECT run_id, text, created_at FROM chat_said_now WHERE chat_id = ? ORDER BY id",
     )
@@ -272,6 +272,37 @@ pub async fn say_now(
 /// megabytes while it waits, and a desktop app is the wrong place to spend that on a conversation
 /// nobody came back to.
 const LIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
+/// How long a DEVELOPMENT conversation's process waits: one whose last turn called `Agent`/`Task` or
+/// ran longer than [`DEV_TURN`] (spec 4.2 item 3; owner 2026-10-05: derived, never a toggle).
+const DEV_IDLE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// A turn longer than this marks its conversation as development work.
+const DEV_TURN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// At most this many conversation processes alive at once, kept or mid-turn (owner 2026-10-05).
+const LIVE_CAP: usize = 5;
+/// The cap `keep_live` enforces. Unbounded under test: `LIVE_CHATS` is one static shared by every
+/// test running in parallel, and a real cap there would evict other tests' processes. `make_room`
+/// is tested directly with `LIVE_CAP`.
+#[cfg(not(any(test, feature = "testkit")))]
+const ENFORCED_CAP: usize = LIVE_CAP;
+#[cfg(any(test, feature = "testkit"))]
+const ENFORCED_CAP: usize = usize::MAX;
+
+/// Every `LiveChat` alive, in `LIVE_CHATS` or in a turn's hands. Held by [`LiveCount`].
+static LIVE_PROCESSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one `LiveChat` in [`LIVE_PROCESSES`] for exactly as long as it exists, on every way out.
+struct LiveCount;
+impl LiveCount {
+    fn start() -> Self {
+        LIVE_PROCESSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+impl Drop for LiveCount {
+    fn drop(&mut self) {
+        LIVE_PROCESSES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// One conversation's living CLI, kept between turns instead of started again for each.
 ///
@@ -334,6 +365,10 @@ struct LiveChat {
     cwd: Option<std::path::PathBuf>,
     /// When it last finished a turn, which is what the reaper measures.
     idle_since: std::time::Instant,
+    /// How long it may stay idle before the reaper takes it; set from its last turn by `keep_live`.
+    idle_for: std::time::Duration,
+    /// Its place in `LIVE_PROCESSES`.
+    _counted: LiveCount,
     /// Events read between turns and not yet handed to a turn, oldest first. `gather` drains these
     /// before the channel, so nothing read early is lost or reordered.
     carried: std::collections::VecDeque<crate::runner::TurnEvent>,
@@ -570,20 +605,111 @@ fn take_live(chat_id: &str) -> Option<LiveChat> {
 }
 
 /// Puts a process back, having just finished a turn, for the next one to find.
-fn keep_live(chat_id: &str, mut live: LiveChat) {
+fn keep_live(chat_id: &str, mut live: LiveChat, idle_for: std::time::Duration) {
     live.idle_since = std::time::Instant::now();
-    LIVE_CHATS.lock().unwrap().insert(chat_id.to_owned(), live);
+    live.idle_for = idle_for;
+    let evicted = {
+        let mut kept = LIVE_CHATS.lock().unwrap();
+        kept.insert(chat_id.to_owned(), live);
+        let alive = LIVE_PROCESSES.load(std::sync::atomic::Ordering::SeqCst);
+        make_room(&mut kept, alive, chat_id, ENFORCED_CAP)
+    };
+    // Dropped outside the lock; dropping is what stops them.
+    drop(evicted);
     reap_idle_live_chats();
+}
+
+/// How long a process may idle after this turn: [`DEV_IDLE`] when the turn called `Agent`/`Task` or
+/// lasted longer than [`DEV_TURN`], [`LIVE_IDLE`] otherwise.
+fn idle_for_turn(stdout: &str, lasted: std::time::Duration) -> std::time::Duration {
+    let used_subagents = stdout.lines().any(|line| {
+        if !line.contains("\"tool_use\"") {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        value.get("type").and_then(serde_json::Value::as_str) == Some("assistant")
+            && value
+                .pointer("/message/content")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                            && matches!(
+                                item.get("name").and_then(serde_json::Value::as_str),
+                                Some("Agent" | "Task")
+                            )
+                    })
+                })
+    });
+    if used_subagents || lasted > DEV_TURN {
+        DEV_IDLE
+    } else {
+        LIVE_IDLE
+    }
+}
+
+/// How long a process idles after a SPONTANEOUS turn: the later of what it already had and what the
+/// turn earns. A background answer is usually a short plain reply, and must not drop a development
+/// chat back to [`LIVE_IDLE`] right after its background `Agent` finished. Human turns do not use
+/// this: the last turn decides.
+fn idle_after_spontaneous(
+    current: std::time::Duration,
+    stdout: &str,
+    lasted: std::time::Duration,
+) -> std::time::Duration {
+    current.max(idle_for_turn(stdout, lasted))
+}
+
+/// Takes processes out of `kept` until `alive` fits under `cap`, least recently used first, and
+/// returns them for the caller to drop. Never one with a background task, nor one whose `carried`
+/// still holds an answer no turn has claimed yet (evicting it would lose that answer). The one being
+/// kept goes only when nothing else can (spec 4.2 item 3: when every other is busy, the new one is
+/// not kept).
+fn make_room(
+    kept: &mut HashMap<String, LiveChat>,
+    alive: usize,
+    keeping: &str,
+    cap: usize,
+) -> Vec<LiveChat> {
+    let mut evicted = Vec::new();
+    let mut excess = alive.saturating_sub(cap);
+    while excess > 0 {
+        let oldest = kept
+            .iter()
+            .filter(|(id, live)| {
+                id.as_str() != keeping && live.background.is_empty() && live.carried.is_empty()
+            })
+            .min_by_key(|(_, live)| live.idle_since)
+            .map(|(id, _)| id.clone());
+        let victim = match oldest {
+            Some(id) => id,
+            None if kept
+                .get(keeping)
+                .is_some_and(|live| live.background.is_empty() && live.carried.is_empty()) =>
+            {
+                keeping.to_owned()
+            }
+            None => break,
+        };
+        let Some(live) = kept.remove(&victim) else {
+            break;
+        };
+        evicted.push(live);
+        excess -= 1;
+    }
+    evicted
 }
 
 /// Whether a turn runs with the user's ambient MCP servers: only when the conversation opted in
 /// and the turn is not restricted to NucleOS's own tools.
-pub(crate) fn ambient_mcp_for(policy: crate::runner::ToolPolicy, opted_in: bool) -> bool {
+pub fn ambient_mcp_for(policy: crate::runner::ToolPolicy, opted_in: bool) -> bool {
     opted_in && policy == crate::runner::ToolPolicy::Unrestricted
 }
 
 /// Stops a conversation's process for good, if it has one.
-pub(crate) fn evict_live(chat_id: &str) {
+pub fn evict_live(chat_id: &str) {
     // The removed value is dropped here, which is what aborts it.
     LIVE_CHATS.lock().unwrap().remove(chat_id);
 }
@@ -622,7 +748,8 @@ fn reap_now() {
         // A background task that has started and not reported its end is work the process is still
         // doing for the conversation (spec 4.2 item 2; spike 2026-10-05 (c): the CLI answers on its
         // own when it ends), so such a process is kept however long it has been idle.
-        still_standing && (!live.background.is_empty() || live.idle_since.elapsed() < LIVE_IDLE)
+        // The idle time is the chat's own, derived from its last turn.
+        still_standing && (!live.background.is_empty() || live.idle_since.elapsed() < live.idle_for)
     });
 }
 
@@ -673,6 +800,7 @@ async fn serve_turn(
             // The steering entry is open for exactly as long as the turn is being gathered, so a
             // line written into the process lands in THIS turn. It is dropped before the process
             // goes back to the registry.
+            let began = std::time::Instant::now();
             let steer = SteerGuard::open(chat_id, &live.messages);
             let served = tokio::time::timeout(
                 deadlines.ceiling,
@@ -691,8 +819,9 @@ async fn serve_turn(
                         .lock()
                         .map(|held| held.clone())
                         .unwrap_or_default();
+                    let idle_for = idle_for_turn(&stdout, began.elapsed());
                     let gathered = gathered(outcome, stdout, session_id);
-                    keep_live(chat_id, live);
+                    keep_live(chat_id, live, idle_for);
                     return Ok(Ok(gathered));
                 }
                 // It heard the turn and died before answering. Starting it again would re-run
@@ -736,6 +865,7 @@ async fn start_live_chat(
     chat_id: &str,
     deadlines: TurnDeadlines,
 ) -> Result<std::io::Result<crate::runner::RunOutcome>, tokio::time::error::Elapsed> {
+    let began = std::time::Instant::now();
     let (messages, incoming) = tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (process_session_tx, mut process_session_rx) =
@@ -843,6 +973,8 @@ async fn start_live_chat(
         permission: was_permission,
         cwd: started_in,
         idle_since: std::time::Instant::now(),
+        idle_for: LIVE_IDLE,
+        _counted: LiveCount::start(),
         carried: Default::default(),
         background: HashSet::new(),
         watcher: 0,
@@ -862,9 +994,10 @@ async fn start_live_chat(
                 .lock()
                 .map(|held| held.clone())
                 .unwrap_or_default();
+            let idle_for = idle_for_turn(&stdout, began.elapsed());
             let known = session_id.lock().unwrap().clone().unwrap_or_default();
             let gathered = gathered(outcome, stdout, known);
-            keep_live(chat_id, live);
+            keep_live(chat_id, live, idle_for);
             Ok(Ok(gathered))
         }
         // A process that fell over without answering. `live` is dropped on the way out, which takes
@@ -1070,17 +1203,42 @@ fn watch_between_turns(state: &crate::state::AppState, chat_id: &str) {
     let state = state.clone();
     let chat_id = chat_id.to_owned();
     tokio::spawn(async move {
+        // How many of the process's carried events were already written to `chat_tasks`. Valid for
+        // this reader's life: `carried` only grows while no turn holds the process, and a turn
+        // taking the process ends this reader.
+        let mut recorded = 0_usize;
         loop {
             tokio::time::sleep(BETWEEN_TURNS_TICK).await;
             // No lock is held across an await: the guard lives only in this block. An entry that is
             // gone (a turn took it) or owned by a newer reader ends this one.
-            let begun = {
+            let (begun, task_lines) = {
                 let mut kept = LIVE_CHATS.lock().unwrap();
                 match kept.get_mut(&chat_id) {
-                    Some(live) if live.watcher == token => live.drain_idle(),
+                    Some(live) if live.watcher == token => {
+                        let begun = live.drain_idle();
+                        let fresh: Vec<String> = live
+                            .carried
+                            .iter()
+                            .skip(recorded)
+                            .filter_map(|event| match event {
+                                crate::runner::TurnEvent::Line(line)
+                                    if is_task_bookkeeping(line) =>
+                                {
+                                    Some(line.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        recorded = live.carried.len();
+                        (begun, fresh)
+                    }
                     _ => return,
                 }
             };
+            // A task that ends between turns is recorded now, not when a later turn reads the line.
+            for line in &task_lines {
+                crate::chat_tasks::apply_line(&state.pool, &chat_id, line).await;
+            }
             if !begun {
                 continue;
             }
@@ -1203,6 +1361,7 @@ async fn start_spontaneous_turn(
     let after = state.clone();
     let chat = chat_id.to_owned();
     crate::runs::spawn_registered(state, id, async move {
+        let began = std::time::Instant::now();
         let served = tokio::time::timeout(
             deadlines.ceiling,
             live.gather(&transcript, deadlines.silence),
@@ -1215,12 +1374,13 @@ async fn start_spontaneous_turn(
                     .lock()
                     .map(|held| held.clone())
                     .unwrap_or_default();
+                let idle_for = idle_after_spontaneous(live.idle_for, &stdout, began.elapsed());
                 let known = live.session_id.lock().unwrap().clone().unwrap_or_default();
                 let o = gathered(outcome, stdout, known);
                 // The process has now served this turn too, under the same barrier.
                 note_served(live.process_key(), id, mode);
                 // Kept first, so the process is back for the next turn before the row says done.
-                keep_live(&chat, live);
+                keep_live(&chat, live, idle_for);
                 record_spontaneous_answer(&pool, id, &chat, &o, &completed_at).await;
             }
             Ok(LiveTurn::DiedMidTurn(why)) => {
@@ -1327,6 +1487,7 @@ async fn record_spontaneous_answer(
     .execute(pool)
     .await;
     crate::runs::warn_on_terminal_write_err(&completed, id, "completed");
+    crate::chat_tasks::record_turn(pool, chat_id, id, &o.stdout).await;
     if let Some(session_id) = o.session_id.as_deref() {
         // The same rule as a person's turn: a session that read third-party text is not resumable.
         match crate::runs::read_untrusted_context(pool, id).await {
@@ -1346,8 +1507,8 @@ async fn record_spontaneous_answer(
 /// Beside the guard rather than reached for through a second copy of `BUSY_CHATS`: what makes the
 /// slot mean anything is that there is exactly one set of busy chats, and a test that inserted into
 /// its own would be testing a set nothing reads.
-#[cfg(test)]
-pub(crate) fn take_the_slot_for_testing(chat_id: &str) -> impl Drop {
+#[cfg(any(test, feature = "testkit"))]
+pub fn take_the_slot_for_testing(chat_id: &str) -> impl Drop {
     ChatSlot::acquire(chat_id).expect("the chat should have been free")
 }
 
@@ -1387,7 +1548,7 @@ impl Drop for TurnGuard {
 /// refuses anything: it is handed to the CLI as `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, and the CLI
 /// compacts its own context inside the same session rather than the daemon minting a new one. See
 /// `0116_chats_context_window.sql` for why that swap is both gentler and cheaper.
-pub(crate) const CONTEXT_WINDOW_TOKENS: i64 = 140_000;
+pub const CONTEXT_WINDOW_TOKENS: i64 = 140_000;
 
 /// The largest window there is any point asking for.
 ///
@@ -1399,14 +1560,14 @@ pub(crate) const CONTEXT_WINDOW_TOKENS: i64 = 140_000;
 /// Only the pick-up path ever reaches for it: a conversation continued from the editor may arrive
 /// carrying more than the default window can hold, and raising its window to fit is what lets it be
 /// resumed instead of stumped.
-pub(crate) const LARGEST_WINDOW_TOKENS: i64 = 200_000;
+pub const LARGEST_WINDOW_TOKENS: i64 = 200_000;
 
 /// The headroom the CLI keeps below the window before it compacts.
 ///
 /// Read out of the CLI's own binary — its threshold is `window - 13000` — rather than guessed, and
 /// named here because the pick-up path has to answer "will this session fit" and the honest answer
 /// is "does it fit under the line the CLI will actually draw", not "under the window".
-pub(crate) const COMPACTION_HEADROOM: i64 = 13_000;
+pub const COMPACTION_HEADROOM: i64 = 13_000;
 
 /// The window this conversation runs in: its own if it asked for one, the default otherwise.
 ///
@@ -1414,7 +1575,7 @@ pub(crate) const COMPACTION_HEADROOM: i64 = 13_000;
 /// by a pick-up whose ceiling has since changed — is not something a turn should refuse over. The
 /// CLI clamps this again at its own end; agreeing with it here means the number the window SHOWS is
 /// the number the CLI will actually use.
-pub(crate) fn window_of(asked: Option<i64>) -> i64 {
+pub fn window_of(asked: Option<i64>) -> i64 {
     asked
         .unwrap_or(CONTEXT_WINDOW_TOKENS)
         .clamp(CONTEXT_WINDOW_TOKENS, LARGEST_WINDOW_TOKENS)
@@ -1911,7 +2072,7 @@ pub const IMAGE_TOO_LARGE: &str = "one of those pictures is too large to send";
 
 /// Sends a message with nothing attached. Only the tests send without pictures through this
 /// shorthand; production callers go through `send_message_with`.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn send_message(
     state: &crate::state::AppState,
     chat_id: &str,
@@ -2392,7 +2553,7 @@ núcleo: ",
 ///
 /// A failure to read or parse it is empty, not an error. A turn answering without its predecessor's
 /// tail is worse than one answering with it, and better than one that refuses.
-pub(crate) async fn handed_over(pool: &SqlitePool, chat_id: &str) -> Vec<(String, String)> {
+pub async fn handed_over(pool: &SqlitePool, chat_id: &str) -> Vec<(String, String)> {
     let stored = match crate::chats::handover_of(pool, chat_id).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return Vec::new(),
@@ -2426,7 +2587,7 @@ pub(crate) async fn handed_over(pool: &SqlitePool, chat_id: &str) -> Vec<(String
 /// own `cleared_after_run_id` (0114). They are separate because they mean different things: one is
 /// a safety property this daemon imposes, the other is somebody asking to start again, and either
 /// alone must still hold when the other is absent.
-pub(crate) async fn recent_exchanges(
+pub async fn recent_exchanges(
     pool: &SqlitePool,
     chat_id: &str,
 ) -> sqlx::Result<Vec<(String, String)>> {
@@ -2489,7 +2650,7 @@ const LOCAL_AGENT_ANSWERED_BY: &[&str] = &["local", "openrouter"];
 /// added here without a matching edit at every call site would repeat. Checking against
 /// `LOCAL_AGENT_ANSWERED_BY` instead of the two literals directly means a future third entry needs
 /// only ONE new line, not a search for every place someone once wrote `"local"`.
-pub(crate) fn answered_by_a_local_agent_loop(answered_by: &str) -> bool {
+pub fn answered_by_a_local_agent_loop(answered_by: &str) -> bool {
     LOCAL_AGENT_ANSWERED_BY.contains(&answered_by)
 }
 
@@ -2743,7 +2904,7 @@ async fn spawn_local_turn(
 /// Every failing arm falls to `McpOnly`, which is what every chat turn has always used: the
 /// conversation still continues and still resumes its session, and what it loses is the ability to
 /// touch the machine.
-pub(crate) fn tool_policy_for(
+pub fn tool_policy_for(
     cwd: Option<&str>,
     origin: Origin,
     hook_is_wired: bool,
@@ -2758,10 +2919,7 @@ pub(crate) fn tool_policy_for(
 }
 
 /// Chooses the CLI that should answer a conversation turn.
-pub(crate) fn answering_cli(
-    config: &crate::config::ModelsConfig,
-    pinned: Option<&str>,
-) -> &'static str {
+pub fn answering_cli(config: &crate::config::ModelsConfig, pinned: Option<&str>) -> &'static str {
     pinned
         .and_then(|id| {
             config
@@ -2778,7 +2936,7 @@ pub(crate) fn answering_cli(
 }
 
 /// Chooses a runner for a turn without replacing the daemon's default unnecessarily.
-pub(crate) fn runner_for_turn(
+pub fn runner_for_turn(
     daemon: &std::sync::Arc<dyn crate::runner::CommandRunner>,
     assistants: &dyn crate::assistants::Assistants,
     config: &crate::config::ModelsConfig,
@@ -2801,7 +2959,7 @@ pub(crate) fn runner_for_turn(
 }
 
 /// Whether this turn may retain a live CLI process for a later turn.
-pub(crate) fn may_keep_process(policy: crate::runner::ToolPolicy, cli: &str) -> bool {
+pub fn may_keep_process(policy: crate::runner::ToolPolicy, cli: &str) -> bool {
     matches!(policy, crate::runner::ToolPolicy::Unrestricted) && cli == "claude"
 }
 
@@ -2849,7 +3007,7 @@ fn system_prompt_with_knowledge(
 }
 
 /// Whether a rooted shell conversation may answer through Codex.
-pub(crate) fn may_answer_on_codex(cwd: Option<&str>) -> bool {
+pub fn may_answer_on_codex(cwd: Option<&str>) -> bool {
     tool_policy_for(
         cwd,
         Origin::Shell,
@@ -3396,6 +3554,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .execute(&pool)
                     .await;
                     crate::runs::warn_on_terminal_write_err(&completed, id, status);
+                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
                     if let Some(session_id) = o.session_id.as_deref() {
                         // `get_session` would refuse to resume this session anyway, by looking at the
                         // runs that produced it. Dropping the row here as well closes the one case that
@@ -3456,6 +3615,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .execute(&pool)
                     .await;
                     crate::runs::warn_on_terminal_write_err(&failed, id, status);
+                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
                 }
             },
             Ok(Err(e)) => {
@@ -3652,7 +3812,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 
@@ -4220,7 +4380,7 @@ mod tests {
         let door = axum::Router::new()
             .route(
                 "/knowledge",
-                axum::routing::post(crate::http::post_knowledge),
+                axum::routing::post(crate::door::post_knowledge),
             )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7141,6 +7301,8 @@ mod tests {
                 permission: crate::runner::Permission::Default,
                 cwd: None,
                 idle_since: std::time::Instant::now(),
+                idle_for: LIVE_IDLE,
+                _counted: LiveCount::start(),
                 carried: Default::default(),
                 background: HashSet::new(),
                 watcher: 0,
@@ -7233,6 +7395,234 @@ mod tests {
         assert!(LIVE_CHATS.lock().unwrap().contains_key("working-chat"));
         // Taken back out, because this map outlives the test that wrote to it.
         LIVE_CHATS.lock().unwrap().remove("working-chat");
+    }
+
+    // ---- idle time per chat and the cap on live processes ----------------------------------------
+
+    /// An assistant event whose content is a `tool_use` of the named tool.
+    fn idle_lru_tool_use(name: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"tu-1","name":"{name}","input":{{"prompt":"look"}}}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn idle_lru_a_turn_that_called_a_subagent_gets_the_development_idle() {
+        for tool in ["Agent", "Task"] {
+            let stdout = format!("{}\n", idle_lru_tool_use(tool));
+            assert_eq!(
+                idle_for_turn(&stdout, Duration::from_secs(1)),
+                DEV_IDLE,
+                "a turn that called {tool} is development work"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_lru_a_turn_longer_than_five_minutes_gets_the_development_idle() {
+        assert_eq!(
+            idle_for_turn("", DEV_TURN + Duration::from_secs(1)),
+            DEV_IDLE
+        );
+    }
+
+    #[test]
+    fn idle_lru_a_short_plain_turn_keeps_the_conversation_idle() {
+        let mentions = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"ask the Agent"}]}}"#;
+        let reads = idle_lru_tool_use("Read");
+        let stdout = format!("{mentions}\n{reads}\n");
+        assert_eq!(idle_for_turn(&stdout, Duration::from_secs(1)), LIVE_IDLE);
+    }
+
+    #[tokio::test]
+    async fn idle_lru_a_live_turn_that_called_agent_is_kept_for_the_development_idle() {
+        for (prefix, line, expected) in [
+            ("idle-lru-dev", idle_lru_tool_use("Agent"), DEV_IDLE),
+            (
+                "idle-lru-plain",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}"#
+                    .to_owned(),
+                LIVE_IDLE,
+            ),
+        ] {
+            let chat = a_chat(prefix);
+            let (live, _said, events, _why) = live_chat_for_testing();
+            LIVE_CHATS.lock().unwrap().insert(chat.clone(), live);
+            events.send(crate::runner::TurnEvent::Line(line)).unwrap();
+            events
+                .send(crate::runner::TurnEvent::Ended(
+                    crate::runner::TurnOutcome::default(),
+                ))
+                .unwrap();
+            let runner: Arc<dyn crate::runner::CommandRunner> =
+                Arc::new(FakeCommandRunner::default());
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let transcript = Arc::new(Mutex::new(String::new()));
+
+            let served = serve_turn(
+                &runner,
+                silence_request(),
+                tx,
+                &transcript,
+                &chat,
+                TurnDeadlines {
+                    silence: Some(Duration::from_secs(5)),
+                    ceiling: Duration::from_secs(10),
+                },
+                true,
+            )
+            .await;
+            let kept_for = LIVE_CHATS.lock().unwrap().get(&chat).map(|l| l.idle_for);
+            evict_live(&chat);
+
+            served.expect("in time").expect("the process answered");
+            assert_eq!(kept_for, Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_lru_a_development_chat_outlives_ninety_seconds_and_is_reaped_after_fifteen_minutes()
+     {
+        let chat = a_chat("idle-lru-reap");
+        let (mut live, _said, _events, _why) = live_chat_for_testing();
+        live.idle_for = DEV_IDLE;
+        live.idle_since = std::time::Instant::now()
+            .checked_sub(LIVE_IDLE * 2)
+            .expect("a machine that has been up three minutes");
+        LIVE_CHATS.lock().unwrap().insert(chat.clone(), live);
+
+        reap_now();
+        assert!(
+            LIVE_CHATS.lock().unwrap().contains_key(&chat),
+            "a development chat idle for 180 s is still wanted"
+        );
+
+        LIVE_CHATS
+            .lock()
+            .unwrap()
+            .get_mut(&chat)
+            .unwrap()
+            .idle_since = std::time::Instant::now()
+            .checked_sub(DEV_IDLE + Duration::from_secs(1))
+            .expect("a machine that has been up sixteen minutes");
+        reap_now();
+        assert!(
+            !LIVE_CHATS.lock().unwrap().contains_key(&chat),
+            "past fifteen minutes it is reaped"
+        );
+    }
+
+    /// Six lives "c0".."c5", c0 the least recently used.
+    fn idle_lru_six() -> (HashMap<String, LiveChat>, Vec<impl Sized>) {
+        let mut kept = HashMap::new();
+        let mut held = Vec::new();
+        for i in 0..6u64 {
+            let (mut live, said, events, why) = live_chat_for_testing();
+            live.idle_since = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(60 - i))
+                .expect("a machine that has been up a minute");
+            kept.insert(format!("c{i}"), live);
+            held.push((said, events, why));
+        }
+        (kept, held)
+    }
+
+    #[tokio::test]
+    async fn idle_lru_keeping_a_sixth_process_evicts_the_least_recently_used_idle_one() {
+        let (mut kept, _held) = idle_lru_six();
+
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(!kept.contains_key("c0"), "the oldest idle one goes");
+        assert_eq!(kept.len(), 5);
+        assert!(kept.contains_key("c5"), "never the one being kept");
+    }
+
+    #[tokio::test]
+    async fn idle_lru_a_process_with_a_background_task_is_never_evicted() {
+        let (mut kept, _held) = idle_lru_six();
+        kept.get_mut("c0")
+            .unwrap()
+            .background
+            .insert("bg".to_owned());
+
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(kept.contains_key("c0"), "busy: left alone however old");
+        assert!(!kept.contains_key("c1"), "the next-oldest idle one goes");
+    }
+
+    #[test]
+    fn idle_lru_a_background_reply_does_not_lower_a_development_idle() {
+        let plain = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#;
+        assert_eq!(
+            idle_after_spontaneous(DEV_IDLE, plain, Duration::from_secs(1)),
+            DEV_IDLE,
+            "a short plain background reply keeps the development idle"
+        );
+        assert_eq!(
+            idle_after_spontaneous(LIVE_IDLE, plain, Duration::from_secs(1)),
+            LIVE_IDLE
+        );
+        assert_eq!(
+            idle_after_spontaneous(
+                LIVE_IDLE,
+                &idle_lru_tool_use("Agent"),
+                Duration::from_secs(1)
+            ),
+            DEV_IDLE,
+            "a background turn may still raise it"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_lru_a_process_holding_an_unclaimed_answer_is_never_evicted() {
+        let (mut kept, _held) = idle_lru_six();
+        kept.get_mut("c0")
+            .unwrap()
+            .carried
+            .push_back(crate::runner::TurnEvent::Line("an answer".to_owned()));
+
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(kept.contains_key("c0"), "its answer is not yet claimed");
+        assert!(!kept.contains_key("c1"), "the next-oldest idle one goes");
+    }
+
+    #[tokio::test]
+    async fn idle_lru_when_every_other_process_is_busy_the_new_one_is_not_kept() {
+        let mut kept: HashMap<String, LiveChat> = HashMap::new();
+        let mut held = Vec::new();
+        for id in ["c0", "c1", "c2", "c3", "new"] {
+            let (mut live, said, events, why) = live_chat_for_testing();
+            if id != "new" {
+                live.background.insert("bg".to_owned());
+            }
+            kept.insert(id.to_owned(), live);
+            held.push((said, events, why));
+        }
+
+        let evicted = make_room(&mut kept, 6, "new", LIVE_CAP);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(!kept.contains_key("new"), "the one being kept is dropped");
+        for id in ["c0", "c1", "c2", "c3"] {
+            assert!(kept.contains_key(id), "{id} is busy and stays");
+        }
+
+        // With a background task of its own it is not dropped either.
+        let (mut live, said, events, why) = live_chat_for_testing();
+        live.background.insert("bg".to_owned());
+        kept.insert("new".to_owned(), live);
+        held.push((said, events, why));
+
+        let evicted = make_room(&mut kept, 6, "new", LIVE_CAP);
+
+        assert!(evicted.is_empty());
+        assert_eq!(kept.len(), 5);
     }
 
     /// The whole point: a conversation's second turn is answered by the process its first one
@@ -7555,7 +7945,7 @@ mod tests {
     }
 
     /// One turn of a rooted conversation, in the shape `send_message_with` builds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     fn seam_request(
         prompt: &str,
         cwd: &std::path::Path,
@@ -7660,6 +8050,8 @@ mod tests {
             permission: crate::runner::Permission::Default,
             cwd: None,
             idle_since: std::time::Instant::now(),
+            idle_for: LIVE_IDLE,
+            _counted: LiveCount::start(),
             carried: Default::default(),
             background: HashSet::new(),
             watcher: 0,
@@ -7958,6 +8350,87 @@ mod tests {
             Some(0.25),
             "the person was billed for the task's answer"
         );
+    }
+
+    /// A task the opening turn launched is a durable row from that turn's end, and its end event
+    /// arriving between turns closes the row with status, tokens and summary.
+    #[tokio::test]
+    async fn a_background_task_is_recorded_from_its_launch_to_its_end_between_turns() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        *fake.canned.lock().unwrap() = Some(crate::runner::RunOutcome {
+            exit_code: 0,
+            stdout: concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bg","name":"Bash","input":{"command":"sleep 20","run_in_background":true}}]}}"#,
+                "
+",
+                r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bg","is_backgrounded":true}"#,
+                "
+",
+                r#"{"type":"result","subtype":"success","result":"fake output"}"#
+            )
+            .to_owned(),
+            stderr: String::new(),
+            session_id: Some("fake-session-id".into()),
+            cost_usd: Some(0.0),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        });
+        let (unprompted, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        *fake.unprompted.lock().unwrap() = Some(rx);
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("task-row");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "lança", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        let mut rows = Vec::new();
+        for _ in 0..300 {
+            rows = crate::chat_tasks::for_chat(&state.pool, &chat)
+                .await
+                .unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let [launched] = rows.as_slice() else {
+            panic!("expected one task row after the launching turn, got {rows:?}");
+        };
+        assert_eq!(launched.status, "running");
+        assert_eq!(launched.kind, "background_bash");
+        assert_eq!(launched.launched_by_run_id, first);
+        assert_eq!(launched.task_id.as_deref(), Some("bg1"));
+
+        unprompted
+            .send(
+                r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bg","status":"completed","summary":"(exit code 0)","usage":{"total_tokens":321}}"#
+                    .to_owned(),
+            )
+            .unwrap();
+        for _ in 0..300 {
+            rows = crate::chat_tasks::for_chat(&state.pool, &chat)
+                .await
+                .unwrap();
+            if rows.first().is_some_and(|row| row.status != "running") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let [ended] = rows.as_slice() else {
+            panic!("expected one task row, got {rows:?}");
+        };
+        assert_eq!(ended.status, "completed");
+        assert_eq!(ended.total_tokens, Some(321));
+        assert_eq!(ended.summary.as_deref(), Some("(exit code 0)"));
+        assert!(ended.finished_at.is_some());
     }
 
     /// The spontaneous turn runs the same process the person's last turn did, so it carries that

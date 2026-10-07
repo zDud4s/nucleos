@@ -33,6 +33,8 @@ import (
 // late rather than never, and "never" is the failure that matters — it would leave the agent
 // reasoning about a page that never changed.
 func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.Action) (browser.ActResult, error) {
+	d.gate.RLock()
+	defer d.gate.RUnlock()
 	entry, lookupErr := d.lookup(id)
 	if lookupErr != nil {
 		return browser.ActResult{}, lookupErr
@@ -51,6 +53,12 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	// Second layer. The núcleo refuses this too, from its own record of the session, and neither
 	// layer is redundant: this one holds even if the núcleo's row and the browser disagree about who
 	// is driving, which is exactly the state a crash between the two produces.
+	if d.personHolds(id) {
+		return browser.Refused(
+			browser.ConsequencePersonDriving,
+			"a person is driving this session; the agent has no wheel until they hand it back",
+		), nil
+	}
 	if mode != browser.ModeAgent {
 		return browser.Refused(
 			browser.ConsequenceWheelRequested,

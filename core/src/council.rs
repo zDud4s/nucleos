@@ -343,7 +343,7 @@ pub struct CouncilRow {
 ///
 /// Test-only since roles arrived: `start_with` writes through [`insert_council_with_roles`], and
 /// this role-less shape is what the fixtures convene councils with.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn insert_council(
     pool: &sqlx::SqlitePool,
     id: &str,
@@ -2349,7 +2349,7 @@ pub const TERMINAL_COUNCIL_STATUSES: [&str; 3] = [STATUS_DONE, STATUS_ERROR, STA
 pub const DEFAULT_COUNCIL_RETENTION_DAYS: i64 = 90;
 
 /// The window, overridable the way `runs`, `feed` and `worktree` allow theirs to be.
-pub(crate) fn retention_days() -> i64 {
+pub fn retention_days() -> i64 {
     std::env::var("NUCLEOS_COUNCIL_RETENTION_DAYS")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
@@ -2950,7 +2950,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 

@@ -72,6 +72,16 @@ func (d *Driver) onFetchPaused(event cdp.Event) {
 }
 
 func (d *Driver) answerRequest(ctx context.Context, on cdp.SessionID, paused fetchPaused) {
+	// A person is driving: the fence is lifted for them. The request is continued bare — no response
+	// stage, so no CSP — and a main-frame document is written down, because where the person went is
+	// what a grant is read from. The state is read without the gate; see Driver.person.
+	if state := d.person.Load(); state != nil {
+		if isDocumentType(paused.ResourceType) && paused.FrameID == state.frame {
+			state.recorder.record(paused.Request.URL)
+		}
+		d.answerOrFail(ctx, on, paused.RequestID, "Fetch.continueRequest", map[string]any{"requestId": paused.RequestID})
+		return
+	}
 	request := fence.Request{
 		Method:       paused.Request.Method,
 		URL:          paused.Request.URL,
@@ -121,6 +131,12 @@ func (d *Driver) answerRequest(ctx context.Context, on cdp.SessionID, paused fet
 }
 
 func (d *Driver) answerResponse(ctx context.Context, session cdp.SessionID, paused fetchPaused) {
+	// A response already paused when the person's turn began, or one the person's own request raced
+	// with: plain continue, no verdict and no CSP, the same lifting as the request stage.
+	if d.person.Load() != nil {
+		d.answerOrFail(ctx, session, paused.RequestID, "Fetch.continueResponse", map[string]any{"requestId": paused.RequestID})
+		return
+	}
 	verdict := fence.DecideResponse(d.policy, fence.Response{
 		URL:          paused.Request.URL,
 		ResourceType: paused.ResourceType,
