@@ -1837,10 +1837,8 @@ mod tests {
             running_in.display(),
         );
 
-        let mut sources = fs::read_dir(running_in.join("src"))
-            .expect("core source directory must be readable")
-            .map(|entry| entry.expect("core source entry must be readable").path())
-            .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("rs"))
+        let mut sources = crate::source_scan::top_level_rust_files()
+            .into_iter()
             .map(|path| {
                 let name = path
                     .file_name()

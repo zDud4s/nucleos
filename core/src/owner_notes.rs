@@ -1139,36 +1139,24 @@ mod tests {
             "lib.rs",
         ];
         let needle = ["owner", "note"].join("_");
-        let src = running_in.join("src");
         let mut scanned = 0;
-        // Recursive: a module directory (`council/`, `judge/`) is as much the agent's memory as
-        // a top-level file. Only the four top-level files are allowed, so a `http.rs` nested in
-        // some module directory is scanned like any other.
-        let mut pending = vec![src.clone()];
-        while let Some(dir) = pending.pop() {
-            for entry in std::fs::read_dir(&dir).expect("core source must be readable") {
-                let path = entry.expect("entry must be readable").path();
-                if path.is_dir() {
-                    pending.push(path);
-                    continue;
-                }
-                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                    continue;
-                }
-                scanned += 1;
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if dir == src && allowed.contains(&name) {
-                    continue;
-                }
-                let source = std::fs::read_to_string(&path).expect("source file must be readable");
-                assert!(
-                    !source.contains(&needle),
-                    "{} mentions `{needle}`: the owner's notes are reachable from owner_notes.rs, \
-                     http.rs, main.rs and distill.rs (spec D4) only, so that nothing in the \
-                     agent's memory can read them",
-                    path.display()
-                );
+        // Recursive, over every source root: a module directory (`council/`, `judge/`) is as much
+        // the agent's memory as a top-level file. Only the top-level files of a root are allowed,
+        // so a `http.rs` nested in some module directory is scanned like any other.
+        for path in crate::source_scan::rust_files() {
+            scanned += 1;
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if crate::source_scan::is_top_level(&path) && allowed.contains(&name) {
+                continue;
             }
+            let source = std::fs::read_to_string(&path).expect("source file must be readable");
+            assert!(
+                !source.contains(&needle),
+                "{} mentions `{needle}`: the owner's notes are reachable from owner_notes.rs, \
+                 http.rs, main.rs and distill.rs (spec D4) only, so that nothing in the \
+                 agent's memory can read them",
+                path.display()
+            );
         }
         assert!(scanned > 20, "the scan found only {scanned} source files");
     }

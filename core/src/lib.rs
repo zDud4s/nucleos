@@ -132,6 +132,8 @@ pub mod seed;
 pub mod sessions;
 pub mod shadow;
 pub mod sidecar;
+#[cfg(any(test, feature = "testkit"))]
+pub mod source_scan;
 pub mod speak;
 pub mod speed;
 pub mod state;
