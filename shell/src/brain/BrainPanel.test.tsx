@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
-import type { Node } from "@xyflow/react";
 import { BrainPanel } from "./BrainPanel";
+import type { GModel } from "./graph-types";
 import type { NoteDetail, NotesGraph } from "../data/owner-notes";
 import { renderWithRouter } from "../test/harness";
 
@@ -11,6 +11,21 @@ const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHea
 vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),
   ...daemon,
+}));
+
+// The canvas is its own suite's business: here it lists the node ids it was handed.
+vi.mock("./ForceGraph", () => ({
+  ForceGraph: ({ model, onSelect }: { model: GModel; onSelect: (id: string) => void }) => (
+    <ul aria-label="Local graph nodes">
+      {model.nodes.map((node) => (
+        <li key={node.id}>
+          <button type="button" onClick={() => onSelect(node.id)}>
+            {node.id}
+          </button>
+        </li>
+      ))}
+    </ul>
+  ),
 }));
 
 import { ApiRefusal } from "../data/client";
@@ -29,19 +44,28 @@ function detail(over: Partial<NoteDetail> = {}): NoteDetail {
 }
 
 const graph: NotesGraph = { notes: [NOTE], links: [], targets: [] };
-const nodes: Node[] = [{ id: "n:4", type: "note", position: { x: 0, y: 0 }, data: { note: NOTE } }];
+const model: GModel = {
+  nodes: [{ id: "n:4", kind: "note", ref: "4", label: NOTE.text, bucket: "in_force", missing: false, degree: 0 }],
+  edges: [],
+};
+
+/** What `/owner-notes/graph?include_archived=true` answers; `panel` sets it. */
+let wide: NotesGraph = graph;
 
 function serve(d: NoteDetail, other?: (path: string, init?: RequestInit) => unknown) {
   daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) => {
     if (path === "/owner-notes/4" && init === undefined) return Promise.resolve(d);
+    if (path === "/owner-notes/graph?include_archived=true") return Promise.resolve(wide);
+    if (path === "/knowledge" || path === "/projects") return Promise.resolve([]);
     const answer = other?.(path, init);
     if (answer !== undefined) return answer;
     return Promise.reject(new Error(`unexpected ${path}`));
   });
 }
 
-async function panel(g: NotesGraph = graph) {
-  await renderWithRouter(<BrainPanel nodeId="n:4" graph={g} nodes={nodes} edges={[]} />, {
+async function panel(g: NotesGraph = graph, onSelect?: (id: string) => void) {
+  wide = g;
+  await renderWithRouter(<BrainPanel nodeId="n:4" graph={g} model={model} onSelect={onSelect} />, {
     initialPath: "/brain",
   });
   await screen.findByText("Rust owns the state");
@@ -177,5 +201,53 @@ describe("BrainPanel", () => {
     fireEvent.click(armed);
 
     await waitFor(() => expect(deleted).toEqual(["/owner-notes/links/9"]));
+  });
+
+  it("the local graph shows the note's neighbours, and a neighbour click selects it", async () => {
+    const neighbour = { ...NOTE, id: 7, text: "A neighbour" };
+    const far = { ...NOTE, id: 8, text: "Two hops away" };
+    const linked: NotesGraph = {
+      notes: [NOTE, neighbour, far],
+      links: [
+        { id: 1, note_id: 4, link_type: "relates", target_kind: "note", target_ref: "7", created_at: NOTE.created_at },
+        { id: 2, note_id: 7, link_type: "supports", target_kind: "note", target_ref: "8", created_at: NOTE.created_at },
+      ],
+      targets: [],
+    };
+    const picked: string[] = [];
+    serve(detail());
+    await panel(linked, (id) => picked.push(id));
+
+    const local = await screen.findByRole("list", { name: "Local graph nodes" });
+    expect(local.textContent).toContain("n:4");
+    expect(local.textContent).toContain("n:7");
+    expect(local.textContent).not.toContain("n:8");
+
+    fireEvent.click(screen.getByRole("button", { name: "Depth 2" }));
+    await waitFor(() =>
+      expect(screen.getByRole("list", { name: "Local graph nodes" }).textContent).toContain("n:8"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "n:7" }));
+    fireEvent.click(screen.getByRole("button", { name: "n:4" })); // the note itself selects nothing
+    expect(picked).toEqual(["n:7"]);
+  });
+
+  it("links in include the ones from archived notes, marked as such", async () => {
+    const archived = { ...NOTE, id: 5, text: "An old idea", state: "archived" as const };
+    const fromArchived: NotesGraph = {
+      notes: [NOTE, archived],
+      links: [
+        { id: 3, note_id: 5, link_type: "details", target_kind: "note", target_ref: "4", created_at: NOTE.created_at },
+      ],
+      targets: [],
+    };
+    serve(detail());
+    await panel(fromArchived);
+
+    const list = await screen.findByRole("list", { name: "Links in" });
+    expect(list.textContent).toContain("details");
+    expect(list.textContent).toContain("An old idea");
+    expect(list.textContent).toContain("archived");
   });
 });

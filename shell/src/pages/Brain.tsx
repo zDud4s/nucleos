@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { BrainCanvas } from "../canvas/BrainCanvas";
 import { BrainPanel } from "../brain/BrainPanel";
-import { layout, toGraph, type BrainFilters } from "../data/brain-graph";
-import { useKnowledge } from "../data/knowledge";
+import { ForceGraph } from "../brain/ForceGraph";
+import { buildModel } from "../brain/graph-model";
+import type { GFilters } from "../brain/graph-types";
+import { GraphFilters, defaultGraphFilters } from "../brain/GraphFilters";
+import { formatItem, itemOfNode, nodeIdOf, parseItem, parseView, type BrainView } from "../brain/item-ref";
+import { useKnowledge, type Known } from "../data/knowledge";
 import {
-  LINK_TYPES,
-  TARGET_KINDS,
   useNotesGraph,
   useCreateNote,
   useOwnerNotes,
@@ -14,6 +15,7 @@ import {
   type NoteState,
   type OwnerNote,
 } from "../data/owner-notes";
+import { useProjects } from "../data/system";
 import { Button, ErrorNote, PageHeader, Panel, Quiet, RelativeTime, Row, Rows } from "../ui";
 import "./brain.css";
 
@@ -21,12 +23,28 @@ import "./brain.css";
  * Brain — the owner's own notes, which no agent ever reads.
  *
  * A capture box above a list: what is typed here is kept as written and shown back, nothing more.
- * The `List | Graph` switch is the only place the notes are drawn as a map.
+ * The `List | Graph` switch is the only place the notes are drawn as a map. The view and the
+ * selected item live in the address (`?view=`, `?item=`), so a reload or a shared link lands on the
+ * same thing, and "back" walks from item to item.
  */
 export function Brain() {
-  const [view, setView] = useState<"list" | "graph">("list");
+  const { view, item } = useBrainSearch();
+  const navigate = useNavigate();
   const [state, setState] = useState<NoteState | "all">("active");
   const [query, setQuery] = useState("");
+
+  // Switching view replaces the entry; picking an item pushes one (spec §3.2).
+  const showView = (next: BrainView) =>
+    void navigate({
+      to: "/brain",
+      search: (prev: Record<string, unknown>) => brainSearch({ ...validateBrainSearch(prev), view: next }),
+      replace: true,
+    });
+  const showItem = (next: string) =>
+    void navigate({
+      to: "/brain",
+      search: (prev: Record<string, unknown>) => brainSearch({ ...validateBrainSearch(prev), item: next }),
+    });
 
   const searching = query.trim() !== "";
   const notes = useOwnerNotes(state);
@@ -50,7 +68,7 @@ export function Brain() {
               key={value}
               variant="quiet"
               aria-pressed={view === value}
-              onClick={() => setView(value)}
+              onClick={() => showView(value)}
             >
               {label}
             </Button>
@@ -83,7 +101,7 @@ export function Brain() {
       </div>
 
       {view === "graph" ? (
-        <BrainGraphView />
+        <BrainGraphView item={item} onItem={showItem} />
       ) : (
         <>
           {shown.isError && (
@@ -107,7 +125,7 @@ export function Brain() {
   );
 }
 
-const VIEWS: readonly (readonly ["list" | "graph", string])[] = [
+const VIEWS: readonly (readonly [BrainView, string])[] = [
   ["list", "List"],
   ["graph", "Graph"],
 ];
@@ -118,15 +136,43 @@ const STATES: readonly (readonly [NoteState | "all", string])[] = [
   ["all", "All"],
 ];
 
+export interface BrainSearch {
+  capture?: number;
+  view: BrainView;
+  /** `note:<id>` | `knowledge:<id>`, already checked by `parseItem`. */
+  item?: string;
+}
+
 /**
- * The `capture` stamp a shortcut puts in the address to say "take a note now". A number or
- * nothing, as `validateVoiceSearch` does for `talk`: anything else is the same as not asking.
+ * The Brain's search params.
+ *
+ * `capture` is the stamp a shortcut puts in the address to say "take a note now": a number or
+ * nothing, as `validateVoiceSearch` does for `talk` — anything else is the same as not asking.
+ * `view` is `list` unless it says `graph`. `item` is kept only when `parseItem` accepts it, so a
+ * malformed one (`knowledge:abc`) is dropped rather than opening a panel for nothing.
  */
-export function validateBrainSearch(search: Record<string, unknown>): { capture?: number } {
+export function validateBrainSearch(search: Record<string, unknown>): BrainSearch {
+  const out: BrainSearch = { view: parseView(search.view) };
   const capture = typeof search.capture === "number" ? search.capture : Number(search.capture);
-  return Number.isFinite(capture) && search.capture !== undefined && search.capture !== ""
-    ? { capture }
-    : {};
+  if (Number.isFinite(capture) && search.capture !== undefined && search.capture !== "") {
+    out.capture = capture;
+  }
+  const item = parseItem(search.item);
+  if (item !== null) out.item = formatItem(item);
+  return out;
+}
+
+/** What goes back into the address: no empty keys, and the default view left out. */
+function brainSearch(search: BrainSearch): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (search.capture !== undefined) out.capture = search.capture;
+  if (search.view !== "list") out.view = search.view;
+  if (search.item !== undefined) out.item = search.item;
+  return out;
+}
+
+function useBrainSearch(): BrainSearch {
+  return validateBrainSearch(useSearch({ strict: false }) as Record<string, unknown>);
 }
 
 /**
@@ -138,15 +184,21 @@ function Capture() {
   const [text, setText] = useState("");
   const areaRef = useRef<HTMLTextAreaElement>(null);
   const navigate = useNavigate();
-  const { capture } = validateBrainSearch(useSearch({ strict: false }) as Record<string, unknown>);
+  const { capture } = useBrainSearch();
   const consumedRef = useRef<number | undefined>(undefined);
 
   // The stamp is removed from the address as it is consumed, so a reload does not refocus; the
-  // consumed value is remembered because clearing the address is itself a navigation.
+  // consumed value is remembered because clearing the address is itself a navigation. Only the
+  // stamp goes: the view and the item it was opened with stay.
   useEffect(() => {
     if (capture === undefined || capture === consumedRef.current) return;
     consumedRef.current = capture;
-    void navigate({ to: "/brain", search: {}, replace: true });
+    void navigate({
+      to: "/brain",
+      search: (prev: Record<string, unknown>) =>
+        brainSearch({ ...validateBrainSearch(prev), capture: undefined }),
+      replace: true,
+    });
     areaRef.current?.focus();
   }, [capture, navigate]);
 
@@ -198,41 +250,72 @@ function NoteRow({ note }: { note: OwnerNote }) {
   );
 }
 
-const EMPTY_KNOWLEDGE: never[] = [];
+const EMPTY_KNOWLEDGE: Known[] = [];
 
-/** The Graph side of the switch: filters and canvas on the left, the selected node on the right. */
-export function BrainGraphView() {
-  const [filters, setFilters] = useState<BrainFilters>({
-    knowledge: "linked",
-    linkTypes: new Set<string>(LINK_TYPES),
-    kinds: new Set<string>(TARGET_KINDS),
-    showArchived: false,
-  });
-  const [selected, setSelected] = useState<string | null>(null);
+/**
+ * What the graph is drawn without, in words: only the notes graph failing is an error (spec §3.3);
+ * knowledge or the project roster missing just leaves their part out.
+ */
+function missingSentence(
+  knowledge: { isError: boolean; data: unknown },
+  projects: { isError: boolean; data: unknown },
+): string | null {
+  const parts: string[] = [];
+  if (knowledge.isError) parts.push("knowledge did not answer — its rows are not drawn");
+  else if (knowledge.data === undefined) parts.push("knowledge is still loading — its rows are not drawn yet");
+  if (projects.isError) parts.push("the project roster did not answer — projects show their ids");
+  else if (projects.data === undefined) parts.push("the project roster is still loading — projects show their ids");
+  if (parts.length === 0) return null;
+  const sentence = parts.join("; ");
+  return `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.`;
+}
+
+/**
+ * The Graph side of the switch: filters and canvas on the left, the selected node on the right.
+ *
+ * A note is selected through `?item=`. Knowledge rows and entity nodes are selected in component
+ * state until the knowledge panel exists; that selection belongs to the item it was made under, so
+ * "back" to another item drops it.
+ */
+export function BrainGraphView({ item, onItem }: { item?: string; onItem: (item: string) => void }) {
+  const [filters, setFilters] = useState<GFilters>(defaultGraphFilters);
+  const [entity, setEntity] = useState<{ id: string; under: string | undefined } | null>(null);
   const graph = useNotesGraph(filters.showArchived);
   const knowledge = useKnowledge();
+  const projects = useProjects();
+  const knownRows = knowledge.data ?? EMPTY_KNOWLEDGE;
+  const projectRows = projects.data;
 
-  const shaped = useMemo(() => {
-    if (graph.data === undefined) return null;
-    const g = toGraph(graph.data, knowledge.data ?? EMPTY_KNOWLEDGE, filters);
-    return { ...g, nodes: layout(g) };
-  }, [graph.data, knowledge.data, filters]);
+  const model = useMemo(
+    () => (graph.data === undefined ? null : buildModel(graph.data, knownRows, projectRows, filters)),
+    [graph.data, knownRows, projectRows, filters],
+  );
+
+  const ref = parseItem(item);
+  const selected =
+    entity !== null && entity.under === item ? entity.id : ref !== null ? nodeIdOf(ref) : null;
+  const select = (nodeId: string) => {
+    const picked = itemOfNode(nodeId);
+    if (picked?.kind === "note") {
+      setEntity(null);
+      onItem(formatItem(picked));
+    } else {
+      setEntity({ id: nodeId, under: item });
+    }
+  };
 
   if (graph.isError) return <ErrorNote>the núcleo did not answer — the graph is not known</ErrorNote>;
-  if (graph.data === undefined || shaped === null) return <Quiet says="Loading the graph…" />;
+  if (graph.data === undefined || model === null) return <Quiet says="Loading the graph…" />;
+  const missing = missingSentence(knowledge, projects);
 
   return (
     <div className="brain-graph">
-      <BrainCanvas
-        nodes={shaped.nodes}
-        edges={shaped.edges}
-        meta={shaped.meta}
-        filters={filters}
-        onFilters={setFilters}
-        selectedId={selected}
-        onSelect={setSelected}
-      />
-      <BrainPanel nodeId={selected} graph={graph.data} nodes={shaped.nodes} edges={shaped.edges} />
+      <div className="brain-graph-main">
+        <GraphFilters filters={filters} onFilters={setFilters} />
+        {missing !== null && <Quiet says={missing} />}
+        <ForceGraph model={model} selected={selected} onSelect={select} />
+      </div>
+      <BrainPanel nodeId={selected} graph={graph.data} model={model} onSelect={select} />
     </div>
   );
 }

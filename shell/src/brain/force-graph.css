@@ -1,0 +1,102 @@
+/**
+ * The Brain force graph: a wrapper, a canvas, and the colours the canvas reads.
+ *
+ * The canvas paints every pixel itself, so the only thing CSS gives it is its palette: each
+ * `--brain-*` property below is read back with `getComputedStyle(canvas)` once per frame
+ * (`colorToken` in `graph-util.ts` names which one a node takes). Nothing writes a style
+ * attribute — the production CSP refuses that — so a colour changes HERE, never in the component.
+ *
+ * The node hues are identity, not state: a note, a project, a knowledge layer. They are their own
+ * set on purpose — borrowing `--tone-*` would make a procedural row read as "pending" and a
+ * contact as "active". State on the graph is shape (hollow for proposed, dashed for missing),
+ * never colour. Dark is the base and light the override, as in `tokens.css`.
+ */
+
+.brain-force {
+  --brain-note: #8fb4ff;
+  --brain-k-semantic: #c49bff;
+  --brain-k-episodic: #ff9ec7;
+  --brain-k-procedural: #7fdcc0;
+  --brain-k-working: #f5c46b;
+  --brain-project: #f09168;
+  --brain-contact: #9fd36f;
+  --brain-mail: #7ec8e3;
+  --brain-file: #b9c0cc;
+
+  --brain-edge: rgba(152, 161, 178, 0.28);
+  --brain-edge-strong: rgba(231, 234, 240, 0.75);
+  --brain-label: var(--text-muted);
+  --brain-label-strong: var(--text);
+  --brain-ring: var(--accent);
+  --brain-missing: var(--text-faint);
+  --brain-ground: var(--surface-sunken);
+
+  position: relative;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--brain-ground);
+  overflow: hidden;
+}
+
+@media (prefers-color-scheme: light) {
+  .brain-force {
+    --brain-note: #2f62c9;
+    --brain-k-semantic: #7a3fd0;
+    --brain-k-episodic: #c23b7d;
+    --brain-k-procedural: #13836a;
+    --brain-k-working: #a06c00;
+    --brain-project: #b4531f;
+    --brain-contact: #4d8a17;
+    --brain-mail: #1f7fa3;
+    --brain-file: #5f6875;
+
+    --brain-edge: rgba(87, 96, 110, 0.3);
+    --brain-edge-strong: rgba(20, 23, 29, 0.7);
+  }
+}
+
+.brain-force-canvas {
+  display: block;
+  width: 100%;
+  cursor: grab;
+  touch-action: none;
+}
+
+.brain-force-canvas:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.brain-force-canvas.is-hovering {
+  cursor: pointer;
+}
+
+.brain-force-canvas.is-dragging {
+  cursor: grabbing;
+}
+
+.brain-force-controls {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  display: flex;
+  gap: var(--space-1);
+}
+
+.brain-force-control {
+  min-width: 1.75rem;
+  height: 1.75rem;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: 1;
+}
+
+.brain-force-control:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
