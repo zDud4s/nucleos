@@ -652,6 +652,70 @@ fn judge_wait(started: Instant) -> Option<Duration> {
     (remaining >= JUDGE_FLOOR).then(|| remaining.min(crate::judge::JUDGE_DEADLINE))
 }
 
+/// F2b step 1, observe only: records a verification command the run executed by itself.
+///
+/// Best effort. The decision is already taken and nothing here can change it: a missing or
+/// invalid tests map, an unreadable gate command or a failed insert all end in a return (or a
+/// warning), never in a different answer for the call.
+async fn observe_verification(
+    state: &AppState,
+    run_id: i64,
+    project_id: &str,
+    cwd: &str,
+    payload: &PreToolUsePayload,
+    decision: &str,
+    shadow_decision_id: Option<i64>,
+) {
+    let Some(command) = payload.tool_input.get("command").and_then(Value::as_str) else {
+        return;
+    };
+    let root = std::path::PathBuf::from(cwd);
+    let map = match tokio::task::spawn_blocking(move || crate::tests_map::load(&root)).await {
+        Ok(crate::tests_map::MapState::Valid(map)) => map,
+        _ => return,
+    };
+    let machine_root = state.machine_config_root.as_deref();
+    let gate = match crate::config::load_schedule_rules(machine_root, project_id) {
+        Ok(rules) => rules.gate_command,
+        Err(error) => {
+            tracing::warn!(
+                run_id,
+                %error,
+                "pretooluse-decision: failed to read the project's gate command"
+            );
+            None
+        }
+    };
+    let Some(hit) = crate::verify_guard::detect(
+        command,
+        classifier::shell_for(&payload.tool_name),
+        &map,
+        gate.as_deref(),
+    ) else {
+        return;
+    };
+    if let Err(error) = crate::verify_observe::record(
+        &state.pool,
+        &crate::verify_observe::Observation {
+            project_id,
+            run_id,
+            shadow_decision_id,
+            tool_name: &payload.tool_name,
+            command,
+            hit: &hit,
+            decision,
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id,
+            %error,
+            "pretooluse-decision: failed to record a verification observation"
+        );
+    }
+}
+
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
@@ -1063,6 +1127,25 @@ async fn pretooluse_decision_from(
     } else {
         None
     };
+
+    // F2b step 1: an in-flight worktree run that ran a verification command by itself is
+    // recorded, after the decision above is already taken and without any way to change it.
+    if mode == "worktree"
+        && is_in_flight
+        && matches!(payload.tool_name.as_str(), "Bash" | "PowerShell")
+        && let (Some(project_id), Some(cwd)) = (project_id.as_deref(), cwd.as_deref())
+    {
+        observe_verification(
+            &state,
+            run_id,
+            project_id,
+            cwd,
+            &payload,
+            &classification.decision.decision,
+            shadow_decision_id,
+        )
+        .await;
+    }
 
     // **Spec B D12: a person already declined this exact action in this lineage.**
     //
@@ -11413,5 +11496,197 @@ mod tests {
         let barred = decide(&app, &ambient).await;
         assert_eq!(barred.decision, "deny");
         assert_eq!(barred.reason, UNTRUSTED_CONTEXT_DENY_REASON);
+    }
+
+    // F2b step 1: verification observed, never decided.
+
+    /// A directory holding a valid `nucleos.tests.yaml` that allows `cargo fmt` only.
+    fn mapped_cwd() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nucleos.tests.yaml"),
+            "version: 1\ntests:\n  tools:\n    cargo: { allow: [fmt] }\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    async fn observed_rows(state: &AppState, run_id: i64) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM verification_observations WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn ask_tool(app: &Router, run_id: i64, tool: &str, input: serde_json::Value) -> Decision {
+        decide(
+            app,
+            &serde_json::json!({ "run_id": run_id, "tool_name": tool, "tool_input": input })
+                .to_string(),
+        )
+        .await
+    }
+
+    /// The observation is a side record: the same call gets the same decision and reason whether
+    /// the cwd carries a tests map (and a row is written) or not (and none is).
+    #[tokio::test]
+    async fn verification_observed_records_a_row_without_changing_the_decision() {
+        let state = test_state().await;
+        let mapped = mapped_cwd();
+        let bare = tempfile::tempdir().unwrap();
+        let with_map = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(mapped.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let without_map = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(bare.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+        let input = serde_json::json!({ "command": "cargo test -p x some_test" });
+
+        let a = ask_tool(&app, with_map, "Bash", input.clone()).await;
+        let b = ask_tool(&app, without_map, "Bash", input).await;
+
+        assert_eq!(a.decision, b.decision);
+        assert_eq!(a.reason, b.reason);
+        assert_eq!(observed_rows(&state, with_map).await, 1);
+        assert_eq!(observed_rows(&state, without_map).await, 0);
+        let (kind, name): (String, String) =
+            sqlx::query_as("SELECT kind, name FROM verification_observations WHERE run_id = ?")
+                .bind(with_map)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!((kind.as_str(), name.as_str()), ("tool", "cargo"));
+    }
+
+    /// Only an in-flight worktree Bash/PowerShell call whose command the map does not allow is
+    /// observed: an allowed subcommand, a `real` run and a non-shell tool leave no row.
+    #[tokio::test]
+    async fn verification_observed_skips_allowed_commands_real_runs_and_other_tools() {
+        let state = test_state().await;
+        let mapped = mapped_cwd();
+        let cwd = mapped.path().to_str().unwrap();
+        let worktree = in_flight_run(&state, "worktree", Some("p"), Some(cwd), None).await;
+        let real = in_flight_run(&state, "real", Some("p"), Some(cwd), None).await;
+        let app = test_router(state.clone());
+
+        ask_tool(
+            &app,
+            worktree,
+            "Bash",
+            serde_json::json!({ "command": "cargo fmt" }),
+        )
+        .await;
+        ask_tool(
+            &app,
+            real,
+            "Bash",
+            serde_json::json!({ "command": "cargo test" }),
+        )
+        .await;
+        ask_tool(
+            &app,
+            worktree,
+            "Edit",
+            serde_json::json!({ "file_path": "src/ordinary.rs" }),
+        )
+        .await;
+
+        assert_eq!(observed_rows(&state, worktree).await, 0);
+        assert_eq!(observed_rows(&state, real).await, 0);
+    }
+
+    /// A map the loader does not accept (an unknown `version`) is no map: no row, and the decision
+    /// is the one a cwd without any map gets.
+    #[tokio::test]
+    async fn verification_observed_ignores_an_invalid_map() {
+        let state = test_state().await;
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(
+            broken.path().join("nucleos.tests.yaml"),
+            "version: 9\ntests:\n  tools:\n    cargo: { allow: [fmt] }\n",
+        )
+        .unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        let with_broken = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(broken.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let without_map = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(bare.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+        let input = serde_json::json!({ "command": "cargo test -p x some_test" });
+
+        let a = ask_tool(&app, with_broken, "Bash", input.clone()).await;
+        let b = ask_tool(&app, without_map, "Bash", input).await;
+
+        assert_eq!(a.decision, b.decision);
+        assert_eq!(a.reason, b.reason);
+        assert_eq!(observed_rows(&state, with_broken).await, 0);
+    }
+
+    /// The project's `gate_command` (read from the machine-config autopilot file) is observed too,
+    /// as kind `gate_command`.
+    #[tokio::test]
+    async fn verification_observed_reads_the_projects_gate_command() {
+        let mut state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(root.path().to_path_buf());
+        let rules = crate::project_state::file(
+            Some(root.path()),
+            "p",
+            crate::project_state::AUTOPILOT_FILE,
+        )
+        .unwrap();
+        std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
+        std::fs::write(&rules, "gate_command: \"make gate\"\n").unwrap();
+        let mapped = mapped_cwd();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(mapped.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        ask_tool(
+            &app,
+            run_id,
+            "Bash",
+            serde_json::json!({ "command": "make gate" }),
+        )
+        .await;
+
+        assert_eq!(observed_rows(&state, run_id).await, 1);
+        let kind: String =
+            sqlx::query_scalar("SELECT kind FROM verification_observations WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(kind, "gate_command");
     }
 }

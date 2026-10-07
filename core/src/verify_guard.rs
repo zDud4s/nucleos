@@ -197,7 +197,10 @@ fn is_python(program: &str) -> bool {
 
 /// Programs whose first non-flag argument is the script they run.
 fn is_interpreter(program: &str) -> bool {
-    matches!(program, "bash" | "sh" | "zsh" | "node" | "pwsh" | "powershell") || is_python(program)
+    matches!(
+        program,
+        "bash" | "sh" | "zsh" | "node" | "pwsh" | "powershell"
+    ) || is_python(program)
 }
 
 /// Takes one layer off `words` (which is not empty and starts with a program).
