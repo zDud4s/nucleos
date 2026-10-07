@@ -2,14 +2,20 @@
 
     python scripts/heavy_watch.py [--interval 2]
 
-Shows the capacity in use, who holds a place, who waits, the target-dir slots and every
-running rustc with its CPU share. Never reaps, never writes: it reads the same state files
-`heavy.py status` reads. Ctrl+C to leave.
+One block per running job, numbered #1, #2...: its phases (prepare -> compile -> test)
+with the current one marked, cargo's own progress as the broker reads it from the job's
+output (units compiled out of the total, then the test binary and tests run), the target
+slot it leased and the rustc processes it spawned. Queued jobs show how long the same
+command took before, from the broker's log. The slot list names jobs by the same number;
+rustc outside any broker job is listed apart. Never reaps, never writes: it reads the state
+files `heavy.py status` reads. Ctrl+C to leave.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -19,15 +25,27 @@ import heavy  # noqa: E402
 
 try:
     import psutil
-except ImportError:  # the broker view still works without the rustc panel
+except ImportError:  # the broker view still works without the process panels
     psutil = None
 
 RESET, DIM, BOLD = "\x1b[0m", "\x1b[2m", "\x1b[1m"
 GREEN, YELLOW, RED, CYAN = "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[36m"
+# One colour per job number, reused wherever that job is named (its block, the slot list).
+# `cargo clippy` compiles through clippy-driver, not rustc.
+COMPILERS = {"rustc.exe", "clippy-driver.exe", "rustc", "clippy-driver"}
+JOB_COLOURS = ["\x1b[36m", "\x1b[35m", "\x1b[34m", "\x1b[33m"]
 
 
 def short_wt(path) -> str:
-    return Path(str(path or "-")).name or str(path)
+    """The worktree's name. A held record carries the directory the command ran from (often
+    `<worktree>/core`), so walk up to the checkout root: the slot list names the root."""
+    if not path:
+        return "-"
+    p = Path(str(path))
+    for c in (p, *p.parents) if p.is_absolute() else ():
+        if (c / ".git").exists():
+            return c.name
+    return p.name or str(path)
 
 
 def short_argv(rec: dict, width: int = 60) -> str:
@@ -45,7 +63,8 @@ def age_s(path: Path, rec: dict) -> int:
         return 0
 
 
-def fmt_age(s: int) -> str:
+def fmt_age(s: float) -> str:
+    s = int(s)
     if s < 60:
         return f"{s}s"
     if s < 3600:
@@ -62,94 +81,279 @@ def bar(used: int, total: int) -> str:
     return f"[{cells}] {used}/{total}"
 
 
-def rustc_rows(primed: dict) -> list[str]:
-    if psutil is None:
-        return [f"  {DIM}(pip install psutil para ver o rustc){RESET}"]
-    rows = []
-    for p in psutil.process_iter(["pid", "name", "cmdline", "create_time", "memory_info"]):
-        if (p.info["name"] or "").lower() != "rustc.exe":
-            continue
-        cmd = p.info["cmdline"] or []
+def meter(done: int, total: int, width: int = 24) -> str:
+    frac = min(1.0, done / total) if total else 0.0
+    filled = int(frac * width)
+    return (f"[{CYAN}{'█' * filled}{RESET}{DIM}{'░' * (width - filled)}{RESET}] "
+            f"{int(frac * 100):>3}%")
+
+
+def colour_of(n: int) -> str:
+    return JOB_COLOURS[(n - 1) % len(JOB_COLOURS)]
+
+
+def tag(n: int) -> str:
+    return f"{colour_of(n)}{BOLD}#{n}{RESET}"
+
+
+# ------------------------------------------------------------------ history
+
+# The broker log only grows; re-parse it when its size changes, not every frame.
+_history_cache: dict = {"size": -1, "rows": []}
+
+
+def history() -> list[dict]:
+    try:
+        size = (heavy.state_dir() / "log.jsonl").stat().st_size
+    except OSError:
+        return []
+    if size != _history_cache["size"]:
+        _history_cache["size"], _history_cache["rows"] = size, heavy._read_log(None)
+    return _history_cache["rows"]
+
+
+def estimate(rec: dict) -> str:
+    """How long the same command took before: median and spread of the last runs in the
+    same worktree when there are at least two (an incremental build there is the closest
+    match), else of the last runs anywhere. Runs that never started (exit 75) are left out.
+    The spread is shown because it is wide: a full rebuild and an incremental one share an
+    argv."""
+    key = [str(a) for a in (rec.get("argv") or [])]
+    rows = [r for r in history() if r.get("argv") == key
+            and r.get("exit") != heavy.EXIT_QUEUE_TIMEOUT
+            and isinstance(r.get("run_s"), (int, float)) and r["run_s"] > 0]
+    wt = heavy._real(rec.get("worktree") or "")
+    here = [r for r in rows if heavy._real(r.get("worktree") or "") == wt][-5:]
+    runs, where = (here, "this worktree") if len(here) >= 2 else (rows[-15:], "any worktree")
+    vals = sorted(float(r["run_s"]) for r in runs)
+    if not vals:
+        return f"{DIM}unknown (never ran){RESET}"
+    med = statistics.median(vals)
+    if len(vals) >= 4:
+        lo, _, hi = statistics.quantiles(vals, n=4)
+    else:
+        lo, hi = vals[0], vals[-1]
+    spread = f" ({fmt_age(lo)}–{fmt_age(hi)})" if hi - lo >= 5 else ""
+    return f"~{fmt_age(med)}{spread} {DIM}{where}, n={len(vals)}{RESET}"
+
+
+# ------------------------------------------------------------------ phases
+
+def read_progress(pid) -> dict:
+    """What the broker read from this job's own output (heavy.py `_write_progress`).
+    Empty for a job that is not cargo, or that started under a broker without it."""
+    try:
+        return json.loads((heavy.state_dir() / "progress" / str(pid)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def phases_of(argv: list) -> list[str]:
+    args = [str(a) for a in argv]
+    if not args or not Path(args[0]).stem.lower().startswith("cargo"):
+        return ["run"]
+    sub = next((a for a in args[1:] if not a.startswith(("-", "+"))), "")
+    if sub in ("test", "t", "bench") and "--no-run" not in args:
+        return ["prepare", "compile", "test"]
+    return ["prepare", "compile"]
+
+
+def current_phase(phases: list[str], prog: dict) -> str:
+    if phases == ["run"]:
+        return "run"
+    if prog.get("binary") and "test" in phases:
+        return "test"
+    if prog.get("units_total"):
+        return "compile"
+    return "prepare"
+
+
+def phase_line(phases: list[str], now: str) -> str:
+    i = phases.index(now)
+    parts = []
+    for j, p in enumerate(phases):
+        if j < i:
+            parts.append(f"{DIM}✓ {p}{RESET}")
+        elif j == i:
+            parts.append(f"{BOLD}{YELLOW}▶ {p}{RESET}")
+        else:
+            parts.append(f"{DIM}· {p}{RESET}")
+    return "  →  ".join(parts) + f"   {DIM}phase {i + 1} of {len(phases)}{RESET}"
+
+
+# ------------------------------------------------------------------ processes
+
+def rustc_info(p, primed: dict) -> dict | None:
+    """Crate, uptime, cpu and memory of one rustc compiling a crate; None for anything
+    else, cargo's `rustc -vV` probes included."""
+    try:
+        if p.name().lower() not in COMPILERS:
+            return None
+        cmd = p.cmdline()
         if "--crate-name" not in cmd:
-            continue
-        crate = cmd[cmd.index("--crate-name") + 1]
-        out = cmd[cmd.index("--out-dir") + 1] if "--out-dir" in cmd else "?"
-        target = Path(out).parent.parent.name
+            return None
         if p.pid not in primed:
             primed[p.pid] = p
             p.cpu_percent(None)
-            cpu = "…"
+            cpu = None
         else:
-            cpu = f"{primed[p.pid].cpu_percent(None) / psutil.cpu_count():5.1f}%"
-        mb = (p.info["memory_info"].rss if p.info["memory_info"] else 0) // 2**20
-        up = fmt_age(int(time.time() - p.info["create_time"]))
-        test = " test" if "--test" in cmd else ""
-        rows.append(f"  {p.pid:>6}  {crate}{test:<5}  {CYAN}{target:<24}{RESET} "
-                    f"cpu {cpu:>6}  {mb:>5} MB  {up}")
-    return rows or [f"  {DIM}(nenhum){RESET}"]
+            cpu = primed[p.pid].cpu_percent(None) / (psutil.cpu_count() or 1)
+        out = cmd[cmd.index("--out-dir") + 1] if "--out-dir" in cmd else ""
+        return {
+            "crate": cmd[cmd.index("--crate-name") + 1] + (" (test)" if "--test" in cmd else "")
+                     + (" [clippy]" if "clippy" in p.name().lower() else ""),
+            "up": time.time() - p.create_time(), "cpu": cpu,
+            "mb": p.memory_info().rss // 2**20,
+            "target": Path(out).parent.parent.name if out else "?",
+        }
+    except psutil.Error:
+        return None
+
+
+def rustc_line(info: dict, indent: str, with_target: bool = False) -> str:
+    cpu = "   …" if info["cpu"] is None else f"{info['cpu']:4.1f}%"
+    target = f"  {CYAN}{info['target']}{RESET}" if with_target else ""
+    return (f"{indent}{info['crate']:<32} for {fmt_age(info['up']):>5}  cpu {cpu}  "
+            f"{info['mb']:>5} MB{target}")
+
+
+def job_tree(pid, primed: dict) -> tuple[list[dict], set[int]]:
+    """The rustc this job spawned (longest-running first), and every pid in its tree."""
+    if psutil is None:
+        return [], set()
+    try:
+        kids = psutil.Process(int(pid)).children(recursive=True)
+    except (psutil.Error, ValueError, TypeError):
+        return [], set()
+    infos = [i for i in (rustc_info(k, primed) for k in kids) if i]
+    return sorted(infos, key=lambda i: -i["up"]), {k.pid for k in kids}
+
+
+def stray_rustc(owned: set[int], primed: dict) -> list[dict]:
+    if psutil is None:
+        return []
+    out = []
+    for p in psutil.process_iter(["name"]):
+        if p.pid in owned or (p.info["name"] or "").lower() not in COMPILERS:
+            continue
+        info = rustc_info(p, primed)
+        if info:
+            out.append(info)
+    return out
+
+
+# ------------------------------------------------------------------ frame
+
+def job_block(n: int, f: Path, r: dict, slot: int | None, primed: dict,
+              owned: set[int]) -> list[str]:
+    pad = f"  {colour_of(n)}│{RESET}   "
+    slot_txt = f"pool-{slot}" if slot else f"{DIM}no slot{RESET}"
+    lines = [f"  {tag(n)}  {BOLD}{short_wt(r.get('worktree'))}{RESET}  {short_argv(r)}",
+             f"{pad}{DIM}running for{RESET} {fmt_age(age_s(f, r))}  {DIM}·{RESET} "
+             f"w{r.get('weight')}  {DIM}·{RESET} {slot_txt}  {DIM}· usually{RESET} {estimate(r)}"]
+
+    phases = phases_of(r.get("argv") or [])
+    prog = read_progress(r.get("pid"))
+    now = current_phase(phases, prog)
+    lines.append(pad + phase_line(phases, now))
+
+    if now == "compile":
+        done, total = prog["units_done"], prog["units_total"]
+        lines.append(f"{pad}{meter(done, total)}  {done}/{total} units compiled")
+    elif now == "test":
+        total, done = prog.get("tests_total"), prog.get("tests_done") or 0
+        what = f"binary {prog.get('binaries')}: {prog.get('binary')}"
+        if total:
+            lines.append(f"{pad}{meter(done, total)}  {done}/{total} tests  {DIM}{what}{RESET}")
+        else:
+            lines.append(f"{pad}{DIM}{what}, starting…{RESET}")
+
+    infos, tree = job_tree(r.get("pid"), primed)
+    owned |= tree
+    for i, info in enumerate(infos[:4]):
+        label = f"{DIM}rustc{RESET} " if i == 0 else "      "
+        lines.append(pad + label + rustc_line(info, ""))
+    if len(infos) > 4:
+        lines.append(f"{pad}      {DIM}+{len(infos) - 4} rustc{RESET}")
+    return lines
 
 
 def frame(primed: dict) -> str:
     d = heavy.state_dir()
-    lines = [f"{BOLD}heavy broker{RESET}  {DIM}{d}  {time.strftime('%H:%M:%S')}{RESET}", ""]
-
     held = heavy._entries(d / "held", reap=False)
     used = sum(int(r.get("weight") or 1) for _, r in held)
-    lines.append(f"{BOLD}capacidade{RESET} {bar(used, heavy.capacity())}")
+    head = (f"{BOLD}heavy broker{RESET}  {time.strftime('%H:%M:%S')}   "
+            f"capacity {bar(used, heavy.capacity())}")
     if psutil is not None:
         vm, sw = psutil.virtual_memory(), psutil.swap_memory()
         colour = RED if vm.available < 2 * 2**30 else (YELLOW if vm.available < 4 * 2**30 else GREEN)
-        lines.append(f"{BOLD}RAM{RESET}        {colour}{vm.available / 2**30:4.1f} GB livres{RESET} "
-                     f"de {vm.total / 2**30:.1f}  {DIM}swap {sw.used / 2**30:.1f} GB{RESET}")
-    lines.append("")
+        head += (f"   RAM {colour}{vm.available / 2**30:.1f} GB free{RESET}"
+                 f"{DIM} of {vm.total / 2**30:.0f} · swap {sw.used / 2**30:.1f}{RESET}")
+    lines = [head, f"{DIM}{d}{RESET}", ""]
 
-    lines.append(f"{BOLD}a correr ({len(held)}){RESET}")
-    for f, r in held:
-        lines.append(f"  {GREEN}●{RESET} {fmt_age(age_s(f, r)):>6}  w{r.get('weight')}  "
-                     f"{short_wt(r.get('worktree')):<28} {DIM}{short_argv(r)}{RESET}")
-    if not held:
-        lines.append(f"  {DIM}(nada){RESET}")
-    lines.append("")
-
-    queue = heavy._queue_order(heavy._entries(d / "queue", reap=False), d)
-    lines.append(f"{BOLD}na fila ({len(queue)}){RESET}")
-    for i, (f, r) in enumerate(queue, 1):
-        lines.append(f"  {YELLOW}{i}.{RESET} {fmt_age(age_s(f, r)):>6}  "
-                     f"p{heavy._int_prio(r.get('prio'))} w{r.get('weight')}  "
-                     f"{short_wt(r.get('worktree')):<28} {DIM}{short_argv(r)}{RESET}")
-    if not queue:
-        lines.append(f"  {DIM}(vazia){RESET}")
-    lines.append("")
-
-    lines.append(f"{BOLD}target slots{RESET}")
+    slots: dict[int, dict] = {}
     try:
         for k in range(1, heavy.target_slots() + 1):
-            rec = heavy._read_slot(d, k)
-            if heavy._slot_busy(rec):
-                state = f"{GREEN}ocupado{RESET} {short_wt(rec.get('worktree'))}"
-            else:
-                state = f"{DIM}livre{RESET}"
-            lines.append(f"  pool-{k}: {state}  {DIM}último={short_wt(rec.get('last_worktree'))}{RESET}")
-    except Exception as exc:  # a view must not die on one unreadable file
-        lines.append(f"  {RED}ilegível: {exc}{RESET}")
+            slots[k] = heavy._read_slot(d, k)
+    except Exception:  # a view must not die on one unreadable file
+        pass
+    # A slot names its holder by the broker's pid, the same pid as the held record.
+    held = sorted(held, key=lambda fr: -age_s(*fr))
+    job_of = {r.get("pid"): n for n, (_, r) in enumerate(held, 1)}
+    slot_of = {rec.get("pid"): k for k, rec in slots.items() if heavy._slot_busy(rec)}
+
+    lines.append(f"{BOLD}RUNNING ({len(held)}){RESET}")
+    owned: set[int] = set()
+    for n, (f, r) in enumerate(held, 1):
+        lines.extend(job_block(n, f, r, slot_of.get(r.get("pid")), primed, owned))
+        lines.append("")
+    if not held:
+        lines += [f"  {DIM}(nothing){RESET}", ""]
+
+    queue = heavy._queue_order(heavy._entries(d / "queue", reap=False), d)
+    lines.append(f"{BOLD}QUEUED ({len(queue)}){RESET}")
+    for i, (f, r) in enumerate(queue, 1):
+        lines.append(f"  {YELLOW}{i}.{RESET} {BOLD}{short_wt(r.get('worktree'))}{RESET}  {short_argv(r)}")
+        lines.append(f"     {DIM}waiting for{RESET} {fmt_age(age_s(f, r))}  {DIM}·{RESET} "
+                     f"p{heavy._int_prio(r.get('prio'))} w{r.get('weight')}  "
+                     f"{DIM}· should take{RESET} {estimate(r)}")
+    if not queue:
+        lines.append(f"  {DIM}(empty){RESET}")
     lines.append("")
 
-    wt = d / "wt"
+    lines.append(f"{BOLD}TARGET SLOTS{RESET}")
+    for k, rec in slots.items():
+        if heavy._slot_busy(rec):
+            n = job_of.get(rec.get("pid"))
+            who = tag(n) if n else f"{YELLOW}?{RESET}"
+            state = f"{who} {short_wt(rec.get('worktree'))}"
+        else:
+            state = f"{DIM}free  (last: {short_wt(rec.get('last_worktree'))}){RESET}"
+        lines.append(f"  pool-{k}  {state}")
+    lines.append("")
+
     stale = []
+    wt = d / "wt"
     for lock in sorted(wt.glob("*.lock")) if wt.is_dir() else []:
         rec = heavy._read_lock(lock)
         if rec and not heavy.is_alive(rec.get("pid"), rec.get("ctime")):
             stale.append(rec)
     if stale:
-        lines.append(f"{BOLD}locks órfãos ({len(stale)}){RESET} {DIM}pid morto; o broker limpa-os sozinho{RESET}")
+        lines.append(f"{BOLD}ORPHAN LOCKS ({len(stale)}){RESET} "
+                     f"{DIM}dead pid; the broker clears them itself{RESET}")
         for r in stale:
             lines.append(f"  {RED}✗{RESET} {short_wt(r.get('worktree')):<28} {DIM}{short_argv(r)}{RESET}")
         lines.append("")
 
-    lines.append(f"{BOLD}rustc{RESET}")
-    lines.extend(rustc_rows(primed))
-    lines.append("")
-    lines.append(f"{DIM}Ctrl+C para sair{RESET}")
+    strays = stray_rustc(owned, primed)
+    if strays:
+        lines.append(f"{BOLD}RUSTC OUTSIDE THE BROKER ({len(strays)}){RESET} "
+                     f"{DIM}cargo started without heavy.py (IDE, tauri dev, NUCLEOS_HEAVY=0){RESET}")
+        lines.extend(rustc_line(i, "  ", with_target=True) for i in strays)
+        lines.append("")
+    if psutil is None:
+        lines.append(f"{DIM}(pip install psutil to see rustc and RAM){RESET}")
+    lines.append(f"{DIM}Ctrl+C to quit{RESET}")
     return "\n".join(lines)
 
 
