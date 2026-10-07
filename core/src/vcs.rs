@@ -799,6 +799,153 @@ pub fn shell_segments(command: &str) -> Vec<&str> {
     crate::command_reader::segments(command, crate::command_reader::Shell::Posix)
 }
 
+/// Where a segment's git command runs, as the line itself says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentDir {
+    /// Nothing earlier in the line moved it: the session's own working directory.
+    Session,
+    /// Directories to apply in order, starting from the session's working directory: every
+    /// `cd <dir>` before the segment, then the segment's own `git -C <dir>`.
+    Steps(Vec<String>),
+    /// The line moves the directory in a way this reader does not follow; holds the spelling.
+    Unfollowable(String),
+}
+
+/// A shell segment with its `git -C <dir>` lifted out, and the directory it runs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectedSegment {
+    pub dir: SegmentDir,
+    /// The segment as the parsers read it: `git -C x merge y` arrives here as `git merge y`.
+    pub command: String,
+}
+
+/// PURE: `shell_segments`, plus the directory each one runs in.
+///
+/// **The queue's parsers name the branch a merge moves from where the command RUNS, and that used
+/// to be read from the session's working directory alone.** `cd <worktree> && git merge master`,
+/// typed from a session rooted in the main checkout (on `master`), queued `master into master` — a
+/// no-op the hook then reported as performed — instead of merging into the worktree's branch.
+/// `git -C <worktree> merge master` was refused outright, because no parser reads `-C`. So an agent
+/// could not merge master into its own branch from a session rooted anywhere else.
+///
+/// Both spellings are now followed: every `cd`/`pushd`/`chdir`/`Set-Location` with exactly one
+/// plain target, and a run of `-C <dir>` right after `git`. Anything else that moves the directory
+/// (bare `cd`, `cd -`, `popd`, a flag, a variable, `~`, a glob, a subshell) is `Unfollowable`, and
+/// the caller refuses a queue operation behind it rather than guess — guessing wrong performs the
+/// operation on a branch nobody named.
+pub fn directed_segments(command: &str) -> Vec<DirectedSegment> {
+    let mut steps: Vec<String> = Vec::new();
+    let mut lost: Option<String> = None;
+    let mut out = Vec::new();
+    for segment in shell_segments(command) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let Some(first) = tokens.first() else {
+            continue;
+        };
+        let moves = |token: &str| {
+            matches!(
+                token.to_ascii_lowercase().as_str(),
+                "cd" | "chdir" | "pushd" | "popd" | "set-location" | "sl"
+            )
+        };
+        let bare = first.to_ascii_lowercase();
+        // A directory change that is not the segment's own program — `{ cd x`, `if cd x`,
+        // `then cd x` — still moves the shell, and this reader does not follow shell grammar.
+        if !moves(first)
+            && !first.eq_ignore_ascii_case("git")
+            && tokens.iter().any(|token| moves(token))
+        {
+            lost = Some(format!("`{}`", segment.trim()));
+            continue;
+        }
+        if moves(first) {
+            // A subshell's `cd` does not outlive it, and `shell_segments` splits on the parens
+            // without saying where they were — so in a line holding any paren at all, no `cd` is
+            // followed. Refusing a line that merely quotes one is the cheap direction to be wrong.
+            let target = match tokens.as_slice() {
+                [_, target] if bare != "popd" && !command.contains(['(', ')']) => {
+                    followable_dir(target)
+                }
+                _ => None,
+            };
+            match target {
+                Some(target) => steps.push(target),
+                None => lost = Some(format!("`{}`", segment.trim())),
+            }
+            continue;
+        }
+
+        let mut own_steps = Vec::new();
+        let mut parsed = segment.trim().to_owned();
+        let mut own_lost = None;
+        if first.eq_ignore_ascii_case("git") && tokens.get(1) == Some(&"-C") {
+            let mut index = 1;
+            while tokens.get(index) == Some(&"-C") {
+                match tokens.get(index + 1).and_then(|dir| followable_dir(dir)) {
+                    Some(dir) => own_steps.push(dir),
+                    None => own_lost = Some(format!("`{}`", segment.trim())),
+                }
+                index += 2;
+            }
+            parsed = std::iter::once(*first)
+                .chain(tokens.get(index..).unwrap_or(&[]).iter().copied())
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+
+        let dir = match lost.clone().or(own_lost) {
+            Some(how) => SegmentDir::Unfollowable(how),
+            None if steps.is_empty() && own_steps.is_empty() => SegmentDir::Session,
+            None => SegmentDir::Steps(steps.iter().cloned().chain(own_steps).collect()),
+        };
+        out.push(DirectedSegment {
+            dir,
+            command: parsed,
+        });
+    }
+    out
+}
+
+/// PURE: a `cd`/`-C` target this reader can follow without a shell, unquoted, or `None`.
+fn followable_dir(raw: &str) -> Option<String> {
+    let unquoted = match raw.as_bytes() {
+        [b'"', .., b'"'] | [b'\'', .., b'\''] if raw.len() >= 2 => &raw[1..raw.len() - 1],
+        _ => raw,
+    };
+    let refused = unquoted.is_empty()
+        || unquoted.starts_with(['-', '~'])
+        || unquoted.contains([
+            '$', '`', '*', '?', '(', ')', '{', '}', '<', '>', '"', '\'', '%', '!',
+        ]);
+    (!refused).then(|| unquoted.to_owned())
+}
+
+/// PURE: `/c/Projects/x` (Git Bash's spelling of a drive) as `C:/Projects/x`, or `None` when the
+/// path is not one. Applied on Windows only, where a native `Path` reads the MSYS spelling as a
+/// drive-relative path and lands somewhere else.
+pub fn msys_drive_path(raw: &str) -> Option<String> {
+    let rest = raw.strip_prefix('/')?;
+    let mut chars = rest.chars();
+    let drive = chars.next().filter(char::is_ascii_alphabetic)?;
+    let tail = chars.as_str();
+    if !(tail.is_empty() || tail.starts_with('/')) {
+        return None;
+    }
+    Some(format!("{}:{}", drive.to_ascii_uppercase(), if tail.is_empty() { "/" } else { tail }))
+}
+
+/// PURE: the directory `steps` lead to from `session`, each one absolute or relative to the last.
+pub fn resolve_segment_dir(session: &std::path::Path, steps: &[String]) -> std::path::PathBuf {
+    steps.iter().fold(session.to_path_buf(), |current, step| {
+        let native = if cfg!(windows) {
+            msys_drive_path(step).unwrap_or_else(|| step.clone())
+        } else {
+            step.clone()
+        };
+        current.join(native)
+    })
+}
+
 pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     // Matched as whole shapes rather than by filtering the flag out of the token list, and the
@@ -3477,6 +3624,99 @@ mod tests {
             second.from_resolution,
             "a resolution's landing has to arrive at the executor marked, or nothing verifies it"
         );
+    }
+
+    fn steps(dirs: &[&str]) -> SegmentDir {
+        SegmentDir::Steps(dirs.iter().map(|dir| (*dir).to_owned()).collect())
+    }
+
+    /// The directory a segment runs in is what the line says, not the session's: every followable
+    /// `cd` before it, then its own `-C`, which is lifted out so the parsers read the plain shape.
+    #[test]
+    fn a_segment_carries_the_directory_its_line_moves_it_to() {
+        let read = |command: &str| {
+            directed_segments(command)
+                .into_iter()
+                .map(|segment| (segment.dir, segment.command))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            read("git merge master"),
+            vec![(SegmentDir::Session, "git merge master".to_owned())]
+        );
+        assert_eq!(
+            read("cd /c/Projects/wt && git merge master"),
+            vec![(steps(&["/c/Projects/wt"]), "git merge master".to_owned())]
+        );
+        assert_eq!(
+            read("git -C C:/Projects/wt merge master"),
+            vec![(steps(&["C:/Projects/wt"]), "git merge master".to_owned())]
+        );
+        assert_eq!(
+            read("cd \"C:/Projects\" && git -C wt -C sub merge --no-ff master"),
+            vec![(
+                steps(&["C:/Projects", "wt", "sub"]),
+                "git merge --no-ff master".to_owned()
+            )]
+        );
+        assert_eq!(
+            read("Set-Location C:/Projects/wt; git branch -d old"),
+            vec![(steps(&["C:/Projects/wt"]), "git branch -d old".to_owned())]
+        );
+        // Other global flags are left where they are, so the parsers still refuse the spelling.
+        assert_eq!(
+            read("git -c a=b merge master"),
+            vec![(SegmentDir::Session, "git -c a=b merge master".to_owned())]
+        );
+
+        for lost in [
+            "cd && git merge master",
+            "cd - && git merge master",
+            "cd ~/wt && git merge master",
+            "cd $WT && git merge master",
+            "cd -P wt && git merge master",
+            "popd && git merge master",
+            "(cd wt) && git merge master",
+            "git -C $WT merge master",
+        ] {
+            let found = directed_segments(lost);
+            let last = found.last().expect("the git segment is still there");
+            assert!(
+                matches!(last.dir, SegmentDir::Unfollowable(_)),
+                "{lost}: {last:?}"
+            );
+            assert_eq!(last.command, "git merge master", "{lost}");
+        }
+    }
+
+    #[test]
+    fn a_git_bash_drive_path_reads_as_its_windows_spelling() {
+        assert_eq!(msys_drive_path("/c/Projects/wt").as_deref(), Some("C:/Projects/wt"));
+        assert_eq!(msys_drive_path("/d").as_deref(), Some("D:/"));
+        assert_eq!(msys_drive_path("/tmp/x"), None);
+        assert_eq!(msys_drive_path("C:/Projects"), None);
+        assert_eq!(msys_drive_path("wt"), None);
+    }
+
+    #[test]
+    fn steps_resolve_from_the_session_each_absolute_or_relative_to_the_last() {
+        let session = std::path::Path::new("C:/Projects/nucleos");
+        assert_eq!(
+            resolve_segment_dir(session, &["../wt".to_owned()]),
+            session.join("../wt")
+        );
+        let absolute = if cfg!(windows) { "D:/elsewhere" } else { "/elsewhere" };
+        assert_eq!(
+            resolve_segment_dir(session, &[absolute.to_owned(), "sub".to_owned()]),
+            std::path::Path::new(absolute).join("sub")
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                resolve_segment_dir(session, &["/c/Projects/wt".to_owned()]),
+                std::path::Path::new("C:/Projects/wt")
+            );
+        }
     }
 
     /// Round-tripping through the stored form is the point: the row is the contract between the
