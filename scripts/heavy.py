@@ -609,7 +609,16 @@ _RUNNING_BIN = re.compile(
     rb"^\s*Running .*\((?:.*[\\/])?([^\\/)]+?)(?:-[0-9a-f]{16})?(?:\.exe)?\)\s*$")
 _DOC_TESTS = re.compile(rb"^\s*Doc-tests (\S+)")
 _RUNNING_N = re.compile(rb"^running (\d+) tests?\s*$")
-_TEST_DONE = re.compile(rb"^test .+ \.\.\. (?:ok|FAILED|ignored)")
+_TEST_DONE = re.compile(rb"^test (.+?) \.\.\. (ok|FAILED|ignored)")
+_FINISHED = re.compile(rb"^\s*Finished ")
+# cargo-nextest: `Starting 3 tests across 2 binaries (1 test skipped)`, then one line per finished
+# test carrying its own counter, `PASS [   0.332s] (1/3) nx::x it`. SLOW and START report a test
+# still running, a `TRY n` attempt may yet be retried, and after `Summary` nextest repeats the
+# failures: none of those counts as a failure.
+_NX_START = re.compile(rb"^\s*Starting (\d+) tests? across (\d+) binar")
+_NX_DONE = re.compile(
+    rb"^\s*(TRY \d+ )?([A-Z][A-Z-]+)\s+\[[^\]]*\]\s+\(\s*(\d+)/(\d+)\)\s+(.+?)\s*$")
+_NX_SUMMARY = re.compile(rb"^\s*Summary \[")
 
 
 def _new_stats() -> dict:
@@ -640,8 +649,36 @@ def _note_progress(seg: bytes, prog: dict) -> bool:
         # the child's `running 1 test` would otherwise reset the total mid-run.
         if prog.get("tests_total") is None:
             prog.update(tests_total=int(m.group(1)), tests_done=0)
-    elif _TEST_DONE.match(text):
+        return False
+    m = _TEST_DONE.match(text)
+    if m:
         prog["tests_done"] = prog.get("tests_done", 0) + 1
+        prog["last_test"] = m.group(1).decode("utf-8", "replace")
+        if m.group(2) == b"FAILED":
+            prog["failed"] = prog.get("failed", 0) + 1
+        return False
+    if _FINISHED.match(text) and prog.get("units_total"):
+        # cargo erases its bar without ever drawing the last unit.
+        prog["units_done"] = prog["units_total"]
+        return False
+    m = _NX_START.match(text)
+    if m:
+        prog.update(runner="nextest", tests_total=int(m.group(1)), tests_done=0,
+                    binaries=int(m.group(2)))
+        prog.pop("building", None)
+        return False
+    if _NX_SUMMARY.match(text):
+        prog["summary"] = True
+        return False
+    m = _NX_DONE.match(text)
+    if m and prog.get("runner") == "nextest" and not prog.get("summary"):
+        status = m.group(2).decode()
+        if status in ("SLOW", "START"):
+            return False
+        prog.update(tests_done=int(m.group(3)), tests_total=int(m.group(4)),
+                    last_test=m.group(5).decode("utf-8", "replace"))
+        if not m.group(1) and status not in ("PASS", "SKIP"):
+            prog["failed"] = prog.get("failed", 0) + 1
     return False
 
 
