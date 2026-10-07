@@ -635,7 +635,11 @@ def _note_progress(seg: bytes, prog: dict) -> bool:
         return False
     m = _RUNNING_N.match(text)
     if m:
-        prog.update(tests_total=int(m.group(1)), tests_done=0)
+        # Only the first count after a binary's `Running` header is that binary's. Tests that
+        # re-run their own executable in a child (scheduler.rs, for one) share this output, and
+        # the child's `running 1 test` would otherwise reset the total mid-run.
+        if prog.get("tests_total") is None:
+            prog.update(tests_total=int(m.group(1)), tests_done=0)
     elif _TEST_DONE.match(text):
         prog["tests_done"] = prog.get("tests_done", 0) + 1
     return False
