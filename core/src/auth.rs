@@ -981,7 +981,7 @@ mod tests {
             .await
             .unwrap();
         // Run tokens are resolved against the `runs` table, so this can no longer be a bare pool.
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         AppState {
             token: Token(token.to_string()),
             pool,

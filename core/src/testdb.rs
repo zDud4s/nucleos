@@ -22,7 +22,7 @@ pub async fn fresh_pool() -> sqlx::SqlitePool {
     let schema = MIGRATED_SCHEMA
         .get_or_init(|| async {
             let pool = empty_memory_pool().await;
-            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            crate::storage::MIGRATOR.run(&pool).await.unwrap();
             let mut connection = pool.acquire().await.unwrap();
             let bytes = connection.serialize(None).await.unwrap().to_vec();
             drop(connection);
@@ -66,10 +66,7 @@ mod fresh_pool_tests {
             .fetch_one(&first)
             .await
             .unwrap();
-        assert_eq!(
-            migrations as usize,
-            sqlx::migrate!("./migrations").iter().count()
-        );
+        assert_eq!(migrations as usize, crate::storage::MIGRATOR.iter().count());
         sqlx::query(
             "INSERT INTO runs (prompt, status, created_at) VALUES ('only-first', 'running', 'now')",
         )
@@ -121,7 +118,7 @@ pub async fn apply_migration(pool: &sqlx::SqlitePool, version: i64) {
 }
 
 async fn apply_migrations(pool: &sqlx::SqlitePool, wanted: impl Fn(i64) -> bool) {
-    for migration in sqlx::migrate!("./migrations").iter() {
+    for migration in crate::storage::MIGRATOR.iter() {
         if !wanted(migration.version) {
             continue;
         }
@@ -144,7 +141,7 @@ async fn apply_migrations(pool: &sqlx::SqlitePool, wanted: impl Fn(i64) -> bool)
 #[test]
 fn no_two_migrations_share_a_version() {
     let mut seen = std::collections::BTreeMap::new();
-    for migration in sqlx::migrate!("./migrations").iter() {
+    for migration in crate::storage::MIGRATOR.iter() {
         if let Some(first) = seen.insert(migration.version, migration.description.clone()) {
             panic!(
                 "migrations '{first}' and '{}' both carry version {} — renumber the one the \

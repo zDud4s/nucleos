@@ -983,7 +983,7 @@ mod tests {
             )
             .await
             .expect("an in-memory database");
-        sqlx::migrate!("./migrations")
+        crate::storage::MIGRATOR
             .run(&pool)
             .await
             .expect("migrations to apply");

@@ -3767,7 +3767,7 @@ mod tests {
 
         let pool = {
             let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            crate::storage::MIGRATOR.run(&pool).await.unwrap();
             pool
         };
 
@@ -4582,7 +4582,7 @@ mod tests {
         use crate::local_agent::ToolBox;
 
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         sqlx::query(
             "INSERT INTO runs (id, prompt, status, mode, created_at)
              VALUES (1, 'triage', 'completed', ?, '2026-08-11T00:00:00Z'),
@@ -4667,7 +4667,7 @@ mod tests {
         use crate::local_agent::ToolBox;
 
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         sqlx::query(
             "INSERT INTO runs (id, prompt, status, mode, created_at)
              VALUES (1, 'triage', 'completed', ?, '2026-08-11T00:00:00Z'),
@@ -4910,7 +4910,7 @@ mod tests {
     /// below need.
     async fn test_pool() -> sqlx::SqlitePool {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 
