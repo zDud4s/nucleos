@@ -96,6 +96,10 @@ pub struct ModelsConfig {
     /// arriving here as a count instead of a flag.
     #[serde(default)]
     pub local_context_tokens: Option<usize>,
+    /// The Ollama model that embeds knowledge rows (spec 5.4, D6). Embeddings are always local:
+    /// no text of a project leaves the machine for this.
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
     /// The models a conversation may be moved to, in the order the window offers them.
     ///
     /// A list here rather than a list in the window, because the window cannot know it. The agent
@@ -694,9 +698,17 @@ impl Default for ModelsConfig {
             local_engine: None,
             local_base_url: None,
             local_context_tokens: None,
+            embedding_model: default_embedding_model(),
             assistant_choices: default_assistant_choices(),
         }
     }
+}
+
+/// The small Ollama embedding model an untouched install uses.
+pub const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
+
+fn default_embedding_model() -> String {
+    DEFAULT_EMBEDDING_MODEL.to_string()
 }
 
 fn deserialize_optional_model<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -4827,5 +4839,33 @@ cycle_seconds: 30
             )
             .is_err()
         );
+    }
+
+    /// Embeddings are always local (spec 5.4, D6): the key names an Ollama model, and a file that
+    /// predates it must keep working, so absence is the small default rather than an error.
+    #[test]
+    fn embedding_model_defaults_to_a_small_ollama_model_and_can_be_overridden() {
+        assert_eq!(DEFAULT_EMBEDDING_MODEL, "nomic-embed-text");
+        assert_eq!(
+            ModelsConfig::default().embedding_model,
+            DEFAULT_EMBEDDING_MODEL
+        );
+
+        let absent = parse_models_config(
+            "claude_model: sonnet
+codex_model: gpt
+",
+        )
+        .unwrap();
+        assert_eq!(absent.embedding_model, DEFAULT_EMBEDDING_MODEL);
+
+        let named = parse_models_config(
+            "claude_model: sonnet
+codex_model: gpt
+embedding_model: mxbai-embed-large
+",
+        )
+        .unwrap();
+        assert_eq!(named.embedding_model, "mxbai-embed-large");
     }
 }
