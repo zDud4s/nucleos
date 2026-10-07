@@ -8169,7 +8169,13 @@ mod tests {
             background: HashSet::new(),
             watcher: 0,
         };
-        note_served(live.process_key(), "drop-vouch-chat", 4242, "auto", &state.pool);
+        note_served(
+            live.process_key(),
+            "drop-vouch-chat",
+            4242,
+            "auto",
+            &state.pool,
+        );
         sqlx::query(
             "INSERT INTO chat_tasks (chat_id, launched_by_run_id, tool_use_id, kind, status, started_at)
              VALUES ('drop-vouch-chat', 4242, 'toolu_drop', 'background_agent', 'running', '2026-01-01T00:00:00Z')",
