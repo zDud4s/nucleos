@@ -137,7 +137,7 @@ describe("BrainPanel", () => {
     expect(list.textContent).toContain("gone");
   });
 
-  it("teaching a note posts the chosen kind and points to Learned", async () => {
+  it("teaching a note posts the chosen kind and points to the Brain", async () => {
     serve(detail(), (path, init) =>
       path === "/owner-notes/4/teach" && init?.method === "POST"
         ? Promise.resolve({ knowledge_id: 1, proposal_id: 2, link_id: 3 })
@@ -155,7 +155,7 @@ describe("BrainPanel", () => {
       ),
     );
     expect(await screen.findByText(/Proposed — waiting for your approval in/)).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Learned" }).getAttribute("href")).toBe("/learned");
+    expect(screen.getByRole("link", { name: "the Brain" }).getAttribute("href")).toBe("/brain?item=knowledge%3A1");
   });
 
   it("an already-taught refusal is shown", async () => {

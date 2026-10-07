@@ -404,7 +404,7 @@ function Teach({ id }: { id: number }) {
       </Button>
       {teach.isSuccess && (
         <p role="status">
-          Proposed — waiting for your approval in <Link to="/learned">Learned</Link>
+          Proposed — waiting for your approval in <Link to="/brain" search={{ item: `knowledge:${teach.data.knowledge_id}` }}>the Brain</Link>
         </p>
       )}
       {teach.isError && <Failure error={teach.error} sentences={TEACH_SENTENCES} />}

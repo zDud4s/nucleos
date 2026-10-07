@@ -51,14 +51,7 @@ describe("the nav table", () => {
       "Waiting",
       "Runs",
       "Feed",
-      // **The one entry that is not a transcription of §3.1.** The knowledge
-      // store postdates the design document, and it needs a door: what the
-      // agent has been told is decided by a person and read by every later run,
-      // and until this page it was reachable only over HTTP. Recorded as an
-      // addition rather than folded in silently — the point of this file is
-      // that the sidebar does not drift without somebody saying so.
-      "Learned",
-      // The owner's own notes: an addition after the design, for the same reason as Learned.
+      // The owner's notes and the knowledge store in one place; `/learned` redirects here.
       "Brain",
     ]);
   });

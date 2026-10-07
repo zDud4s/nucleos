@@ -3,6 +3,7 @@ import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { Brain, validateBrainSearch } from "./Brain";
 import type { NoteLink, NotesGraph, OwnerNote } from "../data/owner-notes";
 import type { GModel } from "../brain/graph-types";
+import { known } from "../brain/knowledge/test-helpers";
 import { renderWithRouter } from "../test/harness";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -109,22 +110,15 @@ describe("Brain", () => {
     await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe(""));
   });
 
-  it("a search shows matching notes only", async () => {
-    daemon.apiFetch.mockImplementation(
-      daemonWith({
-        listed: [note(), note({ id: 2, text: "Unrelated" })],
-        matched: [note({ id: 3, text: "Only the match" })],
-      }),
+  it("the list view is the unified list, and ?item=knowledge opens the knowledge panel", async () => {
+    const row = known({ id: 5, title: "Prefer small diffs", status: "active" });
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) =>
+      path === "/knowledge" ? Promise.resolve([row]) : daemonWith({ listed: [note()] })(path, init),
     );
-    await renderWithRouter(<Brain />, { initialPath: "/brain" });
+    await renderWithRouter(<Brain />, { initialPath: "/brain?item=knowledge:5" });
 
-    expect(await screen.findByText("Unrelated")).toBeTruthy();
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search notes" }), {
-      target: { value: "match" },
-    });
-
-    expect(await screen.findByText("Only the match")).toBeTruthy();
-    expect(screen.queryByText("Unrelated")).toBeNull();
+    expect(await screen.findByText("Rust owns the state")).toBeTruthy();
+    expect((await screen.findAllByText(/Prefer small diffs/)).length).toBeGreaterThan(1);
   });
 
   it("a capture stamp focuses the capture box and keeps the view", async () => {
@@ -145,11 +139,10 @@ describe("Brain", () => {
     const drawn = await screen.findByRole("list", { name: "Graph nodes" });
     expect(drawn.textContent).toContain("n:1");
     expect(drawn.textContent).toContain("project:nucleos");
-    expect(screen.queryByRole("searchbox", { name: "Search notes" })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "List" }));
     await waitFor(() => expect(router.state.location.search).toEqual({}));
-    expect(await screen.findByRole("searchbox", { name: "Search notes" })).toBeTruthy();
+    expect(screen.queryByRole("list", { name: "Graph nodes" })).toBeNull();
   });
 
   it("clicking a note in the graph puts it in the address and opens it", async () => {

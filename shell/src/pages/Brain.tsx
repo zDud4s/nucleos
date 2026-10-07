@@ -1,37 +1,30 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { BrainPanel } from "../brain/BrainPanel";
+import { KnowledgePanel } from "../brain/knowledge/KnowledgePanel";
+import { UnifiedList } from "../brain/UnifiedList";
 import { ForceGraph } from "../brain/ForceGraph";
 import { buildModel } from "../brain/graph-model";
 import type { GFilters } from "../brain/graph-types";
 import { GraphFilters, defaultGraphFilters } from "../brain/GraphFilters";
-import { formatItem, itemOfNode, nodeIdOf, parseItem, parseView, type BrainView } from "../brain/item-ref";
+import { formatItem, itemOfNode, nodeIdOf, parseItem, parseView, type BrainView, type ItemRef } from "../brain/item-ref";
 import { useKnowledge, type Known } from "../data/knowledge";
-import {
-  useNotesGraph,
-  useCreateNote,
-  useOwnerNotes,
-  useSearchOwnerNotes,
-  type NoteState,
-  type OwnerNote,
-} from "../data/owner-notes";
+import { useNotesGraph, useCreateNote } from "../data/owner-notes";
 import { useProjects } from "../data/system";
-import { Button, ErrorNote, PageHeader, Panel, Quiet, RelativeTime, Row, Rows } from "../ui";
+import { Button, ErrorNote, PageHeader, Quiet } from "../ui";
 import "./brain.css";
 
 /**
- * Brain — the owner's own notes, which no agent ever reads.
+ * Brain — the owner's notes (which no agent ever reads) and what the agent has been taught.
  *
- * A capture box above a list: what is typed here is kept as written and shown back, nothing more.
- * The `List | Graph` switch is the only place the notes are drawn as a map. The view and the
+ * A capture box above one attention-ordered list of both; the `List | Graph` switch is where they
+ * are drawn as a map. The view and the
  * selected item live in the address (`?view=`, `?item=`), so a reload or a shared link lands on the
  * same thing, and "back" walks from item to item.
  */
 export function Brain() {
   const { view, item } = useBrainSearch();
   const navigate = useNavigate();
-  const [state, setState] = useState<NoteState | "all">("active");
-  const [query, setQuery] = useState("");
 
   // Switching view replaces the entry; picking an item pushes one (spec §3.2).
   const showView = (next: BrainView) =>
@@ -46,18 +39,9 @@ export function Brain() {
       search: (prev: Record<string, unknown>) => brainSearch({ ...validateBrainSearch(prev), item: next }),
     });
 
-  const searching = query.trim() !== "";
-  const notes = useOwnerNotes(state);
-  const found = useSearchOwnerNotes(query);
-  const shown = searching ? found : notes;
-  // A search spans every state, so the state switch narrows its results here.
-  const rows = searching
-    ? found.data?.filter((note) => state === "all" || note.state === state)
-    : notes.data;
-
   return (
     <>
-      <PageHeader title="Brain" headline="your own notes — no agent ever reads them" />
+      <PageHeader title="Brain" headline="your notes and what the agent has been taught" />
 
       <Capture />
 
@@ -74,52 +58,12 @@ export function Brain() {
             </Button>
           ))}
         </div>
-        {view === "list" && (
-          <>
-            <div role="group" aria-label="State">
-              {STATES.map(([value, label]) => (
-                <Button
-                  key={value}
-                  variant="quiet"
-                  aria-pressed={state === value}
-                  onClick={() => setState(value)}
-                >
-                  {label}
-                </Button>
-              ))}
-            </div>
-            <input
-              type="search"
-              className="brain-search"
-              aria-label="Search notes"
-              placeholder="Search notes"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-            />
-          </>
-        )}
       </div>
 
       {view === "graph" ? (
         <BrainGraphView item={item} onItem={showItem} />
       ) : (
-        <>
-          {shown.isError && (
-            <ErrorNote>the núcleo did not answer — your notes are not known</ErrorNote>
-          )}
-          {rows !== undefined && rows.length === 0 && (
-            <Quiet says={searching ? "No note matches that." : "No notes here yet."} />
-          )}
-          {rows !== undefined && rows.length > 0 && (
-            <Panel title={searching ? "Matches" : "Notes"}>
-              <Rows label="Notes">
-                {rows.map((note) => (
-                  <NoteRow key={note.id} note={note} />
-                ))}
-              </Rows>
-            </Panel>
-          )}
-        </>
+        <BrainListView item={item} onItem={showItem} />
       )}
     </>
   );
@@ -128,12 +72,6 @@ export function Brain() {
 const VIEWS: readonly (readonly [BrainView, string])[] = [
   ["list", "List"],
   ["graph", "Graph"],
-];
-
-const STATES: readonly (readonly [NoteState | "all", string])[] = [
-  ["active", "Active"],
-  ["archived", "Archived"],
-  ["all", "All"],
 ];
 
 export interface BrainSearch {
@@ -237,20 +175,8 @@ function Capture() {
   );
 }
 
-function NoteRow({ note }: { note: OwnerNote }) {
-  return (
-    <Row className="brain-row">
-      <p className="brain-text">{note.text}</p>
-      <div className="brain-meta">
-        <span className="brain-origin">{note.origin}</span>
-        {note.state === "archived" && <span className="brain-state">archived</span>}
-        <RelativeTime at={note.created_at} />
-      </div>
-    </Row>
-  );
-}
-
 const EMPTY_KNOWLEDGE: Known[] = [];
+const ALL_ARCHIVED: GFilters = { ...defaultGraphFilters(), showArchived: true };
 
 /**
  * What the graph is drawn without, in words: only the notes graph failing is an error (spec §3.3);
@@ -296,7 +222,7 @@ export function BrainGraphView({ item, onItem }: { item?: string; onItem: (item:
     entity !== null && entity.under === item ? entity.id : ref !== null ? nodeIdOf(ref) : null;
   const select = (nodeId: string) => {
     const picked = itemOfNode(nodeId);
-    if (picked?.kind === "note") {
+    if (picked !== null) {
       setEntity(null);
       onItem(formatItem(picked));
     } else {
@@ -315,7 +241,49 @@ export function BrainGraphView({ item, onItem }: { item?: string; onItem: (item:
         {missing !== null && <Quiet says={missing} />}
         <ForceGraph model={model} selected={selected} onSelect={select} />
       </div>
-      <BrainPanel nodeId={selected} graph={graph.data} model={model} onSelect={select} />
+      {ref?.kind === "knowledge" && entity?.under !== item ? (
+        <KnowledgePanel key={ref.id} id={ref.id} onSelect={select} />
+      ) : (
+        <BrainPanel nodeId={selected} graph={graph.data} model={model} onSelect={select} />
+      )}
     </div>
   );
+}
+
+/**
+ * The List side of the switch: the unified list, and beside it the selected item's panel. A
+ * knowledge row opens the knowledge panel; a note opens the note panel, which reads the archived-
+ * inclusive notes graph.
+ */
+export function BrainListView({ item, onItem }: { item?: string; onItem: (item: string) => void }) {
+  const ref = parseItem(item);
+  return (
+    <div className={ref === null ? undefined : "brain-graph"}>
+      <div className="brain-graph-main">
+        <UnifiedList onSelect={onItem} />
+      </div>
+      {ref !== null && <ItemPanel item={ref} onItem={onItem} />}
+    </div>
+  );
+}
+
+function ItemPanel({ item, onItem }: { item: ItemRef; onItem: (item: string) => void }) {
+  const graph = useNotesGraph(true);
+  const knowledge = useKnowledge();
+  const projects = useProjects();
+  const model = useMemo(
+    () =>
+      graph.data === undefined
+        ? null
+        : buildModel(graph.data, knowledge.data ?? EMPTY_KNOWLEDGE, projects.data, ALL_ARCHIVED),
+    [graph.data, knowledge.data, projects.data],
+  );
+  const select = (nodeId: string) => {
+    const picked = itemOfNode(nodeId);
+    if (picked !== null) onItem(formatItem(picked));
+  };
+  if (item.kind === "knowledge") return <KnowledgePanel key={item.id} id={item.id} onSelect={select} />;
+  if (graph.isError) return <ErrorNote>the núcleo did not answer — the note is not known</ErrorNote>;
+  if (graph.data === undefined || model === null) return <Quiet says="Loading…" />;
+  return <BrainPanel nodeId={nodeIdOf(item)} graph={graph.data} model={model} onSelect={select} />;
 }
