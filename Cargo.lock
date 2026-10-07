@@ -1531,6 +1531,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "nucleos-base"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "chrono-tz",
+ "directories",
+ "keyring",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "url",
+ "windows-sys",
+]
+
+[[package]]
 name = "nucleos-core"
 version = "0.1.0"
 dependencies = [
@@ -1544,6 +1570,7 @@ dependencies = [
  "iana-time-zone",
  "keyring",
  "libc",
+ "nucleos-base",
  "nucleos-core",
  "rand",
  "reqwest",

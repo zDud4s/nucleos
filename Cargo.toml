@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core"]
+members = ["core", "core/crates/nucleos-base"]
 # The Tauri shell's Rust side (shell/src-tauri) is a standalone package, deliberately
 # NOT a member of this workspace — it keeps its own Cargo.lock so the daemon's deps
 # (sqlx/axum/...) and the shell's (tauri/wry/...) resolve independently. Excluding it

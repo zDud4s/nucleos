@@ -931,7 +931,11 @@ pub fn msys_drive_path(raw: &str) -> Option<String> {
     if !(tail.is_empty() || tail.starts_with('/')) {
         return None;
     }
-    Some(format!("{}:{}", drive.to_ascii_uppercase(), if tail.is_empty() { "/" } else { tail }))
+    Some(format!(
+        "{}:{}",
+        drive.to_ascii_uppercase(),
+        if tail.is_empty() { "/" } else { tail }
+    ))
 }
 
 /// PURE: the directory `steps` lead to from `session`, each one absolute or relative to the last.
@@ -3692,7 +3696,10 @@ mod tests {
 
     #[test]
     fn a_git_bash_drive_path_reads_as_its_windows_spelling() {
-        assert_eq!(msys_drive_path("/c/Projects/wt").as_deref(), Some("C:/Projects/wt"));
+        assert_eq!(
+            msys_drive_path("/c/Projects/wt").as_deref(),
+            Some("C:/Projects/wt")
+        );
         assert_eq!(msys_drive_path("/d").as_deref(), Some("D:/"));
         assert_eq!(msys_drive_path("/tmp/x"), None);
         assert_eq!(msys_drive_path("C:/Projects"), None);
@@ -3706,7 +3713,11 @@ mod tests {
             resolve_segment_dir(session, &["../wt".to_owned()]),
             session.join("../wt")
         );
-        let absolute = if cfg!(windows) { "D:/elsewhere" } else { "/elsewhere" };
+        let absolute = if cfg!(windows) {
+            "D:/elsewhere"
+        } else {
+            "/elsewhere"
+        };
         assert_eq!(
             resolve_segment_dir(session, &[absolute.to_owned(), "sub".to_owned()]),
             std::path::Path::new(absolute).join("sub")

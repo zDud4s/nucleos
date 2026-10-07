@@ -14,9 +14,10 @@ doctest = false
 # `testkit` exposes test doubles and fixtures to the binary's tests; the self dev-dependency
 # below turns it on for every test build and never for a release build.
 [features]
-testkit = ["dep:tempfile"]
+testkit = ["dep:tempfile", "nucleos-base/testkit"]
 
 [dependencies]
+nucleos-base = { path = "crates/nucleos-base" }
 async-trait = "0.1.89"
 axum = "0.8.9"
 base64 = "0.23.0"

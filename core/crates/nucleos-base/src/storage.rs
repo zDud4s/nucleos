@@ -5,7 +5,7 @@ use std::path::Path;
 /// migrate a pool of their own — goes through this one static instead of expanding
 /// `sqlx::migrate!()` where it stands: each expansion embeds every migration again, and a bare
 /// `migrate!()` resolves against whichever crate it is expanded in, which a crate split would move.
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// A write that has been made durable but is not yet visible at its destination.
 #[must_use = "a staged write does nothing until it is committed"]

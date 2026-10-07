@@ -1397,7 +1397,7 @@ mod tests {
     #[tokio::test]
     async fn a_measuring_pass_records_what_each_live_worktree_touched() {
         let db = crate::storage::TempDb::new().await;
-        let (repo, base) = crate::inspect::tests::seeded_repo();
+        let (repo, base) = crate::inspect::test_support::seeded_repo();
         std::fs::write(repo.path().join("touched.rs"), "x\n").unwrap();
         seed_worktree_row(&db.pool, "job", 1, "project-a", repo.path(), Some(&base)).await;
 
@@ -1429,8 +1429,8 @@ mod tests {
     #[tokio::test]
     async fn two_real_trees_editing_one_file_collide_over_exactly_that_file() {
         let db = crate::storage::TempDb::new().await;
-        let (tree_a, base_a) = crate::inspect::tests::seeded_repo();
-        let (tree_b, base_b) = crate::inspect::tests::seeded_repo();
+        let (tree_a, base_a) = crate::inspect::test_support::seeded_repo();
+        let (tree_b, base_b) = crate::inspect::test_support::seeded_repo();
         std::fs::write(tree_a.path().join("shared.rs"), "written by a\n").unwrap();
         std::fs::write(tree_a.path().join("only-a.rs"), "a alone\n").unwrap();
         std::fs::write(tree_b.path().join("shared.rs"), "written by b\n").unwrap();
@@ -1479,7 +1479,7 @@ mod tests {
     #[tokio::test]
     async fn a_worktree_with_no_base_is_left_unmeasured_rather_than_measured_empty() {
         let db = crate::storage::TempDb::new().await;
-        let (repo, _) = crate::inspect::tests::seeded_repo();
+        let (repo, _) = crate::inspect::test_support::seeded_repo();
         seed_worktree_row(&db.pool, "job", 1, "project-a", repo.path(), None).await;
 
         measure(&db.pool).await;
