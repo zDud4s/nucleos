@@ -132,9 +132,15 @@ def is_alive(pid, ctime=None) -> bool:
 # ----------------------------------------------------------------------------- mutex
 
 
+# The mutex dirs this process holds right now; an owner record naming this process for a dir
+# not in here is a leftover of its own (see Mutex._stale).
+_MUTEX_HELD: set[str] = set()
+
+
 class Mutex:
-    """`mkdir $DIR/.mutex` plus an `owner` file. Stale when older than 60 s or the owner
-    is dead; a stale one is removed and the acquisition retried."""
+    """`mkdir $DIR/.mutex` plus an `owner` file. Stale when older than 60 s, when the owner
+    is dead, or when the owner is this very process and it does not hold it; a stale one is
+    removed and the acquisition retried."""
 
     def __init__(self, state_dir: Path, timeout: float = MUTEX_WAIT_S):
         self.path = Path(state_dir) / ".mutex"
@@ -188,6 +194,11 @@ class Mutex:
             return False  # vanished meanwhile: the retry will take it
         try:
             owner = json.loads((self.path / "owner").read_text())
+            if owner.get("pid") == os.getpid() and str(self.path) not in _MUTEX_HELD:
+                # Our own release left it behind (2026-10-07: 30388 waited 30 s on itself,
+                # and six queued commands gave up on the queue together). Alive, so the
+                # liveness check below would never call it stale.
+                return True
             return not is_alive(owner.get("pid"), owner.get("ctime"))
         except (OSError, ValueError):
             # No readable owner yet: its creator may be between mkdir and the write.
@@ -220,6 +231,7 @@ class Mutex:
                     raise TimeoutError("broker mutex busy")
                 time.sleep(0.05)
         self.held = True
+        _MUTEX_HELD.add(str(self.path))
         self.t_held = time.time()
         self.waited = self.t_held - t0
         _, ctime = proc_identity(os.getpid())
@@ -234,15 +246,21 @@ class Mutex:
             self.held = False
             held = time.time() - self.t_held
             self._remove()
+            _MUTEX_HELD.discard(str(self.path))
             if held >= MUTEX_TRACE_S or self.waited >= MUTEX_TRACE_S:
                 self._trace({"event": "slow", "held_s": round(held, 3)})
 
     def _remove(self) -> None:
-        try:
-            (self.path / "owner").unlink()
-        except OSError:
-            pass
+        # Windows refuses to delete `owner` while a waiter's _stale() has it open, and a dir
+        # with `owner` still in it cannot go: retry the file with the dir, not the dir alone.
         for _ in range(50):
+            try:
+                (self.path / "owner").unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                time.sleep(0.02)
+                continue
             try:
                 self.path.rmdir()
                 return
