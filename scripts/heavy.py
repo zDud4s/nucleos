@@ -40,6 +40,9 @@ LOG_ARGV_WORDS = 40
 LOG_ARGV_CHARS = 300
 MUTEX_STALE_S = 60.0
 MUTEX_WAIT_S = 30.0
+# Measurement (2026-10-07, "broker mutex busy" fail-opens): an acquisition that waits or
+# holds longer than this, and every timeout, gets a row in `mutex.jsonl`.
+MUTEX_TRACE_S = 1.0
 STILL_ACTIVE = 259
 DEFAULT_CAPACITY = 4
 AGENT_WAIT_MAX_S = 540.0
@@ -137,6 +140,45 @@ class Mutex:
         self.path = Path(state_dir) / ".mutex"
         self.timeout = timeout
         self.held = False
+        try:
+            self.site = sys._getframe(1).f_code.co_name
+        except Exception:
+            self.site = "?"
+        self.waited = 0.0
+        self.t_held = 0.0
+        self.n_exists = self.n_perm = 0
+
+    def _trace(self, row: dict) -> None:
+        try:
+            row = dict(row, v=LOG_VERSION, ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                       site=self.site, pid=os.getpid(), waited_s=round(self.waited, 3),
+                       n_exists=self.n_exists, n_perm=self.n_perm)
+            with open(self.path.parent / "mutex.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+        except Exception:
+            pass
+
+    def _trace_timeout(self) -> None:
+        row: dict = {"event": "timeout"}
+        try:
+            row["dir_age_s"] = round(time.time() - self.path.stat().st_mtime, 3)
+        except OSError:
+            row["dir_age_s"] = None
+        try:
+            owner = json.loads((self.path / "owner").read_text())
+            row["owner"] = owner
+            row["owner_alive"] = is_alive(owner.get("pid"), owner.get("ctime"))
+            t = owner.get("t")
+            row["owner_held_s"] = round(time.time() - float(t), 3) if t else None
+        except (OSError, ValueError, TypeError):
+            row["owner"] = None
+            row["owner_alive"] = None
+            row["owner_held_s"] = None
+        try:
+            row["queue_len"] = len(os.listdir(self.path.parent / "queue"))
+        except OSError:
+            row["queue_len"] = None
+        self._trace(row)
 
     def _stale(self) -> bool:
         try:
@@ -155,44 +197,60 @@ class Mutex:
                 return False
 
     def acquire(self) -> None:
-        deadline = time.time() + self.timeout
+        t0 = time.time()
+        deadline = t0 + self.timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
         while True:
             try:
                 self.path.mkdir()
                 break
-            except (FileExistsError, PermissionError):
+            except (FileExistsError, PermissionError) as exc:
                 # Windows answers a mkdir on a directory whose delete is still pending
                 # with "access denied", not "exists".
+                if isinstance(exc, PermissionError):
+                    self.n_perm += 1
+                else:
+                    self.n_exists += 1
                 if self._stale():
                     shutil.rmtree(self.path, ignore_errors=True)
                     continue
                 if time.time() > deadline:
+                    self.waited = time.time() - t0
+                    self._trace_timeout()
                     raise TimeoutError("broker mutex busy")
                 time.sleep(0.05)
         self.held = True
+        self.t_held = time.time()
+        self.waited = self.t_held - t0
         _, ctime = proc_identity(os.getpid())
         try:
-            (self.path / "owner").write_text(json.dumps({"pid": os.getpid(), "ctime": ctime}))
+            (self.path / "owner").write_text(json.dumps(
+                {"pid": os.getpid(), "ctime": ctime, "site": self.site, "t": self.t_held}))
         except OSError:
             pass
 
     def release(self) -> None:
         if self.held:
             self.held = False
+            held = time.time() - self.t_held
+            self._remove()
+            if held >= MUTEX_TRACE_S or self.waited >= MUTEX_TRACE_S:
+                self._trace({"event": "slow", "held_s": round(held, 3)})
+
+    def _remove(self) -> None:
+        try:
+            (self.path / "owner").unlink()
+        except OSError:
+            pass
+        for _ in range(50):
             try:
-                (self.path / "owner").unlink()
+                self.path.rmdir()
+                return
+            except FileNotFoundError:
+                return
             except OSError:
-                pass
-            for _ in range(50):
-                try:
-                    self.path.rmdir()
-                    return
-                except FileNotFoundError:
-                    return
-                except OSError:
-                    time.sleep(0.02)
-            shutil.rmtree(self.path, ignore_errors=True)
+                time.sleep(0.02)
+        shutil.rmtree(self.path, ignore_errors=True)
 
     def __enter__(self):
         self.acquire()
