@@ -1131,7 +1131,13 @@ mod tests {
         // `distill.rs` is the one sanctioned exception: D4 of `.ai/specs/2026-10-05-destilador-design.md`
         // lets the distiller's dossier read the notes linked to a project, as context only.
         // `lib.rs` only declares the module (`pub mod owner_notes;`) since the core lib/bin split.
-        let allowed = ["owner_notes.rs", "http.rs", "main.rs", "distill.rs", "lib.rs"];
+        let allowed = [
+            "owner_notes.rs",
+            "http.rs",
+            "main.rs",
+            "distill.rs",
+            "lib.rs",
+        ];
         let needle = ["owner", "note"].join("_");
         let src = running_in.join("src");
         let mut scanned = 0;
