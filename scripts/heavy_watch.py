@@ -360,6 +360,9 @@ def job_block(n: int, f: Path, r: dict, slot: int | None, primed: dict,
         lines.append(field(pad, "progress", f"{meter(done, total)}  {done}/{total} {DIM}units{RESET}"))
     elif now == "test":
         total, done = prog.get("tests_total"), prog.get("tests_done") or 0
+        if total:
+            # A test that re-runs its own binary adds its child's `test ... ok` line.
+            done = min(done, total)
         what = f"{DIM}binary {prog.get('binaries')}:{RESET} {prog.get('binary')}"
         if total:
             lines.append(field(pad, "progress", f"{meter(done, total)}  {done}/{total} {DIM}tests{RESET}"))
