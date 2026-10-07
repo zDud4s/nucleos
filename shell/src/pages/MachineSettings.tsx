@@ -11,6 +11,7 @@ import {
 } from "../data/machine-config";
 import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, StateBadge } from "../ui";
 import { DistillerModel } from "./DistillerModel";
+import { EmbeddingModel } from "./EmbeddingModel";
 
 /**
  * This machine's settings — the files whose author is the daemon rather than
@@ -61,6 +62,7 @@ export function MachineSettings() {
   return (
     <>
       <DistillerModel />
+      <EmbeddingModel />
 
       {/* The folder, as one line above the files rather than a panel of its own. */}
       <p className="sy-machine-intro">

@@ -65,6 +65,11 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::distill_model::get_distiller_config)
                 .post(crate::distill_model::post_distiller_config),
         )
+        .route(
+            "/config/embedding",
+            get(crate::embed_model::get_embedding_config)
+                .post(crate::embed_model::post_embedding_config),
+        )
         .route("/config/secrets", get(get_machine_secrets))
         .route(
             "/config/secrets/{key}",
@@ -565,6 +570,11 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/distill/causes",
             get(crate::distill_origin::get_distill_causes),
+        )
+        // Rows the distiller flagged as near-duplicates; same access as `/distill/causes`.
+        .route(
+            "/distill/duplicates",
+            get(crate::distill_origin::get_near_duplicates),
         )
         // The owner's own notes. In no `auth.rs` table on purpose: the table is default-deny, so a
         // route nobody lists is reachable by Control and Admin alone — the same reasoning as
@@ -38385,6 +38395,16 @@ mod tests {
         let state = test_state().await;
 
         let (status, body) = workflow_call(state, "GET", "/distill/causes", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]));
+    }
+
+    /// Same for the near-duplicate marks: an empty database answers an empty list.
+    #[tokio::test]
+    async fn the_distill_duplicates_route_answers_a_list() {
+        let state = test_state().await;
+
+        let (status, body) = workflow_call(state, "GET", "/distill/duplicates", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!([]));
     }

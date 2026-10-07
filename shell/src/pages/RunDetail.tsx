@@ -558,6 +558,7 @@ function BriefingRow({ item }: { item: BriefingItem }) {
   const scope = item.scope_id ?? item.scope_kind;
   const signals = [
     ["text match", item.s_fts],
+    ["similarity", item.s_sim],
     ["scope", item.s_scope],
     ["structure", item.s_structure],
     ["recency", item.s_recency],

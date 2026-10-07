@@ -391,6 +391,7 @@ export interface BriefingItem {
   knowledge_id: number;
   shown: boolean;
   s_fts: number;
+  s_sim: number;
   s_scope: number;
   s_structure: number;
   s_recency: number;

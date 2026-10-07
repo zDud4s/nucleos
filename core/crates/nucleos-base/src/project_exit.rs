@@ -44,8 +44,12 @@ const PROJECT_SCOPED: &[&str] = &[
     // then counts time from that moment on, instead of resurrecting the old time from transcripts
     // that still exist on disk.
     "devtime_cwd_map",
-    // The parent of five session-keyed tables; those are written out in `remove`, ahead of the loop.
+    // What the rule catalogue concluded about the project's sessions (migration 0171): derived from
+    // the sessions below, so it goes with them.
+    "devtime_findings",
+    // The parent of six session-keyed tables; those are written out in `remove`, ahead of the loop.
     "devtime_sessions",
+    "devtime_turn_stats",
     // Pending distillations are the project's history; a forgotten project must not be distilled later.
     "distill_queue",
     "feed",
@@ -362,6 +366,7 @@ pub async fn remove(
             "devtime_attempts",
             "devtime_spans",
             "devtime_markers",
+            "devtime_attempt_marks",
         ] {
             forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {child}
@@ -372,6 +377,20 @@ pub async fn remove(
             .await?
             .rows_affected();
         }
+
+        // The owner's feedback on a finding is not derived — it survives every recompute — but it is
+        // still this project's dev time, and the rule above says that goes with the project. A mark
+        // names its session when it has one; a cross-session mark is found through the finding it
+        // judged. Before the loop, which deletes both `devtime_sessions` and `devtime_findings`.
+        forgotten += sqlx::query(
+            "DELETE FROM devtime_feedback
+              WHERE session_id IN (SELECT session_id FROM devtime_sessions WHERE project_id = ?1)
+                 OR finding_key IN (SELECT finding_key FROM devtime_findings WHERE project_id = ?1)",
+        )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
 
         // Children first. The deferral above means it would work in any order, and doing it in the
         // order the rows actually depend on keeps the statement log readable when one of them fails.
@@ -1177,6 +1196,26 @@ mod tests {
                  VALUES ('/work/' || ?2, ?2, 'project', ?3)",
                 "INSERT INTO devtime_files (path, session_id, offset, parser_version, updated_at)
                  VALUES ('/t/' || ?1 || '.jsonl', ?1, 4096, 1, ?3)",
+                "INSERT INTO devtime_findings (finding_key, project_id, session_id, scope, rule_id, rule_version,
+                                               level, waste, lever, confidence, lane, started_at, ended_at,
+                                               cost_ms, rules_version, parser_version)
+                 VALUES ('fk-' || ?1, ?2, ?1, 'session', 'A1', 1, 'fact', 'rework', 'tests', 'high', 'main',
+                         ?3, ?3, 1000, 'rv', 2)",
+                "INSERT INTO devtime_findings (finding_key, project_id, session_id, scope, rule_id, rule_version,
+                                               level, waste, lever, confidence, lane, started_at, ended_at,
+                                               cost_ms, rules_version, parser_version)
+                 VALUES ('fx-' || ?1, ?2, ?1, 'cross', 'F1', 1, 'fact', 'rework', 'tests', 'high', 'main',
+                         ?3, ?3, 1000, 'rv', 2)",
+                "INSERT INTO devtime_attempt_marks (attempt_id, session_id, verified, rules_version)
+                 VALUES ('att-' || ?1, ?1, 'unknown', 'rv')",
+                "INSERT INTO devtime_turn_stats (session_id, turn_seq, project_id, turn_class, started_at,
+                                                 calls, active_ms, explained_ms, rules_version)
+                 VALUES (?1, 0, ?2, 'small', ?3, 1, 1000, 0, 'rv')",
+                // One mark names its session; the other judged a cross-session finding and names none.
+                "INSERT INTO devtime_feedback (finding_key, rule_id, session_id, verdict, marked_at)
+                 VALUES ('fk-' || ?1, 'A1', ?1, 'useful', ?3)",
+                "INSERT INTO devtime_feedback (finding_key, rule_id, session_id, verdict, marked_at)
+                 VALUES ('fx-' || ?1, 'F1', NULL, 'useful', ?3)",
             ];
             for sql in statements {
                 sqlx::query(sql)
@@ -1200,17 +1239,31 @@ mod tests {
             ("devtime_spans", "session_id", 0, 1),
             ("devtime_markers", "session_id", 0, 1),
             ("devtime_cwd_map", "cwd", 0, 1),
+            ("devtime_findings", "session_id", 0, 2),
+            ("devtime_attempt_marks", "session_id", 0, 1),
+            ("devtime_turn_stats", "session_id", 0, 1),
+            ("devtime_feedback", "finding_key", 0, 1),
+            ("devtime_feedback", "cross_key", 0, 1),
             // Kept on purpose: the offsets are what stop a re-added folder being re-ingested.
             ("devtime_files", "session_id", 1, 1),
         ] {
             for (id, expected) in [("alpha", alpha_left), ("bravo", bravo_left)] {
                 let wanted = if key == "cwd" {
                     format!("/work/{id}")
+                } else if key == "finding_key" {
+                    format!("fk-sess-{id}")
+                } else if key == "cross_key" {
+                    format!("fx-sess-{id}")
                 } else {
                     format!("sess-{id}")
                 };
+                let column = if key == "cross_key" {
+                    "finding_key"
+                } else {
+                    key
+                };
                 let left: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                    "SELECT COUNT(*) FROM {table} WHERE {key} = ?"
+                    "SELECT COUNT(*) FROM {table} WHERE {column} = ?"
                 )))
                 .bind(wanted)
                 .fetch_one(&pool)

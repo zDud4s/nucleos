@@ -348,6 +348,8 @@ export const keys = {
     all: ["knowledge"] as const,
     /** `GET /distill/causes` — the cause of every distilled row. */
     distillCauses: ["knowledge", "distill-causes"] as const,
+    /** `GET /distill/duplicates` — each row flagged a near-duplicate, and of which. */
+    nearDuplicates: ["knowledge", "near-duplicates"] as const,
     detail: (id: number) => ["knowledge", "detail", id] as const,
   },
 
@@ -622,6 +624,8 @@ export const keys = {
     machine: ["system", "machine"] as const,
     /** `GET /config/distiller` — which brain the distiller asks. */
     distiller: ["system", "distiller"] as const,
+    /** `GET /config/embedding` — which Ollama model embeds knowledge rows. */
+    embedding: ["system", "embedding"] as const,
     /** The credentials this machine holds, by presence only -- `GET /config/secrets`. */
     secrets: ["system", "secrets"] as const,
   },
