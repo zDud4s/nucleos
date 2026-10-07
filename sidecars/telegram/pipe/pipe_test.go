@@ -120,6 +120,11 @@ type recordingDaemon struct {
 	// noteCalls records the text of every CreateNote call; noteErr is what the next one reports.
 	noteCalls []string
 	noteErr   error
+	// answerCalls records every AnswerCapture call; answerErr is what the next one reports and
+	// answerReleased what it says about the request.
+	answerCalls    []answerCall
+	answerErr      error
+	answerReleased bool
 	// The notification policy this fake daemon serves, and the error it serves instead. The zero
 	// value is an empty policy, which allows everything — so every test written before the policy
 	// existed keeps the behaviour it was written against.
@@ -163,6 +168,19 @@ func (d *recordingDaemon) SendAssistantMessage(chatID, _ string) (int64, error) 
 	d.sendAssistantCalls++
 	d.lastChatID = chatID
 	return 0, d.sendAssistantErr
+}
+
+type answerCall struct {
+	jobID int64
+	text  string
+}
+
+func (d *recordingDaemon) AnswerCapture(jobID int64, text string) (int64, bool, error) {
+	d.answerCalls = append(d.answerCalls, answerCall{jobID, text})
+	if d.answerErr != nil {
+		return 0, false, d.answerErr
+	}
+	return 31, d.answerReleased, nil
 }
 
 func (d *recordingDaemon) CreateNote(text string) (int64, error) {

@@ -211,3 +211,48 @@ func TestVoiceCaptureRefusedConnectionFallsBackToLocal(t *testing.T) {
 		t.Fatalf("VoiceCapture with nothing listening = configured %v, err %v; want false, nil", configured, err)
 	}
 }
+
+func TestAnswerCapturePostsTextWithTelegramOrigin(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/capture-requests/7/answer" {
+			t.Errorf("path = %q, want /capture-requests/7/answer", r.URL.Path)
+		}
+		var request map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if request["text"] != "it was the VPN" || request["origin"] != "telegram" {
+			t.Errorf("request = %v", request)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"note_id":31,"released":false}`))
+	}))
+	defer server.Close()
+
+	noteID, released, err := New(server.URL, "tok").AnswerCapture(7, "it was the VPN")
+	if err != nil {
+		t.Fatalf("AnswerCapture() error = %v", err)
+	}
+	if noteID != 31 || released {
+		t.Errorf("got (%d, %v), want (31, false)", noteID, released)
+	}
+}
+
+func TestAnswerCaptureErrorNeverCarriesTheText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	_, _, err := New(server.URL, "tok").AnswerCapture(7, "the-secret-answer")
+	if err == nil {
+		t.Fatal("AnswerCapture() error = nil, want 404")
+	}
+	if strings.Contains(err.Error(), "the-secret-answer") {
+		t.Errorf("error carries the answer text: %v", err)
+	}
+}

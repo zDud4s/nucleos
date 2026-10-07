@@ -60,6 +60,7 @@ type Bot interface {
 type Daemon interface {
 	SendAssistantMessage(chatKey, text string) (int64, error)
 	CreateNote(text string) (int64, error)
+	AnswerCapture(jobID int64, text string) (noteID int64, released bool, err error)
 	GetRun(id int64) (map[string]any, error)
 	GetProposals() ([]map[string]any, error)
 	// GetRefusedActions is what the injection barrier turned away. A separate route from the one

@@ -109,6 +109,32 @@ func (c *Client) CreateNote(text string) (int64, error) {
 	return response.ID, nil
 }
 
+// AnswerCapture answers the capture request of a job with the owner's text. released is false when
+// the request had already closed: the note is kept anyway, the distiller has simply moved on.
+// Errors never carry text, for the same reason as CreateNote.
+func (c *Client) AnswerCapture(jobID int64, text string) (int64, bool, error) {
+	path := fmt.Sprintf("/capture-requests/%d/answer", jobID)
+	body, status, err := c.do(http.MethodPost, path, map[string]string{
+		"text":   text,
+		"origin": "telegram",
+	})
+	if err != nil {
+		return 0, false, fmt.Errorf("answer capture: %w", err)
+	}
+	if err := statusError("answer capture", status, body); err != nil {
+		return 0, false, err
+	}
+
+	var response struct {
+		NoteID   int64 `json:"note_id"`
+		Released bool  `json:"released"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return 0, false, fmt.Errorf("parse answer capture response: %w", err)
+	}
+	return response.NoteID, response.Released, nil
+}
+
 func (c *Client) GetRun(id int64) (map[string]any, error) {
 	return c.getObject("get run", "/assistant/"+strconv.FormatInt(id, 10))
 }
