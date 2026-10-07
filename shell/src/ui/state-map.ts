@@ -259,6 +259,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     email_sent_mailbox_foreign: { tone: "danger", label: "sent mail filed elsewhere" },
     // Project settings and machine lines.
     config_written: { tone: "info", label: "project file written" },
+    // A settings file copied out of an old `.ai/` at startup (`main.rs` migrate_*); the old file is
+    // left in place and no longer read, which is news rather than a fault.
+    config_migrated: { tone: "info", label: "settings file migrated" },
     // A project brought under NucleOS: by a person on the onboarding panel, or at startup for one
     // that passed the old check (`onboarding.rs`). A record, like the write beside it.
     project_onboarded: { tone: "info", label: "project onboarded" },

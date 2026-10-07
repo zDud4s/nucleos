@@ -4,7 +4,7 @@
 //! this module logs a title, a body, a query or a vector.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 use sqlx::{Row, SqliteConnection, SqlitePool};
@@ -267,15 +267,21 @@ pub async fn backfill(
     Ok(done)
 }
 
-static EMBEDDER: OnceLock<Arc<dyn Embedder>> = OnceLock::new();
+static EMBEDDER: RwLock<Option<Arc<dyn Embedder>>> = RwLock::new(None);
 
-/// Installs the process-wide embedder. Daemon start only, never from a test.
+/// Installs the process-wide embedder, replacing an earlier one: the daemon at start, and the
+/// settings door when the owner picks another model. Never from a test that shares the process.
+///
+/// Swapping the model needs nothing else. Every reader asks `installed()` per use and filters
+/// vectors by `model()` (`vectors_for`, `nearest_in`), so rows embedded by the old model are simply
+/// not compared; `backfill` selects rows whose vector is missing or from another model, so the
+/// worker re-embeds them under the new one once it is nudged.
 pub fn install(embedder: Arc<dyn Embedder>) {
-    let _ = EMBEDDER.set(embedder);
+    *EMBEDDER.write().unwrap_or_else(|e| e.into_inner()) = Some(embedder);
 }
 
 pub fn installed() -> Option<Arc<dyn Embedder>> {
-    EMBEDDER.get().cloned()
+    EMBEDDER.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 static WAKE: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
