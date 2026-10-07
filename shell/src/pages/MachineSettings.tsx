@@ -10,6 +10,7 @@ import {
   type MachineSetting,
 } from "../data/machine-config";
 import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, StateBadge } from "../ui";
+import { DistillerModel } from "./DistillerModel";
 
 /**
  * This machine's settings — the files whose author is the daemon rather than
@@ -59,6 +60,8 @@ export function MachineSettings() {
 
   return (
     <>
+      <DistillerModel />
+
       {/* The folder, as one line above the files rather than a panel of its own. */}
       <p className="sy-machine-intro">
         These files belong to the daemon rather than to any project, and live in{" "}

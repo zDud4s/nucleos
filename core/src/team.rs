@@ -969,7 +969,7 @@ impl std::fmt::Display for StartError {
 
 /// `start_with` at `normal`, with no lineage: the shape most tests start a run in. Test-only since
 /// `post_team_run` began carrying a speed, which left no production caller.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn start(
     state: &AppState,
     team_id: &str,
@@ -1149,7 +1149,7 @@ pub async fn start_with(
 }
 
 fn files_root(state: &AppState) -> Result<std::path::PathBuf, String> {
-    crate::http::files_root(state)
+    crate::door::files_root(state)
         .map(std::path::Path::to_path_buf)
         .map_err(|_| "no files folder is configured on this machine".to_owned())
 }
@@ -4963,7 +4963,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         AppState {
             token: crate::auth::Token("test-token".into()),
             pool,

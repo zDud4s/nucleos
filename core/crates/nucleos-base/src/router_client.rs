@@ -264,7 +264,7 @@ fn body_error(error: reqwest::Error) -> RouterError {
 }
 
 /// Stub routers for tests here and in `route_advice`: loopback, port 0, no live llm-router.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub mod test_support {
     /// Serves `app` on a fresh loopback port and returns its base URL.
     pub async fn serve(app: axum::Router) -> String {

@@ -146,7 +146,7 @@ pub fn interpret_barrier_probe(stdout: &str) -> Result<(), BarrierError> {
 }
 
 /// Runs the sandbox's hook script once with the given environment and returns its stdout.
-async fn probe_hook(sandbox: &Path, env: &[(&str, String)]) -> Result<String, BarrierError> {
+pub async fn probe_hook(sandbox: &Path, env: &[(&str, String)]) -> Result<String, BarrierError> {
     use tokio::io::AsyncWriteExt;
 
     let script = sandbox.join("hooks").join("ask_daemon.py");
@@ -3296,7 +3296,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         crate::state::AppState {
             token: crate::auth::Token("verification-token".into()),
             pool,
@@ -3342,40 +3342,6 @@ mod tests {
         url
     }
 
-    #[tokio::test]
-    async fn the_barrier_verifies_against_the_real_router() {
-        let dir = tempfile::tempdir().unwrap();
-        ensure_sandbox(dir.path()).unwrap();
-        let state = test_state().await;
-        let pool = state.pool.clone();
-        let url = serve(crate::http::build_router(state)).await;
-
-        assert_eq!(
-            verify_hook_barrier(&pool, dir.path(), &url, "verification-token").await,
-            Ok(())
-        );
-    }
-
-    /// The verification's own bookkeeping: it must not leave the row it invented behind, or every
-    /// restart adds one to a table the triage loop counts over.
-    #[tokio::test]
-    async fn verification_leaves_no_row_behind() {
-        let dir = tempfile::tempdir().unwrap();
-        ensure_sandbox(dir.path()).unwrap();
-        let state = test_state().await;
-        let pool = state.pool.clone();
-        let url = serve(crate::http::build_router(state)).await;
-
-        verify_hook_barrier(&pool, dir.path(), &url, "verification-token")
-            .await
-            .unwrap();
-        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(left, 0);
-    }
-
     /// The branch deleted or misspelled: a daemon that answers `allow` must fail the check. This is
     /// the case the obvious implementation could not detect.
     #[tokio::test]
@@ -3416,54 +3382,6 @@ mod tests {
             verify_hook_barrier(&state.pool, dir.path(), &url, "verification-token").await,
             Err(BarrierError::WrongReason(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn a_probe_without_a_run_id_fails_the_verification() {
-        let dir = tempfile::tempdir().unwrap();
-        ensure_sandbox(dir.path()).unwrap();
-        let state = test_state().await;
-        let url = serve(crate::http::build_router(state)).await;
-
-        let probe = probe_hook(
-            dir.path(),
-            &[
-                ("NUCLEOS_DAEMON_URL", url),
-                ("NUCLEOS_DAEMON_TOKEN", "verification-token".to_string()),
-            ],
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            interpret_barrier_probe(&probe),
-            Err(BarrierError::NoOpinion)
-        );
-    }
-
-    /// An id no run carries falls through to `mode = "real"`, where the classifier ALLOWS `Read`.
-    /// So a verification that forgot to insert its row would be testing the classifier, not the
-    /// barrier — and would fail for a reason that has nothing to do with the hook.
-    #[tokio::test]
-    async fn a_probe_naming_an_unknown_run_fails_the_verification() {
-        let dir = tempfile::tempdir().unwrap();
-        ensure_sandbox(dir.path()).unwrap();
-        let state = test_state().await;
-        let url = serve(crate::http::build_router(state)).await;
-
-        let probe = probe_hook(
-            dir.path(),
-            &[
-                ("NUCLEOS_RUN_ID", "424242".to_string()),
-                ("NUCLEOS_DAEMON_URL", url),
-                ("NUCLEOS_DAEMON_TOKEN", "verification-token".to_string()),
-            ],
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            interpret_barrier_probe(&probe),
-            Err(BarrierError::NotBlocked)
-        );
     }
 
     #[test]

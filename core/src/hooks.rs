@@ -92,6 +92,20 @@ pub const SESSION_SETTLE_WAIT: Duration = Duration::from_secs(20);
 /// whatever of this is left, so the answer still lands inside the hook's 30s timeout.
 const SESSION_DECISION_BUDGET: Duration = Duration::from_secs(25);
 
+/// A valid branch name that only stands in while a segment's SHAPE is matched, before the branch
+/// it really runs on has been read. Never reaches an op that is queued.
+const QUEUE_OP_PROBE_BRANCH: &str = "probe";
+
+/// The six parsers, in the order the session gate asks them, for one segment.
+fn queue_op(segment: &str, branch: &str) -> Option<crate::vcs::Op> {
+    crate::vcs::merge_from_command(segment, branch)
+        .or_else(|| crate::vcs::push_from_command(segment, branch))
+        .or_else(|| crate::vcs::tag_from_command(segment, branch))
+        .or_else(|| crate::vcs::fetch_from_command(segment))
+        .or_else(|| crate::vcs::branch_delete_from_command(segment))
+        .or_else(|| crate::vcs::rebase_from_command(segment, branch))
+}
+
 #[derive(Deserialize)]
 pub struct SessionGitPayload {
     pub tool_name: String,
@@ -159,15 +173,6 @@ async fn session_git_decision_within(
     // spends git subprocesses on a person's keystrokes — which is why the caller filters first and
     // only asks about commands that could possibly be queueable.
     let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
-    let Ok(root) = crate::git_exec::toplevel(Path::new(&payload.cwd), deadline).await else {
-        // Standing outside a working tree, so no git command from here reaches a repository this
-        // queue serves. Silence rather than refusal: this hook is registered for one repository and
-        // a session that has wandered out of it is not the case being governed.
-        return no_opinion();
-    };
-    let Ok(branch) = crate::git_exec::current_branch(&root, deadline).await else {
-        return no_opinion();
-    };
 
     // Per SEGMENT, not per command. Every parser below matches its whole token list as an exact
     // shape, so a shell operator in front of the git call made the list longer and the match fail —
@@ -175,28 +180,87 @@ async fn session_git_decision_within(
     // whose entire purpose is to refuse it, measured against the running daemon. The strictness of
     // the parsers is not what was wrong and is not touched; they are simply asked about each command
     // in the line rather than about the line.
-    let Some(op) = crate::vcs::shell_segments(command)
-        .into_iter()
-        .find_map(|segment| {
-            crate::vcs::merge_from_command(segment, &branch)
-                .or_else(|| crate::vcs::push_from_command(segment, &branch))
-                .or_else(|| crate::vcs::tag_from_command(segment, &branch))
-                .or_else(|| crate::vcs::fetch_from_command(segment))
-                .or_else(|| crate::vcs::branch_delete_from_command(segment))
-                .or_else(|| crate::vcs::rebase_from_command(segment, &branch))
-        })
-    else {
+    //
+    // **And each segment in the directory it runs in.** The branch a merge moves was read from the
+    // session's cwd alone, so `cd <worktree> && git merge master` from a session on `master` queued
+    // `master into master` and reported it performed. The shape is matched first with a stand-in
+    // branch (the parsers only copy the branch into the op), and the real one is read afterwards
+    // from where the segment actually runs.
+    let segments = crate::vcs::directed_segments(command);
+    let Some((segment, probe)) = segments.iter().find_map(|segment| {
+        queue_op(&segment.command, QUEUE_OP_PROBE_BRANCH).map(|probe| (segment, probe))
+    }) else {
         // Declined by the queue is not the same sentence as fine to run by hand, and reading them
         // as one left `git push --force` passing. A spelling that still writes something other
         // sessions share is refused with NOTHING queued — there is nothing to queue, because the
         // queue cannot perform that spelling either. Per segment, for the reason above.
-        return match crate::vcs::shell_segments(command)
+        let Some(reason) = crate::vcs::shell_segments(command)
             .into_iter()
             .find_map(crate::vcs::unqueueable_but_shared)
-        {
-            Some(reason) => Json(deny_with(&reason).into()),
-            None => no_opinion(),
+        else {
+            return no_opinion();
         };
+        // Standing outside a working tree, so no git command from here reaches a repository this
+        // queue serves. Silence rather than refusal: this hook is registered for one repository and
+        // a session that has wandered out of it is not the case being governed.
+        if crate::git_exec::toplevel(Path::new(&payload.cwd), deadline)
+            .await
+            .is_err()
+        {
+            return no_opinion();
+        }
+        return Json(deny_with(&reason).into());
+    };
+
+    let kind = probe.kind();
+    let cwd = match &segment.dir {
+        crate::vcs::SegmentDir::Session => std::path::PathBuf::from(&payload.cwd),
+        crate::vcs::SegmentDir::Steps(steps) => {
+            crate::vcs::resolve_segment_dir(Path::new(&payload.cwd), steps)
+        }
+        crate::vcs::SegmentDir::Unfollowable(how) => {
+            return Json(
+                deny_with(&format!(
+                    "{kind} goes through the queue, and the queue has to know which branch it \
+                     moves — but this line changes directory with {how}, which this hook does not \
+                     follow, so performing it from the session's own directory could move a branch \
+                     nobody named. Nothing was queued. Name the directory plainly: \
+                     `git -C <dir> {}` or `cd <dir> && {}`.",
+                    segment.command.trim_start_matches("git ").trim(),
+                    segment.command.trim(),
+                ))
+                .into(),
+            );
+        }
+    };
+    let explicit = segment.dir != crate::vcs::SegmentDir::Session;
+    let root = match crate::git_exec::toplevel(&cwd, deadline).await {
+        Ok(root) => root,
+        // An explicit `cd`/`-C` into something that is not a working tree is a mistake to report,
+        // not a session that wandered off; falling silent would let it run by hand.
+        Err(reason) if explicit => {
+            return Json(deny_with(&format!("{kind} goes through the queue, and {reason}")).into());
+        }
+        Err(_) => return no_opinion(),
+    };
+    let branch = match crate::git_exec::current_branch(&root, deadline).await {
+        Ok(branch) => branch,
+        Err(reason) if explicit => {
+            return Json(deny_with(&format!("{kind} goes through the queue, and {reason}")).into());
+        }
+        Err(_) => return no_opinion(),
+    };
+    let Some(op) = queue_op(&segment.command, &branch) else {
+        // The shape matched with the stand-in and not with the real branch: the parsers refuse only
+        // a detached HEAD on that ground, and it names no branch the queue could move.
+        return Json(
+            deny_with(&format!(
+                "{kind} goes through the queue, and {} is on a detached HEAD, which names no \
+                 branch the queue can move. Nothing was queued.",
+                root.display()
+            ))
+            .into(),
+        );
     };
 
     // From here the command IS one the queue performs, so every remaining failure refuses rather
@@ -1133,10 +1197,23 @@ async fn pretooluse_decision_from(
                 }
 
                 let cwd = cwd.as_deref()?;
+                let command = payload.tool_input.get("command").and_then(Value::as_str)?;
+                // The branch is read where the segment RUNS, not where the run stands: `cd x &&`
+                // and `git -C x` move it. A directory change this reader cannot follow is not
+                // auto-queued; it falls to the approval path, where a person sees the line.
+                let segments = crate::vcs::directed_segments(command);
+                let segment = segments
+                    .iter()
+                    .find(|segment| queue_op(&segment.command, QUEUE_OP_PROBE_BRANCH).is_some())?;
+                let cwd = match &segment.dir {
+                    crate::vcs::SegmentDir::Session => std::path::PathBuf::from(cwd),
+                    crate::vcs::SegmentDir::Steps(steps) => {
+                        crate::vcs::resolve_segment_dir(Path::new(cwd), steps)
+                    }
+                    crate::vcs::SegmentDir::Unfollowable(_) => return None,
+                };
                 let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
-                let root = crate::git_exec::toplevel(Path::new(cwd), deadline)
-                    .await
-                    .ok()?;
+                let root = crate::git_exec::toplevel(&cwd, deadline).await.ok()?;
                 let branch = crate::git_exec::current_branch(&root, deadline)
                     .await
                     .ok()?;
@@ -1152,17 +1229,7 @@ async fn pretooluse_decision_from(
                     .await
                     .ok()?;
 
-                let command = payload.tool_input.get("command").and_then(Value::as_str)?;
-                let op = crate::vcs::shell_segments(command)
-                    .into_iter()
-                    .find_map(|segment| {
-                        crate::vcs::merge_from_command(segment, &branch)
-                            .or_else(|| crate::vcs::push_from_command(segment, &branch))
-                            .or_else(|| crate::vcs::tag_from_command(segment, &branch))
-                            .or_else(|| crate::vcs::fetch_from_command(segment))
-                            .or_else(|| crate::vcs::branch_delete_from_command(segment))
-                            .or_else(|| crate::vcs::rebase_from_command(segment, &branch))
-                    })?;
+                let op = queue_op(&segment.command, &branch)?;
                 if !declared.iter().any(|kind| kind == op.kind()) {
                     return None;
                 }
@@ -1930,7 +1997,7 @@ async fn rooted_turn(state: &AppState, run_id: i64) -> Option<String> {
 ///
 /// Long enough for somebody looking at the window to read a command and decide; short enough that
 /// stepping away costs one refused tool call rather than a conversation that hangs.
-pub(crate) const ASK_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
+pub const ASK_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// One tool call a conversation is waiting to be allowed.
 ///
@@ -1965,7 +2032,7 @@ static ASKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Stri
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Records that this turn is waiting to be allowed something, and returns the question's name.
-pub(crate) fn ask_about(chat_id: &str, run_id: i64, tool: &str, detail: Option<String>) -> String {
+pub fn ask_about(chat_id: &str, run_id: i64, tool: &str, detail: Option<String>) -> String {
     let id = crate::auth::generate_uuid_v4();
     let (answer, heard) = tokio::sync::oneshot::channel();
     ASKS.lock().unwrap().insert(
@@ -2018,7 +2085,7 @@ pub fn answer_ask(id: &str, allow: bool) -> bool {
 ///
 /// The question is taken down either way. A turn whose call was refused has moved on, and a
 /// question still standing in the window would be about something that is no longer happening.
-pub(crate) async fn wait_for_run(run_id: i64, window: std::time::Duration) -> Option<bool> {
+pub async fn wait_for_run(run_id: i64, window: std::time::Duration) -> Option<bool> {
     let (id, heard) = {
         let mut asks = ASKS.lock().unwrap();
         let (id, pending) = asks
@@ -2035,7 +2102,7 @@ pub(crate) async fn wait_for_run(run_id: i64, window: std::time::Duration) -> Op
 }
 
 /// What the owner is told when a rooted turn asks for something that would need approving.
-pub(crate) const ROOTED_APPROVAL_DENY_REASON: &str = "this needs approving, and a conversation is not where that happens — do it in the window, or \
+pub const ROOTED_APPROVAL_DENY_REASON: &str = "this needs approving, and a conversation is not where that happens — do it in the window, or \
      say what you want and let it start a run";
 
 /// A rooted turn's tool call: the NucleOS tools as ever, and the machine through the classifier.
@@ -2310,7 +2377,7 @@ const BYPASS_STILL_ASKS: &str =
 const DONT_ASK_CLAUSE: &str = " — and this conversation asks nobody";
 
 /// Spec B D12, word for word: a person already answered this exact action for this task.
-pub(crate) const A_PERSON_DECLINED_THIS: &str = "A person already declined this exact action for this task. It was not run. Do not try it again. Carry on with the task another way if there is one, or finish what you can and say what is missing in your final message.";
+pub const A_PERSON_DECLINED_THIS: &str = "A person already declined this exact action for this task. It was not run. Do not try it again. Carry on with the task another way if there is one, or finish what you can and say what is missing in your final message.";
 
 /// Which of the classifier's `allow`s survive this rung.
 ///
@@ -3032,7 +3099,7 @@ const DENIAL_LIMIT: i64 = 3;
 /// the enum" is held: a caller that means to ignore it has to say `let _ =`, in view.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DenialCount {
+pub enum DenialCount {
     /// Counted, and the run is still below `DENIAL_LIMIT` — the only case spec B's E1 may ask the
     /// judge about: the judge may stop a run BEFORE the limit, never after it.
     Counted(i64),
@@ -3788,16 +3855,7 @@ mod tests {
     use tower::ServiceExt;
 
     async fn test_state() -> AppState {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_pool().await;
         AppState {
             token: Token("test-token".into()),
             pool,
@@ -10375,8 +10433,8 @@ mod tests {
 
     /// A repository on the roster, and the path a session would be standing in.
     async fn rostered_repo(state: &AppState, prefix: &str) -> tempfile::TempDir {
-        let dir = crate::git_exec::tests::space_free_tempdir(prefix);
-        crate::git_exec::tests::initialize_repo(dir.path());
+        let dir = crate::git_exec::testkit::space_free_tempdir(prefix);
+        crate::git_exec::testkit::initialize_repo(dir.path());
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
         )
@@ -10589,7 +10647,12 @@ mod tests {
         .await;
         let app = test_router(state.clone());
 
-        let decision = run_git_decision(&app, run_id, "cd repo && git merge master").await;
+        // The `cd` is followed, so it names the run's own worktree rather than a directory below it.
+        let command = format!(
+            "cd {} && git merge master",
+            repo.path().display().to_string().replace('\\', "/")
+        );
+        let decision = run_git_decision(&app, run_id, &command).await;
 
         assert_eq!(decision.decision, "deny", "{}", decision.reason);
         assert_eq!(
@@ -10722,6 +10785,87 @@ mod tests {
             vec![("merge".to_owned(), "shell".to_owned())],
             "an editor session is `shell`: a person's agent redirected here, not a person acting"
         );
+    }
+
+    async fn queued_ops(state: &AppState) -> Vec<crate::vcs::Op> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT op, args FROM vcs_requests ORDER BY id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        rows.iter()
+            .map(|(kind, args)| crate::vcs::Op::from_stored(kind, args).unwrap())
+            .collect()
+    }
+
+    /// 2026-10-07: a session rooted in the main checkout (on `master`) ran
+    /// `cd <worktree> && git merge master`, and the queue merged master into MASTER — read from the
+    /// session's cwd — and reported it performed. `git -C <worktree> merge master` was refused as an
+    /// unknown spelling. Both now merge into the branch the worktree they name stands on.
+    #[tokio::test]
+    async fn a_merge_behind_cd_or_dash_c_targets_the_branch_of_the_directory_it_names() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-cd-main").await;
+        let holder = crate::git_exec::testkit::space_free_tempdir("hook-session-cd-wt");
+        let worktree = holder.path().join("wt");
+        assert!(crate::git_exec::testkit::git_ok(
+            repo.path(),
+            &[
+                std::ffi::OsStr::new("worktree"),
+                std::ffi::OsStr::new("add"),
+                std::ffi::OsStr::new("-b"),
+                std::ffi::OsStr::new("side"),
+                worktree.as_os_str(),
+            ]
+        ));
+        let there = worktree.display().to_string().replace('\\', "/");
+
+        for command in [
+            format!("cd {there} && git merge master"),
+            format!("cd \"{there}\"; git merge --no-ff master"),
+            format!("git -C {there} merge master"),
+            format!("NUCLEOS_ALLOW_DIRECT_GIT=1 git -C {there} merge master"),
+        ] {
+            let decision = session_decision(&state, &command, repo.path()).await;
+            assert_eq!(decision.decision, "deny", "{command}: {}", decision.reason);
+            assert!(
+                decision.reason.contains("queued as vcs request"),
+                "{command}: {}",
+                decision.reason
+            );
+        }
+        let expected = crate::vcs::Op::Merge {
+            source: crate::vcs::Branch::new("master").unwrap(),
+            target: crate::vcs::Branch::new("side").unwrap(),
+        };
+        assert_eq!(queued_ops(&state).await, vec![expected; 4]);
+    }
+
+    /// The other half: where the line moves the directory in a way the hook does not follow, or
+    /// names one that is not a working tree, the merge is refused with nothing queued — never
+    /// performed on the session's own branch.
+    #[tokio::test]
+    async fn a_merge_behind_a_directory_change_the_hook_cannot_follow_is_refused_unqueued() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-cd-lost").await;
+
+        for command in [
+            "cd ~/elsewhere && git merge master",
+            "cd $WORKTREE && git merge master",
+            "cd - && git merge master",
+            "popd && git merge master",
+            "git -C $WORKTREE merge master",
+            "cd no-such-directory-here && git merge master",
+        ] {
+            let decision = session_decision(&state, command, repo.path()).await;
+            assert_eq!(decision.decision, "deny", "{command}: {}", decision.reason);
+            assert!(
+                !decision.reason.contains("queued as vcs request"),
+                "{command}: {}",
+                decision.reason
+            );
+        }
+        assert!(queued_rows(&state).await.is_empty());
     }
 
     fn ticket(status: &str, sha: Option<&str>, reason: Option<&str>) -> crate::vcs::Ticket {
@@ -10969,7 +11113,6 @@ mod tests {
              git branch -d fix/espera-que-responde 2>&1 | tail -6"
                 .to_owned(),
             "git branch -d a b".to_owned(),
-            format!("git -C {} branch -d feature", repo.path().display()),
             "git branch -df feature".to_owned(),
         ];
         for command in &unreadable {
@@ -10986,14 +11129,18 @@ mod tests {
             "nothing the queue could not read may be admitted as if it had"
         );
 
+        // A `cd`/`-C` is followed now, so it has to name a directory that exists: the deletion is
+        // queued against the repository found THERE.
+        let here = repo.path().display().to_string().replace('\\', "/");
         for command in [
-            "git branch -d feature",
-            "git branch --delete feature",
-            "git worktree remove x && git branch -d feature",
-            "cd somewhere && git branch -d feature",
-            "cd somewhere\ngit branch -d feature",
+            "git branch -d feature".to_owned(),
+            "git branch --delete feature".to_owned(),
+            "git worktree remove x && git branch -d feature".to_owned(),
+            format!("cd {here} && git branch -d feature"),
+            format!("cd {here}\ngit branch -d feature"),
+            format!("git -C {here} branch -d feature"),
         ] {
-            let decision = session_decision(&state, command, repo.path()).await;
+            let decision = session_decision(&state, &command, repo.path()).await;
             assert_eq!(decision.decision, "deny", "{command}: {}", decision.reason);
             assert!(
                 decision.reason.contains("queued as vcs request"),
@@ -11056,8 +11203,8 @@ mod tests {
     #[tokio::test]
     async fn a_repository_no_project_claims_is_refused_rather_than_waved_through() {
         let state = test_state().await;
-        let dir = crate::git_exec::tests::space_free_tempdir("hook-session-unclaimed");
-        crate::git_exec::tests::initialize_repo(dir.path());
+        let dir = crate::git_exec::testkit::space_free_tempdir("hook-session-unclaimed");
+        crate::git_exec::testkit::initialize_repo(dir.path());
 
         let decision = session_decision(&state, "git merge feature", dir.path()).await;
 

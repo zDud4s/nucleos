@@ -13,7 +13,7 @@
 
 /// What a detector found, as a half-open byte range into the scanned string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Finding {
+pub struct Finding {
     pub start: usize,
     pub end: usize,
     /// The marker the span is replaced by, chosen so the reader still knows what KIND of thing was
@@ -27,7 +27,7 @@ pub(crate) struct Finding {
 /// Overlapping findings are resolved by taking the earliest, then the longest — a PEM block that
 /// happens to contain a base64 run must be redacted as the block, not sliced into pieces around its
 /// interior.
-pub(crate) fn redact_secrets(input: &str) -> String {
+pub fn redact_secrets(input: &str) -> String {
     let findings = scan_secrets(input);
     if findings.is_empty() {
         return input.to_owned();
@@ -48,7 +48,7 @@ pub(crate) fn redact_secrets(input: &str) -> String {
 }
 
 /// PURE: every secret-looking span in `input`, sorted by start and de-overlapped.
-pub(crate) fn scan_secrets(input: &str) -> Vec<Finding> {
+pub fn scan_secrets(input: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     findings.extend(pem_blocks(input));
     findings.extend(prefixed_tokens(input));
@@ -757,7 +757,7 @@ fn is_portuguese_nif(digits: &[u32]) -> bool {
 /// reads the scheme as `dial imaps`, rejects it for the space, and hands the line back unchanged.
 /// `sidecar.rs`, its first caller, therefore splits a line into whitespace-separated tokens and
 /// applies this to each. Any future caller with a whole log line to clean must do the same.
-pub(crate) fn redact_url(input: &str) -> String {
+pub fn redact_url(input: &str) -> String {
     let Some(scheme_end) = input.find("://") else {
         return strip_userinfo_from_non_url(input).unwrap_or_else(|| input.to_owned());
     };
@@ -1325,7 +1325,6 @@ A fatura de julho segue em anexo.\n\n\
             built_in.display(),
             running_in.display(),
         );
-        let source_dir = running_in.join("src");
         let forbidden = [
             "body_excerpt",
             "body_text",
@@ -1335,12 +1334,10 @@ A fatura de julho segue em anexo.\n\n\
             "extraction_answer",
         ];
 
-        for entry in fs::read_dir(source_dir).expect("core source directory must be readable") {
-            let entry = entry.expect("core source entry must be readable");
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("rs")
-                || path.file_name().and_then(|name| name.to_str()) == Some("redact.rs")
-            {
+        // The top-level files of every source root: the core's own `src/` and, once modules move
+        // out of it, the `src/` of each crate under `core/crates/`.
+        for path in crate::source_scan::top_level_rust_files() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("redact.rs") {
                 continue;
             }
 

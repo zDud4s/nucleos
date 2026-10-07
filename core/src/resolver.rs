@@ -693,7 +693,7 @@ fn resolution_prompt(source: &str, target: &str, output_tail: Option<&str>) -> S
 /// landed unverified and unlinked.
 ///
 /// Scoped to the project, or two projects' branch names would decide each other's.
-pub(crate) async fn landing_is_a_resolution(
+pub async fn landing_is_a_resolution(
     pool: &sqlx::SqlitePool,
     project_id: &str,
     branch: &str,
@@ -745,7 +745,7 @@ pub(crate) async fn landing_is_a_resolution(
 /// database read that failed. Fails toward NOT linking rather than guessing: a resolution admitted
 /// without a link still lands and still tells `/wait` the truth eventually, once its own row goes
 /// terminal and the caller polls it directly; a wrong link would point a person at the wrong row.
-pub(crate) async fn escalated_request_id(
+pub async fn escalated_request_id(
     pool: &sqlx::SqlitePool,
     project_id: &str,
     branch: &str,
@@ -1062,7 +1062,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 
@@ -1590,9 +1590,9 @@ mod tests {
         run_status: &str,
         progress: Progress,
     ) -> Scenario {
-        let container = crate::git_exec::tests::space_free_tempdir(prefix);
+        let container = crate::git_exec::testkit::space_free_tempdir(prefix);
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         assert!(git_at(&repo, &["branch", "-M", "master"]));
         assert!(git_at(&repo, &["checkout", "-q", "-b", "feat/x"]));
         std::fs::write(repo.join("seed.txt"), "theirs\n").unwrap();
@@ -2051,9 +2051,9 @@ mod tests {
 
     /// A real repository on `master`, and the directory that keeps it alive.
     fn moot_repo(prefix: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let container = crate::git_exec::tests::space_free_tempdir(prefix);
+        let container = crate::git_exec::testkit::space_free_tempdir(prefix);
         let repo = container.path().join("repo");
-        crate::git_exec::tests::initialize_repo(&repo);
+        crate::git_exec::testkit::initialize_repo(&repo);
         assert!(git_at(&repo, &["branch", "-M", "master"]));
         (container, repo)
     }

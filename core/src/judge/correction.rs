@@ -25,7 +25,7 @@ use crate::state::AppState;
 ///
 /// On a connection, because it is asked twice: before the transaction (fast refusal) and inside
 /// it, after the correction row took the write lock, where it can no longer change until commit.
-pub(crate) async fn lineage_trace_on(
+pub async fn lineage_trace_on(
     conn: &mut SqliteConnection,
     root: i64,
     branch: Option<&str>,
@@ -70,7 +70,7 @@ pub(crate) async fn lineage_trace_on(
 /// worktree run consults the mark today (spec §1.2), so the judge consults it itself: an
 /// automatic continuation, with nobody watching, of a session that may have read a stranger is
 /// exactly the case to hand to the owner.
-pub(crate) async fn lineage_read_untrusted(pool: &SqlitePool, root: i64) -> sqlx::Result<bool> {
+pub async fn lineage_read_untrusted(pool: &SqlitePool, root: i64) -> sqlx::Result<bool> {
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM runs WHERE (id = ?1 OR lineage_root_id = ?1) AND read_untrusted = 1)",
     )
@@ -82,7 +82,7 @@ pub(crate) async fn lineage_read_untrusted(pool: &SqlitePool, root: i64) -> sqlx
 /// Spec D6, condition 7: the project's corrections in the last 24 hours. A rolling day rather
 /// than a calendar one: no timezone to choose, and no midnight at which six can happen in an
 /// hour.
-pub(crate) async fn corrections_in_last_day_on(
+pub async fn corrections_in_last_day_on(
     conn: &mut SqliteConnection,
     project_id: &str,
     now: chrono::DateTime<chrono::Utc>,
@@ -121,7 +121,7 @@ async fn needs_owner(pool: &SqlitePool, project_id: &str, run_id: i64, reason: &
 
 /// Why `refusal_before_the_transaction` stopped a correction.
 #[derive(Debug)]
-pub(crate) enum Refusal {
+pub enum Refusal {
     /// A condition failed: the owner is told, with the reason.
     Owner(String),
     /// The resolver is no longer in enforce: nothing is corrected and no owner line is written
@@ -132,7 +132,7 @@ pub(crate) enum Refusal {
 /// Spec D6, conditions 2 and 5 to 8, read AFTER the judge answered (S3): they read state that
 /// changes (the queue, the brakes, the switches, the ceiling), and reading them after a call that
 /// may take 10 s shortens the window between reading and acting. `None` when all hold.
-pub(crate) async fn refusal_before_the_transaction(
+pub async fn refusal_before_the_transaction(
     state: &AppState,
     project_id: &str,
     root: i64,
@@ -227,7 +227,7 @@ type GateFailedRow = (
 /// write won with `completed` and the gate `failed` (not `errored`: that is the gate that did not
 /// run, not the code). Every way out is today's behaviour (the `worktree_gate_failed` line already
 /// out) plus, in enforce, one line of the resolver's own. Any failure falls back to the owner.
-pub(crate) async fn after_gate_failed(state: AppState, run_id: i64, exit_code: i32) {
+pub async fn after_gate_failed(state: AppState, run_id: i64, exit_code: i32) {
     let pool = &state.pool;
     let row: Option<GateFailedRow> = sqlx::query_as(
         "SELECT mode, job_id, project_id, COALESCE(lineage_root_id, id), gate_output, successor_run_id
@@ -382,7 +382,7 @@ fn completed_within_grace(completed_at: Option<&str>) -> bool {
 /// carry the lineage. A chain that completed with its gate failing already has its
 /// `worktree_gate_failed` line and is never corrected again (condition 4); it is marked without a
 /// line, so the sweep never reads it again.
-pub(crate) async fn report_ended_corrections(pool: &SqlitePool) {
+pub async fn report_ended_corrections(pool: &SqlitePool) {
     let open: Vec<(i64, i64, String, i64, String, Option<String>)> = match sqlx::query_as(
         "SELECT c.id, c.origin_run_id, c.project_id, r.id, r.status, r.completed_at
          FROM judge_corrections c
@@ -463,7 +463,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 

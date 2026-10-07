@@ -25,7 +25,7 @@ use crate::verify_sched::{self, Candidate};
 use crate::warm;
 
 /// A project's warm-state ceiling when its `autopilot.yaml` sets none.
-pub(crate) const DEFAULT_PROJECT_DISK_CAP_GB: u64 = 30;
+pub const DEFAULT_PROJECT_DISK_CAP_GB: u64 = 30;
 const POLL: Duration = Duration::from_millis(500);
 const SWEEP_EVERY: Duration = Duration::from_secs(30 * 60);
 /// How often a unit looks again at a warm dir the sweep is removing.
@@ -34,7 +34,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Weight of a unit: what the heavy-command broker charges for the same program.
 /// `cargo` (any case, with or without `.exe`) weighs 2, everything else 1, never above `capacity`.
-pub(crate) fn weight_of(argv: &[String], capacity: i64) -> i64 {
+pub fn weight_of(argv: &[String], capacity: i64) -> i64 {
     let program = argv.first().map(String::as_str).unwrap_or("");
     let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
     let lower = base.to_ascii_lowercase();
@@ -98,7 +98,7 @@ struct InFlight {
     removing: HashSet<PathBuf>,
 }
 
-pub(crate) struct Executor {
+pub struct Executor {
     pub pool: SqlitePool,
     pub config: VerifyConfig,
     pub machine_root: Option<PathBuf>,
@@ -151,11 +151,7 @@ impl Drop for Reservation {
 }
 
 impl Executor {
-    pub(crate) fn new(
-        pool: SqlitePool,
-        config: VerifyConfig,
-        machine_root: Option<PathBuf>,
-    ) -> Arc<Self> {
+    pub fn new(pool: SqlitePool, config: VerifyConfig, machine_root: Option<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             pool,
             config,
@@ -193,7 +189,7 @@ impl Executor {
     }
 
     /// Queues (or joins) a unit and wakes the worker.
-    pub(crate) async fn submit(&self, mut request: Request) -> sqlx::Result<Submitted> {
+    pub async fn submit(&self, mut request: Request) -> sqlx::Result<Submitted> {
         let capacity = self.capacity();
         request.weight = if request.weight > 0 {
             request.weight.min(capacity)
@@ -208,12 +204,12 @@ impl Executor {
         Ok(submitted)
     }
 
-    pub(crate) async fn get(&self, id: i64) -> sqlx::Result<Option<State>> {
+    pub async fn get(&self, id: i64) -> sqlx::Result<Option<State>> {
         verify_runs::get(&self.pool, id).await
     }
 
     /// Starts every unit that fits now. Returns how many started. (One scheduling pass.)
-    pub(crate) async fn start_ready(self: &Arc<Self>) -> usize {
+    pub async fn start_ready(self: &Arc<Self>) -> usize {
         let aging_ms = seconds_to_ms(self.config.aging_seconds);
         let mut started = 0;
         loop {
@@ -440,7 +436,7 @@ async fn sweep_once(executor: Arc<Executor>, _running: Sweeping) {
 }
 
 /// The worker: schedules on every wake and every `POLL`, sweeps warm state every `SWEEP_EVERY`.
-pub(crate) async fn run_executor(executor: Arc<Executor>) {
+pub async fn run_executor(executor: Arc<Executor>) {
     let first_sweep = tokio::time::Instant::now() + SWEEP_EVERY;
     let mut sweep = tokio::time::interval_at(first_sweep, SWEEP_EVERY);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -474,7 +470,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 

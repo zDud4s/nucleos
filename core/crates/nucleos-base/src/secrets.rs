@@ -115,13 +115,13 @@ impl SecretStore for OsCredentialStore {
 ///
 /// `#[cfg(test)]` and not a feature flag: production has exactly one store and there is no
 /// configuration under which it should have another.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 #[derive(Default)]
 pub struct InMemorySecrets {
     entries: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 impl SecretStore for InMemorySecrets {
     fn present(&self, key: &str) -> Result<bool, String> {
         Ok(self.entries.lock().unwrap().contains_key(key))

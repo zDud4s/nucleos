@@ -52,7 +52,7 @@ impl BrowserRuntime {
     ///
     /// `#[cfg(test)]` because production always builds a real one from `~/.nucleos/browser.yaml`; this is
     /// what the `test_state()` fixtures hold.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn disabled() -> Self {
         Self {
             enabled: false,
@@ -1488,14 +1488,14 @@ async fn requester_now(state: &AppState, now: chrono::DateTime<chrono::Utc>) -> 
 
 /// The session row, if it is still open. A closed one is not addressable: the browser behind it is
 /// gone, and answering from the row would describe a page that no longer exists.
-pub(crate) async fn live_session(state: &AppState, id: i64) -> Option<SessionRow> {
+pub async fn live_session(state: &AppState, id: i64) -> Option<SessionRow> {
     match session_row(&state.pool, id).await {
         Ok(Some(row)) if row.closed_at.is_none() => Some(row),
         _ => None,
     }
 }
 
-pub(crate) fn gone() -> axum::response::Response {
+pub fn gone() -> axum::response::Response {
     (StatusCode::NOT_FOUND, "no such browsing session").into_response()
 }
 
@@ -1509,7 +1509,7 @@ fn db_error(error: sqlx::Error) -> axum::response::Response {
 /// `FenceDown` is 503 and not 500 for the reason spec §6.2a gives: nothing is broken, browsing is
 /// simply not available, and a 500 reads as a crash and invites the retry loop that would run
 /// against an unfenced browser.
-pub(crate) fn browser_error(error: BrowserError) -> axum::response::Response {
+pub fn browser_error(error: BrowserError) -> axum::response::Response {
     let status = match error {
         BrowserError::Unreachable(_) => StatusCode::BAD_GATEWAY,
         BrowserError::FenceDown(_) => StatusCode::SERVICE_UNAVAILABLE,

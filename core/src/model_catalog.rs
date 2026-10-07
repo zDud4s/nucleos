@@ -730,7 +730,7 @@ where
 }
 
 /// `previous` while it is fresh, a refresh otherwise. The freshness rule `current` applies.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn ensure_with<F, Fut>(keys: &Keys, fetch: F, previous: Option<&Snapshot>) -> Snapshot
 where
     F: Fn(&'static str, String) -> Fut,

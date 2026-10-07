@@ -251,7 +251,7 @@ pub fn claims_for(
 /// because resolving it would necessarily escape, but because this module has no business deciding
 /// that — the path guard refuses traversal first and with its own status code, and an ownership
 /// answer for a path with `..` in it would be an answer about a file nobody named.
-pub(crate) fn normalise(rel: &str) -> Option<String> {
+pub fn normalise(rel: &str) -> Option<String> {
     let rel = rel.trim();
     if rel.is_empty() || rel.contains('\\') || rel.starts_with('/') {
         return None;
