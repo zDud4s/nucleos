@@ -601,26 +601,100 @@ def state_dir() -> Path:
 
 
 _COMPILING = re.compile(rb"^(?:\x1b\[[0-9;]*m)*\s*(?:\x1b\[[0-9;]*m)*Compiling ")
+_ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
+# Cargo's own bar, which it draws even into a pipe once CARGO_TERM_PROGRESS_WHEN=always:
+# `    Building [=====>    ] 120/310: crate_a, crate_b(test)` ended by `\r`.
+_BAR = re.compile(rb"^\s*Building \[[^\]]*\]\s*(\d+)/(\d+)(?::\s*(.*?))?\s*$")
+_RUNNING_BIN = re.compile(
+    rb"^\s*Running .*\((?:.*[\\/])?([^\\/)]+?)(?:-[0-9a-f]{16})?(?:\.exe)?\)\s*$")
+_DOC_TESTS = re.compile(rb"^\s*Doc-tests (\S+)")
+_RUNNING_N = re.compile(rb"^running (\d+) tests?\s*$")
+_TEST_DONE = re.compile(rb"^test .+ \.\.\. (?:ok|FAILED|ignored)")
 
 
 def _new_stats() -> dict:
-    return {"compiled": False, "test_failed": False, "compile_error": False}
+    return {"compiled": False, "test_failed": False, "compile_error": False, "progress": {}}
 
 
-def _pump(src, dst, stats: dict) -> None:
+def _note_progress(seg: bytes, prog: dict) -> bool:
+    """Read one output segment into `prog`; True when it is cargo's progress bar (or the
+    blank line cargo writes to erase it), which only a terminal should be shown."""
+    text = _ANSI.sub(b"", seg).rstrip(b"\r\n")
+    m = _BAR.match(text)
+    if m:
+        prog.update(units_done=int(m.group(1)), units_total=int(m.group(2)),
+                    building=(m.group(3) or b"").decode("utf-8", "replace"))
+        return True
+    if seg.endswith(b"\r") and not text.strip():
+        return True
+    m = _RUNNING_BIN.match(text) or _DOC_TESTS.match(text)
+    if m:
+        prog.update(binary=m.group(1).decode("utf-8", "replace"),
+                    binaries=prog.get("binaries", 0) + 1, tests_total=None, tests_done=0)
+        prog.pop("building", None)
+        return False
+    m = _RUNNING_N.match(text)
+    if m:
+        prog.update(tests_total=int(m.group(1)), tests_done=0)
+    elif _TEST_DONE.match(text):
+        prog["tests_done"] = prog.get("tests_done", 0) + 1
+    return False
+
+
+def _segments(buf: bytes, eof: bool) -> tuple[list[bytes], bytes]:
+    """Split on `\n`, `\r\n` and a lone `\r`, terminators kept; return (segments, rest).
+    A trailing `\r` waits for the next chunk unless at EOF: it may be half of `\r\n`."""
+    out, start, i, n = [], 0, 0, len(buf)
+    while i < n:
+        c = buf[i]
+        if c == 0x0A:
+            out.append(buf[start:i + 1])
+            start = i + 1
+        elif c == 0x0D:
+            if i + 1 < n:
+                if buf[i + 1] != 0x0A:
+                    out.append(buf[start:i + 1])
+                    start = i + 1
+            elif eof:
+                out.append(buf[start:i + 1])
+                start = i + 1
+            else:
+                break
+        i += 1
+    rest = buf[start:]
+    if eof and rest:
+        out.append(rest)
+        rest = b""
+    return out, rest
+
+
+def _pump(src, dst, stats: dict, show_bar: bool = True) -> None:
+    """Forward src to dst byte for byte, noting what the stream says on the way. Read in
+    chunks, not lines: cargo's bar is redrawn with `\r` and no `\n` for minutes at a time.
+    With `show_bar` false the bar's segments are noted and not forwarded."""
+    prog = stats.setdefault("progress", {})
+    read = getattr(src, "read1", None) or src.read
+    buf = b""
     try:
-        for line in iter(src.readline, b""):
-            if _COMPILING.match(line):
-                stats["compiled"] = True
-            if b"test result: FAILED" in line:
-                stats["test_failed"] = True
-            if b"could not compile" in line:
-                stats["compile_error"] = True
-            try:
-                dst.write(line)
-                dst.flush()
-            except Exception:
-                pass
+        while True:
+            chunk = read(65536)
+            segs, buf = _segments(buf + chunk, eof=not chunk)
+            for seg in segs:
+                if _COMPILING.match(seg):
+                    stats["compiled"] = True
+                if b"test result: FAILED" in seg:
+                    stats["test_failed"] = True
+                if b"could not compile" in seg:
+                    stats["compile_error"] = True
+                if _note_progress(seg, prog) and not show_bar:
+                    continue
+                try:
+                    dst.write(seg)
+                    dst.flush()
+                except Exception:
+                    pass
+            if not chunk:
+                break
     finally:
         try:
             src.close()
@@ -628,10 +702,44 @@ def _pump(src, dst, stats: dict) -> None:
             pass
 
 
-def run_child(argv: list[str], env: dict | None, job, low: bool = False
-              ) -> tuple[int, dict]:
+def _write_progress(path: Path, stats: dict, stop: threading.Event) -> None:
+    """Publish stats["progress"] to `path` (read by scripts/heavy_watch.py) while the child
+    runs, at most once a second and only when it changed; remove it at the end."""
+    last = None
+    try:
+        while True:
+            snap = dict(stats.get("progress") or {})
+            if snap and snap != last:
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = path.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(dict(snap, pid=os.getpid())), encoding="utf-8")
+                    os.replace(tmp, path)
+                    last = snap
+                except OSError:
+                    pass
+            if stop.wait(1.0):
+                break
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _isatty(stream) -> bool:
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
+
+
+def run_child(argv: list[str], env: dict | None, job, low: bool = False,
+              progress: Path | None = None) -> tuple[int, dict]:
     """Run argv, streaming stdout/stderr through; return (exit, stats). `low` runs it at
-    below-normal CPU priority (Windows) with no console window of its own."""
+    below-normal CPU priority (Windows) with no console window of its own. With `progress`,
+    a cargo child is asked to draw its bar into the pipe, and what the output says about
+    units and tests is kept in that file while it runs."""
     stats = _new_stats()
     # CreateProcess finds only `.exe` without an extension, so `npm`/`npx` (`.cmd` shims)
     # failed with WinError 2: resolve argv[0] through PATH and PATHEXT the way a shell would.
@@ -639,6 +747,17 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False
         found = shutil.which(argv[0], path=(env or os.environ).get("PATH"))
         if found:
             argv = [found] + list(argv[1:])
+    out = getattr(sys.stdout, "buffer", sys.stdout)
+    err = getattr(sys.stderr, "buffer", sys.stderr)
+    show_bar = True
+    if progress is not None and env is not None and _is_cargo(argv):
+        # The bar is turned on for the watch; the caller sees it only if it asked for it or
+        # is a terminal, so an agent's captured output stays what it was.
+        show_bar = "CARGO_TERM_PROGRESS_WHEN" in env or _isatty(err)
+        env.setdefault("CARGO_TERM_PROGRESS_WHEN", "always")
+        env.setdefault("CARGO_TERM_PROGRESS_WIDTH", "100")
+    else:
+        progress = None
     flags = 0
     if low and os.name == "nt":
         flags = 0x00004000 | 0x08000000  # BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW
@@ -649,17 +768,24 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False
         assign_to_job(job, proc)
     except Exception:
         pass
-    out = getattr(sys.stdout, "buffer", sys.stdout)
-    err = getattr(sys.stderr, "buffer", sys.stderr)
     threads = [
-        threading.Thread(target=_pump, args=(proc.stdout, out, stats), daemon=True),
-        threading.Thread(target=_pump, args=(proc.stderr, err, stats), daemon=True),
+        threading.Thread(target=_pump, args=(proc.stdout, out, stats, show_bar), daemon=True),
+        threading.Thread(target=_pump, args=(proc.stderr, err, stats, show_bar), daemon=True),
     ]
+    stop = threading.Event()
+    writer = None
+    if progress is not None:
+        writer = threading.Thread(target=_write_progress, args=(progress, stats, stop),
+                                  daemon=True)
+        writer.start()
     for t in threads:
         t.start()
     code = proc.wait()
     for t in threads:
         t.join(timeout=10)
+    stop.set()
+    if writer is not None:
+        writer.join(timeout=5)
     return code, stats
 
 
@@ -1217,6 +1343,11 @@ def broker_run(args: list[str], held: bool = False) -> int:
             "pid": os.getpid(), "ctime": ctime, "weight": weight, "prio": prio,
             "agent": agent, "worktree": os.getcwd(), "argv": argv,
         }
+        # Claude Code exports its session id to every command it runs; heavy_watch turns it
+        # into the session's title. Absent for a terminal, the daemon's own gates, CI.
+        session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if session:
+            rec["session"] = session
         # Fixed order: worktree lock -> token. A cargo run takes the lock of its worktree
         # (waiting without holding a token); a session already inside a held worktree or
         # under a token holder does not retake it.
@@ -1428,6 +1559,8 @@ def broker_run(args: list[str], held: bool = False) -> int:
         }
         if warm:
             row["warm"] = True
+        if session:
+            row["session"] = session
         if eff_td:
             row["target_dir"] = eff_td
     except Exception as exc:
@@ -1447,7 +1580,8 @@ def broker_run(args: list[str], held: bool = False) -> int:
 
     t_run = time.time()
     try:
-        code, stats = run_child(argv, env, job, low=warm)
+        code, stats = run_child(argv, env, job, low=warm,
+                                progress=directory / "progress" / str(os.getpid()))
     except OSError as exc:
         sys.stderr.write(f"heavy: {argv[0]}: {exc}\n")
         code, stats = 127, _new_stats()
