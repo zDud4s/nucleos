@@ -1544,6 +1544,7 @@ dependencies = [
  "iana-time-zone",
  "keyring",
  "libc",
+ "nucleos-core",
  "rand",
  "reqwest",
  "rmcp",

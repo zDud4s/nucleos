@@ -259,7 +259,7 @@ impl<'de> Deserialize<'de> for Remote {
 }
 
 /// The `Branch` counterpart, and it exists for the same reason: tests build remotes from literals.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 impl From<&str> for Remote {
     fn from(value: &str) -> Self {
         Remote::new(value).expect("a test used an invalid remote name literal")
@@ -299,7 +299,7 @@ impl<'de> Deserialize<'de> for TagName {
 }
 
 /// The `Branch` counterpart, for the same reason: tests build tag names from literals.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 impl From<&str> for TagName {
     fn from(value: &str) -> Self {
         TagName::new(value).expect("a test used an invalid tag name literal")
@@ -314,7 +314,7 @@ impl<'de> Deserialize<'de> for Branch {
 
 /// Tests build branches from literals everywhere. Panicking is right for a literal a developer
 /// wrote; production has only the fallible path, and this impl does not exist there.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 impl From<&str> for Branch {
     fn from(value: &str) -> Self {
         Branch::new(value).expect("a test used an invalid branch name literal")
@@ -599,7 +599,7 @@ impl ResolvedRepo {
     /// Tests build repositories that do not exist on disk: what most of them exercise is the SQL,
     /// and making each one create a real git repository would test git twice and slow the suite.
     /// `resolve_repo` is the only constructor compiled into the daemon.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn synthetic(project_id: &str, root: &str, key: &str) -> Self {
         Self {
             project_id: project_id.to_owned(),
@@ -1015,7 +1015,7 @@ pub fn branch_delete_from_command(command: &str) -> Option<Op> {
 /// and the asymmetry was a hole rather than a tidiness problem — `git -C <path> merge <branch>` put
 /// `<path>` where the verb scan looks, matched no arm, and was ALLOWED by a function whose whole
 /// job is to refuse that merge.
-pub(crate) const GIT_FLAGS_WITH_VALUES: &[&str] = &[
+pub const GIT_FLAGS_WITH_VALUES: &[&str] = &[
     "-C",
     "-c",
     "--git-dir",
@@ -3029,7 +3029,7 @@ pub async fn run_queue_worker(pool: sqlx::SqlitePool, executor: std::sync::Arc<d
 
 /// The test double for `VcsExecutor`. `#[cfg(test)]` because every user of it is a test — building it
 /// into the daemon would ship an executor that can report a merge it never performed.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 struct FakeVcsExecutor {
     outcome: Outcome,
     /// How long to take before answering. A real merge takes seconds, and a test about what happens
@@ -3071,7 +3071,7 @@ struct FakeVcsExecutor {
     held: Option<tokio::sync::Semaphore>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 impl FakeVcsExecutor {
     /// `output_tail` is non-empty and deliberately unlike the sha, for the reason
     /// `failing_with`'s doc comment gives about its own two strings: a fake whose two columns
@@ -3190,7 +3190,7 @@ impl FakeVcsExecutor {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 #[async_trait::async_trait]
 impl VcsExecutor for FakeVcsExecutor {
     async fn execute(&self, request: &ClaimedRequest) -> Outcome {
@@ -6633,8 +6633,8 @@ mod tests {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
         let (_container, repo) =
-            crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-vcs-e2e-");
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-vcs-wt-");
+            crate::git_exec::testkit::repo_with_a_branch_to_merge("nucleos-vcs-e2e-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-vcs-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
 
         // Real root, synthetic key: what this test exercises is the executor against a repository
@@ -6679,8 +6679,8 @@ mod tests {
         let _lock = crate::worktree::test_env_lock();
         let pool = test_pool().await;
         let (_container, repo) =
-            crate::git_exec::tests::repo_with_a_branch_to_merge("nucleos-vcs-e2e-blocked-");
-        let roots = crate::git_exec::tests::space_free_tempdir("nucleos-vcs-wt-");
+            crate::git_exec::testkit::repo_with_a_branch_to_merge("nucleos-vcs-e2e-blocked-");
+        let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-vcs-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
 
         // `feature.txt` is what `feat/x` adds, so the fast-forward has to write it — and it cannot,

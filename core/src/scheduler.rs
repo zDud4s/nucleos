@@ -328,7 +328,7 @@ async fn start_job(
     .await
 }
 
-pub(crate) async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
+pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
     if crate::autopilot::kill_switch_engaged(&state.pool)
         .await
         .unwrap_or(true)

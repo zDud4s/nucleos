@@ -564,7 +564,7 @@ fn sql_table(kind: &str) -> Option<&'static str> {
 /// agents never read owner notes. The text is context for the dossier and must never be injected
 /// into a prompt run or quoted into knowledge; the only direct note -> knowledge door stays
 /// `teach`.
-pub(crate) async fn active_note_texts_for_project(
+pub async fn active_note_texts_for_project(
     pool: &SqlitePool,
     project_id: &str,
 ) -> sqlx::Result<Vec<String>> {

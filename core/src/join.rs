@@ -23,9 +23,7 @@
 /// future came from, so a slow future cannot push a fast one out of place. `declared_for` and the
 /// council's seats both index straight back into the input, and neither would survive results
 /// arriving in completion order.
-pub(crate) async fn all<F: std::future::Future>(
-    futures: impl IntoIterator<Item = F>,
-) -> Vec<F::Output> {
+pub async fn all<F: std::future::Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
     let mut pending: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
     let mut results: Vec<Option<F::Output>> = (0..pending.len()).map(|_| None).collect();
     let mut remaining = pending.len();

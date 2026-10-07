@@ -17,7 +17,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 /// from what ships: the SQL is the SQL that will run on the real database, in the order it will
 /// run there. Nothing is written to `_sqlx_migrations` — the bookkeeping is not what is under
 /// test, and a caller finishes the chain with `apply_migrations_after`.
-pub(crate) async fn pool_migrated_through(version: i64) -> sqlx::SqlitePool {
+pub async fn pool_migrated_through(version: i64) -> sqlx::SqlitePool {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
@@ -32,13 +32,13 @@ pub(crate) async fn pool_migrated_through(version: i64) -> sqlx::SqlitePool {
 }
 
 /// Finishes the chain a `pool_migrated_through` stopped, running everything above `version`.
-pub(crate) async fn apply_migrations_after(pool: &sqlx::SqlitePool, version: i64) {
+pub async fn apply_migrations_after(pool: &sqlx::SqlitePool, version: i64) {
     apply_migrations(pool, |candidate| candidate > version).await;
 }
 
 /// Runs exactly one migration, for a test whose claim is about that file alone and must not see
 /// what later migrations add on top of it.
-pub(crate) async fn apply_migration(pool: &sqlx::SqlitePool, version: i64) {
+pub async fn apply_migration(pool: &sqlx::SqlitePool, version: i64) {
     apply_migrations(pool, |candidate| candidate == version).await;
 }
 

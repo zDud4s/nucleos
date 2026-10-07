@@ -76,7 +76,7 @@ fn git_bin() -> String {
 /// `pre-merge-commit` guard sees them: without the marker it refuses every one, and each refusal
 /// reads as a conflict. `git_exec::run_git` comes through here too, so this is the one place the
 /// marker has to be set for every git process this crate starts.
-pub(crate) fn git() -> tokio::process::Command {
+pub fn git() -> tokio::process::Command {
     let mut command = tokio::process::Command::new(git_bin());
     command.arg("-c").arg("core.fsmonitor=");
     command.env(crate::git_exec::QUEUE_MARKER, "1");
@@ -455,7 +455,7 @@ pub enum CatchUp {
 /// is 1 for both. A merge refused before it started — an unknown ref, a dirty tree — leaves no
 /// unmerged paths, and reporting that as a staged conflict would put an agent in a checkout with no
 /// work in it and no way to tell.
-pub(crate) async fn catch_up(worktree: &Path, source: &str) -> io::Result<CatchUp> {
+pub async fn catch_up(worktree: &Path, source: &str) -> io::Result<CatchUp> {
     let merged = git()
         .arg("-C")
         .arg(worktree)
@@ -583,7 +583,7 @@ async fn exclude_artifacts_dir(repo_path: &Path) -> io::Result<()> {
 /// worktree comes into existence: both call this before their own `git worktree add`, and both
 /// fail creation if it errors. Neither that failure path nor an `Ok` here proves the tree ended
 /// up hidden outside the default layout — only that it did for the default one.
-pub(crate) async fn hide_root_if_nested(project_root: &Path, root: &Path) -> io::Result<()> {
+pub async fn hide_root_if_nested(project_root: &Path, root: &Path) -> io::Result<()> {
     if path_contains(project_root, root) {
         exclude_artifacts_dir(project_root).await?;
     }
@@ -604,7 +604,7 @@ pub async fn prepare_artifacts(worktree: &Path) -> io::Result<PathBuf> {
     Ok(artifacts)
 }
 
-pub(crate) async fn try_remove_once(project_root: &Path, path: &Path) -> io::Result<()> {
+pub async fn try_remove_once(project_root: &Path, path: &Path) -> io::Result<()> {
     let output = git()
         .arg("-C")
         .arg(project_root)
@@ -943,10 +943,7 @@ async fn is_worktree_root(worktree_path: &Path) -> bool {
     !(path_contains(&toplevel, &here) && !paths_equal(&toplevel, &here))
 }
 
-pub(crate) async fn preserve_uncommitted(
-    worktree_path: &Path,
-    byte_ceiling: u64,
-) -> io::Result<bool> {
+pub async fn preserve_uncommitted(worktree_path: &Path, byte_ceiling: u64) -> io::Result<bool> {
     if !is_worktree_root(worktree_path).await {
         // A plain directory inside someone else's repository. Nothing here belongs to a run, and
         // staging it would commit that repository's work — so preserve nothing and let the ordinary
@@ -1032,7 +1029,7 @@ pub(crate) async fn preserve_uncommitted(
 /// and saves the disk. Here, refusing costs the NEXT item its footing, which is the exact state this
 /// whole change exists to abolish. If a ceiling is ever wanted here it has to come with an answer to
 /// "and then what does the next item revert to", and today there is none.
-pub(crate) async fn checkpoint(worktree_path: &Path) -> io::Result<String> {
+pub async fn checkpoint(worktree_path: &Path) -> io::Result<String> {
     if !is_worktree_root(worktree_path).await {
         // Same door `preserve_uncommitted` keeps shut: a plain directory inside somebody else's
         // repository would have its `add -A` land on THAT repository's work.
@@ -1123,7 +1120,7 @@ pub(crate) async fn checkpoint(worktree_path: &Path) -> io::Result<String> {
 /// `--no-ff`, so the history says a merge happened even when it could have fast-forwarded. Nothing
 /// downstream reads the merge commit, but the branch is handed to a person, and a person reading it
 /// should see the shape of what arrived.
-pub(crate) async fn merge_branch(worktree_path: &Path, branch: &str) -> io::Result<bool> {
+pub async fn merge_branch(worktree_path: &Path, branch: &str) -> io::Result<bool> {
     let merged = git()
         .arg("-C")
         .arg(worktree_path)
@@ -1150,7 +1147,7 @@ pub(crate) async fn merge_branch(worktree_path: &Path, branch: &str) -> io::Resu
     Ok(false)
 }
 
-pub(crate) async fn revert_to(worktree_path: &Path, sha: &str) -> io::Result<()> {
+pub async fn revert_to(worktree_path: &Path, sha: &str) -> io::Result<()> {
     let reset = git()
         .arg("-C")
         .arg(worktree_path)
@@ -1178,7 +1175,7 @@ pub(crate) async fn revert_to(worktree_path: &Path, sha: &str) -> io::Result<()>
     Ok(())
 }
 
-pub(crate) async fn head_sha(worktree_path: &Path) -> io::Result<String> {
+pub async fn head_sha(worktree_path: &Path) -> io::Result<String> {
     let output = git()
         .arg("-C")
         .arg(worktree_path)
@@ -1221,10 +1218,7 @@ pub async fn remove(project_root: &Path, path: &Path, backoff: &[Duration]) -> i
     result
 }
 
-pub(crate) async fn retry_with_backoff<F, Fut>(
-    backoff: &[Duration],
-    mut attempt: F,
-) -> io::Result<()>
+pub async fn retry_with_backoff<F, Fut>(backoff: &[Duration], mut attempt: F) -> io::Result<()>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = io::Result<()>>,
@@ -1333,11 +1327,11 @@ pub async fn mark_removed(pool: &SqlitePool, owner: Owner) -> sqlx::Result<()> {
     .fetch_all(pool)
     .await?;
     // Tests must never schedule deletions under the developer's real `~/.nucleos/warm`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     let _ = removed;
     // The verification state kept for this tree is dead weight now. Detached and best-effort: the
     // executor's periodic sweep removes anything this misses.
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "testkit")))]
     if let Some(root) = crate::machine_config::root() {
         for (project_id, path) in removed {
             let Some(project_id) = project_id else {
@@ -1549,7 +1543,7 @@ async fn feed_branch_outcome(pool: &SqlitePool, worktree: &WorktreeRow, deleted:
 // `job::every_ending_a_job_can_have_is_an_ending_the_gc_collects` for the job arm, and
 // `runs::every_ending_a_run_can_have_is_an_ending_the_gc_collects` for the run arm. The run arm had
 // no such guard until `superseded` was found missing from it.
-pub(crate) const GC_CANDIDATES_SQL: &str =
+pub const GC_CANDIDATES_SQL: &str =
     "SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch
          FROM worktrees w
          JOIN runs r ON r.id = w.owner_id
@@ -1600,7 +1594,7 @@ fn retention() -> chrono::Duration {
         .unwrap_or_else(|| chrono::Duration::hours(72))
 }
 
-pub(crate) async fn gc_pass(
+pub async fn gc_pass(
     pool: &SqlitePool,
     now: DateTime<Utc>,
     retention: chrono::Duration,
@@ -2028,8 +2022,8 @@ pub async fn run_gc(pool: SqlitePool) {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+#[cfg(any(test, feature = "testkit"))]
+pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
         .lock()

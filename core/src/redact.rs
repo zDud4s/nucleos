@@ -13,7 +13,7 @@
 
 /// What a detector found, as a half-open byte range into the scanned string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Finding {
+pub struct Finding {
     pub start: usize,
     pub end: usize,
     /// The marker the span is replaced by, chosen so the reader still knows what KIND of thing was
@@ -27,7 +27,7 @@ pub(crate) struct Finding {
 /// Overlapping findings are resolved by taking the earliest, then the longest — a PEM block that
 /// happens to contain a base64 run must be redacted as the block, not sliced into pieces around its
 /// interior.
-pub(crate) fn redact_secrets(input: &str) -> String {
+pub fn redact_secrets(input: &str) -> String {
     let findings = scan_secrets(input);
     if findings.is_empty() {
         return input.to_owned();
@@ -48,7 +48,7 @@ pub(crate) fn redact_secrets(input: &str) -> String {
 }
 
 /// PURE: every secret-looking span in `input`, sorted by start and de-overlapped.
-pub(crate) fn scan_secrets(input: &str) -> Vec<Finding> {
+pub fn scan_secrets(input: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     findings.extend(pem_blocks(input));
     findings.extend(prefixed_tokens(input));
@@ -757,7 +757,7 @@ fn is_portuguese_nif(digits: &[u32]) -> bool {
 /// reads the scheme as `dial imaps`, rejects it for the space, and hands the line back unchanged.
 /// `sidecar.rs`, its first caller, therefore splits a line into whitespace-separated tokens and
 /// applies this to each. Any future caller with a whole log line to clean must do the same.
-pub(crate) fn redact_url(input: &str) -> String {
+pub fn redact_url(input: &str) -> String {
     let Some(scheme_end) = input.find("://") else {
         return strip_userinfo_from_non_url(input).unwrap_or_else(|| input.to_owned());
     };

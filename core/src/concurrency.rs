@@ -110,7 +110,7 @@ async fn house_limit_on(conn: &mut SqliteConnection) -> sqlx::Result<i64> {
 }
 
 /// How many slots are held right now, everywhere.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn slots_in_flight(pool: &SqlitePool) -> sqlx::Result<i64> {
     slots_in_flight_on(&mut *pool.acquire().await?).await
 }
@@ -236,7 +236,7 @@ pub async fn release(pool: &SqlitePool, owner: Owner) -> sqlx::Result<()> {
 }
 
 /// Which slot an owner holds, if any.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn slot_of(pool: &SqlitePool, owner: Owner) -> sqlx::Result<Option<i64>> {
     slot_of_on(&mut *pool.acquire().await?, owner).await
 }

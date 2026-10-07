@@ -69,7 +69,7 @@ impl From<sqlx::Error> for Fail {
 }
 
 /// The key a transcript is stored under in `devtime_files`.
-pub(crate) fn path_key(path: &Path) -> String {
+pub fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 

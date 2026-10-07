@@ -420,7 +420,7 @@ impl ConfiguredAssistants {
     /// constructor parameter (pointing discovery at a loopback stub instead of the real
     /// catalogue), but as a method rather than a constructor parameter so it costs no existing
     /// call site anything; see `hosted_base_url`'s own field doc for why.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn with_hosted_base_url(mut self, hosted_base_url: String) -> Self {
         self.hosted_base_url = hosted_base_url;
         self
@@ -773,10 +773,10 @@ impl ConfiguredAssistants {
 /// What the migrated `assistant.rs` sites need: each sets one fake assistant and asserts on what it
 /// answered, and none of them cares which route or model the turn asked for — that is
 /// `RecordingAssistants`'s job below, not this one's.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub struct FixedAssistants(pub std::sync::Arc<crate::local_agent::LocalAssistant>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 #[async_trait::async_trait]
 impl Assistants for FixedAssistants {
     fn assistant_for(
@@ -817,13 +817,13 @@ impl Assistants for FixedAssistants {
 /// Interior mutability because `assistant_for` takes `&self`: the same `Mutex` idiom
 /// `capabilities::DiscoveryCache` uses, and for the same reason — the trait method has no `&mut
 /// self` to record into.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub struct RecordingAssistants {
     assistant: std::sync::Arc<crate::local_agent::LocalAssistant>,
     pub calls: std::sync::Mutex<Vec<(crate::chats::Brain, Option<String>)>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 impl RecordingAssistants {
     pub fn new(assistant: std::sync::Arc<crate::local_agent::LocalAssistant>) -> Self {
         Self {
@@ -833,7 +833,7 @@ impl RecordingAssistants {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 #[async_trait::async_trait]
 impl Assistants for RecordingAssistants {
     fn assistant_for(
@@ -872,10 +872,10 @@ impl Assistants for RecordingAssistants {
 
 /// Refuses everything with `Refusal::RouteNotConfigured` — the ship-dark default the `AppState`
 /// literals that do not exercise an assistant need: an untouched install serves no route.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub struct NoAssistants;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 #[async_trait::async_trait]
 impl Assistants for NoAssistants {
     fn assistant_for(

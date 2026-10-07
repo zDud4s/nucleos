@@ -63,7 +63,7 @@ const READ_LOCAL_TOOLS: &[&str] = &[
 /// repeating it. The handler used to carry its own `["Edit", "Write"]`, which is two lists for
 /// one fact and the ordinary way they come to disagree: the day this one grew, the door would
 /// have gone on refusing a rule the write chain had just learned to enforce.
-pub(crate) const WRITE_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
+pub const WRITE_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
 /// Tools that start a subagent. Both spellings, because the CLI has used each.
 ///
@@ -1135,7 +1135,7 @@ fn classify_segment(
 /// read as POSIX, which is the safe direction — a `Bash` line misread as PowerShell would be split
 /// too eagerly and merely asked about, while the reverse would honour quotes a POSIX shell does
 /// not have.
-pub(crate) fn shell_for(tool_name: &str) -> crate::command_reader::Shell {
+pub fn shell_for(tool_name: &str) -> crate::command_reader::Shell {
     if tool_name == "PowerShell" {
         crate::command_reader::Shell::PowerShell
     } else {
@@ -1477,7 +1477,7 @@ fn strip_fd_duplications(command: &str) -> String {
 ///
 /// Exposed rather than reimplemented for a reason that survives all three: a second spelling of
 /// "fold" is how the two sides would come to disagree about what the fold even is.
-pub(crate) fn normalize_command(command: &str) -> String {
+pub fn normalize_command(command: &str) -> String {
     command
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -1496,7 +1496,7 @@ fn matches_any_phrase(command: &str, patterns: &[&str]) -> bool {
 ///
 /// The match was against the token whole, so `rm -rf x` was denied and `/bin/rm -rf x` — the same
 /// program, spelled the way a script spells it — was not.
-pub(crate) fn program_name(token: &str) -> &str {
+pub fn program_name(token: &str) -> &str {
     // A subshell `(rm`, a PowerShell `(Remove-Item`, `$(rm`, `@(ri` and a script block `{rm` all
     // name the same program as the bare spelling; left on, the opener hid it from every list here.
     let token = token.trim_start_matches(['(', '{', '$', '@']);
@@ -1773,7 +1773,7 @@ fn checks_formatting_without_writing(command: &str) -> bool {
 /// writing down, and would tell the owner they could never be enforced while the engine enforced
 /// them. Migration `0128` puts it in one line: "Do lado `deny` não há nada a validar — uma recusa a
 /// mais nunca deixou correr nada."
-pub(crate) fn shell_form_is_readable(command: &str) -> bool {
+pub fn shell_form_is_readable(command: &str) -> bool {
     !has_shell_control(command)
         && !command.split_whitespace().any(|token| token == "--fix")
         && !writes_an_output_file(command)
@@ -1938,7 +1938,7 @@ fn find_executes_or_writes(command: &str) -> bool {
 /// `pub(crate)` for `project_policy::ShellRules`, which measures a project's declared prefixes with
 /// the same rule the compiled list uses. Generic over the element so `&[&str]` and `&[String]` are
 /// the same call — two functions here is how the two lists would drift.
-pub(crate) fn matches_command_prefix<S: AsRef<str>>(command: &str, prefixes: &[S]) -> bool {
+pub fn matches_command_prefix<S: AsRef<str>>(command: &str, prefixes: &[S]) -> bool {
     prefixes.iter().any(|prefix| {
         let prefix = prefix.as_ref();
         command == prefix || command.starts_with(&format!("{prefix} "))
@@ -2346,7 +2346,7 @@ fn delete_targets<'a>(program: &str, arguments: &'a [String]) -> Vec<&'a str> {
 /// these tokens. Shared rather than copied on purpose: a second tokenizer would drift from this
 /// one, and the two would disagree about the same command line — which is the class of bug this
 /// file exists to keep out.
-pub(crate) fn shell_words(command: &str) -> Vec<String> {
+pub fn shell_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quote = None;
@@ -2581,7 +2581,7 @@ const INLINE_CODE_FLAGS: &[&str] = &["-c", "-e", "--eval", "-p", "-r", "-command
 /// contradicts it. What the predicate needs is to be able to enumerate the line's tokens, which
 /// `command_reader::read` answers (`Unreadable` for a command substitution, a heredoc it cannot
 /// bound, a lone `&`) together with an unterminated quote (`without_quoted_text` is `None`).
-pub(crate) fn runs_network_or_inline_code(tool_name: &str, tool_input: &Value) -> bool {
+pub fn runs_network_or_inline_code(tool_name: &str, tool_input: &Value) -> bool {
     if !reads_github_policy(tool_name) {
         return false;
     }
@@ -2653,7 +2653,7 @@ fn passes_inline_code(arguments: &[String]) -> bool {
 /// Which of spec A's three guards a tool call trips (D5). Each makes a call one the judge may
 /// refuse but never approve; none changes a verdict of `classify`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JudgeGuard {
+pub enum JudgeGuard {
     /// G1: a secret or a database is read, wherever the result goes.
     SensitiveSource,
     /// G2: a path outside the run's root, or one the shell rewrites before anyone can check it.
@@ -2672,7 +2672,7 @@ pub(crate) enum JudgeGuard {
 /// comparison `writes_outside_cwd` makes, `with_git_bash_drive` for `/c/…` under Git's bash), and
 /// it is lexical: a link inside the worktree that points out of it passes. Closing that needs the
 /// disk at every call, which is the OS sandbox's job (`2026-09-14-sandbox-de-so-design.md`).
-pub(crate) fn judge_guard(tool_name: &str, tool_input: &Value, cwd: &Path) -> Option<JudgeGuard> {
+pub fn judge_guard(tool_name: &str, tool_input: &Value, cwd: &Path) -> Option<JudgeGuard> {
     let workspace = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
     if WRITE_TOOLS.contains(&tool_name) {
         // A write that names no path is one whose destination nobody can check: outside, not fine.

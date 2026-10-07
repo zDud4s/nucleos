@@ -883,7 +883,7 @@ fn run_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, InspectError> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use super::*;
     use tempfile::tempdir;
 
@@ -891,7 +891,7 @@ pub(crate) mod tests {
     ///
     /// `pub(crate)` along with `seeded_repo` below, because `collision.rs` reuses them — the same
     /// pattern `git_exec.rs` already uses to expose its `mod tests` to `http.rs`.
-    pub(crate) fn git_in_repo(dir: &Path, args: &[&str]) {
+    pub fn git_in_repo(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -902,7 +902,7 @@ pub(crate) mod tests {
     }
 
     /// A repository with one commit, and that commit's sha.
-    pub(crate) fn seeded_repo() -> (tempfile::TempDir, String) {
+    pub fn seeded_repo() -> (tempfile::TempDir, String) {
         let repo = tempdir().unwrap();
         git_in_repo(repo.path(), &["init"]);
         git_in_repo(repo.path(), &["config", "user.email", "test@x"]);

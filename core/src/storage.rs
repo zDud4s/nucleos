@@ -106,13 +106,13 @@ pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
 /// starve the very task being waited for. `close` is therefore explicit and consuming — the value
 /// cannot be used afterwards, and `a_closed_temp_db_leaves_nothing_behind` is what notices if
 /// someone drops the call.
-#[cfg(test)]
-pub(crate) struct TempDb {
+#[cfg(any(test, feature = "testkit"))]
+pub struct TempDb {
     pub pool: SqlitePool,
     dir: tempfile::TempDir,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 impl TempDb {
     pub async fn new() -> Self {
         let dir = tempfile::tempdir().expect("create database tempdir");
