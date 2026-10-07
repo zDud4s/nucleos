@@ -48,7 +48,7 @@ run() {
   # The same goes for the other heavy steps (tsc, npm test, go test/vet): they reach the machine-wide
   # broker through `heavy_run`, which falls back to today's behaviour when no broker is present.
   if [ "$1" = cargo ]; then
-    case "$2" in build|check|clippy|test|run|doc) set -- heavy_run "$@" ;; esac
+    case "$2" in build|check|clippy|test|nextest|run|doc) set -- heavy_run "$@" ;; esac
   elif [ "$1" = npx ] && [ "$2" = tsc ]; then
     set -- heavy_run "$@"
   elif [ "$1" = npm ] && [ "$2" = test ]; then
@@ -291,7 +291,17 @@ if [ "$target" = core ] || [ "$target" = all ]; then
   # Every target (lib, bin, tests/): `--lib` alone would skip the binary's http.rs tests. And every
   # workspace crate under core/: `-p nucleos-core` alone would skip the modules moved down to
   # core/crates/nucleos-base.
-  run "core: test"   . cargo test -p nucleos-base -p nucleos-core
+  #
+  # cargo-nextest when it is installed: one process per test, scheduled across every core. Measured
+  # 2026-10-07 on master, both under the same load: `cargo test` ran the suite in ~37 min (median
+  # of the broker log), nextest in 15.5 min — libtest's binaries run one after another and each
+  # waits for its slowest test. `--no-fail-fast` keeps `cargo test`'s report of every failure.
+  # Without nextest (CI, a fresh machine) the gate is what it was.
+  if cargo nextest --version >/dev/null 2>&1; then
+    run "core: test"   . cargo nextest run -p nucleos-base -p nucleos-core --no-fail-fast
+  else
+    run "core: test"   . cargo test -p nucleos-base -p nucleos-core
+  fi
 fi
 
 if [ "$target" = sidecars ] || [ "$target" = all ]; then

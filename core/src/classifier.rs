@@ -314,6 +314,12 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "git show-ref",
     "git reflog",
     "cargo test",
+    // The core gate's test runner (`scripts/gates.sh`), which runs each test in a process of its
+    // own: the same build and the same tests as `cargo test`. Only `run` and `list`: `cargo
+    // nextest self update` replaces the binary and `archive` writes a file, so the bare program is
+    // not admitted.
+    "cargo nextest run",
+    "cargo nextest list",
     "cargo check",
     "cargo clippy",
     // **`cargo build` was missing, and its absence was an omission rather than a decision.** The
@@ -4331,6 +4337,12 @@ mod tests {
             ("cargo fmt -- --emit=files --check", "unrecognized"),
             ("cargo clippy --fix", "unrecognized"),
             ("cargo fix", "unrecognized"),
+            // Only nextest's `run` and `list` are admitted; these replace or write files.
+            ("cargo nextest self update", "unrecognized"),
+            (
+                "cargo nextest archive --archive-file a.tar.zst",
+                "unrecognized",
+            ),
             ("sed -i 's/a/b/' f", "unrecognized"),
             ("sed -n '1,40w out' f", "unrecognized"),
         ] {

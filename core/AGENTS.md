@@ -273,7 +273,8 @@ On Windows, keep the Rust toolchain on a path without spaces: a user profile wit
 breaks the GNU linker, so point `RUSTUP_HOME` and `CARGO_HOME` at a space-free directory and put its
 `bin` on PATH. Then, from the repo root:
 
-- Gate: `cargo test -p nucleos-base -p nucleos-core` (every target of both). One test, one target:
+- Gate: `cargo nextest run -p nucleos-base -p nucleos-core --no-fail-fast` (every target of both;
+  `scripts/gates.sh core` falls back to `cargo test` without nextest). One test, one target:
   `-p nucleos-base <name>` for a module under `crates/nucleos-base/src`, `--lib <name>` for one in the
   core library (every other module but `http.rs`/`main.rs`), `--bin nucleos-core <name>` for one in
   `http.rs` or `main.rs` — each builds only that test binary.
