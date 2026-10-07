@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import statistics
 import sys
 import time
@@ -30,9 +31,12 @@ except ImportError:  # the broker view still works without the process panels
 
 RESET, DIM, BOLD = "\x1b[0m", "\x1b[2m", "\x1b[1m"
 GREEN, YELLOW, RED, CYAN = "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[36m"
-# One colour per job number, reused wherever that job is named (its block, the slot list).
+# Prefixes a job's rustc line with its rank, so `fit` can drop the least useful ones first
+# when the frame is taller than the terminal; it never reaches the screen.
+RUSTC_MARK = "\x1f"
 # `cargo clippy` compiles through clippy-driver, not rustc.
 COMPILERS = {"rustc.exe", "clippy-driver.exe", "rustc", "clippy-driver"}
+# One colour per job number, reused wherever that job is named (its block, the slot list).
 JOB_COLOURS = ["\x1b[36m", "\x1b[35m", "\x1b[34m", "\x1b[33m"]
 
 
@@ -270,11 +274,9 @@ def job_block(n: int, f: Path, r: dict, slot: int | None, primed: dict,
 
     infos, tree = job_tree(r.get("pid"), primed)
     owned |= tree
-    for i, info in enumerate(infos[:4]):
+    for i, info in enumerate(infos):
         label = f"{DIM}rustc{RESET} " if i == 0 else "      "
-        lines.append(pad + label + rustc_line(info, ""))
-    if len(infos) > 4:
-        lines.append(f"{pad}      {DIM}+{len(infos) - 4} rustc{RESET}")
+        lines.append(f"{RUSTC_MARK}{i}{RUSTC_MARK}" + pad + label + rustc_line(info, ""))
     return lines
 
 
@@ -357,20 +359,60 @@ def frame(primed: dict) -> str:
     return "\n".join(lines)
 
 
+def fit(text: str, rows: int) -> list[str]:
+    """The frame cut to the terminal's height, so it never scrolls: drop the rustc lines of
+    each job from the last one up, then cut the tail and say how much was left out."""
+    lines = text.split("\n")
+
+    def keep(limit: int) -> list[str]:
+        out = []
+        for line in lines:
+            if line.startswith(RUSTC_MARK):
+                rank, _, rest = line[1:].partition(RUSTC_MARK)
+                if int(rank) < limit:
+                    out.append(rest)
+            else:
+                out.append(line)
+        return out
+
+    for limit in (4, 2, 1, 0):
+        out = keep(limit)
+        if len(out) <= rows:
+            break
+    hidden = sum(1 for line in lines if line.startswith(RUSTC_MARK)) - sum(
+        1 for line in lines if line.startswith(RUSTC_MARK)
+        and int(line[1:].partition(RUSTC_MARK)[0]) < limit)
+    if hidden:
+        out[-1] += f"   {DIM}(+{hidden} rustc not shown){RESET}"
+    if len(out) > rows:
+        cut = len(out) - rows + 1
+        out = out[:rows - 1] + [f"{YELLOW}… {cut} more lines: enlarge the terminal{RESET}"]
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--interval", type=float, default=2.0)
     args = ap.parse_args()
     os.system("")  # turns on ANSI escapes in a Windows console
     primed: dict = {}
+    # Alternate screen (no scrollback to push frames into, as htop and less do), cursor
+    # hidden, line wrap off so a long line costs one row; each frame is drawn over the last
+    # from the top-left instead of clearing the screen, which is what made the VS Code
+    # terminal grow a scrollback and stop following.
+    sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?7l")
     try:
         while True:
-            text = frame(primed)
-            sys.stdout.write("\x1b[H\x1b[2J" + text + "\n")
+            size = shutil.get_terminal_size((120, 40))
+            out = fit(frame(primed), max(5, size.lines))
+            sys.stdout.write("\x1b[H" + "\x1b[K\n".join(out) + "\x1b[K\x1b[J")
             sys.stdout.flush()
             time.sleep(args.interval)
     except KeyboardInterrupt:
         return 0
+    finally:
+        sys.stdout.write("\x1b[?7h\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
