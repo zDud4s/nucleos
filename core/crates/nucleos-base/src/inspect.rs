@@ -882,15 +882,16 @@ fn run_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, InspectError> {
     Ok(bytes)
 }
 
-#[cfg(test)]
-pub mod tests {
-    use super::*;
+/// Repository fixtures shared with the crates above (`collision.rs` uses them).
+#[cfg(any(test, feature = "testkit"))]
+pub mod test_support {
+    use std::path::Path;
     use tempfile::tempdir;
 
     /// A git that has to succeed.
     ///
-    /// `pub(crate)` along with `seeded_repo` below, because `collision.rs` reuses them — the same
-    /// pattern `git_exec.rs` already uses to expose its `mod tests` to `http.rs`.
+    /// Public along with `seeded_repo` below, behind `testkit`, because `collision.rs` in
+    /// `nucleos-core` reuses them.
     pub fn git_in_repo(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .arg("-C")
@@ -928,6 +929,13 @@ pub mod tests {
         .to_owned();
         (repo, base)
     }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::test_support::{git_in_repo, seeded_repo};
+    use super::*;
+    use tempfile::tempdir;
 
     /* --------------------------------------------------- the write target -- */
 

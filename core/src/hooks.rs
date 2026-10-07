@@ -1202,9 +1202,9 @@ async fn pretooluse_decision_from(
                 // and `git -C x` move it. A directory change this reader cannot follow is not
                 // auto-queued; it falls to the approval path, where a person sees the line.
                 let segments = crate::vcs::directed_segments(command);
-                let segment = segments.iter().find(|segment| {
-                    queue_op(&segment.command, QUEUE_OP_PROBE_BRANCH).is_some()
-                })?;
+                let segment = segments
+                    .iter()
+                    .find(|segment| queue_op(&segment.command, QUEUE_OP_PROBE_BRANCH).is_some())?;
                 let cwd = match &segment.dir {
                     crate::vcs::SegmentDir::Session => std::path::PathBuf::from(cwd),
                     crate::vcs::SegmentDir::Steps(steps) => {
@@ -1213,9 +1213,7 @@ async fn pretooluse_decision_from(
                     crate::vcs::SegmentDir::Unfollowable(_) => return None,
                 };
                 let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
-                let root = crate::git_exec::toplevel(&cwd, deadline)
-                    .await
-                    .ok()?;
+                let root = crate::git_exec::toplevel(&cwd, deadline).await.ok()?;
                 let branch = crate::git_exec::current_branch(&root, deadline)
                     .await
                     .ok()?;
