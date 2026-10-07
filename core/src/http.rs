@@ -32932,7 +32932,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         let state = AppState {
             token: Token("test-token".into()),
             pool: pool.clone(),
@@ -38399,7 +38399,7 @@ mod triage_barrier_tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         crate::state::AppState {
             token: crate::auth::Token("verification-token".into()),
             pool,

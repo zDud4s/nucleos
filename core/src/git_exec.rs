@@ -3532,7 +3532,7 @@ gate_command: git --version
             )
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         let outcome = GitExecutor {
             machine_root: Some(container.path().to_path_buf()),
             pool: Some(pool.clone()),

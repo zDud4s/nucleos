@@ -4963,7 +4963,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         AppState {
             token: crate::auth::Token("test-token".into()),
             pool,

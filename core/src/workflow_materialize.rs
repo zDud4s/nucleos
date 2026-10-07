@@ -1416,7 +1416,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("worktree");
         std::fs::create_dir_all(&worktree).unwrap();
@@ -1530,7 +1530,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let tree = temp
             .path()

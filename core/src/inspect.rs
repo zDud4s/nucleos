@@ -1637,7 +1637,7 @@ pub mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
 
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', '/some/root')",

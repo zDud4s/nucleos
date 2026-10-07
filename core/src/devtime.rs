@@ -878,7 +878,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         // The roster is autopilot's table and its public writers demand an onboarded project with a
         // wired hook, which a fixture has no use for: the row is written directly, in the test only.
         sqlx::query(

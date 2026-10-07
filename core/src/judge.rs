@@ -1270,7 +1270,7 @@ pub mod test_support {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 
