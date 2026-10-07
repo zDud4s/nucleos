@@ -23,7 +23,7 @@ use crate::verify_store::{PlannedUnit, RequestRow};
 /// What a unit does: the group's cheap `check` command, or its `command` (the tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum Kind {
+pub enum Kind {
     Check,
     Test,
 }
@@ -40,7 +40,7 @@ impl Kind {
 /// How wide the request reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum ScopeArg {
+pub enum ScopeArg {
     /// What the caller changed, selected through the map.
     Own,
     /// What the whole branch changed since its base, selected through the map.
@@ -240,7 +240,7 @@ pub(crate) fn plan(
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct Progress {
+pub struct Progress {
     pub total: usize,
     pub finished: usize,
     pub queued: usize,
@@ -248,7 +248,7 @@ pub(crate) struct Progress {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct UnitReport {
+pub struct UnitReport {
     pub group: Option<String>,
     pub argv: Vec<String>,
     pub why: String,
@@ -263,7 +263,7 @@ pub(crate) struct UnitReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct Ticket {
+pub struct Ticket {
     pub ticket: i64,
     pub done: bool,
     /// Some exactly when `done`: "passed" | "failed" | "errored" | "nothing_ran".

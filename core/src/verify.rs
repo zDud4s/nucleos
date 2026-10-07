@@ -52,7 +52,7 @@ fn yes() -> bool {
 /// The body of `POST /verify`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct VerifyArgs {
+pub struct VerifyArgs {
     pub kind: Kind,
     pub scope: ScopeArg,
     /// Required for the owner; a job node may omit it, and may only name its own.
@@ -69,7 +69,7 @@ pub(crate) struct VerifyArgs {
 /// The body of `POST /verify/status`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StatusArgs {
+pub struct StatusArgs {
     pub ticket: i64,
     #[serde(default = "yes")]
     pub wait: bool,
@@ -163,7 +163,7 @@ static EXECUTOR: OnceLock<Arc<Executor>> = OnceLock::new();
 
 /// Called once from `main` when the executor starts. A second call changes nothing: the first
 /// executor is the one whose worker loop is draining the queue.
-pub(crate) fn install(executor: Arc<Executor>) {
+pub fn install(executor: Arc<Executor>) {
     if EXECUTOR.set(executor).is_err() {
         tracing::warn!("verify executor installed twice; keeping the first");
     }
@@ -907,7 +907,7 @@ fn database_error(error: sqlx::Error) -> (StatusCode, String) {
 }
 
 /// `POST /verify`: plans and queues, then waits up to `vcs::DEFAULT_WAIT` for the verdict.
-pub(crate) async fn post_verify(
+pub async fn post_verify(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
     Json(args): Json<VerifyArgs>,
@@ -949,7 +949,7 @@ pub(crate) async fn post_verify(
 }
 
 /// `POST /verify/status`: one ticket, waited on like `post_verify` unless `wait` is false.
-pub(crate) async fn post_verify_status(
+pub async fn post_verify_status(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
     Json(args): Json<StatusArgs>,

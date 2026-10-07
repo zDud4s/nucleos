@@ -1882,13 +1882,16 @@ async fn main() {
         devtime_config,
         devtime_projects_dir,
     ));
-    // Nothing submits to it yet (F2a-2 wires `verify`), but an empty queue costs one poll, and
-    // starting it now lets the restart above hand interrupted units straight back to a worker.
-    tokio::spawn(verify_exec::run_executor(verify_exec::Executor::new(
+    // `POST /verify` submits to it, so the handlers need the very instance the worker drains: it is
+    // parked in `verify::install` (an `OnceLock`, because `AppState` is built literally in dozens of
+    // places) before the worker starts. The restart above hands interrupted units straight back to it.
+    let verify_executor = verify_exec::Executor::new(
         state.pool.clone(),
         verify_config,
         machine_config_root.clone(),
-    )));
+    );
+    verify::install(verify_executor.clone());
+    tokio::spawn(verify_exec::run_executor(verify_executor));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor {
