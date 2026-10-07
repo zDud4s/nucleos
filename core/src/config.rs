@@ -1240,6 +1240,8 @@ pub struct VerifyConfig {
     pub disk_cap_gb: u64,
     /// The argv prefixed to every unit when it runs (a machine's broker). Empty means none.
     pub broker_prefix: Vec<String>,
+    /// Days a green unit stays reusable by the cache (spec §5.3).
+    pub cache_days: u64,
 }
 
 impl Default for VerifyConfig {
@@ -1250,6 +1252,7 @@ impl Default for VerifyConfig {
             unit_timeout_seconds: 1800,
             disk_cap_gb: 60,
             broker_prefix: Vec::new(),
+            cache_days: 7,
         }
     }
 }
@@ -1276,6 +1279,9 @@ pub fn parse_verify_config(contents: &str) -> Result<VerifyConfig, String> {
     }
     if config.disk_cap_gb < 1 {
         return Err("disk_cap_gb must be at least 1".to_string());
+    }
+    if config.cache_days < 1 {
+        return Err("cache_days must be at least 1".to_string());
     }
     Ok(config)
 }
@@ -4797,6 +4803,25 @@ cycle_seconds: 30
     #[test]
     fn a_verify_disk_cap_of_zero_is_refused() {
         assert!(parse_verify_config("disk_cap_gb: 0\n").is_err());
+    }
+
+    #[test]
+    fn verify_cache_days_defaults_to_seven() {
+        assert_eq!(VerifyConfig::default().cache_days, 7);
+        assert_eq!(parse_verify_config("capacity: 2\n").unwrap().cache_days, 7);
+    }
+
+    #[test]
+    fn verify_cache_days_is_read() {
+        assert_eq!(
+            parse_verify_config("cache_days: 30\n").unwrap().cache_days,
+            30
+        );
+    }
+
+    #[test]
+    fn a_verify_cache_days_of_zero_is_refused() {
+        assert!(parse_verify_config("cache_days: 0\n").is_err());
     }
 
     #[test]

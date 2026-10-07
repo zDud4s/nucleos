@@ -71,6 +71,8 @@ pub struct Group {
     pub cache: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
+    /// Also hash ignored files matching `reads` into the fingerprint. Needs `reads`: without it
+    /// the whole ignored tree, build output included, would be hashed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub include_ignored: bool,
 }
@@ -328,6 +330,11 @@ fn check_group(name: &str, group: &Group, errors: &mut Vec<String>) {
                 ));
             }
         }
+    }
+    if group.include_ignored && group.reads.is_none() {
+        errors.push(format!(
+            "{at}.include_ignored: needs `reads`; without it the whole ignored tree (build output included) would be hashed"
+        ));
     }
     for variable in &group.env {
         if !is_env_name(variable) {
@@ -587,5 +594,24 @@ mod tests {
         assert!(matches!(load(temp.path()), MapState::Invalid(_)));
         std::fs::write(temp.path().join(MAP_FILE), MINIMAL).unwrap();
         assert!(matches!(load(temp.path()), MapState::Valid(_)));
+    }
+
+    #[test]
+    fn include_ignored_without_reads_is_refused() {
+        let text = format!("{MINIMAL}      include_ignored: true\n");
+        let found = errors(&text);
+        assert!(
+            found
+                .iter()
+                .any(|e| e.contains("include_ignored") && e.contains("reads")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn include_ignored_with_reads_is_accepted() {
+        let text = format!("{MINIMAL}      reads: [core/]\n      include_ignored: true\n");
+        let map = parse(&text).unwrap();
+        assert!(map.tests.groups["core"].include_ignored);
     }
 }

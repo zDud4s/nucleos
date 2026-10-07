@@ -409,6 +409,30 @@ struct VcsTicketParams {
     wait: Option<bool>,
 }
 
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct VerifyParams {
+    /// "check" runs the cheap static checks; "test" runs the tests.
+    kind: String,
+    /// "own" verifies what this worktree changed; "scope" widens to what the changed paths touch;
+    /// "full" is the whole suite.
+    scope: String,
+    /// The worktree to verify, as an absolute path. Required outside a job node, where the daemon
+    /// knows which worktree you are standing in.
+    worktree: Option<String>,
+    /// Restrict the verification to these paths, relative to the worktree.
+    files: Option<Vec<String>>,
+    /// The commit or branch to diff against. Absent means the project's integration branch.
+    base: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct VerifyStatusParams {
+    /// The ticket `verify` gave back.
+    ticket: i64,
+    /// Block until it finishes, up to about 45 seconds. Absent means block.
+    wait: Option<bool>,
+}
+
 /// Shared shape of three of the four project reads: a listing, a file's contents, and a diff all
 /// take just the project and a path inside it. `project_grep` is not this — it also needs a query
 /// — and has its own struct below rather than this one with an extra optional field bolted on.
@@ -1479,6 +1503,51 @@ impl NucleosTools {
     ) -> String {
         json_result(self.client.vcs_ticket(id, wait.unwrap_or(false)).await)
     }
+
+    #[tool(
+        description = "Verify a worktree: only the daemon runs verification, so call this instead of \
+                       running tests or checks yourself. Blocks for about 45 seconds and returns the \
+                       result, or a ticket with progress to read back through verify_status. \
+                       worktree is required outside a job node. In a project with no \
+                       nucleos.tests.yaml, scope own runs nothing."
+    )]
+    async fn verify(
+        &self,
+        Parameters(VerifyParams {
+            kind,
+            scope,
+            worktree,
+            files,
+            base,
+        }): Parameters<VerifyParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .verify(
+                    &kind,
+                    &scope,
+                    worktree.as_deref(),
+                    files.as_deref(),
+                    base.as_deref(),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Read a verification ticket: per-unit status, durations and output tails. \
+                       Blocks up to about 45 seconds for it to finish unless wait is false."
+    )]
+    async fn verify_status(
+        &self,
+        Parameters(VerifyStatusParams { ticket, wait }): Parameters<VerifyStatusParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .verify_status(ticket, wait.unwrap_or(true))
+                .await,
+        )
+    }
 }
 
 #[tool_handler(name = "nucleos")]
@@ -1984,10 +2053,19 @@ pub const TEAM_TOOLS: &[&str] = &[
 ///
 /// A finding belongs to one running job node. Offering it through `LOCAL_TOOLS` would give a chat
 /// that authority.
-pub const JOB_NODE_TOOLS: &[&str] = &["note_finding"];
+///
+/// `verify` and `verify_status` are listed too, so a job node can verify its own worktree (they are
+/// in `--allowedTools` through this list) — but, unlike `note_finding`, they are also offered to
+/// every other box: see `EVERY_BOX_TOOLS`.
+pub const JOB_NODE_TOOLS: &[&str] = &["note_finding", "verify", "verify_status"];
+
+/// The members of `JOB_NODE_TOOLS` that `McpBox::All` serves as well. A chat or a plain run has a
+/// worktree of its own to verify and the daemon is the only thing that may run verification, so
+/// these two are not a job node's privilege the way a finding is.
+pub const EVERY_BOX_TOOLS: &[&str] = &["verify", "verify_status"];
 
 /// Whether a box announces and dispatches one name. `McpBox::All` is the whole server except the
-/// named job-node tools.
+/// named job-node tools that `EVERY_BOX_TOOLS` does not give back.
 ///
 /// Lifted out of `NucleosTools::serves` when a second caller appeared that has no instance to ask:
 /// `advertised_schema_chars` prices what a box WOULD announce, from a launch site that never builds
@@ -1996,7 +2074,7 @@ pub const JOB_NODE_TOOLS: &[&str] = &["note_finding"];
 /// way to observe the other.
 fn served_in_box(served: McpBox, tool: &str) -> bool {
     match served {
-        McpBox::All => !JOB_NODE_TOOLS.contains(&tool),
+        McpBox::All => !JOB_NODE_TOOLS.contains(&tool) || EVERY_BOX_TOOLS.contains(&tool),
         McpBox::JobNode(_) => JOB_NODE_TOOLS.contains(&tool),
     }
 }
@@ -2320,6 +2398,10 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("triage_email", ToolEffect::Acts),
     ("vcs_request", ToolEffect::Acts),
     ("vcs_ticket", ToolEffect::ReadsOwn),
+    // `WritesOwn`: it enqueues work on this machine's own verification queue and writes its own
+    // ticket and cache rows; nothing leaves the machine. `verify_status` only reads that ticket.
+    ("verify", ToolEffect::WritesOwn),
+    ("verify_status", ToolEffect::ReadsOwn),
     ("web_read", ToolEffect::ReadsUntrusted),
     ("web_search", ToolEffect::ReadsUntrusted),
 ];
@@ -2957,6 +3039,9 @@ mod tests {
     /// and council, which is worse than never offering it; every other name remains unboxed.
     #[test]
     fn a_server_with_no_box_still_serves_everything_except_the_one_tool_that_needs_a_job() {
+        // `verify` and `verify_status` sit on the job-node list yet are served everywhere, so the
+        // only name this server withholds is the finding tool.
+        assert!(!served_in_box(McpBox::All, "note_finding"));
         let registered = every_tool_name();
         for name in registered
             .iter()
@@ -2965,7 +3050,7 @@ mod tests {
         {
             assert_eq!(
                 served_in_box(McpBox::All, name),
-                !JOB_NODE_TOOLS.contains(&name),
+                !JOB_NODE_TOOLS.contains(&name) || EVERY_BOX_TOOLS.contains(&name),
                 "the unboxed server classified {name} incorrectly"
             );
         }
@@ -3592,6 +3677,8 @@ mod tests {
                 "triage_email",
                 "vcs_request",
                 "vcs_ticket",
+                "verify",
+                "verify_status",
                 "web_read",
                 "web_search",
             ]
@@ -4976,14 +5063,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_job_node_server_announces_only_the_finding_tool() {
+    async fn a_job_node_server_announces_only_the_finding_and_verify_tools() {
         let (_running, context) = served_request_context().await;
 
         let job_node = job_node_server(9)
             .list_tools(None, context.clone())
             .await
             .unwrap();
-        assert_eq!(advertised(&job_node), ["note_finding"]);
+        assert_eq!(
+            advertised(&job_node),
+            ["note_finding", "verify", "verify_status"]
+        );
 
         let unboxed = unboxed_server()
             .list_tools(None, context.clone())
@@ -5046,6 +5136,55 @@ mod tests {
             "the job-node control never dispatched, so the refusal above proves nothing: \
              {control:?}"
         );
+    }
+
+    /// `verify` is the one job-node tool that is not job-only: the owner's assistant verifies a
+    /// worktree it names, and a job node verifies its own.
+    #[test]
+    fn verify_is_served_in_both_boxes() {
+        assert_eq!(EVERY_BOX_TOOLS, ["verify", "verify_status"]);
+        for name in EVERY_BOX_TOOLS {
+            assert!(
+                JOB_NODE_TOOLS.contains(name),
+                "{name} left the job-node list"
+            );
+            assert!(
+                served_in_box(McpBox::All, name),
+                "the unboxed server lost {name}"
+            );
+            assert!(
+                served_in_box(McpBox::JobNode(1), name),
+                "a job node lost {name}"
+            );
+        }
+        let registered = every_tool_name();
+        for name in EVERY_BOX_TOOLS {
+            assert!(
+                registered.iter().any(|r| r == name),
+                "{name} is not registered"
+            );
+        }
+    }
+
+    /// Ordering the verification is a write the caller owns; reading its ticket is not.
+    #[test]
+    fn verify_writes_own_and_verify_status_reads_own() {
+        assert_eq!(tool_effect("verify"), ToolEffect::WritesOwn);
+        assert_eq!(tool_effect("verify_status"), ToolEffect::ReadsOwn);
+    }
+
+    #[test]
+    fn verify_stays_off_the_chat_council_team_and_hosted_lists() {
+        for (list, name) in [
+            (LOCAL_TOOLS, "LOCAL_TOOLS"),
+            (COUNCIL_TOOLS, "COUNCIL_TOOLS"),
+            (TEAM_TOOLS, "TEAM_TOOLS"),
+            (HOSTED_TOOLS, "HOSTED_TOOLS"),
+        ] {
+            for tool in EVERY_BOX_TOOLS {
+                assert!(!list.contains(tool), "{tool} must stay off {name}");
+            }
+        }
     }
 
     #[test]
@@ -5258,7 +5397,10 @@ mod tests {
         let mut everything: Vec<String> = NucleosTools::tool_router()
             .list_all()
             .into_iter()
-            .filter(|tool| !JOB_NODE_TOOLS.contains(&tool.name.as_ref()))
+            .filter(|tool| {
+                !JOB_NODE_TOOLS.contains(&tool.name.as_ref())
+                    || EVERY_BOX_TOOLS.contains(&tool.name.as_ref())
+            })
             .map(|tool| tool.name.into_owned())
             .collect();
         everything.sort_unstable();
