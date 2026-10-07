@@ -213,6 +213,12 @@ func HandleUpdate(bot Bot, dc Daemon, dl Downloader, cfg config.Config, tr *Trac
 	}
 
 	to := u.Message.Destination()
+	// A capture answer is checked after the sender, before resolveIncoming: a dictated answer is
+	// refused, never transcribed (spec P6).
+	if jobID := captureTarget(u.Message); jobID != 0 {
+		handleCaptureReply(bot, dc, to, u.Message, jobID)
+		return
+	}
 	text := resolveIncoming(dl, dc, cfg.TranscribeCmd, u.Message)
 	if strings.TrimSpace(text) == "" {
 		// A sticker, a location, a poll: none of them carries a prompt, and a turn started on an
