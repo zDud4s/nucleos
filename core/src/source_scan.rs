@@ -108,6 +108,9 @@ mod tests {
         let top = top_level_rust_files();
         assert!(!top.is_empty());
         assert!(top.len() < all.len());
-        assert!(top.iter().all(|path| all.contains(path) && is_top_level(path)));
+        assert!(
+            top.iter()
+                .all(|path| all.contains(path) && is_top_level(path))
+        );
     }
 }
