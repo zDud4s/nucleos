@@ -980,6 +980,13 @@ func sleepUntil(ctx context.Context, interval time.Duration) bool {
 	}
 }
 
+// captureRequestedKind is the feed kind of a capture request. Its summary opens with its own
+// header line, so the raw "kind: " prefix would only stand in front of the question.
+const captureRequestedKind = "capture_requested"
+
 func formatFeed(f map[string]any) string {
+	if kindOf(f) == captureRequestedKind {
+		return strOr(f, "summary", "")
+	}
 	return strOr(f, "kind", "event") + ": " + strOr(f, "summary", "")
 }

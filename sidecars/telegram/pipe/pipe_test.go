@@ -1611,3 +1611,14 @@ func TestAPolicySuppressedLineIsNotSentToItsTopic(t *testing.T) {
 		t.Errorf("the allowed line = %+v, want one send to its topic", got)
 	}
 }
+
+func TestACaptureRequestFeedLineIsSentWithoutItsKindPrefix(t *testing.T) {
+	summary := "🧠 web · job #7 · job failed\nHá alguma coisa que só tu saibas sobre isto?\n(até às 14:30; depois o destilador avança) #cap7"
+	got := formatFeed(map[string]any{"kind": "capture_requested", "summary": summary})
+	if got != summary {
+		t.Errorf("formatFeed = %q, want the summary alone", got)
+	}
+	if got := formatFeed(map[string]any{"kind": "job_failed", "summary": "x"}); got != "job_failed: x" {
+		t.Errorf("other kinds lost their prefix: %q", got)
+	}
+}
