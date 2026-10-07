@@ -1325,7 +1325,6 @@ A fatura de julho segue em anexo.\n\n\
             built_in.display(),
             running_in.display(),
         );
-        let source_dir = running_in.join("src");
         let forbidden = [
             "body_excerpt",
             "body_text",
@@ -1335,12 +1334,10 @@ A fatura de julho segue em anexo.\n\n\
             "extraction_answer",
         ];
 
-        for entry in fs::read_dir(source_dir).expect("core source directory must be readable") {
-            let entry = entry.expect("core source entry must be readable");
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("rs")
-                || path.file_name().and_then(|name| name.to_str()) == Some("redact.rs")
-            {
+        // The top-level files of every source root: the core's own `src/` and, once modules move
+        // out of it, the `src/` of each crate under `core/crates/`.
+        for path in crate::source_scan::top_level_rust_files() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("redact.rs") {
                 continue;
             }
 
