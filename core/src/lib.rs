@@ -114,6 +114,7 @@ pub use nucleos_base::prompt_budget;
 pub mod proposals;
 pub mod quota;
 pub mod quota_client;
+pub mod quote_guard;
 pub use nucleos_base::recurrence;
 pub mod redact;
 pub mod relay;
