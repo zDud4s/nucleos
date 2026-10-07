@@ -125,9 +125,26 @@ func waitEnd(t *testing.T, done <-chan error) error {
 	}
 }
 
-// Spec §3.1: handing a session to a person ends the viewers with "wheel" — the page they were looking
-// at is about to be a person's.
-func TestWatchHandoffEndsWithWheel(t *testing.T) {
+// stillWatching asserts the viewer was not ended, then ends it through Close so the goroutine does not
+// outlive the test.
+func stillWatching(t *testing.T, pool *Pool, id browser.SessionID, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("the viewer was ended (%v), but the page is still the one it is watching", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := pool.Close(context.Background(), id); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got := endedWith(t, waitEnd(t, done)); got != browser.EndClosed {
+		t.Fatalf("reason = %q, want closed", got)
+	}
+}
+
+// A handoff is no longer a process swap: the same browser stays up with the same page, so the viewer
+// keeps watching it.
+func TestWatchHandoffDoesNotEndTheViewer(t *testing.T) {
 	pool, launcher := watchPool(t)
 	session := mustOpen(t, pool, ephemeral("r1"))
 	done := startWatch(t, pool, launcher.first(t), session.ID, discard)
@@ -135,9 +152,19 @@ func TestWatchHandoffEndsWithWheel(t *testing.T) {
 	if _, err := pool.Handoff(context.Background(), session.ID, "login"); err != nil {
 		t.Fatalf("handoff: %v", err)
 	}
-	if got := endedWith(t, waitEnd(t, done)); got != browser.EndWheel {
-		t.Fatalf("reason = %q, want wheel", got)
+	stillWatching(t, pool, session.ID, done)
+}
+
+// BeginPerson keeps the same browser too, so the viewer stays on it.
+func TestWatchBeginPersonDoesNotEndTheViewer(t *testing.T) {
+	pool, launcher := watchPool(t)
+	session := mustOpen(t, pool, project("acme", "https://jira.example.org"))
+	done := startWatch(t, pool, launcher.first(t), session.ID, discard)
+
+	if err := pool.BeginPerson(context.Background(), session.ID); err != nil {
+		t.Fatalf("BeginPerson: %v", err)
 	}
+	stillWatching(t, pool, session.ID, done)
 }
 
 func TestWatchTakeWheelEndsWithWheel(t *testing.T) {

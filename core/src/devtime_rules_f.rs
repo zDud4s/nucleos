@@ -107,14 +107,14 @@ fn f1(rows: &[CrossAttempt], cfg: &DevtimeRulesConfig) -> Vec<CrossFinding> {
         let Some((started_ms, done_ms)) = interval_of(row) else {
             continue;
         };
-        if is_shell(row, cfg) {
-            if let Some(hash) = row.cmd_hash.as_deref().filter(|hash| !hash.is_empty()) {
-                cmds.entry(row.session_id.clone()).or_default().push(Item {
-                    key: hash.to_string(),
-                    started_ms,
-                    done_ms,
-                });
-            }
+        if is_shell(row, cfg)
+            && let Some(hash) = row.cmd_hash.as_deref().filter(|hash| !hash.is_empty())
+        {
+            cmds.entry(row.session_id.clone()).or_default().push(Item {
+                key: hash.to_string(),
+                started_ms,
+                done_ms,
+            });
         }
         for path in read_paths(&row.reads) {
             if paths.is_external(&path) {
@@ -173,7 +173,7 @@ fn sequences(
     }
     let mut has_predecessor: BTreeSet<Vec<String>> = BTreeSet::new();
     for (gram, sessions) in &grams {
-        if let Some(followers) = by_prefix.get(&gram[1..].to_vec()) {
+        if let Some(followers) = by_prefix.get(&gram[1..]) {
             for follower in followers {
                 if follower != gram && grams[follower] == *sessions {
                     has_predecessor.insert(follower.clone());
@@ -200,7 +200,7 @@ fn sequences(
         let mut tail = start.clone();
         loop {
             let next = by_prefix
-                .get(&tail[1..].to_vec())
+                .get(&tail[1..])
                 .and_then(|followers| {
                     followers
                         .iter()

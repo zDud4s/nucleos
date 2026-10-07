@@ -40,6 +40,7 @@ import {
   type VcsRequestSummary,
   type WheelRequest,
 } from "../data/waiting";
+import { useApproveWheel } from "../data/browser";
 import {
   Button,
   ConfirmButton,
@@ -675,7 +676,7 @@ function ReadFrom({ raw }: { raw: string | null }) {
 /* ------------------------------------------------------- 1. wheel requests -- */
 
 function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
-  const approve = useApproveProposal();
+  const approve = useApproveWheel();
   const reject = useRejectProposal();
   const rows = view.rows ?? [];
   const { items, onArmedChange } = useOrderFreeze(
@@ -693,19 +694,26 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
       why={
         <>
           An agent has met a wall it may not climb and is asking for the window.
-          Giving it the wheel opens a real browser on this machine, in the
-          profile named on the card; refusing closes the session, and the run
-          carries on without that page.
+          A session the shell can drive may be approved to be driven here, in the
+          shell, or opened as a real browser window on this machine; one it
+          cannot is only offered the window. Either way it runs in the profile
+          named on the card. Refusing closes the session, and the run carries
+          on without that page.
         </>
       }
       notes={
         <DecisionNotes
-          outcome={approve.data}
+          outcome={undefined}
           approveError={approve.isError ? approve.error : null}
           refuseError={reject.isError ? reject.error : null}
         />
       }
     >
+      {approve.isSuccess && approve.variables?.seat === "shell" && (
+        <p className="waiting-outcome" role="status">
+          the shell has the wheel — <Link to="/web/sessions">drive it on Web</Link>
+        </p>
+      )}
       <Rows label="Wheel requests" className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((session) => (
           <Row className="waiting-card" dense={dense(items.length)} key={session.id}>
@@ -745,15 +753,41 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
               <p className="waiting-reasoning">{session.refusal}</p>
             )}
             <div className="waiting-actions">
-              <ConfirmButton
-                label={`Give wheel #${session.proposal_id} the window`}
-                confirmLabel="Open a real browser here"
-                subject={`#${session.proposal_id}`}
-                variant="approve"
-                disabled={approve.isPending}
-                onArmedChange={onArmedChange}
-                onConfirm={() => approve.mutate(session.proposal_id)}
-              />
+              {session.shell_eligible && (
+                <ConfirmButton
+                  label={`Approve wheel #${session.proposal_id}`}
+                  confirmLabel="Drive it here in the shell"
+                  variant="approve"
+                  disabled={approve.isPending}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() =>
+                    approve.mutate({ proposalId: session.proposal_id, sessionId: session.id, seat: "shell" })
+                  }
+                />
+              )}
+              {session.shell_eligible ? (
+                <ConfirmButton
+                  label={`Open real window for wheel #${session.proposal_id}`}
+                  confirmLabel="Open a real browser here"
+                  variant="ghost"
+                  disabled={approve.isPending}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() =>
+                    approve.mutate({ proposalId: session.proposal_id, sessionId: session.id, seat: "window" })
+                  }
+                />
+              ) : (
+                <ConfirmButton
+                  label={`Open real window for wheel #${session.proposal_id}`}
+                  confirmLabel="Open a real browser here"
+                  variant="approve"
+                  disabled={approve.isPending}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() =>
+                    approve.mutate({ proposalId: session.proposal_id, sessionId: session.id, seat: "window" })
+                  }
+                />
+              )}
               <ConfirmButton
                 label={`Refuse wheel #${session.proposal_id}`}
                 confirmLabel="Refuse and close the session"

@@ -346,6 +346,8 @@ export const keys = {
    */
   knowledge: {
     all: ["knowledge"] as const,
+    /** `GET /distill/causes` — the cause of every distilled row. */
+    distillCauses: ["knowledge", "distill-causes"] as const,
     detail: (id: number) => ["knowledge", "detail", id] as const,
   },
 
@@ -427,6 +429,8 @@ export const keys = {
     frontCommands: (query: string) => ["chats", "front-commands", query] as const,
     project: (chatId: string) => ["chats", "project", chatId] as const,
     diff: (chatId: string) => ["chats", "diff", chatId] as const,
+    /** `GET /assistant/chats/{id}/tasks` — the work a conversation's turns launched. */
+    tasks: (chatId: string) => ["chats", "tasks", chatId] as const,
     ideSessions: ["chats", "ide-sessions"] as const,
     ideSession: (sessionId: string) => ["chats", "ide-session", sessionId] as const,
     live: (turnId: number) => ["chats", "live", turnId] as const,
@@ -616,6 +620,8 @@ export const keys = {
      * about to be compared against.
      */
     machine: ["system", "machine"] as const,
+    /** `GET /config/distiller` — which brain the distiller asks. */
+    distiller: ["system", "distiller"] as const,
     /** The credentials this machine holds, by presence only -- `GET /config/secrets`. */
     secrets: ["system", "secrets"] as const,
   },

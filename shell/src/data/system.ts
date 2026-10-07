@@ -370,6 +370,30 @@ export interface SubsystemReadout {
     | "not-running"
     | "low-disk-space"
     | "unknown";
+  /** Named tallies a subsystem keeps beside its state; absent when it keeps none. */
+  counts?: Record<string, number>;
+}
+
+/** One tally of a subsystem row, ready to draw. */
+export interface SubsystemCount {
+  name: string;
+  /** The key with a trailing `_unix` dropped and `_` read as a space. */
+  label: string;
+  value: number;
+  /** A `_unix` key holds an instant in epoch seconds, not a count. */
+  instant: boolean;
+}
+
+/** A row's tallies sorted by key, whatever order the daemon wrote them in. */
+export function subsystemCounts(row: SubsystemReadout): SubsystemCount[] {
+  return Object.entries(row.counts ?? {})
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([name, value]) => ({
+      name,
+      label: name.replace(/_unix$/, "").replace(/_/g, " "),
+      value,
+      instant: name.endsWith("_unix"),
+    }));
 }
 
 /** `GET /health/readout` — `health::HealthReadout`. */

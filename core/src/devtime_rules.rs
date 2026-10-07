@@ -818,11 +818,11 @@ pub fn lane_attempts<'a>(
 
 /// The first attempt after position `idx` in the same lane that satisfies `pred`.
 #[allow(dead_code)] // the rule families are the callers
-pub fn next_in_lane<'a>(
-    facts: &'a SessionFacts,
+pub fn next_in_lane(
+    facts: &SessionFacts,
     idx: usize,
     pred: impl Fn(&AttemptFact) -> bool,
-) -> Option<&'a AttemptFact> {
+) -> Option<&AttemptFact> {
     let from = facts.attempts.get(idx)?;
     facts
         .attempts
@@ -1552,7 +1552,7 @@ mod tests {
                 .iter()
                 .map(|id| {
                     finding(
-                        *id,
+                        id,
                         "main",
                         first.started_ms,
                         first.done_ms,

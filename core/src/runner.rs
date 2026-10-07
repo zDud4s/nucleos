@@ -60,14 +60,14 @@ pub const DEFAULT_MAX_TURNS: i64 = 200;
 /// no `--max-turns` flag to delegate this to. `--max-budget-usd` exists and is a different brake —
 /// money, which the job already has, rather than motion, which nothing had.
 #[derive(Debug, Default)]
-pub(crate) struct TurnCounter {
+pub struct TurnCounter {
     count: i64,
     seen: std::collections::HashSet<String>,
 }
 
 impl TurnCounter {
     /// Folds one line in, and answers whether it began a response this counter had not seen yet.
-    pub(crate) fn line(&mut self, line: &str) -> bool {
+    pub fn line(&mut self, line: &str) -> bool {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             return false;
         };
@@ -90,7 +90,7 @@ impl TurnCounter {
     }
 
     /// The responses counted so far.
-    pub(crate) fn count(&self) -> i64 {
+    pub fn count(&self) -> i64 {
         self.count
     }
 }
@@ -102,7 +102,7 @@ impl TurnCounter {
 /// rather than an oversight: a misconfiguration that silently stops every run before its first
 /// answer is worse than one that silently disables the brake, because the first looks like the
 /// daemon being broken and the second looks like the daemon it already was.
-pub(crate) fn over_turn_ceiling(turns: i64, ceiling: Option<i64>) -> bool {
+pub fn over_turn_ceiling(turns: i64, ceiling: Option<i64>) -> bool {
     matches!(ceiling, Some(ceiling) if ceiling > 0 && turns >= ceiling)
 }
 
@@ -481,7 +481,7 @@ pub struct LaterTurn {
 /// Measured in `.ai/spikes/2026-10-05-chat-cli-control.md` (a): the CLI ends the turn in about 30 ms
 /// and the process and session survive. Every request carries an id of its own, because
 /// `control_response` echoes it and two interrupts sharing one could not be told apart.
-pub(crate) fn interrupt_line() -> String {
+pub fn interrupt_line() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut line = serde_json::json!({
@@ -500,7 +500,7 @@ pub(crate) fn interrupt_line() -> String {
 /// and the process exits 0. Built through `serde_json` rather than `format!` because a turn is
 /// delimited by a newline: a prompt containing one, or a quote, would otherwise arrive as two
 /// half-parsed lines instead of the single instruction it is.
-pub(crate) fn user_message_line(text: &str, images: &[Attachment]) -> String {
+pub fn user_message_line(text: &str, images: &[Attachment]) -> String {
     // A plain string when there is nothing to carry, and that is not tidiness: the string form is
     // the one measured working, and every run in this daemon that is not a chat uses it. Rewriting
     // them all as arrays to make one new case uniform would change what is proven to make room for
@@ -625,7 +625,7 @@ fn policy_unverified_after_stream(policy: ToolPolicy, init_seen: bool) -> Option
 /// `ArtifactComments`, `ArtifactData` (siblings of `Artifact`, already here) and `ListAgents`
 /// (sibling of `ListMcpResourcesTool`). `scripts/tool-surface.mjs` automates this measurement by
 /// hand after a `claude update`; it is not wired into any gate because it needs the CLI installed.
-pub(crate) const BUILTIN_TOOLS: &[&str] = &[
+pub const BUILTIN_TOOLS: &[&str] = &[
     "Agent",
     "Artifact",
     "ArtifactCheck",
@@ -749,7 +749,7 @@ pub fn agents_json(agents: &[Subagent]) -> String {
 
 /// The full `claude` argument vector for one run. Pure, so the flags that decide what a run can
 /// reach are asserted in tests instead of inspected on a live process.
-pub(crate) fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
+pub fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
     // The request wins: the runner is built once at startup, the request is made per run, so the
     // reverse ordering would leave a per-run choice unexpressible.
     let model = request.model.as_deref().unwrap_or(model);
@@ -934,7 +934,7 @@ fn denied_tools(policy: &ToolPolicy, asked: &[String]) -> Vec<String> {
 ///
 /// Each line is a JSON object; the reply is the last non-empty `result` string. `None` means there
 /// was no such event, and callers fall back to the raw stream rather than lose the output.
-pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
+pub fn extract_reply(stdout: &str) -> Option<String> {
     let mut reply: Option<String> = None;
     for line in stdout.lines() {
         let line = line.trim();
@@ -980,7 +980,7 @@ pub(crate) fn extract_reply(stdout: &str) -> Option<String> {
 /// API server — check your internet or DNS (ENOTFOUND)". Its `subtype` said `success`: only
 /// `is_error` and `terminal_reason` told the truth, which is why neither `subtype` nor the exit
 /// code is read.
-pub(crate) fn failed_on_a_transient_api_error(stdout: &str) -> bool {
+pub fn failed_on_a_transient_api_error(stdout: &str) -> bool {
     let Some(result) = final_api_error(stdout) else {
         return false;
     };
@@ -996,7 +996,7 @@ pub(crate) fn failed_on_a_transient_api_error(stdout: &str) -> bool {
 /// with `api_error_status: 429`. Read exactly as [`failed_on_a_transient_api_error`] reads it, of
 /// which this is the one status that says "this subscription, right now" rather than "the network"
 /// or "the service" — the llm-router locks the subscription on it, and must not on a 529.
-pub(crate) fn failed_on_rate_limit(stdout: &str) -> bool {
+pub fn failed_on_rate_limit(stdout: &str) -> bool {
     final_api_error(stdout)
         .and_then(|result| result.get("api_error_status").and_then(|s| s.as_u64()))
         == Some(429)
@@ -1020,12 +1020,12 @@ fn final_api_error(stdout: &str) -> Option<serde_json::Value> {
 /// Job 26's review, run 900483, cut down to what the detector above reads: the first of its ten
 /// retries, and its result line with the zeroed counters left out. Shared with `job.rs`, whose
 /// tests seed a review that printed exactly this.
-#[cfg(test)]
-pub(crate) const REVIEW_THAT_NEVER_REACHED_THE_API: &str = r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":614,"error_status":null,"error":"unknown","session_id":"f4a94b9c-f0fe-484b-9514-9fefa640a6b6"}
+#[cfg(any(test, feature = "testkit"))]
+pub const REVIEW_THAT_NEVER_REACHED_THE_API: &str = r#"{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":614,"error_status":null,"error":"unknown","session_id":"f4a94b9c-f0fe-484b-9514-9fefa640a6b6"}
 {"stop_reason":"stop_sequence","session_id":"f4a94b9c-f0fe-484b-9514-9fefa640a6b6","total_cost_usd":0,"terminal_reason":"api_error","is_error":true,"num_turns":1,"subtype":"success","api_error_status":null,"result":"API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)","type":"result","duration_ms":172362}"#;
 
 /// The text of the user line the CLI writes into the stream when a turn is interrupted.
-pub(crate) const INTERRUPT_MARKER: &str = "[Request interrupted by user]";
+pub const INTERRUPT_MARKER: &str = "[Request interrupted by user]";
 
 /// Whether a stream-json transcript ended on a turn the person interrupted, as opposed to one that
 /// failed.
@@ -1034,7 +1034,7 @@ pub(crate) const INTERRUPT_MARKER: &str = "[Request interrupted by user]";
 /// [`INTERRUPT_MARKER`], and the LAST `result` event says `error_during_execution`. A failed turn
 /// has the second without the first; an earlier interrupt followed by a later failure has the first
 /// but a different last result.
-pub(crate) fn interrupted_by_user(stdout: &str) -> bool {
+pub fn interrupted_by_user(stdout: &str) -> bool {
     // The marker only counts when it sits AFTER the previous result line and before the last one,
     // so it is cleared whenever a result closes a turn.
     let mut marked = false;
@@ -1074,8 +1074,8 @@ pub(crate) fn interrupted_by_user(stdout: &str) -> bool {
 /// A turn interrupted half way, as the CLI 2.1.280 wrote it in the spike: the partial answer, the
 /// `control_response` to the request, the user line carrying the marker, and an
 /// `error_during_execution` result. Shared with `assistant.rs`, whose fake answers with it.
-#[cfg(test)]
-pub(crate) const INTERRUPTED_TURN: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"half an answer"}]}}
+#[cfg(any(test, feature = "testkit"))]
+pub const INTERRUPTED_TURN: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"half an answer"}]}}
 {"type":"control_response","response":{"subtype":"success","request_id":"nucleos-interrupt-1"}}
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}
 {"type":"result","subtype":"error_during_execution","is_error":true,"stop_reason":null,"num_turns":2,"errors":["[ede_diagnostic] result_type=user"],"total_cost_usd":0}"#;
@@ -1202,11 +1202,15 @@ pub struct ToolCall {
     /// A background call's task: `running`, `completed`, `failed` or `killed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// The CLI's id for this call's task (`task_id` on its task events, `backgroundTaskId` on a
+    /// launch's answer). What `chat_tasks` matches an end event on when it names no tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 impl ToolCall {
     /// The same call with its answer removed, for the transcript. See `result`.
-    pub(crate) fn without_result(self) -> Self {
+    pub fn without_result(self) -> Self {
         Self {
             result: None,
             result_chars: None,
@@ -1295,7 +1299,7 @@ fn result_text(content: Option<&serde_json::Value>) -> Option<String> {
 /// A fixed list of keys tried in order, rather than "the first string in the object": the input
 /// keys belong to the tools, and an unknown tool would otherwise contribute whichever field
 /// happened to be ordered first — a different answer between two runs of the same call.
-pub(crate) fn detail_of(input: &serde_json::Value) -> Option<String> {
+pub fn detail_of(input: &serde_json::Value) -> Option<String> {
     // `description` last, and last on purpose: it is what a `Task` carries and nothing else does,
     // and a tool that also says where it acted must answer with that instead. A key ordered above
     // it would make the sentence a model wrote win over the file it opened.
@@ -1360,7 +1364,7 @@ fn cut_detail(text: &str) -> String {
 /// Completed messages accumulate rather than replace each other: text, a tool call, then more text
 /// is one answer with a gap in it, and keeping only the newest message would silently drop
 /// everything the model said before it reached for anything.
-pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
+pub fn live_from_stream(stream: &str) -> LiveTurn {
     let mut finished: Vec<String> = Vec::new();
     let mut writing = String::new();
     let mut thought: Vec<String> = Vec::new();
@@ -1557,6 +1561,7 @@ pub(crate) fn live_from_stream(stream: &str) -> LiveTurn {
                         .and_then(|r| r.get("backgroundTaskId"))
                         .and_then(|t| t.as_str())
                     {
+                        call.task_id.get_or_insert_with(|| task.to_string());
                         tasks.insert(task.to_string(), index);
                     }
                     let Some(text) = result_text(block.get("content")) else {
@@ -1694,6 +1699,7 @@ fn task_event(
         return;
     };
     let call = &mut did[index];
+    call.task_id.get_or_insert_with(|| task.to_string());
     if subtype == "task_started"
         && value.get("is_backgrounded").and_then(|b| b.as_bool()) == Some(true)
     {
@@ -1738,7 +1744,7 @@ fn task_event(
 /// messages decide it — a subagent's cache is its own — and the `result`'s usage is the fallback
 /// for a stream with no such message. Any 1-hour write wins: that is the entry that outlives the
 /// others.
-pub(crate) fn cache_ttl_from_stream(stdout: &str) -> Option<&'static str> {
+pub fn cache_ttl_from_stream(stdout: &str) -> Option<&'static str> {
     fn ttl_of(usage: Option<&serde_json::Value>) -> Option<&'static str> {
         let split = usage?.get("cache_creation")?;
         let count = |key: &str| {
@@ -1786,7 +1792,7 @@ pub(crate) fn cache_ttl_from_stream(stdout: &str) -> Option<&'static str> {
 
 /// The model that answered this turn: the main agent's first message names it, and the `init`
 /// line names what the CLI launched with when no message got that far.
-pub(crate) fn model_from_stream(stdout: &str) -> Option<String> {
+pub fn model_from_stream(stdout: &str) -> Option<String> {
     let mut launched: Option<String> = None;
     for line in stdout.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
@@ -1825,7 +1831,7 @@ pub(crate) fn model_from_stream(stdout: &str) -> Option<String> {
 ///
 /// This is deliberately separate from `extract_usage`: assistant events describe current context
 /// pressure during a run, while the final result describes aggregate usage after it has ended.
-pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option<i64> {
+pub fn context_fill_from_line(line: &str, current: Option<i64>) -> Option<i64> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return current;
     };
@@ -1863,7 +1869,7 @@ pub(crate) fn context_fill_from_line(line: &str, current: Option<i64>) -> Option
 ///
 /// The `None` in the call is deliberate: what is wanted is what THIS line says, not the running
 /// total, so that the larger of the two can be chosen here.
-pub(crate) fn context_peak_from_line(line: &str, current: Option<i64>) -> Option<i64> {
+pub fn context_peak_from_line(line: &str, current: Option<i64>) -> Option<i64> {
     match context_fill_from_line(line, None) {
         Some(fill) => Some(current.map_or(fill, |peak| peak.max(fill))),
         None => current,
@@ -1876,7 +1882,7 @@ pub(crate) fn context_peak_from_line(line: &str, current: Option<i64>) -> Option
 /// part that fails silently. A typo in it leaves the CLI on its own default window, the daemon
 /// still writes the number the window draws, and the only symptom is a conversation that compacts
 /// at a size nobody asked for. Spelled once, here, where a test can read it back.
-pub(crate) fn window_env(request: &RunRequest) -> Option<(&'static str, String)> {
+pub fn window_env(request: &RunRequest) -> Option<(&'static str, String)> {
     request
         .context_window
         .map(|window| ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", window.to_string()))
@@ -1905,7 +1911,7 @@ pub(crate) fn window_env(request: &RunRequest) -> Option<(&'static str, String)>
 /// also exempts it from the orphan check at turn end.
 ///
 /// Set before `request.env` at the spawn site, like [`window_env`], so an explicit entry still wins.
-pub(crate) fn background_env(request: &RunRequest) -> Option<(&'static str, &'static str)> {
+pub fn background_env(request: &RunRequest) -> Option<(&'static str, &'static str)> {
     let can_be_woken = request.steerable && request.messages.is_some();
     (!can_be_woken && !request.background_tasks)
         .then_some(("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1"))
@@ -1927,7 +1933,7 @@ pub(crate) fn background_env(request: &RunRequest) -> Option<(&'static str, &'st
 /// The second line behind [`background_env`], not the first. With background tasks taken away this
 /// finds nothing, and it exists for the day it would: a CLI that renames the variable would
 /// otherwise bring back a run recorded `completed` with its work abandoned, and nothing saying so.
-pub(crate) fn orphaned_background_tasks(stdout: &str) -> Vec<String> {
+pub fn orphaned_background_tasks(stdout: &str) -> Vec<String> {
     let mut answered = false;
     let mut orphaned: Vec<String> = Vec::new();
     for line in stdout.lines() {
@@ -1984,7 +1990,7 @@ pub(crate) fn orphaned_background_tasks(stdout: &str) -> Vec<String> {
 ///
 /// Sticky once true, like `larger` above: a turn can compact and then go on for many more lines,
 /// and a flag recomputed from the last line alone would report only whatever happened to come last.
-pub(crate) fn compacted_from_line(line: &str, current: bool) -> bool {
+pub fn compacted_from_line(line: &str, current: bool) -> bool {
     if current {
         return true;
     }
@@ -2048,7 +2054,7 @@ pub enum TurnEvent {
 /// It exists so the rule lives in one place that a test can reach without a subprocess: `execute`
 /// feeds it every line and reads back both what to forward and what the turn cost, and nothing else
 /// in the daemon has to know that a `result` is a boundary or that the cost on it is cumulative.
-pub(crate) struct TurnSplitter {
+pub struct TurnSplitter {
     spent: f64,
     /// Belongs to the turn IN FLIGHT, and is cleared when that turn ends.
     ///
@@ -2060,7 +2066,7 @@ pub(crate) struct TurnSplitter {
 }
 
 impl TurnSplitter {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             spent: 0.0,
             compacted: false,
@@ -2072,7 +2078,7 @@ impl TurnSplitter {
     /// A `result` line produces BOTH — it is the last line of the turn it ends, and it carries the
     /// answer, so a consumer told the turn had ended before being given that line would close every
     /// turn one line short of what it said.
-    pub(crate) fn line(&mut self, line: String) -> Vec<TurnEvent> {
+    pub fn line(&mut self, line: String) -> Vec<TurnEvent> {
         self.compacted = compacted_from_line(&line, self.compacted);
         match turn_from_result(&line, self.spent) {
             Some((mut turn, total)) => {
@@ -2086,7 +2092,7 @@ impl TurnSplitter {
 
     /// Everything the process has reported spending so far, which is what bills the PROCESS rather
     /// than any one turn inside it.
-    pub(crate) fn spent(&self) -> f64 {
+    pub fn spent(&self) -> f64 {
         self.spent
     }
 }
@@ -2104,7 +2110,7 @@ impl TurnSplitter {
 /// The session id is read here as well because a turn is where it becomes true: measured on the same
 /// two turns, a live process keeps ONE session across all of them, which is what lets a conversation
 /// still be resumed by it after the process is gone.
-pub(crate) fn turn_from_result(line: &str, already_spent: f64) -> Option<(TurnOutcome, f64)> {
+pub fn turn_from_result(line: &str, already_spent: f64) -> Option<(TurnOutcome, f64)> {
     let line = line.trim();
     let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
     if value.get("type").and_then(|kind| kind.as_str()) != Some("result") {
@@ -2133,7 +2139,7 @@ pub(crate) fn turn_from_result(line: &str, already_spent: f64) -> Option<(TurnOu
     Some((turn, spent.unwrap_or(already_spent)))
 }
 
-pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
+pub fn extract_usage(stdout: &str) -> RunUsage {
     let mut usage = RunUsage::default();
     for line in stdout.lines() {
         let line = line.trim();
@@ -2192,7 +2198,7 @@ pub(crate) fn extract_usage(stdout: &str) -> RunUsage {
 /// And no cost. Nothing here prices tokens, and the budget already charges a run with no cost by
 /// how long it ran (`budget::compute_spend`); a figure built from the input side alone would
 /// displace that estimate with a smaller one.
-pub(crate) fn usage_without_a_result(stdout: &str) -> RunUsage {
+pub fn usage_without_a_result(stdout: &str) -> RunUsage {
     let mut turns = TurnCounter::default();
     let mut usage = RunUsage::default();
     for line in stdout.lines() {
@@ -2500,7 +2506,7 @@ pub trait CommandRunner: Send + Sync {
 /// ~10,250-character schema block that was never sent understates the residual by exactly as much.
 /// And the common case is the deferring one: a shell chat turn is `ToolPolicy::Unrestricted`
 /// (`assistant::tool_policy_for`), so this arm is the one an ordinary turn takes.
-pub(crate) fn authored_prompt(request: &RunRequest) -> crate::prompt_budget::AuthoredPrompt {
+pub fn authored_prompt(request: &RunRequest) -> crate::prompt_budget::AuthoredPrompt {
     crate::prompt_budget::AuthoredPrompt {
         schema_chars: match request.mcp_config {
             None => 0,
@@ -2777,7 +2783,7 @@ pub struct OllamaChat {
 /// itself is bounded again by the caller. Generous because a cold model loads from disk on the
 /// first request, and a first message that times out while Ollama is still starting looks exactly
 /// like a broken bot.
-pub(crate) const OLLAMA_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub const OLLAMA_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl OllamaChat {
     /// Builds from a client the caller already owns, and is the only constructor: every
@@ -3392,7 +3398,7 @@ impl CommandRunner for ClaudeCliRunner {
 /// What `run_prompt` prepared before building argv: MCP overrides, staged image paths and the
 /// sandbox the runner pins.
 #[derive(Debug, Default)]
-pub(crate) struct CodexStaged {
+pub struct CodexStaged {
     pub mcp_overrides: Vec<String>,
     pub images: Vec<std::path::PathBuf>,
     /// The sandbox this launch pins, or `None` to leave Codex's own resolution.
@@ -3403,7 +3409,7 @@ pub(crate) struct CodexStaged {
 /// `codex exec` runs with approval policy `never`, so Codex immediately declines an MCP tool call
 /// that needs confirmation ("user cancelled MCP tool call" on 0.144.4). `approve` pre-approves
 /// the daemon's own MCP servers, as the Claude path does with `--allowedTools mcp__nucleos__*`.
-pub(crate) fn codex_mcp_overrides(
+pub fn codex_mcp_overrides(
     config: &serde_json::Value,
     env_names: &[String],
 ) -> Result<Vec<String>, String> {
@@ -3472,7 +3478,7 @@ pub(crate) fn codex_mcp_overrides(
 }
 
 /// Reads the thread id from Codex's thread-started event.
-pub(crate) fn codex_thread_id(line: &str) -> Option<String> {
+pub fn codex_thread_id(line: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
     (value.get("type").and_then(serde_json::Value::as_str) == Some("thread.started"))
         .then(|| value.get("thread_id").and_then(serde_json::Value::as_str))
@@ -3481,7 +3487,7 @@ pub(crate) fn codex_thread_id(line: &str) -> Option<String> {
 }
 
 /// Decodes opening-turn images into files readable by the Codex CLI.
-pub(crate) fn stage_codex_images(
+pub fn stage_codex_images(
     dir: &std::path::Path,
     stem: &str,
     images: &[Attachment],
@@ -3516,7 +3522,7 @@ pub(crate) fn stage_codex_images(
 /// The model a Codex launch runs: the request's own when it names one, else the runner's
 /// configured model. A routed run names its model on the request, so this is where that choice
 /// reaches the command line.
-pub(crate) fn codex_model<'a>(request: &'a RunRequest, configured: &'a str) -> &'a str {
+pub fn codex_model<'a>(request: &'a RunRequest, configured: &'a str) -> &'a str {
     request.model.as_deref().unwrap_or(configured)
 }
 
@@ -3532,7 +3538,7 @@ pub(crate) fn codex_model<'a>(request: &'a RunRequest, configured: &'a str) -> &
 /// different run than it asked for (one that loses the history it was meant to branch from, or that
 /// answers once and then ignores every steering message) while `runs.rs` recorded it as completed.
 /// Naming the field in the refusal is what tells an operator which request cannot take this path.
-pub(crate) fn codex_cli_args(
+pub fn codex_cli_args(
     request: &RunRequest,
     model: &str,
     staged: &CodexStaged,
@@ -3646,7 +3652,7 @@ pub(crate) fn codex_cli_args(
 /// unknown in both, and unknown is not zero. `num_turns` and `cache_creation_tokens` have no
 /// counterpart in this stream and stay `None` for that reason — counting the events that happened to
 /// be read is not the tool reporting a turn count.
-pub(crate) fn codex_extract_usage(stdout: &str) -> RunUsage {
+pub fn codex_extract_usage(stdout: &str) -> RunUsage {
     let mut usage = RunUsage::default();
     for line in stdout.lines() {
         let line = line.trim();
@@ -4040,7 +4046,7 @@ impl CommandRunner for CodexCliRunner {
 ///
 /// Its own type rather than four loose fields, because the four answer one question together --
 /// does this run start with a past?
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     pub prompt: String,
@@ -4051,14 +4057,14 @@ pub struct Launch {
 
 /// The test double for `CommandRunner`. `#[cfg(test)]` because every user of it is a test — building
 /// it into the daemon would ship a runner that can fake a run's outcome.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub type JobMcpLaunch = (
     Option<std::path::PathBuf>,
     Option<i64>,
     Option<&'static [&'static str]>,
 );
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 #[derive(Default)]
 pub struct FakeCommandRunner {
     pub canned: std::sync::Mutex<Option<RunOutcome>>,
@@ -4174,7 +4180,7 @@ pub struct FakeCommandRunner {
     pub unprompted: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 #[async_trait]
 impl CommandRunner for FakeCommandRunner {
     /// `None` unless a test has explicitly asked this double to stand in for the CLI runner here —
@@ -6221,6 +6227,36 @@ mod tests {
 
         assert_eq!(did[0].status.as_deref(), Some("killed"));
         assert!(did[0].finished_at.is_some());
+    }
+
+    /// A background call carries the CLI's own id for its task, from whichever event names it
+    /// first: the task's start, or the answer to the launch.
+    #[test]
+    fn a_background_call_carries_its_task_id() {
+        let from_the_start = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bg","name":"Bash","input":{"command":"sleep 20","run_in_background":true}}]}}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_bg","is_backgrounded":true}"#,
+        ]
+        .join("
+");
+        assert_eq!(
+            live_from_stream(&from_the_start).did[0].task_id.as_deref(),
+            Some("b1")
+        );
+
+        let from_the_answer = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bg2","name":"Bash","input":{"command":"sleep 20","run_in_background":true}}]}}"#,
+            r#"{"type":"user","parent_tool_use_id":null,"timestamp":"2026-10-03T10:00:06.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bg2","content":"Command running in background with ID: b2"}]},"tool_use_result":{"backgroundTaskId":"b2"}}"#,
+        ]
+        .join("
+");
+        assert_eq!(
+            live_from_stream(&from_the_answer).did[0].task_id.as_deref(),
+            Some("b2")
+        );
+
+        let plain = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_read","name":"Read","input":{"file_path":"a"}}]}}"#;
+        assert_eq!(live_from_stream(plain).did[0].task_id, None);
     }
 
     /// The daemon-clock fallback is fixed by the first parse, so a re-read does not move it.

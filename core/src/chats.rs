@@ -345,7 +345,7 @@ where
 /// Deleting it would have written that word 105 times; leaving it `pub` would have left a second
 /// door into the table, open, with nothing behind it. Naming it a test helper is the true statement
 /// of the two.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn create(
     pool: &SqlitePool,
     brain: Brain,
@@ -468,7 +468,7 @@ pub struct Answering {
 /// with it. What stayed behind is eight assertions in `http.rs` that are about these two columns
 /// and no others — `(Some("opus"), None)` is one thought, and the same eight reaching into an
 /// `Answering` for two of its nine fields is not.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub async fn model_of(
     pool: &SqlitePool,
     chat_id: &str,
@@ -1260,7 +1260,7 @@ mod queue_tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 
@@ -1358,7 +1358,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 

@@ -72,7 +72,7 @@ impl From<sqlx::Error> for Fail {
 }
 
 /// The key a transcript is stored under in `devtime_files`.
-pub(crate) fn path_key(path: &Path) -> String {
+pub fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
@@ -935,7 +935,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         // The roster is autopilot's table and its public writers demand an onboarded project with a
         // wired hook, which a fixture has no use for: the row is written directly, in the test only.
         sqlx::query(

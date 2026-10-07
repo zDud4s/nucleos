@@ -88,6 +88,7 @@ pub const GITHUB_FILE: &str = "github.yaml";
 pub const COUNCIL_FILE: &str = "council.yaml";
 pub const ROUTER_FILE: &str = "router.yaml";
 pub const DEVTIME_FILE: &str = "devtime.yaml";
+pub const VERIFY_FILE: &str = "verify.yaml";
 
 /// One of this machine's settings files, with everything a caller needs to act on it safely.
 ///
@@ -177,7 +178,11 @@ fn validate_models(contents: &str) -> Result<(), String> {
         .map_err(|refusal| refusal.message())
 }
 
-/// This machine's settings files. Ten rows, and the count is asserted in the tests for the same
+fn validate_verify(contents: &str) -> Result<(), String> {
+    crate::config::parse_verify_config(contents).map(|_| ())
+}
+
+/// This machine's settings files. Eleven rows, and the count is asserted in the tests for the same
 /// reason the project registry asserts two: a row added without reading the header above is a row
 /// that has not answered the membership rule.
 pub static SETTINGS: &[Setting] = &[
@@ -254,6 +259,13 @@ pub static SETTINGS: &[Setting] = &[
         // to BUILD runners at startup and do not move until the daemon does.
         takes_effect: "the model picker refreshes at once; the routes themselves are built at startup and move when the daemon restarts",
         validate: validate_models,
+    },
+    Setting {
+        path: VERIFY_FILE,
+        area: "verify",
+        what: "how many verification units run at once on this machine, how long one may take, how long a waiting request waits before it moves up, the disk its warm state may fill, and the broker command every unit runs behind",
+        takes_effect: "when the daemon restarts",
+        validate: validate_verify,
     },
 ];
 
@@ -437,14 +449,14 @@ mod tests {
     /// The membership rule, asserted rather than trusted: every row can say no, and says both of
     /// the sentences the page needs.
     ///
-    /// The count is pinned so a tenth row cannot arrive without somebody reading the header. That
+    /// The count is pinned so a twelfth row cannot arrive without somebody reading the header. That
     /// is the same guard [`crate::ownership`] puts on its own table, and it is here for the same
     /// reason: the dangerous edit to a registry is an addition, not a change.
     #[test]
     fn every_setting_can_refuse_and_says_what_it_changes() {
         assert_eq!(
             SETTINGS.len(),
-            10,
+            11,
             "see the module header before adding a row"
         );
         for setting in SETTINGS {

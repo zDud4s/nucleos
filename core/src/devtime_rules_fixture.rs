@@ -576,7 +576,6 @@ impl Script {
 
     /// The turns, messages, attempts and markers the script describes.
     pub fn rows(&self) -> SessionRows {
-        let ts = format_ms;
         let session = &self.session;
 
         // Explicit messages first, so an attempt can inherit a message's model whatever the line order.
@@ -660,13 +659,13 @@ impl Script {
                 },
             };
             let bg_status = ev.text("bg_status");
-            if let Some(status) = &bg_status {
-                if !devtime_store::BG_STATUSES.contains(&status.as_str()) {
-                    script_error(
-                        ev.line,
-                        &format!("`bg_status={status}` is not completed, failed or killed"),
-                    );
-                }
+            if let Some(status) = &bg_status
+                && !devtime_store::BG_STATUSES.contains(&status.as_str())
+            {
+                script_error(
+                    ev.line,
+                    &format!("`bg_status={status}` is not completed, failed or killed"),
+                );
             }
             let bg_end = ev.secs("bg_end").map(|secs| base_ms() + secs);
 
@@ -920,7 +919,7 @@ impl Script {
 
         let mut tx = devtime_store::begin_chunk(pool).await?;
         devtime_store::upsert_session(
-            &mut *tx,
+            &mut tx,
             &SessionRow {
                 session_id: self.session.clone(),
                 project_id: project.to_string(),
@@ -934,26 +933,26 @@ impl Script {
         .await?;
         for turn in &rows.turns {
             let seq = devtime_store::open_turn(
-                &mut *tx,
+                &mut tx,
                 &self.session,
                 &turn.started_at,
                 turn.opens_with_correction.map(|flag| flag != 0),
                 turn.parser_version,
             )
             .await?;
-            devtime_store::touch_turn(&mut *tx, &self.session, seq, &turn.ended_at).await?;
+            devtime_store::touch_turn(&mut tx, &self.session, seq, &turn.ended_at).await?;
             if turn.interrupted != 0 {
-                devtime_store::mark_turn_interrupted(&mut *tx, &self.session, seq).await?;
+                devtime_store::mark_turn_interrupted(&mut tx, &self.session, seq).await?;
             }
         }
         for message in &rows.messages {
-            devtime_store::upsert_message(&mut *tx, message).await?;
+            devtime_store::upsert_message(&mut tx, message).await?;
         }
         for attempt in &rows.attempts {
-            devtime_store::upsert_attempt_launch(&mut *tx, attempt).await?;
+            devtime_store::upsert_attempt_launch(&mut tx, attempt).await?;
         }
         for marker in &rows.markers {
-            devtime_store::insert_marker(&mut *tx, marker).await?;
+            devtime_store::insert_marker(&mut tx, marker).await?;
         }
         tx.commit().await?;
         devtime_store::replace_spans(pool, &self.session, &spans).await

@@ -53,7 +53,7 @@ pub struct IdeSession {
 /// Beside the type rather than copied into each of them: `create` takes the whole session precisely
 /// so its directory and its id cannot come from two different places, and a fixture written out
 /// four times is four places for them to.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub fn had_in(cwd: &str, session_id: &str) -> IdeSession {
     IdeSession {
         session_id: session_id.to_string(),

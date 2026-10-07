@@ -158,11 +158,7 @@ fn last_commit_before(facts: &SessionFacts, before_ms: i64) -> i64 {
 }
 
 /// Successful edit-tool attempts after `from_ms` and before `to_ms`, any lane, in start order.
-fn edit_tool_calls_between<'a>(
-    facts: &'a SessionFacts,
-    from_ms: i64,
-    to_ms: i64,
-) -> Vec<&'a AttemptFact> {
+fn edit_tool_calls_between(facts: &SessionFacts, from_ms: i64, to_ms: i64) -> Vec<&AttemptFact> {
     facts
         .attempts
         .iter()

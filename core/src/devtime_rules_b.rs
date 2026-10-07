@@ -90,7 +90,7 @@ fn claims_only_first(
     let span_ids: Vec<i64> = facts
         .spans
         .iter()
-        .filter(|span| span.attempt_ids.iter().any(|id| *id == x.attempt_id))
+        .filter(|span| span.attempt_ids.contains(&x.attempt_id))
         .map(|span| span.id)
         .collect();
     Finding {
@@ -220,10 +220,10 @@ fn b7(facts: &SessionFacts, findings: &mut Vec<Finding>) {
                 .fails
                 .push(a);
         } else if passed(a) {
-            if let Some(run) = runs.remove(&a.lane) {
-                if let Some(finding) = finish_run(&run, a) {
-                    findings.push(finding);
-                }
+            if let Some(run) = runs.remove(&a.lane)
+                && let Some(finding) = finish_run(&run, a)
+            {
+                findings.push(finding);
             }
         } else {
             // A timeout, an interruption or a launch: the streak is not a plain retry loop.

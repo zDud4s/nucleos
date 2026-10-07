@@ -259,6 +259,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         hook,
         router,
         devtime,
+        distiller,
     ) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
@@ -303,6 +304,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         ),
         run_subsystem("llm_router", router_probe()),
         run_subsystem("devtime_ingest", devtime_probe(state.pool.clone())),
+        run_subsystem("distiller", distiller_probe(state.pool.clone())),
     );
     let subsystems = vec![
         pool,
@@ -321,6 +323,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         hook,
         router,
         devtime,
+        distiller,
     ];
 
     HealthReadout {
@@ -454,6 +457,77 @@ async fn devtime_probe(pool: sqlx::SqlitePool) -> SubsystemReadout {
     match crate::devtime_store::read_ingest_status(&pool).await {
         Ok(status) => devtime_row(status),
         Err(_) => SubsystemReadout::down("devtime_ingest", FailureCategory::Unknown),
+    }
+}
+
+/// What the distiller's durable queue holds right now, as the readout reports it.
+struct DistillTally {
+    /// Rows still waiting: `pending` and `running` both.
+    pending: i64,
+    /// Rows that failed inside the last 24 hours.
+    failed_24h: i64,
+    /// The newest `done` row's finish instant, as unix seconds; `None` before anything finished.
+    last_done_unix: Option<i64>,
+}
+
+/// One query, three scalar subselects over `distill_queue`.
+///
+/// `finished_at` is RFC 3339 from chrono on both sides, so the 24h cutoff is a plain string
+/// comparison. `MAX(finished_at)` is parsed back to an instant; a value that does not parse is
+/// read as "no instant" rather than failing the whole row.
+async fn distiller_tally(
+    pool: &SqlitePool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<DistillTally> {
+    let cutoff = (now - chrono::Duration::hours(24)).to_rfc3339();
+    let (pending, failed_24h, last_done): (i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT \
+           (SELECT COUNT(*) FROM distill_queue WHERE status IN (?, ?)), \
+           (SELECT COUNT(*) FROM distill_queue WHERE status = ? AND finished_at >= ?), \
+           (SELECT MAX(finished_at) FROM distill_queue WHERE status = ?)",
+    )
+    .bind(crate::distill::STATUS_PENDING)
+    .bind(crate::distill::STATUS_RUNNING)
+    .bind(crate::distill::STATUS_FAILED)
+    .bind(cutoff)
+    .bind(crate::distill::STATUS_DONE)
+    .fetch_one(pool)
+    .await?;
+    Ok(DistillTally {
+        pending,
+        failed_24h,
+        last_done_unix: last_done
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .map(|at| at.timestamp()),
+    })
+}
+
+/// PURE: the distiller row, from its queue tally.
+///
+/// A failure inside the last 24 hours is `degraded` and never `down`: the distiller only turns
+/// closed work into learnings and stops nothing else. `last_done_unix` is absent, not zero, when
+/// nothing has ever been distilled.
+fn distiller_row(tally: DistillTally) -> SubsystemReadout {
+    let mut row = if tally.failed_24h > 0 {
+        SubsystemReadout::degraded("distiller", FailureCategory::Unknown)
+    } else {
+        SubsystemReadout::ok("distiller")
+    };
+    let mut counts = std::collections::BTreeMap::from([
+        ("pending", tally.pending),
+        ("failed_24h", tally.failed_24h),
+    ]);
+    if let Some(at) = tally.last_done_unix {
+        counts.insert("last_done_unix", at);
+    }
+    row.counts = Some(counts);
+    row
+}
+
+async fn distiller_probe(pool: sqlx::SqlitePool) -> SubsystemReadout {
+    match distiller_tally(&pool, chrono::Utc::now()).await {
+        Ok(tally) => distiller_row(tally),
+        Err(_) => SubsystemReadout::down("distiller", FailureCategory::Unknown),
     }
 }
 
@@ -1108,7 +1182,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 
@@ -1745,5 +1819,82 @@ url: http://127.0.0.1:{port}
         assert_eq!(json["counts"]["unmapped"], 3);
         let plain = serde_json::to_value(SubsystemReadout::ok("x")).unwrap();
         assert!(plain.get("counts").is_none());
+    }
+
+    #[test]
+    fn distiller_row_counts_the_queue() {
+        let row = distiller_row(DistillTally {
+            pending: 3,
+            failed_24h: 0,
+            last_done_unix: Some(1_759_000_000),
+        });
+        assert_eq!((row.name, row.status), ("distiller", HealthState::Ok));
+        let counts = row.counts.as_ref().expect("a tally gives counts");
+        assert_eq!(counts.get("pending"), Some(&3));
+        assert_eq!(counts.get("failed_24h"), Some(&0));
+        assert_eq!(counts.get("last_done_unix"), Some(&1_759_000_000));
+        // Nothing has ever been distilled: the instant is absent, not zero.
+        let fresh = distiller_row(DistillTally {
+            pending: 0,
+            failed_24h: 0,
+            last_done_unix: None,
+        });
+        let counts = fresh.counts.as_ref().expect("a tally gives counts");
+        assert!(!counts.contains_key("last_done_unix"));
+        assert_eq!(counts.get("pending"), Some(&0));
+    }
+
+    #[test]
+    fn distiller_row_turns_degraded_on_a_recent_failure() {
+        let row = distiller_row(DistillTally {
+            pending: 0,
+            failed_24h: 1,
+            last_done_unix: None,
+        });
+        assert_eq!(row.status, HealthState::Degraded);
+        assert_eq!(row.reason, Some(FailureCategory::Unknown));
+    }
+
+    #[tokio::test]
+    async fn distiller_tally_reads_the_queue() {
+        let pool = migrated_pool().await;
+        let now = chrono::Utc::now();
+        let t1 = now - chrono::Duration::hours(5);
+        let t2 = now - chrono::Duration::hours(2);
+        let rows: [(i64, &str, Option<chrono::DateTime<chrono::Utc>>); 6] = [
+            (1, crate::distill::STATUS_PENDING, None),
+            (2, crate::distill::STATUS_RUNNING, None),
+            (3, crate::distill::STATUS_DONE, Some(t1)),
+            (4, crate::distill::STATUS_DONE, Some(t2)),
+            (
+                5,
+                crate::distill::STATUS_FAILED,
+                Some(now - chrono::Duration::hours(1)),
+            ),
+            (
+                6,
+                crate::distill::STATUS_FAILED,
+                Some(now - chrono::Duration::hours(48)),
+            ),
+        ];
+        for (job_id, status, finished) in rows {
+            sqlx::query(
+                "INSERT INTO distill_queue \
+                 (cause, project_id, job_id, status, created_at, finished_at) \
+                 VALUES ('job_landed', 'p', ?, ?, ?, ?)",
+            )
+            .bind(job_id)
+            .bind(status)
+            .bind(now.to_rfc3339())
+            .bind(finished.map(|at| at.to_rfc3339()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let tally = distiller_tally(&pool, now).await.unwrap();
+        // A pending and a running row both still wait; only the failure inside 24h counts.
+        assert_eq!(tally.pending, 2);
+        assert_eq!(tally.failed_24h, 1);
+        assert_eq!(tally.last_done_unix, Some(t2.timestamp()));
     }
 }

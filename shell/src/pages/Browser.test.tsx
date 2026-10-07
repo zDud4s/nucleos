@@ -12,9 +12,11 @@ vi.mock("../data/client", async (original) => ({
 import { Browser } from "./Browser";
 import { ApiRefusal } from "../data/client";
 import type { BrowserSession, Site, SidecarState, SubsystemReadout, Written } from "../data/browser";
+import { forgetSeat, rememberSeat, seatNonce } from "../data/seat";
 import { daemonFetch, daemonState, project, renderWithRouter } from "../test/harness";
 
 beforeEach(() => {
+  for (const id of [1, 2, 3, 5]) forgetSeat(id);
   daemon.apiFetch.mockReset();
   daemon.apiText.mockReset();
   daemon.probeHealth.mockReset();
@@ -35,6 +37,8 @@ function session(overrides: Partial<BrowserSession> = {}): BrowserSession {
     final_url: "https://example.com/login",
     rule: "ask",
     mode: "human",
+    seat: null,
+    shell_eligible: false,
     refusal: null,
     proposal_id: null,
     chain: null,
@@ -114,6 +118,21 @@ function browserFetch(world: BrowserWorld): (path: string, init?: RequestInit) =
       if (path === "/browser/window" && init.method === "POST") {
         return world.onWindow(String(init.body));
       }
+      const take = /^\/browser\/sessions\/(\d+)\/take$/.exec(path);
+      if (take) {
+        const row = world.sessions.find((one) => one.id === Number(take[1]));
+        if (row) {
+          row.mode = "human";
+          row.seat = "shell";
+        }
+        return { session: row, seat_nonce: "n1" };
+      }
+      const real = /^\/browser\/sessions\/(\d+)\/window$/.exec(path);
+      if (real) {
+        const row = world.sessions.find((one) => one.id === Number(real[1]));
+        if (row) row.seat = "window";
+        return { session: row };
+      }
       if (path === "/browser/return") {
         return { chain: ["https://jira.example.org/login", "https://jira.example.org/browse/X-1"] };
       }
@@ -170,7 +189,7 @@ describe("Browser - live sessions", () => {
     // decision of its own — the buttons that decide it appear exactly once
     // in the app, and this is not the page that has them.
     expect(screen.getByRole("link", { name: "answer it there" })).toBeDefined();
-    expect(screen.queryByRole("button", { name: /Give wheel #\d+ the window/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /wheel #\d+/ })).toBeNull();
     expect(screen.queryByRole("button", { name: /Refuse wheel/ })).toBeNull();
 
     // This page's own actions exist, worded differently so neither is ever
@@ -220,6 +239,121 @@ describe("Browser - live sessions", () => {
     // And stopping leaves none open.
     fireEvent.click(screen.getByRole("button", { name: "Stop watching" }));
     expect(await screen.findAllByRole("button", { name: "Watch" })).toHaveLength(2);
+  });
+});
+
+/* ------------------------------------------------------ the wheel, in shell -- */
+
+describe("Browser - driving a session from the shell", () => {
+  const postsTo = (world: BrowserWorld, path: string) => world.posted.filter((one) => one.path === path);
+
+  it("offers Take the wheel only on an eligible agent session and drives with the returned nonce", async () => {
+    const world = browserWorld({
+      sessions: [
+        session({ id: 1, mode: "agent", shell_eligible: true }),
+        session({ id: 2, mode: "agent", shell_eligible: false }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+    daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+    await renderBrowser();
+
+    // One eligible row, one button; the other agent row only has Watch and Close.
+    const take = await screen.findAllByRole("button", { name: "Take the wheel" });
+    expect(take).toHaveLength(1);
+
+    fireEvent.click(take[0]);
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Stop the agent and drive it here" }));
+
+    await waitFor(() => expect(postsTo(world, "/browser/sessions/1/take")).toHaveLength(1));
+    // The nonce the core returned is the one this shell now holds, and the view opened on it.
+    await waitFor(() => expect(seatNonce(1)).toBe("n1"));
+    await waitFor(() => expect(daemon.openStream).toHaveBeenCalled());
+    expect(daemon.openStream.mock.calls[0][0]).toBe("/browser/sessions/1/live");
+    // The session came back as `human` on a shell seat: the toggle says it is driving.
+    expect(await screen.findByRole("button", { name: "Stop driving" })).toBeDefined();
+  });
+
+  it("a shell seat offers Give back to the agent, Close and Open real window", async () => {
+    const world = browserWorld({
+      sessions: [session({ id: 5, mode: "human", seat: "shell" })],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+    daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+    await renderBrowser();
+
+    expect(await screen.findByRole("button", { name: "Give back to the agent" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Close" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Open real window" })).toBeDefined();
+    // The window-seat wording is not the one a shell seat gets.
+    expect(screen.queryByRole("button", { name: "Give the wheel back" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Give back to the agent" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Restore the fence and hand it back" }));
+    await waitFor(() => expect(postsTo(world, "/browser/return")).toHaveLength(1));
+    expect(JSON.parse(postsTo(world, "/browser/return")[0].body)).toEqual({ session_id: 5, to: "agent" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Close it and bring the chain back" }));
+    await waitFor(() => expect(postsTo(world, "/browser/return")).toHaveLength(2));
+    expect(JSON.parse(postsTo(world, "/browser/return")[1].body)).toEqual({ session_id: 5, to: "close" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open real window" }));
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Swap to a real window here" }));
+    await waitFor(() => expect(postsTo(world, "/browser/sessions/5/window")).toHaveLength(1));
+  });
+
+  it("offers Drive here on a shell seat whose nonce was lost, and never otherwise", async () => {
+    const world = browserWorld({
+      sessions: [
+        session({ id: 1, mode: "human", seat: "shell" }),
+        session({ id: 2, mode: "human", seat: "shell" }),
+        session({ id: 3, mode: "human", seat: "window" }),
+      ],
+    });
+    rememberSeat(2, "held");
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+    daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+    await renderBrowser();
+
+    // Only row 1 lost its nonce: row 2 holds one, row 3 is a real window.
+    const drive = await screen.findAllByRole("button", { name: "Drive here" });
+    expect(drive).toHaveLength(1);
+
+    fireEvent.click(drive[0]);
+    await afterDwell();
+    fireEvent.click(await screen.findByRole("button", { name: "Take the wheel again and drive it here" }));
+
+    await waitFor(() => expect(postsTo(world, "/browser/sessions/1/take")).toHaveLength(1));
+    await waitFor(() => expect(seatNonce(1)).toBe("n1"));
+    // With a nonce in hand the button is gone and the live view is driven.
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Drive here" })).toBeNull());
+    await waitFor(() => expect(daemon.openStream).toHaveBeenCalled());
+    expect(daemon.openStream.mock.calls[0][0]).toBe("/browser/sessions/1/live");
+    forgetSeat(2);
+  });
+
+  it("offers Watch on a wheel-requested row", async () => {
+    const world = browserWorld({
+      sessions: [session({ id: 2, mode: "wheel-requested", proposal_id: 91 })],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+    daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+    await renderBrowser();
+
+    const watch = await screen.findByRole("button", { name: "Watch" });
+    expect(screen.getByRole("link", { name: "answer it there" })).toBeDefined();
+    fireEvent.click(watch);
+    await waitFor(() => expect(daemon.openStream).toHaveBeenCalledTimes(1));
+    expect(daemon.openStream.mock.calls[0][0]).toBe("/browser/sessions/2/live");
   });
 });
 

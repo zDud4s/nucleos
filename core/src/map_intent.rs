@@ -249,7 +249,7 @@ pub fn parse_extraction(answer: &str) -> Vec<Extracted> {
 /// second entrance (§6) unwrapping the same habit at the other end of the feature. Two spellings of
 /// *find the JSON a model buried in prose* would be two answers to that question, and the one that
 /// drifted would be found by whichever half of the map stopped working.
-pub(crate) fn json_object(answer: &str) -> Option<&str> {
+pub fn json_object(answer: &str) -> Option<&str> {
     let start = answer.find('{')?;
     let end = answer.rfind('}')?;
     (end > start).then(|| &answer[start..=end])
@@ -437,7 +437,7 @@ pub async fn extract(
 /// that shipped before this parameter existed pass — a standing instruction is a change to what a
 /// model is told on every turn, and adding one to a shipped feature while wiring up a different
 /// one would be two changes reported as one.
-pub(crate) async fn ask_once(
+pub async fn ask_once(
     runner: &dyn crate::runner::CommandRunner,
     prompt: String,
     what: &str,

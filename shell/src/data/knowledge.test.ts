@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  distilledOrigin,
   groupWaiting,
   measuredByGenerator,
   parseEvidence,
@@ -55,6 +56,51 @@ describe("parseEvidence", () => {
 
   it("an evidence of only unknown tags counts as empty", () => {
     expect(parseEvidence(JSON.stringify([{ t: "mystery", id: 7 }]))).toEqual([]);
+  });
+
+  it("parseEvidence keeps a job reference", () => {
+    expect(parseEvidence('[{"t":"job","id":7},{"t":"run","id":3}]')).toEqual([
+      { t: "job", id: 7 },
+      { t: "run", id: 3 },
+    ]);
+  });
+});
+
+describe("distilledOrigin", () => {
+  it("distilledOrigin names the job, the runs and the cause", () => {
+    const row = known({
+      id: 5,
+      source: "distiller",
+      evidence: '[{"t":"job","id":7},{"t":"run","id":3},{"t":"run","id":4}]',
+    });
+
+    expect(distilledOrigin(row, new Map([[5, "job_failed"]]))).toEqual({
+      job: 7,
+      runs: [3, 4],
+      cause: "job_failed",
+      causeLabel: "the job failed",
+    });
+    // A cause this build does not know is shown as it came, not hidden.
+    expect(distilledOrigin(row, new Map([[5, "something_new"]]))).toMatchObject({
+      cause: "something_new",
+      causeLabel: "something_new",
+    });
+    // No cause on record: the origin still names its job.
+    expect(distilledOrigin(row, new Map())).toMatchObject({
+      job: 7,
+      cause: null,
+      causeLabel: null,
+    });
+  });
+
+  it("distilledOrigin is null for a row the distiller did not write", () => {
+    const row = known({
+      id: 5,
+      source: "run",
+      evidence: '[{"t":"job","id":7}]',
+    });
+
+    expect(distilledOrigin(row, new Map([[5, "job_failed"]]))).toBeNull();
   });
 });
 

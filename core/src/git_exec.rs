@@ -53,7 +53,7 @@ const OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 /// caller reading its own count hands the same `&Path` it handed to the call, and canonicalising
 /// would introduce a second way for the two to differ (`\\?\` prefixes, 8.3 short names) in service
 /// of a case no test has.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub mod spawns {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -305,7 +305,7 @@ pub async fn run_git(
     // module whose cost is being asserted — a counter the caller increments beside its own call is
     // one a refactor moving that call takes with it, which is exactly the refactor the count exists
     // to catch. Compiled out of the daemon entirely; see [`spawns`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     spawns::record(repo);
 
     let live = in_flight::Guard::enter(repo);
@@ -1354,7 +1354,7 @@ pub async fn current_branch(path: &Path, deadline: std::time::Instant) -> Result
 /// On Windows this returns a verbatim path (`\\?\C:\…`). That is fine for a key, whose only job is
 /// to compare equal to itself, and it is worth knowing before anyone compares a stored repository
 /// key against a stored `project_root` — they are in different spellings on purpose.
-pub(crate) async fn canonical(path: &Path) -> Result<String, String> {
+pub async fn canonical(path: &Path) -> Result<String, String> {
     tokio::fs::canonicalize(path)
         .await
         .map(|path| path.to_string_lossy().into_owned())
@@ -2792,47 +2792,17 @@ async fn push(
 // fifth copy of `init_contained_repo` — four already exist in this crate. Sharing the four helpers
 // `vcs.rs` reaches for (`repo_with_a_branch_to_merge`, `space_free_tempdir`, `WorktreeRootEnv`,
 // `sha_of`) is the smaller cost, and it keeps one definition of what a test repository looks like.
-#[cfg(test)]
-pub(crate) mod tests {
-    // A process-wide guard held across awaits on purpose: it serialises mutation of the shared
-    // NUCLEOS_WORKTREE_ROOT override, and there is no multi-thread runtime here to starve.
-    #![allow(clippy::await_holding_lock)]
-
+/// Fixtures the test module below uses and the binary's tests (`http.rs`) reach for too —
+/// lifted out of `mod tests` by the lib/bin split so the `testkit` feature can expose them.
+#[cfg(any(test, feature = "testkit"))]
+#[allow(unused_imports)]
+pub mod testkit {
     use super::*;
     use std::ffi::{OsStr, OsString};
-    // `Path` explicitly, not via `use super::*`: at Step 1 this file contains nothing BUT this
-    // module, so the glob imports nothing and the helpers below would not resolve it.
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    pub(crate) struct WorktreeRootEnv {
-        previous: Option<OsString>,
-    }
-
-    impl WorktreeRootEnv {
-        // `pub(crate)` on the associated function as well as the struct: the struct alone gives
-        // `error[E0624]: associated function 'set' is private` at `vcs.rs`'s call site.
-        pub(crate) fn set(path: &Path) -> Self {
-            let previous = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
-            unsafe {
-                std::env::set_var("NUCLEOS_WORKTREE_ROOT", path);
-            }
-            Self { previous }
-        }
-    }
-
-    impl Drop for WorktreeRootEnv {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var("NUCLEOS_WORKTREE_ROOT", value),
-                    None => std::env::remove_var("NUCLEOS_WORKTREE_ROOT"),
-                }
-            }
-        }
-    }
-
-    fn git_ok(dir: &Path, args: &[&OsStr]) -> bool {
+    pub fn git_ok(dir: &Path, args: &[&OsStr]) -> bool {
         Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -2845,7 +2815,7 @@ pub(crate) mod tests {
     /// Cargo cannot link under a path containing a space, and the daemon refuses such a worktree
     /// root for the same reason (`worktree.rs:107-111`) — so a tempdir under the checkout, not the
     /// system temp directory, which on Windows is routinely under `C:\Users\Some Name\`.
-    pub(crate) fn space_free_tempdir(prefix: &str) -> tempfile::TempDir {
+    pub fn space_free_tempdir(prefix: &str) -> tempfile::TempDir {
         let base = std::env::current_dir().expect("resolve current directory");
         assert!(
             !base.to_string_lossy().contains(' '),
@@ -2859,7 +2829,7 @@ pub(crate) mod tests {
 
     /// `pub(crate)` for `runs.rs`, which needs a real repository to test the approval path against —
     /// the same reason `space_free_tempdir` above is.
-    pub(crate) fn initialize_repo(repo: &Path) {
+    pub fn initialize_repo(repo: &Path) {
         std::fs::create_dir_all(repo).expect("create repository directory");
         assert!(git_ok(repo, &[OsStr::new("init")]));
         assert!(git_ok(
@@ -2899,7 +2869,7 @@ pub(crate) mod tests {
         ));
     }
 
-    fn init_contained_repo(prefix: &str) -> (tempfile::TempDir, PathBuf) {
+    pub fn init_contained_repo(prefix: &str) -> (tempfile::TempDir, PathBuf) {
         let container = space_free_tempdir(prefix);
         let repo = container.path().join("repo");
         initialize_repo(&repo);
@@ -2908,7 +2878,7 @@ pub(crate) mod tests {
 
     /// `master` with a `feat/x` that touched one file, and back on `master`. Every test in this task
     /// starts here.
-    pub(crate) fn repo_with_a_branch_to_merge(prefix: &str) -> (tempfile::TempDir, PathBuf) {
+    pub fn repo_with_a_branch_to_merge(prefix: &str) -> (tempfile::TempDir, PathBuf) {
         let (container, repo) = init_contained_repo(prefix);
         assert!(git_ok(
             &repo,
@@ -2938,8 +2908,50 @@ pub(crate) mod tests {
         ));
         (container, repo)
     }
+}
 
-    pub(crate) fn sha_of(repo: &Path, revision: &str) -> String {
+#[cfg(test)]
+pub mod tests {
+    // A process-wide guard held across awaits on purpose: it serialises mutation of the shared
+    // NUCLEOS_WORKTREE_ROOT override, and there is no multi-thread runtime here to starve.
+    #![allow(clippy::await_holding_lock)]
+
+    pub use super::testkit::*;
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+    // `Path` explicitly, not via `use super::*`: at Step 1 this file contains nothing BUT this
+    // module, so the glob imports nothing and the helpers below would not resolve it.
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    pub struct WorktreeRootEnv {
+        previous: Option<OsString>,
+    }
+
+    impl WorktreeRootEnv {
+        // `pub(crate)` on the associated function as well as the struct: the struct alone gives
+        // `error[E0624]: associated function 'set' is private` at `vcs.rs`'s call site.
+        pub fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
+            unsafe {
+                std::env::set_var("NUCLEOS_WORKTREE_ROOT", path);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for WorktreeRootEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("NUCLEOS_WORKTREE_ROOT", value),
+                    None => std::env::remove_var("NUCLEOS_WORKTREE_ROOT"),
+                }
+            }
+        }
+    }
+
+    pub fn sha_of(repo: &Path, revision: &str) -> String {
         let output = Command::new("git")
             .arg("-C")
             .arg(repo)
@@ -3520,7 +3532,7 @@ gate_command: git --version
             )
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         let outcome = GitExecutor {
             machine_root: Some(container.path().to_path_buf()),
             pool: Some(pool.clone()),

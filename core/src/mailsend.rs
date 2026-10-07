@@ -309,7 +309,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        crate::storage::MIGRATOR.run(&pool).await.unwrap();
         AppState {
             // Recognisable on purpose: this is the value a fallback would reach for.
             token: Token("control-token".into()),

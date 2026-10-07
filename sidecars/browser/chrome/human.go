@@ -40,13 +40,12 @@ import (
 type Human struct {
 	conn *cdp.Conn
 
-	mu      sync.Mutex
-	chain   []string
-	id      browser.SessionID
-	target  string
-	cdp     cdp.SessionID
-	url     string
-	stopped bool
+	mu     sync.Mutex
+	id     browser.SessionID
+	target string
+	cdp    cdp.SessionID
+	// rec is the chain. Its own lock: onEvent records from the connection's goroutine.
+	rec chainRecorder
 
 	unsubscribe func()
 }
@@ -98,30 +97,11 @@ func (h *Human) onEvent(event cdp.Event) {
 	h.record(params.TargetInfo.URL)
 }
 
-// record appends a url unless it is the one already at the end.
-//
-// Consecutive duplicates only. A chain that returns to where it started — jira, google, jira — is
-// what a real login looks like, and collapsing that to a set here would take from `grant` the one
-// piece of information it uses to tell the destination from the identity provider.
-func (h *Human) record(url string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.stopped {
-		return
-	}
-	if len(h.chain) > 0 && h.chain[len(h.chain)-1] == url {
-		return
-	}
-	h.chain = append(h.chain, url)
-	h.url = url
-}
+// record appends a url unless it is the one already at the end. See chainRecorder.
+func (h *Human) record(url string) { h.rec.record(url) }
 
 // Chain is what the person's navigation produced, in order.
-func (h *Human) Chain() []string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return append([]string(nil), h.chain...)
-}
+func (h *Human) Chain() []string { return h.rec.Chain() }
 
 // Open shows the person the page, in a real window.
 //
@@ -188,8 +168,8 @@ func (h *Human) Close(ctx context.Context, id browser.SessionID) error {
 	// Nothing after this point is part of the person's login, so the recorder stops here rather than
 	// on the connection closing: the tabs Chrome touches while it shuts down are not somewhere anyone
 	// chose to go, and they would arrive at `grant` looking exactly like somewhere they did.
-	h.stopped = true
 	h.mu.Unlock()
+	h.rec.stop()
 
 	closing, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
@@ -231,8 +211,8 @@ func (h *Human) Handoff(context.Context, browser.SessionID, string) (browser.Han
 
 // Detach stops the recorder. Called when the browser behind it is going away.
 func (h *Human) Detach() {
+	h.rec.stop()
 	h.mu.Lock()
-	h.stopped = true
 	unsubscribe := h.unsubscribe
 	h.unsubscribe = nil
 	h.mu.Unlock()

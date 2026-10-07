@@ -48,4 +48,58 @@ describe("live records", () => {
     expect(parser.push(record("E", text("not json")))).toEqual([{ kind: "end", reason: "gone" }]);
     expect(parser.push(record("Z", new Uint8Array([1])))).toEqual([{ kind: "end", reason: "gone" }]);
   });
+
+  const META = {
+    frameWidth: 800,
+    frameHeight: 600,
+    deviceWidth: 1280,
+    deviceHeight: 720,
+    offsetTop: 12.5,
+    pageScaleFactor: 1.25,
+    scrollOffsetX: 0,
+    scrollOffsetY: 40,
+  };
+
+  it("parses an M record into frame metadata", () => {
+    const parser = new RecordParser();
+    expect(parser.push(record("M", text(JSON.stringify(META))))).toEqual([{ kind: "meta", meta: META }]);
+  });
+
+  it("parses P prompt records of every kind and a resolved one", () => {
+    const parser = new RecordParser();
+    const prompts = [
+      { id: "p1", kind: "dialog", dialogType: "prompt", message: "Name?", defaultPrompt: "x" },
+      {
+        id: "p2",
+        kind: "select",
+        options: [
+          { value: "a", label: "A", selected: false },
+          { value: "b", label: "B", selected: true },
+        ],
+        multiple: false,
+      },
+      { id: "p3", kind: "file", multiple: true, accept: "image/*" },
+      { id: "p4", kind: "auth", origin: "https://example.test", realm: "staff" },
+    ];
+    for (const prompt of prompts) {
+      expect(parser.push(record("P", text(JSON.stringify(prompt))))).toEqual([{ kind: "prompt", prompt }]);
+    }
+    const resolved = { id: "p1", kind: "dialog", resolved: true };
+    expect(parser.push(record("P", text(JSON.stringify(resolved))))).toEqual([{ kind: "prompt", prompt: resolved }]);
+  });
+
+  it("a malformed M or P body ends as gone", () => {
+    const gone = [{ kind: "end", reason: "gone" }];
+    const bad = [
+      record("M", text(JSON.stringify({ ...META, offsetTop: undefined }))),
+      record("M", text('{"frameWidth":800}')),
+      record("M", text(JSON.stringify({ ...META, pageScaleFactor: "1.25" }))),
+      record("M", text("not json")),
+      record("P", text(JSON.stringify({ kind: "dialog", dialogType: "alert", message: "m", defaultPrompt: "" }))),
+      record("P", text(JSON.stringify({ id: "p1", kind: "teleport" }))),
+      record("P", text(JSON.stringify({ id: "p1", kind: "select", options: "nope", multiple: false }))),
+      record("P", text("not json")),
+    ];
+    for (const one of bad) expect(new RecordParser().push(one)).toEqual(gone);
+  });
 });

@@ -319,6 +319,16 @@
   border: 1px solid var(--border);
 }
 
+.browser-live-drive {
+  width: fit-content;
+  max-width: 100%;
+}
+
+.browser-live-drive:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
 .browser-live-status {
   display: flex;
   gap: var(--space-3);

@@ -404,7 +404,7 @@ mod tests {
         // A session with no attempt at all: it cannot have fired anything, so it is not counted.
         let mut tx = devtime_store::begin_chunk(&pool).await.unwrap();
         devtime_store::upsert_session(
-            &mut *tx,
+            &mut tx,
             &SessionRow {
                 session_id: "s4".to_string(),
                 project_id: "p1".to_string(),

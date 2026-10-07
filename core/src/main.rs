@@ -1,155 +1,6 @@
-mod agent;
-mod assistant;
-mod assistants;
-mod attention;
-mod auth;
-mod autopilot;
-mod autostart;
-mod backup;
-mod brief;
-mod browser;
-mod browser_client;
-mod browser_live;
-mod browser_policy;
-mod browser_wheel;
-mod budget;
-mod calendar;
-mod capabilities;
-mod chat_groups;
-mod chat_notices;
-mod chats;
-mod classifier;
-mod collision;
-mod command_reader;
-mod commands;
-mod concurrency;
-mod config;
-mod consolidate;
-mod contacts;
-mod council;
-mod daemon_client;
-mod detect;
-mod devtime;
-mod devtime_lanes;
-mod devtime_map;
-mod devtime_parse;
-mod devtime_precision;
-mod devtime_rules;
-mod devtime_rules_a;
-mod devtime_rules_b;
-mod devtime_rules_c;
-mod devtime_rules_cmd;
-mod devtime_rules_dctx;
-mod devtime_rules_dflow;
-mod devtime_rules_f;
-#[cfg(test)]
-mod devtime_rules_fixture;
-mod devtime_store;
-mod devtime_unexplained;
-mod distill;
-mod email;
-mod exclusion;
-mod feed;
-mod files;
-mod gate;
-mod git_exec;
-mod github;
-mod handoff;
-mod health;
-mod hooks;
 mod http;
-mod inspect;
-mod job;
-mod join;
-mod judge;
-mod knowledge;
-mod land;
-mod local_agent;
-mod logging;
-mod machine_config;
-mod mailsend;
-mod map_anchor;
-mod map_intent;
-mod map_items;
-mod map_join;
-mod map_orphan;
-mod map_recency;
-mod map_seam;
-mod map_stamp;
-mod map_store;
-mod map_triage;
-mod mcp_tools;
-mod mentions;
-mod model_catalog;
-mod notes;
-mod notify;
-mod notify_policy;
-mod onboarding;
-mod openai_compatible;
-mod owner_notes;
-mod ownership;
-mod pii_shadow;
-mod presets;
-mod pressure;
-mod priority;
-mod process_tree;
-mod project_commands;
-mod project_exit;
-mod project_map;
-mod project_policy;
-mod project_readings;
-mod project_state;
-mod prompt_budget;
-mod proposals;
-mod quota;
-mod quota_client;
-mod recurrence;
-mod redact;
-mod relay;
-mod repo_trigger;
-mod resolver;
-mod route_advice;
-mod route_report;
-mod router_client;
-mod run_stop;
-mod runner;
-mod runs;
-mod scheduler;
-mod search;
-mod seat_advice;
-mod secrets;
-mod seed;
-mod sessions;
-mod shadow;
-mod sidecar;
-mod speak;
-mod speed;
-mod state;
-mod storage;
-mod team;
-mod team_notes;
-mod team_trigger;
-mod test_select;
-#[cfg(test)]
-mod testdb;
-mod tests_map;
-mod token_efficiency;
-mod transcribe;
-mod triage;
-mod trust;
-mod vcs;
-mod verify_runs;
-mod voice;
-mod wave;
-mod web;
-mod web_client;
-mod webhook;
-mod wip;
-mod workflow_graph;
-mod workflow_materialize;
-mod workflow_package;
-mod workflows;
-mod worktree;
+
+use nucleos_core::*;
 
 use auth::Token;
 use state::AppState;
@@ -1066,6 +917,17 @@ async fn main() {
         );
     }
 
+    // Spec 2026-10-04 §4.2 item 5: a task caught mid-flight by a restart is `orphaned`, beside the
+    // turns marked `interrupted` above. Best effort: a stale task row must not stop the daemon.
+    match chat_tasks::orphan_running(&pool).await {
+        Ok(0) => {}
+        Ok(orphaned) => tracing::warn!(
+            orphaned,
+            "chat tasks left running by a restart -> 'orphaned'"
+        ),
+        Err(error) => tracing::warn!(%error, "could not mark chat tasks left running"),
+    }
+
     let stranded = runs::reconcile_stranded_approvals(&pool)
         .await
         .expect("failed to reconcile stranded approval pauses on startup");
@@ -1114,6 +976,17 @@ async fn main() {
     // Neither fatal like the run reconciliations above nor mere hygiene like the worktree sweep
     // below: louder than the sweep, quieter than the panics.
     //
+    // A verification unit left `running` was cut off by the restart, and the agent holding its ticket
+    // is still waiting: put it back in the queue. One that keeps taking the daemon down gives up
+    // after `verify_runs::MAX_INTERRUPTIONS` instead of looping.
+    match verify_runs::requeue_interrupted(&pool).await {
+        Ok((requeued, given_up)) if requeued + given_up > 0 => tracing::warn!(
+            "requeued {requeued} verification unit(s) interrupted by the restart; gave up on {given_up}"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::error!(%error, "verification queue reconciliation failed"),
+    }
+
     // A `vcs_requests` row left `running` holds its repository's only slot — the partial unique
     // index sees to that — so failing to clear it means no git operation for that project until
     // somebody notices. That is a jam, not untidiness, hence `error!`. But it is one pillar's queue:
@@ -1325,6 +1198,10 @@ async fn main() {
     let devtime_config = machine_file(machine_config::DEVTIME_FILE)
         .as_deref()
         .map(config::load_devtime_config)
+        .unwrap_or_default();
+    let verify_config = machine_file(machine_config::VERIFY_FILE)
+        .as_deref()
+        .map(config::load_verify_config)
         .unwrap_or_default();
     let web_config = machine_file(machine_config::WEB_FILE)
         .as_deref()
@@ -1784,6 +1661,7 @@ async fn main() {
                 browser_sidecar_token.clone(),
             ),
             modes: Default::default(),
+            seats: Default::default(),
         }),
         web: Arc::new(web::WebRuntime {
             enabled: web_config.enabled,
@@ -2000,6 +1878,13 @@ async fn main() {
         devtime_config,
         devtime_projects_dir,
     ));
+    // Nothing submits to it yet (F2a-2 wires `verify`), but an empty queue costs one poll, and
+    // starting it now lets the restart above hand interrupted units straight back to a worker.
+    tokio::spawn(verify_exec::run_executor(verify_exec::Executor::new(
+        state.pool.clone(),
+        verify_config,
+        machine_config_root.clone(),
+    )));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor {
