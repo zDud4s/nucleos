@@ -1081,9 +1081,11 @@ async fn main() {
             );
             config::ModelsConfig::default()
         });
+    // The owner's saved choice (Settings) wins over the file, which is the default of an untouched
+    // install; `embed::install` is called again by the settings door when the choice changes.
     embed::install(Arc::new(embed::OllamaEmbedder::new(
         runner::OLLAMA_BASE_URL.to_string(),
-        models_config.embedding_model.clone(),
+        embed_model::effective(&pool, &models_config.embedding_model).await,
     )));
     let (triage_runner, local_triage_disabled): (
         Option<Arc<dyn runner::CommandRunner>>,

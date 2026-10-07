@@ -260,6 +260,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         router,
         devtime,
         distiller,
+        embeddings,
     ) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
@@ -305,6 +306,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         run_subsystem("llm_router", router_probe()),
         run_subsystem("devtime_ingest", devtime_probe(state.pool.clone())),
         run_subsystem("distiller", distiller_probe(state.pool.clone())),
+        run_subsystem("embeddings", embeddings_probe()),
     );
     let subsystems = vec![
         pool,
@@ -324,6 +326,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         router,
         devtime,
         distiller,
+        embeddings,
     ];
 
     HealthReadout {
@@ -529,6 +532,40 @@ async fn distiller_probe(pool: sqlx::SqlitePool) -> SubsystemReadout {
         Ok(tally) => distiller_row(tally),
         Err(_) => SubsystemReadout::down("distiller", FailureCategory::Unknown),
     }
+}
+
+/// PURE: the embeddings row, from the installed model (`None`: no embedder) and what Ollama lists.
+///
+/// An empty listing is `unreachable`: Ollama down and nothing pulled look the same through
+/// `/api/tags`, and either way no embedding can be made. A model missing from a non-empty listing
+/// is `missing`. Both are `degraded`, never `down`: without vectors a briefing only goes without
+/// similarity and the distiller dedups by text.
+fn embeddings_row(model: Option<&str>, listed: &[String]) -> SubsystemReadout {
+    let Some(model) = model else {
+        return SubsystemReadout::disabled("embeddings", FailureCategory::NotConfigured);
+    };
+    if listed.is_empty() {
+        SubsystemReadout::degraded("embeddings", FailureCategory::Unreachable)
+    } else if !crate::embed_model::is_pulled(model, listed) {
+        SubsystemReadout::degraded("embeddings", FailureCategory::Missing)
+    } else {
+        SubsystemReadout::ok("embeddings")
+    }
+}
+
+/// Asks Ollama what it has pulled (`GET /api/tags`: no text, no vector, loads no model) and checks
+/// the installed embedding model is in it.
+async fn embeddings_probe() -> SubsystemReadout {
+    let Some(embedder) = crate::embed::installed() else {
+        return embeddings_row(None, &[]);
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(400))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let listed =
+        crate::capabilities::installed_local_models(&client, crate::runner::OLLAMA_BASE_URL).await;
+    embeddings_row(Some(embedder.model()), &listed)
 }
 
 /// PURE: the row. `reachable` matters only for a plan that asks.
@@ -1842,6 +1879,34 @@ url: http://127.0.0.1:{port}
         let counts = fresh.counts.as_ref().expect("a tally gives counts");
         assert!(!counts.contains_key("last_done_unix"));
         assert_eq!(counts.get("pending"), Some(&0));
+    }
+
+    #[test]
+    fn embeddings_row_reads_disabled_without_an_embedder_and_checks_the_model_otherwise() {
+        let listed = vec!["nomic-embed-text:latest".to_string()];
+        let none = embeddings_row(None, &listed);
+        assert_eq!(
+            (none.name, none.status, none.reason),
+            (
+                "embeddings",
+                HealthState::Disabled,
+                Some(FailureCategory::NotConfigured)
+            )
+        );
+        assert_eq!(
+            embeddings_row(Some("nomic-embed-text"), &listed).status,
+            HealthState::Ok
+        );
+        let missing = embeddings_row(Some("other"), &listed);
+        assert_eq!(
+            (missing.status, missing.reason),
+            (HealthState::Degraded, Some(FailureCategory::Missing))
+        );
+        let down = embeddings_row(Some("nomic-embed-text"), &[]);
+        assert_eq!(
+            (down.status, down.reason),
+            (HealthState::Degraded, Some(FailureCategory::Unreachable))
+        );
     }
 
     #[test]

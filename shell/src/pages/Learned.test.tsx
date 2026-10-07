@@ -53,8 +53,10 @@ function daemonWith(
   rows: Known[],
   history?: Partial<KnowledgeHistory>,
   causes: { id: number; cause: string }[] = [],
+  duplicates: { id: number; of_id: number }[] = [],
 ) {
   return (path: string) => {
+    if (path === "/distill/duplicates") return Promise.resolve(duplicates);
     if (path === "/distill/causes") return Promise.resolve(causes);
     if (path === "/knowledge") return Promise.resolve(rows);
     if (path.startsWith("/knowledge/")) {
@@ -528,6 +530,29 @@ describe("Learned", () => {
 
     expect(await screen.findByText("older evidence")).toBeDefined();
     expect(daemon.apiFetch).toHaveBeenCalledWith("/knowledge/2");
+  });
+
+  it("a row flagged as a near-duplicate says of which, and opens that row", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith(
+        [
+          known({ id: 2, title: "the older learning" }),
+          known({ id: 5, title: "the newer learning" }),
+        ],
+        undefined,
+        [],
+        [{ id: 5, of_id: 2 }],
+      ),
+    );
+
+    await renderWithRouter(<Learned />);
+
+    expect(await screen.findByText("possible duplicate")).toBeDefined();
+    expect(screen.getAllByText("possible duplicate")).toHaveLength(1);
+    const line = screen.getByText("possible duplicate").closest("p") as HTMLElement;
+    expect(line.textContent).toContain("the older learning");
+    fireEvent.click(within(line).getByRole("button", { name: "#2" }));
+    await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/knowledge/2"));
   });
 
   it("a distilled row says which job it came from, why, and links its runs", async () => {

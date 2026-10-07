@@ -11,6 +11,7 @@ import {
   useDistillCauses,
   useKnowledge,
   useKnowledgeHistory,
+  useNearDuplicates,
   useRejectKnowledge,
   useRevertKnowledge,
   type Known,
@@ -361,6 +362,11 @@ function KnownRow({ row, decisions }: { row: Known; decisions?: ReactNode }) {
   // One cached query however many rows ask; only a distiller row reads its answer.
   const causes = useDistillCauses();
   const origin = distilledOrigin(row, causes.data ?? new Map());
+  // Same: shared cached queries. The title of the older row comes from the list already loaded.
+  const duplicateOf = useNearDuplicates().data?.get(row.id) ?? null;
+  const all = useKnowledge().data;
+  const duplicateTitle =
+    duplicateOf === null ? null : (all?.find((other) => other.id === duplicateOf)?.title ?? null);
 
   return (
     <Row className="learned-row">
@@ -391,6 +397,19 @@ function KnownRow({ row, decisions }: { row: Known; decisions?: ReactNode }) {
             <Link to="/fleet">job #{origin.job}</Link>
           )}
           {origin.causeLabel !== null && <> · {origin.causeLabel}</>}
+        </p>
+      )}
+      {duplicateOf !== null && (
+        <p className="learned-duplicate">
+          <span className="learned-duplicate-mark">possible duplicate</span> of{" "}
+          <Button
+            variant="quiet"
+            aria-expanded={chainId === duplicateOf}
+            onClick={() => setChainId(chainId === duplicateOf ? null : duplicateOf)}
+          >
+            #{duplicateOf}
+          </Button>
+          {duplicateTitle !== null && <> {duplicateTitle}</>}
         </p>
       )}
       <p className="learned-body">{row.body}</p>
