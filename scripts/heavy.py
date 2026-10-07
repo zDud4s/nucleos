@@ -1343,6 +1343,11 @@ def broker_run(args: list[str], held: bool = False) -> int:
             "pid": os.getpid(), "ctime": ctime, "weight": weight, "prio": prio,
             "agent": agent, "worktree": os.getcwd(), "argv": argv,
         }
+        # Claude Code exports its session id to every command it runs; heavy_watch turns it
+        # into the session's title. Absent for a terminal, the daemon's own gates, CI.
+        session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if session:
+            rec["session"] = session
         # Fixed order: worktree lock -> token. A cargo run takes the lock of its worktree
         # (waiting without holding a token); a session already inside a held worktree or
         # under a token holder does not retake it.
@@ -1554,6 +1559,8 @@ def broker_run(args: list[str], held: bool = False) -> int:
         }
         if warm:
             row["warm"] = True
+        if session:
+            row["session"] = session
         if eff_td:
             row["target_dir"] = eff_td
     except Exception as exc:

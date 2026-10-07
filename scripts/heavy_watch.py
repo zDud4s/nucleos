@@ -137,8 +137,95 @@ def estimate(rec: dict) -> str:
         lo, _, hi = statistics.quantiles(vals, n=4)
     else:
         lo, hi = vals[0], vals[-1]
-    spread = f" ({fmt_age(lo)}–{fmt_age(hi)})" if hi - lo >= 5 else ""
-    return f"~{fmt_age(med)}{spread} {DIM}{where}, n={len(vals)}{RESET}"
+    spread = f"{fmt_age(lo)}–{fmt_age(hi)}, " if hi - lo >= 5 else ""
+    return f"~{fmt_age(med)}  {DIM}({spread}{where}, n={len(vals)}){RESET}"
+
+
+# ------------------------------------------------------------------ sessions
+
+# session id -> (checked at, title); a title changes rarely, a transcript can be 100+ MB.
+_titles: dict[str, tuple[float, str]] = {}
+_TITLE_TYPES = ("custom-title", "ai-title")
+
+
+def _claude_projects() -> Path:
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return (Path(base) if base else Path.home() / ".claude") / "projects"
+
+
+def _title_in(lines: list[bytes]) -> str | None:
+    """The newest title among transcript lines: a name given with /rename beats the one
+    Claude Code generates, which is what the VS Code session list shows otherwise."""
+    found: dict[str, str] = {}
+    for raw in lines:
+        if b"-title" not in raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        kind = rec.get("type")
+        if kind in _TITLE_TYPES:
+            title = rec.get("customTitle") or rec.get("aiTitle") or rec.get("title")
+            if isinstance(title, str) and title.strip():
+                found[kind] = title.strip()
+    return next((found[k] for k in _TITLE_TYPES if k in found), None)
+
+
+def _first_prompt(head: list[bytes]) -> str | None:
+    for raw in head:
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if rec.get("type") != "user":
+            continue
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, list):
+            content = next((c.get("text") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text"), None)
+        if isinstance(content, str) and content.strip() and not content.startswith("<"):
+            return content.strip().splitlines()[0]
+    return None
+
+
+def session_title(sid: str) -> str | None:
+    hit = _titles.get(sid)
+    if hit and time.time() - hit[0] < 30:
+        return hit[1] or None
+    title = None
+    for path in _claude_projects().glob(f"*/{sid}.jsonl"):
+        try:
+            with open(path, "rb") as f:
+                size = f.seek(0, 2)
+                f.seek(max(0, size - 2**21))
+                title = _title_in(f.read().splitlines())
+                if not title:
+                    f.seek(0)
+                    head = f.read(2**18).splitlines()
+                    title = _title_in(head) or _first_prompt(head)
+        except OSError:
+            continue
+        if title:
+            break
+    _titles[sid] = (time.time(), title or "")
+    return title
+
+
+def session_label(rec: dict, width: int = 56) -> str:
+    """Who asked for this job: the Claude Code session's title and short id, marked when a
+    subagent of it ran the command; or where it came from when no session did."""
+    sid = rec.get("session")
+    agent = rec.get("agent")
+    if not sid:
+        if agent:
+            return f"{DIM}agent {agent}, session unknown (started before the broker recorded it){RESET}"
+        return f"{DIM}no Claude session (terminal, daemon gate or CI){RESET}"
+    title = session_title(str(sid)) or "untitled"
+    if len(title) > width:
+        title = title[: width - 1] + "…"
+    sub = f"  {YELLOW}subagent {str(agent)[:8]}{RESET}" if agent and agent != "main" else ""
+    return f"{BOLD}{title}{RESET}  {DIM}{str(sid)[:8]}{RESET}{sub}"
 
 
 # ------------------------------------------------------------------ phases
@@ -182,7 +269,12 @@ def phase_line(phases: list[str], now: str) -> str:
             parts.append(f"{BOLD}{YELLOW}▶ {p}{RESET}")
         else:
             parts.append(f"{DIM}· {p}{RESET}")
-    return "  →  ".join(parts) + f"   {DIM}phase {i + 1} of {len(phases)}{RESET}"
+    return f" {DIM}→{RESET} ".join(parts) + f"   {DIM}{i + 1}/{len(phases)}{RESET}"
+
+
+def field(pad: str, label: str, value: str) -> str:
+    """One `label  value` row: the label is the dim column, the value reads at full strength."""
+    return f"{pad}{DIM}{label:<9}{RESET}{value}"
 
 
 # ------------------------------------------------------------------ processes
@@ -217,8 +309,8 @@ def rustc_info(p, primed: dict) -> dict | None:
 def rustc_line(info: dict, indent: str, with_target: bool = False) -> str:
     cpu = "   …" if info["cpu"] is None else f"{info['cpu']:4.1f}%"
     target = f"  {CYAN}{info['target']}{RESET}" if with_target else ""
-    return (f"{indent}{info['crate']:<32} for {fmt_age(info['up']):>5}  cpu {cpu}  "
-            f"{info['mb']:>5} MB{target}")
+    return (f"{indent}{info['crate']:<32} {fmt_age(info['up']):>5}  "
+            f"{cpu} {DIM}cpu{RESET}  {info['mb']:>5} {DIM}MB{RESET}{target}")
 
 
 def job_tree(pid, primed: dict) -> tuple[list[dict], set[int]]:
@@ -250,33 +342,36 @@ def stray_rustc(owned: set[int], primed: dict) -> list[dict]:
 
 def job_block(n: int, f: Path, r: dict, slot: int | None, primed: dict,
               owned: set[int]) -> list[str]:
-    pad = f"  {colour_of(n)}│{RESET}   "
-    slot_txt = f"pool-{slot}" if slot else f"{DIM}no slot{RESET}"
-    lines = [f"  {tag(n)}  {BOLD}{short_wt(r.get('worktree'))}{RESET}  {short_argv(r)}",
-             f"{pad}{DIM}running for{RESET} {fmt_age(age_s(f, r))}  {DIM}·{RESET} "
-             f"w{r.get('weight')}  {DIM}·{RESET} {slot_txt}  {DIM}· usually{RESET} {estimate(r)}"]
+    pad = f"  {colour_of(n)}│{RESET} "
+    slot_txt = f"pool-{slot}" if slot else "none"
+    lines = [f"  {tag(n)} {BOLD}{short_wt(r.get('worktree'))}{RESET}",
+             field(pad, "command", short_argv(r, 72)),
+             field(pad, "session", session_label(r)),
+             field(pad, "running", f"{fmt_age(age_s(f, r))}   {DIM}usually{RESET} {estimate(r)}"),
+             field(pad, "slot", f"{slot_txt}   {DIM}weight {r.get('weight')}{RESET}")]
 
     phases = phases_of(r.get("argv") or [])
     prog = read_progress(r.get("pid"))
     now = current_phase(phases, prog)
-    lines.append(pad + phase_line(phases, now))
+    lines.append(field(pad, "phase", phase_line(phases, now)))
 
     if now == "compile":
         done, total = prog["units_done"], prog["units_total"]
-        lines.append(f"{pad}{meter(done, total)}  {done}/{total} units compiled")
+        lines.append(field(pad, "progress", f"{meter(done, total)}  {done}/{total} {DIM}units{RESET}"))
     elif now == "test":
         total, done = prog.get("tests_total"), prog.get("tests_done") or 0
-        what = f"binary {prog.get('binaries')}: {prog.get('binary')}"
+        what = f"{DIM}binary {prog.get('binaries')}:{RESET} {prog.get('binary')}"
         if total:
-            lines.append(f"{pad}{meter(done, total)}  {done}/{total} tests  {DIM}{what}{RESET}")
+            lines.append(field(pad, "progress", f"{meter(done, total)}  {done}/{total} {DIM}tests{RESET}"))
+            lines.append(field(pad, "", what))
         else:
-            lines.append(f"{pad}{DIM}{what}, starting…{RESET}")
+            lines.append(field(pad, "progress", f"{what} {DIM}starting…{RESET}"))
 
     infos, tree = job_tree(r.get("pid"), primed)
     owned |= tree
     for i, info in enumerate(infos):
-        label = f"{DIM}rustc{RESET} " if i == 0 else "      "
-        lines.append(f"{RUSTC_MARK}{i}{RUSTC_MARK}" + pad + label + rustc_line(info, ""))
+        lines.append(f"{RUSTC_MARK}{i}{RUSTC_MARK}"
+                     + field(pad, "rustc" if i == 0 else "", rustc_line(info, "")))
     return lines
 
 
@@ -315,10 +410,17 @@ def frame(primed: dict) -> str:
     queue = heavy._queue_order(heavy._entries(d / "queue", reap=False), d)
     lines.append(f"{BOLD}QUEUED ({len(queue)}){RESET}")
     for i, (f, r) in enumerate(queue, 1):
-        lines.append(f"  {YELLOW}{i}.{RESET} {BOLD}{short_wt(r.get('worktree'))}{RESET}  {short_argv(r)}")
-        lines.append(f"     {DIM}waiting for{RESET} {fmt_age(age_s(f, r))}  {DIM}·{RESET} "
-                     f"p{heavy._int_prio(r.get('prio'))} w{r.get('weight')}  "
-                     f"{DIM}· should take{RESET} {estimate(r)}")
+        pad = f"  {YELLOW}│{RESET} "
+        lines += [
+            f"  {YELLOW}{BOLD}{i}.{RESET} {BOLD}{short_wt(r.get('worktree'))}{RESET}",
+            field(pad, "command", short_argv(r, 72)),
+            field(pad, "session", session_label(r)),
+            field(pad, "waiting", f"{fmt_age(age_s(f, r))}   {DIM}priority "
+                  f"{heavy._int_prio(r.get('prio'))}, weight {r.get('weight')}{RESET}"),
+            field(pad, "takes", estimate(r)),
+        ]
+        if i < len(queue):
+            lines.append("")
     if not queue:
         lines.append(f"  {DIM}(empty){RESET}")
     lines.append("")
