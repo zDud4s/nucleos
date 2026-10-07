@@ -479,10 +479,14 @@ def _read_lock(lock: Path) -> dict | None:
     return rec
 
 
-def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float
-                 ) -> tuple[bool, float, int]:
+def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
+                 fail_on_hold: bool = False) -> tuple[bool, float, int]:
     """Take the worktree lock, waiting in `<hash>.waiters` by (priority, arrival). Holds no
-    token while it waits. Returns (acquired, waited_s, arrival_ns)."""
+    token while it waits. Returns (acquired, waited_s, arrival_ns).
+
+    `fail_on_hold` gives up at once when the holder is a `hold-worktree` session (a gate):
+    it keeps the tree for its whole run, 30-50 min here, so an agent capped at 540 s can
+    only wait nine minutes and leave with nothing (52 such exits in four days, 2026-10-06)."""
     lock, wdir = _lock_paths(directory, h)
     me = os.getpid()
     poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
@@ -502,6 +506,14 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float
                     lock.write_text(json.dumps(dict(rec, acquired=time.time())),
                                     encoding="utf-8")
                     return True, time.time() - t0, arrival
+                if holder is not None and holder.get("hold") and fail_on_hold:
+                    held_for = int(time.time() - float(holder.get("acquired") or time.time()))
+                    sys.stderr.write(
+                        f"heavy: this worktree is held by a gate run (pid {holder.get('pid')}, "
+                        f"running {held_for // 60} min); nothing was compiled. A gate keeps its "
+                        "worktree until it ends - wait for it to finish rather than retrying, "
+                        "and run nothing heavy here meanwhile.\n")
+                    return False, time.time() - t0, arrival
                 if holder is None:
                     ahead = [f for f, _ in _entries(wdir)
                              if f.name != wfile.name and _wkey(f) < mine]
@@ -1244,7 +1256,8 @@ def broker_run(args: list[str], held: bool = False) -> int:
             lock_hash = worktree_hash(root)
             lrec = dict(rec, worktree=root, start=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                         hold=held)
-            got, wait_lock, arrival = acquire_lock(directory, lock_hash, lrec, cap)
+            got, wait_lock, arrival = acquire_lock(directory, lock_hash, lrec, cap,
+                                                   fail_on_hold=bool(opts["agent"]) and not held)
             if not got:
                 lock_hash = None
                 _log_timeout(directory, agent, prio, kind, weight, wait_lock, argv)
