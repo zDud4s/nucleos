@@ -155,6 +155,7 @@ pub mod verify;
 pub mod verify_exec;
 pub mod verify_fingerprint;
 pub mod verify_guard;
+pub mod verify_observe;
 pub mod verify_plan;
 pub mod verify_runs;
 pub use nucleos_base::verify_sched;
