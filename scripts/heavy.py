@@ -830,13 +830,9 @@ def injected_target_dir(argv: list[str], root: str, cwd: str | None = None) -> s
         return None
     if _own_target_dir_config(argv, root, cwd):
         return None
-    try:
-        out = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root,
-                             capture_output=True, text=True, timeout=20)
-        if out.returncode == 0 and out.stdout.strip().startswith(("run/", "job/", "integration-")):
-            return None  # daemon-owned branches keep the daemon's own target dir
-    except Exception:
-        pass
+    # Daemon branches (run/, job/, integration-) are pooled too. Their old exemption dates
+    # from per-branch dirs; under the pool it sent them to the machine-wide default
+    # `C:/Projects/.cargo-target`, shared with every other unpooled build.
     return str(_td_root())
 
 
