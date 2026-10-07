@@ -97,3 +97,4 @@ libc = "0.2"
 [dev-dependencies]
 nucleos-core = { path = ".", features = ["testkit"] }
 tempfile = "3.27.0"
+sqlx = { version = "0.9.0", features = ["sqlite-deserialize"] }

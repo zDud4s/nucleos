@@ -5482,16 +5482,7 @@ pub mod testkit {
         delay: Option<Duration>,
         run_timeout: Duration,
     ) -> (AppState, Arc<FakeCommandRunner>) {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_pool().await;
 
         let runner = Arc::new(FakeCommandRunner {
             canned: std::sync::Mutex::new(Some(RunOutcome {
