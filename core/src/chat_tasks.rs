@@ -240,6 +240,29 @@ pub async fn orphan_running(pool: &SqlitePool) -> sqlx::Result<u64> {
     Ok(done.rows_affected())
 }
 
+/// A kept process ended: every task its turns launched and that is still `running` ended with it.
+pub async fn stop_launched_by(
+    pool: &SqlitePool,
+    chat_id: &str,
+    run_ids: &[i64],
+) -> sqlx::Result<u64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut closed = 0;
+    for run_id in run_ids {
+        closed += sqlx::query(
+            "UPDATE chat_tasks SET status = 'stopped', finished_at = COALESCE(finished_at, ?)
+              WHERE chat_id = ? AND launched_by_run_id = ? AND status = 'running'",
+        )
+        .bind(&now)
+        .bind(chat_id)
+        .bind(run_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+    Ok(closed)
+}
+
 /// A chat's tasks, oldest first (at most `READ_LIMIT`, the newest).
 pub async fn for_chat(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<ChatTask>> {
     sqlx::query_as::<_, ChatTask>(
@@ -390,5 +413,31 @@ mod tests {
             assert!(task.finished_at.is_some(), "{call}");
         }
         assert_eq!(row(&pool, "toolu_task").await.status, "completed");
+    }
+
+    #[tokio::test]
+    async fn stopping_a_process_closes_only_the_tasks_it_launched() {
+        let pool = test_pool().await;
+        record_turn(&pool, "chat-1", 7, LAUNCHES).await;
+        sqlx::query(
+            "INSERT INTO chat_tasks (chat_id, launched_by_run_id, tool_use_id, kind, status, started_at)
+             VALUES ('chat-1', 8, 'toolu_other', 'background_bash', 'running', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(stop_launched_by(&pool, "chat-1", &[7]).await.unwrap(), 2);
+
+        for call in ["toolu_bg", "toolu_agent"] {
+            let task = row(&pool, call).await;
+            assert_eq!(task.status, "stopped", "{call}");
+            assert!(task.finished_at.is_some(), "{call}");
+        }
+        assert_eq!(row(&pool, "toolu_task").await.status, "completed");
+        assert_eq!(row(&pool, "toolu_other").await.status, "running");
+
+        assert_eq!(stop_launched_by(&pool, "chat-2", &[8]).await.unwrap(), 0);
+        assert_eq!(row(&pool, "toolu_other").await.status, "running");
     }
 }

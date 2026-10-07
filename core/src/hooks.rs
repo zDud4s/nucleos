@@ -2476,8 +2476,12 @@ async fn rooted_decision(
     // it covers ordinary in-workspace writes too, so `Write` sailed through the barrier. An
     // allow-list of tools that cannot change anything, rather than a deny-list of the classes that
     // can — because the second hands every future class through by default.
+    //
+    // `read_untrusted_since` and not `read_untrusted_context`: a live task's calls arrive under its
+    // launcher's id, and the process it runs in was fed by every later turn of the chat too, so
+    // those turns count against it.
     if !crate::classifier::only_reads(&payload.tool_name) {
-        match crate::runs::read_untrusted_context(&state.pool, payload.run_id).await {
+        match crate::runs::read_untrusted_since(&state.pool, payload.run_id).await {
             Ok(false) => {}
             Ok(true) => {
                 tracing::warn!(
@@ -2684,7 +2688,7 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
             })
         }
         crate::mcp_tools::ToolEffect::Acts => {
-            match crate::runs::read_untrusted_context(&state.pool, payload.run_id).await {
+            match crate::runs::read_untrusted_since(&state.pool, payload.run_id).await {
                 Ok(false) => Json(Decision {
                     decision: "allow".to_owned(),
                     reason: "orchestrator NucleOS tool".to_owned(),
@@ -8517,6 +8521,51 @@ mod tests {
             &app,
             &probe(
                 run_id,
+                "Bash",
+                serde_json::json!({"command": "npm install"}),
+            ),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, UNTRUSTED_CONTEXT_DENY_REASON);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A task that outlives its turn is never cleaner than the turns that came after it.
+    ///
+    /// Its calls arrive under the launcher's id, but the process also fed every later turn of the
+    /// chat. The launcher's own flag is clean here; only a LATER run read the stranger's words.
+    #[tokio::test]
+    async fn a_live_tasks_action_is_refused_after_a_later_turn_read_third_party_text() {
+        let (state, asked) = state_with_judge(Ok("YES"), std::time::Duration::ZERO).await;
+        let app = test_router(state.clone());
+        let launcher = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Auto,
+        )
+        .await;
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(launcher)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        state.run_handles.lock().unwrap().remove(&launcher);
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, read_untrusted, created_at)
+             SELECT 'later', 'completed', 'assistant', chat_id, 1, '2026-01-01T00:00:00Z'
+               FROM runs WHERE id = ?",
+        )
+        .bind(launcher)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let decision = decide(
+            &app,
+            &probe(
+                launcher,
                 "Bash",
                 serde_json::json!({"command": "npm install"}),
             ),
