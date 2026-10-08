@@ -61,6 +61,10 @@ const PROJECT_SCOPED: &[&str] = &[
     // that no longer exist.
     "judge_corrections",
     "map_decisions",
+    // The post-merge gate's state (migration 0180): last green sha, the running gate, red groups.
+    // Derived per-project state like `verify_cache`; a re-added folder must start with no gate
+    // verdict inherited from a repository the user no longer has on record.
+    "postgate_state",
     "project_commands",
     // The same species as its neighbours, and the resurrection argument below bites hardest here:
     // a row in this table is a standing grant to perform a git operation — a push, a merge — for an
