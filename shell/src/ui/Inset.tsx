@@ -32,8 +32,8 @@ export interface InsetProps {
    */
   as?: InsetAs;
   /**
-   * A page's own modifier on top of the shared recipe — `ap-row-selected`, and
-   * nothing else in the app today.
+   * A page's own modifier on top of the shared recipe — today
+   * `ap-project-root`, `ap-job`, `fi-tree` and `fi-move`.
    *
    * The escape hatch is here under protest and with a narrow brief: it is for
    * marking *this* box out from its siblings, never for restating fill, radius,
