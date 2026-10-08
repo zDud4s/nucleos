@@ -1906,6 +1906,10 @@ async fn main() {
         machine_config_root.clone(),
     );
     verify::install(verify_executor.clone());
+    // Off for every project unless its rules set `gate_after_land`.
+    tokio::spawn(verify_postgate_worker::run_postgate_worker(
+        verify_executor.clone(),
+    ));
     tokio::spawn(verify_exec::run_executor(verify_executor));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),

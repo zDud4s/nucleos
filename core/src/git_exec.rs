@@ -1406,9 +1406,55 @@ async fn prepare_integration_worktree(
     deadline: std::time::Instant,
 ) -> Result<std::path::PathBuf, Outcome> {
     let integration = integration_worktree(project_root);
+    reset_or_create_worktree(project_root, &integration, "integration", deadline).await
+}
+
+/// Ensures the post-merge gate's worktree exists, is clean, and is checked out detached at `sha`.
+///
+/// The directory is the daemon's property exactly like the integration tree, so it takes the same
+/// guard and the same reset; the checkout then moves it to the tip the gate is about to measure.
+/// It never goes through the vcs queue: no branch ref is touched.
+pub(crate) async fn prepare_postgate_worktree(
+    project_root: &Path,
+    sha: &str,
+    deadline: std::time::Instant,
+) -> Result<std::path::PathBuf, String> {
+    let path = crate::verify_postgate::postgate_worktree(project_root);
+    let path = reset_or_create_worktree(project_root, &path, "postgate", deadline)
+        .await
+        .map_err(|outcome| match outcome {
+            Outcome::Failed {
+                reason,
+                output_tail,
+                ..
+            } => format!("{reason}: {output_tail}"),
+            other => format!("{other:?}"),
+        })?;
+    let moved = git(&path, &["checkout", "--detach", "--force", sha], deadline)
+        .await
+        .map_err(|outcome| format!("{outcome:?}"))?;
+    if !moved.succeeded() {
+        return Err(format!(
+            "could not check out {sha} in {}: {}",
+            path.display(),
+            moved.output_tail
+        ));
+    }
+    Ok(path)
+}
+
+/// The shared body of the daemon-owned detached trees: create `path` when it is absent, otherwise
+/// guard it, reset it and clean it. `what` names the tree in the creation failure.
+async fn reset_or_create_worktree(
+    project_root: &Path,
+    path: &Path,
+    what: &str,
+    deadline: std::time::Instant,
+) -> Result<std::path::PathBuf, Outcome> {
+    let integration = path.to_path_buf();
 
     if tokio::fs::metadata(&integration).await.is_err() {
-        return create_integration_worktree(project_root, &integration, deadline).await;
+        return create_integration_worktree(project_root, &integration, what, deadline).await;
     }
 
     // **This check runs before any git command is pointed at that directory, and it is load-bearing.**
@@ -1488,6 +1534,7 @@ async fn prepare_integration_worktree(
 async fn create_integration_worktree(
     project_root: &Path,
     integration: &Path,
+    what: &str,
     deadline: std::time::Instant,
 ) -> Result<std::path::PathBuf, Outcome> {
     if let Some(parent) = integration.parent() {
@@ -1520,7 +1567,7 @@ async fn create_integration_worktree(
     }
     if !added.succeeded() {
         return Err(failed(
-            "could not create the integration worktree".to_owned(),
+            format!("could not create the {what} worktree"),
             &added,
         ));
     }
@@ -4133,6 +4180,46 @@ gate_command: git --version
             !integration.join("litter.txt").exists(),
             "untracked litter is cleaned too, or it accumulates for the life of the project"
         );
+    }
+
+    /// The post-merge gate's tree: created detached at the asked sha, and on reuse reset, cleaned
+    /// and moved to the next sha. It never touches a branch ref, so it is not a vcs-queue operation.
+    #[tokio::test]
+    async fn the_postgate_worktree_is_created_and_reset_at_the_target_sha() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-postgate-");
+        let roots = space_free_tempdir("nucleos-gitexec-pgwt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let master = sha_of(&repo, "master");
+        let feature = sha_of(&repo, "feat/x");
+        assert_ne!(master, feature);
+
+        let path = prepare_postgate_worktree(&repo, &master, deadline())
+            .await
+            .expect("the first prepare creates the worktree");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("postgate-repo")
+        );
+        assert_eq!(sha_of(&path, "HEAD"), master);
+        assert!(!path.join("feature.txt").exists());
+
+        // Left as a killed gate would leave it: a tracked file modified and untracked litter.
+        std::fs::write(path.join("seed.txt"), "half-applied\n").expect("write");
+        std::fs::write(path.join("litter.txt"), "left behind\n").expect("write");
+
+        let again = prepare_postgate_worktree(&repo, &feature, deadline())
+            .await
+            .expect("a dirty postgate worktree must not fail the next gate");
+        assert_eq!(again, path, "the same directory is reused");
+        assert_eq!(sha_of(&path, "HEAD"), feature, "moved to the new sha");
+        assert!(!path.join("litter.txt").exists(), "litter is cleaned");
+        assert_eq!(
+            std::fs::read_to_string(path.join("seed.txt")).expect("seed"),
+            "seed\n",
+            "tracked edits are reset"
+        );
+        assert!(path.join("feature.txt").exists());
     }
 
     /// The `.git` guard, and the reason it must run before any git command is pointed at that

@@ -83,6 +83,8 @@ pub(crate) enum Caller {
     Run(i64),
     /// The daemon's own item gate. `from_scope` never produces it, so no key can claim to be one.
     Job(i64),
+    /// The daemon's post-merge gate. `from_scope` never produces it.
+    Postgate,
 }
 
 impl Caller {
@@ -101,6 +103,7 @@ impl Caller {
         match self {
             Caller::Owner => PRIORITY_INTERACTIVE,
             Caller::Run(_) | Caller::Job(_) => PRIORITY_AUTONOMOUS,
+            Caller::Postgate => verify_runs::PRIORITY_POSTGATE,
         }
     }
 
@@ -110,6 +113,16 @@ impl Caller {
             Caller::Owner => "owner".to_owned(),
             Caller::Run(id) => format!("run:{id}"),
             Caller::Job(id) => format!("job:{id}"),
+            Caller::Postgate => "postgate".to_owned(),
+        }
+    }
+
+    /// What a unit's `requested_by` records. Only the post-merge gate is named by caller; every
+    /// other caller keeps the scope text, so existing readers see no new values.
+    pub(crate) fn requested_by(self, scope: &str) -> String {
+        match self {
+            Caller::Postgate => verify_runs::REQUESTED_BY_POSTGATE.to_owned(),
+            _ => scope.to_owned(),
         }
     }
 }
@@ -119,7 +132,7 @@ impl Caller {
 pub(crate) fn may_read(caller: Caller, row_caller: &str) -> bool {
     match caller {
         Caller::Owner => true,
-        Caller::Run(_) | Caller::Job(_) => row_caller == caller.label(),
+        Caller::Run(_) | Caller::Job(_) | Caller::Postgate => row_caller == caller.label(),
     }
 }
 
@@ -240,7 +253,7 @@ pub(crate) async fn resolve_worktree(
         }
         // The daemon names the job's worktree itself, and it is held to the same registered-
         // worktree-of-a-known-project check as the owner's.
-        Caller::Owner | Caller::Job(_) => {
+        Caller::Owner | Caller::Job(_) | Caller::Postgate => {
             let Some(asked) = asked else {
                 return Err(VerifyError::BadRequest("worktree is required".to_owned()));
             };
@@ -315,7 +328,11 @@ pub(crate) async fn resolve_worktree(
 }
 
 /// The full object id `rev` names in `repo`, or why git would not resolve it to a commit.
-async fn resolve_commit(repo: &Path, rev: &str, deadline: Instant) -> Result<String, String> {
+pub(crate) async fn resolve_commit(
+    repo: &Path,
+    rev: &str,
+    deadline: Instant,
+) -> Result<String, String> {
     let spec = format!("{rev}^{{commit}}");
     let resolved = git(repo, &["rev-parse", "--verify", "--quiet", &spec], deadline).await?;
     let sha = resolved.stdout.trim();
@@ -723,7 +740,7 @@ pub(crate) async fn submit(
                 scope: scope.to_owned(),
                 origin: ORIGIN_VERIFY.to_owned(),
                 origin_id: Some(id),
-                requested_by: scope.to_owned(),
+                requested_by: caller.requested_by(scope),
                 group_name: unit.group.clone(),
                 kind: Some(kind.to_owned()),
                 argv: unit.argv.clone(),
@@ -1359,6 +1376,43 @@ tests:
             Scope::ApiToken(ApiTokenLevel::Admin),
         ] {
             assert_ne!(Caller::from_scope(&scope), Some(Caller::Job(9)));
+        }
+    }
+
+    #[test]
+    fn the_postgate_caller_runs_at_postgate_priority_and_no_key_can_claim_it() {
+        assert_eq!(
+            Caller::Postgate.priority(),
+            crate::verify_runs::PRIORITY_POSTGATE
+        );
+        assert_eq!(Caller::Postgate.label(), "postgate");
+        assert!(may_read(Caller::Postgate, "postgate"));
+        assert!(!may_read(Caller::Postgate, "owner"));
+        assert!(!may_read(Caller::Postgate, "job:9"));
+        assert!(!may_read(Caller::Run(3), "postgate"));
+        assert!(!may_read(Caller::Job(9), "postgate"));
+
+        // Only the post-merge gate's units are labelled by caller; every other caller keeps the
+        // scope text, so the readers of `requested_by` see no new values.
+        assert_eq!(
+            Caller::Postgate.requested_by("full"),
+            crate::verify_runs::REQUESTED_BY_POSTGATE
+        );
+        assert_eq!(Caller::Postgate.requested_by("full"), "postgate");
+        assert_eq!(Caller::Owner.requested_by("full"), "full");
+        assert_eq!(Caller::Job(9).requested_by("diff"), "diff");
+        assert_eq!(Caller::Run(7).requested_by("files"), "files");
+
+        // No auth scope maps to it.
+        for scope in [
+            Scope::Control,
+            Scope::Run(9),
+            Scope::ApiToken(ApiTokenLevel::Admin),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+            Scope::TeamRun("t".to_owned()),
+        ] {
+            assert_ne!(Caller::from_scope(&scope), Some(Caller::Postgate));
         }
     }
 

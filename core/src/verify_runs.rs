@@ -20,6 +20,8 @@ pub const ORIGIN_VERIFY: &str = "verify";
 
 pub const SCOPE_FULL: &str = "full";
 pub const REQUESTED_BY_GATE: &str = "gate";
+/// The post-merge gate's units (`verify::Caller::Postgate`).
+pub const REQUESTED_BY_POSTGATE: &str = "postgate";
 
 pub const STATUS_PASSED: &str = "passed";
 pub const STATUS_FAILED: &str = "failed";

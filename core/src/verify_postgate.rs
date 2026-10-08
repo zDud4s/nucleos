@@ -10,7 +10,7 @@
 //! `worktree::owner_from_dir_name` claims only `run-`, `job-` and `item-`, so nothing here needs
 //! an `Owner` variant or a `worktrees` row.
 //!
-//! Called by nothing yet; F3-2 wires it.
+//! Driven by `verify_postgate_worker` (F3-2).
 
 use std::path::{Path, PathBuf};
 
@@ -188,6 +188,42 @@ pub async fn finish_red(
     Ok(done.rows_affected() > 0)
 }
 
+/// Stores the verify ticket of the gate running for `sha`. Refused (`false`) when `sha` is not
+/// the running one, so a late ticket cannot attach itself to a gate that already finished.
+pub async fn set_request(
+    pool: &SqlitePool,
+    project_id: &str,
+    sha: &str,
+    request_id: i64,
+) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE postgate_state SET running_request_id = ?, updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ? AND running_sha = ?",
+    )
+    .bind(request_id)
+    .bind(project_id)
+    .bind(sha)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Gives up the gate running for `sha` without a verdict: the slot is released and
+/// `last_attempted_sha` stays, so the same tip is not retried; only a new merge is.
+pub async fn abandon(pool: &SqlitePool, project_id: &str, sha: &str) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE postgate_state SET \
+             running_sha = NULL, running_request_id = NULL, running_started_at = NULL, \
+             updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ? AND running_sha = ?",
+    )
+    .bind(project_id)
+    .bind(sha)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
 /// Marks `sha` green without running a gate (`verify_batch`'s `MarkCovered`: the full gate
 /// already passed on exactly that sha before it was published). Starts nothing and leaves a
 /// running gate untouched.
@@ -355,6 +391,59 @@ mod tests {
             decide(&s.target_state("b"), &[]),
             Decision::Idle(Idle::UpToDate)
         );
+    }
+
+    #[tokio::test]
+    async fn set_request_records_the_ticket_only_for_the_running_sha() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+
+        assert!(set_request(&pool, "p", "a1", 42).await.unwrap());
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.running_request_id, Some(42));
+        assert_eq!(s.running_sha.as_deref(), Some("a1"));
+
+        // Another sha, or a project with no row, changes nothing.
+        let before = load(&pool, "p").await.unwrap();
+        assert!(!set_request(&pool, "p", "zzz", 99).await.unwrap());
+        assert!(!set_request(&pool, "other", "a1", 99).await.unwrap());
+        assert_eq!(load(&pool, "p").await.unwrap(), before);
+
+        // Once the gate has finished nothing is running, so a late ticket is refused.
+        finish_green(&pool, "p", "a1").await.unwrap();
+        assert!(!set_request(&pool, "p", "a1", 7).await.unwrap());
+        assert_eq!(
+            load(&pool, "p").await.unwrap().unwrap().running_request_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn abandon_clears_running_and_keeps_the_attempt() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", Some(5)).await.unwrap();
+
+        // A different sha is not the running one: nothing changes.
+        let before = load(&pool, "p").await.unwrap();
+        assert!(!abandon(&pool, "p", "zzz").await.unwrap());
+        assert_eq!(load(&pool, "p").await.unwrap(), before);
+
+        assert!(abandon(&pool, "p", "a1").await.unwrap());
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.running_sha, None);
+        assert_eq!(s.running_request_id, None);
+        assert!(!s.running());
+        assert_eq!(s.last_attempted_sha.as_deref(), Some("a1"));
+        assert_eq!(s.last_green_sha, None, "an abandoned gate measured nothing");
+        assert!(s.red_groups.is_empty());
+
+        // The same tip is not retried; only a new merge is.
+        assert_eq!(
+            decide(&s.target_state("a1"), &[]),
+            Decision::Idle(Idle::UpToDate)
+        );
+        // Nothing running any more, so a second abandon is a no-op.
+        assert!(!abandon(&pool, "p", "a1").await.unwrap());
     }
 
     #[test]
