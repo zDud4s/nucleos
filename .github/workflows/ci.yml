@@ -100,6 +100,17 @@ jobs:
 
       - run: bash scripts/gates.sh hooks
 
+  # The build broker (`scripts/heavy.py` and its PreToolUse hook): Windows only, the one platform
+  # it runs on, and a job of its own because its tests take about six minutes of real waiting.
+  broker:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: bash scripts/gates.sh broker
+
   security:
     # Gitleaks reads content, not the OS, so one runner is enough.
     runs-on: ubuntu-latest
