@@ -1034,7 +1034,10 @@ mod tests {
         assert!(link_allowed("relates", "job", 1, "7").is_ok());
         for bad in ["007", "+7", "0", "-3", "", " 7", "7 ", "x"] {
             assert!(
-                matches!(link_allowed("relates", "job", 1, bad), Err(LinkError::BadRef)),
+                matches!(
+                    link_allowed("relates", "job", 1, bad),
+                    Err(LinkError::BadRef)
+                ),
                 "{bad:?} must be refused"
             );
         }

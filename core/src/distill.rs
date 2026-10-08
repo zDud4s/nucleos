@@ -2314,7 +2314,10 @@ mod tests {
     #[tokio::test]
     async fn a_zero_wait_never_holds() {
         let (pool, row) = waiting_pool(0).await;
-        assert_eq!(claim_next(&pool, noon()).await.unwrap().map(|r| r.id), Some(row));
+        assert_eq!(
+            claim_next(&pool, noon()).await.unwrap().map(|r| r.id),
+            Some(row)
+        );
         assert_eq!(request_state(&pool, 1).await, None, "no request at zero");
 
         // A request opened while the wait was 120 stops holding once the wait is 0.
@@ -2322,7 +2325,10 @@ mod tests {
         assert!(claim_next(&pool, noon()).await.unwrap().is_none());
         assert_eq!(request_state(&pool, 1).await.as_deref(), Some("open"));
         crate::capture::set_wait_minutes(&pool, 0).await.unwrap();
-        assert_eq!(claim_next(&pool, noon()).await.unwrap().map(|r| r.id), Some(row));
+        assert_eq!(
+            claim_next(&pool, noon()).await.unwrap().map(|r| r.id),
+            Some(row)
+        );
     }
 
     #[tokio::test]
@@ -2331,7 +2337,10 @@ mod tests {
         seed_job(&pool, 1, "alpha", 0).await;
         let row = seed_queue(&pool, "job_landed", 1, None, "pending", 0, None).await;
         crate::capture::set_wait_minutes(&pool, 120).await.unwrap();
-        assert_eq!(claim_next(&pool, noon()).await.unwrap().map(|r| r.id), Some(row));
+        assert_eq!(
+            claim_next(&pool, noon()).await.unwrap().map(|r| r.id),
+            Some(row)
+        );
         assert_eq!(request_state(&pool, 1).await, None);
     }
 
@@ -2347,7 +2356,10 @@ mod tests {
         crate::capture::dismiss(&pool, 1, noon()).await.unwrap();
         assert!(claim_next(&pool, noon()).await.unwrap().is_none());
         let later = noon() + chrono::Duration::minutes(10);
-        assert_eq!(claim_next(&pool, later).await.unwrap().map(|r| r.id), Some(row));
+        assert_eq!(
+            claim_next(&pool, later).await.unwrap().map(|r| r.id),
+            Some(row)
+        );
     }
 
     #[tokio::test]
