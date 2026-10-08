@@ -27,7 +27,7 @@
   --brain-edge-strong: rgba(231, 234, 240, 0.75);
   --brain-label: var(--text-muted);
   --brain-label-strong: var(--text);
-  --brain-ring: var(--accent);
+  --brain-ring: var(--text);
   --brain-missing: var(--text-faint);
   --brain-ground: var(--surface-sunken);
 
