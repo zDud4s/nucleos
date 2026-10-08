@@ -58,11 +58,12 @@ def posix_bash() -> str:
 BASH = posix_bash()
 
 
-def drive(steps: str, workdir: Path) -> tuple[int, str]:
+def drive(steps: str, workdir: Path, keep_going: bool = True) -> tuple[int, str]:
     """Source gates.sh, run `steps`, print the summary; return (status, stdout and stderr as one).
 
     One stream, the way the daemon reads a gate. `TMPDIR` points at `workdir/tmp` so the test can
-    see whether the captures were cleaned up.
+    see whether the captures were cleaned up. `keep_going` runs every step past a red one: the
+    summary tests need several red steps to summarise, and the gate stops at the first by default.
     """
     scratch = workdir / "tmp"
     scratch.mkdir()
@@ -72,7 +73,8 @@ def drive(steps: str, workdir: Path) -> tuple[int, str]:
         cwd=workdir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        env=dict(os.environ, TMPDIR=scratch.as_posix()),
+        env=dict(os.environ, TMPDIR=scratch.as_posix(),
+                 NUCLEOS_GATE_KEEP_GOING="1" if keep_going else "0"),
         timeout=120,
     )
     left = list(scratch.iterdir())
@@ -178,7 +180,22 @@ def test_a_green_run_says_so_and_exits_zero() -> None:
     assert "gates FAILED" not in output, output
 
 
+def test_the_gate_stops_at_its_first_red_step() -> None:
+    # 2026-10-08: a gate that kept going ran a 36-minute suite after clippy was already red.
+    with tempfile.TemporaryDirectory() as tmp:
+        status, output = drive(STEPS + 'run "fake: after" . passing\n', Path(tmp), keep_going=False)
+    assert status == 1, (status, output[-2000:])
+    assert "noisy line 500" in output and "noisy's own verdict" in output, output[-2000:]
+    assert "\nskip fake: quiet\n" in output and "\nskip fake: after\n" in output, output[-2000:]
+    assert "FAIL fake: quiet" not in output, output[-2000:]
+    summary = output.split("\ngates FAILED:\n", 1)[1]
+    red, skipped = summary.split("\nnot run, after the first red step:\n", 1)
+    assert red.startswith("  fake: noisy\n"), red
+    assert skipped == "  fake: quiet\n  fake: after\n", skipped
+
+
 test_a_red_steps_own_lines_follow_its_name()
+test_the_gate_stops_at_its_first_red_step()
 test_three_red_steps_fit_well_inside_the_daemons_tail()
 test_a_green_run_says_so_and_exits_zero()
 print("gates summary: ok")

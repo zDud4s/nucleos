@@ -6,13 +6,17 @@
 # `.github/workflows/ci.yml` calls it rather than repeating them — one definition of green, run in
 # two places.
 #
-# Every stack runs even when an earlier one fails — a summary of three real failures beats
-# stopping at the first and re-running twice to discover the other two.
+# The gate stops at its first red step and names the steps it skipped (owner's call, 2026-10-08).
+# Running on used to be the rule, so that one run reported every failure, but 11 of the 12 gates in
+# the broker log were red and kept going: one ran a 36-minute test suite after clippy had already
+# failed, holding a build slot that every other worktree was waiting for. NUCLEOS_GATE_KEEP_GOING=1
+# restores the old behaviour for a run that wants the whole list.
 #
 # Usage: scripts/gates.sh [core|sidecars|shell|tauri|hooks|security|all]   (default: all)
 set -uo pipefail
 
 failures=""
+skipped=""
 
 # Every step's output is streamed exactly as it always was AND kept, so that a red step's own last
 # lines can be repeated under its name in the closing summary. The daemon hands the node that must
@@ -38,6 +42,11 @@ run() {
   shift 2
   [ -n "$captures" ] && capture="$captures/step"
   printf '\n=== %s ===\n' "$label"
+  if [ -n "$failures" ] && [ "${NUCLEOS_GATE_KEEP_GOING:-0}" != 1 ]; then
+    printf 'skip %s\n' "$label"
+    skipped="$skipped  $label"$'\n'
+    return 0
+  fi
   # stderr joins stdout on its way into `tee`, because the kept lines need both in the order they
   # were printed: rustfmt's diff goes to one and cargo's `error:` to the other. The daemon already
   # reads the two as one stream. The cost: a step that leaves a background process holding its
@@ -89,6 +98,8 @@ kept_lines() {
 print_summary() {
   if [ -n "$failures" ]; then
     printf '\ngates FAILED:\n%s' "$failures" >&2
+    # After the evidence, so it stays inside the daemon's 4096-byte tail with it.
+    [ -n "$skipped" ] && printf '\nnot run, after the first red step:\n%s' "$skipped" >&2
     return 1
   fi
   printf '\nall gates green.\n'
@@ -263,6 +274,23 @@ esac
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
+
+# The whole gate is one broker session (`heavy.py hold-worktree`), so the cargo target slot its
+# first cargo step leases stays its own until the gate ends. Each step is a separate broker run, and
+# between clippy and test another worktree used to take the slot; the gate's next step then rebuilt
+# the crate from clean, at a median of 453s against 202s on a slot that had not changed hands
+# (broker log, 2026-10-03..08). Skipped when a session already holds this run (the test selector
+# opens one), when the broker is off, and where there is no broker (CI, a fresh clone).
+if [ -z "${NUCLEOS_HEAVY_HELD:-}" ] && [ "${NUCLEOS_HEAVY:-}" != 0 ]; then
+  heavy_main="${NUCLEOS_HEAVY_MAIN:-$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")}"
+  if [ "${OS:-}" = Windows_NT ]; then heavy_py="${NUCLEOS_HEAVY_PYTHON:-python}"; else heavy_py="${NUCLEOS_HEAVY_PYTHON:-python3}"; fi
+  if [ -f "$heavy_main/scripts/heavy.py" ] && [ -f "$heavy_main/.ai/scripts/heavy_classify.py" ]; then
+    # The broker is a native program: under Git bash `$BASH` is `/usr/bin/bash`, which it cannot open.
+    heavy_bash="$BASH"
+    command -v cygpath >/dev/null 2>&1 && heavy_bash="$(cygpath -m "$BASH")"
+    exec "$heavy_py" "$heavy_main/scripts/heavy.py" hold-worktree -- "$heavy_bash" "$repo_root/scripts/gates.sh" "$target"
+  fi
+fi
 
 # Said before the suite runs, not after. The worktree tests assert a space-free checkout path and
 # produce ~25 failures when they don't get one — failures whose text points at the tests, so the

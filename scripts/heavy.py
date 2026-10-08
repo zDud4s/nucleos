@@ -49,7 +49,7 @@ AGENT_WAIT_MAX_S = 540.0
 CALLER_WAIT_MAX_S = 3600.0
 EXIT_QUEUE_TIMEOUT = 75
 
-SUBCOMMANDS = ("status", "report", "hold-worktree", "warm")
+SUBCOMMANDS = ("status", "report", "hold-worktree", "warm", "idle")
 WARM_PRIO = 3
 WARM_ARGV = ["cargo", "test", "-p", "nucleos-core", "--no-run"]
 
@@ -1179,9 +1179,29 @@ def _read_slot(directory: Path, k: int) -> dict:
         return {}
 
 
-def _slot_busy(rec: dict) -> bool:
+def _session_alive(rec: dict) -> bool:
+    sid = rec.get("session")
+    return bool(sid) and is_alive(sid, rec.get("session_ctime"))
+
+
+def _slot_busy(rec: dict, session: int | None = None) -> bool:
+    """Busy while its holder runs, AND while the hold-worktree session that pinned it lives:
+    a gate's clippy, test and tauri steps are separate broker runs, and without the pin the
+    gaps between them let another worktree take the slot, which costs the gate a clean
+    rebuild (median 453s against 202s on an unswitched slot, measured 2026-10-08). The
+    pinning session itself (`session`) sees its own slot as free."""
     pid = rec.get("pid")
-    return bool(pid) and is_alive(pid, rec.get("ctime"))
+    if bool(pid) and is_alive(pid, rec.get("ctime")):
+        return True
+    return _session_alive(rec) and rec.get("session") != session
+
+
+def held_session() -> int | None:
+    """The hold-worktree session this call runs under (its pid), or None."""
+    try:
+        return int(os.environ.get("NUCLEOS_HEAVY_HELD") or 0) or None
+    except ValueError:
+        return None
 
 
 def _same_wt(a, b) -> bool:
@@ -1200,20 +1220,35 @@ def affinity_slot(directory: Path, worktree: str) -> int | None:
     return best[0] if best else None
 
 
-def try_lease_slot(directory: Path, worktree: str, only: int | None = None):
+def try_lease_slot(directory: Path, worktree: str, only: int | None = None,
+                   session: int | None = None):
     """Lease a free slot (a dead holder's lease counts as free). Affinity: this worktree's
     last slot, else a never-used one, else the least recently used. Returns
-    (k, path, previous last_worktree) or None when every candidate is busy."""
+    (k, path, previous last_worktree) or None when every candidate is busy.
+
+    Under a hold-worktree `session` the first lease pins the slot to that session, and every
+    later call of the session gets the same slot back, even while a sibling call of the same
+    session still builds in it (cargo's own lock on the target dir serialises the two)."""
     me = os.getpid()
     _, ctime = proc_identity(me)
     with Mutex(directory):
         (directory / "target-slots").mkdir(parents=True, exist_ok=True)
+        if session:
+            for k in range(1, target_slots() + 1):
+                rec = _read_slot(directory, k)
+                if rec.get("session") == session and _session_alive(rec):
+                    if only is not None and k != only:
+                        return None
+                    if not _slot_busy(rec, session):
+                        rec.update(pid=me, ctime=ctime, worktree=worktree)
+                        _write_slot(directory, k, rec)
+                    return k, str(slot_dir(k)), rec.get("last_worktree")
         free = []
         for k in range(1, target_slots() + 1):
             if only is not None and k != only:
                 continue
             rec = _read_slot(directory, k)
-            if not _slot_busy(rec):
+            if not _slot_busy(rec, session):
                 free.append((k, rec))
         if not free:
             return None
@@ -1228,27 +1263,51 @@ def try_lease_slot(directory: Path, worktree: str, only: int | None = None):
 
         k, old = min(free, key=rank)
         prev = old.get("last_worktree")
-        path = _slot_file(directory, k)
-        tmp = path.with_name(f"{path.name}.{me}.tmp")
-        tmp.write_text(json.dumps({
+        new = {
             "pid": me, "ctime": ctime, "worktree": worktree, "acquired": time.time(),
             "last_worktree": worktree, "prev_worktree": prev,
-        }), encoding="utf-8")
-        os.replace(tmp, path)
+        }
+        if session:
+            new["session"] = session
+            new["session_ctime"] = proc_identity(session)[1]
+        _write_slot(directory, k, new)
     return k, str(slot_dir(k)), prev
 
 
-def any_slot_free(directory: Path) -> bool:
-    return any(not _slot_busy(_read_slot(directory, k)) for k in range(1, target_slots() + 1))
+def _write_slot(directory: Path, k: int, rec: dict) -> None:
+    path = _slot_file(directory, k)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(rec), encoding="utf-8")
+    os.replace(tmp, path)
 
 
-def lease_slot_wait(directory: Path, worktree: str, cap: float):
+def any_slot_free(directory: Path, session: int | None = None) -> bool:
+    return any(not _slot_busy(_read_slot(directory, k), session)
+               for k in range(1, target_slots() + 1))
+
+
+def release_session_slots(directory: Path, session: int) -> None:
+    """Unpin every slot this hold-worktree session pinned, at the end of the session. A
+    session that dies without getting here unpins itself: a dead session is not alive."""
+    try:
+        with Mutex(directory):
+            for k in range(1, target_slots() + 1):
+                rec = _read_slot(directory, k)
+                if rec.get("session") == session:
+                    rec.pop("session", None)
+                    rec.pop("session_ctime", None)
+                    _write_slot(directory, k, rec)
+    except Exception as exc:
+        sys.stderr.write(f"heavy: could not unpin the session's target slot: {exc}\n")
+
+
+def lease_slot_wait(directory: Path, worktree: str, cap: float, session: int | None = None):
     """Blocking lease (for callers that hold no token): poll until a slot is free or `cap`
     seconds pass. Returns the lease, or None on timeout."""
     poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
     t0 = last = time.time()
     while True:
-        got = try_lease_slot(directory, worktree)
+        got = try_lease_slot(directory, worktree, session=session)
         if got is not None:
             return got
         now = time.time()
@@ -1273,13 +1332,14 @@ def release_slot(directory: Path, lease) -> None:
             rec = _read_slot(directory, k)
             if rec.get("pid") != os.getpid():
                 return
-            path = _slot_file(directory, k)
-            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({
+            new = {
                 "pid": None, "last_worktree": rec.get("last_worktree"),
                 "acquired": rec.get("acquired"), "released": time.time(),
-            }), encoding="utf-8")
-            os.replace(tmp, path)
+            }
+            if _session_alive(rec):  # the pin outlives each call of its session
+                new["session"] = rec["session"]
+                new["session_ctime"] = rec.get("session_ctime")
+            _write_slot(directory, k, new)
     except Exception as exc:
         sys.stderr.write(f"heavy: could not release the target slot: {exc}\n")
 
@@ -1665,7 +1725,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
                 if not pool:
                     break
                 try:
-                    lease = try_lease_slot(directory, wt)
+                    lease = try_lease_slot(directory, wt, session=held_session())
                 except Exception as exc:
                     pool = False  # fail-open: run without an injected dir
                     sys.stderr.write(f"heavy: target slot lease failed: {exc}\n")
@@ -1674,7 +1734,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
                     break
                 release_token(directory)
                 holding = False
-                while not any_slot_free(directory):
+                while not any_slot_free(directory, held_session()):
                     if time.time() - t_q >= cap:
                         sys.stderr.write(
                             f"heavy: waited {int(time.time() - t_q)}s for a free cargo target "
@@ -1692,7 +1752,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
         if pool and lease is None and nested:
             # No token to give back here (nested runs under its parent's token).
             try:
-                lease = lease_slot_wait(directory, wt, cap)
+                lease = lease_slot_wait(directory, wt, cap, held_session())
             except Exception as exc:
                 lease = None
                 pool = False
@@ -1900,10 +1960,37 @@ def cmd_status() -> int:
             rec = _read_slot(d, k)
             who = (f"pid={rec.get('pid')} worktree={rec.get('worktree')}" if _slot_busy(rec)
                    else "free")
+            if _session_alive(rec):
+                who += f" pinned-by-session={rec.get('session')}"
             print(f"  slot {k}: {who} last={rec.get('last_worktree') or '-'}")
     except Exception as exc:
         print(f"target slots: unreadable ({exc})")
     return 0
+
+
+def cmd_idle() -> int:
+    """Exit 0 when nothing but the caller's own session (and idle-priority warms) uses the
+    broker: no queued or held run, no other worktree lock, no slot another session holds.
+    select_tests asks this before running its groups in parallel; any doubt answers busy."""
+    d = state_dir()
+    me = held_session()
+    busy = []
+    for kind in ("queue", "held"):
+        for _, rec in _entries(d / kind, reap=False):
+            if _int_prio(rec.get("prio")) < WARM_PRIO:
+                busy.append(f"{kind}: pid={rec.get('pid')} {rec.get('worktree') or ''}".rstrip())
+    wt = d / "wt"
+    for lock in (sorted(wt.glob("*.lock")) if wt.is_dir() else []):
+        rec = _read_lock(lock)
+        if rec and rec.get("pid") != me:
+            busy.append(f"lock: pid={rec.get('pid')} {rec.get('worktree') or ''}".rstrip())
+    for k in range(1, target_slots() + 1):
+        if _slot_busy(_read_slot(d, k), me):
+            busy.append(f"slot {k}")
+    for line in busy:
+        print(line)
+    print("idle" if not busy else f"busy ({len(busy)})")
+    return 0 if not busy else 1
 
 
 def _warm_marker(directory: Path, root: str) -> Path:
@@ -2060,8 +2147,14 @@ def main(argv: list[str]) -> int:
             return cmd_report(argv[1:])
         if argv and argv[0] == "warm":
             return cmd_warm(argv[1:])
+        if argv and argv[0] == "idle":
+            return cmd_idle()
         if argv and argv[0] == "hold-worktree":
-            return broker_run(argv[1:], held=True)
+            try:
+                return broker_run(argv[1:], held=True)
+            finally:
+                if os.environ.get("NUCLEOS_HEAVY") != "0":
+                    release_session_slots(state_dir(), os.getpid())
         return broker_run(argv)
     except KeyboardInterrupt:
         return 130
