@@ -306,6 +306,8 @@ pub enum LinkError {
     /// `supersedes` only makes sense between two notes.
     SupersedesNeedsNote,
     SelfLink,
+    /// A `job` target must be a positive id written canonically.
+    BadRef,
     NotFound,
     Duplicate,
     Db(sqlx::Error),
@@ -324,6 +326,7 @@ impl std::fmt::Display for LinkError {
             Self::UnknownKind => formatter.write_str("unknown target kind"),
             Self::SupersedesNeedsNote => formatter.write_str("supersedes can only target a note"),
             Self::SelfLink => formatter.write_str("a note cannot link to itself"),
+            Self::BadRef => formatter.write_str("a job target must be a positive job id"),
             Self::NotFound => formatter.write_str("not found"),
             Self::Duplicate => formatter.write_str("that link already exists"),
             Self::Db(error) => write!(formatter, "database error: {error}"),
@@ -360,6 +363,15 @@ pub fn link_allowed(
     }
     if target_kind == "note" && target_ref.trim().parse::<i64>() == Ok(note_id) {
         return Err(LinkError::SelfLink);
+    }
+    // "007" and "+7" would name job 7 and still be a different link row from "7".
+    if target_kind == "job" {
+        let canonical = target_ref
+            .parse::<i64>()
+            .is_ok_and(|id| id >= 1 && id.to_string() == target_ref);
+        if !canonical {
+            return Err(LinkError::BadRef);
+        }
     }
     Ok(())
 }
@@ -1015,6 +1027,19 @@ mod tests {
                 "supersedes must refuse {kind}"
             );
         }
+    }
+
+    #[test]
+    fn a_job_target_must_be_written_canonically() {
+        assert!(link_allowed("relates", "job", 1, "7").is_ok());
+        for bad in ["007", "+7", "0", "-3", "", " 7", "7 ", "x"] {
+            assert!(
+                matches!(link_allowed("relates", "job", 1, bad), Err(LinkError::BadRef)),
+                "{bad:?} must be refused"
+            );
+        }
+        // Other kinds keep taking free-form refs.
+        assert!(link_allowed("relates", "file", 1, "007").is_ok());
     }
 
     #[tokio::test]
