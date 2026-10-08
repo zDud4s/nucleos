@@ -125,6 +125,10 @@ type recordingDaemon struct {
 	answerCalls    []answerCall
 	answerErr      error
 	answerReleased bool
+	// openCaptures is the jobs whose capture request is open; openCapturesErr fails the listing.
+	openCaptures     []int64
+	openCapturesErr  error
+	openCaptureCalls int
 	// The notification policy this fake daemon serves, and the error it serves instead. The zero
 	// value is an empty policy, which allows everything — so every test written before the policy
 	// existed keeps the behaviour it was written against.
@@ -181,6 +185,11 @@ func (d *recordingDaemon) AnswerCapture(jobID int64, text string) (int64, bool, 
 		return 0, false, d.answerErr
 	}
 	return 31, d.answerReleased, nil
+}
+
+func (d *recordingDaemon) OpenCaptureJobs() ([]int64, error) {
+	d.openCaptureCalls++
+	return d.openCaptures, d.openCapturesErr
 }
 
 func (d *recordingDaemon) CreateNote(text string) (int64, error) {

@@ -61,6 +61,7 @@ type Daemon interface {
 	SendAssistantMessage(chatKey, text string) (int64, error)
 	CreateNote(text string) (int64, error)
 	AnswerCapture(jobID int64, text string) (noteID int64, released bool, err error)
+	OpenCaptureJobs() ([]int64, error)
 	GetRun(id int64) (map[string]any, error)
 	GetProposals() ([]map[string]any, error)
 	// GetRefusedActions is what the injection barrier turned away. A separate route from the one
@@ -98,10 +99,27 @@ type Downloader interface {
 type Tracker struct {
 	mu       sync.Mutex
 	lastTurn map[string]int64
+	// hinted holds the jobs whose open capture request a loose message has already been pointed
+	// at, so the hint is said once per request rather than under every message.
+	hinted map[int64]bool
 }
 
 func NewTracker() *Tracker {
-	return &Tracker{lastTurn: map[string]int64{}}
+	return &Tracker{lastTurn: map[string]int64{}, hinted: map[int64]bool{}}
+}
+
+// unhinted returns the jobs not hinted at yet and marks them hinted.
+func (t *Tracker) unhinted(jobs []int64) []int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var fresh []int64
+	for _, job := range jobs {
+		if !t.hinted[job] {
+			t.hinted[job] = true
+			fresh = append(fresh, job)
+		}
+	}
+	return fresh
 }
 
 func (t *Tracker) Set(key string, turnID int64) {
@@ -219,6 +237,7 @@ func HandleUpdate(bot Bot, dc Daemon, dl Downloader, cfg config.Config, tr *Trac
 		handleCaptureReply(bot, dc, to, u.Message, jobID)
 		return
 	}
+	hintOpenCaptures(bot, dc, tr, to, u.Message)
 	text := resolveIncoming(dl, dc, cfg.TranscribeCmd, u.Message)
 	if strings.TrimSpace(text) == "" {
 		// A sticker, a location, a poll: none of them carries a prompt, and a turn started on an

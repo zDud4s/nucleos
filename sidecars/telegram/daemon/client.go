@@ -135,6 +135,29 @@ func (c *Client) AnswerCapture(jobID int64, text string) (int64, bool, error) {
 	return response.NoteID, response.Released, nil
 }
 
+// OpenCaptureJobs lists the jobs whose capture request is still open, oldest request first.
+func (c *Client) OpenCaptureJobs() ([]int64, error) {
+	body, status, err := c.do(http.MethodGet, "/capture-requests?state=open", nil)
+	if err != nil {
+		return nil, fmt.Errorf("list capture requests: %w", err)
+	}
+	if err := statusError("list capture requests", status, body); err != nil {
+		return nil, err
+	}
+
+	var requests []struct {
+		JobID int64 `json:"job_id"`
+	}
+	if err := json.Unmarshal(body, &requests); err != nil {
+		return nil, fmt.Errorf("parse capture requests response: %w", err)
+	}
+	jobs := make([]int64, 0, len(requests))
+	for _, r := range requests {
+		jobs = append(jobs, r.JobID)
+	}
+	return jobs, nil
+}
+
 func (c *Client) GetRun(id int64) (map[string]any, error) {
 	return c.getObject("get run", "/assistant/"+strconv.FormatInt(id, 10))
 }
