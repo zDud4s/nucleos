@@ -367,6 +367,16 @@ export const keys = {
   },
 
   /**
+   * Capture requests — `GET /capture-requests`. One root so an answer or a dismissal refetches
+   * the open list (the Brain badge) and the history together.
+   */
+  captures: {
+    all: ["captures"] as const,
+    open: ["captures", "open"] as const,
+    everything: ["captures", "all"] as const,
+  },
+
+  /**
    * The Work namespace — chats, council, agents — landing together
    * ahead of the pages that read most of it, for the reason at the top of this
    * file: a namespace four pages edit in sequence is a namespace where the
@@ -624,6 +634,8 @@ export const keys = {
     machine: ["system", "machine"] as const,
     /** `GET /config/distiller` — which brain the distiller asks. */
     distiller: ["system", "distiller"] as const,
+    /** `GET /config/capture-wait` — how long a capture request waits for the owner, in minutes. */
+    captureWait: ["system", "captureWait"] as const,
     /** `GET /config/embedding` — which Ollama model embeds knowledge rows. */
     embedding: ["system", "embedding"] as const,
     /** The credentials this machine holds, by presence only -- `GET /config/secrets`. */

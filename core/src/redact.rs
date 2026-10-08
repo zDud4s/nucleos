@@ -1332,6 +1332,7 @@ A fatura de julho segue em anexo.\n\n\
             "note_text",
             "dossier",
             "extraction_answer",
+            "prompt_text",
         ];
 
         // The top-level files of every source root: the core's own `src/` and, once modules move

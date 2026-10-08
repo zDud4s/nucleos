@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
+import type { CaptureRequest } from "../data/captures";
 import type { Known } from "../data/knowledge";
 import type { OwnerNote } from "../data/owner-notes";
 import { filterItems, toItems, type ItemFilters } from "./unified";
@@ -47,6 +48,22 @@ function known(over: Partial<Known> = {}): Known {
   };
 }
 
+function capture(over: Partial<CaptureRequest> = {}): CaptureRequest {
+  return {
+    job_id: 1,
+    project_id: "nucleos",
+    causes: [],
+    prompt_text: "a question",
+    state: "open",
+    deadline: "2026-09-02T09:00:00+00:00",
+    seconds_left: 10,
+    note_id: null,
+    created_at: "2026-09-01T09:00:00+00:00",
+    closed_at: null,
+    ...over,
+  };
+}
+
 const ALL: ItemFilters = { type: "all", state: "all", layer: "all", scope: "all", q: "" };
 
 describe("toItems", () => {
@@ -65,7 +82,7 @@ describe("filterItems", () => {
         known({ id: 6, activated_at: null, created_at: "2026-09-02T00:00:00+00:00" }),
       ],
     );
-    const out = filterItems(items, ALL).map((item) => (item.kind === "note" ? `n${item.note.id}` : `k${item.known.id}`));
+    const out = filterItems(items, ALL).map((item) => (item.kind === "note" ? `n${item.note.id}` : item.kind === "knowledge" ? `k${item.known.id}` : `c${item.capture.job_id}`));
     expect(out).toEqual(["k5", "k6", "n1"]);
   });
 
@@ -81,7 +98,7 @@ describe("filterItems", () => {
       [known({ id: 3 }), known({ id: 4, status: "proposed" }), known({ id: 5, status: "rejected" })],
     );
     const ids = (state: ItemFilters["state"]) =>
-      filterItems(items, { ...ALL, state }).map((i) => (i.kind === "note" ? `n${i.note.id}` : `k${i.known.id}`)).sort();
+      filterItems(items, { ...ALL, state }).map((i) => (i.kind === "note" ? `n${i.note.id}` : i.kind === "knowledge" ? `k${i.known.id}` : `c${i.capture.job_id}`)).sort();
     expect(ids("in_force")).toEqual(["k3", "n1"]);
     expect(ids("out")).toEqual(["k5", "n2"]);
     expect(ids("all")).toHaveLength(5);
@@ -110,5 +127,21 @@ describe("filterItems", () => {
     const out = filterItems(items, { ...ALL, q: "alpha" });
     expect(out.filter((i) => i.kind === "knowledge")).toHaveLength(2);
     expect(out.filter((i) => i.kind === "note")).toHaveLength(1);
+  });
+
+  it("captures: state buckets, type filter, layer excludes them, three-kind tie-break", () => {
+    const items = toItems(
+      [note({ id: 1 })],
+      [known({ id: 1, activated_at: "2026-09-01T09:00:00+00:00" })],
+      [capture({ job_id: 1 }), capture({ job_id: 2, state: "expired" })],
+    );
+    const ids = (f: Partial<ItemFilters>) =>
+      filterItems(items, { ...ALL, ...f }).map((i) => `${i.kind}${i.kind === "capture" ? i.capture.job_id : ""}`);
+    expect(ids({ type: "capture" })).toEqual(["capture2", "capture1"]);
+    expect(ids({ type: "capture", state: "in_force" })).toEqual([]);
+    expect(ids({ type: "capture", state: "out" })).toEqual(["capture2"]);
+    expect(ids({ layer: "semantic" })).toEqual(["knowledge"]);
+    // Same instant: note, then knowledge, then captures by id descending.
+    expect(ids({})).toEqual(["note", "knowledge", "capture2", "capture1"]);
   });
 });

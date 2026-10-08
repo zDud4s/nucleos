@@ -60,6 +60,7 @@ const LANE_OF: Record<string, FeedLane> = {
   job_review_skipped: "jobs",
   job_review_retried: "jobs",
   job_waiting: "jobs",
+  capture_requested: "jobs",
   job_finished: "jobs",
   job_failed: "jobs",
   job_stopped: "jobs",

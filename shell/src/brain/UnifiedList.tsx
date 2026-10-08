@@ -1,22 +1,27 @@
 import { useState } from "react";
+import { useAllCaptures } from "../data/captures";
 import { useApproveKnowledge, useKnowledge, useRejectKnowledge, type Known, type KnownLayer } from "../data/knowledge";
 import { useOwnerNotes, useSearchOwnerNotes } from "../data/owner-notes";
 import { Button, ErrorNote, Panel, Quiet, RelativeTime, Row, Rows, Teach } from "../ui";
+import { CapturesWaiting } from "./CapturesWaiting";
 import { formatItem } from "./item-ref";
 import { MeasuredSummary } from "./knowledge/MeasuredSummary";
 import { WaitingPanel } from "./knowledge/WaitingPanel";
-import { filterItems, itemDate, scopeKey, toItems, type BrainItem, type ItemFilters } from "./unified";
+import { filterItems, itemDate, itemId, scopeKey, toItems, type BrainItem, type ItemFilters } from "./unified";
 import "./unified-list.css";
 
 export interface UnifiedListProps {
-  /** Receives `formatItem(ref)`: `note:12` or `knowledge:5`. */
+  /** Receives `formatItem(ref)`: `note:12`, `knowledge:5` or `capture:7`. */
   onSelect(item: string): void;
+  /** The item open in the side panel, so the list does not draw its form twice. */
+  selected?: string;
 }
 
 const TYPE_FILTERS: readonly (readonly [ItemFilters["type"], string])[] = [
   ["all", "All"],
   ["note", "Notes"],
   ["knowledge", "Knowledge"],
+  ["capture", "Captures"],
 ];
 
 const STATE_FILTERS: readonly (readonly [ItemFilters["state"], string])[] = [
@@ -34,7 +39,7 @@ const LAYER_FILTERS: readonly (readonly [KnownLayer | "all", string])[] = [
 ];
 
 /** The attention-ordered list: what waits for a decision, then notes and knowledge by date. */
-export function UnifiedList({ onSelect }: UnifiedListProps) {
+export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
   const [type, setType] = useState<ItemFilters["type"]>("all");
   const [state, setState] = useState<ItemFilters["state"]>("in_force");
   const [layer, setLayer] = useState<KnownLayer | "all">("all");
@@ -45,12 +50,13 @@ export function UnifiedList({ onSelect }: UnifiedListProps) {
   const allNotes = useOwnerNotes("all");
   const found = useSearchOwnerNotes(q);
   const knowledge = useKnowledge();
+  const captureRows = useAllCaptures();
   const approve = useApproveKnowledge();
   const reject = useRejectKnowledge();
 
   const noteRows = (searching ? found.data : allNotes.data) ?? [];
   const known = knowledge.data ?? [];
-  const items = filterItems(toItems(noteRows, known), { type, state, layer, scope, q });
+  const items = filterItems(toItems(noteRows, known, captureRows.data ?? []), { type, state, layer, scope, q });
   const waiting = known.filter((row) => row.status === "proposed");
   const deciding = approve.isPending || reject.isPending;
   const scopes = scopeOptions(known);
@@ -58,8 +64,10 @@ export function UnifiedList({ onSelect }: UnifiedListProps) {
   const nothingAtAll =
     allNotes.data !== undefined &&
     knowledge.data !== undefined &&
+    captureRows.data !== undefined &&
     allNotes.data.length === 0 &&
-    knowledge.data.length === 0;
+    knowledge.data.length === 0 &&
+    captureRows.data.length === 0;
 
   if (nothingAtAll) {
     return (
@@ -73,9 +81,10 @@ export function UnifiedList({ onSelect }: UnifiedListProps) {
 
   return (
     <>
-      {(allNotes.isError || knowledge.isError) && (
+      {(allNotes.isError || knowledge.isError || captureRows.isError) && (
         <ErrorNote>the núcleo did not answer — part of what is known is missing</ErrorNote>
       )}
+      <CapturesWaiting onSelect={onSelect} selected={selected} />
       <WaitingPanel rows={waiting} />
 
       <div className="unified-filters">
@@ -93,7 +102,7 @@ export function UnifiedList({ onSelect }: UnifiedListProps) {
             </Button>
           ))}
         </div>
-        {type !== "note" && (
+        {type !== "note" && type !== "capture" && (
           <>
             <div role="group" aria-label="Layer">
               {LAYER_FILTERS.map(([value, label]) => (
@@ -128,7 +137,7 @@ export function UnifiedList({ onSelect }: UnifiedListProps) {
           <Rows label="Notes and knowledge">
             {items.map((item) => (
               <ItemRow
-                key={`${item.kind}:${item.kind === "note" ? item.note.id : item.known.id}`}
+                key={`${item.kind}:${itemId(item)}`}
                 item={item}
                 onSelect={onSelect}
                 deciding={deciding}
@@ -160,8 +169,15 @@ function ItemRow({ item, onSelect, deciding, onApprove, onReject }: ItemRowProps
   const ref =
     item.kind === "note"
       ? formatItem({ kind: "note", id: item.note.id })
-      : formatItem({ kind: "knowledge", id: item.known.id });
-  const title = item.kind === "note" ? firstLine(item.note.text) : item.known.title;
+      : item.kind === "capture"
+        ? formatItem({ kind: "capture", id: item.capture.job_id })
+        : formatItem({ kind: "knowledge", id: item.known.id });
+  const title =
+    item.kind === "note"
+      ? firstLine(item.note.text)
+      : item.kind === "capture"
+        ? firstLine(item.capture.prompt_text)
+        : item.known.title;
   const proposalId =
     item.kind === "knowledge" && item.known.status === "proposed" ? item.known.proposal_id : null;
   return (

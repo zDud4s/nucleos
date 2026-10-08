@@ -84,6 +84,44 @@ fn now() -> String {
 /// Files a note, active, with a `created` event, in one transaction. The text is trimmed; nothing is
 /// written for an empty one or an unknown origin.
 pub async fn create(pool: &SqlitePool, text: &str, origin: &str) -> Result<i64, NoteError> {
+    let mut tx = pool.begin().await?;
+    let id = insert_note_in(&mut tx, text, origin).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Files a note already linked to a job (`relates job:<id>`), on the caller's connection so the
+/// caller's transaction decides whether it stands. The job is not looked up: the caller holds the
+/// request that names it.
+pub async fn create_linked_to_job_in(
+    conn: &mut sqlx::SqliteConnection,
+    text: &str,
+    origin: &str,
+    job_id: i64,
+) -> Result<i64, NoteError> {
+    let id = insert_note_in(conn, text, origin).await?;
+    let at = now();
+    let target_ref = job_id.to_string();
+    sqlx::query(
+        "INSERT INTO owner_note_links (note_id, link_type, target_kind, target_ref, created_at)
+         VALUES (?, 'relates', 'job', ?, ?)",
+    )
+    .bind(id)
+    .bind(&target_ref)
+    .bind(&at)
+    .execute(&mut *conn)
+    .await?;
+    let detail = format!("relates job:{target_ref}");
+    record_raw(conn, id, "linked", Some(&detail), &at).await?;
+    Ok(id)
+}
+
+/// The shared body of `create`: validates, inserts the note `active` and records `created`.
+async fn insert_note_in(
+    conn: &mut sqlx::SqliteConnection,
+    text: &str,
+    origin: &str,
+) -> Result<i64, NoteError> {
     let text = text.trim();
     if text.is_empty() {
         return Err(NoteError::Empty);
@@ -92,7 +130,6 @@ pub async fn create(pool: &SqlitePool, text: &str, origin: &str) -> Result<i64, 
         return Err(NoteError::UnknownOrigin);
     }
     let at = now();
-    let mut tx = pool.begin().await?;
     let id = sqlx::query(
         "INSERT INTO owner_notes (note_text, origin, state, created_at, updated_at)
          VALUES (?, ?, 'active', ?, ?)",
@@ -101,11 +138,10 @@ pub async fn create(pool: &SqlitePool, text: &str, origin: &str) -> Result<i64, 
     .bind(origin)
     .bind(&at)
     .bind(&at)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?
     .last_insert_rowid();
-    record(&mut tx, id, "created", None, &at).await?;
-    tx.commit().await?;
+    record(conn, id, "created", None, &at).await?;
     Ok(id)
 }
 
@@ -251,9 +287,17 @@ pub const LINK_TYPES: [&str; 5] = [
     "details",
     "supersedes",
 ];
-/// What a note can point at. `note`, `knowledge`, `contact` and `mail` resolve in SQL; `project` and
+/// What a note can point at. `note`, `knowledge`, `contact`, `mail` and `job` resolve in SQL; `project` and
 /// `file` are resolved by the HTTP layer, which owns the roster and the files root.
-pub const TARGET_KINDS: [&str; 6] = ["note", "knowledge", "project", "contact", "mail", "file"];
+pub const TARGET_KINDS: [&str; 7] = [
+    "note",
+    "knowledge",
+    "project",
+    "contact",
+    "mail",
+    "file",
+    "job",
+];
 
 #[derive(Debug)]
 pub enum LinkError {
@@ -262,6 +306,8 @@ pub enum LinkError {
     /// `supersedes` only makes sense between two notes.
     SupersedesNeedsNote,
     SelfLink,
+    /// A `job` target must be a positive id written canonically.
+    BadRef,
     NotFound,
     Duplicate,
     Db(sqlx::Error),
@@ -280,6 +326,7 @@ impl std::fmt::Display for LinkError {
             Self::UnknownKind => formatter.write_str("unknown target kind"),
             Self::SupersedesNeedsNote => formatter.write_str("supersedes can only target a note"),
             Self::SelfLink => formatter.write_str("a note cannot link to itself"),
+            Self::BadRef => formatter.write_str("a job target must be a positive job id"),
             Self::NotFound => formatter.write_str("not found"),
             Self::Duplicate => formatter.write_str("that link already exists"),
             Self::Db(error) => write!(formatter, "database error: {error}"),
@@ -316,6 +363,15 @@ pub fn link_allowed(
     }
     if target_kind == "note" && target_ref.trim().parse::<i64>() == Ok(note_id) {
         return Err(LinkError::SelfLink);
+    }
+    // "007" and "+7" would name job 7 and still be a different link row from "7".
+    if target_kind == "job" {
+        let canonical = target_ref
+            .parse::<i64>()
+            .is_ok_and(|id| id >= 1 && id.to_string() == target_ref);
+        if !canonical {
+            return Err(LinkError::BadRef);
+        }
     }
     Ok(())
 }
@@ -553,11 +609,13 @@ fn sql_table(kind: &str) -> Option<&'static str> {
         "knowledge" => Some("knowledge"),
         "contact" => Some("contacts"),
         "mail" => Some("emails"),
+        "job" => Some("jobs"),
         _ => None,
     }
 }
 
-/// The text of every ACTIVE note linked to a project, oldest first.
+/// The text of every ACTIVE note linked to a project, or to the given job, oldest first and each
+/// note once even when it is linked to both.
 ///
 /// This exists solely for the distiller's dossier, under D4 of
 /// `.ai/specs/2026-10-05-destilador-design.md` - the one sanctioned exception to the rule that
@@ -567,14 +625,19 @@ fn sql_table(kind: &str) -> Option<&'static str> {
 pub async fn active_note_texts_for_project(
     pool: &SqlitePool,
     project_id: &str,
+    job_id: Option<i64>,
 ) -> sqlx::Result<Vec<String>> {
     sqlx::query_scalar(
         "SELECT n.note_text FROM owner_notes n
-           JOIN owner_note_links l ON l.note_id = n.id
-          WHERE l.target_kind = 'project' AND l.target_ref = ? AND n.state = 'active'
+          WHERE n.state = 'active'
+            AND EXISTS (SELECT 1 FROM owner_note_links l WHERE l.note_id = n.id
+                         AND ((l.target_kind = 'project' AND l.target_ref = ?)
+                           OR (l.target_kind = 'job' AND l.target_ref = ?)))
           ORDER BY n.id",
     )
     .bind(project_id)
+    // `target_ref` is TEXT; a NULL bind never matches.
+    .bind(job_id.map(|id| id.to_string()))
     .fetch_all(pool)
     .await
 }
@@ -592,7 +655,7 @@ pub async fn target_exists(
     let Ok(id) = target_ref.trim().parse::<i64>() else {
         return Ok(Some(false));
     };
-    // `AssertSqlSafe`, audited: `table` is one of four literals from `sql_table`.
+    // `AssertSqlSafe`, audited: `table` is one of the literals from `sql_table`.
     let found = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
         "SELECT 1 FROM {table} WHERE id = ?"
     )))
@@ -955,7 +1018,7 @@ mod tests {
         for kind in TARGET_KINDS {
             assert!(link_allowed("relates", kind, 1, "2").is_ok());
         }
-        for kind in ["knowledge", "project", "contact", "mail", "file"] {
+        for kind in ["knowledge", "project", "contact", "mail", "file", "job"] {
             assert!(
                 matches!(
                     link_allowed("supersedes", kind, 1, "2"),
@@ -964,6 +1027,22 @@ mod tests {
                 "supersedes must refuse {kind}"
             );
         }
+    }
+
+    #[test]
+    fn a_job_target_must_be_written_canonically() {
+        assert!(link_allowed("relates", "job", 1, "7").is_ok());
+        for bad in ["007", "+7", "0", "-3", "", " 7", "7 ", "x"] {
+            assert!(
+                matches!(
+                    link_allowed("relates", "job", 1, bad),
+                    Err(LinkError::BadRef)
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+        // Other kinds keep taking free-form refs.
+        assert!(link_allowed("relates", "file", 1, "007").is_ok());
     }
 
     #[tokio::test]
@@ -1203,6 +1282,97 @@ mod tests {
             );
         }
         assert!(scanned > 20, "the scan found only {scanned} source files");
+    }
+
+    async fn job_note(pool: &sqlx::SqlitePool, text: &str, job_id: i64) -> i64 {
+        let mut conn = pool.acquire().await.unwrap();
+        create_linked_to_job_in(&mut conn, text, "shell", job_id)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_job_note_reaches_its_job_and_no_other() {
+        let pool = test_pool().await;
+        job_note(&pool, "about job seven", 7).await;
+        let seven = active_note_texts_for_project(&pool, "p", Some(7))
+            .await
+            .unwrap();
+        assert_eq!(seven, vec!["about job seven".to_string()]);
+        assert!(
+            active_note_texts_for_project(&pool, "p", Some(8))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            active_note_texts_for_project(&pool, "p", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The link and its event are written the way `add_link` writes them.
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail FROM owner_note_events WHERE kind = 'linked' ORDER BY id LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(detail, "relates job:7");
+    }
+
+    #[tokio::test]
+    async fn a_note_linked_to_both_is_read_once() {
+        let pool = test_pool().await;
+        let id = job_note(&pool, "both", 7).await;
+        add_link(&pool, id, "relates", "project", "p")
+            .await
+            .unwrap();
+        let other = create(&pool, "project only", "shell").await.unwrap();
+        add_link(&pool, other, "relates", "project", "p")
+            .await
+            .unwrap();
+        let texts = active_note_texts_for_project(&pool, "p", Some(7))
+            .await
+            .unwrap();
+        assert_eq!(texts, vec!["both".to_string(), "project only".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_archived_job_note_stays_out() {
+        let pool = test_pool().await;
+        let id = job_note(&pool, "set aside", 7).await;
+        update(&pool, id, None, Some("archived")).await.unwrap();
+        assert!(
+            active_note_texts_for_project(&pool, "p", Some(7))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_linked_to_job_refuses_empty_and_unknown_origin() {
+        let pool = test_pool().await;
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(matches!(
+            create_linked_to_job_in(&mut conn, "   ", "shell", 7).await,
+            Err(NoteError::Empty)
+        ));
+        assert!(matches!(
+            create_linked_to_job_in(&mut conn, "text", "nowhere", 7).await,
+            Err(NoteError::UnknownOrigin)
+        ));
+        drop(conn);
+        let links: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM owner_note_links")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let notes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM owner_notes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((notes, links), (0, 0));
     }
 
     #[tokio::test]

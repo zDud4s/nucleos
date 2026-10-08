@@ -471,6 +471,9 @@ struct DistillTally {
     failed_24h: i64,
     /// The newest `done` row's finish instant, as unix seconds; `None` before anything finished.
     last_done_unix: Option<i64>,
+    /// Capture requests still open, and when the oldest was opened (spec 11).
+    capture_open: i64,
+    capture_oldest_unix: Option<i64>,
 }
 
 /// One query, three scalar subselects over `distill_queue`.
@@ -496,10 +499,19 @@ async fn distiller_tally(
     .bind(crate::distill::STATUS_DONE)
     .fetch_one(pool)
     .await?;
+    let (capture_open, capture_oldest): (i64, Option<String>) =
+        sqlx::query_as("SELECT COUNT(*), MIN(created_at) FROM capture_requests WHERE state = ?")
+            .bind(crate::capture::STATE_OPEN)
+            .fetch_one(pool)
+            .await?;
     Ok(DistillTally {
         pending,
         failed_24h,
         last_done_unix: last_done
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .map(|at| at.timestamp()),
+        capture_open,
+        capture_oldest_unix: capture_oldest
             .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
             .map(|at| at.timestamp()),
     })
@@ -522,6 +534,10 @@ fn distiller_row(tally: DistillTally) -> SubsystemReadout {
     ]);
     if let Some(at) = tally.last_done_unix {
         counts.insert("last_done_unix", at);
+    }
+    counts.insert("capture_open", tally.capture_open);
+    if let Some(at) = tally.capture_oldest_unix {
+        counts.insert("capture_oldest_unix", at);
     }
     row.counts = Some(counts);
     row
@@ -1858,6 +1874,8 @@ url: http://127.0.0.1:{port}
             pending: 3,
             failed_24h: 0,
             last_done_unix: Some(1_759_000_000),
+            capture_open: 0,
+            capture_oldest_unix: None,
         });
         assert_eq!((row.name, row.status), ("distiller", HealthState::Ok));
         let counts = row.counts.as_ref().expect("a tally gives counts");
@@ -1869,6 +1887,8 @@ url: http://127.0.0.1:{port}
             pending: 0,
             failed_24h: 0,
             last_done_unix: None,
+            capture_open: 0,
+            capture_oldest_unix: None,
         });
         let counts = fresh.counts.as_ref().expect("a tally gives counts");
         assert!(!counts.contains_key("last_done_unix"));
@@ -1909,6 +1929,8 @@ url: http://127.0.0.1:{port}
             pending: 0,
             failed_24h: 1,
             last_done_unix: None,
+            capture_open: 0,
+            capture_oldest_unix: None,
         });
         assert_eq!(row.status, HealthState::Degraded);
         assert_eq!(row.reason, Some(FailureCategory::Unknown));
@@ -1955,5 +1977,32 @@ url: http://127.0.0.1:{port}
         assert_eq!(tally.pending, 2);
         assert_eq!(tally.failed_24h, 1);
         assert_eq!(tally.last_done_unix, Some(t2.timestamp()));
+    }
+
+    #[tokio::test]
+    async fn distiller_tally_counts_open_capture_requests() {
+        let pool = migrated_pool().await;
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, created_at)
+             VALUES (1, 'p', '[]', 't', 'open', '2026-10-07T12:00:00+00:00', '2026-10-07T10:00:00+00:00'),
+                    (2, 'p', '[]', 't', 'open', '2026-10-07T13:00:00+00:00', '2026-10-07T11:00:00+00:00'),
+                    (3, 'p', '[]', 't', 'expired', '2026-10-07T09:00:00+00:00', '2026-10-07T07:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let tally = distiller_tally(&pool, now).await.unwrap();
+        assert_eq!(tally.capture_open, 2);
+        assert_eq!(
+            tally.capture_oldest_unix,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-10-07T10:00:00+00:00")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+        let row = distiller_row(tally);
+        assert_eq!(row.counts.unwrap().get("capture_open"), Some(&2));
     }
 }

@@ -39,6 +39,8 @@ const PROJECT_SCOPED: &[&str] = &[
     "browser_sessions",
     "browser_sites",
     "browser_writes",
+    // A forgotten project's open questions must hold nothing, nor be answered later.
+    "capture_requests",
     // Dev time is project history, and it goes with the project. Its file offsets in
     // `devtime_files` are deliberately KEPT (owner's decision, 2026-10-05): re-adding the folder
     // then counts time from that moment on, instead of resurrecting the old time from transcripts
@@ -1419,6 +1421,33 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(theirs, 1, "forgetting alpha took bravo's distill queue");
+    }
+
+    /// An open capture request is the project's history: forgetting the project must not leave a
+    /// question that could still be answered.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_its_capture_requests() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        sqlx::query(
+            "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, created_at)
+             VALUES (7, ?, '[]', 'p', 'open', '2026-10-07T12:00:00+00:00', '2026-10-07T10:00:00+00:00')",
+        )
+        .bind("alpha")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM capture_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "a forgotten project's capture requests outlived it"
+        );
     }
 
     /// A slot taken here is work in flight, and nothing is removed under it.

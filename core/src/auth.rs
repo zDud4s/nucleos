@@ -2676,6 +2676,11 @@ mod tests {
             (Method::POST, "/owner-notes/7/links"),
             (Method::DELETE, "/owner-notes/links/3"),
             (Method::POST, "/owner-notes/7/teach"),
+            (Method::GET, "/capture-requests"),
+            (Method::POST, "/capture-requests/7/dismiss"),
+            (Method::POST, "/capture-requests/7/answer"),
+            (Method::GET, "/config/capture-wait"),
+            (Method::POST, "/config/capture-wait"),
         ];
         let refused = [
             Scope::Run(1),

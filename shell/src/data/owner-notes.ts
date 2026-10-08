@@ -28,7 +28,7 @@ export type NoteOrigin = "shell" | "telegram";
 export const LINK_TYPES = ["relates", "supports", "contradicts", "details", "supersedes"] as const;
 export type LinkType = (typeof LINK_TYPES)[number];
 
-export const TARGET_KINDS = ["note", "knowledge", "project", "contact", "mail", "file"] as const;
+export const TARGET_KINDS = ["note", "knowledge", "project", "contact", "mail", "file", "job"] as const;
 export type TargetKind = (typeof TARGET_KINDS)[number];
 
 export interface OwnerNote {

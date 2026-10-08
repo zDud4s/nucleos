@@ -34,6 +34,7 @@ pub mod browser_wheel;
 pub mod budget;
 pub mod calendar;
 pub mod capabilities;
+pub mod capture;
 pub mod chat_groups;
 pub mod chat_notices;
 pub mod chat_tasks;

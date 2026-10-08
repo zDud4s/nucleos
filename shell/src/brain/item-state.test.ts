@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { knownBucket, noteBucket, passesState } from "./item-state";
+import { captureBucket, knownBucket, noteBucket, passesState } from "./item-state";
 import type { StateBucket } from "./graph-types";
 
 describe("knownBucket", () => {
@@ -28,6 +28,18 @@ describe("noteBucket", () => {
     ["weird", "unknown"],
   ])("%s -> %s", (state, bucket) => {
     expect(noteBucket(state)).toBe(bucket);
+  });
+});
+
+describe("captureBucket", () => {
+  it.each([
+    ["open", "proposed"],
+    ["answered", "out"],
+    ["dismissed", "out"],
+    ["expired", "out"],
+    ["weird", "unknown"],
+  ])("%s -> %s", (state, bucket) => {
+    expect(captureBucket(state)).toBe(bucket);
   });
 });
 

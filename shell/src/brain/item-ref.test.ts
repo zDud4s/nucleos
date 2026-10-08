@@ -48,6 +48,9 @@ describe("formatItem / nodeIdOf / itemOfNode", () => {
   it("maps to graph node ids and back", () => {
     expect(nodeIdOf({ kind: "note", id: 45 })).toBe("n:45");
     expect(nodeIdOf({ kind: "knowledge", id: 123 })).toBe("k:123");
+    expect(nodeIdOf({ kind: "capture", id: 7 })).toBeNull();
+    expect(parseItem("capture:7")).toEqual({ kind: "capture", id: 7 });
+    expect(formatItem({ kind: "capture", id: 7 })).toBe("capture:7");
     expect(itemOfNode("n:45")).toEqual({ kind: "note", id: 45 });
     expect(itemOfNode("k:123")).toEqual({ kind: "knowledge", id: 123 });
   });

@@ -182,6 +182,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // and not a park. Amber on every parked job taught the Feed to summon somebody for a slot that
     // frees itself. The verdict, where there is one, is the `wait_reason` badge beside it.
     job_waiting: { tone: "info", label: "job waiting" },
+    // Awaiting-You Amber: unlike a parked job, this line IS a question put to the reader — the
+    // distiller holds the job until the owner answers, dismisses or the wait runs out.
+    capture_requested: { tone: "pending", label: "asked of you" },
     job_finished: { tone: "info", label: "job finished" },
     job_failed: { tone: "danger", label: "job failed" },
     job_stopped: { tone: "off", label: "job stopped" },

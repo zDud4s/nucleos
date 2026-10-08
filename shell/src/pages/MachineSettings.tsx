@@ -11,6 +11,7 @@ import {
 } from "../data/machine-config";
 import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, StateBadge } from "../ui";
 import { DistillerModel } from "./DistillerModel";
+import { CaptureWait } from "./CaptureWait";
 import { EmbeddingModel } from "./EmbeddingModel";
 
 /**
@@ -62,6 +63,7 @@ export function MachineSettings() {
   return (
     <>
       <DistillerModel />
+      <CaptureWait />
       <EmbeddingModel />
 
       {/* The folder, as one line above the files rather than a panel of its own. */}

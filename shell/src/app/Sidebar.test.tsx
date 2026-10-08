@@ -135,6 +135,12 @@ describe("Sidebar", () => {
     expect(screen.getByRole("link", { name: "Mail" })).toBeDefined();
   });
 
+  it("shows the open capture count on the Brain entry", async () => {
+    await renderWithRouter(<Sidebar badges={{ captures: 3 }} />);
+
+    expect(screen.getByRole("link", { name: "Brain, 3 to answer" })).toBeDefined();
+  });
+
   it("renders no badge at all for a count the shell has no source for", async () => {
     await renderWithRouter(<Sidebar badges={{ proposals: 3 }} />);
 
