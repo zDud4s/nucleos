@@ -4384,6 +4384,18 @@ fn map_is_trusted(worktree: &Path, project_root: &Path) -> bool {
 }
 
 async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize) -> Step {
+    gate_item_with(state, job, ordinal, items, crate::verify::installed()).await
+}
+
+/// `gate_item` with the verify executor handed in, so a test can drive both gate paths without the
+/// process-wide install that only `main` performs.
+async fn gate_item_with(
+    state: &AppState,
+    job: &JobRow,
+    ordinal: usize,
+    items: usize,
+    installed: Option<std::sync::Arc<crate::verify_exec::Executor>>,
+) -> Step {
     let pool = &state.pool;
     let last = ordinal + 1 == items;
 
@@ -4454,11 +4466,7 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
 
     // An intermediate item with a trusted test map is measured by the daemon's verify executor
     // over the job's own diff; everything else falls through to the full gate below, untouched.
-    let executor = if last {
-        None
-    } else {
-        crate::verify::installed()
-    };
+    let executor = if last { None } else { installed };
     let trusted = if executor.is_some() {
         let tree = worktree.clone();
         let root = PathBuf::from(&job.project_root);
@@ -4492,14 +4500,18 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
             );
             return Step::Stopped;
         }
-        return match verdict {
+        match verdict {
             crate::verify::ScopeVerdict::Measured(outcome) => {
-                record_gate(state, job, ordinal, outcome).await
+                return record_gate(state, job, ordinal, outcome).await;
             }
             crate::verify::ScopeVerdict::NothingRan => {
-                pass_without_measuring("the test map selects no group for the job's diff").await
+                return pass_without_measuring("the test map selects no group for the job's diff")
+                    .await;
             }
-        };
+            // The scope request could not even be submitted, so nothing was measured: fall
+            // through to the full gate below, exactly as if no executor were installed.
+            crate::verify::ScopeVerdict::Unavailable => {}
+        }
     }
 
     // Both writes are compare-and-set, and losing either stops the pass. A gate takes minutes, and
@@ -15201,5 +15213,175 @@ tests:
             vec![note_id],
             "the note was spent on a node that never read it, and nothing will say so"
         );
+    }
+
+    // ---- which gate an item takes, driven through `gate_item_with` -----------------------------
+
+    /// A job whose project root and worktree are one real repository carrying a test map, cut at
+    /// its first commit and standing on its second, with a running verify executor on the same pool.
+    struct ScopeJob {
+        pool: sqlx::SqlitePool,
+        state: AppState,
+        job: JobRow,
+        executor: std::sync::Arc<crate::verify_exec::Executor>,
+        _repo: tempfile::TempDir,
+        _machine: tempfile::TempDir,
+    }
+
+    /// `rostered` is whether the repository is a known project's root; without it `submit` refuses
+    /// the scope request (`project_for_worktree` finds no project) before anything is queued.
+    async fn scope_job(rostered: bool) -> ScopeJob {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("core")).unwrap();
+        std::fs::write(root.join("core/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(
+            root.join(crate::tests_map::MAP_FILE),
+            "version: 1
+tests:
+  groups:
+    core:
+      paths: [core/]
+      check: git --version
+      command: git --version
+",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@x"],
+            vec!["config", "user.name", "test"],
+            vec!["add", "-A"],
+            vec!["commit", "-q", "-m", "one"],
+        ] {
+            assert!(git_ok(root, &args), "git {args:?}");
+        }
+        let base = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        std::fs::write(root.join("core/a.rs"), "fn a() { let _ = 1; }\n").unwrap();
+        assert!(git_ok(root, &["commit", "-q", "-am", "two"]));
+
+        let machine = tempfile::tempdir().unwrap();
+        crate::project_state::write_for_test(
+            machine.path(),
+            "project-a",
+            crate::project_state::AUTOPILOT_FILE,
+            "gate_command: git --version\n",
+        );
+        let pool = test_pool().await;
+        let state = AppState {
+            machine_config_root: Some(machine.path().to_path_buf()),
+            ..test_state(pool.clone()).await
+        };
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let root_text = root.to_string_lossy().into_owned();
+        sqlx::query("UPDATE jobs SET project_root = ? WHERE id = ?")
+            .bind(&root_text)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::worktree::record(
+            &pool,
+            crate::worktree::Owner::Job(job_id),
+            "project-a",
+            &root_text,
+            &root_text,
+            "main",
+            Some(&base),
+        )
+        .await
+        .unwrap();
+        if rostered {
+            sqlx::query(
+                "INSERT INTO autopilot_state (project_id, mode, project_root) \
+                 VALUES ('project-a', 'active', ?)",
+            )
+            .bind(&root_text)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        seed_items(&pool, job_id, &["implemented", "implemented"]).await;
+
+        let executor = crate::verify_exec::Executor::new(
+            pool.clone(),
+            crate::config::VerifyConfig::default(),
+            Some(machine.path().to_path_buf()),
+        );
+        tokio::spawn(crate::verify_exec::run_executor(executor.clone()));
+        let job = load_job(&pool, job_id).await.unwrap();
+        ScopeJob {
+            pool,
+            state,
+            job,
+            executor,
+            _repo: repo,
+            _machine: machine,
+        }
+    }
+
+    async fn scope_requests(pool: &sqlx::SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT caller FROM verify_requests ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn full_gate_rows(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM verify_runs WHERE origin = 'job_item'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The last item is the measurement a partial is trusted on: it takes the full gate even when
+    /// an executor is installed and the map is trusted, and queues nothing with the executor.
+    #[tokio::test]
+    async fn gate_item_sends_the_last_item_through_the_full_gate_despite_a_trusted_map() {
+        let f = scope_job(true).await;
+
+        gate_item_with(&f.state, &f.job, 1, 2, Some(f.executor.clone())).await;
+
+        assert_eq!(scope_requests(&f.pool).await, Vec::<String>::new());
+        assert_eq!(full_gate_rows(&f.pool).await, 1);
+    }
+
+    /// An intermediate item with an installed executor and a trusted map is measured by `scope`:
+    /// a verify request is made in the job's name, and the full gate does not run.
+    #[tokio::test]
+    async fn gate_item_sends_an_intermediate_item_with_a_trusted_map_through_scope() {
+        let f = scope_job(true).await;
+
+        gate_item_with(&f.state, &f.job, 0, 2, Some(f.executor.clone())).await;
+
+        assert_eq!(
+            scope_requests(&f.pool).await,
+            vec![format!("job:{}", f.job.id)]
+        );
+        assert_eq!(full_gate_rows(&f.pool).await, 0);
+    }
+
+    /// A scope request that cannot even be submitted measured nothing, so the item takes today's
+    /// full gate instead of being recorded as errored.
+    #[tokio::test]
+    async fn gate_item_falls_back_to_the_full_gate_when_scope_cannot_be_submitted() {
+        let f = scope_job(false).await;
+
+        gate_item_with(&f.state, &f.job, 0, 2, Some(f.executor.clone())).await;
+
+        assert_eq!(scope_requests(&f.pool).await, Vec::<String>::new());
+        assert_eq!(full_gate_rows(&f.pool).await, 1);
+        assert_eq!(item_statuses(&f.pool, f.job.id).await[0], "passed");
     }
 }

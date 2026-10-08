@@ -908,6 +908,9 @@ pub(crate) enum ScopeVerdict {
     Measured(crate::gate::GateOutcome),
     /// No unit agreed with the work: nothing was measured, so there is nothing to bless.
     NothingRan,
+    /// The request could not even be submitted (refused, no ticket): nothing was measured and
+    /// nothing is queued, so the caller falls back to the measurement it made before `scope`.
+    Unavailable,
 }
 
 /// Translates a ticket into the outcome an item gate records. A failed ticket carries the tail of
@@ -962,8 +965,9 @@ pub(crate) fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
 }
 
 /// Gates a job item over its worktree's diff from its recorded base: `scope` of kind `test`,
-/// cached, at autonomous priority. A refusal or a ticket that does not finish within `wait` is an
-/// `Errored` outcome, never a pass; the units it queued keep running and may still fill the cache.
+/// cached, at autonomous priority. A ticket that does not finish within `wait` is an `Errored`
+/// outcome, never a pass; the units it queued keep running and may still fill the cache. A request
+/// that cannot be submitted at all is `Unavailable`, and the caller measures the old way instead.
 pub(crate) async fn gate_job_scope(
     executor: &Arc<Executor>,
     job_id: i64,
@@ -983,9 +987,12 @@ pub(crate) async fn gate_job_scope(
     let id = match submit(executor, Caller::Job(job_id), &args).await {
         Ok(id) => id,
         Err(error) => {
-            return ScopeVerdict::Measured(GateOutcome::Errored {
-                reason: format!("scope verification was refused: {}", error.message()),
-            });
+            tracing::warn!(
+                job_id,
+                reason = error.message(),
+                "scope verification could not be submitted; the item takes the full gate"
+            );
+            return ScopeVerdict::Unavailable;
         }
     };
     match wait_ticket(&executor.pool, id, wait).await {
@@ -1502,6 +1509,19 @@ tests:
         let verdict = gate_job_scope(&f.ex, 1, f.repo.path(), WAIT).await;
         assert!(matches!(verdict, ScopeVerdict::NothingRan), "{verdict:?}");
         assert_eq!(count(&f.pool, "verify_runs").await, 0);
+    }
+
+    /// A scope request that cannot even be submitted measured nothing: the caller must be told so
+    /// (and measure the old way), not handed an `Errored` outcome it would record against the item.
+    #[tokio::test]
+    async fn a_job_gate_scope_that_cannot_be_submitted_is_unavailable() {
+        let f = fixture(Some(&plain_map()), None, true).await;
+        // A directory that is no git worktree at all: `submit` refuses before queueing anything.
+        let bare = tempfile::tempdir().unwrap();
+
+        let verdict = gate_job_scope(&f.ex, 1, bare.path(), WAIT).await;
+        assert!(matches!(verdict, ScopeVerdict::Unavailable), "{verdict:?}");
+        assert_eq!(count(&f.pool, "verify_requests").await, 0);
     }
 
     #[test]
