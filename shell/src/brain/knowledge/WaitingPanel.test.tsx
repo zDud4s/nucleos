@@ -27,7 +27,7 @@ describe("WaitingPanel", () => {
     );
 
     await renderWaiting();
-    const panel = await panelFor("Waiting for you");
+    const panel = await panelFor("Lessons to approve");
     const groups = panel.querySelectorAll(".learned-group");
 
     expect(groups).toHaveLength(3);

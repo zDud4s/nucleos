@@ -69,14 +69,13 @@ describe("UnifiedList", () => {
     expect(onSelect).toHaveBeenCalledWith("note:1");
   });
 
-  it("shows the waiting panel for proposed rows, and quick decisions in the list under Any state", async () => {
+  it("keeps proposed rows out of the default list, and decides them quickly under Any state", async () => {
     daemonHolding([], [
       known({ id: 4, title: "In force one" }),
       known({ id: 9, status: "proposed", proposal_id: 3, title: "Proposed thing" }),
     ]);
     await renderWithRouter(<UnifiedList onSelect={vi.fn()} />);
 
-    expect(await screen.findByRole("heading", { level: 2, name: "Waiting for you" })).toBeTruthy();
     // The default state keeps proposed rows out of the list itself.
     await screen.findByRole("button", { name: /In force one/ });
     expect(screen.queryByRole("button", { name: "Approve Proposed thing" })).toBeNull();
@@ -84,7 +83,7 @@ describe("UnifiedList", () => {
     const state = screen.getByRole("group", { name: "State" });
     fireEvent.click(within(state).getByRole("button", { name: "Any state" }));
     const approvals = await screen.findAllByRole("button", { name: "Approve Proposed thing" });
-    // One in the waiting panel is labelled plain "Approve"; the quick one carries the title.
+    // The quick decision carries the title; the full one is in the aside's "Lessons to approve".
     expect(approvals).toHaveLength(1);
     fireEvent.click(approvals[0] as HTMLElement);
     await waitFor(() =>

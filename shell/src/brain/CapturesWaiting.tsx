@@ -5,7 +5,7 @@ import { formatItem } from "./item-ref";
 import "./capture.css";
 
 /**
- * "Asked of you": the open capture requests, soonest deadline first. One request, one form — no
+ * "Questions for you": the open capture requests, soonest deadline first. One request, one form — no
  * batches and no groups. Draws nothing when nothing is open.
  */
 export function CapturesWaiting({ onSelect, selected }: { onSelect(item: string): void; selected?: string }) {
@@ -14,7 +14,7 @@ export function CapturesWaiting({ onSelect, selected }: { onSelect(item: string)
   if (rows.length === 0) return null;
 
   return (
-    <Panel title="Asked of you" aside={<Count n={rows.length} />}>
+    <Panel title="Questions for you" aside={<Count n={rows.length} />}>
       {rows.map((request) => (
         <div key={request.job_id} className="capture-item">
           <button

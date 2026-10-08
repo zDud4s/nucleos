@@ -26,6 +26,8 @@ import type {
 } from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
 import type { NoteDetail, NoteLink, NotesGraph, OwnerNote } from "../data/owner-notes";
+import type { Known } from "../data/knowledge";
+import type { CaptureRequest } from "../data/captures";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
 import type { EmailConfigView, EmailDetail, QueuedEmail } from "../data/mail";
@@ -520,6 +522,48 @@ export const NOTES_GRAPH: NotesGraph = {
     { kind: "mail", ref: "48190", label: null, missing: true },
   ],
 };
+
+/*
+  What the agent has been taught, beside the notes: two rows in force, one waiting for a decision
+  and one superseded — so the Brain photographs its waiting panel, its knowledge rows and the
+  graph's knowledge layers rather than a list of notes alone.
+*/
+function known(row: Partial<Known> & Pick<Known, "id" | "layer" | "title" | "body" | "status">): Known {
+  return {
+    scope_kind: "project",
+    scope_id: "alpha",
+    source: "distiller",
+    generator: "gate",
+    kind: "memory",
+    proposal_id: null,
+    supersedes: null,
+    origin_run_id: null,
+    evidence: null,
+    observations: null,
+    fingerprint: null,
+    expires_after_runs: null,
+    last_confirmed_at: null,
+    shown_count: 0,
+    outcome_count: 0,
+    green_count: 0,
+    last_shown_at: null,
+    created_at: ago(4 * DAY),
+    activated_at: ago(4 * DAY),
+    ended_at: null,
+    ...row,
+  };
+}
+
+export const KNOWLEDGE: Known[] = [
+  known({ id: 1, layer: "semantic", title: "Rust owns the state", body: "Only the núcleo writes SQLite; sidecars ask over HTTP.", status: "active", source: "owner", generator: null, shown_count: 14, outcome_count: 9, green_count: 8 }),
+  known({ id: 2, layer: "procedural", title: "Suite needs PATH", body: "Five tests spawn echo as a program; under PowerShell prepend Git's usr/bin.", status: "proposed", proposal_id: 31, observations: 3, created_at: ago(5 * HOUR), activated_at: null }),
+  known({ id: 3, layer: "episodic", title: "Gate flaked under load", body: "Timing tests in vcs:: failed while another suite ran; each passed alone.", status: "active", observations: 2, created_at: ago(2 * DAY), activated_at: ago(2 * DAY) }),
+  known({ id: 4, layer: "semantic", title: "Sidecars own their DB", body: "Each sidecar keeps its own store.", status: "superseded", source: "run", ended_at: ago(4 * DAY), created_at: ago(12 * DAY) }),
+];
+
+export const OPEN_CAPTURES: CaptureRequest[] = [
+  { job_id: 7, project_id: "alpha", causes: ["gate"], prompt_text: "Why did the release gate fail twice on Friday? Anything you know that the logs do not say.", state: "open", deadline: ago(-6 * HOUR), seconds_left: 6 * 3600, note_id: null, created_at: ago(40 * MINUTE), closed_at: null },
+];
 
 function noteDetail(id: number): NoteDetail | null {
   const note = OWNER_NOTES.find((row) => row.id === id);
@@ -2040,6 +2084,82 @@ const EMAIL_DETAIL = {
 } satisfies EmailDetail;
 
 /**
+ * The web archive: four pages, so the list and the reader can be looked at with something in them.
+ * One is quarantined (its content is the local model's banner and summary, verbatim), one was
+ * redirected, and one has no title — the row then falls back to its url.
+ */
+const WEB_PAGES = [
+  {
+    id: 1,
+    requested_url: "https://docs.rs/sqlx/latest/sqlx/",
+    final_url: "https://docs.rs/sqlx/latest/sqlx/",
+    host: "docs.rs",
+    title: "sqlx — Rust SQL toolkit",
+    byline: null,
+    content_md:
+      "The async SQL toolkit for Rust.\n\nCompile-time checked queries without a DSL. Supports PostgreSQL, MySQL and SQLite.\n\n## Pools\n\nA `Pool` holds a set of connections and hands one out per query; it is cheap to clone and meant to be shared.",
+    extract_status: "article",
+    trust_at_fetch: "raw",
+    trust_rule: "owner-allowlisted",
+    bytes: 18_420,
+    fetched_at: ago(4 * HOUR),
+  },
+  {
+    id: 2,
+    requested_url: "https://docs.rs/git2/latest/git2/struct.Repository.html",
+    final_url: "https://docs.rs/git2/latest/git2/struct.Repository.html",
+    host: "docs.rs",
+    title: "Repository in git2",
+    byline: null,
+    content_md: "An owned git repository, representing all state associated with the underlying filesystem.",
+    extract_status: "article",
+    trust_at_fetch: "raw",
+    trust_rule: "owner-allowlisted",
+    bytes: 9_310,
+    fetched_at: ago(51 * MINUTE),
+  },
+  {
+    id: 3,
+    requested_url: "https://t.co/x7Qa",
+    final_url: "https://blog.example.net/2026/09/sqlite-wal-in-practice",
+    host: "blog.example.net",
+    title: "SQLite WAL mode in practice",
+    byline: "M. Okafor",
+    content_md:
+      "[quarantined — summarised by the local model; the page itself never reached an agent]\n\n- WAL lets readers proceed while one writer appends.\n- Checkpoints fold the log back; a long reader can stall them.\n- `busy_timeout` matters more than pool size.",
+    extract_status: "fallback",
+    trust_at_fetch: "quarantined",
+    trust_rule: "default-quarantine",
+    bytes: 41_877,
+    fetched_at: ago(2 * DAY),
+  },
+  {
+    id: 4,
+    requested_url: "https://tauri.app/reference/config/",
+    final_url: "https://tauri.app/reference/config/",
+    host: "tauri.app",
+    title: null,
+    byline: null,
+    content_md: "Configuration reference for tauri.conf.json.",
+    extract_status: "article",
+    trust_at_fetch: "raw",
+    trust_rule: "owner-allowlisted",
+    bytes: 63_002,
+    fetched_at: ago(5 * DAY),
+  },
+];
+
+const webHit = (p: (typeof WEB_PAGES)[number]) => ({
+  id: p.id,
+  final_url: p.final_url,
+  host: p.host,
+  title: p.title,
+  snippet: p.content_md.replace(/^\[[^\]]*\]\s*/, "").split("\n")[0],
+  trust_at_fetch: p.trust_at_fetch,
+  fetched_at: p.fetched_at,
+});
+
+/**
  * The contacts roster, drawn so its cards hold deliberately unequal content: every badge plus
  * the human-linked unmerge button on one, nothing at all and no name on another, a name and an
  * address long enough to wrap. The cards must still come out one height — the shot `80-contacts`
@@ -2768,6 +2888,22 @@ export function answer(path: string, init?: RequestInit): unknown {
     return { turns: CHAT_TURNS, more: false };
   }
 
+  {
+    const [base, params] = splitQuery(path);
+    if (base === "/web/pages") {
+      const q = (params.get("q") ?? "").toLowerCase();
+      return WEB_PAGES.filter((p) => q === "" || `${p.title ?? ""} ${p.final_url} ${p.content_md}`.toLowerCase().includes(q)).map(webHit);
+    }
+    const page = /^\/web\/pages\/(\d+)$/.exec(base);
+    if (page) return WEB_PAGES.find((p) => p.id === Number(page[1])) ?? null;
+    if (base === "/web/read" && init?.method === "POST") {
+      return { ...WEB_PAGES[0], trust: WEB_PAGES[0].trust_at_fetch, from_cache: true };
+    }
+    if (base === "/web/search" && init?.method === "POST") {
+      return { provider: "unavailable", cached: WEB_PAGES.slice(0, 1).map(webHit), results: [] };
+    }
+  }
+
   if (path === "/contacts") return CONTACTS;
   if (path === "/teams") return TEAMS;
   if (path === "/team-runs") return RUNS;
@@ -2819,6 +2955,9 @@ export function answer(path: string, init?: RequestInit): unknown {
     if (splitQuery(path)[1].get("include_archived") !== "true") return NOTES_GRAPH;
     return { ...NOTES_GRAPH, notes: OWNER_NOTES } satisfies NotesGraph;
   }
+  if (path === "/knowledge") return KNOWLEDGE;
+  if (path === "/capture-requests") return OPEN_CAPTURES;
+  if (path === "/capture-requests?state=all") return OPEN_CAPTURES;
   const ownerNote = /^\/owner-notes\/(\d+)$/.exec(path);
   if (ownerNote !== null && init?.method === undefined) return noteDetail(Number(ownerNote[1]));
   if (path === "/proposals") return PROPOSALS;

@@ -33,9 +33,11 @@
 
   position: relative;
   width: 100%;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--brain-ground);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-lg);
+  background:
+    radial-gradient(circle at 1px 1px, var(--border) 1px, transparent 0) 0 0 / 24px 24px,
+    var(--brain-ground);
   overflow: hidden;
 }
 
@@ -89,11 +91,15 @@
   height: 1.75rem;
   padding: 0 var(--space-2);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background: var(--surface-raised);
   color: var(--text-muted);
   font-size: var(--text-xs);
   line-height: 1;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-quick) var(--ease),
+    color var(--dur-quick) var(--ease);
 }
 
 .brain-force-control:hover {
