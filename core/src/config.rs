@@ -2655,6 +2655,20 @@ pub struct JudgeResolveConfig {
     pub fixable_at: Option<f64>,
 }
 
+/// F2b step 2: what the PreToolUse hook does with a verification command that an unattended
+/// worktree run executes by itself.
+///
+/// `Observe` only records it (step 1). `Refuse` makes the hook deny it, pointing the run at the
+/// daemon's `verify` tool. Absent means `Observe`, and that default is the whole compatibility
+/// story: a project that says nothing behaves exactly as before this key existed.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifyGuardMode {
+    #[default]
+    Observe,
+    Refuse,
+}
+
 // `PartialEq` without `Eq`, transitively: a `ScheduleRule`'s `graph:` block holds a float now.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -2726,6 +2740,10 @@ pub struct AutopilotRules {
     /// means the executor's own default.
     #[serde(default)]
     pub verify_disk_cap_gb: Option<u64>,
+    /// Whether the hook refuses a verification command a worktree run runs by itself. Absent is
+    /// `observe`. Its only reader is `hooks::observe_verification`.
+    #[serde(default)]
+    pub verify_guard: VerifyGuardMode,
 }
 
 impl AutopilotRules {
@@ -5275,6 +5293,33 @@ cycle_seconds: 30
                 .verify_disk_cap_gb,
             None
         );
+    }
+
+    #[test]
+    fn the_verify_guard_switch_defaults_to_observe() {
+        assert_eq!(
+            parse_schedule_rules("gate_command: x\n")
+                .unwrap()
+                .verify_guard,
+            VerifyGuardMode::Observe
+        );
+        assert_eq!(
+            parse_schedule_rules("verify_guard: observe\n")
+                .unwrap()
+                .verify_guard,
+            VerifyGuardMode::Observe
+        );
+        assert_eq!(
+            parse_schedule_rules("verify_guard: refuse\n")
+                .unwrap()
+                .verify_guard,
+            VerifyGuardMode::Refuse
+        );
+    }
+
+    #[test]
+    fn an_unknown_verify_guard_value_is_refused() {
+        assert!(parse_schedule_rules("verify_guard: block\n").is_err());
     }
 
     #[test]
