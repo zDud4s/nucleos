@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { CaptureRequest } from "../data/captures";
 import type { Known } from "../data/knowledge";
 import type { OwnerNote } from "../data/owner-notes";
 import { filterItems, toItems, type ItemFilters } from "./unified";
@@ -42,6 +43,22 @@ function known(over: Partial<Known> = {}): Known {
     created_at: "2026-08-01T09:00:00+00:00",
     activated_at: "2026-08-01T09:05:00+00:00",
     ended_at: null,
+    ...over,
+  };
+}
+
+function capture(over: Partial<CaptureRequest> = {}): CaptureRequest {
+  return {
+    job_id: 1,
+    project_id: "nucleos",
+    causes: [],
+    prompt_text: "a question",
+    state: "open",
+    deadline: "2026-09-02T09:00:00+00:00",
+    seconds_left: 10,
+    note_id: null,
+    created_at: "2026-09-01T09:00:00+00:00",
+    closed_at: null,
     ...over,
   };
 }
@@ -109,5 +126,21 @@ describe("filterItems", () => {
     const out = filterItems(items, { ...ALL, q: "alpha" });
     expect(out.filter((i) => i.kind === "knowledge")).toHaveLength(2);
     expect(out.filter((i) => i.kind === "note")).toHaveLength(1);
+  });
+
+  it("captures: state buckets, type filter, layer excludes them, three-kind tie-break", () => {
+    const items = toItems(
+      [note({ id: 1 })],
+      [known({ id: 1, activated_at: "2026-09-01T09:00:00+00:00" })],
+      [capture({ job_id: 1 }), capture({ job_id: 2, state: "expired" })],
+    );
+    const ids = (f: Partial<ItemFilters>) =>
+      filterItems(items, { ...ALL, ...f }).map((i) => `${i.kind}${i.kind === "capture" ? i.capture.job_id : ""}`);
+    expect(ids({ type: "capture" })).toEqual(["capture2", "capture1"]);
+    expect(ids({ type: "capture", state: "in_force" })).toEqual([]);
+    expect(ids({ type: "capture", state: "out" })).toEqual(["capture2"]);
+    expect(ids({ layer: "semantic" })).toEqual(["knowledge"]);
+    // Same instant: note, then knowledge, then captures by id descending.
+    expect(ids({})).toEqual(["note", "knowledge", "capture2", "capture1"]);
   });
 });

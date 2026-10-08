@@ -1,14 +1,16 @@
+import type { CaptureRequest } from "../data/captures";
 import type { Known, KnownLayer } from "../data/knowledge";
 import type { OwnerNote } from "../data/owner-notes";
-import { knownBucket, noteBucket, passesState } from "./item-state";
+import { captureBucket, knownBucket, noteBucket, passesState } from "./item-state";
 
 /** One entry of the unified Brain list. Discriminated on `kind`; a third kind is one more arm. */
 export type BrainItem =
   | { kind: "note"; note: OwnerNote }
-  | { kind: "knowledge"; known: Known };
+  | { kind: "knowledge"; known: Known }
+  | { kind: "capture"; capture: CaptureRequest };
 
 export interface ItemFilters {
-  type: "all" | "note" | "knowledge";
+  type: "all" | "note" | "knowledge" | "capture";
   state: "in_force" | "out" | "all";
   /** Knowledge only. Notes pass when this is `"all"` and are excluded otherwise. */
   layer: KnownLayer | "all";
@@ -18,21 +20,32 @@ export interface ItemFilters {
   q: string;
 }
 
-export function toItems(notes: readonly OwnerNote[], known: readonly Known[]): BrainItem[] {
+export function toItems(
+  notes: readonly OwnerNote[],
+  known: readonly Known[],
+  captures: readonly CaptureRequest[] = [],
+): BrainItem[] {
   return [
     ...notes.map((note): BrainItem => ({ kind: "note", note })),
     ...known.map((row): BrainItem => ({ kind: "knowledge", known: row })),
+    ...captures.map((capture): BrainItem => ({ kind: "capture", capture })),
   ];
 }
 
-/** When the item entered the list: a note's creation, a knowledge row's activation (else creation). */
+/** When the item entered the list: a note's or capture's creation, a knowledge row's activation (else creation). */
 export function itemDate(item: BrainItem): string {
-  return item.kind === "note" ? item.note.created_at : (item.known.activated_at ?? item.known.created_at);
+  if (item.kind === "note") return item.note.created_at;
+  if (item.kind === "capture") return item.capture.created_at;
+  return item.known.activated_at ?? item.known.created_at;
 }
 
 export function itemId(item: BrainItem): number {
-  return item.kind === "note" ? item.note.id : item.known.id;
+  if (item.kind === "note") return item.note.id;
+  if (item.kind === "capture") return item.capture.job_id;
+  return item.known.id;
 }
+
+const KIND_ORDER: Record<BrainItem["kind"], number> = { note: 0, knowledge: 1, capture: 2 };
 
 /** The scope key a knowledge row answers to in the Scope filter (same keys as the Learned page). */
 export function scopeKey(row: Known): string {
@@ -54,6 +67,10 @@ export function filterItems(items: readonly BrainItem[], filters: ItemFilters): 
         if (!passesState(noteBucket(item.note.state), filters.state, "list")) return false;
         return filters.layer === "all" && filters.scope === "all";
       }
+      if (item.kind === "capture") {
+        if (!passesState(captureBucket(item.capture.state), filters.state, "list")) return false;
+        return filters.layer === "all" && filters.scope === "all";
+      }
       const row = item.known;
       if (!passesState(knownBucket(row.status), filters.state, "list")) return false;
       if (filters.layer !== "all" && row.layer !== filters.layer) return false;
@@ -64,7 +81,7 @@ export function filterItems(items: readonly BrainItem[], filters: ItemFilters): 
     .sort((a, b) => {
       const diff = time(b) - time(a);
       if (diff !== 0) return diff;
-      if (a.kind !== b.kind) return a.kind === "note" ? -1 : 1;
+      if (a.kind !== b.kind) return KIND_ORDER[a.kind] - KIND_ORDER[b.kind];
       return itemId(b) - itemId(a);
     });
 }

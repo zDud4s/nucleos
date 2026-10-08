@@ -32,6 +32,13 @@ export function noteBucket(state: string): StateBucket {
   return "unknown";
 }
 
+/** A capture request is open until it is answered, dismissed or expired; any other state is not ours to read. */
+export function captureBucket(state: string): StateBucket {
+  if (state === "open") return "proposed";
+  if (state === "answered" || state === "dismissed" || state === "expired") return "out";
+  return "unknown";
+}
+
 /**
  * Whether a bucket survives the Estado filter. In the graph, "in force" also keeps `proposed`
  * rows (drawn hollow) so a pending item still shows where it would attach; the list does not.

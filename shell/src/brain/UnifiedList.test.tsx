@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import type { OwnerNote } from "../data/owner-notes";
+import type { CaptureRequest } from "../data/captures";
 import type { Known } from "../data/knowledge";
 import { renderWithRouter } from "../test/harness";
 import { daemonWith, known } from "./knowledge/test-helpers";
@@ -30,9 +31,27 @@ function note(over: Partial<OwnerNote> = {}): OwnerNote {
   };
 }
 
-function daemonHolding(notes: OwnerNote[], rows: Known[]) {
+function capture(over: Partial<CaptureRequest> = {}): CaptureRequest {
+  return {
+    job_id: 7,
+    project_id: "nucleos",
+    causes: [],
+    prompt_text: "Why did the gate fail?\nmore",
+    state: "answered",
+    deadline: "2026-09-02T09:00:00+00:00",
+    seconds_left: 0,
+    note_id: null,
+    created_at: "2026-09-01T10:00:00+00:00",
+    closed_at: "2026-09-01T11:00:00+00:00",
+    ...over,
+  };
+}
+
+function daemonHolding(notes: OwnerNote[], rows: Known[], captures: CaptureRequest[] = []) {
   const knowledge = daemonWith(rows);
   daemon.apiFetch.mockImplementation((path: string) => {
+    if (path === "/capture-requests?state=all") return Promise.resolve(captures);
+    if (path === "/capture-requests") return Promise.resolve(captures.filter((c) => c.state === "open"));
     if (path.startsWith("/owner-notes")) return Promise.resolve(notes);
     return knowledge(path);
   });
@@ -82,6 +101,19 @@ describe("UnifiedList", () => {
     fireEvent.click(within(type).getByRole("button", { name: "Knowledge" }));
     await waitFor(() => expect(screen.queryByRole("button", { name: /Rust owns the state/ })).toBeNull());
     expect(screen.getByRole("button", { name: /Suite needs PATH/ })).toBeTruthy();
+  });
+
+  it("lists closed captures under Over, titled by the first line of the question", async () => {
+    daemonHolding([], [known({ id: 5, title: "Suite needs PATH" })], [capture({ job_id: 7 })]);
+    const onSelect = vi.fn();
+    await renderWithRouter(<UnifiedList onSelect={onSelect} />);
+    await screen.findByRole("button", { name: /Suite needs PATH/ });
+    expect(screen.queryByRole("button", { name: /Why did the gate fail/ })).toBeNull();
+
+    const state = screen.getByRole("group", { name: "State" });
+    fireEvent.click(within(state).getByRole("button", { name: "Over" }));
+    fireEvent.click(await screen.findByRole("button", { name: /Why did the gate fail\?/ }));
+    expect(onSelect).toHaveBeenCalledWith("capture:7");
   });
 
   it("shows the Teach callout when there is nothing at all", async () => {
