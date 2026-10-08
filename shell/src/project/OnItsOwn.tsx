@@ -26,6 +26,7 @@ import {
   StaleNote,
   StateBadge,
 } from "../ui";
+import { IdeVerifyPanel } from "./IdeVerify";
 /* The `pj-` family is this component's vocabulary as much as the inspector's. Imported here as
    well, so the component draws correctly wherever it is mounted — the project workspace is the
    next place, and it imports nothing from the inspector. */
@@ -38,7 +39,7 @@ import "../pages/projects.css";
  * person goes to change how a project behaves. The inspector is a stop-gap for reading the tree —
  * `router.tsx` says the Código mode replaces it — and this is the one part of it that nothing
  * replaces: the rules that start work with nobody asking, the gate that measures it, the judge that
- * answers for you on Auto, and the ceiling that stops it piling up. Safety controls found only by
+ * answers for you on Auto, and the ceiling that stops it piling up, and the IDE verify switch beside them. Safety controls found only by
  * a link from a file browser are safety controls nobody finds.
  *
  * **Self-contained on purpose.** It takes a project id and reads the rules itself. React Query
@@ -112,6 +113,7 @@ export function OnItsOwn({ projectId }: OnItsOwnProps) {
         stale={stale}
       />
       <WipPanel projectId={projectId} rules={rules.data} stale={stale} />
+      <IdeVerifyPanel projectId={projectId} rules={rules.data} stale={stale} />
     </>
   );
 }

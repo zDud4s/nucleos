@@ -23,8 +23,8 @@ import { whereWaiting } from "./roster";
  * `diff` gets an explicit refresh instead, which is the honest shape: the tree
  * changes when the person changes it.
  *
- * Two writes live here, and neither is a file: the WIP ceiling and the judge, both rows in the
- * núcleo's database. "The one write is the WIP ceiling" was true until the judge arrived beside it,
+ * Three writes live here, and none is a file: the WIP ceiling, the judge and the IDE verify switch,
+ * all rows in the núcleo's database. "The one write is the WIP ceiling" was true until the judge arrived beside it,
  * and a sentence that outlives its truth is read as a promise.
  */
 
@@ -86,6 +86,11 @@ export interface ProjectRules {
    * and a second copy of it in the window is a copy that will eventually disagree.
    */
   gate_before_publish: boolean;
+  /**
+   * Whether the IDE verify switch is on. Optional: the shell can be newer than the daemon, and an
+   * older one does not report it — the toggle then offers no control.
+   */
+  ide_verify?: boolean;
   /** Who answers an approval a conversation on `auto` would otherwise put to a person. */
   judge: JudgeState;
   schedules: ScheduleView[];
@@ -274,6 +279,41 @@ export function useSetWipLimit() {
       apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/wip-limit`, {
         method: "POST",
         body: JSON.stringify({ limit }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.projects.all });
+    },
+  });
+}
+
+/** What the reconcile did to one IDE worktree (`verify_provision::ProvisionState`). */
+export type IdeVerifyState = "provisioned" | "removed" | "not_provisioned" | "untouched";
+
+export interface WorktreeReport {
+  path: string;
+  state: IdeVerifyState;
+  reason?: string;
+}
+
+/** The answer to `POST /projects/{id}/ide-verify`: the switch as stored and every worktree seen. */
+export interface IdeVerifyAnswer {
+  project: string;
+  enabled: boolean;
+  worktrees: WorktreeReport[];
+}
+
+/**
+ * Switch IDE verify on or off for one project. Owner-only on the daemon side. Posting `true` to a
+ * project that is already on re-provisions it, which is how a worktree created later is picked up.
+ */
+export function useSetIdeVerify() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ projectId, enabled }: { projectId: string; enabled: boolean }) =>
+      apiFetch<IdeVerifyAnswer>(`/projects/${encodeURIComponent(projectId)}/ide-verify`, {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
       }),
     retry: false,
     onSettled: () => {

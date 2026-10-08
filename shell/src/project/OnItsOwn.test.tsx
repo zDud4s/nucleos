@@ -82,6 +82,16 @@ describe("OnItsOwn", () => {
     expect(daemon.apiFetch).toHaveBeenCalledWith("/projects/alpha/rules");
   });
 
+  /* The IDE verify toggle is mounted from a project id alone, and drawing it writes nothing. */
+  it("mounts the ide verify panel without posting to it", async () => {
+    await mount(rules({ ide_verify: false }));
+
+    expect(await screen.findByRole("heading", { name: "IDE verify" })).toBeDefined();
+    expect(
+      daemon.apiFetch.mock.calls.some(([path]) => path === "/projects/alpha/ide-verify"),
+    ).toBe(false);
+  });
+
   /* Every finding it shows is put right in one file, and the file's editor is in the workspace.
      The unparseable-file alert used to leave the person to find that on their own. */
   it("leads an unreadable rules file to its editor", async () => {
