@@ -59,10 +59,13 @@ def env_for(slots_dir: Path, **extra: str) -> dict:
     env = dict(os.environ)
     # The machine's own tuning must not reach the tests: a user-level NUCLEOS_BUILD_SLOTS=4 let a
     # third holder run beside two that were meant to fill every slot.
-    for name in ("NUCLEOS_BUILD_SLOT_HELD", "NUCLEOS_BUILD_SLOTS", "NUCLEOS_BUILD_SLOT_TIMEOUT"):
+    for name in ("NUCLEOS_BUILD_SLOT_HELD", "NUCLEOS_BUILD_SLOTS", "NUCLEOS_BUILD_SLOT_TIMEOUT", "NUCLEOS_HEAVY"):
         env.pop(name, None)
     env["NUCLEOS_BUILD_SLOTS_DIR"] = slots_dir.as_posix()
     env["NUCLEOS_HEAVY_MAIN"] = Path(NO_BROKER).as_posix()
+    # Nor whether this machine runs the broker: its state dir decides that (gates.sh heavy_broker),
+    # and the owner's machine has one. A test opts in by pointing this at a directory that exists.
+    env["NUCLEOS_HEAVY_DIR"] = Path(NO_BROKER, "heavy-state").as_posix()
     env.update(extra)
     return env
 
@@ -339,13 +342,19 @@ def test_gates_delegates_to_broker_when_present() -> None:
         main, record = fake_main(work)
         path = fake_cargo(work)
         py = Path(sys.executable).as_posix()
-        extra = dict(NUCLEOS_HEAVY_MAIN=main.as_posix(), NUCLEOS_HEAVY_PYTHON=py, PATH=path)
+        extra = dict(NUCLEOS_HEAVY_MAIN=main.as_posix(), NUCLEOS_HEAVY_PYTHON=py, PATH=path,
+                     NUCLEOS_HEAVY_DIR=work.as_posix())
         # build-slot.sh goes through the broker...
         result = slot_run(slots, "cargo", "test", "-p", "x", **extra)
         assert result.returncode == 0, (result.returncode, result.stderr)
         assert record.is_file(), ("the broker was not called", result.stdout, result.stderr)
         assert record.read_text().split(NL) == ["--", "cargo", "test", "-p", "x"], record.read_text()
         assert "fake cargo" not in result.stdout, "the command ran in-process instead of via the broker"
+        record.unlink()
+        # NUCLEOS_HEAVY=1 opts a machine in without the state dir.
+        result = slot_run(slots, "cargo", "test", **{**extra, "NUCLEOS_HEAVY_DIR": (work / "none").as_posix(),
+                                                     "NUCLEOS_HEAVY": "1"})
+        assert record.is_file(), ("NUCLEOS_HEAVY=1 did not opt in", result.stdout, result.stderr)
         record.unlink()
         # ...and so does a step of gates.sh's own `run`.
         script = f'source "{GATES.as_posix()}" || exit 2; run "step" "{work.as_posix()}" cargo build'
@@ -382,6 +391,15 @@ def test_gates_falls_back_when_broker_absent() -> None:
         assert result.returncode == 0, (result.returncode, result.stderr)
         assert "fake cargo test" in result.stdout, result.stdout
         assert not record.exists(), "an incomplete broker was called"
+        # Both files present but this machine never ran the broker (CI, a fresh clone): the files
+        # are tracked, so their presence alone must not switch it on.
+        main2, record2 = fake_main(work / "tracked")
+        result = slot_run(
+            slots, "cargo", "test", NUCLEOS_HEAVY_MAIN=main2.as_posix(), NUCLEOS_HEAVY_PYTHON=py, PATH=path
+        )
+        assert result.returncode == 0, (result.returncode, result.stderr)
+        assert "fake cargo test" in result.stdout, result.stdout
+        assert not record2.exists(), "the broker ran on a machine that never opted in"
         # a non-cargo command goes through gates.sh's run untouched when the broker is absent
         script = f'source "{GATES.as_posix()}" || exit 2; run "step" "{work.as_posix()}" echo plain'
         result = subprocess.run(
