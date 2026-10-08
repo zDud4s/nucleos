@@ -204,7 +204,7 @@ pub fn install(executor: Arc<Executor>) {
 }
 
 /// `None` until `main` installs the executor, which the handlers answer with 503.
-pub(crate) fn installed() -> Option<Arc<Executor>> {
+pub fn installed() -> Option<Arc<Executor>> {
     EXECUTOR.get().cloned()
 }
 
