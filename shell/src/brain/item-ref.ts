@@ -1,14 +1,15 @@
 /**
  * The address of one Brain item, as it travels in `?item=`.
  *
- * Two kinds only: a note and a knowledge row. Graph entity nodes (projects,
+ * Three kinds: a note, a knowledge row and a capture request (keyed by its job id). Graph entity nodes (projects,
  * files) are not items - they have no side panel.
  */
-export type ItemRef = { kind: "note"; id: number } | { kind: "knowledge"; id: number };
+export type ItemRef = { kind: "note"; id: number } | { kind: "knowledge"; id: number }
+  | { kind: "capture"; id: number };
 
 export type BrainView = "list" | "graph";
 
-const ITEM = /^(note|knowledge):([1-9][0-9]*)$/;
+const ITEM = /^(note|knowledge|capture):([1-9][0-9]*)$/;
 
 /** `"note:45"` | `"knowledge:123"` -> a ref; anything else, including a non-positive id, -> null. */
 export function parseItem(raw: unknown): ItemRef | null {
@@ -24,8 +25,12 @@ export function formatItem(ref: ItemRef): string {
   return `${ref.kind}:${ref.id}`;
 }
 
-/** The graph node id of an item: `n:<id>` for a note, `k:<id>` for a knowledge row. */
-export function nodeIdOf(ref: ItemRef): string {
+/**
+ * The graph node id of an item: `n:<id>` for a note, `k:<id>` for a knowledge row. A capture
+ * request is no graph node, so it has none.
+ */
+export function nodeIdOf(ref: ItemRef): string | null {
+  if (ref.kind === "capture") return null;
   return `${ref.kind === "note" ? "n" : "k"}:${ref.id}`;
 }
 

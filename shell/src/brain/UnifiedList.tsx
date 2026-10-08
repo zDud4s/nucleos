@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useApproveKnowledge, useKnowledge, useRejectKnowledge, type Known, type KnownLayer } from "../data/knowledge";
 import { useOwnerNotes, useSearchOwnerNotes } from "../data/owner-notes";
 import { Button, ErrorNote, Panel, Quiet, RelativeTime, Row, Rows, Teach } from "../ui";
+import { CapturesWaiting } from "./CapturesWaiting";
 import { formatItem } from "./item-ref";
 import { MeasuredSummary } from "./knowledge/MeasuredSummary";
 import { WaitingPanel } from "./knowledge/WaitingPanel";
@@ -9,7 +10,7 @@ import { filterItems, itemDate, scopeKey, toItems, type BrainItem, type ItemFilt
 import "./unified-list.css";
 
 export interface UnifiedListProps {
-  /** Receives `formatItem(ref)`: `note:12` or `knowledge:5`. */
+  /** Receives `formatItem(ref)`: `note:12`, `knowledge:5` or `capture:7`. */
   onSelect(item: string): void;
 }
 
@@ -76,6 +77,7 @@ export function UnifiedList({ onSelect }: UnifiedListProps) {
       {(allNotes.isError || knowledge.isError) && (
         <ErrorNote>the núcleo did not answer — part of what is known is missing</ErrorNote>
       )}
+      <CapturesWaiting onSelect={onSelect} />
       <WaitingPanel rows={waiting} />
 
       <div className="unified-filters">

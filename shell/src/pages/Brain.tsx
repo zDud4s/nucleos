@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { BrainPanel } from "../brain/BrainPanel";
+import { CapturePanel } from "../brain/CapturePanel";
 import { KnowledgePanel } from "../brain/knowledge/KnowledgePanel";
 import { UnifiedList } from "../brain/UnifiedList";
 import { ForceGraph } from "../brain/ForceGraph";
@@ -220,6 +221,7 @@ export function BrainGraphView({ item, onItem }: { item?: string; onItem: (item:
   const ref = parseItem(item);
   const selected =
     entity !== null && entity.under === item ? entity.id : ref !== null ? nodeIdOf(ref) : null;
+  // A capture request has no graph node: it selects nothing there (nodeIdOf is null).
   const select = (nodeId: string) => {
     const picked = itemOfNode(nodeId);
     if (picked !== null) {
@@ -282,6 +284,7 @@ function ItemPanel({ item, onItem }: { item: ItemRef; onItem: (item: string) => 
     const picked = itemOfNode(nodeId);
     if (picked !== null) onItem(formatItem(picked));
   };
+  if (item.kind === "capture") return <CapturePanel key={item.id} id={item.id} onSelect={onItem} />;
   if (item.kind === "knowledge") return <KnowledgePanel key={item.id} id={item.id} onSelect={select} />;
   if (graph.isError) return <ErrorNote>the núcleo did not answer — the note is not known</ErrorNote>;
   if (graph.data === undefined || model === null) return <Quiet says="Loading…" />;
