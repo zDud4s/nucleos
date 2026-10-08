@@ -1,0 +1,6 @@
+# cargo-nextest settings for the workspace (`scripts/gates.sh core` runs the suite with nextest).
+[profile.default]
+# A test that hangs is terminated instead of holding the gate open. Neither the gate nor the
+# selector has a timeout of its own, and a hung `core: test` once kept a gate running for 5.6 hours.
+# The slowest test on master took 59 s, so ten minutes leaves room for a loaded machine.
+slow-timeout = { period = "60s", terminate-after = 10 }
