@@ -2713,6 +2713,12 @@ pub struct AutopilotRules {
     /// `git_exec::gate_the_merge`, which is the only reader.
     #[serde(default)]
     pub gate_before_publish: bool,
+    /// Whether the daemon runs the full gate on the target after a merge lands (spec
+    /// 2026-10-05 §6.1). Off by default — a project that says nothing behaves exactly as before
+    /// this key existed. No reader yet (F3-2 wires it); turning it on is the owner's decision
+    /// (F3-8).
+    #[serde(default)]
+    pub gate_after_land: bool,
     /// Whether a job asks if the owner is at the keyboard before it starts its next node.
     ///
     /// `Option`, and the absent case is the brake ON. That is deliberately not the same as
@@ -4808,6 +4814,31 @@ resolve_effort: \"  \"
             assert!(rules.schedules.is_empty());
             assert!(rules.repo_triggers.is_empty());
         }
+    }
+
+    #[test]
+    fn gate_after_land_is_off_by_default_and_existing_files_parse_unchanged() {
+        assert!(!AutopilotRules::default().gate_after_land);
+
+        let rules = parse_schedule_rules("gate_command: x\ngate_before_publish: true\n").unwrap();
+        assert!(!rules.gate_after_land);
+        assert_eq!(rules.gate_command.as_deref(), Some("x"));
+        assert!(rules.gate_before_publish);
+
+        for contents in ["", "   \n"] {
+            let rules = parse_schedule_rules(contents).unwrap();
+            assert!(
+                !rules.gate_after_land,
+                "{contents:?} must leave the switch off"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_after_land_parses_when_set() {
+        let rules = parse_schedule_rules("gate_command: x\ngate_after_land: true\n").unwrap();
+        assert!(rules.gate_after_land);
+        assert_eq!(rules.gate_command.as_deref(), Some("x"));
     }
 
     #[test]
