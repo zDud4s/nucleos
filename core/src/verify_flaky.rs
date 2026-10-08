@@ -14,7 +14,7 @@ pub const MIN_OBSERVED: u32 = 5;
 pub const SUSPECT_PER_MILLE: u32 = 100;
 
 /// The columns of one `verify_runs` row that flakiness reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct Run {
     pub id: i64,
     pub group_name: Option<String>,
@@ -134,14 +134,7 @@ pub async fn history(
     project_id: &str,
     limit: i64,
 ) -> sqlx::Result<Vec<Run>> {
-    let rows: Vec<(
-        i64,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        String,
-        String,
-    )> = sqlx::query_as(
+    sqlx::query_as(
         "SELECT id, group_name, sha, fingerprint, status, requested_by \
              FROM verify_runs \
              WHERE project_id = ? AND status IN (?, ?, ?) AND group_name IS NOT NULL \
@@ -153,20 +146,7 @@ pub async fn history(
     .bind(STATUS_ERRORED)
     .bind(limit)
     .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(
-            |(id, group_name, sha, fingerprint, status, requested_by)| Run {
-                id,
-                group_name,
-                sha,
-                fingerprint,
-                status,
-                requested_by,
-            },
-        )
-        .collect())
+    .await
 }
 
 #[cfg(test)]
