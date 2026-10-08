@@ -916,6 +916,40 @@ describe("Autopilot - the ledger line names what it counts", () => {
     // The line never promises to BE the queue; the link that actually goes there is untouched.
     expect(screen.getAllByRole("link", { name: /Go to the queue|to review across the roster/ }).length).toBeGreaterThan(0);
   });
+
+  it("the ledger names one full queue in the singular", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({ project_id: "alpha", mode: "active", queue_full: true }),
+        project({ project_id: "beta", mode: "shadow" }),
+      ],
+      proposals: [proposal({ id: 1 })],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByRole("link", { name: "1 to review across the roster" })).toBeDefined();
+    expect(document.querySelector(".ap-ledger")?.textContent).toContain("— 1 project's queue full");
+  });
+
+  it("the ledger names several full queues in the plural", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({ project_id: "alpha", mode: "active", queue_full: true }),
+        project({ project_id: "beta", mode: "active", queue_full: true }),
+      ],
+      proposals: [proposal({ id: 1 })],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByRole("link", { name: "1 to review across the roster" })).toBeDefined();
+    const ledger = document.querySelector(".ap-ledger")?.textContent;
+    expect(ledger).toContain("— 2 projects' queues full");
+    expect(ledger).not.toContain("project queue full");
+  });
 });
 
 /* ---------------------------------------------------------- the ask form -- */

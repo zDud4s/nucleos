@@ -297,7 +297,9 @@ function Ledger({
           {pending} to review across the roster
         </Link>
       )}
-      {pending !== undefined && held > 0 && ` — ${held} project queue full`}
+      {pending !== undefined &&
+        held > 0 &&
+        (held === 1 ? " — 1 project's queue full" : ` — ${held} projects' queues full`)}
       {pending !== undefined && spend !== undefined && " · "}
       {spend}
     </p>
