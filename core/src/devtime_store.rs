@@ -2364,4 +2364,35 @@ mod tests {
         );
         assert_eq!(rows[0].tool_name, "Bash");
     }
+
+    /// The ingest's per-event lookups run inside the chunk's write transaction, so a scan of a long
+    /// session's attempts there holds the write lock past busy_timeout (migration 0181).
+    #[tokio::test]
+    async fn the_ingest_lookups_use_their_indexes() {
+        let pool = test_pool().await;
+        for (query, index) in [
+            (
+                "SELECT attempt_id FROM devtime_attempts WHERE session_id = 's' AND tool_use_id = 't'",
+                "idx_devtime_attempts_tool_use",
+            ),
+            (
+                "SELECT DISTINCT bg_task_id FROM devtime_attempts
+                  WHERE session_id = 's' AND bg_task_id IS NOT NULL",
+                "idx_devtime_attempts_bg_task",
+            ),
+        ] {
+            let plan: Vec<String> =
+                sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {query}")))
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get::<String, _>("detail"))
+                    .collect();
+            assert!(
+                plan.iter().any(|detail| detail.contains(index)),
+                "{query} should use {index}, plan: {plan:?}"
+            );
+        }
+    }
 }
