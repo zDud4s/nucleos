@@ -1557,9 +1557,10 @@ mod tests {
     async fn a_postgate_tree_is_never_synced() {
         let pool = crate::testdb::fresh_pool().await;
         let temp = tempfile::tempdir().unwrap();
-        let tree = temp
-            .path()
-            .join(format!("{}project", crate::verify_postgate::POSTGATE_PREFIX));
+        let tree = temp.path().join(format!(
+            "{}project",
+            crate::verify_postgate::POSTGATE_PREFIX
+        ));
         std::fs::create_dir_all(&tree).unwrap();
         crate::project_state::write_for_test(
             temp.path(),

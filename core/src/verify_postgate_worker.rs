@@ -407,9 +407,7 @@ mod tests {
     }
 
     async fn count(pool: &sqlx::SqlitePool, table: &str) -> i64 {
-        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT COUNT(*) FROM {table}"
-        )))
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
             .fetch_one(pool)
             .await
             .unwrap()
@@ -426,7 +424,10 @@ mod tests {
 
             let passes = tick(&f.ex).await;
 
-            assert!(passes.is_empty(), "no pass for a project that is switched off");
+            assert!(
+                passes.is_empty(),
+                "no pass for a project that is switched off"
+            );
             assert_eq!(count(&f.pool, "postgate_state").await, 0);
             assert_eq!(count(&f.pool, "verify_requests").await, 0);
             assert_eq!(count(&f.pool, "verify_runs").await, 0);
@@ -480,7 +481,11 @@ mod tests {
             .fetch_all(&f.pool)
             .await
             .unwrap();
-        assert_eq!(units, vec!["postgate".to_owned()], "one unit, labelled postgate");
+        assert_eq!(
+            units,
+            vec!["postgate".to_owned()],
+            "one unit, labelled postgate"
+        );
     }
 
     #[tokio::test]
@@ -491,7 +496,10 @@ mod tests {
         let step = tick_until(&f, |s| matches!(s, Step::Green(_))).await;
         assert_eq!(step, Step::Green(f.tip.clone()));
 
-        let s = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(s.last_green_sha.as_deref(), Some(f.tip.as_str()));
         assert_eq!(s.running_sha, None);
         assert_eq!(s.running_request_id, None);
@@ -515,7 +523,10 @@ mod tests {
             }
         );
 
-        let s = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
         // The gate unit has no group, so the failing unit is named by the command's key.
         assert_eq!(s.red_groups, vec!["gate_command".to_owned()]);
         assert_eq!(s.red_since_sha.as_deref(), Some(f.tip.as_str()));
@@ -535,10 +546,7 @@ mod tests {
         assert_eq!(count(&f.pool, "verify_requests").await, 1);
 
         // The restarted daemon: a later tick finds the gate running with its ticket id.
-        assert!(matches!(
-            step_of(&f).await,
-            Some(Step::Waiting { .. })
-        ));
+        assert!(matches!(step_of(&f).await, Some(Step::Waiting { .. })));
         tokio::spawn(verify_exec::run_executor(f.ex.clone()));
 
         let step = tick_until(&f, |s| matches!(s, Step::Green(_))).await;
@@ -567,7 +575,10 @@ mod tests {
         };
         assert_eq!(sha, f.tip);
 
-        let s = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(s.running_request_id, Some(request));
         assert_eq!(count(&f.pool, "verify_requests").await, 1);
     }
@@ -603,7 +614,10 @@ mod tests {
         };
         assert_eq!(sha, f.tip);
 
-        let s = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(s.running_sha, None, "the slot is released");
         assert_eq!(s.running_request_id, None);
         assert_eq!(s.last_attempted_sha.as_deref(), Some(f.tip.as_str()));
