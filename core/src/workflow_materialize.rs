@@ -1131,9 +1131,12 @@ pub async fn into_worktree(
     // gate that measures a merge there must measure the merge commit as it is, not the commit plus
     // untracked rules this module put beside it. No caller passes one today — they are opened by
     // `git_exec`, never by `worktree::create_at` — and this guard keeps it that way if one ever does.
+    // `postgate-*` is the post-merge gate's tree (`git_exec::prepare_postgate_worktree`), same
+    // reasons: the daemon resets it itself and the gate must measure the commit as it is.
     if worktree.file_name().is_some_and(|name| {
-        name.to_string_lossy()
-            .starts_with(crate::git_exec::INTEGRATION_PREFIX)
+        let name = name.to_string_lossy();
+        name.starts_with(crate::git_exec::INTEGRATION_PREFIX)
+            || name.starts_with(crate::verify_postgate::POSTGATE_PREFIX)
     }) {
         return;
     }
@@ -1525,6 +1528,39 @@ mod tests {
         let tree = temp
             .path()
             .join(format!("{}project", crate::git_exec::INTEGRATION_PREFIX));
+        std::fs::create_dir_all(&tree).unwrap();
+        crate::project_state::write_for_test(
+            temp.path(),
+            "project",
+            crate::project_state::PINS_FILE,
+            "workflows:\n  - name: dev\n    version: 1.0\n    hash: sha256:missing\n    origin: test\n",
+        );
+
+        into_worktree(
+            &pool,
+            Some(temp.path()),
+            Some(&temp.path().join("library")),
+            "project",
+            &tree,
+        )
+        .await;
+
+        let lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(lines, 0);
+    }
+
+    /// The post-merge gate's tree is a disposable checkout of the target tip: same reasons.
+    #[tokio::test]
+    async fn a_postgate_tree_is_never_synced() {
+        let pool = crate::testdb::fresh_pool().await;
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join(format!(
+            "{}project",
+            crate::verify_postgate::POSTGATE_PREFIX
+        ));
         std::fs::create_dir_all(&tree).unwrap();
         crate::project_state::write_for_test(
             temp.path(),
