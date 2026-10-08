@@ -994,6 +994,19 @@ def _is_cargo(argv: list[str]) -> bool:
     return os.path.splitext(base)[0] == "cargo"
 
 
+def pool_argv(argv: list[str], verdict) -> list[str] | None:
+    """The cargo argv a run leases a target-dir pool slot for: argv itself, or the cargo the
+    classifier found inside a wrapper (`bash -c`, a script, a Makefile). Its CARGO_TARGET_DIR
+    reaches every cargo the wrapper starts, so none of them builds into the shared default
+    dir. None when the run is not a cargo one."""
+    if _is_cargo(argv):
+        return list(argv)
+    inner = list(getattr(verdict, "cargo_argv", None) or [])
+    if getattr(verdict, "via", None) and getattr(verdict, "kind", None) == "cargo"             and _is_cargo(inner):
+        return inner
+    return None
+
+
 def _cargo_args(argv: list[str]) -> list[str]:
     """Cargo's own tokens: everything between the program and a `--`."""
     out = []
@@ -1560,6 +1573,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
         else:
             prio = _int_prio(opts["prio"] or os.environ.get("NUCLEOS_HEAVY_PRIO"), 1)
         weight, kind = 1, opts["kind"] or "auto"
+        verdict = None
         try:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             import heavy_classify  # type: ignore
@@ -1599,11 +1613,13 @@ def broker_run(args: list[str], held: bool = False) -> int:
         crate, named = None, False
         inject = None
         pool = False  # eligible for a leased pool dir
+        cargo_argv = None
         try:
-            if kind in ("cargo", "auto") and _is_cargo(argv):
+            cargo_argv = pool_argv(argv, verdict)
+            if kind in ("cargo", "auto") and cargo_argv:
                 # hold-worktree itself leases no slot: nested cargo calls lease their own.
                 pool = (not held and injected_target_dir(
-                    argv, root or worktree_root(), os.getcwd()) is not None)
+                    cargo_argv, root or worktree_root(), os.getcwd()) is not None)
         except Exception:
             pool = False
         wt = None
@@ -1765,8 +1781,8 @@ def broker_run(args: list[str], held: bool = False) -> int:
                 return EXIT_QUEUE_TIMEOUT
         if lease is not None:
             try:
-                prepare_slot(directory, lease, wt, argv[0] if _is_cargo(argv) else "cargo",
-                             os.getcwd(), argv)
+                prepare_slot(directory, lease, wt, cargo_argv[0] if cargo_argv else "cargo",
+                             os.getcwd(), cargo_argv or argv)
                 inject = lease[1]
                 if crate is not None and not nested and not held and (
                         fp is None or fp[1] != _real(inject)):

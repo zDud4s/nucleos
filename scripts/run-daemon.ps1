@@ -19,6 +19,10 @@
 # Why the child starts with cwd = repo root: `cargo run` runs the daemon with the cwd it was typed
 # in, and the daemon reads it (main.rs legacy .ai/ migration, health.rs worktree free-space probe).
 #
+# heavy-broker: skip -- the heavy-command hook must not run this under scripts/heavy.py: the
+# daemon it starts would hold a broker token and a target slot for as long as it lives, and
+# inherit that slot's CARGO_TARGET_DIR into every build it runs.
+#
 # This script never kills anything. If the daemon is already running from the copy, it refuses
 # (exit 3) and says so; stopping it is the owner's decision.
 #
