@@ -1552,7 +1552,8 @@ impl NucleosTools {
         json_result(
             self.client
                 .verify_status(ticket, wait.unwrap_or(true))
-                .await,
+                .await
+                .and_then(|answer| ticket_for_box(&self.served, ticket, answer)),
         )
     }
 }
@@ -2119,6 +2120,24 @@ pub(crate) fn worktree_for_call(
         Some(asked) => Err(format!(
             "this session may only verify its own worktree, {own}, not {asked:?}"
         )),
+    }
+}
+
+/// What a `verify_status` answer becomes in this box. The worktree box reads only tickets of its
+/// own worktree: a ticket of another worktree, or one that names none, is refused with the same
+/// words as a ticket that does not exist, so the refusal does not reveal that it does. The other
+/// boxes hand the answer through untouched.
+pub(crate) fn ticket_for_box(
+    served: &McpBox,
+    ticket: i64,
+    answer: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let McpBox::Worktree(own) = served else {
+        return Ok(answer);
+    };
+    match answer["worktree"].as_str() {
+        Some(theirs) if !theirs.is_empty() && fence_key(theirs) == fence_key(own) => Ok(answer),
+        _ => Err(format!("no ticket {ticket}")),
     }
 }
 
@@ -3260,6 +3279,39 @@ mod tests {
                 worktree_for_call(&other, Some("/anywhere")),
                 Ok(Some("/anywhere".to_owned()))
             );
+        }
+    }
+
+    /// The worktree box reads only the tickets of its own worktree: a ticket of another worktree,
+    /// or one with no usable `worktree` field, answers exactly like a ticket that does not exist.
+    #[test]
+    fn the_worktree_box_reads_only_its_own_tickets() {
+        let own = McpBox::Worktree("/work/a".to_owned());
+        let ticket_of = |worktree: &str| serde_json::json!({ "ticket": 7, "worktree": worktree });
+
+        let mine = ticket_of("/work/a");
+        assert_eq!(ticket_for_box(&own, 7, mine.clone()), Ok(mine));
+        let backslashed = ticket_of("\\work\\a\\");
+        assert_eq!(
+            ticket_for_box(&own, 7, backslashed.clone()),
+            Ok(backslashed)
+        );
+
+        let refused = Err("no ticket 7".to_owned());
+        assert_eq!(ticket_for_box(&own, 7, ticket_of("/work/b")), refused);
+        assert_eq!(
+            ticket_for_box(&own, 7, serde_json::json!({ "ticket": 7 })),
+            refused
+        );
+        assert_eq!(ticket_for_box(&own, 7, ticket_of("")), refused);
+        assert_eq!(
+            ticket_for_box(&own, 7, serde_json::json!({ "ticket": 7, "worktree": 5 })),
+            refused
+        );
+
+        for other in [McpBox::All, McpBox::JobNode(3)] {
+            let foreign = ticket_of("/work/b");
+            assert_eq!(ticket_for_box(&other, 7, foreign.clone()), Ok(foreign));
         }
     }
 

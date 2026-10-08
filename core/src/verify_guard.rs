@@ -432,11 +432,12 @@ fn entry_candidate(words: &[String]) -> &str {
 }
 
 /// The first word that names a subcommand: past `+toolchain` selectors and flags, and past the
-/// value of a flag that takes one. `None` for `--version`/`--help`-style lines.
+/// value of a flag that takes one. Empty words are skipped, so it never yields `""` (which would
+/// match the `detection_union` sentinel). `None` for `--version`/`--help`-style lines.
 fn subcommand_of(args: &[String]) -> Option<&str> {
     let mut args = args.iter();
     while let Some(word) = args.next() {
-        if word.starts_with('+') {
+        if word.is_empty() || word.starts_with('+') {
             continue;
         }
         if word.starts_with('-') {
@@ -452,7 +453,7 @@ fn subcommand_of(args: &[String]) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hit, Kind, detect, detection_union};
+    use super::{Hit, Kind, detect, detection_union, subcommand_of};
     use crate::command_reader::Shell;
     use crate::tests_map::{self, TestsMap};
 
@@ -695,6 +696,45 @@ tests:
         }
         for command in ["cargo --version", "cargo --help", "cargo"] {
             assert_eq!(hit_in(&union, command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn subcommand_of_never_yields_an_empty_subcommand() {
+        let args = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(subcommand_of(&args(&["", "test"])), Some("test"));
+        assert_eq!(subcommand_of(&args(&[""])), None);
+        assert_eq!(subcommand_of(&args(&["", "--help"])), None);
+    }
+
+    /// Characterisation: `classifier::shell_words` already drops an empty quote pair before
+    /// `subcommand_of` sees it, so this holds without a fix in the guard itself.
+    #[test]
+    fn an_empty_argument_against_a_disjoint_union_is_no_subcommand_in_either_shell() {
+        let target = parsed("version: 1\ntests:\n  tools:\n    cargo: { allow: [fmt] }\n");
+        let worktree = parsed("version: 1\ntests:\n  tools:\n    cargo: { allow: [clippy] }\n");
+        let union = detection_union(&target, &worktree);
+
+        for shell in [Shell::Posix, Shell::PowerShell] {
+            for command in ["cargo \"\"", "cargo ''"] {
+                assert_eq!(
+                    found(detect(command, shell, &union, None)),
+                    None,
+                    "{shell:?} {command}"
+                );
+            }
+            for command in ["cargo \"\" test", "cargo '' fmt"] {
+                assert_eq!(
+                    found(detect(command, shell, &union, None)),
+                    tool("cargo"),
+                    "{shell:?} {command}"
+                );
+            }
         }
     }
 }

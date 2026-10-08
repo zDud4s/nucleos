@@ -4482,6 +4482,7 @@ async fn gate_item_with(
         if matches!(set_live_status(pool, job.id, "gating").await, Ok(false)) {
             return Step::Stopped;
         }
+        // The timeout counts from the submit, so time queued behind other work is part of it.
         let verdict = crate::verify::gate_job_scope(
             &executor,
             job.id,

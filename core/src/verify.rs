@@ -937,7 +937,10 @@ pub(crate) fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
 
     if !ticket.done {
         return ScopeVerdict::Measured(GateOutcome::Errored {
-            reason: "scope verification did not finish in time".to_owned(),
+            reason: format!(
+                "scope verification did not finish in time ({} of {} units still queued)",
+                ticket.progress.queued, ticket.progress.total
+            ),
         });
     }
     match ticket.verdict.as_deref() {
@@ -985,6 +988,7 @@ pub(crate) fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
 /// cached, at autonomous priority. A ticket that does not finish within `wait` is an `Errored`
 /// outcome, never a pass; the units it queued keep running and may still fill the cache. A request
 /// that cannot be submitted at all is `Unavailable`, and the caller measures the old way instead.
+/// `wait` counts from the submit, so time spent queued behind other work eats into it.
 pub(crate) async fn gate_job_scope(
     executor: &Arc<Executor>,
     job_id: i64,
@@ -1513,6 +1517,25 @@ tests:
 
         let nothing = ticket(true, Some("nothing_ran"), Vec::new());
         assert!(matches!(scope_outcome(&nothing), ScopeVerdict::NothingRan));
+    }
+
+    #[test]
+    fn a_job_gate_scope_still_queued_at_the_deadline_errors_and_says_so() {
+        use crate::gate::GateOutcome;
+
+        let mut pending = ticket(false, None, vec![unit(Some("core"), "queued", None, None)]);
+        pending.progress.total = 3;
+        pending.progress.finished = 1;
+        pending.progress.queued = 2;
+        match scope_outcome(&pending) {
+            ScopeVerdict::Measured(GateOutcome::Errored { reason }) => {
+                assert!(
+                    reason.contains("2 of 3 units still queued"),
+                    "the reason must say how much was still queued: {reason}"
+                );
+            }
+            other => panic!("expected Errored, got {other:?}"),
+        }
     }
 
     async fn insert_job_worktree(f: &Fixture, base: &str) {
