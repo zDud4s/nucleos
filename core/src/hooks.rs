@@ -663,6 +663,11 @@ const VERIFY_GUARD_REFUSAL: &str = "this project verifies through the daemon: ca
 /// and is not counted against the prober allowance. A missing or invalid tests map, an
 /// unreadable rules file or a failed insert all end in `false` (or a warning), never in a
 /// different answer for the call.
+///
+/// Step 3 detects against the union of the worktree's tests map and the project root's
+/// (`verify_guard::detection_union`): the agent owns the worktree's file, not the root's. A missing
+/// or invalid worktree map leaves the root's alone; a missing or invalid root map (or none
+/// recorded) leaves the worktree's alone.
 async fn observe_verification(
     state: &AppState,
     run_id: i64,
@@ -675,9 +680,41 @@ async fn observe_verification(
     let Some(command) = payload.tool_input.get("command").and_then(Value::as_str) else {
         return false;
     };
+    use crate::tests_map::MapState;
+    let target_root = match crate::inspect::project_root(&state.pool, project_id).await {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(
+                run_id,
+                %error,
+                "pretooluse-decision: failed to read the project root for the target test map"
+            );
+            None
+        }
+    };
     let root = std::path::PathBuf::from(cwd);
-    let map = match tokio::task::spawn_blocking(move || crate::tests_map::load(&root)).await {
-        Ok(crate::tests_map::MapState::Valid(map)) => map,
+    let (tree, target) = match tokio::task::spawn_blocking(move || {
+        (
+            crate::tests_map::load(&root),
+            target_root.map(|root| crate::tests_map::load(std::path::Path::new(&root))),
+        )
+    })
+    .await
+    {
+        Ok(maps) => maps,
+        Err(_) => return false,
+    };
+    if matches!(&target, Some(MapState::Invalid(_))) {
+        tracing::warn!(
+            run_id,
+            "pretooluse-decision: the project root's tests map is invalid; detecting against the worktree's alone"
+        );
+    }
+    let map = match (tree, target) {
+        (MapState::Valid(tree), Some(MapState::Valid(target))) => {
+            crate::verify_guard::detection_union(&target, &tree)
+        }
+        (MapState::Valid(map), _) | (_, Some(MapState::Valid(map))) => map,
         _ => return false,
     };
     let machine_root = state.machine_config_root.as_deref();
@@ -1136,10 +1173,12 @@ async fn pretooluse_decision_from(
         None
     };
 
-    // F2b steps 1-2: an in-flight worktree run that ran a verification command by itself is
+    // F2b steps 1-3: an in-flight worktree run that ran a verification command by itself is
     // recorded, after the decision above is taken. Under an explicit `verify_guard: refuse` the
     // call is refused here, before D12 / grants / judge / pause, so a verification command never
     // parks a run or fetches a person, and it is not counted against the prober allowance.
+    // Step 3: detection reads the union of the worktree's map and the project root's, so the run
+    // cannot escape by deleting, corrupting or widening its own copy.
     if mode == "worktree"
         && is_in_flight
         && matches!(payload.tool_name.as_str(), "Bash" | "PowerShell")
@@ -11882,5 +11921,221 @@ mod tests {
         assert_eq!(p.decision, "deny");
         assert_eq!(p.reason, q.reason);
         assert_ne!(p.reason, VERIFY_GUARD_REFUSAL);
+    }
+
+    // F2b step 3: detection runs against the union of the worktree's map and the target's.
+
+    /// Records `root` as the project root of `project`, the row `inspect::project_root` reads.
+    async fn record_root(state: &AppState, project: &str, root: &Path) {
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
+        )
+        .bind(project)
+        .bind(root.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A directory holding a `nucleos.tests.yaml` with exactly `text`.
+    fn map_dir(text: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nucleos.tests.yaml"), text).unwrap();
+        dir
+    }
+
+    /// The target's map: the same one `mapped_cwd` writes (the build tool allows `fmt` only).
+    const TARGET_MAP: &str = "version: 1\ntests:\n  tools:\n    cargo: { allow: [fmt] }\n";
+
+    /// A map the loader refuses (unknown version), so it is `Invalid`, not `Absent`.
+    const INVALID_MAP: &str = "version: 9\n";
+
+    /// Deleting or corrupting the worktree map must not lift the refusal: the target's map still
+    /// detects the test run.
+    #[tokio::test]
+    async fn verification_guard_reads_the_target_map_when_the_worktree_map_is_gone() {
+        let mut state = test_state().await;
+        let config = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(config.path().to_path_buf());
+        write_rules(config.path(), "p", "verify_guard: refuse\n");
+        let target = map_dir(TARGET_MAP);
+        record_root(&state, "p", target.path()).await;
+        let deleted = tempfile::tempdir().unwrap();
+        let corrupt = map_dir(INVALID_MAP);
+        let run_a = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(deleted.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let run_b = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(corrupt.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+        let input = serde_json::json!({ "command": "cargo test -p x some_test" });
+
+        let a = ask_tool(&app, run_a, "Bash", input.clone()).await;
+        let b = ask_tool(&app, run_b, "Bash", input).await;
+
+        assert_eq!(a.decision, "deny");
+        assert_eq!(a.reason, VERIFY_GUARD_REFUSAL);
+        assert_eq!(b.decision, "deny");
+        assert_eq!(b.reason, VERIFY_GUARD_REFUSAL);
+        assert_eq!(observed_rows(&state, run_a).await, 1);
+        assert_eq!(observed_rows(&state, run_b).await, 1);
+    }
+
+    /// A worktree map that widens `allow` to cover `test` cannot open what the target refuses.
+    #[tokio::test]
+    async fn verification_guard_ignores_a_worktree_allow_the_target_does_not_grant() {
+        let mut state = test_state().await;
+        let config = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(config.path().to_path_buf());
+        write_rules(config.path(), "p", "verify_guard: refuse\n");
+        let target = map_dir(TARGET_MAP);
+        record_root(&state, "p", target.path()).await;
+        let widened = map_dir("version: 1\ntests:\n  tools:\n    cargo: { allow: [fmt, test] }\n");
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(widened.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let refused = ask_tool(
+            &app,
+            run_id,
+            "Bash",
+            serde_json::json!({ "command": "cargo test -p x some_test" }),
+        )
+        .await;
+        let allowed = ask_tool(
+            &app,
+            run_id,
+            "Bash",
+            serde_json::json!({ "command": "cargo fmt" }),
+        )
+        .await;
+
+        assert_eq!(refused.decision, "deny");
+        assert_eq!(refused.reason, VERIFY_GUARD_REFUSAL);
+        assert_ne!(allowed.reason, VERIFY_GUARD_REFUSAL);
+    }
+
+    /// Observe mode: a hit only the target's map sees is recorded, and the decision and reason
+    /// equal those of a project with no map at all.
+    #[tokio::test]
+    async fn verification_observed_records_a_target_only_hit_without_changing_the_decision() {
+        let state = test_state().await;
+        let target = map_dir(TARGET_MAP);
+        record_root(&state, "p", target.path()).await;
+        let bare_p = tempfile::tempdir().unwrap();
+        let bare_q = tempfile::tempdir().unwrap();
+        let with_root = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(bare_p.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let without_root = in_flight_run(
+            &state,
+            "worktree",
+            Some("q"),
+            Some(bare_q.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+        let input = serde_json::json!({ "command": "cargo test -p x some_test" });
+
+        let a = ask_tool(&app, with_root, "Bash", input.clone()).await;
+        let b = ask_tool(&app, without_root, "Bash", input).await;
+
+        assert_eq!(a.decision, b.decision);
+        assert_eq!(a.reason, b.reason);
+        assert_ne!(a.reason, VERIFY_GUARD_REFUSAL);
+        assert_eq!(observed_rows(&state, with_root).await, 1);
+        assert_eq!(observed_rows(&state, without_root).await, 0);
+        let kind: String =
+            sqlx::query_scalar("SELECT kind FROM verification_observations WHERE run_id = ?")
+                .bind(with_root)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let name: String =
+            sqlx::query_scalar("SELECT name FROM verification_observations WHERE run_id = ?")
+                .bind(with_root)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(kind, "tool");
+        assert_eq!(name, "cargo");
+        assert_eq!(stored_decision(&state, with_root).await, a.decision);
+    }
+
+    /// A target map that is invalid, or no recorded root at all, leaves the worktree's map to
+    /// decide alone; with neither map valid there is no row and no refusal.
+    #[tokio::test]
+    async fn verification_guard_falls_back_to_the_worktree_map_without_a_target_map() {
+        let mut state = test_state().await;
+        let config = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(config.path().to_path_buf());
+        for project in ["p", "q", "r"] {
+            write_rules(config.path(), project, "verify_guard: refuse\n");
+        }
+        let invalid_p = map_dir(INVALID_MAP);
+        record_root(&state, "p", invalid_p.path()).await;
+        let invalid_r = map_dir(INVALID_MAP);
+        record_root(&state, "r", invalid_r.path()).await;
+        let mapped_p = mapped_cwd();
+        let mapped_q = mapped_cwd();
+        let bare_r = tempfile::tempdir().unwrap();
+        let run_p = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(mapped_p.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let run_q = in_flight_run(
+            &state,
+            "worktree",
+            Some("q"),
+            Some(mapped_q.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let run_r = in_flight_run(
+            &state,
+            "worktree",
+            Some("r"),
+            Some(bare_r.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+        let input = serde_json::json!({ "command": "cargo test -p x some_test" });
+
+        let p = ask_tool(&app, run_p, "Bash", input.clone()).await;
+        let q = ask_tool(&app, run_q, "Bash", input.clone()).await;
+        let r = ask_tool(&app, run_r, "Bash", input).await;
+
+        assert_eq!(p.reason, VERIFY_GUARD_REFUSAL);
+        assert_eq!(q.reason, VERIFY_GUARD_REFUSAL);
+        assert_ne!(r.reason, VERIFY_GUARD_REFUSAL);
+        assert_eq!(observed_rows(&state, run_r).await, 0);
     }
 }
