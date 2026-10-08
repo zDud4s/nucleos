@@ -81,7 +81,7 @@ describe("filterItems", () => {
         known({ id: 6, activated_at: null, created_at: "2026-09-02T00:00:00+00:00" }),
       ],
     );
-    const out = filterItems(items, ALL).map((item) => (item.kind === "note" ? `n${item.note.id}` : `k${item.known.id}`));
+    const out = filterItems(items, ALL).map((item) => (item.kind === "note" ? `n${item.note.id}` : item.kind === "knowledge" ? `k${item.known.id}` : `c${item.capture.job_id}`));
     expect(out).toEqual(["k5", "k6", "n1"]);
   });
 
@@ -97,7 +97,7 @@ describe("filterItems", () => {
       [known({ id: 3 }), known({ id: 4, status: "proposed" }), known({ id: 5, status: "rejected" })],
     );
     const ids = (state: ItemFilters["state"]) =>
-      filterItems(items, { ...ALL, state }).map((i) => (i.kind === "note" ? `n${i.note.id}` : `k${i.known.id}`)).sort();
+      filterItems(items, { ...ALL, state }).map((i) => (i.kind === "note" ? `n${i.note.id}` : i.kind === "knowledge" ? `k${i.known.id}` : `c${i.capture.job_id}`)).sort();
     expect(ids("in_force")).toEqual(["k3", "n1"]);
     expect(ids("out")).toEqual(["k5", "n2"]);
     expect(ids("all")).toHaveLength(5);

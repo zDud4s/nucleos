@@ -82,6 +82,7 @@ export function buildModel(
 
   /** The node a link lands on, made as a stub when nothing else has made it. */
   const resolve = (link: NoteLink): GNode | null => {
+    if (link.target_kind === "job") return null;
     const id = targetId(link.target_kind, link.target_ref);
     const existing = nodes.get(id);
     if (existing) return existing;
@@ -115,6 +116,8 @@ export function buildModel(
   };
 
   for (const link of graph.links) {
+    // A job is evidence, not a thing in the graph: its links live in the note panel only.
+    if (link.target_kind === "job") continue;
     if (!keptNoteIds.has(String(link.note_id))) continue;
     if (!filters.edgeTypes.has(link.link_type) || !keepsKind(link.target_kind)) continue;
     const source = nodes.get(`n:${link.note_id}`);
