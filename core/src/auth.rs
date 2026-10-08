@@ -999,17 +999,8 @@ mod tests {
     }
 
     async fn test_state(token: &str) -> AppState {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
         // Run tokens are resolved against the `runs` table, so this can no longer be a bare pool.
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_pool().await;
         AppState {
             token: Token(token.to_string()),
             pool,

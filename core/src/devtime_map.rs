@@ -177,22 +177,12 @@ async fn decide(
 mod tests {
     use super::*;
     use crate::devtime_store::{self, CwdMapping};
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
     use std::path::Path;
     use std::process::Command;
 
     async fn test_pool() -> sqlx::SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     fn git(dir: &Path, args: &[&str]) {

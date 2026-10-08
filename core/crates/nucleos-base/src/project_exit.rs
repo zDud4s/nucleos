@@ -84,6 +84,8 @@ const PROJECT_SCOPED: &[&str] = &[
     "runs",
     "scheduler_state",
     "vcs_requests",
+    "verify_cache",
+    "verify_requests",
     "verify_runs",
     "webhook_deliveries",
     "worktree_touched_paths",
@@ -743,16 +745,9 @@ mod tests {
     /// instead of refusing. Every claim this module makes about what a forget can and cannot do
     /// depends on the setting being the real one.
     async fn pool() -> SqlitePool {
-        // The URL form and then `.foreign_keys(true)` — both halves copied from `email::test_pool`,
-        // which already paid for each of them. Built from a filename instead, every connection gets
-        // a private in-memory database and the migrations land on one the queries never see; and
-        // without the second, an FK bug lives for a week because no test has the constraint on.
-        let options: sqlx::sqlite::SqliteConnectOptions = "sqlite::memory:".parse().unwrap();
-        let pool = SqlitePool::connect_with(options.foreign_keys(true))
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        // One database every connection shares, with foreign keys on — what `email::test_pool`
+        // learned to ask for, and what `fresh_shared_pool` gives.
+        crate::testdb::fresh_shared_pool().await
     }
 
     async fn register(pool: &SqlitePool, project_id: &str) {

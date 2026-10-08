@@ -927,16 +927,7 @@ mod tests {
     /// returned beside it so the directory lives exactly as long as the test that holds it.
     async fn test_state(delay: Option<Duration>) -> (AppState, tempfile::TempDir) {
         let home = tempfile::tempdir().expect("create a stand-in home");
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_pool().await;
 
         let state = AppState {
             token: Token("test-token".into()),

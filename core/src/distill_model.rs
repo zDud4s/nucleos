@@ -246,22 +246,12 @@ mod tests {
     use crate::runner::{CommandRunner, RunOutcome, RunRequest};
     use serde_json::{Value, json};
     use sqlx::SqlitePool;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     async fn test_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     /// Answers one fixed message and remembers every conversation it was asked, so a test can read

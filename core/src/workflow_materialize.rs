@@ -1411,12 +1411,7 @@ mod tests {
 
     #[tokio::test]
     async fn f5_a_missing_workflow_is_fail_soft_and_writes_a_feed_line() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_pool().await;
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("worktree");
         std::fs::create_dir_all(&worktree).unwrap();
@@ -1525,12 +1520,7 @@ mod tests {
     /// line saying it is missing, which is what a pin with no library would otherwise produce.
     #[tokio::test]
     async fn an_integration_tree_is_never_synced() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_pool().await;
         let temp = tempfile::tempdir().unwrap();
         let tree = temp
             .path()

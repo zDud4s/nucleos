@@ -249,24 +249,9 @@ pub fn render(notes: &[TeamNote]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     async fn test_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true)
-                    // On, as `storage.rs` has it. `team_notes.team_run_id` references `team_runs`,
-                    // and a test pool with the pragma off would let this module's rows exist against
-                    // a run that does not — the one shape the daemon can never produce.
-                    .foreign_keys(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     /// A department and one run of it, for the notes to belong to.

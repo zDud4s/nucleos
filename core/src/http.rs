@@ -32980,19 +32980,9 @@ mod tests {
     async fn a_dropped_reject_request_still_discards_the_paused_run() {
         use std::future::Future;
 
-        let dir = tempfile::tempdir().unwrap();
         // File-backed, with room for a second connection: the assertions have to watch the handler's
         // progress while the handler itself is parked on the pool.
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(dir.path().join("reject.db"))
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_shared_pool().await;
         let state = AppState {
             token: Token("test-token".into()),
             pool: pool.clone(),
@@ -38507,12 +38497,7 @@ mod triage_barrier_tests {
     };
 
     async fn test_state() -> crate::state::AppState {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_shared_pool().await;
         crate::state::AppState {
             token: crate::auth::Token("verification-token".into()),
             pool,

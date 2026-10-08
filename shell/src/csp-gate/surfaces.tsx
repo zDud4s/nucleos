@@ -18,6 +18,9 @@ import {
   DialogTitle,
 } from "@/ui/vendor/dialog";
 import { Sparkline } from "@/ui/Sparkline";
+import { ForceGraph } from "../brain/ForceGraph";
+import type { GModel } from "../brain/graph-types";
+import type { Placed } from "../brain/hit-test";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -33,7 +36,7 @@ import {
  * **This is a list of LIBRARIES, not a list of screens**, and the distinction is what keeps it
  * short enough to stay true. A Content-Security-Policy refusal is a property of how a dependency
  * writes style — a `<style>` element it builds at runtime, or a `style=` attribute it puts into
- * markup — so covering one screen that uses xyflow covers every screen that uses xyflow. Five
+ * markup — so covering one screen that uses xyflow covers every screen that uses xyflow. Six
  * libraries in this app can write style that way, and every one of them has a surface below.
  *
  * The list is meant to be annoying in the same way `app/nav.test.ts` is: **adding a dependency
@@ -253,6 +256,84 @@ function ChartSurface({ done }: { done: () => void }) {
   );
 }
 
+const FORCE_MODEL: GModel = {
+  nodes: [
+    { id: "n:1", kind: "note", ref: "1", label: "Rust owns the state", bucket: "in_force", missing: false, degree: 3 },
+    {
+      id: "k:2",
+      kind: "knowledge",
+      ref: "2",
+      label: "prefer small diffs",
+      layer: "procedural",
+      bucket: "in_force",
+      missing: false,
+      degree: 2,
+    },
+    {
+      id: "k:3",
+      kind: "knowledge",
+      ref: "3",
+      label: "a proposal",
+      layer: "semantic",
+      bucket: "proposed",
+      missing: false,
+      degree: 1,
+    },
+    { id: "project:p1", kind: "project", ref: "p1", label: "p1", bucket: "unknown", missing: false, degree: 2 },
+    { id: "contact:c1", kind: "contact", ref: "c1", label: "a contact", bucket: "unknown", missing: false, degree: 1 },
+    { id: "n:9", kind: "note", ref: "9", label: "deleted note", bucket: "unknown", missing: true, degree: 1 },
+  ],
+  edges: [
+    { id: "relates|n:1|k:2", source: "n:1", target: "k:2", type: "relates" },
+    { id: "supports|n:1|contact:c1", source: "n:1", target: "contact:c1", type: "supports" },
+    { id: "details|n:1|n:9", source: "n:1", target: "n:9", type: "details" },
+    { id: "scope|k:2|project:p1", source: "k:2", target: "project:p1", type: "scope" },
+    { id: "scope|k:3|project:p1", source: "k:3", target: "project:p1", type: "scope" },
+  ],
+};
+
+/**
+ * `d3-force`, `d3-zoom`, `d3-drag` (and `d3-selection` under them), through the Brain graph.
+ *
+ * The graph paints a canvas, so the risk is not its pixels but its plumbing: d3-zoom and d3-drag
+ * set `touch-action`, tap-highlight and user-select as they bind, and the component sizes its
+ * canvas. All of that must go through the CSSOM and never through a `style` attribute in markup or
+ * a runtime `<style>`. Every node shape is on screen (filled, hollow proposed, dashed missing,
+ * selected ring), and one hover is simulated once the first frame says where a node is, so the
+ * neighbour-lighting branch runs too.
+ */
+function ForceGraphSurface({ done }: { done: () => void }) {
+  const [selected, setSelected] = useState<string | null>("k:2");
+  const [placed, setPlaced] = useState<Placed[] | null>(null);
+
+  useEffect(() => {
+    if (!placed) return;
+    const canvas = document.querySelector<HTMLCanvasElement>(".brain-force-canvas");
+    const target = placed.find((p) => p.id === "n:1");
+    if (!canvas || !target) return;
+    const rect = canvas.getBoundingClientRect();
+    canvas.dispatchEvent(
+      new PointerEvent("pointermove", {
+        bubbles: true,
+        clientX: rect.left + target.x,
+        clientY: rect.top + target.y,
+      }),
+    );
+  }, [placed]);
+  useDoneAfter(done, 1800);
+
+  return (
+    <div className="p-6">
+      <ForceGraph
+        model={FORCE_MODEL}
+        selected={selected}
+        onSelect={setSelected}
+        onLayout={(next) => setPlaced((current) => current ?? next)}
+      />
+    </div>
+  );
+}
+
 export const SURFACES: Surface[] = [
   {
     name: "workflow",
@@ -278,5 +359,10 @@ export const SURFACES: Surface[] = [
     name: "charts",
     why: "@visx/{group,scale,shape}, which compute geometry per render — both branches of Sparkline",
     Component: ChartSurface,
+  },
+  {
+    name: "force-graph",
+    why: "d3-force / d3-zoom / d3-drag on a canvas — no runtime style, proven here",
+    Component: ForceGraphSurface,
   },
 ];

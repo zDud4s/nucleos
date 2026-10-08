@@ -974,20 +974,7 @@ mod tests {
     const LISBON: Tz = chrono_tz::Europe::Lisbon;
 
     async fn test_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .expect("an in-memory database");
-        crate::storage::MIGRATOR
-            .run(&pool)
-            .await
-            .expect("migrations to apply");
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     fn local(text: &str) -> NaiveDateTime {

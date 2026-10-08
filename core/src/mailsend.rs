@@ -300,16 +300,7 @@ mod tests {
     }
 
     async fn test_state(email: EmailRuntime) -> AppState {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_pool().await;
         AppState {
             // Recognisable on purpose: this is the value a fallback would reach for.
             token: Token("control-token".into()),

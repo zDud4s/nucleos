@@ -918,7 +918,7 @@ mod tests {
     use crate::devtime_store;
     use sha2::{Digest, Sha256};
     use sqlx::SqlitePool;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -926,16 +926,7 @@ mod tests {
     const ROOT: &str = "C:/fixture/proj";
 
     async fn test_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_pool().await;
         // The roster is autopilot's table and its public writers demand an onboarded project with a
         // wired hook, which a fixture has no use for: the row is written directly, in the test only.
         sqlx::query(

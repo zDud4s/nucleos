@@ -3852,11 +3852,7 @@ mod tests {
     async fn every_offered_tool_can_be_dispatched() {
         use crate::local_agent::ToolBox;
 
-        let pool = {
-            let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-            crate::storage::MIGRATOR.run(&pool).await.unwrap();
-            pool
-        };
+        let pool = { crate::testdb::fresh_shared_pool().await };
 
         for (list, audience) in EVERY_OFFERED_LIST {
             // Pointed at a port nothing listens on: a dispatched call fails to CONNECT, which is a
@@ -4668,8 +4664,7 @@ mod tests {
     async fn reading_mail_taints_a_turn_and_shuts_the_acting_tools() {
         use crate::local_agent::ToolBox;
 
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_shared_pool().await;
         sqlx::query(
             "INSERT INTO runs (id, prompt, status, mode, created_at)
              VALUES (1, 'triage', 'completed', ?, '2026-08-11T00:00:00Z'),
@@ -4753,8 +4748,7 @@ mod tests {
     async fn the_local_path_fences_by_what_the_call_reads_and_not_by_the_name() {
         use crate::local_agent::ToolBox;
 
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_shared_pool().await;
         sqlx::query(
             "INSERT INTO runs (id, prompt, status, mode, created_at)
              VALUES (1, 'triage', 'completed', ?, '2026-08-11T00:00:00Z'),
@@ -4996,9 +4990,7 @@ mod tests {
     /// An in-memory database with this crate's schema on it, which is what the two taint tests
     /// below need.
     async fn test_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_shared_pool().await
     }
 
     /// A `RequestContext` and the service that had to exist for one to be minted.

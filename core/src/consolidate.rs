@@ -895,7 +895,7 @@ mod tests {
 
     use chrono::{DateTime, TimeZone, Utc};
     use serde_json::Value;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
     use sqlx::{Row, SqlitePool};
 
     use super::{CONSOLIDATION_INTERVAL, due, merge_duplicates, promote_to_machine, run_pass};
@@ -907,17 +907,7 @@ mod tests {
     const FAILURE: &str = "error: build failed because the linker refused output.exe";
 
     async fn test_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     fn at(hour: u32) -> DateTime<Utc> {
