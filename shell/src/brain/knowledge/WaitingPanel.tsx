@@ -25,7 +25,7 @@ export interface WaitingPanelProps {
 }
 
 /**
- * The "Waiting for you" groups: proposed rows by scope and source, with a
+ * The "Lessons to approve" groups: proposed rows by scope and source, with a
  * decision per row and batch decisions per group. Owns its own mutations, so it
  * can stand anywhere a list of proposed rows can be handed to it.
  */
@@ -45,11 +45,9 @@ export function WaitingPanel({ rows }: WaitingPanelProps) {
   return (
     <>
       {refusal !== null && <DecisionRefusal error={refusal} />}
-      <Panel title="Waiting for you" aside={<Count n={rows.length} />}>
+      <Panel title="Lessons to approve" aside={<Count n={rows.length} />}>
         <p className="learned-lede">
-          Declared, and reaching nothing until you answer. Approving adds it
-          to every later run in its scope; refusing keeps the refusal on the
-          record rather than erasing the question.
+          None reaches a prompt until you approve it; a refusal stays on the record.
         </p>
         {groups.map((group) => {
           const resultBelongsHere = sameProposalIds(

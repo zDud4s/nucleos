@@ -60,7 +60,7 @@ describe("CapturesWaiting", () => {
     const { container } = await renderWithRouter(<CapturesWaiting onSelect={() => {}} />);
     await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalled());
     expect(container.querySelector("section")).toBeNull();
-    expect(screen.queryByText("Asked of you")).toBeNull();
+    expect(screen.queryByText("Questions for you")).toBeNull();
   });
 
   it("orders requests by deadline", async () => {

@@ -10,6 +10,7 @@ import { useNotesGraph, type NotesGraph } from "../../data/owner-notes";
 import { useProjects } from "../../data/system";
 import { Button, ConfirmButton, ErrorNote, Quiet } from "../../ui";
 import { ForceGraph } from "../ForceGraph";
+import { Segments } from "../Segments";
 import { backlinks, buildModel, localModel } from "../graph-model";
 import type { GFilters } from "../graph-types";
 import { EDGE_TYPES, NODE_KINDS } from "../GraphFilters";
@@ -103,13 +104,17 @@ export function KnowledgePanel({ id, onSelect }: KnowledgePanelProps) {
       {refusal !== null && <DecisionRefusal error={refusal} />}
       <KnownRow row={row} decisions={decisions} />
 
-      <h4>Notes pointing here</h4>
-      <Backlinks id={id} wide={wide.data} onSelect={onSelect} />
+      <section className="brain-sec">
+        <h4>Notes pointing here</h4>
+        <Backlinks id={id} wide={wide.data} onSelect={onSelect} />
+      </section>
 
       <LocalGraph id={id} wide={wide.data} onSelect={onSelect} />
 
-      <h4>Used in prompts</h4>
-      <Quiet says="Not tracked here yet." />
+      <section className="brain-sec">
+        <h4>Used in prompts</h4>
+        <Quiet says="Not tracked here yet." />
+      </section>
     </div>
   );
 }
@@ -127,17 +132,19 @@ function Backlinks({
   const links = backlinks(wide, "knowledge", String(id));
   if (links.length === 0) return <Quiet says="No note points here." />;
   return (
-    <ul aria-label="Notes pointing here">
+    <ul aria-label="Notes pointing here" className="brain-links">
       {links.map((link) => {
         const source = wide.notes.find((note) => note.id === link.note_id);
         const name = source !== undefined ? firstLine(source.text) : `note ${link.note_id}`;
         return (
           <li key={link.id}>
-            {link.link_type} ←{" "}
-            <Button variant="quiet" onClick={() => onSelect(`n:${link.note_id}`)}>
-              {name}
-            </Button>
-            {source?.state === "archived" && <span className="brain-node-tag">archived</span>}
+            <span className="brain-link-type">{link.link_type}</span>
+            <span className="brain-link-target">
+              <Button variant="quiet" onClick={() => onSelect(`n:${link.note_id}`)}>
+                {name}
+              </Button>
+              {source?.state === "archived" && <span className="brain-node-tag">archived</span>}
+            </span>
           </li>
         );
       })}
@@ -168,16 +175,18 @@ function LocalGraph({
   );
 
   return (
-    <section className="brain-local" aria-label="Local graph">
+    <section className="brain-sec brain-local" aria-label="Local graph">
       <div className="brain-local-head">
         <h4>Local graph</h4>
-        <div role="group" aria-label="Local graph depth">
-          {([1, 2] as const).map((value) => (
-            <Button key={value} variant="quiet" aria-pressed={depth === value} onClick={() => setDepth(value)}>
-              Depth {value}
-            </Button>
-          ))}
-        </div>
+        <Segments
+          label="Local graph depth"
+          value={depth}
+          options={[
+            [1, "Depth 1"],
+            [2, "Depth 2"],
+          ]}
+          onChange={setDepth}
+        />
       </div>
       {local === null ? (
         <Quiet says="Loading the local graph…" />

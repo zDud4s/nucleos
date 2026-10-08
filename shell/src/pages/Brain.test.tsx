@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { Brain, validateBrainSearch } from "./Brain";
 import type { NoteLink, NotesGraph, OwnerNote } from "../data/owner-notes";
 import type { GModel } from "../brain/graph-types";
@@ -119,6 +119,24 @@ describe("Brain", () => {
 
     expect(await screen.findByText("Rust owns the state")).toBeTruthy();
     expect((await screen.findAllByText(/Prefer small diffs/)).length).toBeGreaterThan(1);
+  });
+
+  it("with nothing open the aside holds the lessons to approve, and Close gives them back", async () => {
+    const proposed = known({ id: 9, status: "proposed", proposal_id: 3, title: "Proposed thing" });
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) =>
+      path === "/knowledge" ? Promise.resolve([proposed]) : daemonWith({ listed: [note()] })(path, init),
+    );
+    await renderWithRouter(<Brain />, { initialPath: "/brain" });
+
+    const aside = await screen.findByRole("complementary", { name: "For you" });
+    expect(await within(aside).findByRole("heading", { level: 2, name: "Lessons to approve" })).toBeTruthy();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Rust owns the state/ }));
+    const open = await screen.findByRole("complementary", { name: "Selected" });
+    expect(within(open).queryByRole("heading", { name: "Lessons to approve" })).toBeNull();
+
+    fireEvent.click(within(open).getByRole("button", { name: "Close" }));
+    expect(await screen.findByRole("complementary", { name: "For you" })).toBeTruthy();
   });
 
   it("a capture stamp focuses the capture box and keeps the view", async () => {

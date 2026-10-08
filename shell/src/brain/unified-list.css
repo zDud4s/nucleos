@@ -1,78 +1,204 @@
-.unified-filters {
+/**
+ * The Brain's one list: a filter bar, then a hairline-ruled column of notes, knowledge and
+ * captures. `unified-` throughout.
+ */
+
+/* ------------------------------------------------------------------- bar -- */
+
+/**
+ * Type and state on the first line with the search at its far end; the knowledge-only filters
+ * (layer, scope) on a second line, present only while knowledge is in the list — so choosing
+ * "Notes" takes away the controls that would do nothing, not just greys them.
+ */
+.unified-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+.unified-bar-knowledge {
+  display: contents;
+}
+
+/* Search leads the bar across the column's full width: it is the one filter that takes words,
+   and squeezed beside two segment tracks it wrapped onto a line of its own, hanging right. */
+.unified-search {
+  position: relative;
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: var(--space-3);
-  margin: 0 0 var(--space-4);
-  font-size: var(--text-sm);
+  order: -1;
+  flex-basis: 100%;
   color: var(--text-muted);
 }
 
-.unified-filters > div {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: var(--space-2);
+.unified-search svg {
+  position: absolute;
+  left: var(--space-3);
+  pointer-events: none;
 }
 
-.unified-filters select,
-.unified-filters input[type="search"] {
-  margin-left: var(--space-1);
-  padding: var(--space-1) var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
+.unified-search input,
+.unified-scope {
+  height: 2rem;
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
   color: var(--text);
-  background: var(--surface);
+  font-size: var(--text-sm);
+  transition: border-color var(--dur-quick) var(--ease);
 }
 
-.unified-row {
-  display: flex;
+.unified-search input {
+  width: 100%;
+  padding: 0 var(--space-3) 0 calc(var(--space-3) + 14px + var(--space-2));
+  font-family: var(--font-body);
+}
+
+.unified-search input::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+/* A scope is a project id or "this machine": the daemon's words, so mono. */
+.unified-scope {
+  padding: 0 var(--space-2);
+  font-family: var(--font-mono);
+}
+
+.unified-search input:hover,
+.unified-scope:hover {
+  border-color: var(--border-strong);
+}
+
+.unified-search input:focus-visible,
+.unified-scope:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* ------------------------------------------------------------------ rows -- */
+
+/**
+ * The row's own grid, on two classes so it beats `.ui-rows-row-line` whichever stylesheet loads
+ * first. On one class it lost to the stacking default when `ui.css` landed later, and a stacked
+ * flex column with `align-items: center` centred every row's text in the middle of the list.
+ */
+.ui-rows-row.unified-row {
+  flex-wrap: nowrap;
   align-items: center;
   gap: var(--space-2);
+  padding: 0;
+  transition: background-color var(--dur-quick) var(--ease);
 }
 
+/* Tinted from the text colour rather than `--surface-raised`: in light that token is the same
+   white as the list, so hover and selection vanished (1.0:1). A mix of the ink holds in both. */
+.ui-rows-row.unified-row:hover {
+  background: color-mix(in srgb, var(--text) 4%, var(--surface));
+}
+
+.ui-rows-row.unified-row.ui-current {
+  background: color-mix(in srgb, var(--text) 8%, var(--surface));
+}
+
+/* The whole row is the target: kind, title and age, on one baseline grid. */
 .unified-open {
-  flex: 1;
-  display: flex;
+  display: grid;
+  grid-template-columns: 6.5rem minmax(0, 1fr) auto;
   align-items: baseline;
   gap: var(--space-3);
+  flex: 1;
   min-width: 0;
-  padding: 0;
-  font: inherit;
-  color: inherit;
-  text-align: left;
-  background: none;
+  min-height: 2.75rem;
+  padding: var(--space-3) var(--space-4);
   border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
   cursor: pointer;
 }
 
+.unified-open:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
 .unified-kind {
-  flex: none;
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
   font-family: var(--font-mono);
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   color: var(--text-muted);
 }
 
+/* The identity mark: the same hue the item's node takes on the graph. */
+.unified-mark {
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--brain-note);
+  transform: translateY(-0.05rem);
+}
+
+.unified-mark-note { background: var(--brain-note); }
+.unified-mark-k-semantic { background: var(--brain-k-semantic); }
+.unified-mark-k-episodic { background: var(--brain-k-episodic); }
+.unified-mark-k-procedural { background: var(--brain-k-procedural); }
+.unified-mark-k-working { background: var(--brain-k-working); }
+.unified-mark-project { background: var(--brain-project); }
+.unified-mark-contact { background: var(--brain-contact); }
+.unified-mark-mail { background: var(--brain-mail); }
+.unified-mark-file { background: var(--brain-file); }
+
+/* A capture is a question waiting on you: hollow, in the one tone that asks something. */
+.unified-mark-capture {
+  background: none;
+  box-shadow: inset 0 0 0 1.5px var(--tone-pending-fg);
+}
+
 .unified-title {
-  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--text);
 }
 
 .unified-when {
-  flex: none;
-  font-size: var(--text-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
 }
 
-.unified-summary {
-  margin-top: var(--space-4);
+.unified-decide {
+  display: flex;
+  flex: none;
+  gap: var(--space-1);
+  padding-right: var(--space-3);
 }
 
+.unified-decide .ui-button {
+  padding: 0.3rem 0.45rem;
+}
+
+/* --------------------------------------------------------------- summary -- */
+
 .unified-summary > summary {
+  width: fit-content;
   cursor: pointer;
   color: var(--text-muted);
   font-size: var(--text-sm);
+}
+
+.unified-summary > summary:hover {
+  color: var(--text);
+}
+
+.unified-summary[open] > summary {
+  margin-bottom: var(--space-3);
 }

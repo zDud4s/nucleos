@@ -64,6 +64,16 @@ const FALLBACK_WIDTH = 600;
 /** Fit the view once the layout has had this many ticks to settle. */
 const FIT_AFTER_TICKS = 120;
 const LABEL_MAX = 40;
+/** The local graph sits in a 23rem panel: a 40-character label ran off its edge. */
+const LOCAL_LABEL_MAX = 22;
+
+/**
+ * Under reduced motion the layout is settled before it is drawn rather than animated into place:
+ * the drift of a settling graph is exactly the motion the setting asks to leave out.
+ */
+function prefersReducedMotion(): boolean {
+  return typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
 
 export function ForceGraph({ model, selected, onSelect, compact = false, height, onLayout }: ForceGraphProps) {
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -234,7 +244,8 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
           isHovered || isSelected
             ? colour("--brain-label-strong", "#e7eaf0")
             : colour("--brain-label", "#98a1b2");
-        const text = n.label.length > LABEL_MAX ? `${n.label.slice(0, LABEL_MAX - 1)}…` : n.label;
+        const max = small ? LOCAL_LABEL_MAX : LABEL_MAX;
+        const text = n.label.length > max ? `${n.label.slice(0, max - 1)}…` : n.label;
         c.fillText(text, (n.x ?? 0) + nodeRadius(n.degree) + 4 / k, n.y ?? 0);
       }
       c.globalAlpha = 1;
@@ -398,7 +409,14 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
         sim.nodes(nodes);
         linkForce.links(links).distance(small ? 40 : 60);
         chargeForce.strength(small ? -60 : -120);
-        sim.alpha(0.5).restart();
+        if (prefersReducedMotion()) {
+          sim.alpha(0.5).stop();
+          sim.tick(Math.ceil(Math.log(sim.alphaMin() / 0.5) / Math.log(1 - sim.alphaDecay())));
+          fitted = true;
+          fit();
+        } else {
+          sim.alpha(0.5).restart();
+        }
         requestDraw();
       },
       redraw: requestDraw,
