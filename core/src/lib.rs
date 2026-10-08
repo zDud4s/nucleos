@@ -186,3 +186,10 @@ pub mod workflow_materialize;
 pub mod workflow_package;
 pub mod workflows;
 pub mod worktree;
+
+// The module-map check only reads files, so it runs inside this library's test binary. As an
+// integration test under `tests/` it made every `cargo test` build the daemon executable too, a
+// second full compile of `http.rs` that no test used.
+#[cfg(test)]
+#[path = "../tests/module_map.rs"]
+mod module_map;
