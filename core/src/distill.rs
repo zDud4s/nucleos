@@ -660,7 +660,8 @@ async fn gather(pool: &SqlitePool, row: &QueueRow) -> sqlx::Result<Option<Dossie
     };
 
     let mut owner_context: Vec<String> =
-        crate::owner_notes::active_note_texts_for_project(pool, &row.project_id).await?;
+        crate::owner_notes::active_note_texts_for_project(pool, &row.project_id, row.job_id)
+            .await?;
     let job_notes: Vec<String> =
         sqlx::query_scalar("SELECT body FROM job_notes WHERE job_id = ? ORDER BY id")
             .bind(job_id)

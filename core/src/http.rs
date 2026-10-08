@@ -15918,6 +15918,35 @@ async fn get_owner_notes_graph(
                 target.missing = !owner_note_file_exists(&state, &target.r#ref).unwrap_or(false);
                 target.label = Some(target.r#ref.clone());
             }
+            "job" => {
+                // `prompt` is nullable on old rows, so the outer Option is "row gone" and the
+                // inner one "no prompt to quote".
+                let row = match target.r#ref.trim().parse::<i64>() {
+                    Ok(id) => sqlx::query_scalar::<_, Option<String>>(
+                        "SELECT prompt FROM jobs WHERE id = ?",
+                    )
+                    .bind(id)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .map_err(|error| owner_note_db_status(&error, None))?,
+                    Err(_) => None,
+                };
+                target.missing = row.is_none();
+                target.label = row.map(|prompt| {
+                    let first: String = prompt
+                        .as_deref()
+                        .and_then(|text| text.lines().next())
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect();
+                    if first.is_empty() {
+                        format!("job #{}", target.r#ref)
+                    } else {
+                        format!("job #{} \u{2014} {first}", target.r#ref)
+                    }
+                });
+            }
             _ => {}
         }
     }
@@ -38031,6 +38060,61 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (_, detail) = call(state, "GET", &format!("/owner-notes/{note}"), None).await;
         assert!(detail["links_out"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_job_target_that_does_not_exist_is_refused() {
+        let state = test_state().await;
+        let note = file_owner_note(&state, "about a job").await;
+        let uri = format!("/owner-notes/{note}/links");
+        let body = |job: &str| {
+            serde_json::json!({
+                "link_type": "relates", "target_kind": "job", "target_ref": job,
+            })
+        };
+        let (status, _) = call(state.clone(), "POST", &uri, Some(body("999"))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, created_at)
+             VALUES (5, 'proj', 'C:/x', 'x', 'implementing', 5, '2026-09-27T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let (status, _) = call(state, "POST", &uri, Some(body("5"))).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn a_job_target_is_labelled_and_a_gone_job_is_missing() {
+        let state = test_state().await;
+        let note = file_owner_note(&state, "about two jobs").await;
+        let long = "a".repeat(80);
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, created_at)
+             VALUES (5, 'proj', 'C:/x', ?, 'implementing', 5, '2026-09-27T00:00:00Z')",
+        )
+        .bind(format!("{long}\nsecond line"))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        crate::owner_notes::add_link(&state.pool, note, "relates", "job", "5")
+            .await
+            .unwrap();
+        crate::owner_notes::add_link(&state.pool, note, "relates", "job", "6")
+            .await
+            .unwrap();
+
+        let (status, graph) = call(state, "GET", "/owner-notes/graph", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let targets = graph["targets"].as_array().unwrap();
+        let find = |id: &str| targets.iter().find(|t| t["ref"] == id).unwrap();
+        assert_eq!(find("5")["missing"], false);
+        assert_eq!(
+            find("5")["label"],
+            format!("job #5 \u{2014} {}", "a".repeat(60))
+        );
+        assert_eq!(find("6")["missing"], true);
     }
 
     #[tokio::test]
