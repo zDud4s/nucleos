@@ -49,7 +49,7 @@ AGENT_WAIT_MAX_S = 540.0
 CALLER_WAIT_MAX_S = 3600.0
 EXIT_QUEUE_TIMEOUT = 75
 
-SUBCOMMANDS = ("status", "report", "hold-worktree", "warm")
+SUBCOMMANDS = ("status", "report", "hold-worktree", "warm", "idle")
 WARM_PRIO = 3
 WARM_ARGV = ["cargo", "test", "-p", "nucleos-core", "--no-run"]
 
@@ -1968,6 +1968,31 @@ def cmd_status() -> int:
     return 0
 
 
+def cmd_idle() -> int:
+    """Exit 0 when nothing but the caller's own session (and idle-priority warms) uses the
+    broker: no queued or held run, no other worktree lock, no slot another session holds.
+    select_tests asks this before running its groups in parallel; any doubt answers busy."""
+    d = state_dir()
+    me = held_session()
+    busy = []
+    for kind in ("queue", "held"):
+        for _, rec in _entries(d / kind, reap=False):
+            if _int_prio(rec.get("prio")) < WARM_PRIO:
+                busy.append(f"{kind}: pid={rec.get('pid')} {rec.get('worktree') or ''}".rstrip())
+    wt = d / "wt"
+    for lock in (sorted(wt.glob("*.lock")) if wt.is_dir() else []):
+        rec = _read_lock(lock)
+        if rec and rec.get("pid") != me:
+            busy.append(f"lock: pid={rec.get('pid')} {rec.get('worktree') or ''}".rstrip())
+    for k in range(1, target_slots() + 1):
+        if _slot_busy(_read_slot(d, k), me):
+            busy.append(f"slot {k}")
+    for line in busy:
+        print(line)
+    print("idle" if not busy else f"busy ({len(busy)})")
+    return 0 if not busy else 1
+
+
 def _warm_marker(directory: Path, root: str) -> Path:
     return directory / "warm" / (worktree_hash(root) + ".json")
 
@@ -2122,6 +2147,8 @@ def main(argv: list[str]) -> int:
             return cmd_report(argv[1:])
         if argv and argv[0] == "warm":
             return cmd_warm(argv[1:])
+        if argv and argv[0] == "idle":
+            return cmd_idle()
         if argv and argv[0] == "hold-worktree":
             try:
                 return broker_run(argv[1:], held=True)
