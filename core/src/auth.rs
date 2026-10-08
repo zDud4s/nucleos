@@ -3675,4 +3675,33 @@ mod tests {
         );
         assert_eq!(resolve(&state, &key).await, Some(Scope::Run(turn)));
     }
+
+    /// The IDE verify switch writes `.mcp.json` and a Claude Code approval into the project's
+    /// worktrees, so it is the owner's alone. Membership rather than a request, like
+    /// `POST /projects/{id}/write` above: `permits` is default-deny, so it is safe today by being in
+    /// no table, and this is the test that says no to filing it beside the `/projects/{id}/...` reads.
+    #[test]
+    fn switching_ide_verify_is_in_no_scope_table() {
+        const ROUTE: &str = "/projects/{id}/ide-verify";
+
+        assert!(
+            !route_is_listed(READ_ONLY_ROUTES, &Method::POST, ROUTE)
+                && !route_is_listed(RUN_CREATING_ROUTES, &Method::POST, ROUTE)
+                && !route_is_listed(TEAM_ROUTES, &Method::POST, ROUTE)
+                && !route_is_listed(EMAIL_ROUTES, &Method::POST, ROUTE)
+                && !route_is_listed(COUNCIL_ROUTES, &Method::POST, ROUTE),
+            "writing into a project's worktrees must stay out of every scope table"
+        );
+
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits(&scope, &Method::POST, "/projects/7/ide-verify"),
+                "{scope:?} must not be able to switch IDE verify"
+            );
+        }
+    }
 }
