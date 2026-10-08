@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 // `fireEvent` and not `userEvent`, as everywhere else in this directory: user-event
 // schedules its own delays, and this button's whole behaviour is a state that reverts on

@@ -18,7 +18,13 @@ export default defineConfig({
     // jsdom, not node: the safety interlocks this app is made of — the two-step
     // confirm, the approval queue, the token handshake — are components, and a
     // node-only runner can test the arithmetic around them but never the click.
-    environment: "jsdom",
+    //
+    // happy-dom rather than jsdom because it is cheaper to build per file. Measured 2026-10-08
+    // on the full suite under the same load: 232s wall with 885s of environment time on jsdom,
+    // 186s and 366s on happy-dom. Files that depend on a behaviour only jsdom has (a missing
+    // clipboard, layout numbers, attribute types) opt back in with `@vitest-environment jsdom`.
+    // Files that render nothing use `@vitest-environment node`.
+    environment: "happy-dom",
     include: ["src/**/*.test.{ts,tsx}"],
     setupFiles: ["src/test-setup.ts"],
     // vitest 4's default pool auto-selection fails to collect any suite on
