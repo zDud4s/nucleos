@@ -84,10 +84,11 @@ describe("the nav table", () => {
     expect(NAV_ITEMS[NAV_ITEMS.length - 1]).toBe(SYSTEM_ITEM);
   });
 
-  it("carries a badge on the two items whose count somebody can clear", () => {
+  it("carries a badge on the items whose count somebody can clear", () => {
     const badged = NAV_ITEMS.filter((item) => item.badge !== undefined);
     expect(badged.map((item) => [item.id, item.badge])).toEqual([
       ["waiting", "proposals"],
+      ["brain", "captures"],
       ["chats", "chats"],
     ]);
     // Mail lost its badge on 2026-09-22 and the reason is on its row in `nav.ts`: it counted

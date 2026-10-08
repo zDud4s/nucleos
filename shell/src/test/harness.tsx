@@ -28,6 +28,7 @@ import type {
 } from "../data/project-policy";
 import { foldPathPrefix, foldPrefix } from "../data/project-policy";
 import type { ListingRead, ProjectRepo, ReadOutcome } from "../data/project-github";
+import type { CaptureRequest } from "../data/captures";
 import type { FeedEntry, FeedSeen, FeedTimeline } from "../data/feed";
 import type { Branches, Commit } from "../data/project-git";
 import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
@@ -325,6 +326,8 @@ export interface DaemonState {
   feedSeen: FeedSeen;
   /** Every `through` the shell posted, in order. */
   feedSeenPosts: number[];
+  /** The capture requests `GET /capture-requests` answers from; `?state=all` returns all of them. */
+  captures: CaptureRequest[];
 }
 
 export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
@@ -437,6 +440,7 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     feedTimelineRefusal: null,
     feedSeen: { through: null, through_created_at: null, seen_at: null },
     feedSeenPosts: [],
+    captures: [],
     ...overrides,
   };
 }
@@ -1163,6 +1167,8 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
     // The log route carries a query string, so it is matched on its segment rather than its end.
     if (path.startsWith("/projects/") && path.includes("/log")) return state.log;
 
+    if (path === "/capture-requests") return state.captures.filter((c) => c.state === "open");
+    if (path === "/capture-requests?state=all") return state.captures;
     switch (path) {
       case "/autopilot/kill":
         return state.kill;

@@ -60,7 +60,7 @@ export type NavGroupId = "operate" | "work" | "pillars";
  * between them, and it is what lets a badge be declared here in the slice that
  * builds the nav and filled in by the slice that builds the pillar.
  */
-export type NavBadge = "proposals" | "chats";
+export type NavBadge = "proposals" | "chats" | "captures";
 
 export interface NavItem {
   /** Stable id — used for badge lookup, disabled sets, and test selectors. */
@@ -135,7 +135,7 @@ export const NAV: NavGroup[] = [
        * The owner's own thinking and what the agent has been taught, in one list: notes typed or
        * sent here (never read by agents) beside the knowledge store. `/learned` redirects here.
        */
-      { id: "brain", label: "Brain", path: "/brain", icon: Brain },
+      { id: "brain", label: "Brain", path: "/brain", icon: Brain, badge: "captures" },
     ],
   },
   {

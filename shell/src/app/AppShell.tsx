@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { Outlet, useNavigate } from "@tanstack/react-router";
 import { useChats } from "../data/chats";
+import { useOpenCaptures } from "../data/captures";
 import { useHotkeyRegistration } from "../data/hotkeys";
 import { POLL } from "../data/poll";
 import { useProjects, useSystemHealth, wantsAttention } from "../data/system";
@@ -75,6 +76,8 @@ function Frame() {
    * chat's badge is `waiting`, not a row count.
    */
   const chats = useChats();
+  /** Open capture requests, the Brain badge — absent until the list has answered once. */
+  const captures = useOpenCaptures();
   /**
    * The roster, for the sidebar's project switcher.
    *
@@ -108,6 +111,7 @@ function Frame() {
           badges={{
             proposals: waiting,
             chats: chats.data === undefined ? undefined : unreadTotal(chats.data),
+            captures: captures.data === undefined ? undefined : captures.data.length,
           }}
           projects={projects.data?.map((project) => ({
             id: project.project_id,
