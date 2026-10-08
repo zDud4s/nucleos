@@ -262,7 +262,7 @@ export function BrainListView({ item, onItem }: { item?: string; onItem: (item: 
   return (
     <div className={ref === null ? undefined : "brain-graph"}>
       <div className="brain-graph-main">
-        <UnifiedList onSelect={onItem} />
+        <UnifiedList onSelect={onItem} selected={ref === null ? undefined : formatItem(ref)} />
       </div>
       {ref !== null && <ItemPanel item={ref} onItem={onItem} />}
     </div>

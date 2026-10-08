@@ -8,7 +8,7 @@ import "./capture.css";
  * "Asked of you": the open capture requests, soonest deadline first. One request, one form — no
  * batches and no groups. Draws nothing when nothing is open.
  */
-export function CapturesWaiting({ onSelect }: { onSelect(item: string): void }) {
+export function CapturesWaiting({ onSelect, selected }: { onSelect(item: string): void; selected?: string }) {
   const open = useOpenCaptures();
   const rows = [...(open.data ?? [])].sort((a, b) => a.deadline.localeCompare(b.deadline));
   if (rows.length === 0) return null;
@@ -24,7 +24,12 @@ export function CapturesWaiting({ onSelect }: { onSelect(item: string): void }) 
           >
             Job #{request.job_id} · {request.project_id}
           </button>
-          <CaptureAnswerForm request={request} />
+          {/* The open panel holds this request's form; two drafts of one answer would diverge. */}
+          {selected === formatItem({ kind: "capture", id: request.job_id }) ? (
+            <p className="capture-left">answering in the panel</p>
+          ) : (
+            <CaptureAnswerForm request={request} />
+          )}
         </div>
       ))}
     </Panel>

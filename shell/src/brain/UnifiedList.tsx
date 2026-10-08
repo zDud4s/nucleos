@@ -13,6 +13,8 @@ import "./unified-list.css";
 export interface UnifiedListProps {
   /** Receives `formatItem(ref)`: `note:12`, `knowledge:5` or `capture:7`. */
   onSelect(item: string): void;
+  /** The item open in the side panel, so the list does not draw its form twice. */
+  selected?: string;
 }
 
 const TYPE_FILTERS: readonly (readonly [ItemFilters["type"], string])[] = [
@@ -37,7 +39,7 @@ const LAYER_FILTERS: readonly (readonly [KnownLayer | "all", string])[] = [
 ];
 
 /** The attention-ordered list: what waits for a decision, then notes and knowledge by date. */
-export function UnifiedList({ onSelect }: UnifiedListProps) {
+export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
   const [type, setType] = useState<ItemFilters["type"]>("all");
   const [state, setState] = useState<ItemFilters["state"]>("in_force");
   const [layer, setLayer] = useState<KnownLayer | "all">("all");
@@ -79,10 +81,10 @@ export function UnifiedList({ onSelect }: UnifiedListProps) {
 
   return (
     <>
-      {(allNotes.isError || knowledge.isError) && (
+      {(allNotes.isError || knowledge.isError || captureRows.isError) && (
         <ErrorNote>the núcleo did not answer — part of what is known is missing</ErrorNote>
       )}
-      <CapturesWaiting onSelect={onSelect} />
+      <CapturesWaiting onSelect={onSelect} selected={selected} />
       <WaitingPanel rows={waiting} />
 
       <div className="unified-filters">

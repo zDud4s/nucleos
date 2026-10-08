@@ -40,8 +40,9 @@ export function CaptureAnswerForm({ request }: { request: CaptureRequest }) {
       <div className="capture-actions">
         <Button
           variant="approve"
-          disabled={busy || text.trim() === ""}
-          onClick={() => answer.mutate({ jobId: request.job_id, text })}
+          // Disabled once answered too: a second click would file a second note, the late-answer path.
+          disabled={busy || answer.isSuccess || text.trim() === ""}
+          onClick={() => answer.mutate({ jobId: request.job_id, text }, { onSuccess: () => setText("") })}
         >
           Answer
         </Button>
