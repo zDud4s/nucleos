@@ -17,13 +17,15 @@ const captureTypedOnly = "Capture requests take a typed reply — type your answ
 // request. The mark travels in the message itself, so the sidecar keeps no state for it.
 var captureMarkPattern = regexp.MustCompile(`#cap(\d+)\b`)
 
-// captureMark returns the job id a capture request's text names, or 0 when it names none.
+// captureMark returns the job id a capture request's text names, or 0 when it names none. The
+// LAST mark wins: the núcleo writes it at the very end, after facts that quote free text (an
+// item's description) which could itself contain "#cap<N>".
 func captureMark(text string) int64 {
-	m := captureMarkPattern.FindStringSubmatch(text)
-	if m == nil {
+	all := captureMarkPattern.FindAllStringSubmatch(text, -1)
+	if len(all) == 0 {
 		return 0
 	}
-	id, err := strconv.ParseInt(m[1], 10, 64)
+	id, err := strconv.ParseInt(all[len(all)-1][1], 10, 64)
 	if err != nil {
 		return 0
 	}

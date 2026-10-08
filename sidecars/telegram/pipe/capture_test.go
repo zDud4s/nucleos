@@ -118,6 +118,7 @@ func TestACaptureAnswerNeverReachesTheLog(t *testing.T) {
 func TestCaptureMarkParsing(t *testing.T) {
 	for text, want := range map[string]int64{
 		"… #cap7": 7, "#cap123 tail": 123, "no mark": 0, "#capx": 0, "#cap": 0, "#cap12abc": 0,
+		"«#cap3 in a description» … #cap7": 7,
 	} {
 		if got := captureMark(text); got != want {
 			t.Errorf("captureMark(%q) = %d, want %d", text, got, want)
