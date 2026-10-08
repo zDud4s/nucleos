@@ -594,6 +594,13 @@ pub fn build_router(state: AppState) -> Router {
             "/owner-notes/links/{link_id}",
             delete(delete_owner_note_link),
         )
+        // Capture requests (spec 2026-10-07-pedidos-captura). In no `auth.rs` table on purpose:
+        // Control and Admin only, like the notes an answer becomes.
+        .route("/capture-requests", get(get_capture_requests))
+        .route(
+            "/capture-requests/{job_id}/dismiss",
+            post(post_capture_dismiss),
+        )
         .route("/assistant/message", post(post_assistant_message))
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
         // number cannot shadow a turn id.
@@ -15813,6 +15820,45 @@ async fn delete_owner_note_link(
         Err(LinkError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(LinkError::Db(error)) => Err(owner_note_db_status(&error, None)),
         Err(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CaptureListQuery {
+    state: Option<String>,
+}
+
+async fn get_capture_requests(
+    State(state): State<AppState>,
+    Query(query): Query<CaptureListQuery>,
+) -> Result<Json<Vec<crate::capture::CaptureRequest>>, (StatusCode, Json<serde_json::Value>)> {
+    let listing = match query.state.as_deref() {
+        None => crate::capture::Listing::Open,
+        Some(s) => crate::capture::Listing::parse(s)
+            .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "unknown_state"))?,
+    };
+    crate::capture::list(&state.pool, listing, chrono::Utc::now())
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing capture requests failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })
+}
+
+async fn post_capture_dismiss(
+    State(state): State<AppState>,
+    Path(job_id): Path<i64>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    use crate::capture::CaptureError;
+    match crate::capture::dismiss(&state.pool, job_id, chrono::Utc::now()).await {
+        Ok(()) => Ok(StatusCode::OK),
+        Err(CaptureError::NotFound) => Err(refusal(StatusCode::NOT_FOUND, "not_found")),
+        Err(CaptureError::Closed) => Err(refusal(StatusCode::CONFLICT, "closed")),
+        Err(CaptureError::Db(error)) => {
+            tracing::warn!(job_id, %error, "dismissing a capture request failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
     }
 }
 
@@ -38407,6 +38453,47 @@ mod tests {
         let (status, body) = workflow_call(state, "GET", "/distill/duplicates", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!([]));
+    }
+
+    async fn open_capture_request(state: &AppState, job_id: i64) {
+        sqlx::query(
+            "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, created_at)
+             VALUES (?, 'p', '[{\"row\":1,\"cause\":\"job_failed\",\"fact\":\"f\"}]', 'q', 'open',
+                     '2999-01-01T00:00:00+00:00', '2026-10-07T10:00:00+00:00')",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_requests_are_listed_and_dismissed_once() {
+        let state = test_state().await;
+        open_capture_request(&state, 7).await;
+
+        let (status, list) = call(state.clone(), "GET", "/capture-requests", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list[0]["job_id"], 7);
+        assert_eq!(list[0]["causes"][0], "job_failed");
+        assert!(list[0]["seconds_left"].as_i64().unwrap() > 0);
+
+        let (status, _) = call(state.clone(), "POST", "/capture-requests/7/dismiss", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(state.clone(), "POST", "/capture-requests/7/dismiss", None).await;
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::CONFLICT, Some("closed"))
+        );
+        let (status, _) = call(state.clone(), "POST", "/capture-requests/99/dismiss", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (_, open) = call(state.clone(), "GET", "/capture-requests?state=open", None).await;
+        assert_eq!(open.as_array().unwrap().len(), 0);
+        let (_, all) = call(state.clone(), "GET", "/capture-requests?state=all", None).await;
+        assert_eq!(all[0]["state"], "dismissed");
+        let (status, _) = call(state.clone(), "GET", "/capture-requests?state=later", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
 
