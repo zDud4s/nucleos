@@ -100,6 +100,46 @@ pub async fn wait_minutes(pool: &SqlitePool) -> i64 {
         .unwrap_or(DEFAULT_WAIT_MINUTES)
 }
 
+/// Queue rows created before this UTC second never ask; see migration 0173. Absent: all may ask.
+pub const FROM_KEY: &str = "distiller.capture_from";
+
+#[derive(Debug)]
+pub enum WaitError {
+    OutOfRange,
+    Db(sqlx::Error),
+}
+
+impl std::fmt::Display for WaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WaitError::OutOfRange => write!(f, "the wait is 0 to {MAX_WAIT_MINUTES} minutes"),
+            WaitError::Db(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<sqlx::Error> for WaitError {
+    fn from(error: sqlx::Error) -> Self {
+        WaitError::Db(error)
+    }
+}
+
+/// Store the wait, refusing anything `wait_minutes` would not read back.
+pub async fn set_wait_minutes(pool: &SqlitePool, minutes: i64) -> Result<(), WaitError> {
+    if !(0..=MAX_WAIT_MINUTES).contains(&minutes) {
+        return Err(WaitError::OutOfRange);
+    }
+    sqlx::query(
+        "INSERT INTO schema_meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(WAIT_SETTING_KEY)
+    .bind(minutes.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[derive(sqlx::FromRow)]
 struct AskingRow {
     id: i64,
@@ -195,15 +235,21 @@ pub async fn open_due(
     if wait_minutes <= 0 {
         return Ok(0);
     }
+    let from: Option<String> = sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
+        .bind(FROM_KEY)
+        .fetch_optional(&mut *conn)
+        .await?;
     let rows: Vec<AskingRow> = sqlx::query_as(
         "SELECT id, cause, project_id, job_id, item_id, run_id FROM distill_queue
           WHERE status = ? AND job_id IS NOT NULL AND cause IN (?, ?, ?)
+            AND (?5 IS NULL OR substr(created_at, 1, 19) > ?5)
           ORDER BY id",
     )
     .bind(crate::distill::STATUS_PENDING)
     .bind(ASKING_CAUSES[0].as_str())
     .bind(ASKING_CAUSES[1].as_str())
     .bind(ASKING_CAUSES[2].as_str())
+    .bind(from)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -782,6 +828,66 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(wait_minutes(&pool).await, want, "stored {stored}");
+        }
+    }
+
+    async fn set_meta(pool: &SqlitePool, key: &str, value: &str) {
+        sqlx::query("INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)")
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rows_queued_before_the_marker_never_ask() {
+        let pool = pool().await;
+        job(&pool, 7, "failed").await;
+        queued(&pool, "job_failed", 7, None, None).await;
+        // The helper queues at 09:00:00; a marker at that second or later excludes it.
+        set_meta(&pool, FROM_KEY, "2026-10-07T09:00:00").await;
+        tick(&pool, at("2026-10-07T10:00:00+00:00"), 120).await;
+        assert!(request(&pool, 7).await.is_none());
+
+        set_meta(&pool, FROM_KEY, "2026-10-07T08:59:59").await;
+        tick(&pool, at("2026-10-07T10:00:00+00:00"), 120).await;
+        assert!(request(&pool, 7).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn without_a_marker_every_row_asks() {
+        let pool = pool().await;
+        sqlx::query("DELETE FROM schema_meta WHERE key = ?")
+            .bind(FROM_KEY)
+            .execute(&pool)
+            .await
+            .unwrap();
+        job(&pool, 7, "failed").await;
+        queued(&pool, "job_failed", 7, None, None).await;
+        tick(&pool, at("2026-10-07T10:00:00+00:00"), 120).await;
+        assert!(request(&pool, 7).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_wait_is_set_within_bounds_and_refused_outside() {
+        let pool = pool().await;
+        for bad in [-1, MAX_WAIT_MINUTES + 1] {
+            assert!(matches!(
+                set_wait_minutes(&pool, bad).await,
+                Err(WaitError::OutOfRange)
+            ));
+        }
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
+                .bind(WAIT_SETTING_KEY)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, None, "a refused value writes nothing");
+        for good in [0, 45, MAX_WAIT_MINUTES] {
+            set_wait_minutes(&pool, good).await.unwrap();
+            assert_eq!(wait_minutes(&pool).await, good);
         }
     }
 

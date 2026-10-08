@@ -20,3 +20,12 @@ CREATE TABLE capture_requests (
 
 -- The worker's two questions every tick: which requests are open, and which are past due.
 CREATE INDEX capture_requests_open ON capture_requests (state, deadline);
+
+-- Requests open only for queue rows created after this migration ran: failures already pending
+-- when the feature shipped would otherwise all ask at once on the first tick. A time, not a row id
+-- (ids are reused). Written only when the queue holds pending rows, so a fresh database has no
+-- marker and every row may ask.
+INSERT INTO schema_meta (key, value)
+SELECT 'distiller.capture_from', strftime('%Y-%m-%dT%H:%M:%S', 'now')
+WHERE EXISTS (SELECT 1 FROM distill_queue WHERE status = 'pending')
+ON CONFLICT(key) DO NOTHING;
