@@ -124,7 +124,11 @@ pub fn detect(
 ///
 /// Tools listed in either map stay listed, keys folded to lowercase (the lookup is
 /// case-insensitive and takes the first key); a tool both list keeps only the subcommands BOTH
-/// allow, and an empty `allow` stays empty (everything is a hit). `gate_entrypoints` and
+/// allow, and an empty `allow` stays empty (everything is a hit). When both lists were non-empty
+/// but disjoint, the intersection keeps a single `""` sentinel: `test_argv` reads an empty `allow`
+/// as "every invocation is a hit", and `subcommand_of` never yields an empty subcommand for a real
+/// invocation, so the tool stays "non-empty allow, nothing covered" (a flagless or bare call is
+/// still not a hit, any real subcommand is). `gate_entrypoints` and
 /// `wrappers` are unioned. Groups are unioned by name; the same name with a different `command`
 /// keeps both, the worktree's under `worktree:<name>`.
 ///
@@ -140,9 +144,12 @@ pub fn detection_union(target: &TestsMap, worktree: &TestsMap) -> TestsMap {
                 slot.insert(tool.clone());
             }
             std::collections::btree_map::Entry::Occupied(mut slot) => {
-                slot.get_mut()
-                    .allow
-                    .retain(|allowed| tool.allow.contains(allowed));
+                let allow = &mut slot.get_mut().allow;
+                let both_listed = !allow.is_empty() && !tool.allow.is_empty();
+                allow.retain(|allowed| tool.allow.contains(allowed));
+                if both_listed && allow.is_empty() {
+                    allow.push(String::new());
+                }
             }
         }
     }
@@ -673,5 +680,23 @@ tests:
             hit_in(&union, "make core"),
             Some(("group_command", "worktree:core".to_string()))
         );
+    }
+
+    #[test]
+    fn the_union_of_disjoint_allows_detects_neither_flags_nor_a_bare_call() {
+        let target = parsed("version: 1\ntests:\n  tools:\n    cargo: { allow: [fmt] }\n");
+        let worktree = parsed("version: 1\ntests:\n  tools:\n    cargo: { allow: [clippy] }\n");
+        let union = detection_union(&target, &worktree);
+
+        // The intersection is empty, and an empty `allow` must not read as "everything is a hit".
+        for command in [
+            "cargo fmt",
+            "cargo clippy",
+            "cargo --version",
+            "cargo --help",
+            "cargo",
+        ] {
+            assert_eq!(hit_in(&union, command), None, "{command}");
+        }
     }
 }
