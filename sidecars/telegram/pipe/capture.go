@@ -2,6 +2,7 @@ package pipe
 
 import (
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -41,6 +42,36 @@ func captureTarget(msg *telegram.Message) int64 {
 		return 0
 	}
 	return captureMark(to.Text)
+}
+
+// hintOpenCaptures tells the owner, once per open capture request, that a loose message is not an
+// answer: only a Reply to the request carries its #cap mark. The message itself still goes where it
+// was going — guessing it was meant as the answer could file a conversation as a job's note. A
+// command is left alone, and a daemon that cannot list the requests costs only the hint.
+func hintOpenCaptures(bot Bot, dc Daemon, tr *Tracker, to telegram.Destination, msg *telegram.Message) {
+	if strings.HasPrefix(strings.TrimSpace(msg.Text), "/") {
+		return
+	}
+	jobs, err := dc.OpenCaptureJobs()
+	if err != nil {
+		log.Printf("capture hint skipped: %v", err)
+		return
+	}
+	fresh := tr.unhinted(jobs)
+	if len(fresh) == 0 {
+		return
+	}
+	logSend("capture hint", bot.SendMessage(to, captureHint(fresh)))
+}
+
+// captureHint is the text of the hint for the given jobs.
+func captureHint(jobs []int64) string {
+	marks := make([]string, len(jobs))
+	for i, job := range jobs {
+		marks[i] = fmt.Sprintf("#cap%d", job)
+	}
+	return "This message went to the assistant, not to a capture request. To answer one, use Reply on its message (" +
+		strings.Join(marks, ", ") + ")."
 }
 
 // handleCaptureReply answers a capture request. It never opens an assistant turn, and the

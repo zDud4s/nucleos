@@ -256,3 +256,22 @@ func TestAnswerCaptureErrorNeverCarriesTheText(t *testing.T) {
 		t.Errorf("error carries the answer text: %v", err)
 	}
 }
+
+func TestOpenCaptureJobsListsTheOpenRequestsJobs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/capture-requests" || r.URL.Query().Get("state") != "open" {
+			t.Errorf("request = %s %s", r.Method, r.URL)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"job_id":29,"state":"open"},{"job_id":31,"state":"open"}]`))
+	}))
+	defer server.Close()
+
+	jobs, err := New(server.URL, "tok").OpenCaptureJobs()
+	if err != nil {
+		t.Fatalf("OpenCaptureJobs() error = %v", err)
+	}
+	if len(jobs) != 2 || jobs[0] != 29 || jobs[1] != 31 {
+		t.Errorf("jobs = %v, want [29 31]", jobs)
+	}
+}
