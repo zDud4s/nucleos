@@ -82,6 +82,8 @@ const PROJECT_SCOPED: &[&str] = &[
     "runs",
     "scheduler_state",
     "vcs_requests",
+    // What a project's verification asked, cached, did and observed is its history.
+    "verification_observations",
     "verify_cache",
     "verify_requests",
     "verify_runs",
