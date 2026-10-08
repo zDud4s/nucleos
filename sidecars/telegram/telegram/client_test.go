@@ -380,3 +380,24 @@ func TestDestinationIgnoresAThreadThatIsNotATopic(t *testing.T) {
 		t.Fatalf("Destination() = %+v, want the topic", got)
 	}
 }
+
+func TestAReplyCarriesTheMessageItAnswersAndWhetherItsAuthorIsABot(t *testing.T) {
+	raw := `{"message_id":5,"chat":{"id":42},"from":{"id":42,"is_bot":false},"text":"it was the VPN",
+		"reply_to_message":{"message_id":4,"chat":{"id":42},"from":{"id":999,"is_bot":true},"text":"📣 🧠 x · job #7 #cap7"}}`
+	var m Message
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m.ReplyToMessage == nil {
+		t.Fatal("ReplyToMessage = nil, want the replied-to message")
+	}
+	if !m.ReplyToMessage.From.IsBot {
+		t.Error("ReplyToMessage.From.IsBot = false, want true")
+	}
+	if m.From.IsBot {
+		t.Error("From.IsBot = true, want false")
+	}
+	if m.ReplyToMessage.Text != "📣 🧠 x · job #7 #cap7" {
+		t.Errorf("ReplyToMessage.Text = %q", m.ReplyToMessage.Text)
+	}
+}

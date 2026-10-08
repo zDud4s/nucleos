@@ -120,6 +120,11 @@ type recordingDaemon struct {
 	// noteCalls records the text of every CreateNote call; noteErr is what the next one reports.
 	noteCalls []string
 	noteErr   error
+	// answerCalls records every AnswerCapture call; answerErr is what the next one reports and
+	// answerReleased what it says about the request.
+	answerCalls    []answerCall
+	answerErr      error
+	answerReleased bool
 	// The notification policy this fake daemon serves, and the error it serves instead. The zero
 	// value is an empty policy, which allows everything — so every test written before the policy
 	// existed keeps the behaviour it was written against.
@@ -163,6 +168,19 @@ func (d *recordingDaemon) SendAssistantMessage(chatID, _ string) (int64, error) 
 	d.sendAssistantCalls++
 	d.lastChatID = chatID
 	return 0, d.sendAssistantErr
+}
+
+type answerCall struct {
+	jobID int64
+	text  string
+}
+
+func (d *recordingDaemon) AnswerCapture(jobID int64, text string) (int64, bool, error) {
+	d.answerCalls = append(d.answerCalls, answerCall{jobID, text})
+	if d.answerErr != nil {
+		return 0, false, d.answerErr
+	}
+	return 31, d.answerReleased, nil
 }
 
 func (d *recordingDaemon) CreateNote(text string) (int64, error) {
@@ -1591,5 +1609,16 @@ func TestAPolicySuppressedLineIsNotSentToItsTopic(t *testing.T) {
 	// Without this the assertion above would also pass on a notifier that sends nothing.
 	if got := sentFor(bot, "allowed line"); len(got) != 1 || got[0].to.ThreadID != 77 {
 		t.Errorf("the allowed line = %+v, want one send to its topic", got)
+	}
+}
+
+func TestACaptureRequestFeedLineIsSentWithoutItsKindPrefix(t *testing.T) {
+	summary := "🧠 web · job #7 · job failed\nHá alguma coisa que só tu saibas sobre isto?\n(até às 14:30; depois o destilador avança) #cap7"
+	got := formatFeed(map[string]any{"kind": "capture_requested", "summary": summary})
+	if got != summary {
+		t.Errorf("formatFeed = %q, want the summary alone", got)
+	}
+	if got := formatFeed(map[string]any{"kind": "job_failed", "summary": "x"}); got != "job_failed: x" {
+		t.Errorf("other kinds lost their prefix: %q", got)
 	}
 }

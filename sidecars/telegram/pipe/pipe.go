@@ -60,6 +60,7 @@ type Bot interface {
 type Daemon interface {
 	SendAssistantMessage(chatKey, text string) (int64, error)
 	CreateNote(text string) (int64, error)
+	AnswerCapture(jobID int64, text string) (noteID int64, released bool, err error)
 	GetRun(id int64) (map[string]any, error)
 	GetProposals() ([]map[string]any, error)
 	// GetRefusedActions is what the injection barrier turned away. A separate route from the one
@@ -212,6 +213,12 @@ func HandleUpdate(bot Bot, dc Daemon, dl Downloader, cfg config.Config, tr *Trac
 	}
 
 	to := u.Message.Destination()
+	// A capture answer is checked after the sender, before resolveIncoming: a dictated answer is
+	// refused, never transcribed (spec P6).
+	if jobID := captureTarget(u.Message); jobID != 0 {
+		handleCaptureReply(bot, dc, to, u.Message, jobID)
+		return
+	}
 	text := resolveIncoming(dl, dc, cfg.TranscribeCmd, u.Message)
 	if strings.TrimSpace(text) == "" {
 		// A sticker, a location, a poll: none of them carries a prompt, and a turn started on an
@@ -973,6 +980,13 @@ func sleepUntil(ctx context.Context, interval time.Duration) bool {
 	}
 }
 
+// captureRequestedKind is the feed kind of a capture request. Its summary opens with its own
+// header line, so the raw "kind: " prefix would only stand in front of the question.
+const captureRequestedKind = "capture_requested"
+
 func formatFeed(f map[string]any) string {
+	if kindOf(f) == captureRequestedKind {
+		return strOr(f, "summary", "")
+	}
 	return strOr(f, "kind", "event") + ": " + strOr(f, "summary", "")
 }

@@ -57,6 +57,9 @@ type Message struct {
 	Voice    *Voice      `json:"voice"`
 	Document *Document   `json:"document"`
 	Photo    []PhotoSize `json:"photo"`
+	// ReplyToMessage is the message this one answers, when the owner used Telegram's reply.
+	// A capture request is answered this way: the request's own text carries its #cap<job_id> mark.
+	ReplyToMessage *Message `json:"reply_to_message"`
 }
 
 // SenderID is the id of whoever sent the message, or 0 when Telegram sent no `from` (channel posts,
@@ -142,6 +145,9 @@ type CallbackQuery struct {
 
 type User struct {
 	ID int64 `json:"id"`
+	// IsBot is mandatory in the Bot API. The sidecar never calls getMe, so it does not know its own
+	// id; "a bot wrote it" is what identifies a capture request in an authorised chat.
+	IsBot bool `json:"is_bot"`
 }
 
 type Button struct {
