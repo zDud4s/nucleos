@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { EMPTY_TURN, onIdle, onSegment } from "./turn-assembly";
 

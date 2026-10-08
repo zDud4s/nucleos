@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { compareOccurrences, dateKeyOf, groupByLocalDay, placementOf, slotStamp } from "./slot";
 import type { EventOccurrence } from "../data/calendar";

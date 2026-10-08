@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { formatItem, itemOfNode, nodeIdOf, parseItem, parseView } from "./item-ref";
 

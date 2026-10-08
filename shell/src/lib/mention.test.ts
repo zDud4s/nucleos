@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { commandAt, mentionAt, orchestrateTask, withCommand, withMention } from "./mention";
 

@@ -1,3 +1,4 @@
+// @vitest-environment node
 // §spec mapa-do-projeto
 
 import { describe, expect, it } from "vitest";

@@ -43,8 +43,11 @@ afterEach(cleanup);
 // Typed through a widened view of the prototype on purpose: the DOM lib declares `scrollIntoView`
 // as always present, so an `in` check narrows the negative branch to `never` and fails to compile.
 // The absence is a fact about jsdom, not about the type.
-const elementProto = Element.prototype as { scrollIntoView?: () => void };
-elementProto.scrollIntoView ??= () => {};
+// Guarded because files that render nothing run in the `node` environment, which has no `Element`.
+if (typeof Element !== "undefined") {
+  const elementProto = Element.prototype as { scrollIntoView?: () => void };
+  elementProto.scrollIntoView ??= () => {};
+}
 
 // The same kind of gap, one layer up: jsdom implements no layout, so it ships no
 // `ResizeObserver`. `cmdk` — the list inside the conversation finder — constructs one on

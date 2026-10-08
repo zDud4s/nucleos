@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { ChatGroup, ChatSummary } from "../data/chats";
 import { applyFilters, byGroup, countSessions, dotFor, statusOf } from "./sessions";
