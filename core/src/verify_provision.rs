@@ -188,19 +188,7 @@ async fn every_worktree(root: &Path) -> Result<Vec<String>, String> {
         ));
     }
     let mut out = Vec::new();
-    for block in listed
-        .stdout
-        .replace(
-            "
-", "
-",
-        )
-        .split(
-            "
-
-",
-        )
-    {
+    for block in listed.stdout.replace("\r\n", "\n").split("\n\n") {
         let mut path = None;
         let mut bare = false;
         for line in block.lines() {
