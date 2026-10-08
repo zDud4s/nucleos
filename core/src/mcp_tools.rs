@@ -2,10 +2,13 @@ use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpBox {
     All,
     JobNode(i64),
+    /// An interactive (IDE/terminal) session's box: it serves `EVERY_BOX_TOOLS` and nothing else,
+    /// and every call is held to this absolute worktree path. See `worktree_for_call`.
+    Worktree(String),
 }
 
 pub struct NucleosTools {
@@ -44,7 +47,7 @@ impl NucleosTools {
 
     /// Whether this instance will announce and dispatch one name.
     fn serves(&self, tool: &str) -> bool {
-        served_in_box(self.served, tool)
+        served_in_box(&self.served, tool)
     }
 
     /// What this server ANNOUNCES, in characters of JSON.
@@ -68,7 +71,7 @@ impl NucleosTools {
         Self::tool_router()
             .list_all()
             .into_iter()
-            .filter(|tool| served_in_box(served, tool.name.as_ref()))
+            .filter(|tool| served_in_box(&served, tool.name.as_ref()))
             .filter_map(|tool| serde_json::to_string(&tool).ok())
             .map(|json| json.len())
             .sum()
@@ -1521,6 +1524,10 @@ impl NucleosTools {
             base,
         }): Parameters<VerifyParams>,
     ) -> String {
+        let worktree = match worktree_for_call(&self.served, worktree.as_deref()) {
+            Ok(worktree) => worktree,
+            Err(error) => return json_result::<serde_json::Value>(Err(error)),
+        };
         json_result(
             self.client
                 .verify(
@@ -2072,10 +2079,71 @@ pub const EVERY_BOX_TOOLS: &[&str] = &["verify", "verify_status"];
 /// a server. Two copies of this three-line match is how the price and the surface would come to
 /// disagree — and the disagreement would be silent in both directions, because neither side has any
 /// way to observe the other.
-fn served_in_box(served: McpBox, tool: &str) -> bool {
+fn served_in_box(served: &McpBox, tool: &str) -> bool {
     match served {
         McpBox::All => !JOB_NODE_TOOLS.contains(&tool) || EVERY_BOX_TOOLS.contains(&tool),
         McpBox::JobNode(_) => JOB_NODE_TOOLS.contains(&tool),
+        McpBox::Worktree(_) => EVERY_BOX_TOOLS.contains(&tool),
+    }
+}
+
+/// A path compared as the `worktree` fence compares it: a backslash read as `/`, trailing `/`
+/// dropped, and case folded on Windows only (a Unix filesystem tells `A` from `a`).
+fn fence_key(path: &str) -> String {
+    let unified = path.replace('\\', "/");
+    let trimmed = unified.trim_end_matches('/');
+    if cfg!(windows) {
+        trimmed.to_lowercase()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// The `worktree` argument a `verify` call goes out with, given the box and what the model asked.
+///
+/// The worktree box fills in its own path when none was asked and refuses any other before the
+/// call reaches the daemon (the daemon validates again as the owner, so this is the first fence
+/// and not the only one). The other boxes hand the argument through untouched.
+pub(crate) fn worktree_for_call(
+    served: &McpBox,
+    asked: Option<&str>,
+) -> Result<Option<String>, String> {
+    let McpBox::Worktree(own) = served else {
+        return Ok(asked.map(str::to_owned));
+    };
+    match asked {
+        None => Ok(Some(own.clone())),
+        Some(asked) if !asked.trim().is_empty() && fence_key(asked) == fence_key(own) => {
+            Ok(Some(own.clone()))
+        }
+        Some(asked) => Err(format!(
+            "this session may only verify its own worktree, {own}, not {asked:?}"
+        )),
+    }
+}
+
+/// The daemon client a box starts with. The environment's token wins; only the worktree box, which
+/// an IDE session starts by hand with no `NUCLEOS_DAEMON_TOKEN`, may fall back to the stored one.
+/// The stored token is held in memory and never written into a launch file. Nothing stored, an
+/// empty value or a read error leaves the original error standing.
+pub fn client_for_box(
+    served: &McpBox,
+    from_env: Result<crate::daemon_client::DaemonClient, String>,
+    stored: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<crate::daemon_client::DaemonClient, String> {
+    let error = match from_env {
+        Ok(client) => return Ok(client),
+        Err(error) => error,
+    };
+    if !matches!(served, McpBox::Worktree(_)) {
+        return Err(error);
+    }
+    match stored() {
+        Ok(Some(token)) if !token.is_empty() => Ok(crate::daemon_client::DaemonClient::new(
+            crate::daemon_client::daemon_url(),
+            token,
+        )),
+        _ => Err(error),
     }
 }
 
@@ -2980,8 +3048,20 @@ pub fn box_from_args(args: &[String]) -> Result<McpBox, String> {
                 .map(McpBox::JobNode)
                 .map_err(|error| format!("--job {id} is not a job id: {error}"))
         }
+        "worktree" => {
+            let path = flag_value(args, "--worktree").ok_or_else(|| {
+                "--box worktree needs --worktree <absolute path> to say which worktree".to_owned()
+            })?;
+            if std::path::Path::new(path).is_absolute() {
+                Ok(McpBox::Worktree(path.to_owned()))
+            } else {
+                Err(format!(
+                    "--worktree {path} must be an absolute path (--box worktree)"
+                ))
+            }
+        }
         _ => Err(format!(
-            "--box {kind} is not a box this server knows; the only box is `job-node`"
+            "--box {kind} is not a box this server knows; the boxes are `job-node` and `worktree`"
         )),
     }
 }
@@ -2999,8 +3079,23 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 /// `served` is the box and its scope, and `McpBox::All` — everything except the named job-node
 /// tools — is what `--mcp-tools` alone means. See `NucleosTools::for_box` for why the default must
 /// stay broad.
-pub async fn run_stdio(served: McpBox) -> Result<(), String> {
-    let tools = NucleosTools::for_box(crate::daemon_client::DaemonClient::from_env()?, served);
+pub async fn run_stdio(
+    served: McpBox,
+    client: crate::daemon_client::DaemonClient,
+) -> Result<(), String> {
+    // The worktree box keeps its session live for the daemon. Errors are ignored and nothing is
+    // printed: stdout is the protocol, and a missed beat only lets the liveness expire.
+    if let McpBox::Worktree(path) = &served {
+        let beat_client = client.clone();
+        let path = path.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = beat_client.verify_box_beat(&path).await;
+                tokio::time::sleep(crate::verify_box::BEAT_EVERY).await;
+            }
+        });
+    }
+    let tools = NucleosTools::for_box(client, served);
     let service = tools
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await
@@ -3016,19 +3111,19 @@ mod tests {
     /// Only a job node may write a finding; every other box must keep that door absent.
     #[test]
     fn only_a_job_node_is_offered_the_tool_that_writes_a_finding() {
-        assert!(served_in_box(McpBox::JobNode(1), "note_finding"));
-        assert!(!served_in_box(McpBox::All, "note_finding"));
+        assert!(served_in_box(&McpBox::JobNode(1), "note_finding"));
+        assert!(!served_in_box(&McpBox::All, "note_finding"));
 
         for name in ["create_run", "web_read", "recall", "approve_proposal"] {
             assert!(
-                !served_in_box(McpBox::JobNode(1), name),
+                !served_in_box(&McpBox::JobNode(1), name),
                 "a job node was offered {name}"
             );
         }
         for tools in [LOCAL_TOOLS, TEAM_TOOLS, COUNCIL_TOOLS, HOSTED_TOOLS] {
             for name in tools {
                 assert!(
-                    !served_in_box(McpBox::JobNode(1), name),
+                    !served_in_box(&McpBox::JobNode(1), name),
                     "a job node was offered {name}"
                 );
             }
@@ -3041,7 +3136,7 @@ mod tests {
     fn a_server_with_no_box_still_serves_everything_except_the_one_tool_that_needs_a_job() {
         // `verify` and `verify_status` sit on the job-node list yet are served everywhere, so the
         // only name this server withholds is the finding tool.
-        assert!(!served_in_box(McpBox::All, "note_finding"));
+        assert!(!served_in_box(&McpBox::All, "note_finding"));
         let registered = every_tool_name();
         for name in registered
             .iter()
@@ -3049,7 +3144,7 @@ mod tests {
             .chain(std::iter::once("future_tool_nobody_has_written"))
         {
             assert_eq!(
-                served_in_box(McpBox::All, name),
+                served_in_box(&McpBox::All, name),
                 !JOB_NODE_TOOLS.contains(&name) || EVERY_BOX_TOOLS.contains(&name),
                 "the unboxed server classified {name} incorrectly"
             );
@@ -3077,6 +3172,153 @@ mod tests {
 
         let unknown = box_from_args(&args(&["--box", "telegram"])).unwrap_err();
         assert!(unknown.contains("job-node"), "unknown-box error: {unknown}");
+    }
+
+    /// `--box worktree --worktree <abs>` names the IDE session's box; the path must be there and
+    /// absolute, and the other boxes read exactly as before.
+    #[test]
+    fn the_worktree_box_is_read_from_the_launch_arguments() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let absolute = if cfg!(windows) {
+            "C:/work/a"
+        } else {
+            "/work/a"
+        };
+
+        assert_eq!(
+            box_from_args(&args(&[
+                "--mcp-tools",
+                "--box",
+                "worktree",
+                "--worktree",
+                absolute
+            ])),
+            Ok(McpBox::Worktree(absolute.to_owned()))
+        );
+        let missing = box_from_args(&args(&["--box", "worktree"])).unwrap_err();
+        assert!(
+            missing.contains("--worktree"),
+            "missing-path error: {missing}"
+        );
+        let relative =
+            box_from_args(&args(&["--box", "worktree", "--worktree", "work/a"])).unwrap_err();
+        assert!(relative.contains("absolute") || relative.contains("--worktree"));
+
+        // Nothing else moved.
+        assert_eq!(box_from_args(&args(&[])), Ok(McpBox::All));
+        assert_eq!(
+            box_from_args(&args(&["--box", "job-node", "--job", "9"])),
+            Ok(McpBox::JobNode(9))
+        );
+        let unknown = box_from_args(&args(&["--box", "telegram"])).unwrap_err();
+        assert!(
+            unknown.contains("job-node") && unknown.contains("worktree"),
+            "{unknown}"
+        );
+    }
+
+    /// The worktree box prefills the `worktree` argument and refuses any other worktree before the
+    /// call reaches the daemon; the other boxes hand the argument through untouched.
+    #[test]
+    fn the_worktree_box_fills_and_fences_the_worktree_argument() {
+        let own = McpBox::Worktree("/work/a".to_owned());
+
+        assert_eq!(
+            worktree_for_call(&own, None),
+            Ok(Some("/work/a".to_owned()))
+        );
+        assert_eq!(
+            worktree_for_call(&own, Some("/work/a")),
+            Ok(Some("/work/a".to_owned()))
+        );
+        // The comparison is normalised: separators and a trailing slash do not make another path.
+        assert_eq!(
+            worktree_for_call(&own, Some("/work/a/")),
+            Ok(Some("/work/a".to_owned()))
+        );
+        assert_eq!(
+            worktree_for_call(&own, Some("\\work\\a")),
+            Ok(Some("/work/a".to_owned()))
+        );
+        assert!(worktree_for_call(&own, Some("/work/b")).is_err());
+        assert!(worktree_for_call(&own, Some("/work/a/sub")).is_err());
+        assert!(worktree_for_call(&own, Some("")).is_err());
+        if cfg!(windows) {
+            assert!(worktree_for_call(&own, Some("/WORK/A")).is_ok());
+        } else {
+            assert!(worktree_for_call(&own, Some("/WORK/A")).is_err());
+        }
+
+        for other in [McpBox::All, McpBox::JobNode(3)] {
+            assert_eq!(worktree_for_call(&other, None), Ok(None));
+            assert_eq!(
+                worktree_for_call(&other, Some("/anywhere")),
+                Ok(Some("/anywhere".to_owned()))
+            );
+        }
+    }
+
+    /// Only the worktree box may reach for the stored daemon token: a session opened by hand has no
+    /// `NUCLEOS_DAEMON_TOKEN`, and the other boxes must keep failing rather than quietly gain it.
+    #[test]
+    fn only_the_worktree_box_falls_back_to_the_stored_token() {
+        use std::cell::Cell;
+        let missing = || {
+            Err::<crate::daemon_client::DaemonClient, String>(
+                "NUCLEOS_DAEMON_TOKEN not set".to_owned(),
+            )
+        };
+        let present = || {
+            Ok::<_, String>(crate::daemon_client::DaemonClient::new(
+                "http://127.0.0.1:1".to_owned(),
+                "from-env".to_owned(),
+            ))
+        };
+
+        for other in [McpBox::All, McpBox::JobNode(3)] {
+            let asked = Cell::new(false);
+            let answer = client_for_box(&other, missing(), || {
+                asked.set(true);
+                Ok(Some("stored".to_owned()))
+            });
+            assert_eq!(
+                answer.err().as_deref(),
+                Some("NUCLEOS_DAEMON_TOKEN not set")
+            );
+            assert!(!asked.get(), "{other:?} read the stored token");
+        }
+
+        let own = McpBox::Worktree("/work/a".to_owned());
+        assert!(client_for_box(&own, missing(), || Ok(Some("stored".to_owned()))).is_ok());
+
+        // Nothing stored, an empty value, or a keyring error: the original error stands.
+        for stored in [
+            Ok(None),
+            Ok(Some(String::new())),
+            Err("no keyring".to_owned()),
+        ] {
+            let answer = client_for_box(&own, missing(), || stored);
+            assert_eq!(
+                answer.err().as_deref(),
+                Some("NUCLEOS_DAEMON_TOKEN not set")
+            );
+        }
+
+        // The environment wins when it is there; the keyring is not even consulted.
+        let asked = Cell::new(false);
+        assert!(
+            client_for_box(&own, present(), || {
+                asked.set(true);
+                Ok(Some("stored".to_owned()))
+            })
+            .is_ok()
+        );
+        assert!(!asked.get());
     }
     use sqlx::SqlitePool;
     use tower::ServiceExt as TowerServiceExt;
@@ -5044,6 +5286,16 @@ mod tests {
         )
     }
 
+    fn worktree_server(worktree: &str) -> NucleosTools {
+        NucleosTools::for_box(
+            crate::daemon_client::DaemonClient::new(
+                "http://127.0.0.1:1".to_string(),
+                "unused".to_string(),
+            ),
+            McpBox::Worktree(worktree.to_owned()),
+        )
+    }
+
     fn advertised(listed: &rmcp::model::ListToolsResult) -> Vec<String> {
         let mut names: Vec<String> = listed
             .tools
@@ -5076,6 +5328,25 @@ mod tests {
                 .iter()
                 .any(|name| name == "note_finding")
         );
+    }
+
+    #[tokio::test]
+    async fn a_worktree_box_server_announces_only_verify_and_verify_status() {
+        let (_running, context) = served_request_context().await;
+
+        let listed = worktree_server("/work/a")
+            .list_tools(None, context)
+            .await
+            .unwrap();
+        assert_eq!(advertised(&listed), ["verify", "verify_status"]);
+        assert!(!served_in_box(
+            &McpBox::Worktree("/work/a".to_owned()),
+            "note_finding"
+        ));
+        assert!(!served_in_box(
+            &McpBox::Worktree("/work/a".to_owned()),
+            "create_run"
+        ));
     }
 
     #[tokio::test]
@@ -5141,11 +5412,11 @@ mod tests {
                 "{name} left the job-node list"
             );
             assert!(
-                served_in_box(McpBox::All, name),
+                served_in_box(&McpBox::All, name),
                 "the unboxed server lost {name}"
             );
             assert!(
-                served_in_box(McpBox::JobNode(1), name),
+                served_in_box(&McpBox::JobNode(1), name),
                 "a job node lost {name}"
             );
         }

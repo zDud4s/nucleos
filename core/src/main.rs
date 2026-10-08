@@ -726,7 +726,20 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(e) = mcp_tools::run_stdio(served).await {
+        // Only the worktree box may fall back to the stored daemon token (an IDE session has no
+        // NUCLEOS_DAEMON_TOKEN); every other box fails as it always did.
+        let client = match mcp_tools::client_for_box(
+            &served,
+            daemon_client::DaemonClient::from_env(),
+            || secrets::load_secret(TOKEN_KEY).map_err(|e| e.to_string()),
+        ) {
+            Ok(client) => client,
+            Err(e) => {
+                eprintln!("mcp-tools failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = mcp_tools::run_stdio(served, client).await {
             eprintln!("mcp-tools failed: {e}");
             std::process::exit(1);
         }

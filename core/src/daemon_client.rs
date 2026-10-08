@@ -82,6 +82,7 @@ pub fn daemon_url() -> String {
     url_for(port())
 }
 
+#[derive(Clone)]
 pub struct DaemonClient {
     base_url: String,
     token: String,
@@ -1231,6 +1232,15 @@ impl DaemonClient {
     /// The one request both verify calls make. A refusal carries its reason in the body (the
     /// handlers answer `(StatusCode, String)`), so the body is read first and the status is only
     /// the fallback, as in `github_request`.
+    /// Tells the daemon an IDE session's verify box is still there (`POST /verify/box/beat`).
+    pub async fn verify_box_beat(&self, worktree: &str) -> Result<Value, String> {
+        self.verify_request(
+            "/verify/box/beat",
+            &serde_json::json!({ "worktree": worktree }),
+        )
+        .await
+    }
+
     async fn verify_request(&self, path: &str, body: &Value) -> Result<Value, String> {
         let response = self
             .request(reqwest::Method::POST, path)

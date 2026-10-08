@@ -166,6 +166,7 @@ pub mod triage;
 pub use nucleos_base::trust;
 pub mod vcs;
 pub mod verify;
+pub mod verify_box;
 pub mod verify_exec;
 pub mod verify_fingerprint;
 pub mod verify_guard;
