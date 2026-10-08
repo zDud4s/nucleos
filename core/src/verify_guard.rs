@@ -118,6 +118,62 @@ pub fn detect(
     scan(command, shell, &ctx, 0)
 }
 
+/// PURE: the one map `detect` reads when a run's worktree map and the target's map both exist
+/// (spec 2026-10-05 §3.4 defence 5). The agent owns the worktree's file, so it can only add to
+/// what the target already guards, never subtract.
+///
+/// Tools listed in either map stay listed, keys folded to lowercase (the lookup is
+/// case-insensitive and takes the first key); a tool both list keeps only the subcommands BOTH
+/// allow, and an empty `allow` stays empty (everything is a hit). `gate_entrypoints` and
+/// `wrappers` are unioned. Groups are unioned by name; the same name with a different `command`
+/// keeps both, the worktree's under `worktree:<name>`.
+///
+/// Only what `detect` reads is merged: every other field is the target's, so this is not a map
+/// for any other reader.
+pub fn detection_union(target: &TestsMap, worktree: &TestsMap) -> TestsMap {
+    let mut union = target.clone();
+    let mut tools: std::collections::BTreeMap<String, tests_map::Tool> =
+        std::collections::BTreeMap::new();
+    for (key, tool) in target.tests.tools.iter().chain(&worktree.tests.tools) {
+        match tools.entry(key.to_ascii_lowercase()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(tool.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                slot.get_mut()
+                    .allow
+                    .retain(|allowed| tool.allow.contains(allowed));
+            }
+        }
+    }
+    union.tests.tools = tools;
+    for entry in &worktree.tests.gate_entrypoints {
+        if !union.tests.gate_entrypoints.contains(entry) {
+            union.tests.gate_entrypoints.push(entry.clone());
+        }
+    }
+    for wrapper in &worktree.tests.wrappers {
+        if !union.tests.wrappers.contains(wrapper) {
+            union.tests.wrappers.push(wrapper.clone());
+        }
+    }
+    for (name, group) in &worktree.tests.groups {
+        match union.tests.groups.get(name) {
+            None => {
+                union.tests.groups.insert(name.clone(), group.clone());
+            }
+            Some(existing) if existing.command == group.command => {}
+            Some(_) => {
+                union
+                    .tests
+                    .groups
+                    .insert(format!("worktree:{name}"), group.clone());
+            }
+        }
+    }
+    union
+}
+
 /// Splits a line and looks at every segment. The reader never refuses; when it hands back nothing
 /// for a line that is not blank, the whole line is looked at instead.
 fn scan(command: &str, shell: Shell, ctx: &Ctx<'_>, depth: usize) -> Option<Hit> {
@@ -389,7 +445,7 @@ fn subcommand_of(args: &[String]) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hit, Kind, detect};
+    use super::{Hit, Kind, detect, detection_union};
     use crate::command_reader::Shell;
     use crate::tests_map::{self, TestsMap};
 
@@ -559,5 +615,63 @@ tests:
         assert_eq!(posix("cat scripts/gates.sh"), None);
         assert_eq!(posix("grep cargo Cargo.toml"), None);
         assert_eq!(posix(r#"echo "cargo test""#), None);
+    }
+
+    /// Parses a map for the union tests.
+    fn parsed(text: &str) -> TestsMap {
+        tests_map::parse(text).expect("the fixture map parses")
+    }
+
+    /// Detects `command` (POSIX, no gate command) against `map`.
+    fn hit_in(map: &TestsMap, command: &str) -> Option<(&'static str, String)> {
+        found(detect(command, Shell::Posix, map, None))
+    }
+
+    #[test]
+    fn the_union_keeps_a_tool_only_the_target_lists() {
+        let target =
+            parsed("version: 1\ntests:\n  tools:\n    cargo: { allow: [fmt] }\n    pytest: {}\n");
+        let worktree = parsed("version: 1\ntests:\n  tools: {}\n");
+        let union = detection_union(&target, &worktree);
+
+        assert_eq!(hit_in(&union, "cargo test"), tool("cargo"));
+        assert_eq!(hit_in(&union, "cargo fmt"), None);
+        assert_eq!(hit_in(&union, "pytest -q"), tool("pytest"));
+    }
+
+    #[test]
+    fn the_union_allow_is_the_intersection_whatever_the_case() {
+        let target =
+            parsed("version: 1\ntests:\n  tools:\n    cargo: { allow: [fmt] }\n    rustc: {}\n");
+        let worktree = parsed(
+            "version: 1\ntests:\n  tools:\n    Cargo: { allow: [fmt, test] }\n    rustc: { allow: [build] }\n",
+        );
+        let union = detection_union(&target, &worktree);
+
+        assert_eq!(hit_in(&union, "cargo test"), tool("cargo"));
+        assert_eq!(hit_in(&union, "cargo fmt"), None);
+        assert_eq!(hit_in(&union, "rustc build"), tool("rustc"));
+    }
+
+    #[test]
+    fn the_union_detects_entrypoints_wrappers_and_groups_of_both() {
+        let target = parsed(
+            "version: 1\ntests:\n  groups:\n    core:\n      paths: [core/]\n      command: bash scripts/gates.sh core\n  gate_entrypoints: [scripts/gates.sh]\n  tools:\n    cargo: {}\n",
+        );
+        let worktree = parsed(
+            "version: 1\ntests:\n  groups:\n    core:\n      paths: [core/]\n      command: make core\n  gate_entrypoints: [scripts/other.sh]\n  wrappers: [mywrap]\n",
+        );
+        let union = detection_union(&target, &worktree);
+
+        assert!(hit_in(&union, "bash scripts/gates.sh core").is_some());
+        assert_eq!(
+            hit_in(&union, "bash scripts/other.sh"),
+            Some(("entrypoint", "scripts/other.sh".to_string()))
+        );
+        assert_eq!(hit_in(&union, "mywrap cargo build"), tool("cargo"));
+        assert_eq!(
+            hit_in(&union, "make core"),
+            Some(("group_command", "worktree:core".to_string()))
+        );
     }
 }
