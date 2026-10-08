@@ -142,7 +142,10 @@ func looseUpdate(text string) telegram.Update {
 }
 
 func TestALooseMessageWithARequestOpenIsHintedOnceAndStillReachesTheAssistant(t *testing.T) {
-	bot, dc, tr := &recordingBot{}, &recordingDaemon{openCaptures: []int64{29, 31}}, NewTracker()
+	// The send is refused so no turn starts: a turn polls this fake from its own goroutine, and the
+	// test only needs to know the message was handed to the assistant.
+	bot, tr := &recordingBot{}, NewTracker()
+	dc := &recordingDaemon{openCaptures: []int64{29, 31}, sendAssistantErr: errors.New("busy")}
 	cfg := config.Config{AllowedChatID: 42}
 	HandleUpdate(bot, dc, fakeDownloader{}, cfg, tr, looseUpdate("the VPN was down"))
 	HandleUpdate(bot, dc, fakeDownloader{}, cfg, tr, looseUpdate("and another thing"))
@@ -172,9 +175,9 @@ func TestNoHintWithoutAnOpenRequestForACommandOrWhenTheListingFails(t *testing.T
 		dc   *recordingDaemon
 		text string
 	}{
-		"nothing open":    {&recordingDaemon{}, "hello"},
+		"nothing open":    {&recordingDaemon{sendAssistantErr: errors.New("busy")}, "hello"},
 		"command":         {&recordingDaemon{openCaptures: []int64{29}}, "/help"},
-		"listing failure": {&recordingDaemon{openCaptures: []int64{29}, openCapturesErr: errors.New("down")}, "hello"},
+		"listing failure": {&recordingDaemon{openCaptures: []int64{29}, openCapturesErr: errors.New("down"), sendAssistantErr: errors.New("busy")}, "hello"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			bot := &recordingBot{}
