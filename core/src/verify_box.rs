@@ -57,9 +57,92 @@ impl Liveness {
 /// The process-wide registry the route records into.
 static LIVE: LazyLock<Mutex<Liveness>> = LazyLock::new(|| Mutex::new(Liveness::default()));
 
-/// Whether a box beat for this worktree (canonical path) recently enough. Read by the hook
-/// filter in F2c-3.
-#[allow(dead_code)] // F2c-3 gives this its first caller; nothing launches the box before then.
+/// The machine file (under the machine config root) the interactive hook reads to point an IDE
+/// session at the verify box. Must equal `HINTS_FILE` in `core/hooks/ask_daemon.py`.
+pub const HINTS_FILE: &str = "ide-verify-hints.json";
+
+/// Serialises read-modify-write of the hints file between concurrent beats.
+static HINTS_LOCK: Mutex<()> = Mutex::new(());
+
+/// The hints-file key of a canonical worktree path: no verbatim `\\?\` prefix, `/` separators,
+/// no trailing `/`.
+pub(crate) fn hint_key(canonical: &str) -> String {
+    let plain = canonical.strip_prefix(r"\\?\").unwrap_or(canonical);
+    plain.replace('\\', "/").trim_end_matches('/').to_owned()
+}
+
+/// One worktree's hint: the project, when it stops counting, the worktree map's gated tools (with
+/// their allowed subcommands) and its gate entrypoints.
+fn hint_entry(
+    project: &str,
+    map: &crate::tests_map::TestsMap,
+    expires_at: u64,
+) -> serde_json::Value {
+    let tools: serde_json::Map<String, serde_json::Value> = map
+        .tests
+        .tools
+        .iter()
+        .map(|(name, tool)| (name.clone(), serde_json::json!(tool.allow)))
+        .collect();
+    serde_json::json!({
+        "project": project,
+        "expires_at": expires_at,
+        "tools": tools,
+        "entrypoints": map.tests.gate_entrypoints,
+    })
+}
+
+/// Sets (`Some`) or drops (`None`) the entry for `key` in `dir`/`HINTS_FILE`, pruning every entry
+/// that expired at or before `now_unix`. The file is replaced through a temp file and a rename and
+/// deleted when no entry is left; a malformed file is replaced.
+pub(crate) fn write_hint(
+    dir: &std::path::Path,
+    key: &str,
+    entry: Option<serde_json::Value>,
+    now_unix: u64,
+) -> std::io::Result<()> {
+    let _guard = HINTS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = dir.join(HINTS_FILE);
+    let mut worktrees: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|file| match file.get("worktrees") {
+            Some(serde_json::Value::Object(found)) => Some(found.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    worktrees.retain(|_, value| {
+        value
+            .get("expires_at")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|at| at > now_unix)
+    });
+    match entry {
+        Some(entry) => {
+            worktrees.insert(key.to_owned(), entry);
+        }
+        None => {
+            worktrees.remove(key);
+        }
+    }
+    if worktrees.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    }
+    std::fs::create_dir_all(dir)?;
+    let body = serde_json::json!({ "version": 1, "worktrees": worktrees });
+    let tmp = dir.join(format!("{HINTS_FILE}.tmp"));
+    std::fs::write(&tmp, body.to_string())?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Whether a box beat for this worktree (canonical path) recently enough. The hook reads the
+/// hints file instead (it cannot reach this process), so this has no caller yet.
+#[allow(dead_code)] // The hook decides from the hints file, not from this registry.
 pub(crate) fn is_live(key: &str) -> bool {
     LIVE.lock()
         .map(|live| live.is_live(key, Instant::now()))
@@ -87,6 +170,7 @@ pub(crate) enum BeatError {
 pub(crate) async fn record_beat(
     pool: &sqlx::SqlitePool,
     registry: &Mutex<Liveness>,
+    hints: Option<&std::path::Path>,
     worktree: &str,
     now: Instant,
 ) -> Result<BeatAnswer, BeatError> {
@@ -117,7 +201,29 @@ pub(crate) async fn record_beat(
     registry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .beat(key, project, now);
+        .beat(key.clone(), project.clone(), now);
+    if let Some(dir) = hints {
+        let unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let dir = dir.to_path_buf();
+        let hint_key = hint_key(&key);
+        let written = tokio::task::spawn_blocking(move || {
+            let entry = match crate::tests_map::load(&root) {
+                crate::tests_map::MapState::Valid(map) => {
+                    Some(hint_entry(&project, &map, unix_now + LIVE_FOR.as_secs()))
+                }
+                _ => None,
+            };
+            write_hint(&dir, &hint_key, entry, unix_now)
+        })
+        .await;
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "could not write the IDE verify hint"),
+            Err(error) => tracing::warn!(%error, "the IDE verify hint task failed"),
+        }
+    }
     Ok(BeatAnswer {
         live_for_secs: LIVE_FOR.as_secs(),
         beat_every_secs: BEAT_EVERY.as_secs(),
@@ -143,7 +249,8 @@ pub async fn post_box_beat(
             "only the owner's key can keep a verify box alive".to_owned(),
         ));
     }
-    match record_beat(&state.pool, &LIVE, &args.worktree, Instant::now()).await {
+    let hints = state.machine_config_root.as_deref();
+    match record_beat(&state.pool, &LIVE, hints, &args.worktree, Instant::now()).await {
         Ok(answer) => Ok(Json(answer)),
         Err(BeatError::Off(message)) => Err((StatusCode::CONFLICT, message)),
         Err(BeatError::Refused(error)) => Err((error.status(), error.message().to_owned())),
@@ -247,7 +354,7 @@ mod tests {
         let registry = Mutex::new(Liveness::default());
         let now = Instant::now();
 
-        let answer = record_beat(&pool, &registry, &repo.path().to_string_lossy(), now).await;
+        let answer = record_beat(&pool, &registry, None, &repo.path().to_string_lossy(), now).await;
 
         assert!(
             matches!(answer, Err(BeatError::Off(_))),
@@ -270,7 +377,7 @@ mod tests {
         let registry = Mutex::new(Liveness::default());
         let now = Instant::now();
 
-        let answer = record_beat(&pool, &registry, &repo.path().to_string_lossy(), now).await;
+        let answer = record_beat(&pool, &registry, None, &repo.path().to_string_lossy(), now).await;
 
         let Ok(answer) = answer else {
             panic!("a beat for a registered worktree with the switch on was refused");
@@ -296,7 +403,7 @@ mod tests {
         let stranger = repo();
         let plain = tempfile::tempdir().unwrap();
         for path in [stranger.path(), plain.path()] {
-            let answer = record_beat(&pool, &registry, &path.to_string_lossy(), now).await;
+            let answer = record_beat(&pool, &registry, None, &path.to_string_lossy(), now).await;
             assert!(
                 matches!(answer, Err(BeatError::Refused(_))),
                 "{} is outside every project and must be refused",
@@ -310,5 +417,157 @@ mod tests {
             !registry.lock().unwrap().is_live(&key, now),
             "a refused beat must not make an unrelated worktree live"
         );
+    }
+
+    /// The map F2c-3 mirrors into the hints file: one gated tool with an allowed subcommand, one
+    /// bare tool, one gate entrypoint.
+    const HINT_MAP: &str = "version: 1\ntests:\n  groups:\n    core:\n      paths: [core/]\n      command: bash scripts/gates.sh core\n  gate_entrypoints: [scripts/gates.sh]\n  tools:\n    cargo: { allow: [fmt] }\n    tsc: {}\n";
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn read_hints(dir: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(dir.join(HINTS_FILE)).expect("the hints file exists");
+        serde_json::from_str(&text).expect("the hints file is JSON")
+    }
+
+    #[tokio::test]
+    async fn a_beat_with_the_switch_off_writes_no_hint() {
+        let repo = repo();
+        std::fs::write(repo.path().join("nucleos.tests.yaml"), HINT_MAP).unwrap();
+        let pool = pool_with(repo.path(), false).await;
+        let registry = Mutex::new(Liveness::default());
+        let hints = tempfile::tempdir().unwrap();
+
+        let answer = record_beat(
+            &pool,
+            &registry,
+            Some(hints.path()),
+            &repo.path().to_string_lossy(),
+            Instant::now(),
+        )
+        .await;
+
+        assert!(matches!(answer, Err(BeatError::Off(_))));
+        assert!(
+            !hints.path().join(HINTS_FILE).exists(),
+            "a switched-off project must leave no hint behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_beat_with_the_switch_on_writes_a_hint_for_its_worktree() {
+        let repo = repo();
+        std::fs::write(repo.path().join("nucleos.tests.yaml"), HINT_MAP).unwrap();
+        let pool = pool_with(repo.path(), true).await;
+        let registry = Mutex::new(Liveness::default());
+        let hints = tempfile::tempdir().unwrap();
+
+        let before = unix_now();
+        let answer = record_beat(
+            &pool,
+            &registry,
+            Some(hints.path()),
+            &repo.path().to_string_lossy(),
+            Instant::now(),
+        )
+        .await;
+        let after = unix_now();
+
+        assert!(answer.is_ok(), "the beat was refused");
+        assert_eq!(HINTS_FILE, "ide-verify-hints.json");
+        let file = read_hints(hints.path());
+        assert_eq!(file["version"], 1);
+        let key = hint_key(&key_of(repo.path()).await);
+        let entry = &file["worktrees"][key.as_str()];
+        assert_eq!(entry["project"], "alpha");
+        assert_eq!(entry["tools"]["cargo"], serde_json::json!(["fmt"]));
+        assert_eq!(entry["tools"]["tsc"], serde_json::json!([]));
+        assert_eq!(
+            entry["entrypoints"],
+            serde_json::json!(["scripts/gates.sh"])
+        );
+        let expires = entry["expires_at"]
+            .as_u64()
+            .expect("expires_at is a number");
+        assert!(
+            (before + LIVE_FOR.as_secs() - 1..=after + LIVE_FOR.as_secs() + 1).contains(&expires),
+            "expires_at {expires} is not the beat plus the live window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_beat_without_a_valid_map_drops_its_hint_and_prunes_expired_ones() {
+        let repo = repo();
+        let pool = pool_with(repo.path(), true).await;
+        let registry = Mutex::new(Liveness::default());
+        let hints = tempfile::tempdir().unwrap();
+        let key = hint_key(&key_of(repo.path()).await);
+        let now = unix_now();
+        let live = serde_json::json!({
+            "project": "beta", "expires_at": now + 1000, "tools": {}, "entrypoints": []
+        });
+        let stale = |at: u64| {
+            serde_json::json!({
+                "project": "alpha", "expires_at": at, "tools": {"cargo": []}, "entrypoints": []
+            })
+        };
+        let seed = serde_json::json!({
+            "version": 1,
+            "worktrees": { "/live/other": live, "/gone/expired": stale(1), key.as_str(): stale(now + 1000) }
+        });
+        std::fs::write(hints.path().join(HINTS_FILE), seed.to_string()).unwrap();
+
+        // No map in the worktree at all: its own entry goes, the expired one is pruned, the
+        // foreign live one stays.
+        let answer = record_beat(
+            &pool,
+            &registry,
+            Some(hints.path()),
+            &repo.path().to_string_lossy(),
+            Instant::now(),
+        )
+        .await;
+        assert!(answer.is_ok(), "a missing map must not fail the beat");
+        let file = read_hints(hints.path());
+        let worktrees = file["worktrees"].as_object().unwrap();
+        assert!(!worktrees.contains_key(key.as_str()), "{file}");
+        assert!(!worktrees.contains_key("/gone/expired"), "{file}");
+        assert!(worktrees.contains_key("/live/other"), "{file}");
+
+        // An invalid map drops the entry the same way, and an empty file is deleted.
+        std::fs::write(
+            repo.path().join("nucleos.tests.yaml"),
+            "version: [not a map",
+        )
+        .unwrap();
+        let alone =
+            serde_json::json!({ "version": 1, "worktrees": { key.as_str(): stale(now + 1000) } });
+        std::fs::write(hints.path().join(HINTS_FILE), alone.to_string()).unwrap();
+        let answer = record_beat(
+            &pool,
+            &registry,
+            Some(hints.path()),
+            &repo.path().to_string_lossy(),
+            Instant::now(),
+        )
+        .await;
+        assert!(answer.is_ok());
+        assert!(
+            !hints.path().join(HINTS_FILE).exists(),
+            "a hints file with no entry left must be deleted"
+        );
+    }
+
+    #[test]
+    fn hint_key_is_a_plain_forward_slash_path() {
+        assert_eq!(hint_key(r"\\?\C:\Users\x\repo"), "C:/Users/x/repo");
+        assert_eq!(hint_key(r"C:\w\r\"), "C:/w/r");
+        assert_eq!(hint_key("/tmp/a/b/"), "/tmp/a/b");
+        assert_eq!(hint_key("/tmp/a/b"), "/tmp/a/b");
     }
 }

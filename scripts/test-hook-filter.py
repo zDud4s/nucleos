@@ -746,6 +746,235 @@ def interactive_follow_up_cases():
     return cases
 
 
+HINT_TEXT = (
+    "this project verifies through the daemon: call mcp__nucleos__verify to run this "
+    "worktree's build, test and gate commands in its queue and cache, and wait on it with "
+    "mcp__nucleos__verify_status. Nothing was refused; this command runs as written."
+)
+HINTS_ENV = "NUCLEOS_VERIFY_HINTS_FILE"
+
+
+def _hint_entry(expires_at):
+    return {
+        "project": "alpha",
+        "expires_at": expires_at,
+        "tools": {"cargo": ["fmt"], "tsc": []},
+        "entrypoints": ["scripts/gates.sh"],
+    }
+
+
+def _write_hints(path, worktrees):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"version": 1, "worktrees": worktrees}, handle)
+
+
+def _bash(command, cwd="/work/repo", session="hint"):
+    return {
+        "session_id": session,
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "cwd": cwd,
+    }
+
+
+def _run_hinted(tmp, hints_path, payload, urlopen=None):
+    """`_run_interactive` with the hints file pointed at `hints_path`."""
+    if urlopen is None:
+        def urlopen(_request, timeout=None):
+            raise AssertionError("no daemon call is expected here")
+    with mock.patch.dict(os.environ, {HINTS_ENV: hints_path}):
+        return _run_interactive(tmp, payload, urlopen)
+
+
+def _context_of(printed):
+    """The additionalContext printed, or None; fails loudly on anything but context alone."""
+    if not printed.strip():
+        return None
+    out = json.loads(printed)
+    special = out["hookSpecificOutput"]
+    if set(out) != {"hookSpecificOutput"} or "permissionDecision" in special:
+        raise AssertionError(f"not a context-only answer: {printed!r}")
+    return special["additionalContext"]
+
+
+def _guarded(label, thunk):
+    """One case: `thunk` returns a failure string; an exception is a failure, not a crash."""
+    try:
+        return (label, thunk())
+    except Exception as exc:  # noqa: BLE001 - the message names what broke
+        return (label, f"{type(exc).__name__}: {exc}")
+
+
+def verify_hint_cases():
+    """The interactive hook's local verify hint (F2c-3): only ever adds context, OFF is untouched."""
+    import time as clock
+
+    cases = []
+
+    def identical():
+        failures = []
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "absent.json")
+            read = {"session_id": "hint", "tool_name": "Read", "tool_input": {}, "cwd": "/work/repo"}
+            payloads = [
+                (_bash("cargo test"), False),
+                (dict(_bash("npm test"), tool_name="PowerShell"), False),
+                (read, False),
+                (_bash("ls"), False),
+                (read, True),  # with a settled pending id to tell
+            ]
+            for payload, settled in payloads:
+                outputs = []
+                for patched in (False, True):
+                    urlopen = None
+                    if settled:
+                        _seed(tmp, "hint", [11])
+                        urlopen, _calls = _tickets(
+                            {11: {"id": 11, "status": "failed", "failure_reason": "boom"}}
+                        )
+                    if patched:
+                        # Reference output: the pre-change path, the hint switched off outright.
+                        with mock.patch.object(hook, "verify_hint", return_value=""):
+                            outputs.append(_run_hinted(tmp, missing, payload, urlopen))
+                    else:
+                        outputs.append(_run_hinted(tmp, missing, payload, urlopen))
+                if outputs[0] != outputs[1]:
+                    failures.append(f"{payload['tool_name']} settled={settled}: {outputs!r}")
+        return "; ".join(failures)
+
+    cases.append(_guarded("with no live hint the interactive output is byte-identical", identical))
+
+    def adds_nothing():
+        now = int(clock.time())
+        failures = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hints.json")
+            payload = _bash("cargo test")
+            # The same payload gets its hint from a live entry, so silence below means something.
+            _write_hints(path, {"/work/repo": _hint_entry(now + 60)})
+            _code, printed = _run_hinted(tmp, path, payload)
+            if _context_of(printed) != HINT_TEXT:
+                failures.append(f"control got {printed!r}")
+            variants = {
+                "expired": {"/work/repo": _hint_entry(now - 5)},
+                "expiring now": {"/work/repo": _hint_entry(now)},
+                "foreign worktree": {"/work/other": _hint_entry(now + 60)},
+                "sibling prefix": {"/work/rep": _hint_entry(now + 60)},
+                "entry not an object": {"/work/repo": "x"},
+            }
+            for label, worktrees in variants.items():
+                _write_hints(path, worktrees)
+                _code, printed = _run_hinted(tmp, path, payload)
+                if printed.strip():
+                    failures.append(f"{label}: {printed!r}")
+            bodies = {
+                "malformed": "{not json",
+                "list": "[]",
+                "worktrees list": '{"version":1,"worktrees":[]}',
+                "empty": "",
+            }
+            for label, body in bodies.items():
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(body)
+                code, printed = _run_hinted(tmp, path, payload)
+                if printed.strip() or code not in (0, None):
+                    failures.append(f"{label}: {code!r} {printed!r}")
+        return "; ".join(failures)
+
+    cases.append(_guarded("an expired, foreign or malformed hint adds nothing", adds_nothing))
+
+    def adds_context():
+        now = int(clock.time())
+        failures = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hints.json")
+            _write_hints(path, {"/work/repo": _hint_entry(now + 60)})
+            hits = [
+                _bash("cargo test"),
+                _bash("cargo test", cwd="/work/repo/core"),
+                _bash("cargo +nightly test --workspace"),
+                _bash("cargo --manifest-path core/Cargo.toml test"),
+                _bash("cargo.exe test"),
+                _bash("/usr/bin/cargo build"),
+                _bash("tsc -b"),
+                _bash("bash scripts/gates.sh core"),
+                _bash("./scripts/gates.sh core"),
+                dict(_bash("cargo test"), tool_name="PowerShell"),
+            ]
+            for payload in hits:
+                code, printed = _run_hinted(tmp, path, payload)
+                text = _context_of(printed)
+                if code not in (0, None) or text != HINT_TEXT:
+                    failures.append(f"{payload['tool_input']['command']!r}: {code!r} {printed!r}")
+            # A Windows cwd (backslashes) matches a forward-slash key, from a subdirectory too.
+            _write_hints(path, {"C:/work/repo": _hint_entry(now + 60)})
+            win = _bash("cargo test", cwd="C:\\work\\repo\\core")
+            _code, printed = _run_hinted(tmp, path, win)
+            if _context_of(printed) != HINT_TEXT:
+                failures.append(f"windows cwd: {printed!r}")
+            _write_hints(path, {"/work/repo": _hint_entry(now + 60)})
+            read_it = {
+                "session_id": "hint",
+                "tool_name": "Read",
+                "tool_input": {"command": "cargo test"},
+                "cwd": "/work/repo",
+            }
+            not_text = {
+                "session_id": "hint",
+                "tool_name": "Bash",
+                "tool_input": {"command": 5},
+                "cwd": "/work/repo",
+            }
+            misses = [
+                _bash("cargo fmt"),  # an allowed subcommand
+                _bash("cargo --version"),  # no subcommand
+                _bash("cargo"),
+                _bash("ls -la"),
+                _bash("git status"),
+                _bash("cargo test", cwd="/elsewhere"),
+                read_it,
+                not_text,
+            ]
+            for payload in misses:
+                code, printed = _run_hinted(tmp, path, payload)
+                if printed.strip() or code not in (0, None):
+                    failures.append(f"miss {payload['tool_input']!r}: {code!r} {printed!r}")
+        return "; ".join(failures)
+
+    cases.append(_guarded("a live hint adds context and never a decision", adds_context))
+
+    def after_notice():
+        now = int(clock.time())
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hints.json")
+            _write_hints(path, {"/work/repo": _hint_entry(now + 60)})
+            _seed(tmp, "hint", [11])
+            urlopen, _calls = _tickets({11: {"id": 11, "status": "failed", "failure_reason": "boom"}})
+            code, printed = _run_hinted(tmp, path, _bash("cargo test"), urlopen)
+            text = _context_of(printed)
+            joined = "\n\n" + HINT_TEXT
+            good = (
+                code in (0, None)
+                and text is not None
+                and "#11" in text
+                and text.endswith(joined)
+                and text.index("#11") < text.rindex(joined)
+            )
+            return _verdict(good, f"{code!r} {printed!r}")
+
+    cases.append(_guarded("the hint follows the settled notice", after_notice))
+
+    def same_file_name():
+        with open(os.path.join(ROOT, "core", "src", "verify_box.rs"), encoding="utf-8") as handle:
+            source = handle.read()
+        found = re.search(r'HINTS_FILE:\s*&str\s*=\s*"(.*?)"', source)
+        rust = found.group(1) if found else None
+        return _verdict(rust == hook.HINTS_FILE, f"{rust!r} vs {hook.HINTS_FILE!r}")
+
+    cases.append(_guarded("HINTS_FILE equals verify_box.rs HINTS_FILE", same_file_name))
+    return cases
+
+
 def main() -> int:
     failures = 0
     for command, want in CASES:
@@ -780,6 +1009,7 @@ def main() -> int:
         + control_token_cases()
         + pending_follow_up_cases()
         + interactive_follow_up_cases()
+        + verify_hint_cases()
         + one_source_cases()
     ):
         total += 1
