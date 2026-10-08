@@ -683,19 +683,17 @@ tests:
     }
 
     #[test]
-    fn the_union_of_disjoint_allows_detects_neither_flags_nor_a_bare_call() {
+    fn the_union_of_disjoint_allows_exempts_nothing_but_still_skips_flags_and_a_bare_call() {
         let target = parsed("version: 1\ntests:\n  tools:\n    cargo: { allow: [fmt] }\n");
         let worktree = parsed("version: 1\ntests:\n  tools:\n    cargo: { allow: [clippy] }\n");
         let union = detection_union(&target, &worktree);
 
-        // The intersection is empty, and an empty `allow` must not read as "everything is a hit".
-        for command in [
-            "cargo fmt",
-            "cargo clippy",
-            "cargo --version",
-            "cargo --help",
-            "cargo",
-        ] {
+        // The union intersects exemptions: no subcommand is exempt in both, so an empty `allow`
+        // means every subcommand call is a hit. A call with no subcommand (flags, bare) is not.
+        for command in ["cargo fmt", "cargo clippy"] {
+            assert_eq!(hit_in(&union, command), tool("cargo"), "{command}");
+        }
+        for command in ["cargo --version", "cargo --help", "cargo"] {
             assert_eq!(hit_in(&union, command), None, "{command}");
         }
     }
