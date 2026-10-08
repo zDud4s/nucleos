@@ -48,6 +48,7 @@ export function CaptureAnswerForm({ request }: { request: CaptureRequest }) {
         <ConfirmButton
           label="Dismiss"
           confirmLabel="Dismiss for good"
+          variant="quiet"
           onConfirm={() => dismiss.mutate({ jobId: request.job_id })}
           disabled={busy}
         />
