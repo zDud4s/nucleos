@@ -125,18 +125,34 @@ impl From<sqlx::Error> for WaitError {
 }
 
 /// Store the wait, refusing anything `wait_minutes` would not read back.
-pub async fn set_wait_minutes(pool: &SqlitePool, minutes: i64) -> Result<(), WaitError> {
+pub async fn set_wait_minutes(
+    pool: &SqlitePool,
+    minutes: i64,
+    now: DateTime<Utc>,
+) -> Result<(), WaitError> {
     if !(0..=MAX_WAIT_MINUTES).contains(&minutes) {
         return Err(WaitError::OutOfRange);
     }
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO schema_meta (key, value) VALUES (?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
     .bind(WAIT_SETTING_KEY)
     .bind(minutes.to_string())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    // A zero wait holds nothing, so a request still open would ask a question nobody waits on:
+    // close them as dismissed, the way the owner would have.
+    if minutes == 0 {
+        sqlx::query("UPDATE capture_requests SET state = ?, closed_at = ? WHERE state = ?")
+            .bind(STATE_DISMISSED)
+            .bind(stamp(now))
+            .bind(STATE_OPEN)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -874,7 +890,7 @@ mod tests {
         let pool = pool().await;
         for bad in [-1, MAX_WAIT_MINUTES + 1] {
             assert!(matches!(
-                set_wait_minutes(&pool, bad).await,
+                set_wait_minutes(&pool, bad, Utc::now()).await,
                 Err(WaitError::OutOfRange)
             ));
         }
@@ -886,9 +902,19 @@ mod tests {
                 .unwrap();
         assert_eq!(stored, None, "a refused value writes nothing");
         for good in [0, 45, MAX_WAIT_MINUTES] {
-            set_wait_minutes(&pool, good).await.unwrap();
+            set_wait_minutes(&pool, good, Utc::now()).await.unwrap();
             assert_eq!(wait_minutes(&pool).await, good);
         }
+    }
+
+    #[tokio::test]
+    async fn a_zero_wait_dismisses_the_open_requests() {
+        let pool = pool().await;
+        let now = opened(&pool, 7).await;
+        set_wait_minutes(&pool, 30, now).await.unwrap();
+        assert_eq!(request(&pool, 7).await.unwrap().0, STATE_OPEN);
+        set_wait_minutes(&pool, 0, now).await.unwrap();
+        assert_eq!(request(&pool, 7).await.unwrap().0, STATE_DISMISSED);
     }
 
     async fn opened(pool: &SqlitePool, job_id: i64) -> DateTime<Utc> {

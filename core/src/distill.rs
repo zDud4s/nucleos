@@ -1847,7 +1847,9 @@ mod tests {
     /// Capture requests off, so a failure row is claimed straight away. The hold tests turn the
     /// wait back on after seeding.
     async fn no_capture_wait(pool: &SqlitePool) {
-        crate::capture::set_wait_minutes(pool, 0).await.unwrap();
+        crate::capture::set_wait_minutes(pool, 0, chrono::Utc::now())
+            .await
+            .unwrap();
     }
 
     /// A queue row written by hand, so a test controls its status, attempts and `not_before`.
@@ -2247,7 +2249,9 @@ mod tests {
         let pool = test_pool().await;
         seed_job(&pool, 1, "alpha", 0).await;
         let row = seed_queue(&pool, "job_failed", 1, None, "pending", 0, None).await;
-        crate::capture::set_wait_minutes(&pool, wait).await.unwrap();
+        crate::capture::set_wait_minutes(&pool, wait, chrono::Utc::now())
+            .await
+            .unwrap();
         (pool, row)
     }
 
@@ -2275,7 +2279,9 @@ mod tests {
         let (pool, held) = waiting_pool(120).await;
         seed_job(&pool, 2, "beta", 0).await;
         let free = seed_queue(&pool, "job_landed", 2, None, "pending", 0, None).await;
-        crate::capture::set_wait_minutes(&pool, 120).await.unwrap();
+        crate::capture::set_wait_minutes(&pool, 120, chrono::Utc::now())
+            .await
+            .unwrap();
         let taken = claim_next(&pool, noon())
             .await
             .unwrap()
@@ -2324,7 +2330,9 @@ mod tests {
         let (pool, row) = waiting_pool(120).await;
         assert!(claim_next(&pool, noon()).await.unwrap().is_none());
         assert_eq!(request_state(&pool, 1).await.as_deref(), Some("open"));
-        crate::capture::set_wait_minutes(&pool, 0).await.unwrap();
+        crate::capture::set_wait_minutes(&pool, 0, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(
             claim_next(&pool, noon()).await.unwrap().map(|r| r.id),
             Some(row)
@@ -2336,7 +2344,9 @@ mod tests {
         let pool = test_pool().await;
         seed_job(&pool, 1, "alpha", 0).await;
         let row = seed_queue(&pool, "job_landed", 1, None, "pending", 0, None).await;
-        crate::capture::set_wait_minutes(&pool, 120).await.unwrap();
+        crate::capture::set_wait_minutes(&pool, 120, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(
             claim_next(&pool, noon()).await.unwrap().map(|r| r.id),
             Some(row)
@@ -2350,7 +2360,9 @@ mod tests {
         seed_job(&pool, 1, "alpha", 0).await;
         let due = (noon() + chrono::Duration::minutes(10)).to_rfc3339();
         let row = seed_queue(&pool, "job_failed", 1, None, "pending", 1, Some(&due)).await;
-        crate::capture::set_wait_minutes(&pool, 120).await.unwrap();
+        crate::capture::set_wait_minutes(&pool, 120, chrono::Utc::now())
+            .await
+            .unwrap();
         // The request opens and is dismissed; the row is released but not yet due.
         assert!(claim_next(&pool, noon()).await.unwrap().is_none());
         crate::capture::dismiss(&pool, 1, noon()).await.unwrap();

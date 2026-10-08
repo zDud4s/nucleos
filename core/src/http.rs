@@ -15938,7 +15938,7 @@ async fn post_capture_wait(
     Json(body): Json<CaptureWaitRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use crate::capture::WaitError;
-    match crate::capture::set_wait_minutes(&state.pool, body.minutes).await {
+    match crate::capture::set_wait_minutes(&state.pool, body.minutes, chrono::Utc::now()).await {
         Ok(()) => Ok(Json(serde_json::json!({ "minutes": body.minutes }))),
         Err(WaitError::OutOfRange) => Err((
             StatusCode::UNPROCESSABLE_ENTITY,
