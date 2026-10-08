@@ -38761,7 +38761,10 @@ mod tests {
     async fn the_capture_wait_round_trips_and_refuses_out_of_range() {
         let state = test_state().await;
         let (status, body) = call(state.clone(), "GET", "/config/capture-wait", None).await;
-        assert_eq!((status, body["minutes"].as_i64()), (StatusCode::OK, Some(120)));
+        assert_eq!(
+            (status, body["minutes"].as_i64()),
+            (StatusCode::OK, Some(120))
+        );
 
         let (status, body) = call(
             state.clone(),
@@ -38770,7 +38773,10 @@ mod tests {
             Some(serde_json::json!({ "minutes": 30 })),
         )
         .await;
-        assert_eq!((status, body["minutes"].as_i64()), (StatusCode::OK, Some(30)));
+        assert_eq!(
+            (status, body["minutes"].as_i64()),
+            (StatusCode::OK, Some(30))
+        );
         let (_, body) = call(state.clone(), "GET", "/config/capture-wait", None).await;
         assert_eq!(body["minutes"], 30);
 
