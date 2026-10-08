@@ -1104,6 +1104,58 @@ mod tests {
         assert_eq!(serde_json::to_value(&targets[0]).unwrap()["ref"], note_ref);
     }
 
+    /// `distill.rs` may name the notes module in exactly one place: the call that reads a project's
+    /// notes for the dossier (spec `2026-10-07-fronteira-prompts-design.md` section 5.2). Production
+    /// code only - the file is cut at its `#[cfg(test)] mod tests`, since its tests must create notes -
+    /// and `//` comment lines are skipped.
+    fn distill_mentions_are_sanctioned(source: &str) -> bool {
+        let needle = ["owner", "note"].join("_");
+        let call = format!("{needle}s::active_note_texts_for_project");
+        let mut calls = 0;
+        // Cut at the test module itself, not at any `#[cfg(test)]`: a test-only helper above it
+        // would otherwise hide the production code that follows from the sweep.
+        let lines: Vec<&str> = source.lines().collect();
+        let end = lines
+            .windows(2)
+            .position(|w| {
+                w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests")
+            })
+            .unwrap_or(lines.len());
+        for line in &lines[..end] {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let here = line.matches(call.as_str()).count();
+            if line.matches(needle.as_str()).count() != here {
+                return false;
+            }
+            calls += here;
+        }
+        calls == 1
+    }
+
+    #[test]
+    fn the_distill_rule_holds_one_call_and_nothing_else() {
+        let needle = ["owner", "note"].join("_");
+        let call = format!("let t = {needle}s::active_note_texts_for_project(&pool, p).await;");
+        assert!(distill_mentions_are_sanctioned(&call));
+        assert!(!distill_mentions_are_sanctioned(&format!("{call}\n{call}")));
+        assert!(!distill_mentions_are_sanctioned(&format!(
+            "use crate::{needle}s;\n{call}"
+        )));
+        assert!(!distill_mentions_are_sanctioned("fn nothing() {}"));
+        assert!(distill_mentions_are_sanctioned(&format!(
+            "{call}\n// mentions {needle}s"
+        )));
+        assert!(distill_mentions_are_sanctioned(&format!(
+            "{call}\n#[cfg(test)]\nmod tests {{\n{needle}s::create(&pool, \"x\", \"y\");\n}}"
+        )));
+        // A test-only helper above production code does not end the sweep.
+        assert!(!distill_mentions_are_sanctioned(&format!(
+            "#[cfg(test)]\nfn helper() {{}}\n{call}\nuse crate::{needle}s;"
+        )));
+    }
+
     #[test]
     fn no_core_module_but_four_mentions_owner_notes() {
         // Same guard as `redact.rs`: refuse to scan another checkout's sources.
@@ -1117,16 +1169,11 @@ mod tests {
             built_in.display(),
             running_in.display(),
         );
-        // `distill.rs` is the one sanctioned exception: D4 of `.ai/specs/2026-10-05-destilador-design.md`
-        // lets the distiller's dossier read the notes linked to a project, as context only.
+        // `distill.rs` is the one sanctioned exception, and only for its single call to
+        // `active_note_texts_for_project`: D4 of `.ai/specs/2026-10-05-destilador-design.md` lets the
+        // distiller's dossier read the notes linked to a project, as context only.
         // `lib.rs` only declares the module (`pub mod owner_notes;`) since the core lib/bin split.
-        let allowed = [
-            "owner_notes.rs",
-            "http.rs",
-            "main.rs",
-            "distill.rs",
-            "lib.rs",
-        ];
+        let allowed = ["owner_notes.rs", "http.rs", "main.rs", "lib.rs"];
         let needle = ["owner", "note"].join("_");
         let mut scanned = 0;
         // Recursive, over every source root: a module directory (`council/`, `judge/`) is as much
@@ -1139,11 +1186,19 @@ mod tests {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("source file must be readable");
+            if crate::source_scan::is_top_level(&path) && name == "distill.rs" {
+                assert!(
+                    distill_mentions_are_sanctioned(&source),
+                    "distill.rs may name the notes only in its one call to \
+                     active_note_texts_for_project (spec 2026-10-07 section 5.2)"
+                );
+                continue;
+            }
             assert!(
                 !source.contains(&needle),
                 "{} mentions `{needle}`: the owner's notes are reachable from owner_notes.rs, \
-                 http.rs, main.rs and distill.rs (spec D4) only, so that nothing in the \
-                 agent's memory can read them",
+                 http.rs and main.rs (spec D4), and from distill.rs through one call, only, so \
+                 that nothing in the agent's memory can read them",
                 path.display()
             );
         }

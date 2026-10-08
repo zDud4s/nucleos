@@ -1683,11 +1683,11 @@ pub async fn reconfirm_id_in(
 /// The note of an event that says a new learning resembles an older one without being it.
 pub(crate) const NOTE_NEAR_DUPLICATE: &str = "near_duplicate:";
 
-/// Say, in a same-status event, that `knowledge_id` is a near-duplicate of `of_id`.
-pub async fn note_near_duplicate_in(
+/// Write a same-status event on `knowledge_id` carrying `note`.
+async fn same_status_event_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     knowledge_id: i64,
-    of_id: i64,
+    note: String,
 ) -> sqlx::Result<()> {
     let status: String = sqlx::query_scalar("SELECT status FROM knowledge WHERE id = ?")
         .bind(knowledge_id)
@@ -1700,8 +1700,47 @@ pub async fn note_near_duplicate_in(
     .bind(knowledge_id)
     .bind(&status)
     .bind(&status)
-    .bind(format!("{NOTE_NEAR_DUPLICATE}{of_id}"))
+    .bind(note)
     .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Say, in a same-status event, that `knowledge_id` is a near-duplicate of `of_id`.
+pub async fn note_near_duplicate_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    knowledge_id: i64,
+    of_id: i64,
+) -> sqlx::Result<()> {
+    same_status_event_in(tx, knowledge_id, format!("{NOTE_NEAR_DUPLICATE}{of_id}")).await
+}
+
+/// The note of an event that says a distilled learning quoted the owner's text, so it was proposed
+/// rather than recorded (`.ai/specs/2026-10-07-fronteira-prompts-design.md` section 4.3).
+pub(crate) const NOTE_QUOTED_OWNER_TEXT: &str = "quoted_owner_text";
+
+/// Say, in a same-status event, that `knowledge_id` quoted the owner's text.
+pub async fn note_quoted_owner_text_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    knowledge_id: i64,
+) -> sqlx::Result<()> {
+    same_status_event_in(tx, knowledge_id, NOTE_QUOTED_OWNER_TEXT.to_owned()).await
+}
+
+/// Arm a proposed episode for the trial `record_distilled` gives a recorded one, without the
+/// confirmation that starts it: the expiry sweep needs `active` and a `last_confirmed_at`, so the
+/// row waits untouched, and `approve` starts the trial (spec section 4.4).
+pub async fn arm_trial_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    knowledge_id: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE knowledge SET expires_after_runs = ?
+          WHERE id = ? AND status = 'proposed' AND layer = 'episodic'",
+    )
+    .bind(DISTILLED_TRIAL_RUNS)
+    .bind(knowledge_id)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1823,6 +1862,18 @@ pub async fn approve(pool: &SqlitePool, proposal_id: i64) -> Result<i64, Decisio
     if activated.rows_affected() != 1 {
         return Err(DecisionError::NotPending);
     }
+
+    // An episode armed while it waited (`arm_trial_in`) starts its trial here: the owner's yes is
+    // the confirmation. Any other row keeps what it had.
+    sqlx::query(
+        "UPDATE knowledge SET last_confirmed_at = ?
+          WHERE id = ? AND expires_after_runs IS NOT NULL AND last_confirmed_at IS NULL",
+    )
+    .bind(&now)
+    .bind(knowledge_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| DecisionError::NotFound)?;
 
     sqlx::query(
         "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
@@ -3062,6 +3113,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((knowledge, proposals), (0, 0));
+    }
+
+    /// Propose an episodic distilled row through `propose_in_with`; returns (knowledge id, proposal id).
+    async fn propose_distilled_episode(pool: &sqlx::SqlitePool, title: &str) -> (i64, i64) {
+        let mut tx = pool.begin().await.unwrap();
+        let ids = propose_in_with(
+            &mut tx,
+            Declaration {
+                project_id: Some("alpha"),
+                origin_run_id: None,
+                kind: Kind::Memory,
+                title,
+                body: "b",
+                reasoning: "test",
+                supersedes: None,
+            },
+            &Provenance {
+                source: Some("distiller"),
+                distill_cause: Some("job_failed"),
+                evidence: None,
+                points_at: None,
+                fingerprint: None,
+                layer: Some(Layer::Episodic),
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        ids
+    }
+
+    async fn quoted_events(pool: &sqlx::SqlitePool, id: i64) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT from_status, to_status FROM knowledge_events
+              WHERE knowledge_id = ? AND note = 'quoted_owner_text'",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_quoted_owner_text_event_keeps_the_status() {
+        let pool = test_pool().await;
+        let (id, _) = propose_distilled_episode(&pool, "quoting").await;
+        let mut tx = pool.begin().await.unwrap();
+        note_quoted_owner_text_in(&mut tx, id).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            quoted_events(&pool, id).await,
+            vec![("proposed".to_owned(), "proposed".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quoted_owner_text_event_rolls_back_with_its_transaction() {
+        let pool = test_pool().await;
+        let (id, _) = propose_distilled_episode(&pool, "quoting").await;
+        let mut tx = pool.begin().await.unwrap();
+        note_quoted_owner_text_in(&mut tx, id).await.unwrap();
+        tx.rollback().await.unwrap();
+        assert!(quoted_events(&pool, id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn arming_a_proposed_episode_sets_the_trial_and_no_confirmation() {
+        let pool = test_pool().await;
+        let (id, _) = propose_distilled_episode(&pool, "armed").await;
+        let mut tx = pool.begin().await.unwrap();
+        arm_trial_in(&mut tx, id).await.unwrap();
+        tx.commit().await.unwrap();
+        let row = fetch(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.expires_after_runs, Some(DISTILLED_TRIAL_RUNS));
+        assert_eq!(row.last_confirmed_at, None);
+    }
+
+    #[tokio::test]
+    async fn approving_an_armed_episode_starts_its_trial() {
+        let pool = test_pool().await;
+        let (id, proposal) = propose_distilled_episode(&pool, "armed").await;
+        let mut tx = pool.begin().await.unwrap();
+        arm_trial_in(&mut tx, id).await.unwrap();
+        tx.commit().await.unwrap();
+        approve(&pool, proposal).await.unwrap();
+        let row = fetch(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.status, "active");
+        assert!(row.last_confirmed_at.is_some());
+        assert_eq!(row.expires_after_runs, Some(50));
+    }
+
+    #[tokio::test]
+    async fn approving_an_unarmed_row_leaves_its_confirmation_alone() {
+        let pool = test_pool().await;
+        let (id, proposal) = propose_distilled_episode(&pool, "unarmed").await;
+        approve(&pool, proposal).await.unwrap();
+        let row = fetch(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.last_confirmed_at, None);
+        assert_eq!(row.expires_after_runs, None);
     }
 
     fn distilled<'a>(title: &'a str, body: &'a str, kind: Kind) -> Declaration<'a> {
