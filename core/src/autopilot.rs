@@ -249,6 +249,21 @@ pub async fn ide_verify_enabled(pool: &SqlitePool, project_id: &str) -> sqlx::Re
     Ok(stored.is_some_and(|value| value != 0))
 }
 
+/// Writes the IDE verify switch of one project. `true` when a row matched, so an unknown project
+/// is told apart from a successful flip.
+pub async fn set_ide_verify(
+    pool: &SqlitePool,
+    project_id: &str,
+    enabled: bool,
+) -> sqlx::Result<bool> {
+    let done = sqlx::query("UPDATE autopilot_state SET ide_verify = ? WHERE project_id = ?")
+        .bind(i64::from(enabled))
+        .bind(project_id)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() == 1)
+}
+
 /// Spec A D2/D11: the project's judge setting, photographed onto its next runs. `observe` is an
 /// opt-in because it is a new policy of sending data off the machine: with a key in the keyring,
 /// observing by default would send every project's non-trivial input to TypeSafe unasked.
@@ -1645,6 +1660,31 @@ pub mod tests {
             .unwrap();
         assert!(ide_verify_enabled(&pool, "p").await.unwrap());
         assert!(!ide_verify_enabled(&pool, "nobody").await.unwrap());
+    }
+
+    /// `set_ide_verify` writes the switch of the named project only, and reports whether a row
+    /// matched, so an unknown project is `false` rather than a silent success.
+    #[tokio::test]
+    async fn set_ide_verify_flips_only_the_named_project() {
+        let pool = test_pool().await;
+        for id in ["p", "q"] {
+            sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES (?, 'active')")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert!(set_ide_verify(&pool, "p", true).await.unwrap());
+        assert!(ide_verify_enabled(&pool, "p").await.unwrap());
+        assert!(!ide_verify_enabled(&pool, "q").await.unwrap());
+
+        assert!(!set_ide_verify(&pool, "nobody", true).await.unwrap());
+        assert!(!ide_verify_enabled(&pool, "nobody").await.unwrap());
+
+        assert!(set_ide_verify(&pool, "p", false).await.unwrap());
+        assert!(!ide_verify_enabled(&pool, "p").await.unwrap());
+        assert!(!ide_verify_enabled(&pool, "q").await.unwrap());
     }
 
     /// The stand-in for `~/.nucleos` beside one test's project: inside the project's own temporary

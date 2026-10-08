@@ -242,6 +242,11 @@ pub fn build_router(state: AppState) -> Router {
         // that could name the decisions could name the ones whose answer it liked.
         .route("/projects/{id}/map/triage", post(post_project_map_triage))
         .route("/projects/{id}/wip-limit", post(post_project_wip_limit))
+        // Control/admin only: absent from the `auth.rs` scope tables; the handler re-checks the owner.
+        .route(
+            "/projects/{id}/ide-verify",
+            post(crate::verify_provision::post_project_ide_verify),
+        )
         // Two doors and not one PUT with a nullable field, because the three states are not a value
         // and its absence: naming nobody is a decision, and taking the row away is withdrawing one.
         // A single writer would have had to spell the difference as null-versus-missing, which is
