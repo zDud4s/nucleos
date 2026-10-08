@@ -176,6 +176,7 @@ pub mod verify_flaky;
 pub mod verify_guard;
 pub mod verify_observe;
 pub mod verify_plan;
+pub mod verify_postgate;
 pub mod verify_provision;
 pub mod verify_runs;
 pub use nucleos_base::verify_sched;

@@ -4461,6 +4461,36 @@ mod tests {
         );
     }
 
+    /// The post-merge gate's worktree is protected by name, like the integration one: no `Owner`
+    /// variant, no `worktrees` row. The `run-99` directory is the control, as above.
+    #[tokio::test]
+    async fn the_postgate_worktree_is_not_an_orphan() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let container = space_free_tempdir();
+        let project_root = container.path().join("repo");
+        let roots = container.path().join("worktrees");
+        let _env = WorktreeRootEnv::set(Some(roots.as_path()));
+
+        let postgate = crate::verify_postgate::postgate_worktree(&project_root);
+        std::fs::create_dir_all(&postgate).expect("create the postgate worktree directory");
+        std::fs::create_dir_all(roots.join("run-99")).expect("create the control directory");
+
+        let orphans = orphaned_worktrees(&pool, &project_root, Duration::ZERO)
+            .await
+            .expect("sweep");
+
+        assert!(
+            orphans.contains(&roots.join("run-99")),
+            "the control must be collected, or this test proves nothing"
+        );
+        assert!(
+            !orphans.contains(&postgate),
+            "the post-merge gate's worktree must never be swept"
+        );
+        assert_eq!(owner_from_dir_name("postgate-repo"), None);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn orphan_sweep_leaves_a_young_directory_alone() {
         let _lock = env_lock();
