@@ -2527,6 +2527,7 @@ impl crate::vcs::VcsExecutor for GitExecutor {
 /// `Failed` and never `Escalated` for a red gate. `Escalated` means a person now owns something the
 /// queue cannot resolve; a red suite is owned by whoever wrote the branch, and it is fixed where
 /// every other red suite is fixed — in their own worktree, on their own branch.
+#[allow(clippy::too_many_arguments)]
 async fn gate_the_merge(
     machine_root: Option<&Path>,
     pool: Option<&sqlx::SqlitePool>,
