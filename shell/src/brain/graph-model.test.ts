@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { Known } from "../data/knowledge";
 import type { NoteLink, NotesGraph, OwnerNote } from "../data/owner-notes";

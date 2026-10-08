@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { isAggregateTimeout, sidecarKeyOf, subsystemCounts, wantsAttention, type HealthReadout } from "./system";
 

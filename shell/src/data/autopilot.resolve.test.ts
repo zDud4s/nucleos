@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import {
   RESOLVE_MIN_AGREE_PERCENT,

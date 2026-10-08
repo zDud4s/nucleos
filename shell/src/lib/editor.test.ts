@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { STILL_IN_IT_MS, stillGoing } from "./editor";
 

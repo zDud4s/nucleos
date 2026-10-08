@@ -3,6 +3,9 @@ name = "nucleos-core"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+# `tests/module_map.rs` is compiled into the library's unit tests (see src/lib.rs). Any integration
+# test makes cargo build the binary as well, and the binary is the most expensive unit here.
+autotests = false
 
 # Library + binary in one package: `http.rs` and `main.rs` are the binary, everything else is the
 # library (see src/lib.rs). No doctests: prose in doc comments was never written to compile.

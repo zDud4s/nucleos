@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { GEdge, GModel, GNode } from "./graph-types";
 import { colorToken, neighbours, nodeRadius } from "./graph-util";

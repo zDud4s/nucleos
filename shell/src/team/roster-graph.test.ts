@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 
 import { LAYER_H, buildRoster, placeRoster } from "./roster-graph";
