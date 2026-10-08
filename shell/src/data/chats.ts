@@ -741,6 +741,9 @@ export const TRANSCRIPT_FULL_READ_MS = 15_000;
 /** When each conversation was last read in full, by chat id. */
 const lastFullRead = new Map<string, number>();
 
+/** Sent on the visible transcript poll so the daemon knows this conversation is open. */
+export const CHAT_OPEN_HEADER = "X-Nucleos-Chat-Open";
+
 /**
  * One conversation's transcript, oldest first.
  *
@@ -763,6 +766,9 @@ const lastFullRead = new Map<string, number>();
  * changed that the page knows about), when the incremental read says the
  * page fell too far behind, and every {@link TRANSCRIPT_FULL_READ_MS}, which
  * is what catches a settled turn changing under the page.
+ *
+ * Every read carries {@link CHAT_OPEN_HEADER}, which tells the daemon somebody is looking at this
+ * conversation so it keeps the conversation's process warm.
  */
 export function useChatTranscript(chatId: string | null) {
   const queryKey = keys.chats.detail(chatId ?? "");
@@ -776,12 +782,16 @@ export function useChatTranscript(chatId: string | null) {
       const invalidated = client.getQueryState(queryKey)?.isInvalidated ?? false;
       let incremental =
         watermark !== null && !invalidated && Date.now() - lastFull < TRANSCRIPT_FULL_READ_MS;
-      let read = await apiFetch<TranscriptRead>(incremental ? `${path}?after=${watermark}` : path);
+      const open = { headers: { [CHAT_OPEN_HEADER]: "1" } };
+      let read = await apiFetch<TranscriptRead>(
+        incremental ? `${path}?after=${watermark}` : path,
+        open,
+      );
       if (incremental && read.more) {
         // More turns past the watermark than one read returns: catching up piecewise would leave a
         // hole between the pieces, so this one is read in full.
         incremental = false;
-        read = await apiFetch<TranscriptRead>(path);
+        read = await apiFetch<TranscriptRead>(path, open);
       }
       if (!incremental) lastFullRead.set(chatId ?? "", Date.now());
       const fresh = read.turns.map(turnFromRow);

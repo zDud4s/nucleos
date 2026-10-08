@@ -61,6 +61,7 @@ import type {
   ModelChoice,
   Transcript,
 } from "../data/chats";
+import { CHAT_OPEN_HEADER } from "../data/chats";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
 import type { AssistantTurnRow, ToolCall } from "../lib/turns";
@@ -626,6 +627,32 @@ describe("Chats - refusals the composer meets", () => {
 });
 
 /* -------------------------------------------------------------- A4b: relays -- */
+
+describe("Chats - the open conversation tells the daemon it is open", () => {
+  // The daemon keeps an open chat's process alive past the idle reaper, and learns a chat is open
+  // only from this header on the visible transcript poll.
+  it("marks its transcript reads as coming from the open conversation", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    const transcripts: Record<string, AssistantTurnRow[]> = { "c-1": [turnRow({ id: 1 })] };
+    daemon.apiFetch.mockImplementation(chatsFetch([summary], transcripts));
+
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Transcript" });
+
+    const reads = daemon.apiFetch.mock.calls.filter(
+      (call: unknown[]) =>
+        typeof call[0] === "string" && /^\/assistant\/chats\/c-1(\?|$)/.test(call[0]),
+    );
+    expect(reads.length).toBeGreaterThan(0);
+    const marked = reads.some(
+      (call: unknown[]) =>
+        (call[1] as { headers?: Record<string, string> } | undefined)?.headers?.[
+          CHAT_OPEN_HEADER
+        ] === "1",
+    );
+    expect(marked).toBe(true);
+  });
+});
 
 describe("Chats - a turn another conversation handed over", () => {
   // The whole point of the column. A relayed turn drawn under "you" tells the person reading it

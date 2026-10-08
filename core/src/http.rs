@@ -11333,7 +11333,14 @@ async fn get_assistant_chat(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
     Query(query): Query<TranscriptQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<TranscriptOut>, StatusCode> {
+    // Only the visible transcript poll sends this header (`useChatTranscript`); voice reads and
+    // `?before=` pages do not, so a read that is not somebody looking at the chat never keeps its
+    // process alive.
+    if headers.get("x-nucleos-chat-open").is_some_and(|v| v == "1") {
+        crate::assistant::mark_open(&chat_id);
+    }
     // `?` on a missing bound reads as no bound: `i64::MAX` is above every id this table will ever
     // hold, so one query serves both the recent end and a page above it. Two queries differing by
     // a single clause is how the two come to disagree about ordering.
@@ -27649,6 +27656,38 @@ mod tests {
             .await
             .unwrap();
         chat_id
+    }
+
+    /// Only the visible view's transcript poll says the chat is open, by header; a read without it
+    /// (a voice read, an older page) leaves the chat unmarked.
+    #[tokio::test]
+    async fn a_transcript_read_by_the_visible_view_marks_the_chat_open() {
+        let state = test_state().await;
+        let a = seed_chat(&state, "open-a").await;
+        let b = seed_chat(&state, "open-b").await;
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{a}"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("x-nucleos-chat-open", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        get_json(&state, &format!("/assistant/chats/{b}")).await;
+
+        assert!(
+            crate::assistant::chat_is_open(&a),
+            "the header marks the chat open"
+        );
+        assert!(
+            !crate::assistant::chat_is_open(&b),
+            "a read without the header does not"
+        );
     }
 
     /// A conversation's tasks are read on the conversation's own route.

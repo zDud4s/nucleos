@@ -47,6 +47,30 @@ impl Drop for ChatSlot {
 static LIVE_CHATS: LazyLock<Mutex<HashMap<String, LiveChat>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// When a visible view last polled each chat's transcript: chat id to that instant. Runtime state
+/// beside `LIVE_CHATS`, for the same reason. It anchors the idle clock and spares open chats when
+/// the cap forces an eviction; entries older than `DEV_IDLE` are dropped by `reap_now`.
+static SEEN_CHATS: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Records that a visible view just read this chat's transcript.
+pub fn mark_open(chat_id: &str) {
+    SEEN_CHATS
+        .lock()
+        .unwrap()
+        .insert(chat_id.to_owned(), std::time::Instant::now());
+}
+
+/// Whether a visible view polled this chat within [`OPEN_WINDOW`].
+pub fn chat_is_open(chat_id: &str) -> bool {
+    let seen = SEEN_CHATS.lock().unwrap().get(chat_id).copied();
+    is_open(seen, std::time::Instant::now())
+}
+
+fn is_open(seen: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    seen.is_some_and(|s| now.saturating_duration_since(s) < OPEN_WINDOW)
+}
+
 /// The way into a conversation's process WHILE a turn is running in it: chat id to a clone of
 /// `LiveChat.messages`.
 ///
@@ -279,6 +303,10 @@ const DEV_IDLE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 const DEV_TURN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// At most this many conversation processes alive at once, kept or mid-turn (owner 2026-10-05).
 const LIVE_CAP: usize = 5;
+/// How long after a visible view's last poll a chat still counts as open: three times the shell's
+/// blurred cadence (`BLURRED_CADENCE`, `shell/src/app/pacing.ts`), since a visible but unfocused
+/// window polls about every 10 seconds.
+const OPEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 /// The cap `keep_live` enforces. Unbounded under test: `LIVE_CHATS` is one static shared by every
 /// test running in parallel, and a real cap there would evict other tests' processes. `make_room`
 /// is tested directly with `LIVE_CAP`.
@@ -677,13 +705,21 @@ fn take_live(chat_id: &str) -> Option<LiveChat> {
 
 /// Puts a process back, having just finished a turn, for the next one to find.
 fn keep_live(chat_id: &str, mut live: LiveChat, idle_for: std::time::Duration) {
-    live.idle_since = std::time::Instant::now();
+    let now = std::time::Instant::now();
+    live.idle_since = now;
     live.idle_for = idle_for;
+    let open: HashSet<String> = SEEN_CHATS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, at)| is_open(Some(**at), now))
+        .map(|(id, _)| id.clone())
+        .collect();
     let evicted = {
         let mut kept = LIVE_CHATS.lock().unwrap();
         kept.insert(chat_id.to_owned(), live);
         let alive = LIVE_PROCESSES.load(std::sync::atomic::Ordering::SeqCst);
-        make_room(&mut kept, alive, chat_id, ENFORCED_CAP)
+        make_room(&mut kept, alive, chat_id, ENFORCED_CAP, &open)
     };
     // Dropped outside the lock; dropping is what stops them.
     drop(evicted);
@@ -733,16 +769,17 @@ fn idle_after_spontaneous(
     current.max(idle_for_turn(stdout, lasted))
 }
 
-/// Takes processes out of `kept` until `alive` fits under `cap`, least recently used first, and
-/// returns them for the caller to drop. Never one with a background task, nor one whose `carried`
-/// still holds an answer no turn has claimed yet (evicting it would lose that answer). The one being
-/// kept goes only when nothing else can (spec 4.2 item 3: when every other is busy, the new one is
-/// not kept).
+/// Takes processes out of `kept` until `alive` fits under `cap`, chats nobody has open first and
+/// least recently used within each group, and returns them for the caller to drop. Never one with a
+/// background task, nor one whose `carried` still holds an answer no turn has claimed yet (evicting
+/// it would lose that answer). The one being kept goes only when nothing else can (spec 4.2 item 3:
+/// when every other is busy, the new one is not kept).
 fn make_room(
     kept: &mut HashMap<String, LiveChat>,
     alive: usize,
     keeping: &str,
     cap: usize,
+    open: &HashSet<String>,
 ) -> Vec<LiveChat> {
     let mut evicted = Vec::new();
     let mut excess = alive.saturating_sub(cap);
@@ -752,7 +789,7 @@ fn make_room(
             .filter(|(id, live)| {
                 id.as_str() != keeping && live.background.is_empty() && live.carried.is_empty()
             })
-            .min_by_key(|(_, live)| live.idle_since)
+            .min_by_key(|(id, live)| (open.contains(id.as_str()), live.idle_since))
             .map(|(id, _)| id.clone());
         let victim = match oldest {
             Some(id) => id,
@@ -809,19 +846,39 @@ fn reap_idle_live_chats() {
 /// Its own function, called by the ticker, so the rule can be asserted without waiting fifteen
 /// seconds for a task to decide to run.
 fn reap_now() {
+    let now = std::time::Instant::now();
+    // A poll older than the longest idle window can no longer move any anchor, so it is forgotten.
+    let seen = {
+        let mut seen = SEEN_CHATS.lock().unwrap();
+        seen.retain(|_, at| now.saturating_duration_since(*at) < DEV_IDLE);
+        seen.clone()
+    };
     // `retain` drops what it removes, and dropping is what stops the process.
-    LIVE_CHATS.lock().unwrap().retain(|_, live| {
-        // A closed stdin is the runner's future having ended — it owns the far end — so the process
-        // behind this handle is already gone. Kept entries like that are not merely useless: the
-        // next turn survives finding one, because writing to it fails and it starts a process
-        // instead, but on a conversation nobody returns to it sits there for good.
-        let still_standing = !live.messages.is_closed();
-        // A background task that has started and not reported its end is work the process is still
-        // doing for the conversation (spec 4.2 item 2; spike 2026-10-05 (c): the CLI answers on its
-        // own when it ends), so such a process is kept however long it has been idle.
-        // The idle time is the chat's own, derived from its last turn.
-        still_standing && (!live.background.is_empty() || live.idle_since.elapsed() < live.idle_for)
-    });
+    LIVE_CHATS
+        .lock()
+        .unwrap()
+        .retain(|id, live| worth_keeping(live, seen.get(id).copied(), now));
+}
+
+/// Whether a kept process is still worth its memory at `now`, given when its chat was last polled.
+fn worth_keeping(
+    live: &LiveChat,
+    seen: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    // A closed stdin is the runner's future having ended — it owns the far end — so the process
+    // behind this handle is already gone. Kept entries like that are not merely useless: the
+    // next turn survives finding one, because writing to it fails and it starts a process
+    // instead, but on a conversation nobody returns to it sits there for good.
+    let still_standing = !live.messages.is_closed();
+    // A background task that has started and not reported its end is work the process is still
+    // doing for the conversation (spec 4.2 item 2; spike 2026-10-05 (c): the CLI answers on its
+    // own when it ends), so such a process is kept however long it has been idle.
+    // The idle time is the chat's own, derived from its last turn, and it counts from the later of
+    // that turn's end and the last time the chat was polled by a visible view.
+    let anchor = seen.map_or(live.idle_since, |s| s.max(live.idle_since));
+    still_standing
+        && (!live.background.is_empty() || now.saturating_duration_since(anchor) < live.idle_for)
 }
 
 /// Serves one turn: down the conversation's living process when it has one, by starting one when it
@@ -7595,7 +7652,7 @@ mod tests {
     async fn idle_lru_keeping_a_sixth_process_evicts_the_least_recently_used_idle_one() {
         let (mut kept, _held) = idle_lru_six();
 
-        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP);
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP, &HashSet::new());
 
         assert_eq!(evicted.len(), 1);
         assert!(!kept.contains_key("c0"), "the oldest idle one goes");
@@ -7611,7 +7668,7 @@ mod tests {
             .background
             .insert("bg".to_owned());
 
-        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP);
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP, &HashSet::new());
 
         assert_eq!(evicted.len(), 1);
         assert!(kept.contains_key("c0"), "busy: left alone however old");
@@ -7649,7 +7706,7 @@ mod tests {
             .carried
             .push_back(crate::runner::TurnEvent::Line("an answer".to_owned()));
 
-        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP);
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP, &HashSet::new());
 
         assert_eq!(evicted.len(), 1);
         assert!(kept.contains_key("c0"), "its answer is not yet claimed");
@@ -7669,7 +7726,7 @@ mod tests {
             held.push((said, events, why));
         }
 
-        let evicted = make_room(&mut kept, 6, "new", LIVE_CAP);
+        let evicted = make_room(&mut kept, 6, "new", LIVE_CAP, &HashSet::new());
 
         assert_eq!(evicted.len(), 1);
         assert!(!kept.contains_key("new"), "the one being kept is dropped");
@@ -7683,10 +7740,127 @@ mod tests {
         kept.insert("new".to_owned(), live);
         held.push((said, events, why));
 
-        let evicted = make_room(&mut kept, 6, "new", LIVE_CAP);
+        let evicted = make_room(&mut kept, 6, "new", LIVE_CAP, &HashSet::new());
 
         assert!(evicted.is_empty());
         assert_eq!(kept.len(), 5);
+    }
+
+    /// A chat whose transcript the visible view polled a moment ago is open on someone's screen:
+    /// its idle process is not reaped, however long the process itself has been quiet.
+    #[tokio::test]
+    async fn open_chat_a_chat_polled_recently_is_not_reaped() {
+        let (mut live, _said, _events, _why) = live_chat_for_testing();
+        live.idle_since = std::time::Instant::now()
+            .checked_sub(LIVE_IDLE * 2)
+            .expect("a machine that has been up three minutes");
+        let chat = a_chat("open-polled");
+        LIVE_CHATS.lock().unwrap().insert(chat.clone(), live);
+        mark_open(&chat);
+
+        reap_now();
+        let kept = LIVE_CHATS.lock().unwrap().contains_key(&chat);
+
+        LIVE_CHATS.lock().unwrap().remove(&chat);
+        SEEN_CHATS.lock().unwrap().remove(&chat);
+        assert!(kept, "an open chat's process was reaped");
+    }
+
+    /// The idle clock restarts at the last poll: a poll inside the idle window keeps the process,
+    /// one just past it does not.
+    #[tokio::test]
+    async fn open_chat_the_idle_clock_counts_from_the_last_poll() {
+        let now = std::time::Instant::now();
+        let long_ago = now
+            .checked_sub(LIVE_IDLE * 2)
+            .expect("a machine that has been up three minutes");
+
+        let (mut fresh, _said, _events, _why) = live_chat_for_testing();
+        fresh.idle_since = long_ago;
+        let (mut stale, _said2, _events2, _why2) = live_chat_for_testing();
+        stale.idle_since = long_ago;
+        let fresh_id = a_chat("open-fresh");
+        let stale_id = a_chat("open-stale");
+        {
+            let mut lives = LIVE_CHATS.lock().unwrap();
+            lives.insert(fresh_id.clone(), fresh);
+            lives.insert(stale_id.clone(), stale);
+        }
+        {
+            let mut seen = SEEN_CHATS.lock().unwrap();
+            seen.insert(
+                fresh_id.clone(),
+                now.checked_sub(Duration::from_secs(60)).unwrap(),
+            );
+            seen.insert(
+                stale_id.clone(),
+                now.checked_sub(LIVE_IDLE + Duration::from_secs(1)).unwrap(),
+            );
+        }
+
+        reap_now();
+        let (fresh_kept, stale_kept) = {
+            let lives = LIVE_CHATS.lock().unwrap();
+            (lives.contains_key(&fresh_id), lives.contains_key(&stale_id))
+        };
+
+        for id in [&fresh_id, &stale_id] {
+            LIVE_CHATS.lock().unwrap().remove(id);
+            SEEN_CHATS.lock().unwrap().remove(id);
+        }
+        assert!(fresh_kept, "polled 60s ago is inside the idle window");
+        assert!(!stale_kept, "polled past the idle window is reaped");
+    }
+
+    #[tokio::test]
+    async fn open_chat_make_room_evicts_a_non_open_process_before_an_open_one() {
+        let (mut kept, _held) = idle_lru_six();
+        let open: HashSet<String> = ["c0".to_owned()].into_iter().collect();
+
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP, &open);
+
+        assert_eq!(evicted.len(), 1);
+        assert!(kept.contains_key("c0"), "open, so spared though the oldest");
+        assert!(!kept.contains_key("c1"), "the oldest non-open one goes");
+    }
+
+    /// Open never outranks pinned: a process with a background task or an unclaimed answer is
+    /// not a candidate at all, so when the rest are open the eviction falls on an open one.
+    #[tokio::test]
+    async fn open_chat_pinned_processes_stay_pinned_when_every_other_is_open() {
+        let open: HashSet<String> = ["c1", "c2", "c3", "c4"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        let (mut kept, _held) = idle_lru_six();
+        kept.get_mut("c0")
+            .unwrap()
+            .background
+            .insert("bg".to_owned());
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP, &open);
+        assert_eq!(evicted.len(), 1);
+        assert!(kept.contains_key("c0"), "background task: pinned");
+        assert!(!kept.contains_key("c1"), "the oldest open one goes");
+
+        let (mut kept, _held) = idle_lru_six();
+        kept.get_mut("c0")
+            .unwrap()
+            .carried
+            .push_back(crate::runner::TurnEvent::Line("an answer".to_owned()));
+        let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP, &open);
+        assert_eq!(evicted.len(), 1);
+        assert!(kept.contains_key("c0"), "unclaimed answer: pinned");
+        assert!(!kept.contains_key("c1"), "the oldest open one goes");
+    }
+
+    #[test]
+    fn open_chat_is_open_only_inside_the_window() {
+        let now = std::time::Instant::now();
+        let ago = |s: u64| now.checked_sub(Duration::from_secs(s));
+        assert!(is_open(ago(29), now));
+        assert!(!is_open(ago(31), now));
+        assert!(!is_open(None, now));
     }
 
     /// The whole point: a conversation's second turn is answered by the process its first one
