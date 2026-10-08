@@ -238,6 +238,17 @@ pub async fn autopilot_judge_mode(pool: &SqlitePool, project_id: &str) -> sqlx::
     })
 }
 
+/// Whether interactive sessions in this project's worktrees may receive the `verify` tools
+/// (spec 2026-10-05 section 4.7; migration 0178). A project with no row reads as off.
+pub async fn ide_verify_enabled(pool: &SqlitePool, project_id: &str) -> sqlx::Result<bool> {
+    let stored: Option<i64> =
+        sqlx::query_scalar("SELECT ide_verify FROM autopilot_state WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(stored.is_some_and(|value| value != 0))
+}
+
 /// Spec A D2/D11: the project's judge setting, photographed onto its next runs. `observe` is an
 /// opt-in because it is a new policy of sending data off the machine: with a key in the keyring,
 /// observing by default would send every project's non-trivial input to TypeSafe unasked.
@@ -1613,6 +1624,27 @@ pub mod tests {
 
     async fn test_pool() -> SqlitePool {
         crate::testdb::fresh_pool().await
+    }
+
+    /// The IDE verify switch (spec 4.7, migration 0178) is off unless somebody turns it on, and
+    /// a project the roster has never heard of reads as off rather than as an error.
+    #[tokio::test]
+    async fn ide_verify_is_off_for_a_new_project_and_for_an_unknown_one() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(!ide_verify_enabled(&pool, "p").await.unwrap());
+        assert!(!ide_verify_enabled(&pool, "nobody").await.unwrap());
+
+        sqlx::query("UPDATE autopilot_state SET ide_verify = 1 WHERE project_id = 'p'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(ide_verify_enabled(&pool, "p").await.unwrap());
+        assert!(!ide_verify_enabled(&pool, "nobody").await.unwrap());
     }
 
     /// The stand-in for `~/.nucleos` beside one test's project: inside the project's own temporary

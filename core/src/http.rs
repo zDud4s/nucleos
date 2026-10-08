@@ -785,6 +785,9 @@ pub fn build_router(state: AppState) -> Router {
         // key is the main caller of these two.
         .route("/verify", post(crate::verify::post_verify))
         .route("/verify/status", post(crate::verify::post_verify_status))
+        // Control/admin only, on purpose: absent from the `auth.rs` scope tables, so a run key
+        // cannot keep a worktree's verify box alive.
+        .route("/verify/box/beat", post(crate::verify_box::post_box_beat))
         // Admin-only by construction: absent from BOTH scope tables in `auth.rs`, for the
         // `POST /email/send` reason rather than the `POST /runs` one. It is not out of a scoped
         // key's reach because it is expensive; it is out of reach because it LEAVES THE MACHINE.
