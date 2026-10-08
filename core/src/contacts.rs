@@ -887,9 +887,7 @@ mod tests {
     );
 
     async fn test_pool() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_shared_pool().await
     }
 
     async fn all_contact_address_rows(pool: &SqlitePool) -> Vec<ContactAddressRow> {

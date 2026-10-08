@@ -3291,12 +3291,7 @@ mod tests {
     }
 
     async fn test_state() -> crate::state::AppState {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_shared_pool().await;
         crate::state::AppState {
             token: crate::auth::Token("verification-token".into()),
             pool,

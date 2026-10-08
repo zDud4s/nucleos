@@ -83,17 +83,7 @@ mod tests {
     use crate::knowledge::{self, Declaration, Kind, Provenance};
 
     async fn test_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     /// /learned marks a row "possible duplicate of #N" from the event `distill` writes; an event

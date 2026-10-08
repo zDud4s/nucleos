@@ -737,17 +737,7 @@ mod tests {
     use std::process::Command;
 
     async fn test_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     /// One row on the roster, the shape every test here needs: a project whose root is a real

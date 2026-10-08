@@ -54,13 +54,7 @@ pub async fn record_handoff(
 #[cfg(test)]
 mod tests {
     async fn test_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     #[test]

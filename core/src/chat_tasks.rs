@@ -299,17 +299,7 @@ mod tests {
     use sqlx::SqlitePool;
 
     async fn test_pool() -> SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     async fn row(pool: &SqlitePool, call: &str) -> ChatTask {

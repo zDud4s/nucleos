@@ -134,21 +134,9 @@ pub async fn for_chat(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<Chat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     async fn test_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true)
-                    .foreign_keys(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     /// The unread count as the WINDOW reads it.

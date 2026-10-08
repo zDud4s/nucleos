@@ -741,16 +741,10 @@ mod tests {
     /// test had the constraint switched on. Matching production here is what lets the regression
     /// test underneath actually regress.
     pub async fn test_pool() -> sqlx::SqlitePool {
-        // The URL form, not `SqliteConnectOptions::new().filename(":memory:")`. The two are not the
-        // same database: built from the filename, every connection in the pool gets a private
-        // in-memory database of its own, so the migrations run on one connection and the next query
-        // lands on an empty one — `no such table: email_cursor`, from a pool that looked identical.
-        let options: sqlx::sqlite::SqliteConnectOptions = "sqlite::memory:".parse().unwrap();
-        let pool = sqlx::SqlitePool::connect_with(options.foreign_keys(true))
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        // Shared, not `fresh_pool`: a private in-memory database belongs to one connection, and a
+        // pool of several would send the next query to an empty one — `no such table:
+        // email_cursor`, from a pool that looked identical. Foreign keys are on there too.
+        crate::testdb::fresh_shared_pool().await
     }
 
     #[tokio::test]

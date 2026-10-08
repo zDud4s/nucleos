@@ -1636,16 +1636,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn project_root_reads_autopilot_state() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_pool().await;
 
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', '/some/root')",
