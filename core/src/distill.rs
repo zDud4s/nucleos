@@ -587,23 +587,38 @@ pub async fn recover_running(pool: &SqlitePool) -> sqlx::Result<u64> {
 /// Take the oldest due row, marking it `running` in the same statement. A row whose cause this
 /// build does not know is failed on the spot and the next one is tried.
 pub async fn claim_next(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Option<QueueRow>> {
+    // Read outside any transaction; the claim below sees the value this tick started with.
+    let wait = crate::capture::wait_minutes(pool).await;
     loop {
+        // IMMEDIATE: the transaction writes (requests open and expire in it), and a deferred one
+        // that read first could fail to upgrade to the write lock in WAL mode.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        crate::capture::open_due(&mut tx, now, wait).await?;
+        crate::capture::expire_due(&mut tx, now).await?;
+        // A zero wait holds nothing, even a request opened before the wait was turned off.
         let row: Option<QueueRow> = sqlx::query_as(
             "UPDATE distill_queue SET status = ?
-              WHERE id = (SELECT id FROM distill_queue
-                           WHERE status = ? AND (not_before IS NULL OR not_before <= ?)
-                           ORDER BY id LIMIT 1)
+              WHERE id = (SELECT q.id FROM distill_queue q
+                           WHERE q.status = ? AND (q.not_before IS NULL OR q.not_before <= ?)
+                             AND (? = 0 OR NOT EXISTS (SELECT 1 FROM capture_requests c
+                                  WHERE c.job_id = q.job_id AND c.state = 'open'
+                                    AND c.deadline > ?))
+                           ORDER BY q.id LIMIT 1)
              RETURNING id, cause, project_id, job_id, item_id, run_id, attempts",
         )
         .bind(STATUS_RUNNING)
         .bind(STATUS_PENDING)
         .bind(now.to_rfc3339())
-        .fetch_optional(pool)
+        .bind(wait)
+        .bind(crate::capture::stamp(now))
+        .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
+            tx.commit().await?;
             return Ok(None);
         };
         if Cause::parse(&row.cause).is_some() {
+            tx.commit().await?;
             return Ok(Some(row));
         }
         sqlx::query(
@@ -615,8 +630,9 @@ pub async fn claim_next(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<O
         .bind(now.to_rfc3339())
         .bind(row.id)
         .bind(STATUS_RUNNING)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
     }
 }
 
@@ -1828,6 +1844,12 @@ mod tests {
         chrono::Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap()
     }
 
+    /// Capture requests off, so a failure row is claimed straight away. The hold tests turn the
+    /// wait back on after seeding.
+    async fn no_capture_wait(pool: &SqlitePool) {
+        crate::capture::set_wait_minutes(pool, 0).await.unwrap();
+    }
+
     /// A queue row written by hand, so a test controls its status, attempts and `not_before`.
     async fn seed_queue(
         pool: &SqlitePool,
@@ -1838,6 +1860,7 @@ mod tests {
         attempts: i64,
         not_before: Option<&str>,
     ) -> i64 {
+        no_capture_wait(pool).await;
         sqlx::query(
             "INSERT INTO distill_queue (cause, project_id, job_id, run_id, status, attempts, not_before, created_at)
              VALUES (?, 'alpha', ?, ?, ?, ?, ?, '2026-10-05T00:00:00Z')",
@@ -1875,6 +1898,7 @@ mod tests {
 
     /// A job with a review run whose stdout the dossier will carry, and a queue row for it.
     async fn seeded_cause(pool: &SqlitePool, cause: &str) -> (i64, i64) {
+        no_capture_wait(pool).await;
         seed_job(pool, 1, "alpha", 0).await;
         sqlx::query("UPDATE jobs SET prompt = 'SECRET-JOB-PROMPT' WHERE id = 1")
             .execute(pool)
@@ -2215,6 +2239,115 @@ mod tests {
             "a failed row is never taken again"
         );
         assert_eq!(learnings(&pool).await, 0);
+    }
+
+    /// The wait on, a job in `failed` and one failure row for it: the request opens on the first
+    /// claim.
+    async fn waiting_pool(wait: i64) -> (SqlitePool, i64) {
+        let pool = test_pool().await;
+        seed_job(&pool, 1, "alpha", 0).await;
+        let row = seed_queue(&pool, "job_failed", 1, None, "pending", 0, None).await;
+        crate::capture::set_wait_minutes(&pool, wait).await.unwrap();
+        (pool, row)
+    }
+
+    async fn request_state(pool: &SqlitePool, job_id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT state FROM capture_requests WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_open_request_holds_its_job_rows() {
+        let (pool, row) = waiting_pool(120).await;
+        assert!(claim_next(&pool, noon()).await.unwrap().is_none());
+        assert_eq!(request_state(&pool, 1).await.as_deref(), Some("open"));
+        assert_eq!(queue_state(&pool, row).await.0, "pending");
+        // Still held a minute before the deadline.
+        let near = noon() + chrono::Duration::minutes(119);
+        assert!(claim_next(&pool, near).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn another_jobs_row_is_claimed_while_one_waits() {
+        let (pool, held) = waiting_pool(120).await;
+        seed_job(&pool, 2, "beta", 0).await;
+        let free = seed_queue(&pool, "job_landed", 2, None, "pending", 0, None).await;
+        crate::capture::set_wait_minutes(&pool, 120).await.unwrap();
+        let taken = claim_next(&pool, noon())
+            .await
+            .unwrap()
+            .expect("job 2's row");
+        assert_eq!(taken.id, free);
+        assert_eq!(queue_state(&pool, held).await.0, "pending");
+    }
+
+    #[tokio::test]
+    async fn answered_dismissed_or_expired_releases_the_rows() {
+        for how in ["answered", "dismissed", "expired"] {
+            let (pool, row) = waiting_pool(120).await;
+            assert!(claim_next(&pool, noon()).await.unwrap().is_none(), "{how}");
+            let mut now = noon();
+            match how {
+                "answered" => {
+                    let note = crate::owner_notes::create(&pool, "what only I know", "shell")
+                        .await
+                        .unwrap();
+                    let mut conn = pool.acquire().await.unwrap();
+                    assert!(
+                        crate::capture::close_answered_in(&mut conn, 1, note, now)
+                            .await
+                            .unwrap()
+                    );
+                }
+                "dismissed" => crate::capture::dismiss(&pool, 1, now).await.unwrap(),
+                _ => now += chrono::Duration::minutes(120),
+            }
+            let taken = claim_next(&pool, now).await.unwrap();
+            assert_eq!(taken.map(|r| r.id), Some(row), "{how} releases the row");
+            assert_eq!(request_state(&pool, 1).await.as_deref(), Some(how));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zero_wait_never_holds() {
+        let (pool, row) = waiting_pool(0).await;
+        assert_eq!(claim_next(&pool, noon()).await.unwrap().map(|r| r.id), Some(row));
+        assert_eq!(request_state(&pool, 1).await, None, "no request at zero");
+
+        // A request opened while the wait was 120 stops holding once the wait is 0.
+        let (pool, row) = waiting_pool(120).await;
+        assert!(claim_next(&pool, noon()).await.unwrap().is_none());
+        assert_eq!(request_state(&pool, 1).await.as_deref(), Some("open"));
+        crate::capture::set_wait_minutes(&pool, 0).await.unwrap();
+        assert_eq!(claim_next(&pool, noon()).await.unwrap().map(|r| r.id), Some(row));
+    }
+
+    #[tokio::test]
+    async fn job_landed_rows_never_wait() {
+        let pool = test_pool().await;
+        seed_job(&pool, 1, "alpha", 0).await;
+        let row = seed_queue(&pool, "job_landed", 1, None, "pending", 0, None).await;
+        crate::capture::set_wait_minutes(&pool, 120).await.unwrap();
+        assert_eq!(claim_next(&pool, noon()).await.unwrap().map(|r| r.id), Some(row));
+        assert_eq!(request_state(&pool, 1).await, None);
+    }
+
+    #[tokio::test]
+    async fn backoff_still_applies_to_a_released_row() {
+        let pool = test_pool().await;
+        seed_job(&pool, 1, "alpha", 0).await;
+        let due = (noon() + chrono::Duration::minutes(10)).to_rfc3339();
+        let row = seed_queue(&pool, "job_failed", 1, None, "pending", 1, Some(&due)).await;
+        crate::capture::set_wait_minutes(&pool, 120).await.unwrap();
+        // The request opens and is dismissed; the row is released but not yet due.
+        assert!(claim_next(&pool, noon()).await.unwrap().is_none());
+        crate::capture::dismiss(&pool, 1, noon()).await.unwrap();
+        assert!(claim_next(&pool, noon()).await.unwrap().is_none());
+        let later = noon() + chrono::Duration::minutes(10);
+        assert_eq!(claim_next(&pool, later).await.unwrap().map(|r| r.id), Some(row));
     }
 
     #[tokio::test]
