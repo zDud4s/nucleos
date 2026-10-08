@@ -37,6 +37,10 @@ use std::time::{Duration, SystemTime};
 
 /// The most bytes one transaction covers.
 const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+/// A chunk's write transaction held this long is logged with its size: the other writers wait
+/// behind it for up to the pool's busy timeout, so this is the number that says whether
+/// CHUNK_BYTES needs to shrink.
+const SLOW_CHUNK: Duration = Duration::from_secs(1);
 /// How far into a transcript the first record carrying a `cwd` is looked for.
 const CWD_SCAN_BYTES: u64 = 1024 * 1024;
 /// A tool input string longer than this cannot be a task id and is not kept for comparison.
@@ -691,6 +695,7 @@ async fn ingest_file(
             .await
             .map_err(|error| Fail::Io(std::io::Error::other(error)))??;
 
+        let started = std::time::Instant::now();
         let mut tx = devtime_store::begin_chunk(pool).await?;
         if !turn_loaded {
             turn = devtime_store::last_turn(&mut tx, &file.session).await?;
@@ -707,6 +712,16 @@ async fn ingest_file(
             devtime_store::mark_file_status(&mut tx, &key, "ok").await?;
         }
         tx.commit().await?;
+        let held = started.elapsed();
+        if held >= SLOW_CHUNK {
+            tracing::info!(
+                held_ms = u64::try_from(held.as_millis()).unwrap_or(u64::MAX),
+                items = chunk.items.len(),
+                bytes = chunk.consumed,
+                file = %key,
+                "devtime: slow chunk transaction"
+            );
+        }
 
         stats.lines_read += chunk.lines_read;
         stats.lines_failed += chunk.lines_failed;
