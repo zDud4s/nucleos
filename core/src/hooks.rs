@@ -652,11 +652,17 @@ fn judge_wait(started: Instant) -> Option<Duration> {
     (remaining >= JUDGE_FLOOR).then(|| remaining.min(crate::judge::JUDGE_DEADLINE))
 }
 
-/// F2b step 1, observe only: records a verification command the run executed by itself.
+/// What a refused verification command is told: the daemon verifies, the run does not.
+const VERIFY_GUARD_REFUSAL: &str = "this project verifies through the daemon: call mcp__nucleos__verify and wait on it with mcp__nucleos__verify_status instead of running build, test or gate commands yourself";
+
+/// F2b steps 1-2: records a verification command the run executed by itself, and says whether
+/// the call must be refused (`true`).
 ///
-/// Best effort. The decision is already taken and nothing here can change it: a missing or
-/// invalid tests map, an unreadable gate command or a failed insert all end in a return (or a
-/// warning), never in a different answer for the call.
+/// Step 1 only observes. Step 2 may refuse, and only by explicit opt-in (`verify_guard: refuse`
+/// in the project's rules file that was actually read); it never replaces a classifier `deny`
+/// and is not counted against the prober allowance. A missing or invalid tests map, an
+/// unreadable rules file or a failed insert all end in `false` (or a warning), never in a
+/// different answer for the call.
 async fn observe_verification(
     state: &AppState,
     run_id: i64,
@@ -665,25 +671,25 @@ async fn observe_verification(
     payload: &PreToolUsePayload,
     decision: &str,
     shadow_decision_id: Option<i64>,
-) {
+) -> bool {
     let Some(command) = payload.tool_input.get("command").and_then(Value::as_str) else {
-        return;
+        return false;
     };
     let root = std::path::PathBuf::from(cwd);
     let map = match tokio::task::spawn_blocking(move || crate::tests_map::load(&root)).await {
         Ok(crate::tests_map::MapState::Valid(map)) => map,
-        _ => return,
+        _ => return false,
     };
     let machine_root = state.machine_config_root.as_deref();
-    let gate = match crate::config::load_schedule_rules(machine_root, project_id) {
-        Ok(rules) => rules.gate_command,
+    let (gate, guard) = match crate::config::load_schedule_rules(machine_root, project_id) {
+        Ok(rules) => (rules.gate_command, rules.verify_guard),
         Err(error) => {
             tracing::warn!(
                 run_id,
                 %error,
                 "pretooluse-decision: failed to read the project's gate command"
             );
-            None
+            (None, crate::config::VerifyGuardMode::Observe)
         }
     };
     let Some(hit) = crate::verify_guard::detect(
@@ -692,8 +698,9 @@ async fn observe_verification(
         &map,
         gate.as_deref(),
     ) else {
-        return;
+        return false;
     };
+    let refused = guard == crate::config::VerifyGuardMode::Refuse && decision != "deny";
     if let Err(error) = crate::verify_observe::record(
         &state.pool,
         &crate::verify_observe::Observation {
@@ -703,7 +710,7 @@ async fn observe_verification(
             tool_name: &payload.tool_name,
             command,
             hit: &hit,
-            decision,
+            decision: if refused { "deny" } else { decision },
         },
     )
     .await
@@ -714,6 +721,7 @@ async fn observe_verification(
             "pretooluse-decision: failed to record a verification observation"
         );
     }
+    refused
 }
 
 pub async fn pretooluse_decision(
@@ -1128,14 +1136,15 @@ async fn pretooluse_decision_from(
         None
     };
 
-    // F2b step 1: an in-flight worktree run that ran a verification command by itself is
-    // recorded, after the decision above is already taken and without any way to change it.
+    // F2b steps 1-2: an in-flight worktree run that ran a verification command by itself is
+    // recorded, after the decision above is taken. Under an explicit `verify_guard: refuse` the
+    // call is refused here, before D12 / grants / judge / pause, so a verification command never
+    // parks a run or fetches a person, and it is not counted against the prober allowance.
     if mode == "worktree"
         && is_in_flight
         && matches!(payload.tool_name.as_str(), "Bash" | "PowerShell")
         && let (Some(project_id), Some(cwd)) = (project_id.as_deref(), cwd.as_deref())
-    {
-        observe_verification(
+        && observe_verification(
             &state,
             run_id,
             project_id,
@@ -1144,7 +1153,16 @@ async fn pretooluse_decision_from(
             &classification.decision.decision,
             shadow_decision_id,
         )
-        .await;
+        .await
+    {
+        tracing::info!(
+            run_id,
+            "pretooluse-decision: refused a verification command - the project verifies through the daemon"
+        );
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: VERIFY_GUARD_REFUSAL.to_owned(),
+        });
     }
 
     // **Spec B D12: a person already declined this exact action in this lineage.**
@@ -11688,5 +11706,181 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(kind, "gate_command");
+    }
+
+    // F2b step 2: the refuse switch.
+
+    fn write_rules(root: &Path, project: &str, text: &str) {
+        let rules =
+            crate::project_state::file(Some(root), project, crate::project_state::AUTOPILOT_FILE)
+                .unwrap();
+        std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
+        std::fs::write(&rules, text).unwrap();
+    }
+
+    async fn stored_decision(state: &AppState, run_id: i64) -> String {
+        sqlx::query_scalar("SELECT decision FROM verification_observations WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// `verify_guard: refuse` turns a detected command into a denial that points at `verify`,
+    /// records it as `deny`, does not count it against the run, and leaves allowed ones alone.
+    #[tokio::test]
+    async fn verification_refused_when_the_project_says_refuse() {
+        let mut state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(root.path().to_path_buf());
+        write_rules(root.path(), "p", "verify_guard: refuse\n");
+        let mapped = mapped_cwd();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(mapped.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let d = ask_tool(
+            &app,
+            run_id,
+            "Bash",
+            serde_json::json!({ "command": "cargo test -p x some_test" }),
+        )
+        .await;
+
+        assert_eq!(d.decision, "deny");
+        assert_eq!(d.reason, VERIFY_GUARD_REFUSAL);
+        assert_eq!(observed_rows(&state, run_id).await, 1);
+        assert_eq!(stored_decision(&state, run_id).await, "deny");
+        let denials: i64 = sqlx::query_scalar("SELECT denials FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(denials, 0);
+
+        let ok = ask_tool(
+            &app,
+            run_id,
+            "Bash",
+            serde_json::json!({ "command": "cargo fmt" }),
+        )
+        .await;
+        assert_ne!(ok.reason, VERIFY_GUARD_REFUSAL);
+        assert_eq!(observed_rows(&state, run_id).await, 1);
+    }
+
+    /// An explicit `observe` is exactly a project with no rules file: same decision, same reason,
+    /// and the observation stores the classifier's verdict.
+    #[tokio::test]
+    async fn verification_observe_switch_keeps_todays_decision() {
+        let mut state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(root.path().to_path_buf());
+        write_rules(root.path(), "p", "verify_guard: observe\n");
+        let mapped_p = mapped_cwd();
+        let mapped_q = mapped_cwd();
+        let with_rules = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(mapped_p.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let without_rules = in_flight_run(
+            &state,
+            "worktree",
+            Some("q"),
+            Some(mapped_q.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+        let input = serde_json::json!({ "command": "cargo test -p x some_test" });
+
+        let a = ask_tool(&app, with_rules, "Bash", input.clone()).await;
+        let b = ask_tool(&app, without_rules, "Bash", input).await;
+
+        assert_eq!(a.decision, b.decision);
+        assert_eq!(a.reason, b.reason);
+        assert_ne!(a.reason, VERIFY_GUARD_REFUSAL);
+        assert_eq!(observed_rows(&state, with_rules).await, 1);
+        assert_eq!(observed_rows(&state, without_rules).await, 1);
+        assert_eq!(stored_decision(&state, with_rules).await, a.decision);
+        assert_eq!(stored_decision(&state, without_rules).await, b.decision);
+    }
+
+    /// Refusal shares the observation's scope: a `real` run is never refused.
+    #[tokio::test]
+    async fn verification_refusal_never_applies_outside_worktree_runs() {
+        let mut state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(root.path().to_path_buf());
+        write_rules(root.path(), "p", "verify_guard: refuse\n");
+        let mapped = mapped_cwd();
+        let real = in_flight_run(
+            &state,
+            "real",
+            Some("p"),
+            Some(mapped.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let d = ask_tool(
+            &app,
+            real,
+            "Bash",
+            serde_json::json!({ "command": "cargo test -p x some_test" }),
+        )
+        .await;
+
+        assert_ne!(d.reason, VERIFY_GUARD_REFUSAL);
+        assert_eq!(observed_rows(&state, real).await, 0);
+    }
+
+    /// Refusal never replaces a classifier `deny`: the reason stays the classifier's.
+    #[tokio::test]
+    async fn verification_refusal_keeps_a_classifier_deny() {
+        let mut state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(root.path().to_path_buf());
+        write_rules(root.path(), "p", "verify_guard: refuse\n");
+        let mapped_p = mapped_cwd();
+        let mapped_q = mapped_cwd();
+        let refusing = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(mapped_p.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let observing = in_flight_run(
+            &state,
+            "worktree",
+            Some("q"),
+            Some(mapped_q.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+        let input = serde_json::json!({ "command": "rm -rf / && cargo test" });
+
+        let q = ask_tool(&app, observing, "Bash", input.clone()).await;
+        let p = ask_tool(&app, refusing, "Bash", input).await;
+
+        // Premise: the classifier itself denies this line.
+        assert_eq!(q.decision, "deny");
+        assert_eq!(p.decision, "deny");
+        assert_eq!(p.reason, q.reason);
+        assert_ne!(p.reason, VERIFY_GUARD_REFUSAL);
     }
 }
