@@ -1267,7 +1267,9 @@ mod tests {
     async fn a_job_note_reaches_its_job_and_no_other() {
         let pool = test_pool().await;
         job_note(&pool, "about job seven", 7).await;
-        let seven = active_note_texts_for_project(&pool, "p", Some(7)).await.unwrap();
+        let seven = active_note_texts_for_project(&pool, "p", Some(7))
+            .await
+            .unwrap();
         assert_eq!(seven, vec!["about job seven".to_string()]);
         assert!(
             active_note_texts_for_project(&pool, "p", Some(8))
@@ -1295,12 +1297,16 @@ mod tests {
     async fn a_note_linked_to_both_is_read_once() {
         let pool = test_pool().await;
         let id = job_note(&pool, "both", 7).await;
-        add_link(&pool, id, "relates", "project", "p").await.unwrap();
+        add_link(&pool, id, "relates", "project", "p")
+            .await
+            .unwrap();
         let other = create(&pool, "project only", "shell").await.unwrap();
         add_link(&pool, other, "relates", "project", "p")
             .await
             .unwrap();
-        let texts = active_note_texts_for_project(&pool, "p", Some(7)).await.unwrap();
+        let texts = active_note_texts_for_project(&pool, "p", Some(7))
+            .await
+            .unwrap();
         assert_eq!(texts, vec!["both".to_string(), "project only".to_string()]);
     }
 
