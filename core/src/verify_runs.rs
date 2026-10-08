@@ -22,6 +22,10 @@ pub const SCOPE_FULL: &str = "full";
 pub const REQUESTED_BY_GATE: &str = "gate";
 /// The post-merge gate's units (`verify::Caller::Postgate`).
 pub const REQUESTED_BY_POSTGATE: &str = "postgate";
+/// The post-merge gate's recheck on the red sha (`verify::Caller::FlakeCheck`).
+pub const REQUESTED_BY_FLAKE_CHECK: &str = "flake-check";
+/// One probe of the post-merge gate's bisection (`verify::Caller::Bisect`).
+pub const REQUESTED_BY_BISECT: &str = "bisect";
 
 pub const STATUS_PASSED: &str = "passed";
 pub const STATUS_FAILED: &str = "failed";

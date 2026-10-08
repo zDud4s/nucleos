@@ -1155,6 +1155,82 @@ pub async fn is_ancestor(
     Ok(result.succeeded())
 }
 
+/// The first-parent commits of `(base, tip]`, oldest first, each with a flag for whether it
+/// changed `tests_map::MAP_FILE` relative to its first parent. On the target branch these are the
+/// merges the queue made, which is what the post-merge bisection (spec 2026-10-05 §6.2 step 2)
+/// walks. A merged side branch's own commits are not listed.
+///
+/// Another sanctioned entry to `run_git`, for the reason the others are. The budget is recomputed
+/// before every spawn, as `is_ancestor` does, so a long range cannot outlive the deadline. Any git
+/// failure, including a base git cannot resolve, is an `Err`; an empty range is `Ok(vec![])`.
+pub(crate) async fn first_parent_commits(
+    repo: &Path,
+    base: &str,
+    tip: &str,
+    deadline: std::time::Instant,
+) -> Result<Vec<(String, bool)>, String> {
+    const OUT_OF_TIME: &str = "the operation ran out of time before the range could be listed";
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return Err(OUT_OF_TIME.to_owned());
+    }
+    let range = format!("{base}..{tip}");
+    let listed = run_git(
+        repo,
+        &[
+            OsStr::new("rev-list"),
+            OsStr::new("--first-parent"),
+            OsStr::new("--reverse"),
+            OsStr::new(&range),
+        ],
+        budget,
+    )
+    .await?;
+    if !listed.succeeded() {
+        return Err(format!(
+            "could not list {range}: {}",
+            listed.output_tail.trim()
+        ));
+    }
+    let shas: Vec<String> = listed
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut commits = Vec::with_capacity(shas.len());
+    for sha in shas {
+        let budget = deadline.saturating_duration_since(std::time::Instant::now());
+        if budget.is_zero() {
+            return Err(OUT_OF_TIME.to_owned());
+        }
+        let parent = format!("{sha}^1");
+        let changed = run_git(
+            repo,
+            &[
+                OsStr::new("diff"),
+                OsStr::new("--name-only"),
+                OsStr::new(&parent),
+                OsStr::new(&sha),
+                OsStr::new("--"),
+                OsStr::new(crate::tests_map::MAP_FILE),
+            ],
+            budget,
+        )
+        .await?;
+        if !changed.succeeded() {
+            return Err(format!(
+                "could not diff {sha} against its first parent: {}",
+                changed.output_tail.trim()
+            ));
+        }
+        let touches_map = !changed.stdout.trim().is_empty();
+        commits.push((sha, touches_map));
+    }
+    Ok(commits)
+}
+
 /// Every local branch and remote-tracking ref, as full refnames (`refs/heads/...`,
 /// `refs/remotes/...`).
 ///
@@ -4220,6 +4296,69 @@ gate_command: git --version
             "tracked edits are reset"
         );
         assert!(path.join("feature.txt").exists());
+    }
+
+    /// The bisection's candidate list: the first-parent commits of `(base, tip]`, oldest first,
+    /// with the commits of a merged side branch left out and a flag on whoever changes the map.
+    #[tokio::test]
+    async fn first_parent_commits_lists_the_range_oldest_first_and_flags_map_changes() {
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-fpc-");
+        let commit = |name: &str, content: &str, message: &str| {
+            std::fs::write(repo.join(name), content).expect("write");
+            assert!(git_ok(&repo, &[OsStr::new("add"), OsStr::new("-A")]));
+            assert!(git_ok(
+                &repo,
+                &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new(message)]
+            ));
+            sha_of(&repo, "HEAD")
+        };
+        let base = sha_of(&repo, "master");
+        let c1 = commit("one.txt", "1\n", "c1");
+        // A merge whose side branch carries a commit of its own: only the merge is first-parent.
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("merge"),
+                OsStr::new("--no-ff"),
+                OsStr::new("-m"),
+                OsStr::new("merge feat/x"),
+                OsStr::new("feat/x")
+            ]
+        ));
+        let merge = sha_of(&repo, "HEAD");
+        let side = sha_of(&repo, "feat/x");
+        let c3 = commit(
+            crate::tests_map::MAP_FILE,
+            "version: 1\n",
+            "c3 adds the map",
+        );
+
+        let listed = first_parent_commits(&repo, &base, &c3, deadline())
+            .await
+            .expect("the range lists");
+        assert_eq!(
+            listed,
+            vec![
+                (c1.clone(), false),
+                (merge.clone(), false),
+                (c3.clone(), true)
+            ],
+            "oldest first, the side branch's own commit absent, only the map change flagged"
+        );
+        assert!(listed.iter().all(|(sha, _)| *sha != side));
+
+        // An empty range lists nothing, and a base git cannot resolve is an error.
+        assert!(
+            first_parent_commits(&repo, &c3, &c3, deadline())
+                .await
+                .expect("an empty range")
+                .is_empty()
+        );
+        assert!(
+            first_parent_commits(&repo, "no-such-ref", &c3, deadline())
+                .await
+                .is_err()
+        );
     }
 
     /// The `.git` guard, and the reason it must run before any git command is pointed at that
