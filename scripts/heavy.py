@@ -40,6 +40,9 @@ LOG_ARGV_WORDS = 40
 LOG_ARGV_CHARS = 300
 MUTEX_STALE_S = 60.0
 MUTEX_WAIT_S = 30.0
+# Measurement (2026-10-07, "broker mutex busy" fail-opens): an acquisition that waits or
+# holds longer than this, and every timeout, gets a row in `mutex.jsonl`.
+MUTEX_TRACE_S = 1.0
 STILL_ACTIVE = 259
 DEFAULT_CAPACITY = 4
 AGENT_WAIT_MAX_S = 540.0
@@ -129,14 +132,59 @@ def is_alive(pid, ctime=None) -> bool:
 # ----------------------------------------------------------------------------- mutex
 
 
+# The mutex dirs this process holds right now; an owner record naming this process for a dir
+# not in here is a leftover of its own (see Mutex._stale).
+_MUTEX_HELD: set[str] = set()
+
+
 class Mutex:
-    """`mkdir $DIR/.mutex` plus an `owner` file. Stale when older than 60 s or the owner
-    is dead; a stale one is removed and the acquisition retried."""
+    """`mkdir $DIR/.mutex` plus an `owner` file. Stale when older than 60 s, when the owner
+    is dead, or when the owner is this very process and it does not hold it; a stale one is
+    removed and the acquisition retried."""
 
     def __init__(self, state_dir: Path, timeout: float = MUTEX_WAIT_S):
         self.path = Path(state_dir) / ".mutex"
         self.timeout = timeout
         self.held = False
+        try:
+            self.site = sys._getframe(1).f_code.co_name
+        except Exception:
+            self.site = "?"
+        self.waited = 0.0
+        self.t_held = 0.0
+        self.n_exists = self.n_perm = 0
+
+    def _trace(self, row: dict) -> None:
+        try:
+            row = dict(row, v=LOG_VERSION, ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                       site=self.site, pid=os.getpid(), waited_s=round(self.waited, 3),
+                       n_exists=self.n_exists, n_perm=self.n_perm)
+            with open(self.path.parent / "mutex.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+        except Exception:
+            pass
+
+    def _trace_timeout(self) -> None:
+        row: dict = {"event": "timeout"}
+        try:
+            row["dir_age_s"] = round(time.time() - self.path.stat().st_mtime, 3)
+        except OSError:
+            row["dir_age_s"] = None
+        try:
+            owner = json.loads((self.path / "owner").read_text())
+            row["owner"] = owner
+            row["owner_alive"] = is_alive(owner.get("pid"), owner.get("ctime"))
+            t = owner.get("t")
+            row["owner_held_s"] = round(time.time() - float(t), 3) if t else None
+        except (OSError, ValueError, TypeError):
+            row["owner"] = None
+            row["owner_alive"] = None
+            row["owner_held_s"] = None
+        try:
+            row["queue_len"] = len(os.listdir(self.path.parent / "queue"))
+        except OSError:
+            row["queue_len"] = None
+        self._trace(row)
 
     def _stale(self) -> bool:
         try:
@@ -146,6 +194,11 @@ class Mutex:
             return False  # vanished meanwhile: the retry will take it
         try:
             owner = json.loads((self.path / "owner").read_text())
+            if owner.get("pid") == os.getpid() and str(self.path) not in _MUTEX_HELD:
+                # Our own release left it behind (2026-10-07: 30388 waited 30 s on itself,
+                # and six queued commands gave up on the queue together). Alive, so the
+                # liveness check below would never call it stale.
+                return True
             return not is_alive(owner.get("pid"), owner.get("ctime"))
         except (OSError, ValueError):
             # No readable owner yet: its creator may be between mkdir and the write.
@@ -155,44 +208,67 @@ class Mutex:
                 return False
 
     def acquire(self) -> None:
-        deadline = time.time() + self.timeout
+        t0 = time.time()
+        deadline = t0 + self.timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
         while True:
             try:
                 self.path.mkdir()
                 break
-            except (FileExistsError, PermissionError):
+            except (FileExistsError, PermissionError) as exc:
                 # Windows answers a mkdir on a directory whose delete is still pending
                 # with "access denied", not "exists".
+                if isinstance(exc, PermissionError):
+                    self.n_perm += 1
+                else:
+                    self.n_exists += 1
                 if self._stale():
                     shutil.rmtree(self.path, ignore_errors=True)
                     continue
                 if time.time() > deadline:
+                    self.waited = time.time() - t0
+                    self._trace_timeout()
                     raise TimeoutError("broker mutex busy")
                 time.sleep(0.05)
         self.held = True
+        _MUTEX_HELD.add(str(self.path))
+        self.t_held = time.time()
+        self.waited = self.t_held - t0
         _, ctime = proc_identity(os.getpid())
         try:
-            (self.path / "owner").write_text(json.dumps({"pid": os.getpid(), "ctime": ctime}))
+            (self.path / "owner").write_text(json.dumps(
+                {"pid": os.getpid(), "ctime": ctime, "site": self.site, "t": self.t_held}))
         except OSError:
             pass
 
     def release(self) -> None:
         if self.held:
             self.held = False
+            held = time.time() - self.t_held
+            self._remove()
+            _MUTEX_HELD.discard(str(self.path))
+            if held >= MUTEX_TRACE_S or self.waited >= MUTEX_TRACE_S:
+                self._trace({"event": "slow", "held_s": round(held, 3)})
+
+    def _remove(self) -> None:
+        # Windows refuses to delete `owner` while a waiter's _stale() has it open, and a dir
+        # with `owner` still in it cannot go: retry the file with the dir, not the dir alone.
+        for _ in range(50):
             try:
                 (self.path / "owner").unlink()
-            except OSError:
+            except FileNotFoundError:
                 pass
-            for _ in range(50):
-                try:
-                    self.path.rmdir()
-                    return
-                except FileNotFoundError:
-                    return
-                except OSError:
-                    time.sleep(0.02)
-            shutil.rmtree(self.path, ignore_errors=True)
+            except OSError:
+                time.sleep(0.02)
+                continue
+            try:
+                self.path.rmdir()
+                return
+            except FileNotFoundError:
+                return
+            except OSError:
+                time.sleep(0.02)
+        shutil.rmtree(self.path, ignore_errors=True)
 
     def __enter__(self):
         self.acquire()
@@ -273,6 +349,38 @@ def assign_to_job(job, proc) -> bool:
     k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
     k32.AssignProcessToJobObject.restype = wintypes.BOOL
     return bool(k32.AssignProcessToJobObject(job, int(proc._handle)))
+
+
+def job_cpu_seconds(job) -> float | None:
+    """User + kernel CPU of every process the job has held, those already gone included
+    (rustc, a test binary, tsc's node): the work done so far, whatever the wall clock did."""
+    if job is None or os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class ACCOUNTING(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_int64),
+            ("TotalKernelTime", ctypes.c_int64),
+            ("ThisPeriodTotalUserTime", ctypes.c_int64),
+            ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        ]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+    k32.QueryInformationJobObject.restype = wintypes.BOOL
+    info = ACCOUNTING()
+    JobObjectBasicAccountingInformation = 1
+    if not k32.QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+                                         ctypes.byref(info), ctypes.sizeof(info), None):
+        return None
+    return (info.TotalUserTime + info.TotalKernelTime) / 1e7  # 100 ns units
 
 
 # ----------------------------------------------------------------------------- queue
@@ -609,7 +717,19 @@ _RUNNING_BIN = re.compile(
     rb"^\s*Running .*\((?:.*[\\/])?([^\\/)]+?)(?:-[0-9a-f]{16})?(?:\.exe)?\)\s*$")
 _DOC_TESTS = re.compile(rb"^\s*Doc-tests (\S+)")
 _RUNNING_N = re.compile(rb"^running (\d+) tests?\s*$")
-_TEST_DONE = re.compile(rb"^test .+ \.\.\. (?:ok|FAILED|ignored)")
+_TEST_DONE = re.compile(rb"^test (.+?) \.\.\. (ok|FAILED|ignored)")
+_FINISHED = re.compile(rb"^\s*Finished ")
+# cargo-nextest: `Starting 3 tests across 2 binaries (1 test skipped)`, then one line per finished
+# test carrying its own counter, `PASS [   0.332s] (1/3) nx::x it`. SLOW and START report a test
+# still running, a `TRY n` attempt may yet be retried, and after `Summary` nextest repeats the
+# failures: none of those counts as a failure.
+_NX_START = re.compile(rb"^\s*Starting (\d+) tests? across (\d+) binar")
+_NX_DONE = re.compile(
+    rb"^\s*(TRY \d+ )?([A-Z][A-Z-]+)\s+\[[^\]]*\]\s+\(\s*(\d+)/(\d+)\)\s+(.+?)\s*$")
+_NX_SUMMARY = re.compile(rb"^\s*Summary \[")
+# What cargo says before it builds anything, shown as the prepare phase's current step.
+_STEP = re.compile(rb"^\s*(Blocking waiting for file lock on .*|Updating .*|Locking \d+ packages?.*"
+                   rb"|Downloading crates.*|Downloaded \d+ crates?.*)$")
 
 
 def _new_stats() -> dict:
@@ -624,6 +744,7 @@ def _note_progress(seg: bytes, prog: dict) -> bool:
     if m:
         prog.update(units_done=int(m.group(1)), units_total=int(m.group(2)),
                     building=(m.group(3) or b"").decode("utf-8", "replace"))
+        prog.pop("step", None)
         return True
     if seg.endswith(b"\r") and not text.strip():
         return True
@@ -640,8 +761,40 @@ def _note_progress(seg: bytes, prog: dict) -> bool:
         # the child's `running 1 test` would otherwise reset the total mid-run.
         if prog.get("tests_total") is None:
             prog.update(tests_total=int(m.group(1)), tests_done=0)
-    elif _TEST_DONE.match(text):
+        return False
+    m = _TEST_DONE.match(text)
+    if m:
         prog["tests_done"] = prog.get("tests_done", 0) + 1
+        prog["last_test"] = m.group(1).decode("utf-8", "replace")
+        if m.group(2) == b"FAILED":
+            prog["failed"] = prog.get("failed", 0) + 1
+        return False
+    m = _STEP.match(text)
+    if m and not prog.get("units_total"):
+        prog["step"] = m.group(1).decode("utf-8", "replace").strip()
+        return False
+    if _FINISHED.match(text) and prog.get("units_total"):
+        # cargo erases its bar without ever drawing the last unit.
+        prog["units_done"] = prog["units_total"]
+        return False
+    m = _NX_START.match(text)
+    if m:
+        prog.update(runner="nextest", tests_total=int(m.group(1)), tests_done=0,
+                    binaries=int(m.group(2)))
+        prog.pop("building", None)
+        return False
+    if _NX_SUMMARY.match(text):
+        prog["summary"] = True
+        return False
+    m = _NX_DONE.match(text)
+    if m and prog.get("runner") == "nextest" and not prog.get("summary"):
+        status = m.group(2).decode()
+        if status in ("SLOW", "START"):
+            return False
+        prog.update(tests_done=int(m.group(3)), tests_total=int(m.group(4)),
+                    last_test=m.group(5).decode("utf-8", "replace"))
+        if not m.group(1) and status not in ("PASS", "SKIP"):
+            prog["failed"] = prog.get("failed", 0) + 1
     return False
 
 
@@ -706,13 +859,21 @@ def _pump(src, dst, stats: dict, show_bar: bool = True) -> None:
             pass
 
 
-def _write_progress(path: Path, stats: dict, stop: threading.Event) -> None:
+def _write_progress(path: Path, stats: dict, stop: threading.Event, cpu=None) -> None:
     """Publish stats["progress"] to `path` (read by scripts/heavy_watch.py) while the child
-    runs, at most once a second and only when it changed; remove it at the end."""
+    runs, at most once a second and only when it changed; remove it at the end. With `cpu`
+    (seconds used so far by the child's tree) it goes along as `cpu_s`, and the value at the
+    first sign of building or testing is kept as stats["prep_cpu_s"]: what preparing cost."""
     last = None
     try:
         while True:
             snap = dict(stats.get("progress") or {})
+            used = cpu() if cpu is not None else None
+            if used is not None:
+                snap["cpu_s"] = round(used, 1)
+                if "prep_cpu_s" not in stats and any(
+                        snap.get(k) for k in ("units_total", "binary", "runner")):
+                    stats["prep_cpu_s"] = round(used, 1)
             if snap and snap != last:
                 try:
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -731,6 +892,19 @@ def _write_progress(path: Path, stats: dict, stop: threading.Event) -> None:
             pass
 
 
+def _progress_step(directory: Path, step: str) -> None:
+    """Name what the broker itself is doing before the child starts (the child's progress
+    file replaces this one); best effort."""
+    try:
+        path = directory / "progress" / str(os.getpid())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"step": step, "pid": os.getpid()}), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def _isatty(stream) -> bool:
     try:
         return bool(stream.isatty())
@@ -742,8 +916,8 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
               progress: Path | None = None) -> tuple[int, dict]:
     """Run argv, streaming stdout/stderr through; return (exit, stats). `low` runs it at
     below-normal CPU priority (Windows) with no console window of its own. With `progress`,
-    a cargo child is asked to draw its bar into the pipe, and what the output says about
-    units and tests is kept in that file while it runs."""
+    that file holds, while it runs, the CPU its tree has used and what the output says about
+    units and tests; a cargo child is asked to draw its bar into the pipe for that."""
     stats = _new_stats()
     # CreateProcess finds only `.exe` without an extension, so `npm`/`npx` (`.cmd` shims)
     # failed with WinError 2: resolve argv[0] through PATH and PATHEXT the way a shell would.
@@ -760,8 +934,7 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
         show_bar = "CARGO_TERM_PROGRESS_WHEN" in env or _isatty(err)
         env.setdefault("CARGO_TERM_PROGRESS_WHEN", "always")
         env.setdefault("CARGO_TERM_PROGRESS_WIDTH", "100")
-    else:
-        progress = None
+    before = os.times()
     flags = 0
     if low and os.name == "nt":
         flags = 0x00004000 | 0x08000000  # BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW
@@ -769,9 +942,10 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
         argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags
     )
     try:
-        assign_to_job(job, proc)
+        in_job = assign_to_job(job, proc)
     except Exception:
-        pass
+        in_job = False
+    cpu = (lambda: job_cpu_seconds(job)) if in_job else None
     threads = [
         threading.Thread(target=_pump, args=(proc.stdout, out, stats, show_bar), daemon=True),
         threading.Thread(target=_pump, args=(proc.stderr, err, stats, show_bar), daemon=True),
@@ -779,7 +953,7 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     stop = threading.Event()
     writer = None
     if progress is not None:
-        writer = threading.Thread(target=_write_progress, args=(progress, stats, stop),
+        writer = threading.Thread(target=_write_progress, args=(progress, stats, stop, cpu),
                                   daemon=True)
         writer.start()
     for t in threads:
@@ -790,6 +964,13 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     stop.set()
     if writer is not None:
         writer.join(timeout=5)
+    used = cpu() if cpu is not None else None
+    if used is None and os.name != "nt":
+        after = os.times()
+        used = (after.children_user - before.children_user
+                + after.children_system - before.children_system)
+    if used is not None:
+        stats["cpu_s"] = round(used, 1)
     return code, stats
 
 
@@ -1113,6 +1294,7 @@ def prepare_slot(directory: Path, lease, worktree: str, program: str, cwd: str,
     _, path, prev = lease
     if not prev or _same_wt(prev, worktree):
         return  # first use, or the same worktree coming back to its own slot
+    _progress_step(directory, f"cleaning the target slot after {Path(prev).name}")
     registry_forget(directory, _real(path))
     cargs = _cargo_args(argv or [])
     prof: list[str] = []
@@ -1591,6 +1773,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
         raise
     row.update({
         "run_s": round(time.time() - t_run, 3), "compiled": stats["compiled"],
+        **{k: stats[k] for k in ("cpu_s", "prep_cpu_s") if k in stats},
         "fp_hit": hit, "fp_miss": hit and stats["compiled"], "exit": code,
         "argv0": argv[0], "argv": _log_argv(argv),
     })

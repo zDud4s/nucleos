@@ -29,7 +29,6 @@ import {
   FolderKanban,
   Gauge,
   Globe,
-  GraduationCap,
   Hourglass,
   LayoutDashboard,
   Mail,
@@ -133,16 +132,8 @@ export const NAV: NavGroup[] = [
       { id: "runs", label: "Runs", path: "/runs", icon: Activity },
       { id: "feed", label: "Feed", path: "/feed", icon: Rss },
       /**
-       * Under Operate and not under Work, although it is the closest thing the
-       * app has to a document: what the agent has been told is a fact about the
-       * machine's current behaviour, not a thing you and it are doing together.
-       * It sits after Projects because a lesson is scoped to one.
-       */
-      { id: "learned", label: "Learned", path: "/learned", icon: GraduationCap },
-      /**
-       * The owner's own thinking: notes typed or sent here, never read by agents.
-       * It follows Learned because the two are one question from opposite sides: what the
-       * agent has been told, and what only you know.
+       * The owner's own thinking and what the agent has been taught, in one list: notes typed or
+       * sent here (never read by agents) beside the knowledge store. `/learned` redirects here.
        */
       { id: "brain", label: "Brain", path: "/brain", icon: Brain },
     ],

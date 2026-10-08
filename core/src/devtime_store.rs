@@ -1,5 +1,6 @@
-//! The devtime tables' only SQL (migration 0164): files and offsets, the cwd map, sessions, turns,
-//! messages (usage deduped by message id), attempts, spans, markers and the ingest status.
+//! The devtime tables' only SQL (migrations 0164 and 0171): files and offsets, the cwd map, sessions,
+//! turns, messages (usage deduped by message id), attempts, spans, markers and the ingest status, and
+//! what the rule engine writes: findings, attempt marks, turn stats and the owner's feedback.
 //!
 //! Knows no transcript format and no lane rule: it stores what a parser hands it and answers what a
 //! lane builder asks. The vocabularies below are checked by callers before the write, because the
@@ -49,6 +50,46 @@ pub const MARKER_KINDS: [&str; 8] = [
 pub const OUTCOMES: [&str; 5] = ["ok", "error", "interrupted", "launched", "unknown"];
 #[allow(dead_code)] // a table column or closed vocabulary that no reader asks for yet
 pub const CONFIDENCE: [&str; 2] = ["exact", "inferred"];
+
+// The rule engine's closed vocabularies (migration 0171). The tables carry no CHECK constraints, so
+// the engine and `devtime_precision` check against these before every write.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const WASTES: [&str; 3] = ["useful", "rework", "avoidable"];
+#[cfg_attr(not(test), allow(dead_code))]
+pub const LEVERS: [&str; 19] = [
+    "model",
+    "spec",
+    "clarity",
+    "verification",
+    "dispatch_scope",
+    "machine",
+    "precision",
+    "project_knowledge",
+    "environment_knowledge",
+    "estimation",
+    "permissions",
+    "discipline",
+    "context",
+    "delegation",
+    "parallelism",
+    "waiting",
+    "autonomy",
+    "script_skill",
+    "gotcha",
+];
+#[allow(dead_code)] // vocabulary kept for the SP4 endpoint
+pub const LEVELS: [&str; 3] = ["base", "adapter", "deferred"];
+#[allow(dead_code)] // vocabulary kept for the SP4 endpoint
+pub const VERIFIED: [&str; 3] = ["passed", "failed", "not_measured"];
+#[allow(dead_code)] // vocabulary kept for the SP4 endpoint
+pub const FINDING_SCOPES: [&str; 2] = ["session", "cross"];
+#[cfg_attr(not(test), allow(dead_code))]
+pub const FEEDBACK_VERDICTS: [&str; 2] = ["not_rework", "confirmed"];
+/// A cause may also be any of [`LEVERS`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub const FEEDBACK_CAUSES: [&str; 5] = ["spec_gap", "scope_creep", "gate_skip", "infra", "taste"];
+#[cfg_attr(not(test), allow(dead_code))]
+pub const BG_STATUSES: [&str; 3] = ["completed", "failed", "killed"];
 
 fn now() -> String {
     chrono::Utc::now()
@@ -156,6 +197,11 @@ pub struct AttemptRow {
     pub edits: String,
     pub reads: String,
     pub parser_version: i64,
+    /// `completed|failed|killed` ([`BG_STATUSES`]) once a background task's notification said so.
+    pub bg_status: Option<String>,
+    /// JSON arrays of 8-hex reference hashes (see the plan's D4/D5 rows); empty is written as `[]`.
+    pub refs_in: String,
+    pub refs_out: String,
 }
 
 /// What a tool result adds to an attempt that was launched earlier.
@@ -168,6 +214,8 @@ pub struct AttemptResult {
     pub agent_id: Option<String>,
     pub model: Option<String>,
     pub bg_task_id: Option<String>,
+    /// A JSON array of reference hashes taken from the result; empty is written as `[]`.
+    pub refs_out: String,
 }
 
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
@@ -404,8 +452,9 @@ pub async fn upsert_attempt_launch(
             (attempt_id, session_id, lane, message_id, tool_use_id, kind, tool_name, agent_type,
              agent_id, model, effort, started_at, ended_at, outcome, exit_code, error_class,
              cmd_program, cmd_hash, timeout_ms, background, bg_task_id, bg_ended_at, bg_confidence,
-             files, edits, reads, parser_version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             files, edits, reads, parser_version, bg_status, refs_in, refs_out)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 ?, ?, ?)",
     )
     .bind(&row.attempt_id)
     .bind(&row.session_id)
@@ -434,6 +483,9 @@ pub async fn upsert_attempt_launch(
     .bind(json_or_empty(&row.edits))
     .bind(json_or_empty(&row.reads))
     .bind(row.parser_version)
+    .bind(&row.bg_status)
+    .bind(json_or_empty(&row.refs_in))
+    .bind(json_or_empty(&row.refs_out))
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -450,7 +502,7 @@ pub async fn complete_attempt(
         "UPDATE devtime_attempts SET
             ended_at = ?, outcome = ?, exit_code = ?, error_class = ?,
             agent_id = COALESCE(?, agent_id), model = COALESCE(?, model),
-            bg_task_id = COALESCE(?, bg_task_id)
+            bg_task_id = COALESCE(?, bg_task_id), refs_out = ?
          WHERE attempt_id = ?",
     )
     .bind(&result.ended_at)
@@ -460,6 +512,27 @@ pub async fn complete_attempt(
     .bind(&result.agent_id)
     .bind(&result.model)
     .bind(&result.bg_task_id)
+    .bind(json_or_empty(&result.refs_out))
+    .bind(attempt_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Records how a background attempt ended, from its notification. The exit code only fills a NULL: a
+/// foreground result that already carried one is not overwritten by a later notification.
+pub async fn set_bg_status(
+    conn: &mut SqliteConnection,
+    attempt_id: &str,
+    status: &str,
+    exit_code: Option<i64>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE devtime_attempts SET bg_status = ?, exit_code = COALESCE(exit_code, ?)
+         WHERE attempt_id = ?",
+    )
+    .bind(status)
+    .bind(exit_code)
     .bind(attempt_id)
     .execute(&mut *conn)
     .await?;
@@ -736,7 +809,7 @@ pub async fn session_rows(pool: &SqlitePool, session_id: &str) -> sqlx::Result<S
         "SELECT attempt_id, session_id, lane, message_id, tool_use_id, kind, tool_name, agent_type,
                 agent_id, model, effort, started_at, ended_at, outcome, exit_code, error_class,
                 cmd_program, cmd_hash, timeout_ms, background, bg_task_id, bg_ended_at,
-                bg_confidence, files, edits, reads, parser_version
+                bg_confidence, files, edits, reads, parser_version, bg_status, refs_in, refs_out
          FROM devtime_attempts WHERE session_id = ? ORDER BY started_at, attempt_id",
     )
     .bind(session_id)
@@ -839,24 +912,500 @@ pub async fn read_ingest_status(pool: &SqlitePool) -> sqlx::Result<Option<Ingest
     .await
 }
 
+/// What the rules pass needs to know about a session before it reads the rest: its project, its
+/// span of time, and the two stamps that decide whether the rules still owe it work.
+#[derive(Debug, Clone, Default, sqlx::FromRow)]
+pub struct SessionHead {
+    pub session_id: String,
+    pub project_id: String,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub updated_at: String,
+    /// 1 until `write_rule_results` has seen the rows as they are now.
+    pub dirty: i64,
+    pub rules_version: Option<String>,
+}
+
+pub async fn session_head(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> sqlx::Result<Option<SessionHead>> {
+    sqlx::query_as::<_, SessionHead>(
+        "SELECT session_id, project_id, started_at, ended_at, updated_at, dirty, rules_version
+         FROM devtime_sessions WHERE session_id = ?",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// A session's spans, with their ids, in lane and time order.
+pub async fn session_spans(pool: &SqlitePool, session_id: &str) -> sqlx::Result<Vec<SpanRow>> {
+    sqlx::query_as::<_, SpanRow>(
+        "SELECT id, session_id, lane, kind, started_at, ended_at, attempt_id, attempt_ids,
+                context_tokens, waste, rule_id, confidence, parser_version
+         FROM devtime_spans WHERE session_id = ? ORDER BY lane, started_at, id",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// The sessions whose rule results are missing or out of date, newest first: dirty ones, ones never
+/// ruled, and ones ruled under another `rules_version` fingerprint.
+pub async fn sessions_needing_rules(
+    pool: &SqlitePool,
+    fingerprint: &str,
+    limit: u32,
+) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT session_id FROM devtime_sessions
+         WHERE dirty = 1 OR rules_version IS NULL OR rules_version <> ?
+         ORDER BY updated_at DESC, session_id LIMIT ?",
+    )
+    .bind(fingerprint)
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await
+}
+
+/// One rule finding, session-scoped or cross-session. The two version columns are the engine's
+/// stamps, carried on the row so a cross finding (written without a session pass) has them too.
+#[derive(Debug, Clone, Default, PartialEq, sqlx::FromRow)]
+pub struct FindingRow {
+    pub finding_key: String,
+    pub project_id: String,
+    pub session_id: String,
+    /// One of [`FINDING_SCOPES`].
+    pub scope: String,
+    pub rule_id: String,
+    pub rule_version: i64,
+    /// One of [`LEVELS`].
+    pub level: String,
+    /// One of [`WASTES`].
+    pub waste: String,
+    /// One of [`LEVERS`]: the rule's first lever.
+    pub lever: String,
+    /// One of [`CONFIDENCE`].
+    pub confidence: String,
+    pub lane: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub cost_ms: i64,
+    pub count: i64,
+    /// JSON array; empty is written as `[]`.
+    pub attempt_ids: String,
+    /// JSON array of the sessions a cross finding spans; empty is written as `[]`.
+    pub sessions: String,
+    pub rules_version: String,
+    pub parser_version: i64,
+}
+
+/// The winning annotation of one span.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpanMark {
+    pub span_id: i64,
+    pub waste: Option<String>,
+    pub rule_id: Option<String>,
+    pub lever: Option<String>,
+    pub finding_key: Option<String>,
+}
+
+/// One attempt's winning annotation and its three-valued verification result.
+#[derive(Debug, Clone, Default, PartialEq, sqlx::FromRow)]
+pub struct AttemptMarkRow {
+    pub attempt_id: String,
+    pub session_id: String,
+    pub waste: Option<String>,
+    pub rule_id: Option<String>,
+    pub lever: Option<String>,
+    pub finding_key: Option<String>,
+    /// One of [`VERIFIED`].
+    pub verified: String,
+    /// The rule that set `verified`, when one did.
+    pub verified_by: Option<String>,
+}
+
+/// One main-lane turn's time, and how much of it a rule explains.
+#[derive(Debug, Clone, Default, PartialEq, sqlx::FromRow)]
+pub struct TurnStatRow {
+    pub session_id: String,
+    pub turn_seq: i64,
+    pub project_id: String,
+    pub turn_class: String,
+    pub started_at: String,
+    pub calls: i64,
+    pub active_ms: i64,
+    pub explained_ms: i64,
+}
+
+/// Everything one session's rules pass writes, in one transaction.
+#[derive(Debug, Clone, Default)]
+pub struct RuleWrite {
+    pub findings: Vec<FindingRow>,
+    pub span_marks: Vec<SpanMark>,
+    pub attempt_marks: Vec<AttemptMarkRow>,
+    pub turn_stats: Vec<TurnStatRow>,
+}
+
+async fn insert_finding(conn: &mut SqliteConnection, row: &FindingRow) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO devtime_findings
+            (finding_key, project_id, session_id, scope, rule_id, rule_version, level, waste, lever,
+             confidence, lane, started_at, ended_at, cost_ms, count, attempt_ids, sessions,
+             rules_version, parser_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(finding_key) DO NOTHING",
+    )
+    .bind(&row.finding_key)
+    .bind(&row.project_id)
+    .bind(&row.session_id)
+    .bind(&row.scope)
+    .bind(&row.rule_id)
+    .bind(row.rule_version)
+    .bind(&row.level)
+    .bind(&row.waste)
+    .bind(&row.lever)
+    .bind(&row.confidence)
+    .bind(&row.lane)
+    .bind(&row.started_at)
+    .bind(&row.ended_at)
+    .bind(row.cost_ms)
+    .bind(row.count)
+    .bind(json_or_empty(&row.attempt_ids))
+    .bind(json_or_empty(&row.sessions))
+    .bind(&row.rules_version)
+    .bind(row.parser_version)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Replaces what the rules concluded about one session, wholesale and in one transaction: its
+/// session-scoped findings, the annotations on its spans, its attempt marks and its turn stats.
+/// Then stamps the session with `fingerprint` and clears `dirty`, but only if `updated_at` is still
+/// what `head` read: rows ingested while the rules ran leave it dirty, so the next cycle runs again.
+pub async fn write_rule_results(
+    pool: &SqlitePool,
+    head: &SessionHead,
+    write: &RuleWrite,
+    fingerprint: &str,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM devtime_findings WHERE session_id = ? AND scope = 'session'")
+        .bind(&head.session_id)
+        .execute(&mut *tx)
+        .await?;
+    for finding in &write.findings {
+        insert_finding(&mut tx, finding).await?;
+    }
+    sqlx::query(
+        "UPDATE devtime_spans SET waste = NULL, rule_id = NULL, lever = NULL, finding_key = NULL
+         WHERE session_id = ?",
+    )
+    .bind(&head.session_id)
+    .execute(&mut *tx)
+    .await?;
+    for mark in &write.span_marks {
+        sqlx::query(
+            "UPDATE devtime_spans SET waste = ?, rule_id = ?, lever = ?, finding_key = ?
+             WHERE id = ? AND session_id = ?",
+        )
+        .bind(&mark.waste)
+        .bind(&mark.rule_id)
+        .bind(&mark.lever)
+        .bind(&mark.finding_key)
+        .bind(mark.span_id)
+        .bind(&head.session_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("DELETE FROM devtime_attempt_marks WHERE session_id = ?")
+        .bind(&head.session_id)
+        .execute(&mut *tx)
+        .await?;
+    for mark in &write.attempt_marks {
+        sqlx::query(
+            "INSERT OR REPLACE INTO devtime_attempt_marks
+                (attempt_id, session_id, waste, rule_id, lever, finding_key, verified, verified_by,
+                 rules_version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&mark.attempt_id)
+        .bind(&mark.session_id)
+        .bind(&mark.waste)
+        .bind(&mark.rule_id)
+        .bind(&mark.lever)
+        .bind(&mark.finding_key)
+        .bind(&mark.verified)
+        .bind(&mark.verified_by)
+        .bind(fingerprint)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("DELETE FROM devtime_turn_stats WHERE session_id = ?")
+        .bind(&head.session_id)
+        .execute(&mut *tx)
+        .await?;
+    for stat in &write.turn_stats {
+        sqlx::query(
+            "INSERT OR REPLACE INTO devtime_turn_stats
+                (session_id, turn_seq, project_id, turn_class, started_at, calls, active_ms,
+                 explained_ms, rules_version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&stat.session_id)
+        .bind(stat.turn_seq)
+        .bind(&stat.project_id)
+        .bind(&stat.turn_class)
+        .bind(&stat.started_at)
+        .bind(stat.calls)
+        .bind(stat.active_ms)
+        .bind(stat.explained_ms)
+        .bind(fingerprint)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE devtime_sessions SET rules_version = ?, rules_at = ?,
+            dirty = CASE WHEN updated_at = ? THEN 0 ELSE dirty END
+         WHERE session_id = ?",
+    )
+    .bind(fingerprint)
+    .bind(now())
+    .bind(&head.updated_at)
+    .bind(&head.session_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+/// Replaces a project's cross-session findings for the given rules. Session-scoped findings and
+/// other rules' cross findings are untouched.
+pub async fn replace_cross_findings(
+    pool: &SqlitePool,
+    project_id: &str,
+    rule_ids: &[&str],
+    rows: &[FindingRow],
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    for rule_id in rule_ids {
+        sqlx::query(
+            "DELETE FROM devtime_findings WHERE project_id = ? AND scope = 'cross' AND rule_id = ?",
+        )
+        .bind(project_id)
+        .bind(*rule_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for row in rows {
+        insert_finding(&mut tx, row).await?;
+    }
+    tx.commit().await
+}
+
+/// What the cross-session rules (F) read of one attempt.
+#[derive(Debug, Clone, Default, PartialEq, sqlx::FromRow)]
+pub struct CrossAttempt {
+    pub session_id: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub tool_name: String,
+    pub cmd_program: Option<String>,
+    pub cmd_hash: Option<String>,
+    pub outcome: String,
+    pub error_class: Option<String>,
+    /// A JSON array of `{path, offset}`.
+    pub reads: String,
+}
+
+/// The main-lane attempts of a project's sessions since `since` (a UTC timestamp), in session and
+/// time order.
+pub async fn cross_session_rows(
+    pool: &SqlitePool,
+    project_id: &str,
+    since: &str,
+) -> sqlx::Result<Vec<CrossAttempt>> {
+    sqlx::query_as::<_, CrossAttempt>(
+        "SELECT a.session_id, a.started_at, a.ended_at, a.tool_name, a.cmd_program, a.cmd_hash,
+                a.outcome, a.error_class, a.reads
+         FROM devtime_attempts a
+         JOIN devtime_sessions s ON s.session_id = a.session_id
+         WHERE s.project_id = ? AND a.lane = 'main' AND a.started_at >= ?
+         ORDER BY a.session_id, a.started_at, a.attempt_id",
+    )
+    .bind(project_id)
+    .bind(since)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn finding_by_key(pool: &SqlitePool, key: &str) -> sqlx::Result<Option<FindingRow>> {
+    sqlx::query_as::<_, FindingRow>(
+        "SELECT finding_key, project_id, session_id, scope, rule_id, rule_version, level, waste,
+                lever, confidence, lane, started_at, ended_at, cost_ms, count, attempt_ids, sessions,
+                rules_version, parser_version
+         FROM devtime_findings WHERE finding_key = ?",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The owner's standing mark on one finding.
+#[derive(Debug, Clone, Default, PartialEq, sqlx::FromRow)]
+pub struct FeedbackRow {
+    pub finding_key: String,
+    pub rule_id: String,
+    pub session_id: Option<String>,
+    /// One of [`FEEDBACK_VERDICTS`].
+    pub verdict: String,
+    /// One of [`FEEDBACK_CAUSES`] or [`LEVERS`].
+    pub cause: Option<String>,
+    pub rule_version: Option<i64>,
+    /// Empty on write means now.
+    pub marked_at: String,
+}
+
+/// One standing mark per finding: marking again replaces the earlier mark.
+#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
+pub async fn upsert_feedback(pool: &SqlitePool, row: &FeedbackRow) -> sqlx::Result<()> {
+    let marked_at = if row.marked_at.is_empty() {
+        now()
+    } else {
+        row.marked_at.clone()
+    };
+    sqlx::query(
+        "INSERT INTO devtime_feedback
+            (finding_key, rule_id, session_id, verdict, cause, rule_version, marked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(finding_key) DO UPDATE SET
+            rule_id = excluded.rule_id, session_id = excluded.session_id,
+            verdict = excluded.verdict, cause = excluded.cause,
+            rule_version = excluded.rule_version, marked_at = excluded.marked_at",
+    )
+    .bind(&row.finding_key)
+    .bind(&row.rule_id)
+    .bind(&row.session_id)
+    .bind(&row.verdict)
+    .bind(&row.cause)
+    .bind(row.rule_version)
+    .bind(marked_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// How many current findings of a rule exist and how many of them the owner has judged.
+#[derive(Debug, Clone, Default, PartialEq, sqlx::FromRow)]
+pub struct RuleCaseCounts {
+    pub rule_id: String,
+    /// Findings whose confidence is `exact`.
+    pub exact: i64,
+    /// Findings that are not `exact` but carry a mark.
+    pub inferred_marked: i64,
+    /// Findings marked `not_rework`.
+    pub not_rework: i64,
+    pub total: i64,
+}
+
+/// Per rule, over the findings that exist now: a mark whose finding was recomputed away is kept in
+/// `devtime_feedback` for history but is no longer a case, so the join runs from the findings.
+#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
+pub async fn rule_case_counts(
+    pool: &SqlitePool,
+    since: Option<&str>,
+) -> sqlx::Result<Vec<RuleCaseCounts>> {
+    sqlx::query_as::<_, RuleCaseCounts>(
+        "SELECT f.rule_id AS rule_id,
+                COALESCE(SUM(CASE WHEN f.confidence = 'exact' THEN 1 ELSE 0 END), 0) AS exact,
+                COALESCE(SUM(CASE WHEN f.confidence <> 'exact' AND b.finding_key IS NOT NULL
+                                  THEN 1 ELSE 0 END), 0) AS inferred_marked,
+                COALESCE(SUM(CASE WHEN b.verdict = 'not_rework' THEN 1 ELSE 0 END), 0)
+                    AS not_rework,
+                COUNT(*) AS total
+         FROM devtime_findings f
+         LEFT JOIN devtime_feedback b ON b.finding_key = f.finding_key
+         WHERE (? IS NULL OR f.started_at >= ?)
+         GROUP BY f.rule_id
+         ORDER BY f.rule_id",
+    )
+    .bind(since)
+    .bind(since)
+    .fetch_all(pool)
+    .await
+}
+
+/// How many sessions fired each rule, out of the sessions that have at least one attempt (a session
+/// with none could not have fired anything, so it is not the denominator). Cross findings belong to
+/// no single session's run and are left out.
+#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
+pub async fn rule_base_rates(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+    since: Option<&str>,
+) -> sqlx::Result<(i64, Vec<(String, i64)>)> {
+    let with_tools: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM devtime_sessions s
+         WHERE EXISTS (SELECT 1 FROM devtime_attempts a WHERE a.session_id = s.session_id)
+           AND (? IS NULL OR s.project_id = ?)
+           AND (? IS NULL OR s.started_at >= ?)",
+    )
+    .bind(project_id)
+    .bind(project_id)
+    .bind(since)
+    .bind(since)
+    .fetch_one(pool)
+    .await?;
+    let fired: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT f.rule_id, COUNT(DISTINCT f.session_id)
+         FROM devtime_findings f
+         JOIN devtime_sessions s ON s.session_id = f.session_id
+         WHERE f.scope = 'session'
+           AND EXISTS (SELECT 1 FROM devtime_attempts a WHERE a.session_id = s.session_id)
+           AND (? IS NULL OR s.project_id = ?)
+           AND (? IS NULL OR s.started_at >= ?)
+         GROUP BY f.rule_id
+         ORDER BY f.rule_id",
+    )
+    .bind(project_id)
+    .bind(project_id)
+    .bind(since)
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    Ok((with_tools, fired))
+}
+
+/// Stored per-turn stats, for the unexplained listing.
+#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
+pub async fn turn_stats_rows(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+    since: Option<&str>,
+) -> sqlx::Result<Vec<TurnStatRow>> {
+    sqlx::query_as::<_, TurnStatRow>(
+        "SELECT session_id, turn_seq, project_id, turn_class, started_at, calls, active_ms,
+                explained_ms
+         FROM devtime_turn_stats
+         WHERE (? IS NULL OR project_id = ?) AND (? IS NULL OR started_at >= ?)
+         ORDER BY session_id, turn_seq",
+    )
+    .bind(project_id)
+    .bind(project_id)
+    .bind(since)
+    .bind(since)
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sqlx::Row;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     async fn test_pool() -> sqlx::SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     async fn columns(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {
@@ -948,6 +1497,8 @@ mod tests {
                     "dirty",
                     "parser_version",
                     "updated_at",
+                    "rules_version",
+                    "rules_at",
                 ],
             ),
             (
@@ -1010,6 +1561,9 @@ mod tests {
                     "edits",
                     "reads",
                     "parser_version",
+                    "bg_status",
+                    "refs_in",
+                    "refs_out",
                 ],
             ),
             (
@@ -1028,6 +1582,8 @@ mod tests {
                     "rule_id",
                     "confidence",
                     "parser_version",
+                    "lever",
+                    "finding_key",
                 ],
             ),
             (
@@ -1099,6 +1655,7 @@ mod tests {
                 agent_id: None,
                 model: Some("sonnet".to_string()),
                 bg_task_id: None,
+                refs_out: String::new(),
             },
         )
         .await
@@ -1236,5 +1793,575 @@ mod tests {
             .find(|m| m.r#ref.as_deref() == Some("task-1"))
             .unwrap();
         assert_eq!(one.ts, "2026-10-04T10:00:04.000Z");
+    }
+
+    const T0: &str = "2026-10-04T10:00:00.000Z";
+
+    fn session_row(id: &str, project: &str, dirty: i64) -> SessionRow {
+        SessionRow {
+            session_id: id.to_string(),
+            project_id: project.to_string(),
+            started_at: Some(T0.to_string()),
+            ended_at: Some("2026-10-04T11:00:00.000Z".to_string()),
+            dirty,
+            parser_version: 1,
+            ..Default::default()
+        }
+    }
+
+    async fn add_session(pool: &SqlitePool, id: &str, project: &str, dirty: i64) {
+        let mut tx = begin_chunk(pool).await.unwrap();
+        upsert_session(&mut tx, &session_row(id, project, dirty))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn add_attempt(pool: &SqlitePool, session: &str, id: &str, lane: &str, started: &str) {
+        let mut row = attempt(id);
+        row.session_id = session.to_string();
+        row.lane = lane.to_string();
+        row.started_at = started.to_string();
+        let mut tx = begin_chunk(pool).await.unwrap();
+        upsert_attempt_launch(&mut tx, &row).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    fn span(session: &str, start: &str, end: &str) -> SpanRow {
+        SpanRow {
+            session_id: session.to_string(),
+            lane: "main".to_string(),
+            kind: "tool".to_string(),
+            started_at: start.to_string(),
+            ended_at: end.to_string(),
+            confidence: "exact".to_string(),
+            parser_version: 1,
+            ..Default::default()
+        }
+    }
+
+    fn finding(key: &str, rule: &str, session: &str, scope: &str, confidence: &str) -> FindingRow {
+        FindingRow {
+            finding_key: key.to_string(),
+            project_id: "p1".to_string(),
+            session_id: session.to_string(),
+            scope: scope.to_string(),
+            rule_id: rule.to_string(),
+            rule_version: 1,
+            level: "base".to_string(),
+            waste: "rework".to_string(),
+            lever: "model".to_string(),
+            confidence: confidence.to_string(),
+            lane: "main".to_string(),
+            started_at: T0.to_string(),
+            ended_at: "2026-10-04T10:05:00.000Z".to_string(),
+            cost_ms: 300_000,
+            count: 1,
+            attempt_ids: "[\"a1\"]".to_string(),
+            sessions: String::new(),
+            rules_version: "fp".to_string(),
+            parser_version: 2,
+        }
+    }
+
+    fn span_mark(id: i64, rule: &str, key: &str) -> SpanMark {
+        SpanMark {
+            span_id: id,
+            waste: Some("rework".to_string()),
+            rule_id: Some(rule.to_string()),
+            lever: Some("model".to_string()),
+            finding_key: Some(key.to_string()),
+        }
+    }
+
+    /// Writes `findings` as session `session`'s rule results, reading the head just before.
+    async fn rule_session(pool: &SqlitePool, session: &str, findings: Vec<FindingRow>) {
+        let head = session_head(pool, session).await.unwrap().unwrap();
+        write_rule_results(
+            pool,
+            &head,
+            &RuleWrite {
+                findings,
+                ..Default::default()
+            },
+            "fp",
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn count(pool: &SqlitePool, sql: &'static str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn migration_0171_adds_rule_columns_and_tables() {
+        let pool = test_pool().await;
+        let added: &[(&str, &[&str])] = &[
+            ("devtime_sessions", &["rules_version", "rules_at"]),
+            ("devtime_attempts", &["bg_status", "refs_in", "refs_out"]),
+            ("devtime_spans", &["lever", "finding_key"]),
+            (
+                "devtime_findings",
+                &[
+                    "id",
+                    "finding_key",
+                    "project_id",
+                    "session_id",
+                    "scope",
+                    "rule_id",
+                    "rule_version",
+                    "level",
+                    "waste",
+                    "lever",
+                    "confidence",
+                    "lane",
+                    "started_at",
+                    "ended_at",
+                    "cost_ms",
+                    "count",
+                    "attempt_ids",
+                    "sessions",
+                    "rules_version",
+                    "parser_version",
+                ],
+            ),
+            (
+                "devtime_attempt_marks",
+                &[
+                    "attempt_id",
+                    "session_id",
+                    "waste",
+                    "rule_id",
+                    "lever",
+                    "finding_key",
+                    "verified",
+                    "verified_by",
+                    "rules_version",
+                ],
+            ),
+            (
+                "devtime_feedback",
+                &[
+                    "id",
+                    "finding_key",
+                    "rule_id",
+                    "session_id",
+                    "verdict",
+                    "cause",
+                    "rule_version",
+                    "marked_at",
+                ],
+            ),
+            (
+                "devtime_turn_stats",
+                &[
+                    "session_id",
+                    "turn_seq",
+                    "project_id",
+                    "turn_class",
+                    "started_at",
+                    "calls",
+                    "active_ms",
+                    "explained_ms",
+                    "rules_version",
+                ],
+            ),
+        ];
+        for (table, want) in added {
+            let got = columns(&pool, table).await;
+            for column in *want {
+                assert!(
+                    got.iter().any(|c| c == column),
+                    "{table}.{column} is missing; has {got:?}"
+                );
+            }
+        }
+        for table in [
+            "devtime_findings",
+            "devtime_attempt_marks",
+            "devtime_feedback",
+            "devtime_turn_stats",
+        ] {
+            let want = added.iter().find(|(name, _)| *name == table).unwrap().1;
+            assert_eq!(columns(&pool, table).await.len(), want.len(), "{table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_rule_results_replaces_session_scope_and_clears_dirty() {
+        let pool = test_pool().await;
+        add_session(&pool, "s1", "p1", 1).await;
+        add_attempt(&pool, "s1", "a1", "main", T0).await;
+        replace_spans(
+            &pool,
+            "s1",
+            &[
+                span("s1", T0, "2026-10-04T10:01:00.000Z"),
+                span("s1", "2026-10-04T10:01:00.000Z", "2026-10-04T10:02:00.000Z"),
+            ],
+        )
+        .await
+        .unwrap();
+        let ids: Vec<i64> = session_spans(&pool, "s1")
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        // A cross finding of the same project must survive both writes.
+        replace_cross_findings(
+            &pool,
+            "p1",
+            &["F1"],
+            &[finding("kc", "F1", "s1", "cross", "inferred")],
+        )
+        .await
+        .unwrap();
+
+        let head = session_head(&pool, "s1").await.unwrap().unwrap();
+        assert_eq!(head.dirty, 1);
+        assert_eq!(head.rules_version, None);
+        write_rule_results(
+            &pool,
+            &head,
+            &RuleWrite {
+                findings: vec![finding("k1", "A1", "s1", "session", "exact")],
+                span_marks: vec![span_mark(ids[0], "A1", "k1")],
+                attempt_marks: vec![AttemptMarkRow {
+                    attempt_id: "a1".to_string(),
+                    session_id: "s1".to_string(),
+                    waste: Some("rework".to_string()),
+                    rule_id: Some("A1".to_string()),
+                    lever: Some("model".to_string()),
+                    finding_key: Some("k1".to_string()),
+                    verified: "failed".to_string(),
+                    verified_by: Some("A1".to_string()),
+                }],
+                turn_stats: vec![TurnStatRow {
+                    session_id: "s1".to_string(),
+                    turn_seq: 1,
+                    project_id: "p1".to_string(),
+                    turn_class: "c1".to_string(),
+                    started_at: T0.to_string(),
+                    calls: 3,
+                    active_ms: 60_000,
+                    explained_ms: 60_000,
+                }],
+            },
+            "fp1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM devtime_findings WHERE scope = 'session'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM devtime_turn_stats").await,
+            1
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM devtime_attempt_marks").await,
+            1
+        );
+
+        // The second write has a different finding on the other span: the first one is replaced.
+        let head = session_head(&pool, "s1").await.unwrap().unwrap();
+        assert_eq!(head.dirty, 0, "the first write cleared dirty");
+        assert_eq!(head.rules_version.as_deref(), Some("fp1"));
+        write_rule_results(
+            &pool,
+            &head,
+            &RuleWrite {
+                findings: vec![finding("k2", "B1", "s1", "session", "exact")],
+                span_marks: vec![span_mark(ids[1], "B1", "k2")],
+                ..Default::default()
+            },
+            "fp2",
+        )
+        .await
+        .unwrap();
+        let keys: Vec<String> =
+            sqlx::query_scalar("SELECT finding_key FROM devtime_findings WHERE scope = 'session'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(keys, ["k2"]);
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM devtime_findings WHERE scope = 'cross'"
+            )
+            .await,
+            1,
+            "the cross finding is untouched"
+        );
+        let spans = session_spans(&pool, "s1").await.unwrap();
+        assert_eq!(spans[0].rule_id, None, "the earlier annotation was reset");
+        assert_eq!(spans[0].waste, None);
+        assert_eq!(spans[1].rule_id.as_deref(), Some("B1"));
+        let lever: Option<String> =
+            sqlx::query_scalar("SELECT lever FROM devtime_spans WHERE id = ?")
+                .bind(ids[1])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lever.as_deref(), Some("model"));
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM devtime_attempt_marks").await,
+            0
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM devtime_turn_stats").await,
+            0
+        );
+        let head = session_head(&pool, "s1").await.unwrap().unwrap();
+        assert_eq!(head.rules_version.as_deref(), Some("fp2"));
+        assert_eq!(head.dirty, 0);
+    }
+
+    #[tokio::test]
+    async fn dirty_survives_a_write_racing_new_rows() {
+        let pool = test_pool().await;
+        add_session(&pool, "s1", "p1", 1).await;
+        let head = session_head(&pool, "s1").await.unwrap().unwrap();
+        // Ingestion touches the session after the head was read.
+        sqlx::query("UPDATE devtime_sessions SET updated_at = '2999-01-01T00:00:00.000Z'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        write_rule_results(&pool, &head, &RuleWrite::default(), "fp")
+            .await
+            .unwrap();
+        let after = session_head(&pool, "s1").await.unwrap().unwrap();
+        assert_eq!(
+            after.dirty, 1,
+            "rows arrived mid-run, so the rules still owe a pass"
+        );
+        assert_eq!(after.rules_version.as_deref(), Some("fp"));
+    }
+
+    #[tokio::test]
+    async fn sessions_needing_rules_selects_dirty_null_and_stale() {
+        let pool = test_pool().await;
+        for id in ["dirty", "current", "stale", "never"] {
+            add_session(&pool, id, "p1", i64::from(id == "dirty")).await;
+        }
+        sqlx::query("UPDATE devtime_sessions SET rules_version = 'fp' WHERE session_id IN ('dirty', 'current')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE devtime_sessions SET rules_version = 'old' WHERE session_id = 'stale'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut got = sessions_needing_rules(&pool, "fp", 50).await.unwrap();
+        got.sort();
+        assert_eq!(got, ["dirty", "never", "stale"]);
+        assert_eq!(
+            sessions_needing_rules(&pool, "fp", 2).await.unwrap().len(),
+            2
+        );
+    }
+
+    fn feedback(key: &str, rule: &str, verdict: &str) -> FeedbackRow {
+        FeedbackRow {
+            finding_key: key.to_string(),
+            rule_id: rule.to_string(),
+            session_id: Some("s1".to_string()),
+            verdict: verdict.to_string(),
+            rule_version: Some(1),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn feedback_upsert_keeps_one_mark_per_key_and_case_counts_join_current_findings() {
+        let pool = test_pool().await;
+        add_session(&pool, "s1", "p1", 1).await;
+        rule_session(
+            &pool,
+            "s1",
+            vec![
+                finding("k1", "A1", "s1", "session", "exact"),
+                finding("k2", "A1", "s1", "session", "inferred"),
+                finding("k3", "A1", "s1", "session", "inferred"),
+            ],
+        )
+        .await;
+        upsert_feedback(&pool, &feedback("k1", "A1", "not_rework"))
+            .await
+            .unwrap();
+        upsert_feedback(&pool, &feedback("k2", "A1", "not_rework"))
+            .await
+            .unwrap();
+        // The latest mark wins: k2 is re-marked as confirmed.
+        let mut again = feedback("k2", "A1", "confirmed");
+        again.cause = Some("spec_gap".to_string());
+        upsert_feedback(&pool, &again).await.unwrap();
+        // A mark whose finding no longer exists is kept but is not a case.
+        upsert_feedback(&pool, &feedback("ghost", "A1", "not_rework"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM devtime_feedback").await,
+            3
+        );
+        let verdict: String =
+            sqlx::query_scalar("SELECT verdict FROM devtime_feedback WHERE finding_key = 'k2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(verdict, "confirmed");
+        let counts = rule_case_counts(&pool, None).await.unwrap();
+        assert_eq!(
+            counts,
+            vec![RuleCaseCounts {
+                rule_id: "A1".to_string(),
+                exact: 1,
+                inferred_marked: 1,
+                not_rework: 1,
+                total: 3,
+            }]
+        );
+        assert!(
+            rule_case_counts(&pool, Some("2999-01-01T00:00:00.000Z"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            finding_by_key(&pool, "k3").await.unwrap().unwrap().rule_id,
+            "A1"
+        );
+        assert!(finding_by_key(&pool, "ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn base_rates_exclude_sessions_without_attempts() {
+        let pool = test_pool().await;
+        for id in ["s1", "s2", "s3"] {
+            add_session(&pool, id, "p1", 1).await;
+        }
+        add_session(&pool, "s4", "p2", 1).await;
+        add_attempt(&pool, "s1", "a1", "main", T0).await;
+        add_attempt(&pool, "s3", "a3", "main", T0).await;
+        add_attempt(&pool, "s4", "a4", "main", T0).await;
+        rule_session(
+            &pool,
+            "s1",
+            vec![finding("k1", "A1", "s1", "session", "exact")],
+        )
+        .await;
+        // s2 has no attempt: its finding cannot count, and neither can the session.
+        rule_session(
+            &pool,
+            "s2",
+            vec![finding("k2", "A1", "s2", "session", "exact")],
+        )
+        .await;
+
+        let (sessions, fired) = rule_base_rates(&pool, Some("p1"), None).await.unwrap();
+        assert_eq!(sessions, 2);
+        assert_eq!(fired, [("A1".to_string(), 1)]);
+        let (all, _) = rule_base_rates(&pool, None, None).await.unwrap();
+        assert_eq!(all, 3);
+        let (none, fired) = rule_base_rates(&pool, Some("nobody"), None).await.unwrap();
+        assert_eq!(none, 0);
+        assert!(fired.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attempt_refs_and_bg_status_round_trip() {
+        let pool = test_pool().await;
+        let mut first = attempt("a1");
+        first.refs_in = "[\"aaaaaaaa\"]".to_string();
+        let mut second = attempt("a2");
+        second.tool_use_id = "toolu_2".to_string();
+        let mut tx = begin_chunk(&pool).await.unwrap();
+        upsert_attempt_launch(&mut tx, &first).await.unwrap();
+        upsert_attempt_launch(&mut tx, &second).await.unwrap();
+        complete_attempt(
+            &mut tx,
+            "a1",
+            &AttemptResult {
+                outcome: "launched".to_string(),
+                refs_out: "[\"bbbbbbbb\",\"cccccccc\"]".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        complete_attempt(
+            &mut tx,
+            "a2",
+            &AttemptResult {
+                outcome: "ok".to_string(),
+                exit_code: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A NULL exit code is filled; one the result already carried is kept.
+        set_bg_status(&mut tx, "a1", "failed", Some(2))
+            .await
+            .unwrap();
+        set_bg_status(&mut tx, "a2", "failed", Some(9))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let rows = session_rows(&pool, "s1").await.unwrap();
+        let a1 = rows.attempts.iter().find(|a| a.attempt_id == "a1").unwrap();
+        assert_eq!(a1.refs_in, "[\"aaaaaaaa\"]");
+        assert_eq!(a1.refs_out, "[\"bbbbbbbb\",\"cccccccc\"]");
+        assert_eq!(a1.bg_status.as_deref(), Some("failed"));
+        assert_eq!(a1.exit_code, Some(2));
+        let a2 = rows.attempts.iter().find(|a| a.attempt_id == "a2").unwrap();
+        assert_eq!(
+            a2.refs_in, "[]",
+            "an empty launch holds an empty JSON array"
+        );
+        assert_eq!(a2.refs_out, "[]");
+        assert_eq!(a2.bg_status.as_deref(), Some("failed"));
+        assert_eq!(a2.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn cross_session_rows_are_main_lane_and_windowed() {
+        let pool = test_pool().await;
+        add_session(&pool, "s1", "p1", 1).await;
+        add_session(&pool, "s2", "p1", 1).await;
+        add_session(&pool, "s3", "p2", 1).await;
+        add_attempt(&pool, "s1", "old", "main", "2026-09-01T10:00:00.000Z").await;
+        add_attempt(&pool, "s1", "in1", "main", "2026-10-04T10:00:00.000Z").await;
+        add_attempt(&pool, "s1", "side", "agent:x", "2026-10-04T10:00:01.000Z").await;
+        add_attempt(&pool, "s2", "in2", "main", "2026-10-04T09:00:00.000Z").await;
+        add_attempt(&pool, "s3", "other", "main", "2026-10-04T10:00:00.000Z").await;
+
+        let rows = cross_session_rows(&pool, "p1", "2026-10-01T00:00:00.000Z")
+            .await
+            .unwrap();
+        let seen: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.session_id.as_str(), r.started_at.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("s1", "2026-10-04T10:00:00.000Z"),
+                ("s2", "2026-10-04T09:00:00.000Z"),
+            ],
+            "main lane only, this project only, inside the window, in session then time order"
+        );
+        assert_eq!(rows[0].tool_name, "Bash");
     }
 }

@@ -652,9 +652,7 @@ mod tests {
     use super::*;
 
     async fn test_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_shared_pool().await
     }
 
     /// The check the whole pass rests on. A small model asked to quote will sometimes produce a

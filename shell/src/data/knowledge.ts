@@ -312,6 +312,23 @@ export function useDistillCauses() {
   });
 }
 
+/** The row each flagged row resembles, by row id — `GET /distill/duplicates`. */
+export function useNearDuplicates() {
+  return useQuery({
+    queryKey: keys.knowledge.nearDuplicates,
+    queryFn: () => apiFetch<{ id: number; of_id: number }[]>("/distill/duplicates"),
+    refetchInterval: POLL.queue,
+    // Newest event first, so the first entry per row wins. A daemon without the route: no marks.
+    select: (rows): ReadonlyMap<number, number> => {
+      const byRow = new Map<number, number>();
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (!byRow.has(row.id)) byRow.set(row.id, row.of_id);
+      }
+      return byRow;
+    },
+  });
+}
+
 /**
  * One row's chain and decisions, fetched only when somebody opens it.
  *
@@ -348,6 +365,8 @@ function useKnowledgeDecision<Input, Result>(mutationFn: (input: Input) => Promi
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.knowledge.all });
       void queryClient.invalidateQueries({ queryKey: keys.proposals.all });
+      // The Brain graph and list read notes and knowledge together.
+      void queryClient.invalidateQueries({ queryKey: keys.ownerNotes.all });
     },
   });
 }

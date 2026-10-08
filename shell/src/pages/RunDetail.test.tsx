@@ -145,6 +145,7 @@ function briefingItem(overrides: Partial<BriefingItem> = {}): BriefingItem {
     knowledge_id: 41,
     shown: true,
     s_fts: 0.81,
+    s_sim: 0.62,
     s_scope: 0.2,
     s_structure: 0.55,
     s_recency: 0.1,
@@ -180,6 +181,7 @@ describe("RunDetail — what it was told", () => {
               knowledge_id: 42,
               shown: false,
               s_fts: 0.12,
+              s_sim: 0.0,
               s_scope: 0.44,
               s_structure: 0.67,
               s_recency: 0.23,
@@ -206,10 +208,10 @@ describe("RunDetail — what it was told", () => {
     ).toBeDefined();
 
     const shownItem = screen.getByText("Prefer the narrow gate").closest("li") as HTMLElement;
-    for (const label of ["text match", "scope", "structure", "recency", "use"]) {
+    for (const label of ["text match", "similarity", "scope", "structure", "recency", "use"]) {
       expect(within(shownItem).getByText(label)).toBeDefined();
     }
-    for (const value of ["0.81", "0.20", "0.55", "0.10", "0.33"]) {
+    for (const value of ["0.81", "0.62", "0.20", "0.55", "0.10", "0.33"]) {
       expect(within(shownItem).getByText(value)).toBeDefined();
     }
     expect(screen.queryByText("1.99")).toBeNull();

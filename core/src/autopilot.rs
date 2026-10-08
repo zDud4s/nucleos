@@ -1612,13 +1612,7 @@ pub mod tests {
     }
 
     async fn test_pool() -> SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     /// The stand-in for `~/.nucleos` beside one test's project: inside the project's own temporary

@@ -116,19 +116,45 @@ def history() -> list[dict]:
     return _history_cache["rows"]
 
 
+def _past_runs(rec: dict, field: str) -> tuple[list[dict], str]:
+    """Earlier runs of the same argv that recorded `field`: the last few in this worktree
+    when there are at least two, else the last ones anywhere."""
+    key = [str(a) for a in (rec.get("argv") or [])]
+    rows = [r for r in history() if r.get("argv") == key
+            and r.get("exit") != heavy.EXIT_QUEUE_TIMEOUT
+            and isinstance(r.get(field), (int, float)) and r[field] > 0]
+    wt = heavy._real(rec.get("worktree") or "")
+    here = [r for r in rows if heavy._real(r.get("worktree") or "") == wt][-5:]
+    return (here, "this worktree") if len(here) >= 2 else (rows[-15:], "any worktree")
+
+
+def cpu_progress(rec: dict, used: float | None, field: str) -> str | None:
+    """CPU used so far against the median of what the same command used before (`cpu_s` for
+    the whole run, `prep_cpu_s` for what came before cargo built anything). CPU rather than
+    the wall clock: a job starved by other builds stops advancing instead of running ahead.
+    Never 100% before the job ends, and an estimate, so marked with `~`."""
+    if used is None:
+        return None
+    runs, where = _past_runs(rec, field)
+    vals = [float(r[field]) for r in runs]
+    if len(vals) < 2:
+        return f"{fmt_age(used)} {DIM}cpu used, no CPU history yet{RESET}"
+    usual = statistics.median(vals)
+    if used > usual:
+        return (f"{fmt_age(used)} {DIM}cpu, over the usual{RESET} ~{fmt_age(usual)}"
+                f"  {DIM}({where}, n={len(vals)}){RESET}")
+    frac_done = min(used, usual * 0.99)
+    return (f"~{meter(int(frac_done * 10), int(usual * 10))}  {fmt_age(used)} {DIM}of{RESET}"
+            f" ~{fmt_age(usual)} {DIM}cpu ({where}, n={len(vals)}){RESET}")
+
+
 def estimate(rec: dict) -> str:
     """How long the same command took before: median and spread of the last runs in the
     same worktree when there are at least two (an incremental build there is the closest
     match), else of the last runs anywhere. Runs that never started (exit 75) are left out.
     The spread is shown because it is wide: a full rebuild and an incremental one share an
     argv."""
-    key = [str(a) for a in (rec.get("argv") or [])]
-    rows = [r for r in history() if r.get("argv") == key
-            and r.get("exit") != heavy.EXIT_QUEUE_TIMEOUT
-            and isinstance(r.get("run_s"), (int, float)) and r["run_s"] > 0]
-    wt = heavy._real(rec.get("worktree") or "")
-    here = [r for r in rows if heavy._real(r.get("worktree") or "") == wt][-5:]
-    runs, where = (here, "this worktree") if len(here) >= 2 else (rows[-15:], "any worktree")
+    runs, where = _past_runs(rec, "run_s")
     vals = sorted(float(r["run_s"]) for r in runs)
     if not vals:
         return f"{DIM}unknown (never ran){RESET}"
@@ -243,8 +269,10 @@ def phases_of(argv: list) -> list[str]:
     args = [str(a) for a in argv]
     if not args or not Path(args[0]).stem.lower().startswith("cargo"):
         return ["run"]
-    sub = next((a for a in args[1:] if not a.startswith(("-", "+"))), "")
-    if sub in ("test", "t", "bench") and "--no-run" not in args:
+    words = [a for a in args[1:] if not a.startswith(("-", "+"))][:2]
+    runs_tests = (words[:1] in (["test"], ["t"], ["bench"])
+                  or words in (["nextest", "run"], ["nextest", "r"]))
+    if runs_tests and "--no-run" not in args:
         return ["prepare", "compile", "test"]
     return ["prepare", "compile"]
 
@@ -252,7 +280,7 @@ def phases_of(argv: list) -> list[str]:
 def current_phase(phases: list[str], prog: dict) -> str:
     if phases == ["run"]:
         return "run"
-    if prog.get("binary") and "test" in phases:
+    if (prog.get("binary") or prog.get("runner") == "nextest") and "test" in phases:
         return "test"
     if prog.get("units_total"):
         return "compile"
@@ -355,7 +383,13 @@ def job_block(n: int, f: Path, r: dict, slot: int | None, primed: dict,
     now = current_phase(phases, prog)
     lines.append(field(pad, "phase", phase_line(phases, now)))
 
-    if now == "compile":
+    if now in ("prepare", "run"):
+        if prog.get("step"):
+            lines.append(field(pad, "step", prog["step"]))
+        est = cpu_progress(r, prog.get("cpu_s"), "cpu_s" if now == "run" else "prep_cpu_s")
+        if est:
+            lines.append(field(pad, "progress", est))
+    elif now == "compile":
         done, total = prog["units_done"], prog["units_total"]
         lines.append(field(pad, "progress", f"{meter(done, total)}  {done}/{total} {DIM}units{RESET}"))
     elif now == "test":
@@ -363,12 +397,24 @@ def job_block(n: int, f: Path, r: dict, slot: int | None, primed: dict,
         if total:
             # A test that re-runs its own binary adds its child's `test ... ok` line.
             done = min(done, total)
-        what = f"{DIM}binary {prog.get('binaries')}:{RESET} {prog.get('binary')}"
+        if prog.get("runner") == "nextest":
+            what = f"{DIM}nextest, across {prog.get('binaries')} binaries{RESET}"
+        else:
+            what = f"{DIM}binary {prog.get('binaries')}:{RESET} {prog.get('binary')}"
         if total:
-            lines.append(field(pad, "progress", f"{meter(done, total)}  {done}/{total} {DIM}tests{RESET}"))
+            failed = prog.get("failed")
+            bad = f"   {RED}{failed} failed{RESET}" if failed else ""
+            lines.append(field(pad, "progress",
+                               f"{meter(done, total)}  {done}/{total} {DIM}tests{RESET}{bad}"))
             lines.append(field(pad, "", what))
         else:
             lines.append(field(pad, "progress", f"{what} {DIM}starting…{RESET}"))
+        if prog.get("last_test"):
+            # The runners report a test when it ends, not when it starts: this is the latest to
+            # finish, which is as close to "what is running" as their output gets.
+            name = prog["last_test"]
+            name = name if len(name) <= 72 else "…" + name[-71:]
+            lines.append(field(pad, "finished", name))
 
     infos, tree = job_tree(r.get("pid"), primed)
     owned |= tree

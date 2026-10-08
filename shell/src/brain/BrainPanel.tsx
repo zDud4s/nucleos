@@ -1,12 +1,13 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import type { Edge, Node } from "@xyflow/react";
 import { ApiRefusal } from "../data/client";
+import { useKnowledge, type Known } from "../data/knowledge";
 import {
   LINK_TYPES,
   TARGET_KINDS,
   TEACH_KINDS,
   useAddLink,
+  useNotesGraph,
   useOwnerNote,
   useRemoveLink,
   useTeachNote,
@@ -17,19 +18,32 @@ import {
   type TargetKind,
   type TeachKind,
 } from "../data/owner-notes";
+import { useProjects } from "../data/system";
 import { Button, ConfirmButton, ErrorNote, Quiet, RefusalNote, RelativeTime } from "../ui";
+import { ForceGraph } from "./ForceGraph";
+import { backlinks, buildModel, localModel } from "./graph-model";
+import type { GFilters, GModel, GNode } from "./graph-types";
+import { EDGE_TYPES, NODE_KINDS } from "./GraphFilters";
+import { itemOfNode } from "./item-ref";
 
 /**
  * The side panel of the Brain graph: what the selected node is, and for a note, everything that
  * can be done to it. A note's own text is shown as written; nothing here edits it.
+ *
+ * Backlinks and the local graph read the notes graph WITH archived notes (spec §3.2): a link from
+ * an archived note still points here, and says so. The global graph's archived filter does not
+ * reach this panel.
  */
 
 export interface BrainPanelProps {
-  /** `n:<id>`, `k:<id>` or `<kind>:<ref>`, as `toGraph` names them. */
+  /** `n:<id>`, `k:<id>` or `<kind>:<ref>`, as `buildModel` names them. */
   nodeId: string | null;
+  /** The notes graph the global view drew from (its archived filter applied). */
   graph: NotesGraph;
-  nodes: Node[];
-  edges: Edge[];
+  /** The global model, as filtered: what an entity's "Linked from" is read from. */
+  model: GModel;
+  /** A neighbour picked in the local graph or the backlinks: the same contract as a graph click. */
+  onSelect?: (nodeId: string) => void;
 }
 
 const TEACH_SENTENCES: Record<string, string> = {
@@ -38,51 +52,66 @@ const TEACH_SENTENCES: Record<string, string> = {
   unknown_kind: "The núcleo does not know that kind of lesson.",
 };
 
+/** Everything around a note, whatever the global filters hide: the local graph is the neighbourhood as it is. */
+const LOCAL_FILTERS: GFilters = {
+  state: "all",
+  nodeKinds: new Set(NODE_KINDS),
+  edgeTypes: new Set(EDGE_TYPES),
+  showArchived: true,
+  showOrphans: true,
+};
+
+const EMPTY_KNOWLEDGE: Known[] = [];
+
 /** A refusal as the daemon's own text; anything else means there was no answer. */
 function Failure({ error, sentences }: { error: unknown; sentences?: Record<string, string> }) {
   if (error instanceof ApiRefusal) return <RefusalNote refusal={error} sentences={sentences} />;
   return <ErrorNote>the núcleo did not answer</ErrorNote>;
 }
 
-export function BrainPanel({ nodeId, graph, nodes, edges }: BrainPanelProps) {
+export function BrainPanel({ nodeId, graph, model, onSelect }: BrainPanelProps) {
+  const wide = useNotesGraph(true);
   if (nodeId === null) return <Quiet says="Select a node to see what it is linked to." />;
-  const node = nodes.find((n) => n.id === nodeId);
-  if (node === undefined) return <Quiet says="That node is no longer in the graph." />;
-  if (node.type === "note" && nodeId.startsWith("n:") && node.data.note !== null) {
+  // The archived-inclusive graph decides whether a note exists; the global one stands in while it loads.
+  const known = wide.data ?? graph;
+  const item = itemOfNode(nodeId);
+  if (item?.kind === "note" && known.notes.some((note) => note.id === item.id)) {
     // Keyed by the node, so a title typed or a "proposed" shown for one note never carries over
     // to the next one selected.
-    return <NotePanel key={nodeId} id={Number(nodeId.slice(2))} graph={graph} />;
+    return <NotePanel key={nodeId} id={item.id} graph={known} wide={wide.data} onSelect={onSelect} />;
   }
-  return <OtherPanel node={node} nodes={nodes} edges={edges} />;
+  const node = model.nodes.find((n) => n.id === nodeId);
+  if (node !== undefined) return <OtherPanel node={node} model={model} />;
+  // A well-formed note id the archived-inclusive graph does not know is gone, not merely filtered.
+  if (item?.kind === "note" && wide.data !== undefined) {
+    const gone: GNode = {
+      id: nodeId,
+      kind: "note",
+      ref: String(item.id),
+      label: `note ${item.id}`,
+      bucket: "in_force",
+      missing: true,
+      degree: 0,
+    };
+    return <OtherPanel node={gone} model={model} />;
+  }
+  return <Quiet says="That node is not in the graph as filtered." />;
 }
 
 /** An entity, a knowledge row, or a note that is gone: a label and who points at it. */
-function OtherPanel({ node, nodes, edges }: { node: Node; nodes: Node[]; edges: Edge[] }) {
-  const known = node.data.known as { title: string } | null | undefined;
-  const note = node.data.note as { text: string } | null | undefined;
-  const label =
-    node.type === "knowledge"
-      ? (known?.title ?? "knowledge")
-      : node.type === "note"
-        ? typeof node.data.label === "string"
-          ? node.data.label
-          : "note"
-        : `${String(node.data.kind)}: ${String(node.data.label)}`;
-  const missing = node.data.missing === true;
+function OtherPanel({ node, model }: { node: GNode; model: GModel }) {
+  const label = node.kind === "knowledge" || node.kind === "note" ? node.label : `${node.kind}: ${node.label}`;
   // A note stub that is not gone is one hidden because it is archived.
-  const hidden = node.type === "note" && note === null && !missing;
-  const from = edges
+  const hidden = node.kind === "note" && !node.missing;
+  const from = model.edges
     .filter((edge) => edge.target === node.id)
-    .map((edge) => ({
-      edge,
-      note: nodes.find((n) => n.id === edge.source)?.data.note as { text: string } | null,
-    }));
+    .map((edge) => ({ edge, source: model.nodes.find((n) => n.id === edge.source) }));
 
   return (
     <div className="brain-panel">
       <h3>
         {label}
-        {missing && <span className="brain-node-tag">gone</span>}
+        {node.missing && <span className="brain-node-tag">gone</span>}
         {hidden && <span className="brain-node-tag">archived</span>}
       </h3>
       <h4>Linked from</h4>
@@ -90,9 +119,9 @@ function OtherPanel({ node, nodes, edges }: { node: Node; nodes: Node[]; edges: 
         <Quiet says="Nothing links here." />
       ) : (
         <ul aria-label="Linked from">
-          {from.map(({ edge, note: source }) => (
+          {from.map(({ edge, source }) => (
             <li key={edge.id}>
-              {source?.text ?? edge.source} ({String(edge.label)})
+              {source?.label ?? edge.source} ({edge.type})
             </li>
           ))}
         </ul>
@@ -101,7 +130,18 @@ function OtherPanel({ node, nodes, edges }: { node: Node; nodes: Node[]; edges: 
   );
 }
 
-function NotePanel({ id, graph }: { id: number; graph: NotesGraph }) {
+function NotePanel({
+  id,
+  graph,
+  wide,
+  onSelect,
+}: {
+  id: number;
+  graph: NotesGraph;
+  /** The notes graph with archived notes, once it has answered. */
+  wide: NotesGraph | undefined;
+  onSelect?: (nodeId: string) => void;
+}) {
   const detail = useOwnerNote(id);
   const update = useUpdateNote();
   const remove = useRemoveLink();
@@ -131,6 +171,8 @@ function NotePanel({ id, graph }: { id: number; graph: NotesGraph }) {
       {update.isError && <Failure error={update.error} />}
 
       {!archived && <Teach id={id} />}
+
+      <LocalGraph id={id} wide={wide} onSelect={onSelect} />
 
       <h4>History</h4>
       <ol aria-label="History">
@@ -163,17 +205,106 @@ function NotePanel({ id, graph }: { id: number; graph: NotesGraph }) {
       {remove.isError && <Failure error={remove.error} />}
 
       <h4>Links in</h4>
-      {links_in.length === 0 && <Quiet says="No links in." />}
-      <ul aria-label="Links in">
-        {links_in.map((link) => (
-          <li key={link.id}>
-            {link.link_type} ← note {link.note_id}
-          </li>
-        ))}
-      </ul>
+      <LinksIn id={id} wide={wide} fallback={links_in} onSelect={onSelect} />
 
       <AddLink id={id} />
     </div>
+  );
+}
+
+/**
+ * Every link pointing at this note (its backlinks), archived sources included and marked. Until
+ * the archived-inclusive graph answers, the note's own `links_in` stands in.
+ */
+function LinksIn({
+  id,
+  wide,
+  fallback,
+  onSelect,
+}: {
+  id: number;
+  wide: NotesGraph | undefined;
+  fallback: NoteLink[];
+  onSelect?: (nodeId: string) => void;
+}) {
+  const links = wide === undefined ? fallback : backlinks(wide, "note", String(id));
+  if (links.length === 0) return <Quiet says="No links in." />;
+  return (
+    <ul aria-label="Links in">
+      {links.map((link) => {
+        const source = wide?.notes.find((n) => n.id === link.note_id);
+        const name = source !== undefined ? firstLine(source.text) : `note ${link.note_id}`;
+        return (
+          <li key={link.id}>
+            {link.link_type} ←{" "}
+            {onSelect !== undefined ? (
+              <Button variant="quiet" onClick={() => onSelect(`n:${link.note_id}`)}>
+                {name}
+              </Button>
+            ) : (
+              name
+            )}
+            {source?.state === "archived" && <span className="brain-node-tag">archived</span>}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+/** First line of a note, trimmed: a note has no title of its own. */
+function firstLine(text: string): string {
+  const first = text.trim().split("\n")[0] ?? "";
+  return first.length > 60 ? `${first.slice(0, 59)}…` : first || "(empty note)";
+}
+
+/** The note's neighbourhood at depth 1 (or 2), drawn by the same canvas as the global graph. */
+function LocalGraph({
+  id,
+  wide,
+  onSelect,
+}: {
+  id: number;
+  wide: NotesGraph | undefined;
+  onSelect?: (nodeId: string) => void;
+}) {
+  const [depth, setDepth] = useState<1 | 2>(1);
+  const knowledge = useKnowledge();
+  const projects = useProjects();
+  const self = `n:${id}`;
+  const knownRows = knowledge.data ?? EMPTY_KNOWLEDGE;
+  const projectRows = projects.data;
+  const local = useMemo(
+    () =>
+      wide === undefined ? null : localModel(buildModel(wide, knownRows, projectRows, LOCAL_FILTERS), self, depth),
+    [wide, knownRows, projectRows, self, depth],
+  );
+
+  return (
+    <section className="brain-local" aria-label="Local graph">
+      <div className="brain-local-head">
+        <h4>Local graph</h4>
+        <div role="group" aria-label="Local graph depth">
+          {([1, 2] as const).map((value) => (
+            <Button key={value} variant="quiet" aria-pressed={depth === value} onClick={() => setDepth(value)}>
+              Depth {value}
+            </Button>
+          ))}
+        </div>
+      </div>
+      {local === null ? (
+        <Quiet says="Loading the local graph…" />
+      ) : (
+        <ForceGraph
+          compact
+          model={local}
+          selected={self}
+          onSelect={(nodeId) => {
+            if (nodeId !== self) onSelect?.(nodeId);
+          }}
+        />
+      )}
+    </section>
   );
 }
 
@@ -273,7 +404,7 @@ function Teach({ id }: { id: number }) {
       </Button>
       {teach.isSuccess && (
         <p role="status">
-          Proposed — waiting for your approval in <Link to="/learned">Learned</Link>
+          Proposed — waiting for your approval in <Link to="/brain" search={{ item: `knowledge:${teach.data.knowledge_id}` }}>the Brain</Link>
         </p>
       )}
       {teach.isError && <Failure error={teach.error} sentences={TEACH_SENTENCES} />}

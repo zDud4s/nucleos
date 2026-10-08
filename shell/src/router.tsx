@@ -5,6 +5,7 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
+  redirect,
 } from "@tanstack/react-router";
 import { AppShell } from "./app/AppShell";
 import { RouteError } from "./app/RouteError";
@@ -19,7 +20,6 @@ import { Feed, validateFeedSearch } from "./pages/Feed";
 import { Files } from "./pages/Files";
 import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
-import { Learned } from "./pages/Learned";
 import { Mail } from "./pages/Mail";
 import { MailDetail } from "./pages/MailDetail";
 import { Placeholder } from "./pages/Placeholder";
@@ -68,7 +68,6 @@ export const PAGES: Record<string, () => ReactNode> = {
   "/runs": Runs,
   "/feed": Feed,
   "/projects": Roster,
-  "/learned": Learned,
   "/chats": Chats,
   "/teams": Teams,
   "/council": Council,
@@ -307,8 +306,17 @@ export function createAppRouter(initialPath = "/") {
     }),
   );
 
+  // The Learned page now lives in the Brain; old links and bookmarks land there.
+  const learned = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/learned",
+    beforeLoad: () => {
+      throw redirect({ to: "/brain" });
+    },
+  });
+
   return createRouter({
-    routeTree: rootRoute.addChildren([...routes, ...details]),
+    routeTree: rootRoute.addChildren([...routes, ...details, learned]),
     history: createMemoryHistory({ initialEntries: [initialPath] }),
     /**
      * Nothing here has a loader, so there is nothing to keep warm and nothing

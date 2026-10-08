@@ -607,13 +607,7 @@ mod tests {
     }
 
     async fn migrated_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     async fn convened(pool: &sqlx::SqlitePool, id: &str, rounds: i64) {

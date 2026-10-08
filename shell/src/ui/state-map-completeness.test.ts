@@ -116,7 +116,11 @@ function writtenFeedKinds(): { kinds: Set<string>; files: number; unresolved: st
           else kinds.add(value);
           continue;
         }
-        const qualified = /^(crate(?:::\w+)+)::([A-Z][A-Z0-9_]*)$/.exec(argument.replace(/\s+/g, ""));
+        // `main.rs` is the binary over the lib (`use nucleos_core::*`), so a bare `onboarding::X`
+        // there, or a `nucleos_core::onboarding::X` anywhere, is the lib's `crate::onboarding::X`.
+        let path = argument.replace(/\s+/g, "").replace(/^nucleos_core::/, "crate::");
+        if (name === "main.rs" && !path.startsWith("crate::")) path = `crate::${path}`;
+        const qualified = /^(crate(?:::\w+)+)::([A-Z][A-Z0-9_]*)$/.exec(path);
         if (qualified) {
           const value = byModule.get(qualified[1])?.get(qualified[2]);
           if (value === undefined) unresolved.push(`${name}: ${qualified[0]}`);

@@ -1,15 +1,10 @@
 /**
- * The Learned slice: the four lists of the knowledge store, the row they are
- * all made of, and the chain that unfolds under one. `learned-` throughout, as
- * `waiting-` is for the decision queue and `runs-` for the run index.
+ * The knowledge rows: the row every list is made of, the waiting groups, the
+ * measured summary and the chain that unfolds under a row. Shared by the Learned
+ * page and the Brain page. `learned-` class names are kept as they were.
  *
- * The rule this file lives under: **no class appears in the component that is
- * not defined below.** `tsc` and vitest both pass happily on a class no
- * stylesheet has ever heard of, and the defect shows up only as something
- * looking wrong on a screen nobody is testing.
- *
- * The `ui-` rules the rows lean on — the badge, the buttons, the relative time
- * — are the design system's and are not repeated here.
+ * The rule this file lives under: **no class appears in a component that is
+ * not defined below or in the page stylesheet.**
  */
 
 /**
@@ -25,32 +20,6 @@
  * — the prose measure's value, borrowed by a note. What the note explains is the
  * prose, and the rows below are the wider of the two.
  */
-.learned-filters {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: var(--space-3);
-  margin: 0 0 var(--space-4);
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
-
-.learned-filters > div {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-
-.learned-filters select {
-  margin-left: var(--space-1);
-  padding: var(--space-1) var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  color: var(--text);
-  background: var(--surface);
-}
-
 .learned-lede {
   margin: 0 0 var(--space-4);
   max-width: var(--measure);
@@ -109,6 +78,15 @@
 
 .learned-count {
   color: var(--text-muted);
+}
+
+.learned-duplicate {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.learned-duplicate-mark {
+  font-weight: 600;
 }
 
 .learned-origin {

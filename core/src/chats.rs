@@ -1251,17 +1251,7 @@ mod queue_tests {
     use super::*;
 
     async fn pool_with_a_queue() -> SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     /// A message that waits must be nameable, or nothing can take it back.
@@ -1349,17 +1339,7 @@ mod tests {
     use super::*;
 
     async fn test_pool() -> SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     async fn seed_run(pool: &SqlitePool, chat: &str, status: &str, tools: Option<&str>) {

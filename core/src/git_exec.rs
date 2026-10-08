@@ -3512,7 +3512,7 @@ pub mod tests {
     #[tokio::test]
     async fn o_gate_de_um_merge_fica_em_verify_runs() {
         use crate::vcs::VcsExecutor;
-        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
         let _lock = crate::worktree::test_env_lock();
         let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-rec-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
@@ -3523,16 +3523,7 @@ pub mod tests {
 gate_command: git --version
 ",
         );
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_pool().await;
         let outcome = GitExecutor {
             machine_root: Some(container.path().to_path_buf()),
             pool: Some(pool.clone()),
