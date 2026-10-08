@@ -66,6 +66,10 @@ pub fn build_router(state: AppState) -> Router {
                 .post(crate::distill_model::post_distiller_config),
         )
         .route(
+            "/config/capture-wait",
+            get(get_capture_wait).post(post_capture_wait),
+        )
+        .route(
             "/config/embedding",
             get(crate::embed_model::get_embedding_config)
                 .post(crate::embed_model::post_embedding_config),
@@ -600,6 +604,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/capture-requests/{job_id}/dismiss",
             post(post_capture_dismiss),
+        )
+        .route(
+            "/capture-requests/{job_id}/answer",
+            post(post_capture_answer),
         )
         .route("/assistant/message", post(post_assistant_message))
         // Static segments ahead of `{turn_id}`; matchit prefers the literal, so a chat named like a
@@ -15857,6 +15865,87 @@ async fn post_capture_dismiss(
         Err(CaptureError::Closed) => Err(refusal(StatusCode::CONFLICT, "closed")),
         Err(CaptureError::Db(error)) => {
             tracing::warn!(job_id, %error, "dismissing a capture request failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CaptureAnswerRequest {
+    #[serde(rename = "text")]
+    note_text: String,
+    origin: Option<String>,
+}
+
+/// The owner's answer becomes a note linked to the job; it also closes the request and releases the
+/// job when the request is still open. A late answer keeps its note and releases nothing.
+async fn post_capture_answer(
+    State(state): State<AppState>,
+    Path(job_id): Path<i64>,
+    Json(body): Json<CaptureAnswerRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    use crate::owner_notes::NoteError;
+    let internal = |error: &dyn std::fmt::Display| {
+        tracing::warn!(job_id, %error, "answering a capture request failed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    };
+    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM capture_requests WHERE job_id = ?")
+        .bind(job_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| internal(&error))?
+        .is_some();
+    if !exists {
+        return Err(refusal(StatusCode::NOT_FOUND, "not_found"));
+    }
+    let origin = body.origin.as_deref().unwrap_or("shell");
+    let mut tx = state.pool.begin().await.map_err(|error| internal(&error))?;
+    let note_id =
+        match crate::owner_notes::create_linked_to_job_in(&mut tx, &body.note_text, origin, job_id)
+            .await
+        {
+            Ok(id) => id,
+            Err(NoteError::Empty) => return Err(refusal(StatusCode::BAD_REQUEST, "empty_text")),
+            Err(NoteError::UnknownOrigin) => {
+                return Err(refusal(StatusCode::BAD_REQUEST, "unknown_origin"));
+            }
+            Err(error) => {
+                tracing::warn!(job_id, ?error, "answering a capture request failed");
+                return Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
+            }
+        };
+    let released = crate::capture::close_answered_in(&mut tx, job_id, note_id, chrono::Utc::now())
+        .await
+        .map_err(|error| internal(&error))?;
+    tx.commit().await.map_err(|error| internal(&error))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "note_id": note_id, "released": released })),
+    ))
+}
+
+async fn get_capture_wait(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "minutes": crate::capture::wait_minutes(&state.pool).await }))
+}
+
+#[derive(serde::Deserialize)]
+struct CaptureWaitRequest {
+    minutes: i64,
+}
+
+async fn post_capture_wait(
+    State(state): State<AppState>,
+    Json(body): Json<CaptureWaitRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::capture::WaitError;
+    match crate::capture::set_wait_minutes(&state.pool, body.minutes).await {
+        Ok(()) => Ok(Json(serde_json::json!({ "minutes": body.minutes }))),
+        Err(WaitError::OutOfRange) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "out_of_range" })),
+        )),
+        Err(WaitError::Db(error)) => {
+            tracing::warn!(%error, "setting the capture wait failed");
             Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
         }
     }
@@ -38568,6 +38657,138 @@ mod tests {
         assert_eq!(all[0]["state"], "dismissed");
         let (status, _) = call(state.clone(), "GET", "/capture-requests?state=later", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    async fn request_state(state: &AppState, job_id: i64) -> String {
+        sqlx::query_scalar("SELECT state FROM capture_requests WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn note_count(state: &AppState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM owner_notes")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_answer_becomes_a_job_note_and_releases_the_job() {
+        let state = test_state().await;
+        open_capture_request(&state, 7).await;
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/capture-requests/7/answer",
+            Some(serde_json::json!({ "text": "it was the proxy" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["released"], true);
+        let note_id = body["note_id"].as_i64().unwrap();
+
+        let link: (String, String, String) = sqlx::query_as(
+            "SELECT link_type, target_kind, target_ref FROM owner_note_links WHERE note_id = ?",
+        )
+        .bind(note_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(link, ("relates".into(), "job".into(), "7".into()));
+        assert_eq!(request_state(&state, 7).await, "answered");
+    }
+
+    #[tokio::test]
+    async fn a_late_answer_is_kept_but_releases_nothing() {
+        let state = test_state().await;
+        open_capture_request(&state, 7).await;
+        let (status, _) = call(state.clone(), "POST", "/capture-requests/7/dismiss", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/capture-requests/7/answer",
+            Some(serde_json::json!({ "text": "too late, but true" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["released"], false);
+        assert_eq!(note_count(&state).await, 1);
+        assert_eq!(request_state(&state, 7).await, "dismissed");
+    }
+
+    #[tokio::test]
+    async fn answering_a_job_with_no_request_is_404() {
+        let state = test_state().await;
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/capture-requests/99/answer",
+            Some(serde_json::json!({ "text": "hello" })),
+        )
+        .await;
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::NOT_FOUND, Some("not_found"))
+        );
+        assert_eq!(note_count(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_is_400_and_writes_nothing() {
+        let state = test_state().await;
+        open_capture_request(&state, 7).await;
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/capture-requests/7/answer",
+            Some(serde_json::json!({ "text": "   " })),
+        )
+        .await;
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("empty_text"))
+        );
+        assert_eq!(note_count(&state).await, 0);
+        assert_eq!(request_state(&state, 7).await, "open");
+    }
+
+    #[tokio::test]
+    async fn the_capture_wait_round_trips_and_refuses_out_of_range() {
+        let state = test_state().await;
+        let (status, body) = call(state.clone(), "GET", "/config/capture-wait", None).await;
+        assert_eq!((status, body["minutes"].as_i64()), (StatusCode::OK, Some(120)));
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/config/capture-wait",
+            Some(serde_json::json!({ "minutes": 30 })),
+        )
+        .await;
+        assert_eq!((status, body["minutes"].as_i64()), (StatusCode::OK, Some(30)));
+        let (_, body) = call(state.clone(), "GET", "/config/capture-wait", None).await;
+        assert_eq!(body["minutes"], 30);
+
+        for minutes in [10_081, -1] {
+            let (status, body) = call(
+                state.clone(),
+                "POST",
+                "/config/capture-wait",
+                Some(serde_json::json!({ "minutes": minutes })),
+            )
+            .await;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::UNPROCESSABLE_ENTITY, Some("out_of_range"))
+            );
+        }
+        let (_, body) = call(state, "GET", "/config/capture-wait", None).await;
+        assert_eq!(body["minutes"], 30);
     }
 }
 
