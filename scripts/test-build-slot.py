@@ -300,11 +300,13 @@ def test_gates_wraps_only_the_building_steps() -> None:
     case = [l.strip() for l in lines if l.strip().startswith("case ") and "heavy_run" in l]
     assert len(case) >= 1, case
     subs = case[0].split(" in ", 1)[1].split(")", 1)[0].split("|")
-    assert subs == ["build", "check", "clippy", "test", "run", "doc"], subs
+    assert subs == ["build", "check", "clippy", "test", "nextest", "run", "doc"], subs
     for other in ("tsc", "npm", "go"):
         assert other in text.split("run()", 1)[1].split("kept_lines()", 1)[0], other
     for label in ("core: fmt", "core: clippy", "core: test", "shell/src-tauri: clippy", "shell/src-tauri: test"):
-        assert len([r for r in runs if r.startswith(f'run "{label}"')]) == 1, label
+        # "core: test" appears twice on purpose: cargo nextest when installed, cargo test otherwise.
+        want = 2 if label == "core: test" else 1
+        assert len([r for r in runs if r.startswith(f'run "{label}"')]) == want, label
 
 
 def fake_main(work: Path, with_classify: bool = True) -> tuple[Path, Path]:
