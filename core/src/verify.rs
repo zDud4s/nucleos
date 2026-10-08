@@ -75,11 +75,14 @@ pub struct StatusArgs {
     pub wait: bool,
 }
 
-/// Who asked, as far as verification cares: the owner, or one autonomous run.
+/// Who asked, as far as verification cares: the owner, one autonomous run, or the daemon gating
+/// a job item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Caller {
     Owner,
     Run(i64),
+    /// The daemon's own item gate. `from_scope` never produces it, so no key can claim to be one.
+    Job(i64),
 }
 
 impl Caller {
@@ -97,7 +100,7 @@ impl Caller {
     pub(crate) fn priority(self) -> i64 {
         match self {
             Caller::Owner => PRIORITY_INTERACTIVE,
-            Caller::Run(_) => PRIORITY_AUTONOMOUS,
+            Caller::Run(_) | Caller::Job(_) => PRIORITY_AUTONOMOUS,
         }
     }
 
@@ -106,6 +109,7 @@ impl Caller {
         match self {
             Caller::Owner => "owner".to_owned(),
             Caller::Run(id) => format!("run:{id}"),
+            Caller::Job(id) => format!("job:{id}"),
         }
     }
 }
@@ -115,7 +119,7 @@ impl Caller {
 pub(crate) fn may_read(caller: Caller, row_caller: &str) -> bool {
     match caller {
         Caller::Owner => true,
-        Caller::Run(_) => row_caller == caller.label(),
+        Caller::Run(_) | Caller::Job(_) => row_caller == caller.label(),
     }
 }
 
@@ -234,7 +238,9 @@ pub(crate) async fn resolve_worktree(
             }
             (own, project_id)
         }
-        Caller::Owner => {
+        // The daemon names the job's worktree itself, and it is held to the same registered-
+        // worktree-of-a-known-project check as the owner's.
+        Caller::Owner | Caller::Job(_) => {
             let Some(asked) = asked else {
                 return Err(VerifyError::BadRequest("worktree is required".to_owned()));
             };
@@ -895,6 +901,111 @@ pub(crate) async fn wait_ticket(
     }
 }
 
+/// What an item gate makes of a `scope` verification.
+#[derive(Debug)]
+pub(crate) enum ScopeVerdict {
+    /// The ticket reached a verdict the gate can record.
+    Measured(crate::gate::GateOutcome),
+    /// No unit agreed with the work: nothing was measured, so there is nothing to bless.
+    NothingRan,
+    /// The request could not even be submitted (refused, no ticket): nothing was measured and
+    /// nothing is queued, so the caller falls back to the measurement it made before `scope`.
+    Unavailable,
+}
+
+/// Translates a ticket into the outcome an item gate records. A failed ticket carries the tail of
+/// each failed unit, so the retry prompt still receives the end of the output as it does today.
+pub(crate) fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
+    use crate::gate::GateOutcome;
+
+    if !ticket.done {
+        return ScopeVerdict::Measured(GateOutcome::Errored {
+            reason: "scope verification did not finish in time".to_owned(),
+        });
+    }
+    match ticket.verdict.as_deref() {
+        Some("passed") => ScopeVerdict::Measured(GateOutcome::Passed),
+        Some("nothing_ran") => ScopeVerdict::NothingRan,
+        Some("failed") => {
+            let failed: Vec<&verify_plan::UnitReport> = ticket
+                .units
+                .iter()
+                .filter(|unit| unit.status == "failed")
+                .collect();
+            let exit_code = failed
+                .first()
+                .and_then(|unit| unit.exit_code)
+                .and_then(|code| i32::try_from(code).ok())
+                .unwrap_or(1);
+            let output = failed
+                .iter()
+                .map(|unit| {
+                    let name = unit.group.clone().unwrap_or_else(|| unit.argv.join(" "));
+                    format!(
+                        "== {name} ({}) ==
+{}",
+                        unit.why,
+                        unit.output_tail.as_deref().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                );
+            ScopeVerdict::Measured(GateOutcome::Failed { exit_code, output })
+        }
+        other => ScopeVerdict::Measured(GateOutcome::Errored {
+            reason: format!(
+                "scope verification ended {}",
+                other.unwrap_or("without a verdict")
+            ),
+        }),
+    }
+}
+
+/// Gates a job item over its worktree's diff from its recorded base: `scope` of kind `test`,
+/// cached, at autonomous priority. A ticket that does not finish within `wait` is an `Errored`
+/// outcome, never a pass; the units it queued keep running and may still fill the cache. A request
+/// that cannot be submitted at all is `Unavailable`, and the caller measures the old way instead.
+pub(crate) async fn gate_job_scope(
+    executor: &Arc<Executor>,
+    job_id: i64,
+    worktree: &Path,
+    wait: Duration,
+) -> ScopeVerdict {
+    use crate::gate::GateOutcome;
+
+    let args = VerifyArgs {
+        kind: Kind::Test,
+        scope: ScopeArg::Scope,
+        worktree: Some(worktree.to_string_lossy().into_owned()),
+        files: None,
+        base: None,
+        wait: false,
+    };
+    let id = match submit(executor, Caller::Job(job_id), &args).await {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(
+                job_id,
+                reason = error.message(),
+                "scope verification could not be submitted; the item takes the full gate"
+            );
+            return ScopeVerdict::Unavailable;
+        }
+    };
+    match wait_ticket(&executor.pool, id, wait).await {
+        Ok(Some((ticket, _))) => scope_outcome(&ticket),
+        Ok(None) => ScopeVerdict::Measured(GateOutcome::Errored {
+            reason: format!("scope verification ticket {id} vanished"),
+        }),
+        Err(error) => ScopeVerdict::Measured(GateOutcome::Errored {
+            reason: format!("could not read scope verification ticket {id}: {error}"),
+        }),
+    }
+}
+
 fn refused(error: &VerifyError) -> (StatusCode, String) {
     (error.status(), error.message().to_owned())
 }
@@ -1232,6 +1343,185 @@ tests:
         assert!(!may_read(Caller::Run(3), "run:4"));
         assert!(!may_read(Caller::Run(3), "run:33"));
         assert!(!may_read(Caller::Run(3), "owner"));
+    }
+
+    #[test]
+    fn a_job_caller_is_autonomous_and_labelled_by_its_job() {
+        assert_eq!(Caller::Job(9).priority(), PRIORITY_AUTONOMOUS);
+        assert_eq!(Caller::Job(9).label(), "job:9");
+        assert!(may_read(Caller::Job(9), "job:9"));
+        assert!(!may_read(Caller::Job(9), "job:99"));
+        assert!(!may_read(Caller::Job(9), "run:9"));
+        // No key maps to a job: only the daemon's own gate can be one.
+        for scope in [
+            Scope::Control,
+            Scope::Run(9),
+            Scope::ApiToken(ApiTokenLevel::Admin),
+        ] {
+            assert_ne!(Caller::from_scope(&scope), Some(Caller::Job(9)));
+        }
+    }
+
+    fn unit(
+        group: Option<&str>,
+        status: &str,
+        exit: Option<i64>,
+        tail: Option<&str>,
+    ) -> verify_plan::UnitReport {
+        verify_plan::UnitReport {
+            group: group.map(str::to_owned),
+            argv: vec!["git".to_owned(), "--version".to_owned()],
+            why: "its files changed".to_owned(),
+            status: status.to_owned(),
+            duration_ms: None,
+            exit_code: exit,
+            output_tail: tail.map(str::to_owned),
+            skipped_reason: None,
+            run_id: None,
+            cached_from: None,
+        }
+    }
+
+    fn ticket(done: bool, verdict: Option<&str>, units: Vec<verify_plan::UnitReport>) -> Ticket {
+        Ticket {
+            ticket: 1,
+            done,
+            verdict: verdict.map(str::to_owned),
+            project_id: "alpha".to_owned(),
+            worktree: "/wt".to_owned(),
+            kind: "test".to_owned(),
+            scope: "scope".to_owned(),
+            base: None,
+            note: None,
+            unclaimed: Vec::new(),
+            progress: verify_plan::Progress {
+                total: units.len(),
+                finished: units.len(),
+                queued: 0,
+                running: Vec::new(),
+            },
+            units,
+        }
+    }
+
+    #[test]
+    fn scope_outcome_maps_each_verdict_to_a_gate_outcome() {
+        use crate::gate::GateOutcome;
+
+        let passed = ticket(
+            true,
+            Some("passed"),
+            vec![unit(Some("core"), "passed", Some(0), None)],
+        );
+        assert!(matches!(
+            scope_outcome(&passed),
+            ScopeVerdict::Measured(GateOutcome::Passed)
+        ));
+
+        let failed = ticket(
+            true,
+            Some("failed"),
+            vec![
+                unit(Some("core"), "passed", Some(0), None),
+                unit(Some("py"), "failed", Some(3), Some("py boom")),
+            ],
+        );
+        match scope_outcome(&failed) {
+            ScopeVerdict::Measured(GateOutcome::Failed { exit_code, output }) => {
+                assert_eq!(exit_code, 3);
+                assert!(output.contains("py"), "{output}");
+                assert!(output.contains("py boom"), "{output}");
+                assert!(
+                    !output.contains("core"),
+                    "a passed unit adds nothing: {output}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        let errored = ticket(
+            true,
+            Some("errored"),
+            vec![unit(None, "errored", None, None)],
+        );
+        assert!(matches!(
+            scope_outcome(&errored),
+            ScopeVerdict::Measured(GateOutcome::Errored { .. })
+        ));
+
+        // A ticket that is not done has no verdict to translate: that is a measurement that did
+        // not finish, not a pass.
+        let pending = ticket(false, None, vec![unit(Some("core"), "running", None, None)]);
+        assert!(matches!(
+            scope_outcome(&pending),
+            ScopeVerdict::Measured(GateOutcome::Errored { .. })
+        ));
+
+        let nothing = ticket(true, Some("nothing_ran"), Vec::new());
+        assert!(matches!(scope_outcome(&nothing), ScopeVerdict::NothingRan));
+    }
+
+    async fn insert_job_worktree(f: &Fixture, base: &str) {
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, \
+             created_at, base_sha) \
+             VALUES ('job', 1, 'alpha', ?, ?, 'main', '2026-10-08T00:00:00Z', ?)",
+        )
+        .bind(path_arg(f.repo.path()))
+        .bind(path_arg(f.repo.path()))
+        .bind(base)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_job_gate_scope_runs_only_the_groups_the_job_diff_selects() {
+        use crate::gate::GateOutcome;
+
+        let f = fixture(Some(&plain_map()), None, true).await;
+        // The job tree stands on c2 and was cut from c1: only core/a.rs changed since.
+        insert_job_worktree(&f, &f.c1).await;
+
+        let verdict = gate_job_scope(&f.ex, 1, f.repo.path(), WAIT).await;
+        assert!(
+            matches!(verdict, ScopeVerdict::Measured(GateOutcome::Passed)),
+            "{verdict:?}"
+        );
+        let groups: Vec<String> =
+            sqlx::query_scalar("SELECT group_name FROM verify_runs WHERE origin = 'verify'")
+                .fetch_all(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(groups, vec!["core".to_owned()]);
+        let callers: Vec<String> = sqlx::query_scalar("SELECT caller FROM verify_requests")
+            .fetch_all(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(callers, vec!["job:1".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_job_gate_scope_over_an_unchanged_tree_ran_nothing() {
+        let f = fixture(Some(&plain_map()), None, true).await;
+        insert_job_worktree(&f, &f.c2).await;
+
+        let verdict = gate_job_scope(&f.ex, 1, f.repo.path(), WAIT).await;
+        assert!(matches!(verdict, ScopeVerdict::NothingRan), "{verdict:?}");
+        assert_eq!(count(&f.pool, "verify_runs").await, 0);
+    }
+
+    /// A scope request that cannot even be submitted measured nothing: the caller must be told so
+    /// (and measure the old way), not handed an `Errored` outcome it would record against the item.
+    #[tokio::test]
+    async fn a_job_gate_scope_that_cannot_be_submitted_is_unavailable() {
+        let f = fixture(Some(&plain_map()), None, true).await;
+        // A directory that is no git worktree at all: `submit` refuses before queueing anything.
+        let bare = tempfile::tempdir().unwrap();
+
+        let verdict = gate_job_scope(&f.ex, 1, bare.path(), WAIT).await;
+        assert!(matches!(verdict, ScopeVerdict::Unavailable), "{verdict:?}");
+        assert_eq!(count(&f.pool, "verify_requests").await, 0);
     }
 
     #[test]
