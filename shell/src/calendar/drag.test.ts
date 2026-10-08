@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { moveFromDrop } from "./drag";
 import type { EventOccurrence } from "../data/calendar";

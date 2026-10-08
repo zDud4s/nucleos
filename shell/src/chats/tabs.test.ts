@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { closeTab, openTab, pruneTabs, readTabs } from "./tabs";
 import { CHAT_HUES, chatHue } from "./sessions";

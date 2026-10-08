@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { hitTest, labelVisible, toWorld, type Placed, type Transform } from "./hit-test";
 

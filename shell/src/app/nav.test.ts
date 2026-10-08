@@ -1,3 +1,4 @@
+// @vitest-environment node
 // §spec novo-frontend
 import { describe, expect, it } from "vitest";
 import { NAV, NAV_ITEMS, NAV_PATHS, SYSTEM_ITEM, navItemForPath, sliceOf } from "./nav";

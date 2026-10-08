@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { cacheState, leftText } from "./cache";
 import type { Turn } from "../lib/turns";

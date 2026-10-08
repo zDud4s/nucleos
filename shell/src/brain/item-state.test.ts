@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { knownBucket, noteBucket, passesState } from "./item-state";
 import type { StateBucket } from "./graph-types";

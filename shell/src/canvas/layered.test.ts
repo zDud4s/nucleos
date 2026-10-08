@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { GAP_Y, NODE_H, backEdges, layout, widthOf, wrap } from "./layered";
 
