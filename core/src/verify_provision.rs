@@ -215,6 +215,15 @@ async fn has_provenance(path: &str) -> bool {
     }
 }
 
+/// Whether the record in this worktree's private git directory can be read. A corrupt record is
+/// reported and left untouched, so it must not hold the shared `info/exclude` block for ever.
+async fn has_readable_provenance(path: &str) -> bool {
+    match git_dir(Path::new(path)).await {
+        Ok(dir) => matches!(read_provenance(&dir).await, Ok(Some(_))),
+        Err(_) => false,
+    }
+}
+
 async fn is_tracked(worktree: &Path, rel: &str) -> Result<bool, String> {
     let out = git(worktree, &["--literal-pathspecs", "ls-files", "--", rel]).await?;
     if !out.succeeded() {
@@ -579,7 +588,7 @@ pub(crate) async fn reconcile(
         // The shared block stays while any worktree still has something recorded under it.
         let mut remaining = false;
         for path in every_worktree(root).await? {
-            if has_provenance(&path).await {
+            if has_readable_provenance(&path).await {
                 remaining = true;
                 break;
             }
@@ -1192,6 +1201,42 @@ mod tests {
         assert!(
             exclude.contains(BLOCK_START),
             "a record remains, so the files stay hidden: {exclude}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_provenance_does_not_hold_the_exclude_block() {
+        let repo = repo();
+        let (_keep, wt) = linked(repo.path(), "wt");
+        let pool = pool_with(repo.path(), true).await;
+        reconcile(&pool, "alpha", EXE).await.unwrap();
+        let wt_git_dir = PathBuf::from(git_in(&wt, &["rev-parse", "--absolute-git-dir"]));
+        let record = wt_git_dir.join(PROVENANCE_FILE);
+        std::fs::write(&record, "{not json").unwrap();
+        let record_before = std::fs::read(&record).unwrap();
+        let mcp_before = std::fs::read(wt.join(MCP)).unwrap();
+        let settings_before = std::fs::read(wt.join(SETTINGS)).unwrap();
+
+        let off = switch(&pool, &Scope::Control, "alpha", false, EXE)
+            .await
+            .unwrap();
+
+        let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert!(
+            !exclude.contains(BLOCK_START),
+            "an unreadable record holds nothing hidden: {exclude}"
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), record_before);
+        assert_eq!(std::fs::read(wt.join(MCP)).unwrap(), mcp_before);
+        assert_eq!(std::fs::read(wt.join(SETTINGS)).unwrap(), settings_before);
+        let report = report_for(&off.worktrees, &wt).await;
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unreadable")),
+            "the report keeps the reason: {:?}",
+            report.reason
         );
     }
 

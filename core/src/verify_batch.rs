@@ -1,5 +1,5 @@
 //! Pure. Which commits one post-merge gate covers (spec 2026-10-05 §6.1).
-//! Called by nothing yet; F3-2 wires it.
+//! Driven by `verify_postgate_worker`.
 
 /// What the gate knows about one target branch.
 pub struct TargetState<'a> {
@@ -24,6 +24,9 @@ pub struct Commit {
 pub enum Idle {
     Running,
     UpToDate,
+    /// The tip changed but the first-parent list `(last_green, tip]` is empty. A caller must never
+    /// reach this by turning a git failure into an empty list: that is an error, not idleness.
+    NothingSinceGreen,
 }
 
 /// One gate's worth of commits.
@@ -55,6 +58,9 @@ pub fn decide(state: &TargetState<'_>, since_green: &[Commit]) -> Decision {
     }
     if Some(state.tip) == state.last_attempted || Some(state.tip) == state.last_green {
         return Decision::Idle(Idle::UpToDate);
+    }
+    if since_green.is_empty() {
+        return Decision::Idle(Idle::NothingSinceGreen);
     }
     if let Some(last) = since_green.last()
         && last.sha == state.tip
@@ -117,6 +123,18 @@ mod tests {
         assert_eq!(
             decide(&st, &commits(&["b", "c"])),
             Decision::Idle(Idle::Running)
+        );
+    }
+
+    #[test]
+    fn a_new_tip_with_nothing_since_green_is_idle() {
+        assert_eq!(
+            decide(&state("c3", Some("c1"), None, false), &[]),
+            Decision::Idle(Idle::NothingSinceGreen)
+        );
+        assert_eq!(
+            decide(&state("c3", None, None, false), &[]),
+            Decision::Idle(Idle::NothingSinceGreen)
         );
     }
 
