@@ -2957,10 +2957,16 @@ pub fn implement_prompt(
          of the earlier items; this is the only one you do.\n\n\
          {description}\n\n\
          The full queue is in {artifacts}/plan.json for context. Do not start another item and do \
-         not edit that file. Your work is verified after you finish, so leave the tree building. \
-         That check is the project's gate, and it runs the whole test suite the moment you stop, \
-         so do not run the whole suite yourself: run the narrowest check that tells you your change \
-         works. A command that prints nothing for long is taken for a hang, and it ends this item. \
+         not edit that file. Your work is verified by the daemon after you finish, so leave the \
+         tree building, and do not run the whole suite yourself. While you work, check your change \
+         with the verify tool: kind test (or check for a quick compile), scope own, and files set \
+         to the paths you changed. It runs only the tests those files select, and answers within \
+         about 45 seconds with the result or a ticket and its progress. While a ticket is not \
+         done, call verify_status with it instead of starting the same check again. If the project \
+         has no test map, own runs nothing and says so; then run the narrowest test that tells you \
+         your change works. If you hand part of this item to subagents, tell each one to call \
+         verify with scope own and the files it changed. A command of yours that prints nothing \
+         for long is taken for a hang, and it ends this item. \
          Leave it UNCOMMITTED: the job commits for you once the gate agrees, and committing by hand \
          stops this item to ask permission for something already arranged.",
         ordinal + 1
@@ -4337,6 +4343,46 @@ async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -> Step {
     }
 }
 
+/// Which measurement an item's gate takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemGate {
+    /// The project's whole gate command, as it has always been.
+    Full,
+    /// `verify(scope)` over the job worktree's diff from its recorded base.
+    Scope,
+}
+
+/// `Scope` only for an intermediate item, with a map the measured work cannot have rewritten, and
+/// an executor to run it on. The last item is always `Full`: it is the one measurement a partial
+/// can be trusted on, so a test map never narrows it. Every other case keeps today's behaviour,
+/// because nothing may measure less than it does now without a map worth trusting.
+fn item_gate(last: bool, map_trusted: bool, executor_running: bool) -> ItemGate {
+    if !last && map_trusted && executor_running {
+        ItemGate::Scope
+    } else {
+        ItemGate::Full
+    }
+}
+
+/// True when the job tree holds a valid test map that is byte-identical to the project root's.
+///
+/// Same reason as `tampered_gate_script`: a verdict must not depend on a file the work being
+/// measured may have rewritten. An agent that narrowed `nucleos.tests.yaml` would otherwise pick
+/// which tests judge it. Blocking: reads files from disk.
+fn map_is_trusted(worktree: &Path, project_root: &Path) -> bool {
+    if !matches!(
+        crate::tests_map::load(worktree),
+        crate::tests_map::MapState::Valid(_)
+    ) {
+        return false;
+    }
+    let read = |root: &Path| std::fs::read(root.join(crate::tests_map::MAP_FILE));
+    match (read(worktree), read(project_root)) {
+        (Ok(tree), Ok(root)) => tree == root,
+        _ => false,
+    }
+}
+
 async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize) -> Step {
     let pool = &state.pool;
     let last = ordinal + 1 == items;
@@ -4405,6 +4451,56 @@ async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize)
         )
         .await;
     };
+
+    // An intermediate item with a trusted test map is measured by the daemon's verify executor
+    // over the job's own diff; everything else falls through to the full gate below, untouched.
+    let executor = if last {
+        None
+    } else {
+        crate::verify::installed()
+    };
+    let trusted = if executor.is_some() {
+        let tree = worktree.clone();
+        let root = PathBuf::from(&job.project_root);
+        tokio::task::spawn_blocking(move || map_is_trusted(&tree, &root))
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if item_gate(last, trusted, executor.is_some()) == ItemGate::Scope
+        && let Some(executor) = executor
+    {
+        if matches!(set_live_status(pool, job.id, "gating").await, Ok(false)) {
+            return Step::Stopped;
+        }
+        let verdict = crate::verify::gate_job_scope(
+            &executor,
+            job.id,
+            &worktree,
+            crate::state::DEFAULT_GATE_TIMEOUT,
+        )
+        .await;
+        if matches!(
+            set_live_status(pool, job.id, "implementing").await,
+            Ok(false)
+        ) {
+            tracing::info!(
+                job_id = job.id,
+                ordinal,
+                "job ended while its gate ran; the outcome is not recorded"
+            );
+            return Step::Stopped;
+        }
+        return match verdict {
+            crate::verify::ScopeVerdict::Measured(outcome) => {
+                record_gate(state, job, ordinal, outcome).await
+            }
+            crate::verify::ScopeVerdict::NothingRan => {
+                pass_without_measuring("the test map selects no group for the job's diff").await
+            }
+        };
+    }
 
     // Both writes are compare-and-set, and losing either stops the pass. A gate takes minutes, and
     // a cancel is most likely to land inside one: the old unconditional `implementing` afterwards
@@ -14082,6 +14178,92 @@ mod tests {
         assert_eq!(item_statuses(&pool, job_id).await[1], "gate_errored");
     }
 
+    // ---- intermediate gates by scope -----------------------------------------------------------
+
+    /// The last item is the one measurement a partial can be trusted on, so a test map never
+    /// narrows it: the decision is `Full` whatever the map and the executor say.
+    #[test]
+    fn the_last_item_keeps_the_full_gate_even_with_a_test_map() {
+        assert_eq!(item_gate(true, true, true), ItemGate::Full);
+        assert_eq!(item_gate(true, true, false), ItemGate::Full);
+        assert_eq!(item_gate(true, false, true), ItemGate::Full);
+        assert_eq!(item_gate(true, false, false), ItemGate::Full);
+    }
+
+    #[test]
+    fn an_intermediate_item_with_a_trusted_map_gates_by_scope() {
+        assert_eq!(item_gate(false, true, true), ItemGate::Scope);
+    }
+
+    /// Never measure less than today without a map the work being measured cannot have rewritten,
+    /// and a running executor to measure it with.
+    #[test]
+    fn an_intermediate_item_falls_back_to_the_full_gate_without_map_or_executor() {
+        assert_eq!(item_gate(false, false, true), ItemGate::Full);
+        assert_eq!(item_gate(false, true, false), ItemGate::Full);
+        assert_eq!(item_gate(false, false, false), ItemGate::Full);
+    }
+
+    #[test]
+    fn a_job_tree_map_that_differs_from_the_project_roots_is_not_trusted() {
+        let map = "version: 1
+tests:
+  groups:
+    core:
+      paths: [core/]
+      check: git --version
+      command: git --version
+";
+        let write = |dir: &std::path::Path, text: &str| {
+            std::fs::write(dir.join(crate::tests_map::MAP_FILE), text).unwrap();
+        };
+
+        // Byte-identical and valid: trusted.
+        let root = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        write(root.path(), map);
+        write(tree.path(), map);
+        assert!(map_is_trusted(tree.path(), root.path()));
+
+        // Still a valid map, but not the project's: the work may have narrowed it.
+        write(tree.path(), &map.replace("core/", "core/only/"));
+        assert!(!map_is_trusted(tree.path(), root.path()));
+
+        // Absent from the job tree.
+        let bare = tempfile::tempdir().unwrap();
+        assert!(!map_is_trusted(bare.path(), root.path()));
+
+        // Invalid, even when both sides agree on it.
+        let broken_root = tempfile::tempdir().unwrap();
+        let broken_tree = tempfile::tempdir().unwrap();
+        write(broken_root.path(), "version: [");
+        write(broken_tree.path(), "version: [");
+        assert!(!map_is_trusted(broken_tree.path(), broken_root.path()));
+    }
+
+    #[test]
+    fn an_implement_node_is_told_to_verify_its_own_files_through_the_daemon() {
+        let prompt = implement_prompt("x", 0, 2, "/wt/.nucleos", &[], None, None);
+        assert!(prompt.contains("verify_status"), "{prompt}");
+        assert!(prompt.contains("scope own"), "{prompt}");
+        assert!(
+            prompt.contains("files set to the paths you changed"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("tell each one to call verify"), "{prompt}");
+        assert!(prompt.contains("kind test"), "{prompt}");
+        // What the older prompt tests fix stays true.
+        assert!(
+            prompt.contains("do not run the whole suite yourself"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("taken for a hang"), "{prompt}");
+        assert!(prompt.contains("the job commits for you"), "{prompt}");
+        // The old claim that the whole suite runs the moment the node stops is no longer true of
+        // an intermediate item.
+        assert!(!prompt.contains("runs the whole test suite"), "{prompt}");
+    }
+
     // ---- surviving a restart -------------------------------------------------------------------
 
     /// Decision 11. The discriminator cannot be liveness: by the time this runs, the startup pass
@@ -14187,12 +14369,18 @@ mod tests {
              of the earlier items; this is the only one you do.\n\n\
              write the thing\n\n\
              The full queue is in /wt/.nucleos/plan.json for context. Do not start another item \
-             and do not edit that file. Your work is verified after you finish, so leave the tree \
-             building. That check is the project's gate, and it runs the whole test suite the \
-             moment you stop, so do not run the whole suite yourself: run the narrowest check \
-             that tells you your change works. A command that prints nothing for long is taken \
-             for a hang, and it ends this item. Leave it UNCOMMITTED: the job commits for you \
-             once the gate agrees, and \
+             and do not edit that file. Your work is verified by the daemon after you finish, so \
+             leave the tree building, and do not run the whole suite yourself. While you work, \
+             check your change with the verify tool: kind test (or check for a quick compile), \
+             scope own, and files set to the paths you changed. It runs only the tests those \
+             files select, and answers within about 45 seconds with the result or a ticket and \
+             its progress. While a ticket is not done, call verify_status with it instead of \
+             starting the same check again. If the project has no test map, own runs nothing and \
+             says so; then run the narrowest test that tells you your change works. If you hand \
+             part of this item to subagents, tell each one to call verify with scope own and the \
+             files it changed. A command of yours that prints nothing for long is taken for a \
+             hang, and it ends this item. Leave it UNCOMMITTED: the job commits for you once the \
+             gate agrees, and \
              committing by hand stops this item to ask permission for something already arranged."
         );
         // Said twice on purpose: the equality above is the guarantee, and this says what it is a
