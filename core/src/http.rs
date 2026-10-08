@@ -3914,6 +3914,9 @@ struct ProjectRules {
     /// moment entirely — and a brake nobody can see through this route is one nobody thinks to
     /// check when a landing takes twenty minutes.
     gate_before_publish: bool,
+    /// Whether this project's IDE verify switch is on (`POST /projects/{id}/ide-verify`). Served
+    /// read-only here so the owner's toggle can show it; nothing on this route flips it.
+    ide_verify: bool,
     /// Who answers an approval a conversation on `auto` would otherwise put to a person.
     judge: JudgeView,
     schedules: Vec<ScheduleView>,
@@ -4057,6 +4060,9 @@ async fn get_project_rules(
     // Read before the struct takes `id`, which is what the borrow checker was pointing at and is
     // also the clearer order: every other field here is gathered above.
     let judge: JudgeView = crate::project_policy::judge(&state.pool, &id).await.into();
+    let ide_verify = crate::autopilot::ide_verify_enabled(&state.pool, &id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(ProjectRules {
         project_id: id,
@@ -4066,6 +4072,7 @@ async fn get_project_rules(
         rules_error,
         gate_command: loaded.gate_command.clone(),
         gate_before_publish: loaded.gate_before_publish,
+        ide_verify,
         judge,
         schedules,
         repo_triggers,
@@ -19782,6 +19789,39 @@ mod tests {
         assert_eq!(body["rules_file"], "absent");
         assert!(body["rules_error"].is_null());
         assert!(body["project_root"].is_null());
+    }
+
+    /// The owner's IDE-verify toggle in the shell has to show the switch's current state, and this
+    /// is the only read of it: the roster is polled and visible to read-only keys. The route only
+    /// reports; flipping stays on `POST /projects/{id}/ide-verify`.
+    #[tokio::test]
+    async fn the_rules_read_reports_the_ide_verify_switch_and_never_flips_it() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'shadow')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = read_rules(state.clone(), "alpha").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ide_verify"], false);
+
+        sqlx::query("UPDATE autopilot_state SET ide_verify = 1 WHERE project_id = 'alpha'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (_, body) = read_rules(state.clone(), "alpha").await;
+        assert_eq!(body["ide_verify"], true);
+
+        // Reading it again changes nothing: the switch is still on.
+        let (_, body) = read_rules(state.clone(), "alpha").await;
+        assert_eq!(body["ide_verify"], true);
+        let stored: i64 =
+            sqlx::query_scalar("SELECT ide_verify FROM autopilot_state WHERE project_id = 'alpha'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, 1);
     }
 
     async fn set_wip_limit(state: AppState, id: &str, body: serde_json::Value) -> StatusCode {
