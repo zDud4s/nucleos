@@ -15874,7 +15874,14 @@ async fn post_capture_dismiss(
     Path(job_id): Path<i64>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     use crate::capture::CaptureError;
-    match crate::capture::dismiss(&state.pool, job_id, chrono::Utc::now()).await {
+    let dismissed = crate::capture::retry_busy(
+        crate::capture::BUSY_ATTEMPTS,
+        crate::capture::BUSY_PAUSE,
+        |error: &CaptureError| matches!(error, CaptureError::Db(db) if crate::capture::is_busy(db)),
+        || crate::capture::dismiss(&state.pool, job_id, chrono::Utc::now()),
+    )
+    .await;
+    match dismissed {
         Ok(()) => Ok(StatusCode::OK),
         Err(CaptureError::NotFound) => Err(refusal(StatusCode::NOT_FOUND, "not_found")),
         Err(CaptureError::Closed) => Err(refusal(StatusCode::CONFLICT, "closed")),
@@ -15914,29 +15921,47 @@ async fn post_capture_answer(
         return Err(refusal(StatusCode::NOT_FOUND, "not_found"));
     }
     let origin = body.origin.as_deref().unwrap_or("shell");
-    let mut tx = state.pool.begin().await.map_err(|error| internal(&error))?;
-    let note_id =
-        match crate::owner_notes::create_linked_to_job_in(&mut tx, &body.note_text, origin, job_id)
-            .await
-        {
-            Ok(id) => id,
-            Err(NoteError::Empty) => return Err(refusal(StatusCode::BAD_REQUEST, "empty_text")),
-            Err(NoteError::UnknownOrigin) => {
-                return Err(refusal(StatusCode::BAD_REQUEST, "unknown_origin"));
-            }
-            Err(error) => {
-                tracing::warn!(job_id, ?error, "answering a capture request failed");
-                return Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
-            }
-        };
-    let released = crate::capture::close_answered_in(&mut tx, job_id, note_id, chrono::Utc::now())
-        .await
-        .map_err(|error| internal(&error))?;
-    tx.commit().await.map_err(|error| internal(&error))?;
+    // A busy database is retried: the owner typed this once, and another writer holding the lock
+    // past busy_timeout is no reason to lose it.
+    let answered = crate::capture::retry_busy(
+        crate::capture::BUSY_ATTEMPTS,
+        crate::capture::BUSY_PAUSE,
+        |error: &NoteError| matches!(error, NoteError::Db(db) if crate::capture::is_busy(db)),
+        || answer_capture_once(&state.pool, job_id, &body.note_text, origin),
+    )
+    .await;
+    let (note_id, released) = match answered {
+        Ok(done) => done,
+        Err(NoteError::Empty) => return Err(refusal(StatusCode::BAD_REQUEST, "empty_text")),
+        Err(NoteError::UnknownOrigin) => {
+            return Err(refusal(StatusCode::BAD_REQUEST, "unknown_origin"));
+        }
+        Err(error) => {
+            tracing::warn!(job_id, ?error, "answering a capture request failed");
+            return Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
+        }
+    };
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "note_id": note_id, "released": released })),
     ))
+}
+
+/// One attempt at an answer: the note, its link and the request's close commit together or not at
+/// all, so a retry after a busy database never finds half of the previous try.
+async fn answer_capture_once(
+    pool: &sqlx::SqlitePool,
+    job_id: i64,
+    text: &str,
+    origin: &str,
+) -> Result<(i64, bool), crate::owner_notes::NoteError> {
+    let mut tx = pool.begin().await?;
+    let note_id =
+        crate::owner_notes::create_linked_to_job_in(&mut tx, text, origin, job_id).await?;
+    let released =
+        crate::capture::close_answered_in(&mut tx, job_id, note_id, chrono::Utc::now()).await?;
+    tx.commit().await?;
+    Ok((note_id, released))
 }
 
 async fn get_capture_wait(State(state): State<AppState>) -> Json<serde_json::Value> {
