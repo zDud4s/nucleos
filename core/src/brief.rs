@@ -99,10 +99,10 @@ fn normalise_fts(bm25: &[Option<f64>]) -> Vec<f64> {
         return vec![0.0; raw.len()];
     }
 
-    let lo = raw
-        .iter()
-        .map(|value| value.unwrap_or(0.0))
-        .fold(f64::INFINITY, f64::min);
+    // The floor is zero and not the weakest score of the pass: a matched row must never normalise
+    // to 0, or the weakest of several matches would be indistinguishable from a non-match and fall
+    // under `knowledge::MIN_RELEVANCE`. A sole match is still 1.0 (hi / hi).
+    let lo = 0.0_f64;
     let hi = raw
         .iter()
         .map(|value| value.unwrap_or(0.0))
@@ -151,10 +151,11 @@ async fn fts_ranks(
 
 /// Recall only D12-approved (`active`) knowledge in the daemon-selected scope.
 ///
-/// `live` rows arrive ONLY through the automatic briefing, with a floor of one item in the last
-/// scope group, so if node 1 leaves five facts, node 2 is guaranteed one and may not see the
-/// others. That is deliberate. Errors propagate here because the HTTP handler decides how they are
-/// reported.
+/// `live` rows arrive ONLY through the automatic briefing. Like every other candidate, a `live`
+/// row must first clear `knowledge::MIN_RELEVANCE` on its textual signal, and only then can a layer
+/// floor apply: a live finding from node 1 reaches node 2 only when it matches node 2's task text,
+/// and node 2 may not see the others. That is deliberate. Errors propagate here because the HTTP
+/// handler decides how they are reported.
 pub async fn recall(
     pool: &SqlitePool,
     scope: &Scope,
@@ -219,8 +220,7 @@ pub(crate) async fn of_with(
     embedder: Option<&dyn crate::embed::Embedder>,
     deadline: std::time::Duration,
 ) -> sqlx::Result<Brief> {
-    let scope = context.chain.last().unwrap_or(&Scope::Machine);
-    let mut known = knowledge::for_scope(pool, scope).await?;
+    let mut known = knowledge::for_context(pool, context).await?;
     let candidate_ids: Vec<i64> = known.iter().map(|candidate| candidate.id).collect();
     let ranks = match match_expression(query) {
         Some(expression) => match fts_ranks(pool, &expression, &candidate_ids).await {
@@ -936,6 +936,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         }
     }
 
@@ -1034,7 +1036,8 @@ mod tests {
         );
         assert_eq!(normalise_fts(&[Some(-3.0)]), vec![1.0]);
         assert_eq!(normalise_fts(&[Some(-2.0), Some(-2.0)]), vec![1.0, 1.0]);
-        assert_eq!(normalise_fts(&[Some(-4.0), Some(-1.0)]), vec![1.0, 0.0]);
+        // A matched row never normalises to 0: the weakest match keeps its proportion of the best.
+        assert_eq!(normalise_fts(&[Some(-4.0), Some(-1.0)]), vec![1.0, 0.25]);
         assert_eq!(normalise_fts(&[Some(f64::NAN), Some(-1.0)]), vec![0.0, 1.0]);
 
         assert_eq!(match_expression(""), None);

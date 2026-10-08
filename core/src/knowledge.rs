@@ -135,6 +135,10 @@ pub enum Scope {
     /// The house. `scope_id` is NULL, and only here.
     Machine,
     Project(String),
+    /// A team of agents. Read by an agent that belongs to it, and by nobody else.
+    Team(String),
+    /// One agent's own memory. Read by that agent, and by nobody else.
+    Agent(String),
     /// A job, and the project it belongs to when the caller knows it.
     #[cfg_attr(not(test), allow(dead_code))]
     Job {
@@ -149,6 +153,8 @@ impl Scope {
         match (kind, id) {
             ("machine", None) => Some(Scope::Machine),
             ("project", Some(id)) => Some(Scope::Project(id.to_owned())),
+            ("team", Some(id)) => Some(Scope::Team(id.to_owned())),
+            ("agent", Some(id)) => Some(Scope::Agent(id.to_owned())),
             ("job", Some(id)) => Some(Scope::Job {
                 id: id.parse().ok()?,
                 project: None,
@@ -166,6 +172,8 @@ impl Scope {
         match self {
             Scope::Machine => {}
             Scope::Project(id) => chain.push(("project", Some(id.clone()))),
+            Scope::Team(id) => chain.push(("team", Some(id.clone()))),
+            Scope::Agent(id) => chain.push(("agent", Some(id.clone()))),
             Scope::Job { id, project } => {
                 if let Some(project) = project {
                     chain.push(("project", Some(project.clone())));
@@ -181,7 +189,21 @@ impl Scope {
         match self {
             Scope::Machine => ("machine", None),
             Scope::Project(id) => ("project", Some(id.clone())),
+            Scope::Team(id) => ("team", Some(id.clone())),
+            Scope::Agent(id) => ("agent", Some(id.clone())),
             Scope::Job { id, .. } => ("job", Some(id.to_string())),
+        }
+    }
+
+    /// Where the scope sits in the full chain `machine` -> `project` -> `team` -> `agent` -> `job`:
+    /// the more specific the scope, the higher the rank.
+    fn rank(&self) -> u8 {
+        match self {
+            Scope::Machine => 0,
+            Scope::Project(_) => 1,
+            Scope::Team(_) => 2,
+            Scope::Agent(_) => 3,
+            Scope::Job { .. } => 4,
         }
     }
 
@@ -270,6 +292,10 @@ pub struct Context {
     /// Whether this briefing has a query vector (spec 5.2): absence is per briefing, not per row.
     /// Set only by `brief`.
     pub query_embedded: bool,
+    /// The agent doing the work, when there is one: its own memory joins the chain.
+    pub agent: Option<String>,
+    /// The team that agent belongs to, when there is one: the team's memory joins the chain.
+    pub team: Option<String>,
 }
 
 impl Context {
@@ -286,7 +312,29 @@ impl Context {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         }
+    }
+
+    /// Every scope this context is entitled to read, most general first:
+    /// `machine` -> `project` -> `team` -> `agent` -> `job`.
+    ///
+    /// [`Context::chain`] carries the machine, project and job links; the team and the agent join
+    /// it here, ahead of the job and behind the project, and an absent link is simply skipped. The
+    /// result is ordered by [`Scope::rank`], so the more specific a scope the higher its
+    /// `s_scope`, and a row of any scope outside this list is never selected.
+    pub fn scopes(&self) -> Vec<Scope> {
+        let mut scopes = self.chain.clone();
+        if let Some(team) = &self.team {
+            scopes.push(Scope::Team(team.clone()));
+        }
+        if let Some(agent) = &self.agent {
+            scopes.push(Scope::Agent(agent.clone()));
+        }
+        // Stable, so links of the same rank keep the order the chain gave them.
+        scopes.sort_by_key(Scope::rank);
+        scopes
     }
 }
 
@@ -411,9 +459,10 @@ fn scored_candidates<'a>(known: &'a [Known], context: &Context) -> Vec<(&'a Know
             let mut scored = Scored {
                 knowledge_id: row.id,
                 shown: false,
-                // `brief::of` sets it from SQLite's bm25, min-max normalised per pass
-                // (`brief::normalise_fts`); the clamp keeps out-of-contract input from
-                // outweighing the rest (spec 5.5).
+                // `brief::of` sets it from SQLite's bm25: each row's score as a fraction of the
+                // pass's best match (`brief::normalise_fts` anchors the floor at 0, so an
+                // unmatched row is 0 and the best match is 1); the clamp keeps out-of-contract
+                // input from outweighing the rest (spec 5.5).
                 s_fts: finite_or_zero(row.s_fts).clamp(0.0, 1.0),
                 s_sim: finite_or_zero(row.s_sim).clamp(0.0, 1.0),
                 s_scope: scope_specificity(row, context)?,
@@ -441,11 +490,11 @@ fn finite_or_zero(value: f64) -> f64 {
 
 fn scope_specificity(row: &Known, context: &Context) -> Option<f64> {
     let row_scope = Scope::parse(&row.scope_kind, row.scope_id.as_deref())?;
-    context
-        .chain
+    let scopes = context.scopes();
+    scopes
         .iter()
         .position(|scope| scope.columns() == row_scope.columns())
-        .map(|index| (index + 1) as f64 / context.chain.len() as f64)
+        .map(|index| (index + 1) as f64 / scopes.len() as f64)
         // A recognised but out-of-chain candidate is not entitled to inherit into this context.
         .or(Some(0.0))
 }
@@ -615,6 +664,8 @@ fn scope_heading(scope: &Scope) -> String {
     match scope {
         Scope::Machine => "\n\nHouse-wide knowledge:".into(),
         Scope::Project(id) => format!("\n\nKnowledge about project {id}:"),
+        Scope::Team(id) => format!("\n\nKnowledge for team {id}:"),
+        Scope::Agent(id) => format!("\n\nKnowledge for agent {id}:"),
         Scope::Job { id, .. } => format!("\n\nKnowledge about job {id}:"),
     }
 }
@@ -790,11 +841,34 @@ fn admitted(row: &Known, context: &Context) -> bool {
                 && row.layer == "working"
                 && row.evidence.as_deref().is_some_and(evidence_is_tagged)
                 && context
-                    .chain
+                    .scopes()
                     .iter()
                     .any(|scope| matches!(scope, Scope::Job { .. }) && same_scope(row, scope))
         }
         _ => false,
+    }
+}
+
+/// The least textual relevance a row needs to be briefed at all.
+///
+/// `s_fts` is bm25 over the best match of the pass: an unmatched row is `0.0` and a sole match is
+/// `1.0`, so `0.1` drops the non-matches and the tail matches under a tenth of the best (one
+/// common term), while any real hit survives. The textual signal is `s_fts`, or the larger of
+/// `s_fts` and `s_sim` when the briefing has a query vector ([`Context::query_embedded`]). For
+/// `s_sim` `0.1` is lenient, because the cosine of unrelated texts depends on the configured
+/// embedder; calibrate it on real vectors later.
+pub const MIN_RELEVANCE: f64 = 0.1;
+
+/// How well a row's text answers the briefing's query, on the unit scale.
+///
+/// `s_sim` counts only when the briefing computed a query vector; otherwise it is whatever a reader
+/// left in the field, and says nothing.
+fn textual_relevance(row: &Known, context: &Context) -> f64 {
+    let s_fts = finite_or_zero(row.s_fts).clamp(0.0, 1.0);
+    if context.query_embedded {
+        s_fts.max(finite_or_zero(row.s_sim).clamp(0.0, 1.0))
+    } else {
+        s_fts
     }
 }
 
@@ -805,16 +879,22 @@ fn admitted(row: &Known, context: &Context) -> bool {
 /// owns its bytes first. Populated layers claim their item floors, and candidates left over compete in
 /// [`ordered_candidates`] order. The first pass discovers which scope groups are cut; the second
 /// reserves those notices before choosing rows and accounts for any cut it exposes at the
-/// boundary. The trace covers every admitted candidate.
+/// boundary. Candidates under [`MIN_RELEVANCE`] are left out before either pass, whatever room is
+/// left. The trace covers every admitted candidate.
 pub fn select(known: &[Known], context: &Context, budget: &Budget) -> Brief {
     let admitted: Vec<Known> = known
         .iter()
         .filter(|row| admitted(row, context))
         .cloned()
         .collect();
+    let scopes = context.scopes();
+    // Relevance is decided HERE, before the groups and `select_pass`: the layer floors then only
+    // ever see survivors, and a floor can no longer be spent on a row that matched nothing. The
+    // trace below still carries every admitted row, `shown = false` for the ones dropped.
     let candidates: Vec<&Known> = ordered_candidates(&admitted, context)
         .into_iter()
-        .filter(|row| context.chain.iter().any(|scope| same_scope(row, scope)))
+        .filter(|row| scopes.iter().any(|scope| same_scope(row, scope)))
+        .filter(|row| textual_relevance(row, context) >= MIN_RELEVANCE)
         .collect();
     if candidates.is_empty() {
         return Brief {
@@ -826,8 +906,7 @@ pub fn select(known: &[Known], context: &Context, budget: &Budget) -> Brief {
         };
     }
 
-    let groups: Vec<Scope> = context
-        .chain
+    let groups: Vec<Scope> = scopes
         .iter()
         .filter(|scope| candidates.iter().any(|row| same_scope(row, scope)))
         .cloned()
@@ -1255,7 +1334,24 @@ pub async fn close_orphaned_working(pool: &SqlitePool) -> sqlx::Result<u64> {
 /// Ordered here as well as in [`render`], so a caller that skips the renderer still gets a stable
 /// list, and so the LIMIT below cuts the tail rather than an arbitrary middle.
 pub async fn for_scope(pool: &SqlitePool, scope: &Scope) -> sqlx::Result<Vec<Known>> {
-    let chain = scope.chain();
+    for_columns(pool, &scope.chain()).await
+}
+
+/// What a briefing in this context is entitled to be told: [`for_scope`]'s query over the columns
+/// of every link of [`Context::scopes`], so the agent's and the team's own rows are fetched with
+/// the project's, and another agent's or team's never are.
+pub async fn for_context(pool: &SqlitePool, context: &Context) -> sqlx::Result<Vec<Known>> {
+    let columns: Vec<(&'static str, Option<String>)> =
+        context.scopes().iter().map(Scope::columns).collect();
+    for_columns(pool, &columns).await
+}
+
+/// The query behind [`for_scope`] and [`for_context`], over the `(scope_kind, scope_id)` pairs
+/// the caller is entitled to.
+async fn for_columns(
+    pool: &SqlitePool,
+    chain: &[(&'static str, Option<String>)],
+) -> sqlx::Result<Vec<Known>> {
     let terms: Vec<&str> = chain
         .iter()
         .map(|_| "(scope_kind = ? AND scope_id IS ?)")
@@ -1275,7 +1371,7 @@ pub async fn for_scope(pool: &SqlitePool, scope: &Scope) -> sqlx::Result<Vec<Kno
     // `(scope_kind = ? AND scope_id IS ?)` per link of the chain, which is also a literal. Every
     // value the caller supplies is bound below.
     let mut query = sqlx::query_as::<_, Known>(sqlx::AssertSqlSafe(sql));
-    for (kind, id) in &chain {
+    for (kind, id) in chain {
         query = query.bind(*kind).bind(id.clone());
     }
     query
@@ -1843,22 +1939,169 @@ async fn pending_knowledge(pool: &SqlitePool, proposal_id: i64) -> Result<i64, D
 /// One transaction, like the calendar's: a dropped request must not leave the proposal and the
 /// store disagreeing about whether the agent was allowed to learn something.
 pub async fn approve(pool: &SqlitePool, proposal_id: i64) -> Result<i64, DecisionError> {
+    approve_as(pool, proposal_id, None).await
+}
+
+/// `kind:id` as a human reads a scope in an event note; the machine, which has no id, is bare.
+fn scope_label(kind: &str, id: Option<&str>) -> String {
+    match id {
+        Some(id) => format!("{kind}:{id}"),
+        None => kind.to_owned(),
+    }
+}
+
+/// A real move made by [`approve_as`]: the two labels for the event note, and the target's columns.
+struct Rescope {
+    from: String,
+    to: String,
+    kind: &'static str,
+    id: Option<String>,
+}
+
+/// [`approve`], optionally placing the row in a scope other than the one it was declared in.
+///
+/// `None`, or a target with the row's own columns, is the plain approval exactly. Otherwise the
+/// target must be a project, a team or an agent -- never the house, never a job -- and the row must
+/// not replace another (`supersedes`), because moving a successor would leave its predecessor's
+/// scope answering for a text that now lives elsewhere. Every check is made before anything is
+/// written.
+///
+/// Where the target already holds an `active` row with the same fingerprint, the proposed row is
+/// not activated twice: it is archived as a merge into that row, the proposal is approved, and the
+/// id that answers is the row that stayed. Otherwise the row is activated in the target scope with
+/// one event that names the move. One transaction either way.
+pub async fn approve_as(
+    pool: &SqlitePool,
+    proposal_id: i64,
+    target: Option<&Scope>,
+) -> Result<i64, DecisionError> {
     let knowledge_id = pending_knowledge(pool, proposal_id).await?;
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = pool.begin().await.map_err(|_| DecisionError::NotFound)?;
 
+    // `Some` only for a real move; every refusal happens here, before the first write.
+    let mut rescope: Option<Rescope> = None;
+    if let Some(target) = target {
+        let (kind, id, supersedes, fingerprint): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT scope_kind, scope_id, supersedes, fingerprint FROM knowledge WHERE id = ?",
+        )
+        .bind(knowledge_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| DecisionError::NotFound)?;
+        let columns = target.columns();
+        if columns.0 != kind || columns.1 != id {
+            if !matches!(target, Scope::Project(_) | Scope::Team(_) | Scope::Agent(_))
+                || supersedes.is_some()
+            {
+                return Err(DecisionError::Malformed);
+            }
+            let from = scope_label(&kind, id.as_deref());
+            let to = scope_label(columns.0, columns.1.as_deref());
+
+            let collision: Option<i64> = match fingerprint {
+                Some(fingerprint) => sqlx::query_scalar(
+                    "SELECT id FROM knowledge
+                      WHERE status = 'active' AND fingerprint = ?
+                        AND scope_kind = ? AND scope_id IS ? AND id != ?
+                      ORDER BY id LIMIT 1",
+                )
+                .bind(fingerprint)
+                .bind(columns.0)
+                .bind(columns.1.clone())
+                .bind(knowledge_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| DecisionError::NotFound)?,
+                None => None,
+            };
+
+            if let Some(kept) = collision {
+                let archived = sqlx::query(
+                    "UPDATE knowledge SET status = 'archived', ended_at = ?
+                      WHERE id = ? AND status = 'proposed'",
+                )
+                .bind(&now)
+                .bind(knowledge_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| DecisionError::NotFound)?;
+                if archived.rows_affected() != 1 {
+                    return Err(DecisionError::NotPending);
+                }
+                sqlx::query(
+                    "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+                     VALUES (?, 'proposed', 'archived', ?, ?)",
+                )
+                .bind(knowledge_id)
+                .bind(format!("rescoped {from} -> {to}; merged into {kept}"))
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| DecisionError::NotFound)?;
+
+                sqlx::query(
+                    "UPDATE proposals SET status = 'approved', decided_at = ? WHERE id = ?",
+                )
+                .bind(&now)
+                .bind(proposal_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| DecisionError::NotFound)?;
+                sqlx::query(
+                    "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+                     VALUES (?, 'pending', 'approved', ?, ?)",
+                )
+                .bind(proposal_id)
+                .bind(format!("refinement merged into {kept}"))
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| DecisionError::NotFound)?;
+
+                tx.commit().await.map_err(|_| DecisionError::NotFound)?;
+                return Ok(kept);
+            }
+            rescope = Some(Rescope {
+                from,
+                to,
+                kind: columns.0,
+                id: columns.1,
+            });
+        }
+    }
+
     // Guarded on `proposed`, so a second approval of the same row is a no-op rather than a second
     // activation stamp over the first.
-    let activated = sqlx::query(
-        "UPDATE knowledge SET status = 'active', activated_at = ?
-          WHERE id = ? AND status = 'proposed'",
-    )
-    .bind(&now)
-    .bind(knowledge_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| DecisionError::NotFound)?;
+    let activated = match &rescope {
+        None => sqlx::query(
+            "UPDATE knowledge SET status = 'active', activated_at = ?
+              WHERE id = ? AND status = 'proposed'",
+        )
+        .bind(&now)
+        .bind(knowledge_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| DecisionError::NotFound)?,
+        Some(Rescope { kind, id, .. }) => sqlx::query(
+            "UPDATE knowledge SET status = 'active', activated_at = ?,
+                                  scope_kind = ?, scope_id = ?
+              WHERE id = ? AND status = 'proposed'",
+        )
+        .bind(&now)
+        .bind(*kind)
+        .bind(id.clone())
+        .bind(knowledge_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| DecisionError::NotFound)?,
+    };
     if activated.rows_affected() != 1 {
         return Err(DecisionError::NotPending);
     }
@@ -1875,11 +2118,17 @@ pub async fn approve(pool: &SqlitePool, proposal_id: i64) -> Result<i64, Decisio
     .await
     .map_err(|_| DecisionError::NotFound)?;
 
+    // One event for the activation, which also names the move when there was one.
+    let note = match &rescope {
+        None => "approved by the owner".to_owned(),
+        Some(Rescope { from, to, .. }) => format!("rescoped {from} -> {to}"),
+    };
     sqlx::query(
         "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
-         VALUES (?, 'proposed', 'active', 'approved by the owner', ?)",
+         VALUES (?, 'proposed', 'active', ?, ?)",
     )
     .bind(knowledge_id)
+    .bind(note)
     .bind(&now)
     .execute(&mut *tx)
     .await
@@ -2750,7 +2999,7 @@ mod tests {
         .unwrap();
         seed(&pool, Some("mine"), "active", "a layer this binary knows").await;
 
-        let read = for_scope(&pool, &Scope::Project("mine".into()))
+        let mut read = for_scope(&pool, &Scope::Project("mine".into()))
             .await
             .unwrap();
         assert_eq!(
@@ -2758,6 +3007,11 @@ mod tests {
             2,
             "the read is where the filtering happens, and it is not: {read:?}"
         );
+        // A row reaches a prompt only when it matched the query; `for_scope` leaves `s_fts` at zero,
+        // so mark both as matched and keep this test about the unknown layer.
+        for row in &mut read {
+            row.s_fts = 1.0;
+        }
 
         // The row exists, is `active`, is in scope, and still reaches nothing. That is the whole of
         // what "no CHECK constraints" costs and the whole of what the Rust constants buy.
@@ -2948,7 +3202,7 @@ mod tests {
         assert!(rows.iter().any(|row| row.title == "forty-one finding"));
         assert!(!rows.iter().any(|row| row.title == "forty-two finding"));
 
-        let brief = crate::brief::of(&pool, &job_context(41), "q")
+        let brief = crate::brief::of(&pool, &job_context(41), "finding")
             .await
             .unwrap();
         let block = brief.block.expect("the finding reaches its own job");
@@ -3001,7 +3255,7 @@ mod tests {
         .await
         .unwrap();
 
-        let brief = crate::brief::of(&pool, &job_context(41), "q")
+        let brief = crate::brief::of(&pool, &job_context(41), "finding")
             .await
             .unwrap();
         let block = brief.block.expect("the finding renders");
@@ -3650,8 +3904,12 @@ mod tests {
         );
 
         assert_eq!(approve(&pool, proposal_id).await.unwrap(), knowledge_id);
-        let after = for_scope(&pool, &mine).await.unwrap();
+        let mut after = for_scope(&pool, &mine).await.unwrap();
         assert_eq!(after.len(), 1, "approving did not activate the lesson");
+        // Only a row that matched the query renders; `for_scope` leaves `s_fts` at zero.
+        for row in &mut after {
+            row.s_fts = 1.0;
+        }
         // Rendering now needs the scope chain that the store read represented; approval remains
         // the assertion under test rather than the new grouping.
         assert!(
@@ -3716,7 +3974,7 @@ mod tests {
             kind: kind.into(),
             title: title.into(),
             body: body.into(),
-            s_fts: 0.0,
+            s_fts: 1.0,
             s_sim: 0.0,
             status: "active".into(),
             proposal_id: Some(1),
@@ -3740,6 +3998,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         }
     }
 
@@ -3758,6 +4018,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         }
     }
 
@@ -3793,6 +4055,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         };
 
         let left = render(&known, &context("core/src/left.rs")).expect("left node is briefed");
@@ -3825,6 +4089,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         };
 
         let block = render(&[semantic, episodic], &context).expect("both items render");
@@ -3912,10 +4178,16 @@ mod tests {
         higher_score.layer = Layer::Working.as_str().into();
         higher_score.s_fts = 1.0;
 
-        let tied_second = one(20, "memory", "tied-second", "m2");
-        let tied_first = one(10, "memory", "tied-first", "m1");
-        let prompt = one(80, "prompt", "prompt", "p");
-        let skill = one(70, "skill", "skill", "k");
+        // `one()` rows now count as matched (s_fts 1.0); the losers are put back to an unmatched 0.0
+        // so the ordering this test pins stays the original one.
+        let mut tied_second = one(20, "memory", "tied-second", "m2");
+        tied_second.s_fts = 0.0;
+        let mut tied_first = one(10, "memory", "tied-first", "m1");
+        tied_first.s_fts = 0.0;
+        let mut prompt = one(80, "prompt", "prompt", "p");
+        prompt.s_fts = 0.0;
+        let mut skill = one(70, "skill", "skill", "k");
+        skill.s_fts = 0.0;
 
         // The tied pair shares project scope `p`, this one selection context (and therefore its files),
         // and rank 0.0. The other rows make each earlier key observable before the id tail is asserted.
@@ -3934,6 +4206,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         };
         let ids = |rows: &[Known]| {
             ordered_candidates(rows, &context)
@@ -3954,10 +4228,15 @@ mod tests {
         let mut highest_score = one(50, "subagent", "highest score", "working");
         highest_score.layer = Layer::Working.as_str().into();
         highest_score.s_fts = 0.5;
-        let memory = one(40, "memory", "memory", "semantic");
-        let prompt = one(30, "prompt", "prompt", "procedural");
-        let later_skill = one(20, "skill", "later skill", "procedural");
-        let earlier_skill = one(10, "skill", "earlier skill", "procedural");
+        // `one()` rows now count as matched (s_fts 1.0); all but the winner are put back to 0.0.
+        let mut memory = one(40, "memory", "memory", "semantic");
+        memory.s_fts = 0.0;
+        let mut prompt = one(30, "prompt", "prompt", "procedural");
+        prompt.s_fts = 0.0;
+        let mut later_skill = one(20, "skill", "later skill", "procedural");
+        later_skill.s_fts = 0.0;
+        let mut earlier_skill = one(10, "skill", "earlier skill", "procedural");
+        earlier_skill.s_fts = 0.0;
         let rows = vec![highest_score, memory, prompt, later_skill, earlier_skill];
         let ids = |rows: &[Known]| {
             ordered_candidates(rows, &project_context())
@@ -3987,6 +4266,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         };
         let mut r1 = one(1, "memory", "best", "job");
         r1.scope_kind = "job".into();
@@ -4167,6 +4448,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         };
         let cases = [
             ("odd", vec![(1, 5), (3, 5), (5, 5)], 0.6),
@@ -4207,6 +4490,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         };
         let mut recent_failure = one(1, "memory", "recent failure", "bad");
         recent_failure.shown_count = 4;
@@ -4252,6 +4537,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         };
         let not_measured = one(1, "memory", "not measured", "new");
         let mut failed = one(2, "memory", "failed", "bad");
@@ -4321,6 +4608,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         };
         let budget = Budget {
             render_chars: RENDER_CHARS,
@@ -4355,6 +4644,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         };
         let budget = Budget {
             render_chars: 1_100,
@@ -4404,6 +4695,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         };
         let budget = Budget {
             render_chars: structural_chars,
@@ -4441,6 +4734,8 @@ mod tests {
             node: None,
             gate: None,
             query_embedded: false,
+            agent: None,
+            team: None,
         };
         let budget = Budget {
             render_chars: RENDER_CHARS,
@@ -4744,7 +5039,7 @@ mod tests {
         .await
         .unwrap();
 
-        let brief_77 = crate::brief::of(&pool, &job_context(77), "query words")
+        let brief_77 = crate::brief::of(&pool, &job_context(77), "approved measured merge finding")
             .await
             .unwrap();
         let traced_77: std::collections::BTreeSet<i64> =
@@ -4814,7 +5109,7 @@ mod tests {
             );
         }
 
-        let brief_78 = crate::brief::of(&pool, &job_context(78), "query words")
+        let brief_78 = crate::brief::of(&pool, &job_context(78), "approved measured merge finding")
             .await
             .unwrap();
         assert!(
@@ -5089,5 +5384,557 @@ mod tests {
             looped.replaced.len(),
             "the walk went round the cycle and read a row twice"
         );
+    }
+
+    /// The agent loadout: team and agent scopes, the relevance threshold, and approving a row into
+    /// a narrower scope than the one it was declared in.
+    mod loadout {
+        use super::*;
+
+        /// A row of memory kind in the given scope; `one()` already counts it as matched.
+        fn scoped_row(id: i64, scope_kind: &str, scope_id: Option<&str>, title: &str) -> Known {
+            let mut row = one(id, "memory", title, "body");
+            row.scope_kind = scope_kind.into();
+            row.scope_id = scope_id.map(str::to_owned);
+            row
+        }
+
+        /// The ordinary project context of the other tests, plus the two new links.
+        fn linked(agent: Option<&str>, team: Option<&str>) -> Context {
+            let mut context = Context::for_project(Some("p"));
+            context.agent = agent.map(str::to_owned);
+            context.team = team.map(str::to_owned);
+            context
+        }
+
+        fn columns_of(scopes: &[Scope]) -> Vec<(&'static str, Option<String>)> {
+            scopes.iter().map(Scope::columns).collect()
+        }
+
+        fn scope_signal(brief: &Brief, id: i64) -> f64 {
+            brief
+                .trace
+                .iter()
+                .find(|scored| scored.knowledge_id == id)
+                .unwrap_or_else(|| panic!("row {id} is not in the trace"))
+                .s_scope
+        }
+
+        fn shown(brief: &Brief, id: i64) -> bool {
+            brief
+                .trace
+                .iter()
+                .find(|scored| scored.knowledge_id == id)
+                .unwrap_or_else(|| panic!("row {id} is not in the trace"))
+                .shown
+        }
+
+        /// One active, owner-approved memory row with a body of the caller's choosing.
+        async fn insert_active(pool: &SqlitePool, scope: &Scope, title: &str, body: &str) -> i64 {
+            let (scope_kind, scope_id) = scope.columns();
+            sqlx::query(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES ('semantic', ?, ?, 'owner', 'memory', ?, ?, 'active',
+                         '2026-10-01T00:00:00+00:00')",
+            )
+            .bind(scope_kind)
+            .bind(scope_id)
+            .bind(title)
+            .bind(body)
+            .execute(pool)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+        }
+
+        async fn events_of(
+            pool: &SqlitePool,
+            knowledge_id: i64,
+        ) -> Vec<(Option<String>, String, Option<String>)> {
+            sqlx::query_as(
+                "SELECT from_status, to_status, note FROM knowledge_events
+                  WHERE knowledge_id = ? ORDER BY id",
+            )
+            .bind(knowledge_id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+        }
+
+        async fn event_total(pool: &SqlitePool) -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_events")
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        async fn row_state(pool: &SqlitePool, id: i64) -> (String, String, Option<String>) {
+            sqlx::query_as("SELECT status, scope_kind, scope_id FROM knowledge WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        async fn proposal_status(pool: &SqlitePool, id: i64) -> String {
+            sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        #[test]
+        fn a_team_and_an_agent_scope_round_trip_through_their_columns() {
+            for scope in [Scope::Team("x".into()), Scope::Agent("a".into())] {
+                let (kind, id) = scope.columns();
+                assert_eq!(
+                    Scope::parse(kind, id.as_deref()),
+                    Some(scope.clone()),
+                    "{scope:?} did not survive its own columns"
+                );
+            }
+            assert_eq!(
+                Scope::Team("x".into()).columns(),
+                ("team", Some("x".into()))
+            );
+            assert_eq!(
+                Scope::Agent("a".into()).columns(),
+                ("agent", Some("a".into()))
+            );
+            // Like `project` and `job`, a team or an agent without an id is not a scope.
+            assert_eq!(Scope::parse("team", None), None);
+            assert_eq!(Scope::parse("agent", None), None);
+        }
+
+        #[test]
+        fn the_chain_runs_machine_project_team_agent_job_and_skips_absent_links() {
+            let mut context = job_context(7);
+            context.team = Some("x".into());
+            context.agent = Some("a".into());
+            assert_eq!(
+                columns_of(&context.scopes()),
+                vec![
+                    ("machine", None),
+                    ("project", Some("p".into())),
+                    ("team", Some("x".into())),
+                    ("agent", Some("a".into())),
+                    ("job", Some("7".into())),
+                ]
+            );
+
+            context.team = None;
+            assert_eq!(
+                columns_of(&context.scopes()),
+                vec![
+                    ("machine", None),
+                    ("project", Some("p".into())),
+                    ("agent", Some("a".into())),
+                    ("job", Some("7".into())),
+                ]
+            );
+
+            let mut house = Context::for_project(None);
+            house.agent = Some("a".into());
+            assert_eq!(
+                columns_of(&house.scopes()),
+                vec![("machine", None), ("agent", Some("a".into()))]
+            );
+        }
+
+        #[test]
+        fn a_context_without_agent_or_team_keeps_todays_chain() {
+            let context = Context::for_project(Some("p"));
+            assert_eq!(
+                context.scopes(),
+                vec![Scope::Machine, Scope::Project("p".into())]
+            );
+
+            let project = scoped_row(1, "project", Some("p"), "project row");
+            let team = scoped_row(2, "team", Some("x"), "team row");
+            let agent = scoped_row(3, "agent", Some("a"), "agent row");
+            let brief = select(&[project, team, agent], &context, &Budget::default());
+            let block = brief.block.clone().expect("the project row still renders");
+            assert!(block.contains("project row"));
+            assert!(!block.contains("team row"), "{block}");
+            assert!(!block.contains("agent row"), "{block}");
+            assert!(
+                !brief
+                    .trace
+                    .iter()
+                    .any(|scored| scored.shown && scored.knowledge_id != 1)
+            );
+        }
+
+        #[test]
+        fn the_agent_outranks_the_team_and_the_team_the_project() {
+            let known = [
+                scoped_row(1, "project", Some("p"), "project row"),
+                scoped_row(2, "team", Some("x"), "team row"),
+                scoped_row(3, "agent", Some("a"), "agent row"),
+            ];
+            let brief = select(&known, &linked(Some("a"), Some("x")), &Budget::default());
+            let project = scope_signal(&brief, 1);
+            let team = scope_signal(&brief, 2);
+            let agent = scope_signal(&brief, 3);
+            assert!(agent > team, "agent {agent} did not outrank team {team}");
+            assert!(
+                team > project,
+                "team {team} did not outrank project {project}"
+            );
+        }
+
+        #[test]
+        fn another_agents_or_teams_memory_is_never_selected() {
+            let known = [
+                scoped_row(1, "agent", Some("a"), "agent-a-fact"),
+                scoped_row(2, "agent", Some("b"), "agent-b-fact"),
+                scoped_row(3, "team", Some("x"), "team-x-fact"),
+                scoped_row(4, "team", Some("y"), "team-y-fact"),
+            ];
+            let brief = select(&known, &linked(Some("a"), Some("x")), &Budget::default());
+            let block = brief.block.clone().expect("the matching links render");
+            assert!(block.contains("agent-a-fact"), "{block}");
+            assert!(block.contains("team-x-fact"), "{block}");
+            assert!(!block.contains("agent-b-fact"), "{block}");
+            assert!(!block.contains("team-y-fact"), "{block}");
+            for foreign in [2, 4] {
+                assert!(
+                    brief
+                        .trace
+                        .iter()
+                        .any(|scored| scored.knowledge_id == foreign),
+                    "row {foreign} is admitted and belongs in the trace"
+                );
+                assert!(!shown(&brief, foreign), "row {foreign} was shown");
+            }
+        }
+
+        #[test]
+        fn an_item_below_min_relevance_is_left_out_even_with_room_to_spare() {
+            assert_eq!(MIN_RELEVANCE, 0.1);
+            let mut at = scoped_row(1, "project", Some("p"), "at-the-threshold");
+            at.s_fts = MIN_RELEVANCE;
+            let mut below = scoped_row(2, "project", Some("p"), "just-below-it");
+            below.s_fts = f64::from_bits(MIN_RELEVANCE.to_bits() - 1);
+
+            let brief = select(&[at, below], &project_context(), &Budget::default());
+            let block = brief
+                .block
+                .clone()
+                .expect("the row at the threshold renders");
+            assert!(block.contains("at-the-threshold"), "{block}");
+            assert!(
+                !block.contains("just-below-it"),
+                "a row below the threshold was shown with the whole budget free: {block}"
+            );
+            assert!(shown(&brief, 1));
+            assert!(!shown(&brief, 2));
+        }
+
+        #[test]
+        fn similarity_alone_clears_the_threshold_only_with_a_query_vector() {
+            let mut similar = scoped_row(1, "project", Some("p"), "similar-only");
+            similar.s_fts = 0.0;
+            similar.s_sim = 0.9;
+
+            let without = select(
+                std::slice::from_ref(&similar),
+                &project_context(),
+                &Budget::default(),
+            );
+            assert!(
+                without.block.is_none() && !shown(&without, 1),
+                "a similarity nobody computed cleared the threshold"
+            );
+
+            let mut embedded = project_context();
+            embedded.query_embedded = true;
+            let with = select(&[similar], &embedded, &Budget::default());
+            assert!(shown(&with, 1), "a computed similarity did not clear it");
+            assert!(with.block.expect("rendered").contains("similar-only"));
+        }
+
+        #[test]
+        fn a_layer_floor_is_never_spent_on_an_item_below_the_threshold() {
+            let mut episodic = scoped_row(1, "project", Some("p"), "unmatched-episode");
+            episodic.layer = Layer::Episodic.as_str().into();
+            episodic.source = "consolidator".into();
+            episodic.observations = Some(3);
+            episodic.s_fts = 0.0;
+            let semantic = scoped_row(2, "project", Some("p"), "matched-fact");
+
+            let brief = select(
+                &[episodic, semantic],
+                &project_context(),
+                &Budget::default(),
+            );
+            let block = brief.block.clone().expect("the matched row renders");
+            assert!(block.contains("matched-fact"), "{block}");
+            assert!(
+                !block.contains("unmatched-episode"),
+                "the episodic floor took a row that matched nothing: {block}"
+            );
+            assert!(!shown(&brief, 1));
+        }
+
+        #[test]
+        fn nothing_relevant_is_an_empty_block_not_an_error() {
+            let mut known = vec![
+                scoped_row(1, "project", Some("p"), "first"),
+                scoped_row(2, "project", Some("p"), "second"),
+                scoped_row(3, "machine", None, "third"),
+            ];
+            for row in &mut known {
+                row.s_fts = 0.0;
+            }
+
+            let brief = select(&known, &project_context(), &Budget::default());
+            assert!(brief.block.is_none(), "{:?}", brief.block);
+            assert_eq!(
+                brief.trace.len(),
+                known.len(),
+                "the trace must still carry every admitted row"
+            );
+            assert!(brief.trace.iter().all(|scored| !scored.shown));
+        }
+
+        #[tokio::test]
+        async fn a_briefing_where_every_candidate_matches_shows_the_weakest_match_too() {
+            let pool = test_pool().await;
+            let project = Scope::Project("p".into());
+            // Same length, so the only difference between the two is that one says the word twice.
+            let twice =
+                insert_active(&pool, &project, "zanzibar rollout twice", "zanzibar again").await;
+            let once = insert_active(&pool, &project, "zanzibar rollout once", "plain words").await;
+            for filler in ["one", "two", "three"] {
+                insert_active(&pool, &project, &format!("plain note {filler}"), "filler").await;
+            }
+
+            let brief = crate::brief::of(&pool, &Context::for_project(Some("p")), "zanzibar")
+                .await
+                .unwrap();
+            assert!(shown(&brief, twice), "the strongest match was not shown");
+            assert!(
+                shown(&brief, once),
+                "the weakest match normalised to zero and fell under the threshold"
+            );
+            let block = brief.block.expect("both matches render");
+            assert!(block.contains("zanzibar rollout twice"), "{block}");
+            assert!(block.contains("zanzibar rollout once"), "{block}");
+        }
+
+        #[tokio::test]
+        async fn a_briefing_fetches_its_agent_and_team_links_and_no_others() {
+            let pool = test_pool().await;
+            let mine = insert_active(
+                &pool,
+                &Scope::Agent("a".into()),
+                "zanzibar agent-a-note",
+                "body",
+            )
+            .await;
+            let other = insert_active(
+                &pool,
+                &Scope::Agent("b".into()),
+                "zanzibar agent-b-note",
+                "body",
+            )
+            .await;
+            let team = insert_active(
+                &pool,
+                &Scope::Team("x".into()),
+                "zanzibar team-x-note",
+                "body",
+            )
+            .await;
+            let context = linked(Some("a"), Some("x"));
+
+            let fetched: Vec<i64> = for_context(&pool, &context)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.id)
+                .collect();
+            assert!(fetched.contains(&mine) && fetched.contains(&team));
+            assert!(!fetched.contains(&other), "another agent's row was fetched");
+
+            let brief = crate::brief::of(&pool, &context, "zanzibar").await.unwrap();
+            let block = brief.block.clone().expect("the linked rows render");
+            assert!(block.contains("agent-a-note"), "{block}");
+            assert!(block.contains("team-x-note"), "{block}");
+            assert!(!block.contains("agent-b-note"), "{block}");
+            assert!(
+                !brief
+                    .trace
+                    .iter()
+                    .any(|scored| scored.knowledge_id == other),
+                "another agent's row reached the trace"
+            );
+        }
+
+        #[tokio::test]
+        async fn approving_with_a_scope_moves_the_row_and_records_the_move() {
+            let pool = test_pool().await;
+            let (id, proposal) = declare(&pool, Some("p"), "move me", None).await.unwrap();
+
+            let approved = approve_as(&pool, proposal, Some(&Scope::Agent("a".into())))
+                .await
+                .unwrap();
+            assert_eq!(approved, id);
+            assert_eq!(
+                row_state(&pool, id).await,
+                (
+                    "active".to_owned(),
+                    "agent".to_owned(),
+                    Some("a".to_owned())
+                )
+            );
+            assert_eq!(proposal_status(&pool, proposal).await, "approved");
+
+            let moves: Vec<_> = events_of(&pool, id)
+                .await
+                .into_iter()
+                .filter(|(from, to, _)| from.as_deref() == Some("proposed") && to == "active")
+                .collect();
+            assert_eq!(
+                moves.len(),
+                1,
+                "the move is not exactly one event: {moves:?}"
+            );
+            assert_eq!(moves[0].2.as_deref(), Some("rescoped project:p -> agent:a"));
+        }
+
+        #[tokio::test]
+        async fn approving_into_a_scope_holding_the_fingerprint_archives_the_source() {
+            let pool = test_pool().await;
+            let target = Scope::Agent("a".into());
+            let (first, first_proposal) =
+                declare(&pool, Some("p"), "first copy", None).await.unwrap();
+            let (second, second_proposal) = declare(&pool, Some("p"), "second copy", None)
+                .await
+                .unwrap();
+            let fingerprints: Vec<Option<String>> = sqlx::query_scalar(
+                "SELECT fingerprint FROM knowledge WHERE id IN (?, ?) ORDER BY id",
+            )
+            .bind(first)
+            .bind(second)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert!(
+                fingerprints[0].is_some() && fingerprints[0] == fingerprints[1],
+                "the two declarations must share one fingerprint: {fingerprints:?}"
+            );
+
+            assert_eq!(
+                approve_as(&pool, first_proposal, Some(&target))
+                    .await
+                    .unwrap(),
+                first
+            );
+            let first_events = events_of(&pool, first).await.len();
+
+            let merged = approve_as(&pool, second_proposal, Some(&target))
+                .await
+                .unwrap();
+            assert_eq!(
+                merged, first,
+                "the merge must answer with the row that stayed"
+            );
+
+            assert_eq!(
+                row_state(&pool, first).await,
+                (
+                    "active".to_owned(),
+                    "agent".to_owned(),
+                    Some("a".to_owned())
+                ),
+                "the row already in the target moved"
+            );
+            assert_eq!(events_of(&pool, first).await.len(), first_events);
+            assert_eq!(
+                row_state(&pool, second).await,
+                (
+                    "archived".to_owned(),
+                    "project".to_owned(),
+                    Some("p".to_owned())
+                )
+            );
+            let ended: Option<String> =
+                sqlx::query_scalar("SELECT ended_at FROM knowledge WHERE id = ?")
+                    .bind(second)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(ended.is_some(), "the archived source has no end time");
+
+            let archived: Vec<_> = events_of(&pool, second)
+                .await
+                .into_iter()
+                .filter(|(from, to, _)| from.as_deref() == Some("proposed") && to == "archived")
+                .collect();
+            assert_eq!(archived.len(), 1, "{archived:?}");
+            assert_eq!(
+                archived[0].2.as_deref(),
+                Some(format!("rescoped project:p -> agent:a; merged into {first}").as_str())
+            );
+            assert_eq!(proposal_status(&pool, second_proposal).await, "approved");
+        }
+
+        #[tokio::test]
+        async fn a_rescope_to_machine_or_job_or_with_a_predecessor_is_refused_and_writes_nothing() {
+            let pool = test_pool().await;
+            let (id, proposal) = declare(&pool, Some("p"), "stay put", None).await.unwrap();
+            let (old, old_proposal) = declare(&pool, Some("p"), "old text", None).await.unwrap();
+            approve(&pool, old_proposal).await.unwrap();
+            let (successor, successor_proposal) = declare(&pool, Some("p"), "new text", Some(old))
+                .await
+                .unwrap();
+            let before = event_total(&pool).await;
+
+            let job = Scope::Job {
+                id: 7,
+                project: None,
+            };
+            for target in [Scope::Machine, job] {
+                assert_eq!(
+                    approve_as(&pool, proposal, Some(&target)).await,
+                    Err(DecisionError::Malformed),
+                    "{target:?} was accepted as a target"
+                );
+            }
+            assert_eq!(
+                approve_as(&pool, successor_proposal, Some(&Scope::Agent("a".into()))).await,
+                Err(DecisionError::Malformed),
+                "a row that replaces another moved to a different scope"
+            );
+
+            assert_eq!(
+                row_state(&pool, id).await,
+                (
+                    "proposed".to_owned(),
+                    "project".to_owned(),
+                    Some("p".to_owned())
+                )
+            );
+            assert_eq!(
+                row_state(&pool, successor).await,
+                (
+                    "proposed".to_owned(),
+                    "project".to_owned(),
+                    Some("p".to_owned())
+                )
+            );
+            assert_eq!(row_state(&pool, old).await.0, "active");
+            assert_eq!(proposal_status(&pool, proposal).await, "pending");
+            assert_eq!(proposal_status(&pool, successor_proposal).await, "pending");
+            assert_eq!(
+                event_total(&pool).await,
+                before,
+                "a refused move wrote events"
+            );
+        }
     }
 }

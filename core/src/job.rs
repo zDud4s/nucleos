@@ -3949,6 +3949,8 @@ async fn spawn_node(
         node: None,
         gate: None,
         query_embedded: false,
+        agent: None,
+        team: None,
     };
     let briefing = match crate::brief::of(pool, &context, &task_text).await {
         Ok(briefing) => Some(briefing),
