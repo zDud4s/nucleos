@@ -549,7 +549,7 @@ pub async fn report(
     let repeats = culprit.is_some() && culprit == earlier.as_deref();
     if !repeats {
         crate::feed::append_on(
-            &mut *tx,
+            &mut tx,
             Some(project_id),
             POSTGATE_RED_KIND,
             summary,
@@ -607,6 +607,17 @@ mod tests {
         );
     }
 
+    /// Ends the handling of the red for `red_sha` with an empty verdict, the smallest legitimate
+    /// way to free the slot while keeping `red_since_sha` and `red_groups`.
+    async fn end_red(pool: &SqlitePool, red_sha: &str) {
+        let verdict = crate::verify_bisect::Verdict::NoCandidates;
+        assert!(
+            report(pool, "p", red_sha, &verdict, "no candidates")
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn finish_green_moves_last_green_and_clears_running_and_reds() {
         let pool = crate::testdb::fresh_pool().await;
@@ -617,6 +628,8 @@ mod tests {
                 .await
                 .unwrap()
         );
+        // Handling the red ends with a report, which frees the slot for the next gate.
+        end_red(&pool, "a1").await;
         start(&pool, "p", "master", "b2", Some(3)).await.unwrap();
 
         assert!(finish_green(&pool, "p", "b2").await.unwrap());
@@ -644,7 +657,9 @@ mod tests {
         assert_eq!(s.running_sha, None);
         assert_eq!(s.last_green_sha, None);
 
-        // A second red keeps the first sha it has been red since.
+        // A second red keeps the first sha it has been red since. The first red's handling has to
+        // end (a report) before the next gate may start.
+        end_red(&pool, "a1").await;
         start(&pool, "p", "master", "b2", None).await.unwrap();
         let later = vec!["core".to_owned()];
         assert!(finish_red(&pool, "p", "b2", &later).await.unwrap());
