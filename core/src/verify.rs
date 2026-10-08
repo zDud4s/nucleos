@@ -85,6 +85,10 @@ pub(crate) enum Caller {
     Job(i64),
     /// The daemon's post-merge gate. `from_scope` never produces it.
     Postgate,
+    /// The post-merge gate's recheck of a red sha. `from_scope` never produces it.
+    FlakeCheck,
+    /// One probe of the post-merge gate's bisection. `from_scope` never produces it.
+    Bisect,
 }
 
 impl Caller {
@@ -103,7 +107,9 @@ impl Caller {
         match self {
             Caller::Owner => PRIORITY_INTERACTIVE,
             Caller::Run(_) | Caller::Job(_) => PRIORITY_AUTONOMOUS,
-            Caller::Postgate => verify_runs::PRIORITY_POSTGATE,
+            Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => {
+                verify_runs::PRIORITY_POSTGATE
+            }
         }
     }
 
@@ -113,7 +119,7 @@ impl Caller {
             Caller::Owner => "owner".to_owned(),
             Caller::Run(id) => format!("run:{id}"),
             Caller::Job(id) => format!("job:{id}"),
-            Caller::Postgate => "postgate".to_owned(),
+            Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => "postgate".to_owned(),
         }
     }
 
@@ -122,6 +128,8 @@ impl Caller {
     pub(crate) fn requested_by(self, scope: &str) -> String {
         match self {
             Caller::Postgate => verify_runs::REQUESTED_BY_POSTGATE.to_owned(),
+            Caller::FlakeCheck => verify_runs::REQUESTED_BY_FLAKE_CHECK.to_owned(),
+            Caller::Bisect => verify_runs::REQUESTED_BY_BISECT.to_owned(),
             _ => scope.to_owned(),
         }
     }
@@ -132,7 +140,11 @@ impl Caller {
 pub(crate) fn may_read(caller: Caller, row_caller: &str) -> bool {
     match caller {
         Caller::Owner => true,
-        Caller::Run(_) | Caller::Job(_) | Caller::Postgate => row_caller == caller.label(),
+        Caller::Run(_)
+        | Caller::Job(_)
+        | Caller::Postgate
+        | Caller::FlakeCheck
+        | Caller::Bisect => row_caller == caller.label(),
     }
 }
 
@@ -253,7 +265,7 @@ pub(crate) async fn resolve_worktree(
         }
         // The daemon names the job's worktree itself, and it is held to the same registered-
         // worktree-of-a-known-project check as the owner's.
-        Caller::Owner | Caller::Job(_) | Caller::Postgate => {
+        Caller::Owner | Caller::Job(_) | Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => {
             let Some(asked) = asked else {
                 return Err(VerifyError::BadRequest("worktree is required".to_owned()));
             };
@@ -1413,6 +1425,43 @@ tests:
             Scope::TeamRun("t".to_owned()),
         ] {
             assert_ne!(Caller::from_scope(&scope), Some(Caller::Postgate));
+        }
+    }
+
+    #[test]
+    fn the_flake_check_and_bisect_callers_run_at_postgate_priority_and_label_their_units() {
+        for caller in [Caller::FlakeCheck, Caller::Bisect] {
+            assert_eq!(caller.priority(), crate::verify_runs::PRIORITY_POSTGATE);
+            // The same owner as the gate's own tickets.
+            assert_eq!(caller.label(), "postgate");
+            assert!(may_read(caller, "postgate"));
+            assert!(!may_read(caller, "owner"));
+            assert!(!may_read(caller, "job:9"));
+        }
+        assert!(!may_read(Caller::Run(3), "postgate"));
+
+        assert_eq!(
+            Caller::FlakeCheck.requested_by("full"),
+            crate::verify_runs::REQUESTED_BY_FLAKE_CHECK
+        );
+        assert_eq!(Caller::FlakeCheck.requested_by("full"), "flake-check");
+        assert_eq!(
+            Caller::Bisect.requested_by("full"),
+            crate::verify_runs::REQUESTED_BY_BISECT
+        );
+        assert_eq!(Caller::Bisect.requested_by("full"), "bisect");
+
+        // No auth scope maps to them.
+        for scope in [
+            Scope::Control,
+            Scope::Run(9),
+            Scope::ApiToken(ApiTokenLevel::Admin),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+            Scope::TeamRun("t".to_owned()),
+        ] {
+            assert_ne!(Caller::from_scope(&scope), Some(Caller::FlakeCheck));
+            assert_ne!(Caller::from_scope(&scope), Some(Caller::Bisect));
         }
     }
 
