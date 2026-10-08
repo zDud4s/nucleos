@@ -5,7 +5,7 @@ version: 1
 tests:
   groups:
     core:
-      paths: [core/, Cargo.toml, Cargo.lock, rust-toolchain.toml]
+      paths: [core/, Cargo.toml, Cargo.lock, rust-toolchain.toml, .config/]
       check: cargo clippy -p nucleos-core --all-targets -- -D warnings
       command: bash scripts/gates.sh core
     sidecars:
