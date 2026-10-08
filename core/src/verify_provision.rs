@@ -13,6 +13,9 @@
 //! `.mcp.json` is removed only when its bytes are the ones recorded; anything the user wrote or
 //! edited is left alone and reported.
 //!
+//! While the switch is on, the shared exclude block hides `/.mcp.json` and
+//! `/.claude/settings.local.json` in every worktree of the repository, daemon-owned ones included.
+//!
 //! Nothing here runs a git command that rewrites the index (`ls-files`, `rev-parse` and
 //! `worktree list` only), so a pass with nothing to do leaves `.git` byte-identical.
 
@@ -171,6 +174,57 @@ async fn ide_worktrees(
         out.push(path);
     }
     Ok(out)
+}
+
+/// Every worktree `git worktree list` names, detached ones included, whose directory still exists.
+/// Switching off must reach all of them: a worktree provisioned while it was an IDE worktree may
+/// have become detached, or been claimed by a run, since.
+async fn every_worktree(root: &Path) -> Result<Vec<String>, String> {
+    let listed = git(root, &["worktree", "list", "--porcelain"]).await?;
+    if !listed.succeeded() {
+        return Err(format!(
+            "could not list the worktrees: {}",
+            listed.output_tail
+        ));
+    }
+    let mut out = Vec::new();
+    for block in listed
+        .stdout
+        .replace(
+            "
+", "
+",
+        )
+        .split(
+            "
+
+",
+        )
+    {
+        let mut path = None;
+        let mut bare = false;
+        for line in block.lines() {
+            if let Some(found) = line.strip_prefix("worktree ") {
+                path = Some(found.to_owned());
+            } else if line == "bare" {
+                bare = true;
+            }
+        }
+        let Some(path) = path else { continue };
+        if bare || git_exec::canonical(Path::new(&path)).await.is_err() {
+            continue;
+        }
+        out.push(path);
+    }
+    Ok(out)
+}
+
+/// Whether the daemon has a provenance record in this worktree's private git directory.
+async fn has_provenance(path: &str) -> bool {
+    match git_dir(Path::new(path)).await {
+        Ok(dir) => dir.join(PROVENANCE_FILE).exists(),
+        Err(_) => false,
+    }
 }
 
 async fn is_tracked(worktree: &Path, rel: &str) -> Result<bool, String> {
@@ -422,6 +476,8 @@ async fn unprovision(path: &str) -> Result<WorktreeReport, String> {
     };
     let mut state = ProvisionState::Removed;
     let mut reason = None;
+    // Set when a recorded undo step could not be done: the record must outlive it.
+    let mut keep_record = false;
 
     let mcp_path = wt.join(MCP_FILE);
     if let Some(found) = read_optional(&mcp_path).await? {
@@ -472,13 +528,17 @@ async fn unprovision(path: &str) -> Result<WorktreeReport, String> {
             }
             _ => {
                 state = ProvisionState::NotProvisioned;
-                reason.get_or_insert_with(|| {
-                    format!("{SETTINGS_FILE} is no longer a JSON object; kept")
-                });
+                keep_record = true;
+                reason = Some(format!(
+                    "{SETTINGS_FILE} is no longer a JSON object; kept, with the record"
+                ));
             }
         }
     }
 
+    if keep_record {
+        return Ok(report(path, state, reason));
+    }
     let provenance_path = git_dir.join(PROVENANCE_FILE);
     tokio::fs::remove_file(&provenance_path)
         .await
@@ -503,6 +563,15 @@ pub(crate) async fn reconcile(
     let root = Path::new(&root);
     let worktrees = ide_worktrees(pool, project_id, root).await?;
 
+    let mut worktrees = worktrees;
+    if !enabled {
+        // OFF also visits worktrees that are no longer IDE worktrees but still carry a record.
+        for path in every_worktree(root).await? {
+            if !worktrees.contains(&path) && has_provenance(&path).await {
+                worktrees.push(path);
+            }
+        }
+    }
     let mut reports = Vec::with_capacity(worktrees.len());
     if enabled && !worktrees.is_empty() {
         ensure_exclude_block(&common_dir(root).await?).await?;
@@ -519,7 +588,17 @@ pub(crate) async fn reconcile(
         });
     }
     if !enabled {
-        remove_exclude_block(&common_dir(root).await?).await?;
+        // The shared block stays while any worktree still has something recorded under it.
+        let mut remaining = false;
+        for path in every_worktree(root).await? {
+            if has_provenance(&path).await {
+                remaining = true;
+                break;
+            }
+        }
+        if !remaining {
+            remove_exclude_block(&common_dir(root).await?).await?;
+        }
     }
     Ok(reports)
 }
@@ -1064,5 +1143,94 @@ mod tests {
         assert!(!off.enabled);
         assert!(!switch_is(&pool).await);
         assert!(!repo.path().join(MCP).exists());
+    }
+
+    #[tokio::test]
+    async fn switching_off_cleans_a_worktree_that_became_detached() {
+        let repo = repo();
+        let (_keep, wt) = linked(repo.path(), "wt");
+        let pool = pool_with(repo.path(), true).await;
+        reconcile(&pool, "alpha", EXE).await.unwrap();
+        assert!(wt.join(MCP).is_file());
+        assert!(wt.join(SETTINGS).is_file());
+        // The worktree stops being an IDE worktree after it was provisioned.
+        git_in(&wt, &["checkout", "-q", "--detach"]);
+
+        let off = switch(&pool, &Scope::Control, "alpha", false, EXE)
+            .await
+            .unwrap();
+
+        assert!(
+            !wt.join(MCP).exists(),
+            "the detached worktree keeps nothing"
+        );
+        assert!(!wt.join(".claude").exists());
+        let report = report_for(&off.worktrees, &wt).await;
+        assert!(
+            matches!(report.state, ProvisionState::Removed),
+            "{:?} {:?}",
+            report.state,
+            report.reason
+        );
+        assert!(!repo.path().join(MCP).exists());
+        let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert!(
+            !exclude.contains(BLOCK_START),
+            "no record remains: {exclude}"
+        );
+        assert!(
+            !git_in(&wt, &["rev-parse", "--absolute-git-dir"]).is_empty()
+                && !PathBuf::from(git_in(&wt, &["rev-parse", "--absolute-git-dir"]))
+                    .join(PROVENANCE_FILE)
+                    .exists(),
+            "the record of the detached worktree is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_exclude_block_stays_while_any_provenance_remains() {
+        let repo = repo();
+        let (_keep, wt) = linked(repo.path(), "wt");
+        let pool = pool_with(repo.path(), true).await;
+        reconcile(&pool, "alpha", EXE).await.unwrap();
+        // Break the settings file in the linked worktree so its undo fails and its record stays.
+        std::fs::write(wt.join(SETTINGS), "[1, 2]").unwrap();
+
+        switch(&pool, &Scope::Control, "alpha", false, EXE)
+            .await
+            .unwrap();
+
+        let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.contains(BLOCK_START),
+            "a record remains, so the files stay hidden: {exclude}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_settings_undo_keeps_the_provenance() {
+        let repo = repo();
+        let pool = pool_with(repo.path(), true).await;
+        reconcile(&pool, "alpha", EXE).await.unwrap();
+        let record = repo.path().join(".git").join(PROVENANCE_FILE);
+        assert!(record.is_file());
+        std::fs::write(repo.path().join(SETTINGS), "[\"not an object\"]").unwrap();
+
+        let report = unprovision(&repo.path().to_string_lossy()).await.unwrap();
+
+        assert!(
+            matches!(report.state, ProvisionState::NotProvisioned),
+            "{:?}",
+            report.state
+        );
+        assert!(report.reason.is_some());
+        assert!(
+            record.is_file(),
+            "the record is what lets a later pass retry"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(SETTINGS)).unwrap(),
+            "[\"not an object\"]"
+        );
     }
 }
