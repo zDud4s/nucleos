@@ -83,6 +83,8 @@ pub(crate) enum Caller {
     Run(i64),
     /// The daemon's own item gate. `from_scope` never produces it, so no key can claim to be one.
     Job(i64),
+    /// The merge queue's gate before publish; `from_scope` never produces it.
+    Merge(i64),
     /// The daemon's post-merge gate. `from_scope` never produces it.
     Postgate,
     /// The post-merge gate's recheck of a red sha. `from_scope` never produces it.
@@ -105,6 +107,7 @@ impl Caller {
     /// A person waiting at the keyboard goes ahead of an autonomous run (spec, "Prioridades").
     pub(crate) fn priority(self) -> i64 {
         match self {
+            Caller::Merge(_) => PRIORITY_AUTONOMOUS,
             Caller::Owner => PRIORITY_INTERACTIVE,
             Caller::Run(_) | Caller::Job(_) => PRIORITY_AUTONOMOUS,
             Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => {
@@ -116,6 +119,7 @@ impl Caller {
     /// How the request row records its caller, and what `may_read` compares against.
     pub(crate) fn label(self) -> String {
         match self {
+            Caller::Merge(id) => format!("merge:{id}"),
             Caller::Owner => "owner".to_owned(),
             Caller::Run(id) => format!("run:{id}"),
             Caller::Job(id) => format!("job:{id}"),
@@ -139,6 +143,7 @@ impl Caller {
 /// working on, and a ticket id is a guessable integer.
 pub(crate) fn may_read(caller: Caller, row_caller: &str) -> bool {
     match caller {
+        Caller::Merge(_) => row_caller == caller.label(),
         Caller::Owner => true,
         Caller::Run(_)
         | Caller::Job(_)
@@ -265,7 +270,12 @@ pub(crate) async fn resolve_worktree(
         }
         // The daemon names the job's worktree itself, and it is held to the same registered-
         // worktree-of-a-known-project check as the owner's.
-        Caller::Owner | Caller::Job(_) | Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => {
+        Caller::Merge(_)
+        | Caller::Owner
+        | Caller::Job(_)
+        | Caller::Postgate
+        | Caller::FlakeCheck
+        | Caller::Bisect => {
             let Some(asked) = asked else {
                 return Err(VerifyError::BadRequest("worktree is required".to_owned()));
             };
@@ -1007,6 +1017,18 @@ pub(crate) async fn gate_job_scope(
     worktree: &Path,
     wait: Duration,
 ) -> ScopeVerdict {
+    gate_scope(executor, Caller::Job(job_id), worktree, wait).await
+}
+
+/// The `scope` gate behind `gate_job_scope`, for any daemon-side caller that names itself: the job
+/// item gate as `Caller::Job`, the merge queue's gate before publish as `Caller::Merge`. The
+/// caller's label is what lands in `verify_requests.caller`.
+pub(crate) async fn gate_scope(
+    executor: &Arc<Executor>,
+    caller: Caller,
+    worktree: &Path,
+    wait: Duration,
+) -> ScopeVerdict {
     use crate::gate::GateOutcome;
 
     let args = VerifyArgs {
@@ -1017,13 +1039,13 @@ pub(crate) async fn gate_job_scope(
         base: None,
         wait: false,
     };
-    let id = match submit(executor, Caller::Job(job_id), &args).await {
+    let id = match submit(executor, caller, &args).await {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(
-                job_id,
+                caller = %caller.label(),
                 reason = error.message(),
-                "scope verification could not be submitted; the item takes the full gate"
+                "scope verification could not be submitted; the caller takes the full gate"
             );
             return ScopeVerdict::Unavailable;
         }

@@ -2252,6 +2252,10 @@ pub struct GitExecutor {
     /// gives - measures exactly as before and records nothing, which is every test that never
     /// asked for a database.
     pub pool: Option<sqlx::SqlitePool>,
+    /// The verification executor a merge's `scope` gate is submitted to (spec 2026-10-05 §6.1).
+    /// `None` - what `Default` gives - means every merge takes the full gate, which is how a test
+    /// that never installed one behaves.
+    pub verify: Option<std::sync::Arc<crate::verify_exec::Executor>>,
 }
 
 impl Default for GitExecutor {
@@ -2260,7 +2264,30 @@ impl Default for GitExecutor {
             timeout: OPERATION_TIMEOUT,
             machine_root: None,
             pool: None,
+            verify: None,
         }
+    }
+}
+
+/// What `gate_the_merge` did, because the caller owes the publish a git budget when something ran
+/// and owes the post-merge gate a cover mark when the FULL gate ran on a merge it would repeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeGate {
+    /// `gate_before_publish` is off: nothing was measured.
+    Skipped,
+    /// The full `gate_command` ran and passed; the post-merge gate is not in play.
+    Full,
+    /// The full `gate_command` ran and passed on a merge into the land target while
+    /// `gate_after_land` is on: once published, that sha need not be gated again.
+    FullCovering,
+    /// A `scope` verification ran (or found nothing to run). The post-merge gate still owes the full
+    /// gate on this sha.
+    Scope,
+}
+
+impl MergeGate {
+    fn measured(self) -> bool {
+        self != MergeGate::Skipped
     }
 }
 
@@ -2361,6 +2388,15 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                         // `integration_worktree` and not `prepare_integration_worktree`: the first
                         // is a pure path function, and the second would `merge --abort`, `reset
                         // --hard` and `clean` the very checkout being measured.
+                        //
+                        // Only a merge INTO the integration branch the request names can take the
+                        // combined rule: elsewhere there is no post-merge gate to compensate for a
+                        // lighter measurement.
+                        let land_target = request
+                            .integration_branch
+                            .as_ref()
+                            .map(|branch| branch.as_str())
+                            .filter(|branch| *branch == target.as_str());
                         let measured = match gate_the_merge(
                             self.machine_root.as_deref(),
                             self.pool.as_ref(),
@@ -2369,6 +2405,8 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                             project_root,
                             &integration_worktree(project_root),
                             crate::state::DEFAULT_GATE_TIMEOUT,
+                            land_target,
+                            self.verify.as_ref(),
                         )
                         .await
                         {
@@ -2385,12 +2423,34 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                         // rather than as a slow suite. An UNGATED merge keeps the one deadline it
                         // always had, so nothing about this loosens the budget for anybody who did
                         // not ask to be measured.
-                        let publishing = if measured {
+                        let publishing = if measured.measured() {
                             std::time::Instant::now() + self.timeout
                         } else {
                             deadline
                         };
-                        publish(project_root, target.as_str(), computed, publishing).await
+                        let outcome =
+                            publish(project_root, target.as_str(), computed, publishing).await;
+                        // Marked only AFTER the publish: a lost CAS leaves the measured sha off
+                        // the target, and a mark on it would break the post-merge gate's range.
+                        if measured == MergeGate::FullCovering
+                            && let Outcome::Succeeded { sha: Some(sha), .. } = &outcome
+                            && let Some(pool) = self.pool.as_ref()
+                            && let Err(error) = crate::verify_postgate::mark_covered(
+                                pool,
+                                &request.project_id,
+                                target.as_str(),
+                                sha,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                vcs_request_id = request.id,
+                                %error,
+                                "could not mark the published merge as covered; the post-merge \
+                                 gate will run again"
+                            );
+                        }
+                        outcome
                     }
                     // Computing failed, which IS how this request ended.
                     Err(outcome) => outcome,
@@ -2433,8 +2493,15 @@ impl crate::vcs::VcsExecutor for GitExecutor {
 /// measures something other than what breaks, and merging first and undoing afterwards is a
 /// destructive act on shared history that this queue will not take on its own.
 ///
-/// Returns whether a measurement actually happened, because the caller owes a publish that ran after
-/// a long gate its own git budget and owes one that did not exactly the budget it already had.
+/// Returns which measurement happened (`MergeGate`), because the caller owes a publish that ran
+/// after a long gate its own git budget and owes one that did not exactly the budget it already had.
+///
+/// **With `gate_after_land` on and a merge into the land target (`land_target`), spec §6.1 applies:**
+/// a `Valid` test map on the integration worktree means a cached `verify scope` stands in for the
+/// full gate, because the post-merge worker runs the full gate on the published sha anyway. No map,
+/// no executor, or a `scope` that cannot be submitted falls back to the full `gate_command`, and
+/// that result is `FullCovering`: the caller marks the published sha as covered. With the switch off
+/// nothing here changes.
 ///
 /// **Three refusals rather than one, and each is a different sentence to its reader.**
 /// - The rules file exists and will not parse: we cannot tell whether this repository wanted its
@@ -2468,7 +2535,9 @@ async fn gate_the_merge(
     project_root: &Path,
     integration: &Path,
     timeout: Duration,
-) -> Result<bool, Outcome> {
+    land_target: Option<&str>,
+    verify: Option<&std::sync::Arc<crate::verify_exec::Executor>>,
+) -> Result<MergeGate, Outcome> {
     let refuse = |reason: String| Outcome::Failed {
         reason,
         exit_code: None,
@@ -2487,7 +2556,7 @@ async fn gate_the_merge(
         }
     };
     if !rules.gate_before_publish {
-        return Ok(false);
+        return Ok(MergeGate::Skipped);
     }
     let Some(command) = rules.gate_command else {
         return Err(refuse(format!(
@@ -2495,6 +2564,37 @@ async fn gate_the_merge(
              nothing to measure this merge with and nothing was published"
         )));
     };
+
+    let combine = rules.gate_after_land && land_target.is_some();
+    if combine && let Some(executor) = verify {
+        let root = integration.to_path_buf();
+        let map = tokio::task::spawn_blocking(move || crate::tests_map::load(&root)).await;
+        if matches!(map, Ok(crate::tests_map::MapState::Valid(_))) {
+            match crate::verify::gate_scope(
+                executor,
+                crate::verify::Caller::Merge(request_id),
+                integration,
+                timeout,
+            )
+            .await
+            {
+                crate::verify::ScopeVerdict::Measured(crate::gate::GateOutcome::Passed)
+                | crate::verify::ScopeVerdict::NothingRan => return Ok(MergeGate::Scope),
+                crate::verify::ScopeVerdict::Measured(crate::gate::GateOutcome::Failed {
+                    exit_code,
+                    output,
+                }) => return Err(merge_gate_failed(exit_code, output)),
+                crate::verify::ScopeVerdict::Measured(crate::gate::GateOutcome::Errored {
+                    reason,
+                }) => {
+                    return Err(refuse(format!(
+                        "the merge could not be measured, so nothing was published: {reason}"
+                    )));
+                }
+                crate::verify::ScopeVerdict::Unavailable => {}
+            }
+        }
+    }
 
     let measured = crate::verify_runs::timed_gate(
         pool,
@@ -2511,21 +2611,31 @@ async fn gate_the_merge(
     )
     .await;
     match measured {
-        crate::gate::GateOutcome::Passed => Ok(true),
-        crate::gate::GateOutcome::Failed { exit_code, output } => Err(Outcome::Failed {
-            // Says WHERE the failure lives, because the asker's first instinct will be that their
-            // branch is fine — and it may well be. What was measured is the junction, which is a
-            // tree neither side had ever built.
-            reason: "the merge does not pass this project's gate, so nothing was published. What \
-                     was measured is the two branches TOGETHER: each can be green on its own and \
-                     still make a tree that is not."
-                .to_owned(),
-            exit_code: Some(exit_code),
-            output_tail: output,
+        crate::gate::GateOutcome::Passed => Ok(if combine {
+            MergeGate::FullCovering
+        } else {
+            MergeGate::Full
         }),
+        crate::gate::GateOutcome::Failed { exit_code, output } => {
+            Err(merge_gate_failed(exit_code, output))
+        }
         crate::gate::GateOutcome::Errored { reason } => Err(refuse(format!(
             "the merge could not be measured, so nothing was published: {reason}"
         ))),
+    }
+}
+
+/// A red gate on a merge. Says WHERE the failure lives, because the asker's first instinct will be
+/// that their branch is fine - and it may well be. What was measured is the junction, which is a
+/// tree neither side had ever built.
+fn merge_gate_failed(exit_code: i32, output: String) -> Outcome {
+    Outcome::Failed {
+        reason: "the merge does not pass this project's gate, so nothing was published. What \
+                 was measured is the two branches TOGETHER: each can be green on its own and \
+                 still make a tree that is not."
+            .to_owned(),
+        exit_code: Some(exit_code),
+        output_tail: output,
     }
 }
 
@@ -3770,6 +3880,370 @@ gate_command: git --version
             integration_branch: None,
         })
         .await
+    }
+
+    // ---- F3-6: `gate_before_publish` combined with `gate_after_land` ----------------------------
+    //
+    // Every fixture pairs a RED `gate_command` with a GREEN map group (or the reverse), so the
+    // verdict itself says which gate ran: the red `gate_command` only fails when the full gate
+    // ran, and the map group only runs under `verify scope`.
+
+    const RED_GATE: &str = "git rev-parse --verify nao-existe";
+    const GREEN_GATE: &str = "git --version";
+    const BOTH_SWITCHES: &str = "gate_before_publish: true\ngate_after_land: true\n";
+
+    /// Commits a `nucleos.tests.yaml` on `master` whose single group watches `feature.txt`, the
+    /// file `feat/x` adds, so `map_change` stays `None` and the scope covers the merge's diff.
+    fn commit_map_on_master(repo: &Path, group_command: &str) {
+        std::fs::write(
+            repo.join(crate::tests_map::MAP_FILE),
+            format!(
+                "version: 1\ntests:\n  groups:\n    feature:\n      paths: [feature.txt]\n      \
+                 check: {group_command}\n      command: {group_command}\n"
+            ),
+        )
+        .expect("write the map");
+        assert!(git_ok(repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("add the map")
+            ]
+        ));
+    }
+
+    fn verify_executor(
+        pool: &sqlx::SqlitePool,
+        machine_root: &Path,
+    ) -> std::sync::Arc<crate::verify_exec::Executor> {
+        let executor = crate::verify_exec::Executor::new(
+            pool.clone(),
+            crate::config::VerifyConfig::default(),
+            Some(machine_root.to_path_buf()),
+        );
+        tokio::spawn(crate::verify_exec::run_executor(executor.clone()));
+        executor
+    }
+
+    async fn roster(pool: &sqlx::SqlitePool, repo: &Path) {
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) \
+             VALUES ('alpha', 'active', ?)",
+        )
+        .bind(repo.to_string_lossy().into_owned())
+        .execute(pool)
+        .await
+        .expect("roster alpha");
+    }
+
+    async fn land_with(
+        repo: &Path,
+        machine_root: &Path,
+        pool: Option<sqlx::SqlitePool>,
+        verify: Option<std::sync::Arc<crate::verify_exec::Executor>>,
+        integration_branch: Option<&str>,
+        id: i64,
+    ) -> Outcome {
+        use crate::vcs::VcsExecutor;
+        GitExecutor {
+            machine_root: Some(machine_root.to_path_buf()),
+            pool,
+            verify,
+            ..GitExecutor::default()
+        }
+        .execute(&crate::vcs::ClaimedRequest {
+            id,
+            op: crate::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            project_id: "alpha".to_owned(),
+            project_root: repo.to_string_lossy().into_owned(),
+            from_resolution: false,
+            run_id: None,
+            approved_map_blob: None,
+            integration_branch: integration_branch.map(crate::vcs::Branch::from),
+        })
+        .await
+    }
+
+    async fn request_callers(pool: &sqlx::SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT caller FROM verify_requests ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .expect("read verify_requests")
+    }
+
+    async fn merge_gate_rows(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM verify_runs WHERE origin = ?")
+            .bind(crate::verify_runs::ORIGIN_MERGE)
+            .fetch_one(pool)
+            .await
+            .expect("count verify_runs")
+    }
+
+    /// With `gate_after_land` off (the default) nothing about the merge gate changes, even with a
+    /// valid map and an executor installed: the full gate runs and the verify queue is not asked.
+    #[tokio::test]
+    async fn with_gate_after_land_off_the_merge_takes_the_full_gate_even_with_a_map() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-off-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        commit_map_on_master(&repo, GREEN_GATE);
+        write_autopilot_rules(
+            container.path(),
+            &format!("gate_before_publish: true\ngate_command: {RED_GATE}\n"),
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        let executor = verify_executor(&pool, container.path());
+        let before = sha_of(&repo, "master");
+
+        let outcome = land_with(
+            &repo,
+            container.path(),
+            Some(pool.clone()),
+            Some(executor),
+            Some("master"),
+            7,
+        )
+        .await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+        assert!(request_callers(&pool).await.is_empty(), "no verify request");
+        assert_eq!(sha_of(&repo, "master"), before);
+        assert!(
+            crate::verify_postgate::load(&pool, "alpha")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Both switches and a valid map at the merge: the gate is a `verify scope` named
+    /// `merge:<id>`, and the (red) `gate_command` never runs.
+    #[tokio::test]
+    async fn with_both_switches_and_a_map_the_merge_is_gated_by_scope() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-scope-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        commit_map_on_master(&repo, GREEN_GATE);
+        write_autopilot_rules(
+            container.path(),
+            &format!("{BOTH_SWITCHES}gate_command: {RED_GATE}\n"),
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        let executor = verify_executor(&pool, container.path());
+
+        let outcome = land_with(
+            &repo,
+            container.path(),
+            Some(pool.clone()),
+            Some(executor),
+            Some("master"),
+            7,
+        )
+        .await;
+
+        assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
+        assert_eq!(request_callers(&pool).await, vec!["merge:7".to_owned()]);
+        assert_eq!(merge_gate_rows(&pool).await, 0, "the full gate did not run");
+        assert!(
+            crate::verify_postgate::load(&pool, "alpha")
+                .await
+                .unwrap()
+                .is_none(),
+            "a scope covers nothing for the post-merge gate"
+        );
+    }
+
+    /// A red `scope` refuses the merge, and the target does not move.
+    #[tokio::test]
+    async fn a_red_scope_gate_refuses_the_merge() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-red-scope-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        commit_map_on_master(&repo, RED_GATE);
+        write_autopilot_rules(
+            container.path(),
+            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        let executor = verify_executor(&pool, container.path());
+        let before = sha_of(&repo, "master");
+
+        let outcome = land_with(
+            &repo,
+            container.path(),
+            Some(pool.clone()),
+            Some(executor),
+            Some("master"),
+            7,
+        )
+        .await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+        assert_eq!(request_callers(&pool).await, vec!["merge:7".to_owned()]);
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
+    }
+
+    /// Both switches, no map: the full gate runs once, and after the publish the published SHA is
+    /// recorded as covered, against the right target.
+    #[tokio::test]
+    async fn with_both_switches_and_no_map_the_full_gate_covers_the_postgate() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-nomap-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(
+            container.path(),
+            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        let executor = verify_executor(&pool, container.path());
+
+        let outcome = land_with(
+            &repo,
+            container.path(),
+            Some(pool.clone()),
+            Some(executor),
+            Some("master"),
+            7,
+        )
+        .await;
+
+        let published = match outcome {
+            Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
+            other => panic!("a green full gate must publish, got {other:?}"),
+        };
+        assert_eq!(merge_gate_rows(&pool).await, 1);
+        let state = crate::verify_postgate::load(&pool, "alpha")
+            .await
+            .unwrap()
+            .expect("the published merge is recorded as covered");
+        assert_eq!(state.last_green_sha.as_deref(), Some(published.as_str()));
+        assert_eq!(state.target, "master");
+    }
+
+    /// A red full gate refuses the merge and marks nothing covered.
+    #[tokio::test]
+    async fn a_red_full_gate_marks_nothing_covered() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-redfull-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(
+            container.path(),
+            &format!("{BOTH_SWITCHES}gate_command: {RED_GATE}\n"),
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        let executor = verify_executor(&pool, container.path());
+        let before = sha_of(&repo, "master");
+
+        let outcome = land_with(
+            &repo,
+            container.path(),
+            Some(pool.clone()),
+            Some(executor),
+            Some("master"),
+            7,
+        )
+        .await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+        assert_eq!(sha_of(&repo, "master"), before);
+        assert!(
+            crate::verify_postgate::load(&pool, "alpha")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused merge covers nothing"
+        );
+    }
+
+    /// A `scope` that cannot be submitted (here: the project is not rostered, so `submit` refuses)
+    /// falls back to the full gate, and what ran is the full gate, so it is covered.
+    #[tokio::test]
+    async fn an_unsubmittable_scope_falls_back_to_the_full_gate_and_covers_it() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-unavail-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        commit_map_on_master(&repo, GREEN_GATE);
+        write_autopilot_rules(
+            container.path(),
+            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        // No roster row on purpose.
+        let executor = verify_executor(&pool, container.path());
+
+        let outcome = land_with(
+            &repo,
+            container.path(),
+            Some(pool.clone()),
+            Some(executor),
+            Some("master"),
+            7,
+        )
+        .await;
+
+        let published = match outcome {
+            Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
+            other => panic!("the fallback to the full gate must publish, got {other:?}"),
+        };
+        assert_eq!(merge_gate_rows(&pool).await, 1, "the full gate ran");
+        let state = crate::verify_postgate::load(&pool, "alpha")
+            .await
+            .unwrap()
+            .expect("the full gate covered the published merge");
+        assert_eq!(state.last_green_sha.as_deref(), Some(published.as_str()));
+    }
+
+    /// A merge that is not into the land target (`integration_branch` names another branch) keeps
+    /// today's full gate, asks the verify queue nothing and marks nothing covered.
+    #[tokio::test]
+    async fn a_merge_off_the_land_target_keeps_the_full_gate() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-offtarget-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        commit_map_on_master(&repo, GREEN_GATE);
+        write_autopilot_rules(
+            container.path(),
+            &format!("{BOTH_SWITCHES}gate_command: {RED_GATE}\n"),
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        let executor = verify_executor(&pool, container.path());
+
+        let outcome = land_with(
+            &repo,
+            container.path(),
+            Some(pool.clone()),
+            Some(executor),
+            Some("main"),
+            7,
+        )
+        .await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+        assert!(request_callers(&pool).await.is_empty(), "no verify request");
+        assert!(
+            crate::verify_postgate::load(&pool, "alpha")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Spec §7, first row. A conflict is not a problem this module solves — and the point of

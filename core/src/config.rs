@@ -2715,8 +2715,9 @@ pub struct AutopilotRules {
     pub gate_before_publish: bool,
     /// Whether the daemon runs the full gate on the target after a merge lands (spec
     /// 2026-10-05 §6.1). Off by default — a project that says nothing behaves exactly as before
-    /// this key existed. No reader yet (F3-2 wires it); turning it on is the owner's decision
-    /// (F3-8).
+    /// this key existed. Read by the post-merge worker (`verify_postgate_worker`) and by
+    /// `git_exec::gate_the_merge`, which decides what the gate before publish measures once this is
+    /// on. Turning it on is the owner's decision (F3-8).
     #[serde(default)]
     pub gate_after_land: bool,
     /// Whether a job asks if the owner is at the keyboard before it starts its next node.
