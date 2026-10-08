@@ -1561,7 +1561,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
             prio = _int_prio(opts["prio"] or os.environ.get("NUCLEOS_HEAVY_PRIO"), 1)
         weight, kind = 1, opts["kind"] or "auto"
         try:
-            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".ai" / "scripts"))
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
             import heavy_classify  # type: ignore
 
             verdict = heavy_classify.classify(argv)

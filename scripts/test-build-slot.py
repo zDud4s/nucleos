@@ -313,14 +313,13 @@ def fake_main(work: Path, with_classify: bool = True) -> tuple[Path, Path]:
     """A fake main checkout whose broker records its argv instead of running anything."""
     main = work / "main"
     (main / "scripts").mkdir(parents=True)
-    (main / ".ai" / "scripts").mkdir(parents=True)
     record = work / "broker-argv"
     (main / "scripts" / "heavy.py").write_text(
         NL.join(["import sys", "open(%r, 'w').write(%r.join(sys.argv[1:]))" % (record.as_posix(), NL), ""]),
         encoding="utf-8",
     )
     if with_classify:
-        (main / ".ai" / "scripts" / "heavy_classify.py").write_text("", encoding="utf-8")
+        (main / "scripts" / "heavy_classify.py").write_text("", encoding="utf-8")
     return main, record
 
 

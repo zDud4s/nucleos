@@ -192,7 +192,7 @@ heavy_run() {
   local main py
   main="${NUCLEOS_HEAVY_MAIN:-$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")}"
   if [ "${OS:-}" = Windows_NT ]; then py="${NUCLEOS_HEAVY_PYTHON:-python}"; else py="${NUCLEOS_HEAVY_PYTHON:-python3}"; fi
-  if [ -f "$main/scripts/heavy.py" ] && [ -f "$main/.ai/scripts/heavy_classify.py" ]; then
+  if [ -f "$main/scripts/heavy.py" ] && [ -f "$main/scripts/heavy_classify.py" ]; then
     "$py" "$main/scripts/heavy.py" -- "$@"
   elif [ "$1" = cargo ] || [ -n "${heavy_slot_any:-}" ]; then
     # build-slot.sh sets heavy_slot_any: whatever it is asked to run takes a slot, as before.
@@ -284,7 +284,7 @@ cd "$repo_root"
 if [ -z "${NUCLEOS_HEAVY_HELD:-}" ] && [ "${NUCLEOS_HEAVY:-}" != 0 ]; then
   heavy_main="${NUCLEOS_HEAVY_MAIN:-$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")}"
   if [ "${OS:-}" = Windows_NT ]; then heavy_py="${NUCLEOS_HEAVY_PYTHON:-python}"; else heavy_py="${NUCLEOS_HEAVY_PYTHON:-python3}"; fi
-  if [ -f "$heavy_main/scripts/heavy.py" ] && [ -f "$heavy_main/.ai/scripts/heavy_classify.py" ]; then
+  if [ -f "$heavy_main/scripts/heavy.py" ] && [ -f "$heavy_main/scripts/heavy_classify.py" ]; then
     # The broker is a native program: under Git bash `$BASH` is `/usr/bin/bash`, which it cannot open.
     heavy_bash="$BASH"
     command -v cygpath >/dev/null 2>&1 && heavy_bash="$(cygpath -m "$BASH")"
