@@ -435,6 +435,52 @@ pub async fn dismiss(
     })
 }
 
+/// How many times an owner's answer or dismissal is written before a busy database is reported.
+/// Each attempt already waits the pool's 10s busy_timeout, so two attempts stay under the Telegram
+/// sidecar's 30s client timeout: a retry that outlived the client would save an answer the owner
+/// was told was lost, and the owner's second try would then be a late duplicate.
+pub const BUSY_ATTEMPTS: u32 = 2;
+
+/// The pause before a retry, so it does not land on the same writer's next statement.
+pub const BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether `error` is SQLite's "database is locked" (SQLITE_BUSY, any extended code such as
+/// BUSY_SNAPSHOT): another writer held the lock past busy_timeout, and the same write may pass now.
+pub fn is_busy(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|db| db.code())
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| code & 0xff == 5)
+}
+
+/// Run `op` up to `attempts` times, pausing `pause` between tries, while `busy` says its error is a
+/// busy database. Any other error, or the last busy one, is returned as it came.
+pub async fn retry_busy<T, E, Fut>(
+    attempts: u32,
+    pause: std::time::Duration,
+    busy: impl Fn(&E) -> bool,
+    mut op: impl FnMut() -> Fut,
+) -> Result<T, E>
+where
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut attempt = 1;
+    loop {
+        match op().await {
+            Err(error) if attempt < attempts && busy(&error) => {
+                tracing::info!(
+                    attempt,
+                    "capture: database busy, retrying the owner's write"
+                );
+                attempt += 1;
+                tokio::time::sleep(pause).await;
+            }
+            done => return done,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Listing {
     Open,
@@ -978,5 +1024,92 @@ mod tests {
         let all = list(&pool, Listing::All, now).await.unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all.iter().find(|r| r.job_id == 8).unwrap().seconds_left, 0);
+    }
+
+    /// A real SQLITE_BUSY: one connection holds the write lock, a second with no busy_timeout writes.
+    async fn a_busy_error() -> sqlx::Error {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use sqlx::{Connection, Executor};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+        let mut holder = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        holder.execute("CREATE TABLE t (x INTEGER)").await.unwrap();
+        holder.execute("BEGIN IMMEDIATE").await.unwrap();
+        holder.execute("INSERT INTO t VALUES (1)").await.unwrap();
+        let other = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.busy_timeout(std::time::Duration::ZERO))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t VALUES (2)")
+            .execute(&other)
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn a_locked_database_is_busy_and_other_errors_are_not() {
+        assert!(is_busy(&a_busy_error().await));
+        assert!(!is_busy(&sqlx::Error::RowNotFound));
+        let pool = crate::testdb::fresh_pool().await;
+        let syntax = sqlx::query("SELEC 1").execute(&pool).await.unwrap_err();
+        assert!(!is_busy(&syntax));
+    }
+
+    #[tokio::test]
+    async fn a_busy_write_is_retried_once_and_then_passes() {
+        let busy = a_busy_error().await;
+        let mut first = Some(busy);
+        let mut calls = 0;
+        let done: Result<i64, sqlx::Error> =
+            retry_busy(BUSY_ATTEMPTS, std::time::Duration::ZERO, is_busy, || {
+                calls += 1;
+                let outcome = match first.take() {
+                    Some(error) => Err(error),
+                    None => Ok(7),
+                };
+                async move { outcome }
+            })
+            .await;
+        assert_eq!(done.unwrap(), 7);
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn a_write_still_busy_after_its_attempts_reports_the_busy_error() {
+        let mut calls = 0;
+        let mut errors = vec![
+            a_busy_error().await,
+            a_busy_error().await,
+            a_busy_error().await,
+        ];
+        let done: Result<(), sqlx::Error> =
+            retry_busy(BUSY_ATTEMPTS, std::time::Duration::ZERO, is_busy, || {
+                calls += 1;
+                let error = errors.pop().unwrap();
+                async move { Err(error) }
+            })
+            .await;
+        assert!(is_busy(&done.unwrap_err()));
+        assert_eq!(calls, BUSY_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn any_other_error_is_not_retried() {
+        let mut calls = 0;
+        let done: Result<(), sqlx::Error> =
+            retry_busy(BUSY_ATTEMPTS, std::time::Duration::ZERO, is_busy, || {
+                calls += 1;
+                async { Err(sqlx::Error::RowNotFound) }
+            })
+            .await;
+        assert!(matches!(done, Err(sqlx::Error::RowNotFound)));
+        assert_eq!(calls, 1);
     }
 }
