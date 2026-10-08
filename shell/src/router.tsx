@@ -239,8 +239,11 @@ const DETAIL_ROUTES: {
   { path: "/team-runs/$runId", component: TeamRunDetail },
   { path: "/mail/$emailId", component: MailDetail },
   { path: "/web/pages/$pageId", component: WebTabs },
-  // The Sessions tab of the Web page; it is a route of its own so the tab survives a reload.
-  { path: "/web/sessions", component: WebTabs },
+  // The Archive tab of the Web page (Sessions is /web itself); a route of its own so the tab
+  // survives a reload.
+  { path: "/web/archive", component: WebTabs },
+  // The Sessions tab's address until 2026-10-08, when Sessions became /web; it only forwards.
+  { path: "/web/sessions", component: BrowserRedirect },
   // Old bookmarks and feed rows still point at /browser; it now only forwards to the tab.
   { path: "/browser", component: BrowserRedirect },
   { path: "/system/$view", component: System },
