@@ -1265,13 +1265,7 @@ pub async fn enforce_if_asked(
 #[cfg(any(test, feature = "testkit"))]
 pub mod test_support {
     pub async fn pool() -> sqlx::SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     pub async fn running_run(pool: &sqlx::SqlitePool) -> i64 {

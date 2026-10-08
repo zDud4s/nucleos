@@ -458,13 +458,7 @@ mod tests {
     use super::*;
 
     async fn pool() -> SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     /// A root, its handoff successor, and a stranger; returns (root, successor).

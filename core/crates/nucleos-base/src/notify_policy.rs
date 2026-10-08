@@ -222,20 +222,7 @@ mod tests {
     use super::*;
 
     async fn test_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .expect("an in-memory database");
-        crate::storage::MIGRATOR
-            .run(&pool)
-            .await
-            .expect("migrations to apply");
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     fn rule(selector: &str, enabled: bool) -> Rule {

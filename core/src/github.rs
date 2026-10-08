@@ -3381,9 +3381,7 @@ mod tests {
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_shared_pool().await
     }
 
     fn runtime_with(actions: &[&str]) -> GithubRuntime {

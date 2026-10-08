@@ -456,13 +456,7 @@ mod tests {
     use super::*;
 
     async fn test_pool() -> SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
-        pool
+        crate::testdb::fresh_pool().await
     }
 
     /// Um item a semear: em que round, de que agente, e com que run — ou nenhuma.

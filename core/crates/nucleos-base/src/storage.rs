@@ -122,9 +122,11 @@ pub struct TempDb {
 impl TempDb {
     pub async fn new() -> Self {
         let dir = tempfile::tempdir().expect("create database tempdir");
-        let pool = open(&dir.path().join("nucleos.db"))
-            .await
-            .expect("open database");
+        let path = dir.path().join("nucleos.db");
+        // Seeded with the migrated image `testdb` caches, so `open` finds every migration applied
+        // and only checks them instead of running the chain again.
+        std::fs::write(&path, crate::testdb::migrated_image().await).expect("seed database");
+        let pool = open(&path).await.expect("open database");
         Self { pool, dir }
     }
 

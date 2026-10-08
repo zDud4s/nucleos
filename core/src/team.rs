@@ -4954,16 +4954,7 @@ mod tests {
     pub(super) async fn test_state(root: std::path::PathBuf) -> AppState {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(":memory:")
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        crate::storage::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::testdb::fresh_pool().await;
         AppState {
             token: crate::auth::Token("test-token".into()),
             pool,
