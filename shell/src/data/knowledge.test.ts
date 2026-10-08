@@ -1,9 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { describe, expect, it, vi } from "vitest";
+
+const daemon = vi.hoisted(() => ({ apiFetch: vi.fn() }));
+vi.mock("./client", async (original) => ({
+  ...(await original<typeof import("./client")>()),
+  apiFetch: daemon.apiFetch,
+}));
+
+import { createAppQueryClient } from "../app/queryClient";
+import { keys } from "./keys";
 import {
   distilledOrigin,
   groupWaiting,
   measuredByGenerator,
   parseEvidence,
+  useApproveKnowledge,
+  useDecideKnowledgeBatch,
+  useRejectKnowledge,
+  useRevertKnowledge,
   type Known,
 } from "./knowledge";
 
@@ -182,5 +198,38 @@ describe("groupWaiting", () => {
         proposalIds: [80],
       },
     ]);
+  });
+});
+
+describe("knowledge decisions", () => {
+  // A decision can change a note's standing in the Brain graph (a taught note
+  // links to the row it produced), so every door also refreshes the notes.
+  // The four hooks differ in result type; the test only needs `mutate` and `isSuccess`.
+  type AnyMutation = { mutate: (value: unknown) => void; isSuccess: boolean };
+  const cases: [string, () => AnyMutation, unknown][] = [
+    ["approve", () => useApproveKnowledge() as unknown as AnyMutation, 5],
+    ["reject", () => useRejectKnowledge() as unknown as AnyMutation, 5],
+    [
+      "batch",
+      () => useDecideKnowledgeBatch() as unknown as AnyMutation,
+      { action: "approve" as const, proposalIds: [5] },
+    ],
+    ["revert", () => useRevertKnowledge() as unknown as AnyMutation, 9],
+  ];
+  it.each(cases)("%s invalidates knowledge, proposals and owner notes", async (_name, hook, input) => {
+    daemon.apiFetch.mockReset();
+    daemon.apiFetch.mockResolvedValue(undefined);
+    const client = createAppQueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const { result } = renderHook(hook, { wrapper });
+
+    result.current.mutate(input);
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: keys.knowledge.all });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: keys.proposals.all });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: keys.ownerNotes.all });
   });
 });

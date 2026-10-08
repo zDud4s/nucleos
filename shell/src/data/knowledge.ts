@@ -365,6 +365,8 @@ function useKnowledgeDecision<Input, Result>(mutationFn: (input: Input) => Promi
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.knowledge.all });
       void queryClient.invalidateQueries({ queryKey: keys.proposals.all });
+      // The Brain graph and list read notes and knowledge together.
+      void queryClient.invalidateQueries({ queryKey: keys.ownerNotes.all });
     },
   });
 }
