@@ -82,8 +82,12 @@ pub fn render(header: &Header, facts: &[Fact]) -> String {
 /// Where the wait lives: a row of `schema_meta`, like `distiller.model`, read every tick.
 pub const WAIT_SETTING_KEY: &str = "distiller.capture_wait_minutes";
 pub const DEFAULT_WAIT_MINUTES: i64 = 120;
+/// A week. Beyond it the deadline arithmetic could overflow and panic on every tick, inside the
+/// worker's claiming transaction; no owner means to hold a job longer than that.
+pub const MAX_WAIT_MINUTES: i64 = 7 * 24 * 60;
 
-/// Minutes a request holds its job. `0` turns requests off; anything unreadable is the default.
+/// Minutes a request holds its job. `0` turns requests off; anything unreadable or out of range is
+/// the default.
 pub async fn wait_minutes(pool: &SqlitePool) -> i64 {
     sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = ?")
         .bind(WAIT_SETTING_KEY)
@@ -92,7 +96,7 @@ pub async fn wait_minutes(pool: &SqlitePool) -> i64 {
         .ok()
         .flatten()
         .and_then(|stored| stored.trim().parse::<i64>().ok())
-        .filter(|minutes| *minutes >= 0)
+        .filter(|minutes| (0..=MAX_WAIT_MINUTES).contains(minutes))
         .unwrap_or(DEFAULT_WAIT_MINUTES)
 }
 
@@ -247,7 +251,11 @@ pub async fn open_due(
                 opened += 1;
             }
             Some((state, causes, deadline)) if state == STATE_OPEN => {
-                let mut facts: Vec<Fact> = serde_json::from_str(&causes).unwrap_or_default();
+                // Unreadable facts are left as they are: rewriting them from an empty list would
+                // drop every earlier fact without a trace.
+                let Ok(mut facts) = serde_json::from_str::<Vec<Fact>>(&causes) else {
+                    continue;
+                };
                 if facts.iter().any(|f| f.row == row.id) {
                     continue;
                 }
@@ -703,6 +711,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unreadable_facts_are_never_rewritten_from_nothing() {
+        let pool = pool().await;
+        job(&pool, 7, "failed").await;
+        queued(&pool, "job_failed", 7, None, None).await;
+        let now = at("2026-10-07T10:00:00+00:00");
+        tick(&pool, now, 120).await;
+        sqlx::query("UPDATE capture_requests SET causes = 'not json' WHERE job_id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        queued(&pool, "run_exhausted", 7, None, None).await;
+        tick(&pool, now, 120).await;
+        let (state, causes, _, _) = request(&pool, 7).await.unwrap();
+        assert_eq!((state.as_str(), causes.as_str()), (STATE_OPEN, "not json"));
+    }
+
+    #[tokio::test]
     async fn the_deadline_expires_a_request_exactly_at_its_instant() {
         let pool = pool().await;
         job(&pool, 7, "failed").await;
@@ -747,6 +772,8 @@ mod tests {
             ("45", 45),
             ("-3", DEFAULT_WAIT_MINUTES),
             ("soon", DEFAULT_WAIT_MINUTES),
+            ("10080", MAX_WAIT_MINUTES),
+            ("999999999999", DEFAULT_WAIT_MINUTES),
         ] {
             sqlx::query("INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)")
                 .bind(WAIT_SETTING_KEY)
