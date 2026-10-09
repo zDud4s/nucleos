@@ -112,15 +112,8 @@ import {
   type RelayedFrom,
   type Todo,
 } from "../lib/turns";
-import {
-  blocks,
-  lines,
-  spans as spansOf,
-  type Block as RichBlock,
-  type Line as RichLine,
-  type Span as RichSpan,
-} from "../lib/rich";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { AnswerBlock, AskedBubble, Rich } from "../chats/MessageList";
+import { ComposerBox } from "../chats/ComposerBox";
 import {
   commandAt,
   mentionAt,
@@ -4309,11 +4302,10 @@ const TurnBlock = memo(function TurnBlock({
         <MarkNote key={index} mark={mark} />
       ))}
       <WhoAsked relayedFrom={turn.relayedFrom} chatId={chatId} turnId={turn.id} />
-      <div className="chats-turn-said">
-        {/* Verbatim, and not through `Rich`: their half is not markdown and is not read as any.
-            Somebody who types two asterisks meant two asterisks, and a message redrawn as bold is a
-            message they did not send. */}
-        <p className="chats-turn-asked">{turn.asked}</p>
+      {/* Verbatim, and not through `Rich`: their half is not markdown and is not read as any.
+          Somebody who types two asterisks meant two asterisks, and a message redrawn as bold is a
+          message they did not send. */}
+      <AskedBubble text={turn.asked}>
         {/* Editing, in the only sense this app can honestly offer.
             A turn is a billed run that already happened, and its answer is in the record; there is
             nothing to rewrite and no history to fork. What a person actually wants after a question
@@ -4334,14 +4326,15 @@ const TurnBlock = memo(function TurnBlock({
             exchange — which nobody noticed while both halves were left-aligned and looked the
             same. Moving the question to the right made it obvious. */}
         <TurnPictures paths={turn.images} />
-      </div>
+      </AskedBubble>
       {/* What was said INTO the turn while it worked ("Send now"): the person's own words, drawn
           the way the question is, under the turn they were folded into. */}
       {(turn.saidNow ?? []).map((said, i) => (
-        <div className="chats-turn-said" key={`${said.created_at}-${i}`}>
-          <p className="chats-turn-asked">{said.text}</p>
-          <p className="chats-turn-said-now-note">said while it was working</p>
-        </div>
+        <AskedBubble
+          key={`${said.created_at}-${i}`}
+          text={said.text}
+          note="said while it was working"
+        />
       ))}
       <p className="chats-turn-who">núcleo</p>
       {live && <LiveAnswer turnId={turn.id} since={turn.createdAt} />}
@@ -4350,11 +4343,7 @@ const TurnBlock = memo(function TurnBlock({
       {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
       {!live && <Plan todos={planOf(turn.did)} />}
       {!live && <WhatItDid did={turn.did} turnId={turn.id} settled />}
-      {!live && turn.answer !== null && (
-        <div className="chats-turn-answer">
-          <Rich text={turn.answer} />
-        </div>
-      )}
+      {!live && turn.answer !== null && <AnswerBlock text={turn.answer} />}
       {!live && turn.answer === null && (
         <p className="chats-turn-answer chats-turn-answer-empty">
           no answer recorded
@@ -4379,210 +4368,6 @@ const TurnBlock = memo(function TurnBlock({
     </li>
   );
 });
-
-/**
- * A model's answer, drawn as the shapes it was written in.
- *
- * The parser is in `lib/rich.ts` and returns data, never markup; every element below is chosen
- * here, from a closed set. So a transcript containing a script tag is a string containing a script
- * tag at every step of this, and there is no path by which one talks this into rendering HTML.
- *
- * Only the model's half goes through it. What a person typed is drawn exactly as they typed it.
- */
-function Rich({ text }: { text: string }) {
-  return (
-    <>
-      {blocks(text).map((block, index) =>
-        block.kind === "code" ? (
-          /* The block, and the one gesture anybody performs on one. A wrapper rather than a
-             button inside the `<pre>`: the `<pre>` scrolls sideways, and a control placed in a
-             scrolling box slides out of its own corner the moment the code is wider than the
-             column — which is exactly when somebody wants to copy it rather than read it. */
-          <div key={index} className="chats-code-block">
-            <pre className="chats-code">
-              <code>{block.text}</code>
-            </pre>
-            <span className="chats-code-copy">
-              <CopyButton value={block.text} label="this code" spoken={false} />
-            </span>
-          </div>
-        ) : block.kind === "table" ? (
-          <RichTable key={index} table={block} />
-        ) : (
-          <div key={index} className="chats-prose">
-            {lines(block.text).map((line, at) => (
-              <RichLineOut key={at} line={line} />
-            ))}
-          </div>
-        ),
-      )}
-    </>
-  );
-}
-
-/**
- * A table, as a table.
- *
- * It used to be five rows of pipes: `blocks` had no idea one existed, so the whole thing went
- * through the prose path and came out as the characters it was made of. A comparison of three
- * years against three rules is the single most useful shape an agent writes, and it was the one
- * this drew worst.
- *
- * Scrolls inside its own frame rather than widening the column. A six-column table in a
- * conversation is ordinary, and the alternative to scrolling is either a transcript that scrolls
- * sideways as a whole or cells folded until the table stops being one.
- */
-function RichTable({
-  table,
-}: {
-  table: Extract<RichBlock, { kind: "table" }>;
-}) {
-  // The author's own alignment, mapped to a class rather than an inline style: this window runs
-  // under a CSP with no `unsafe-inline`, so a `style` attribute is not a thing it can write.
-  const align = (at: number) => {
-    const set = table.align[at];
-    return set === null || set === undefined
-      ? "chats-table-cell"
-      : `chats-table-cell chats-table-${set}`;
-  };
-
-  return (
-    <div className="chats-table-wrap">
-      <table className="chats-table">
-        <thead>
-          <tr>
-            {table.head.map((cell, at) => (
-              <th key={at} className={align(at)} scope="col">
-                <RichSpans spans={spansOf(cell)} />
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {table.rows.map((row, index) => (
-            <tr key={index}>
-              {row.map((cell, at) => (
-                <td key={at} className={align(at)}>
-                  <RichSpans spans={spansOf(cell)} />
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-/** The pieces of one line, each drawn as what the parser said it was. */
-function RichSpans({ spans }: { spans: RichSpan[] }) {
-  return (
-    <>
-      {spans.map((span, index) =>
-        span.kind === "code" ? (
-          <code key={index}>{span.text}</code>
-        ) : span.kind === "strong" ? (
-          <strong key={index}>{span.text}</strong>
-        ) : span.kind === "em" ? (
-          <em key={index}>{span.text}</em>
-        ) : span.kind === "link" ? (
-          <RichLink key={index} text={span.text} href={span.href} />
-        ) : (
-          <span key={index}>{span.text}</span>
-        ),
-      )}
-    </>
-  );
-}
-
-/**
- * A link in an answer, opened by the OS rather than by this window.
- *
- * A `<button>` and not an `<a href>`, for the reason `lib/vscode.ts` gives at length: an external
- * URL from inside a webview is handled differently per platform and can simply be swallowed, while
- * the opener plugin crosses to the Rust side and asks the OS the way any other program would. It
- * also means no URL from a transcript is ever an `href` in this document.
- *
- * The scheme was already checked in the parser — a `javascript:` URL never became a link span at
- * all — and the plugin's own scope checks it again on the far side. The address is in the `title`
- * because a link whose destination you cannot see before pressing it is a link you should not
- * press, and this text came from a model.
- */
-function RichLink({ text, href }: { text: string; href: string }) {
-  return (
-    <button
-      type="button"
-      className="chats-rich-link"
-      title={href}
-      /* Spelled out: the visible text is a phrase from a sentence, and a control whose whole
-         accessible name is "calendário gregoriano" announces a noun rather than something that
-         opens a browser. */
-      aria-label={`Open ${href}`}
-      onClick={() => {
-        void openUrl(href).catch(() => {
-          // Refused by the plugin's scope, or nothing on this machine claims the scheme. The
-          // address is in the tooltip either way, which is the honest remainder of the request.
-        });
-      }}
-    >
-      {text}
-    </button>
-  );
-}
-
-/** One line of prose, drawn as the shape the parser found. */
-function RichLineOut({ line }: { line: RichLine }) {
-  if (line.kind === "blank") {
-    // The paragraph break somebody typed. An empty `<p>` has no height, which is how every gap in
-    // every answer was silently dropped and two thoughts came out as one.
-    return <p className="chats-rich-gap" aria-hidden="true" />;
-  }
-  if (line.kind === "rule") {
-    return <hr className="chats-rich-rule" />;
-  }
-  if (line.kind === "heading") {
-    return (
-      <p
-        className={`chats-rich-heading chats-rich-heading-${Math.min(line.level, 4)}`}
-      >
-        <RichSpans spans={line.spans} />
-      </p>
-    );
-  }
-  if (line.kind === "quote") {
-    return (
-      <p className="chats-rich-quote">
-        <RichSpans spans={line.spans} />
-      </p>
-    );
-  }
-  if (line.kind === "bullet") {
-    return (
-      <p
-        className={`chats-rich-bullet chats-rich-depth-${Math.min(line.depth, 3)}`}
-      >
-        {/* The author's own marker, never renumbered — see `Line.marker`. A dash becomes a
-            bullet because a dash is not a character anybody meant to read; a `1.` stays a `1.`
-            because it is. */}
-        <span className="chats-rich-marker" aria-hidden="true">
-          {line.marker ?? "•"}
-        </span>
-        {/* One flex item, not one per span. The row exists to hang the marker beside the text;
-            left unwrapped, every word and every `code` chip became its own flex item — gapped
-            apart and shrinkable on its own, so `budget_usd` was squeezed until it broke mid-name
-            and stacked vertically. Seen in the app, in a bulleted answer. */}
-        <span className="chats-rich-bullet-text">
-          <RichSpans spans={line.spans} />
-        </span>
-      </p>
-    );
-  }
-  return (
-    <p className="chats-rich-line">
-      <RichSpans spans={line.spans} />
-    </p>
-  );
-}
 
 /**
  * How full the context was, and a word before it is summarised.
@@ -5761,137 +5546,99 @@ ${was}`));
           ))}
         </ul>
       )}
-      {/* One object you type into, with the actions inside it — see `.chats-composer-box`. The
-          visible "Message" label went with the frame; the textarea has carried its own `aria-label`
-          all along, so the accessible name is exactly what it was. */}
-      <div className="chats-composer-box">
-        {/* Voice at the top right, away from send at the bottom right. They were neighbours in one
-            row, and they are the two controls in this box that both mean "begin" — one by talking,
-            one by sending — so a hand reaching for one was a hand next to the other.
-
-            **On the line being typed on, as its sibling.** It had a row of its own first, and that
-            row was height every composer paid for whether or not anybody ever talked. The corner is
-            reachable without spending it: the button and the textarea share one flex line, the
-            textarea takes what is left, and `align-items: flex-start` keeps the button at the top
-            as the text grows down past it.
-
-            Which also settles the objection that produced the extra row. This button GROWS when it
-            is recording, gaining the phase label, so a corner held by `position: absolute` would
-            have to reserve room for a width it only sometimes has — reserve for the small state and
-            it covers the text mid-sentence, reserve for the large one and there is a hole in the box
-            whenever nobody is talking. A flex sibling reserves nothing and overlaps nothing: when it
-            grows, the textarea gives up the width. */}
-        <div className="chats-composer-line">
-          <textarea
-            className="chats-composer-text"
-            placeholder="Say something…"
-            ref={box}
-            // Pasting is the gesture: a screenshot goes to the clipboard and then into the box, and
-            // anything that made you save it to a file first would be a step nobody takes.
-            onPaste={(event) => {
-              const pictures = Array.from(event.clipboardData.files).filter(
-                isPicture,
-              );
-              if (pictures.length === 0) return;
-              // Only when there IS a picture: a plain text paste must stay a text paste.
-              event.preventDefault();
-              void attach(pictures);
-            }}
-            /* The floor, not the size. `field-sizing: content` grows the box from here; this is what
-               it falls back to where that is unsupported. */
-            rows={1}
-            aria-label="Message"
-            value={text}
-            onChange={(event) => {
-              setText(event.target.value);
-              setCaret(event.target.selectionStart);
-              setDismissed(null);
-              setHighlight(0);
-            }}
-            // The caret moves without the text changing — arrows, a click, Home. What is being typed
-            // is read from where the caret IS, so every one of those has to be heard or the list goes
-            // stale against a position it no longer describes.
-            onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
-            // Enter sends and Shift+Enter breaks the line, because that is what every chat anybody
-            // has ever used does — and a textarea does the opposite by default, so the habit costs a
-            // reach for the mouse on every single message.
-            //
-            // While a list is open those same keys belong to it. Not a special case bolted on: a list
-            // under the caret owns the arrows and the Enter for as long as it is showing, which is
-            // what every editor does and what the hand already expects.
-            onKeyDown={(event) => {
-              if (listTookTheKey(event, choices, highlight, setHighlight)) return;
-              if (open && event.key === "Escape") {
-                event.preventDefault();
-                setDismissed(live(command) ?? live(mention));
-                return;
-              }
-              if (event.key !== "Enter" || event.shiftKey) return;
-              event.preventDefault();
-              say();
-            }}
-          />
-          <DictateToggle dictation={dictation} />
-        </div>
-        {/* The controls belong to the words being typed, so they live in the box with them — which
-            is the one structure every reference for this page shares. They used to be scattered:
-            the model and plan-only behind a `⋯` at the top of the page, the attach button in a
-            strip under the box. Asking "which model, and does it plan or does it do" a screen away
-            from the sentence those answers apply to is asking about the message somewhere the
-            message is not. */}
-        <div className="chats-composer-actions">
-          {/* The way in for anything not on the clipboard: pictures, small text files, more folders,
-              the web. One "+" rather than a bare file input, which nobody can style into the others. */}
-          <PlusMenu
-            chatId={chatId}
-            onPictures={(files) => void attach(files)}
-            onText={(context) =>
-              setText((was) => (was === "" ? context : `${was}\n${context}`))
-            }
-            onMention={mentionHere}
-          />
-          {chat !== undefined && (
-            <ChatModelControls
+      {/* The visible "Message" label went with the frame; the textarea has carried its own
+          `aria-label` all along, so the accessible name is exactly what it was. */}
+      <ComposerBox
+        text={text}
+        boxRef={box}
+        sendDisabled={!sayable}
+        onSubmit={say}
+        onText={(value, at) => {
+          setText(value);
+          setCaret(at);
+          setDismissed(null);
+          setHighlight(0);
+        }}
+        // The caret moves without the text changing — arrows, a click, Home. What is being typed
+        // is read from where the caret IS, so every one of those has to be heard or the list goes
+        // stale against a position it no longer describes.
+        onSelect={setCaret}
+        // Pasting is the gesture: a screenshot goes to the clipboard and then into the box, and
+        // anything that made you save it to a file first would be a step nobody takes.
+        onPaste={(event) => {
+          const pictures = Array.from(event.clipboardData.files).filter(
+            isPicture,
+          );
+          if (pictures.length === 0) return;
+          // Only when there IS a picture: a plain text paste must stay a text paste.
+          event.preventDefault();
+          void attach(pictures);
+        }}
+        // While a list is open the arrows and the Enter belong to it: a list under the caret owns
+        // them for as long as it is showing, which is what every editor does and what the hand
+        // already expects. Then Escape; Enter-without-Shift is the box's own and calls `say`.
+        onKeyDown={(event) => {
+          if (listTookTheKey(event, choices, highlight, setHighlight))
+            return true;
+          if (open && event.key === "Escape") {
+            event.preventDefault();
+            setDismissed(live(command) ?? live(mention));
+            return true;
+          }
+          return false;
+        }}
+        // Voice sits on the line being typed on, as its sibling, at the top right: away from send
+        // at the bottom right. They are the two controls that both mean "begin", and a flex
+        // sibling reserves nothing and overlaps nothing when it grows to show the phase label.
+        line={<DictateToggle dictation={dictation} />}
+        actions={
+          <>
+            {/* The way in for anything not on the clipboard: pictures, small text files, more
+                folders, the web. One "+" rather than a bare file input. */}
+            <PlusMenu
               chatId={chatId}
-              model={chat.model}
-              effort={chat.effort}
+              onPictures={(files) => void attach(files)}
+              onText={(context) =>
+                setText((was) => (was === "" ? context : `${was}\n${context}`))
+              }
+              onMention={mentionHere}
             />
-          )}
-          <span className="chats-composer-gap" />
-          {/* The one word about the microphone, on a row that exists at this height whether it
-              says anything or not. It was a paragraph under the box until 2026-09-20, and under
-              the box is under a composer pinned to the foot of a conversation: every "nothing was
-              heard" pushed the transcript up a line and the next press pulled it back down. It
-              shrinks rather than grows, with the whole sentence on `title`. */}
-          {dictation.trouble !== null && (
-            <span className="chats-dictation-trouble" title={dictation.trouble}>
-              {dictation.trouble}
-            </span>
-          )}
-          {/* Last before send, because it is the answer most likely to be changed in the moment of
-              sending — "actually, plan this one" — and the hand is already on that corner. */}
-          <PermissionMenu chatId={chatId} />
-          {steerable && (
-            <Button
-              type="button"
-              variant="quiet"
-              disabled={text.trim() === "" || sayNow.isPending}
-              onClick={sayItNow}
-              title="say it to the running turn instead of waiting"
-            >
-              Send now
-            </Button>
-          )}
-          <button
-            type="submit"
-            className="chats-send"
-            aria-label="Send"
-            disabled={!sayable}
-          >
-            <ArrowUp className="chats-send-icon" aria-hidden="true" />
-          </button>
-        </div>
-      </div>
+            {chat !== undefined && (
+              <ChatModelControls
+                chatId={chatId}
+                model={chat.model}
+                effort={chat.effort}
+              />
+            )}
+            <span className="chats-composer-gap" />
+            {/* The one word about the microphone, on a row that exists at this height whether it
+                says anything or not. It shrinks rather than grows, with the whole sentence on
+                `title`. */}
+            {dictation.trouble !== null && (
+              <span
+                className="chats-dictation-trouble"
+                title={dictation.trouble}
+              >
+                {dictation.trouble}
+              </span>
+            )}
+            {/* Last before send, because it is the answer most likely to be changed in the moment
+                of sending — "actually, plan this one" — and the hand is already on that corner. */}
+            <PermissionMenu chatId={chatId} />
+            {steerable && (
+              <Button
+                type="button"
+                variant="quiet"
+                disabled={text.trim() === "" || sayNow.isPending}
+                onClick={sayItNow}
+                title="say it to the running turn instead of waiting"
+              >
+                Send now
+              </Button>
+            )}
+          </>
+        }
+      />
       {send.isError && <MessageRefusal error={send.error} />}
       {sayNow.isError && <MessageRefusal error={sayNow.error} />}
     </form>
