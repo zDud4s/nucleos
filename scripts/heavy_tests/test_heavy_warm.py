@@ -39,6 +39,16 @@ HEAVY = ROOT / "scripts" / "heavy.py"
 BELOW_NORMAL = 0x4000
 IDLE = 0x40
 
+
+def own_priority_class() -> int:
+    """This process's Windows priority class, which a child started with no class flag inherits."""
+    import ctypes
+
+    k = ctypes.windll.kernel32
+    k.GetCurrentProcess.restype = ctypes.c_void_p
+    k.GetPriorityClass.argtypes = [ctypes.c_void_p]
+    return k.GetPriorityClass(k.GetCurrentProcess())
+
 FAKE = r'''
 import os, pathlib, sys, time
 
@@ -379,11 +389,13 @@ class WarmTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda: (self.d / "no-run.pclass").exists()))
         pclass = int((self.d / "no-run.pclass").read_text())
         self.assertIn(pclass, (BELOW_NORMAL, IDLE), f"priority class {pclass:#x}")
-        # A normal request is NOT lowered.
+        # A normal request is NOT lowered: it runs at whatever class this test runs at. Compared
+        # with our own class rather than "not below normal", because a CI runner may start the
+        # whole job below normal already, and every child of it inherits that.
         real = self.broker("real", self.repo_b, prio=1)
         self.assert_started("real")
         self.assertTrue(wait_for(lambda: (self.d / "real.pclass").exists()))
-        self.assertNotIn(int((self.d / "real.pclass").read_text()), (BELOW_NORMAL, IDLE))
+        self.assertEqual(int((self.d / "real.pclass").read_text()), own_priority_class())
         self.stop("real")
         self.assertEqual(real.wait(timeout=20), 0)
 
