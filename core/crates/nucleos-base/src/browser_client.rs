@@ -1164,7 +1164,11 @@ mod tests {
 
         let calls = seen.lock().unwrap();
         assert_eq!(calls[0]["verb"], "open");
-        assert_eq!(calls[0]["body"]["placement"]["visible"], true, "{}", calls[0]);
+        assert_eq!(
+            calls[0]["body"]["placement"]["visible"], true,
+            "{}",
+            calls[0]
+        );
         assert!(
             calls[0]["body"].get("visible").is_none(),
             "visible lives inside placement, not at the top level: {}",
