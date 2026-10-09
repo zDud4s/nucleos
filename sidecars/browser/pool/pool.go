@@ -71,6 +71,10 @@ type Launcher interface {
 	Launch(ctx context.Context, dir string, policy fence.Policy) (Instance, error)
 	// LaunchHuman starts a headful browser with no fence, for spec §4.2's handover.
 	LaunchHuman(ctx context.Context, dir string) (Instance, error)
+	// LaunchVisible starts the agent's browser headful but fenced: same policy as Launch, with a
+	// window. A third method for the same reason as the two above — visibility changes the command
+	// line, and a boolean on Launch would be a flag that is easy to forget to thread.
+	LaunchVisible(ctx context.Context, dir string, policy fence.Policy) (Instance, error)
 	Name() string
 }
 
@@ -143,6 +147,10 @@ type entry struct {
 	// person marks a browser whose one session a person is driving with the fence lifted. Like human
 	// it belongs to the BROWSER, and it is read and written under Pool.mu.
 	person bool
+	// visible marks a browser launched headful by LaunchVisible. A property of the BROWSER, like
+	// human: a visible browser is exclusive on its profile, so a session wanting the other
+	// visibility is refused while any session is open and relaunches the browser once none is.
+	visible bool
 
 	sessions map[browser.SessionID]struct{}
 }
@@ -179,7 +187,7 @@ func (p *Pool) Open(ctx context.Context, req browser.OpenRequest) (browser.Sessi
 	// and counted in its own right.
 	defer p.unreserve()
 
-	holder, err := p.acquire(ctx, req.Placement, policy)
+	holder, err := p.acquire(ctx, req.Placement, policy, req.Visible)
 	if err != nil {
 		return browser.Session{}, err
 	}
@@ -328,7 +336,7 @@ func (p *Pool) unreserve() {
 }
 
 // acquire returns the browser for a placement, launching it if it is not already up.
-func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy fence.Policy) (*entry, error) {
+func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy fence.Policy, visible bool) (*entry, error) {
 	fingerprint := fingerprintOf(placement)
 
 	for {
@@ -338,6 +346,7 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 			starting := &entry{
 				ref:      placement.Profile,
 				fenced:   fingerprint,
+				visible:  visible,
 				ready:    make(chan struct{}),
 				sessions: map[browser.SessionID]struct{}{},
 			}
@@ -367,6 +376,21 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 			// window out from under someone mid-login, and queueing would hold an HTTP request open
 			// for as long as a person takes, which spec §4.4 rule 2 says has no bound at all.
 			return nil, fmt.Errorf("%w: %s", browser.ErrPersonIsDriving, placement.Profile)
+		}
+		if existing.visible != visible {
+			// Same shape as the fingerprint relaunch below: refuse under a live page, otherwise
+			// stop the idle browser and go round to launch one in the requested visibility.
+			p.mu.Lock()
+			if len(existing.sessions) > 0 {
+				p.mu.Unlock()
+				return nil, fmt.Errorf("%w: %s", browser.ErrVisibilityConflict, placement.Profile)
+			}
+			if p.running[placement.Profile] == existing {
+				delete(p.running, placement.Profile)
+			}
+			p.mu.Unlock()
+			existing.driver.Shutdown(ctx)
+			continue
 		}
 		if existing.fenced == fingerprint {
 			return existing, nil
@@ -410,7 +434,12 @@ func (p *Pool) start(ctx context.Context, holder *entry, policy fence.Policy) {
 		fail(err)
 		return
 	}
-	driver, err := p.launcher.Launch(ctx, dir, policy)
+	var driver Instance
+	if holder.visible {
+		driver, err = p.launcher.LaunchVisible(ctx, dir, policy)
+	} else {
+		driver, err = p.launcher.Launch(ctx, dir, policy)
+	}
 	if err != nil {
 		// A launch that failed may still have left a directory behind; an ephemeral one is rubbish
 		// from this moment and nothing else will ever come back for it.

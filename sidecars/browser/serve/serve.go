@@ -86,6 +86,8 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 type OpenRequest struct {
 	URL       string            `json:"url"`
 	Placement browser.Placement `json:"placement"`
+	// Visible asks for a headful, still fenced, browser. The núcleo sets it; see browser.OpenRequest.
+	Visible bool `json:"visible,omitempty"`
 }
 
 // SessionRequest names an existing session. Used by every verb after /open.
@@ -153,6 +155,7 @@ func openHandler(driver browser.Driver) http.HandlerFunc {
 		session, err := driver.Open(r.Context(), browser.OpenRequest{
 			URL:       request.URL,
 			Placement: request.Placement,
+			Visible:   request.Visible,
 		})
 		if err != nil {
 			writeDriverError(w, "open", err)
@@ -553,6 +556,10 @@ func writeDriverError(w http.ResponseWriter, verb string, err error) {
 		// 409 and not 403: nothing is wrong with the request, and it may well succeed later. The
 		// wheel is with a person, and spec §4.4 rule 2 puts no bound on how long that lasts.
 		http.Error(w, "a person is driving this profile", http.StatusConflict)
+	case errors.Is(err, browser.ErrVisibilityConflict):
+		// 409, like the person-driving arm: the request is fine and succeeds once the profile's
+		// other browser has no session left.
+		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, browser.ErrTooManySessions):
 		// The REASON in the body, like ErrNotInstalled above, because the ceiling is something the
 		// caller can act on: close a session. `~/.nucleos/browser.yaml` makes the same argument about

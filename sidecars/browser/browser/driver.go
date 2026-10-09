@@ -81,6 +81,9 @@ type OpenRequest struct {
 	URL string `json:"url"`
 	// Placement is filled by the núcleo, never by the agent. See the package comment.
 	Placement Placement `json:"placement"`
+	// Visible asks for the agent's browser to run headful (spec §4.1), still fenced. Set by the
+	// núcleo from the panel's choice, never by the agent.
+	Visible bool `json:"visible,omitempty"`
 }
 
 // Session is what a caller gets back. RequestedURL and FinalURL are both reported because the trust
@@ -602,6 +605,10 @@ var ErrUnsupported = errors.New("browser: unsupported by this driver")
 // Wrapped with the counts by whoever returns it, because "you are at the ceiling" and "the ceiling
 // is two" are different sentences and only the second tells a person what to change.
 var ErrTooManySessions = errors.New("browser: too many sessions open")
+
+// ErrVisibilityConflict is returned when a profile's browser is running in the other visibility
+// (headless vs visible) and still has sessions: a visible browser is exclusive on its profile.
+var ErrVisibilityConflict = errors.New("browser: this profile's browser is in use in the other visibility")
 
 // LookResult is one annotated picture of the page: what a person would see, with the agent's own
 // refs drawn on top of it.

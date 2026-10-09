@@ -27,6 +27,9 @@ type fakeInstance struct {
 	// headful records that this instance was built by LaunchHuman, which is the only observable
 	// difference between the two launches once the process is gone.
 	headful bool
+	// visible records that this instance was built by LaunchVisible: fenced and agent-driven, but
+	// with a window the person can watch.
+	visible bool
 	chain   []string
 }
 
@@ -96,6 +99,25 @@ func (l *fakeLauncher) LaunchHuman(_ context.Context, dir string) (Instance, err
 		dir:     dir,
 		headful: true,
 		chain:   l.chain,
+	}
+	l.instances = append(l.instances, instance)
+	return instance, nil
+}
+
+func (l *fakeLauncher) LaunchVisible(_ context.Context, dir string, policy fence.Policy) (Instance, error) {
+	if l.delay > 0 {
+		time.Sleep(l.delay)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err != nil {
+		return nil, l.err
+	}
+	instance := &fakeInstance{
+		Fake:    &browser.Fake{FenceAttached: true},
+		dir:     dir,
+		policy:  policy,
+		visible: true,
 	}
 	l.instances = append(l.instances, instance)
 	return instance, nil
@@ -471,6 +493,14 @@ func (l *failingLauncher) LaunchHuman(context.Context, string) (Instance, error)
 	return l.instance, nil
 }
 
+func (l *failingLauncher) LaunchVisible(context.Context, string, fence.Policy) (Instance, error) {
+	l.instance = &fakeInstance{
+		Fake:    &browser.Fake{FenceAttached: true, OpenErr: errors.New("dead site")},
+		visible: true,
+	}
+	return l.instance, nil
+}
+
 // TestShutdownStopsEveryBrowserAndSweepsTheProfiles — spec §9.3. The process the launcher spawned is
 // not the browser: without this the sidecar exits, Chrome keeps running with our argv, the profile
 // stays locked, and the NEXT launch inherits it.
@@ -556,5 +586,63 @@ func TestAnAttemptIsMadeEvenWithNoWindowToChaseIn(t *testing.T) {
 	}
 	if tries != 1 {
 		t.Errorf("a zero window produced %d attempts", tries)
+	}
+}
+
+func openVisibility(pool *Pool, placement browser.Placement, visible bool) (browser.Session, error) {
+	return pool.Open(context.Background(), browser.OpenRequest{
+		URL:       "https://example.org/",
+		Placement: placement,
+		Visible:   visible,
+	})
+}
+
+// TestOpenVisibleIsRefusedWhileTheProfilesHeadlessBrowserIsInUse. A profile has one browser, and a
+// browser is either headless or windowed. Relaunching under a live session would kill the page its
+// owner is on, so the newcomer is refused and the first keeps its browser.
+func TestOpenVisibleIsRefusedWhileTheProfilesHeadlessBrowserIsInUse(t *testing.T) {
+	launcher := &fakeLauncher{}
+	pool, _ := testPool(t, launcher, 4)
+	placement := project("acme", "https://example.org")
+
+	if _, err := openVisibility(pool, placement, false); err != nil {
+		t.Fatalf("headless open: %v", err)
+	}
+	_, err := openVisibility(pool, placement, true)
+	if !errors.Is(err, browser.ErrVisibilityConflict) {
+		t.Fatalf("got %v, want ErrVisibilityConflict", err)
+	}
+	instances := launcher.launched()
+	if len(instances) != 1 {
+		t.Fatalf("launched %d browsers, want the original only", len(instances))
+	}
+	if instances[0].stopped() != 0 {
+		t.Errorf("the headless browser was stopped under a live session")
+	}
+	if instances[0].visible {
+		t.Error("the surviving browser is the visible one")
+	}
+}
+
+// TestOpenHeadlessIsRefusedOnAProfileWithAVisibleBrowser is the same rule read from the other side,
+// plus the positive case: a visible open launches through LaunchVisible, not Launch.
+func TestOpenHeadlessIsRefusedOnAProfileWithAVisibleBrowser(t *testing.T) {
+	launcher := &fakeLauncher{}
+	pool, _ := testPool(t, launcher, 4)
+	placement := project("acme", "https://example.org")
+
+	if _, err := openVisibility(pool, placement, true); err != nil {
+		t.Fatalf("visible open: %v", err)
+	}
+	instances := launcher.launched()
+	if len(instances) != 1 || !instances[0].visible {
+		t.Fatalf("a visible open did not go through LaunchVisible: %+v", instances)
+	}
+	_, err := openVisibility(pool, placement, false)
+	if !errors.Is(err, browser.ErrVisibilityConflict) {
+		t.Fatalf("got %v, want ErrVisibilityConflict", err)
+	}
+	if got := len(launcher.launched()); got != 1 {
+		t.Fatalf("launched %d browsers, want 1", got)
 	}
 }

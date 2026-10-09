@@ -42,6 +42,17 @@ func (l ChromeLauncher) Name() string { return "chrome" }
 // cancelled by Shutdown; ctx bounds the parts that must not outlive the request: dialling and
 // connecting.
 func (l ChromeLauncher) Launch(ctx context.Context, dir string, policy fence.Policy) (Instance, error) {
+	return l.launch(ctx, dir, policy, false)
+}
+
+// LaunchVisible is Launch with a window: the same proxy, the same fence, the same CDP policy, only
+// without --headless=new (see launch.Options.Visible). The panel wiring that shows the window is
+// not here yet.
+func (l ChromeLauncher) LaunchVisible(ctx context.Context, dir string, policy fence.Policy) (Instance, error) {
+	return l.launch(ctx, dir, policy, true)
+}
+
+func (l ChromeLauncher) launch(ctx context.Context, dir string, policy fence.Policy, visible bool) (Instance, error) {
 	// First, and before a browser exists. NewProxy validates the policy, so a policy that does not
 	// hold up is found while the only thing to clean up is nothing at all.
 	proxy, err := fence.NewProxy(policy)
@@ -58,6 +69,7 @@ func (l ChromeLauncher) Launch(ctx context.Context, dir string, policy fence.Pol
 		Mode:           browser.ModeAgent,
 		ProxyAddr:      proxy.Addr(),
 		CacheMB:        l.CacheMB,
+		Visible:        visible,
 	}, l.startTimeout())
 	if err != nil {
 		instance.stop(ctx)
