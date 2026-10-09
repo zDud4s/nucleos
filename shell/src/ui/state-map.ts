@@ -244,6 +244,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     vcs_resolution_discarded: { tone: "danger", label: "resolution discarded changes" },
     land_resolution_failed: { tone: "danger", label: "resolution could not be landed" },
     postgate_red: { tone: "danger", label: "target went red after a merge" },
+    // The post-merge gate did not run, and says why: a daemon verification already passed on the same tree, waiting for the interval, or waiting for an idle machine (`verify_postgate.rs`). A fact, not a question.
+    postgate_held: { tone: "info", label: "post-merge gate held" },
     // Teams.
     team_run_started: { tone: "info", label: "team run started" },
     team_run_finished: { tone: "info", label: "team run settled" },

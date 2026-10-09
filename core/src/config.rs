@@ -2747,6 +2747,20 @@ pub struct AutopilotRules {
     /// (F3-8); nothing in the daemon sets it.
     #[serde(default)]
     pub scoped_final_gate: bool,
+    /// Minimum minutes between the starts of two post-merge batch gates on one target. Off by
+    /// default (0 never holds): a project that says nothing behaves exactly as before this key
+    /// existed. It holds only the start of a NEW batch gate, so merges that land meanwhile join one
+    /// later gate; a recheck, a bisection and a revert are never held. Turning it on is the
+    /// owner's decision; nothing in the daemon sets it.
+    #[serde(default)]
+    pub postgate_min_interval_mins: u64,
+    /// A command the post-merge worker asks before it starts a new batch gate: exit 0 means the
+    /// machine is idle; any other answer (another exit code, a failure to start, a timeout) means
+    /// busy and the gate waits. Off by default (absent never holds). Example:
+    /// `python scripts/heavy.py idle`. Turning it on is the owner's decision; nothing in the
+    /// daemon sets it.
+    #[serde(default)]
+    pub postgate_idle_command: Option<String>,
     /// Whether a job asks if the owner is at the keyboard before it starts its next node.
     ///
     /// `Option`, and the absent case is the brake ON. That is deliberately not the same as
@@ -5034,6 +5048,31 @@ resolve_effort: \"  \"
         )
         .unwrap();
         assert!(rules.scoped_final());
+        assert_eq!(rules.gate_command.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn postgate_quiet_rules_are_off_by_default_and_parse_when_set() {
+        // F3-12: both calm rules are off unless the owner writes them.
+        let rules = AutopilotRules::default();
+        assert_eq!(rules.postgate_min_interval_mins, 0);
+        assert_eq!(rules.postgate_idle_command, None);
+
+        // Files written before the rules existed parse unchanged, with both off.
+        let rules = parse_schedule_rules("gate_command: x\ngate_after_land: true\n").unwrap();
+        assert_eq!(rules.postgate_min_interval_mins, 0);
+        assert_eq!(rules.postgate_idle_command, None);
+
+        let rules = parse_schedule_rules(
+            "gate_command: x\ngate_after_land: true\npostgate_min_interval_mins: 45\n\
+             postgate_idle_command: python scripts/heavy.py idle\n",
+        )
+        .unwrap();
+        assert_eq!(rules.postgate_min_interval_mins, 45);
+        assert_eq!(
+            rules.postgate_idle_command.as_deref(),
+            Some("python scripts/heavy.py idle")
+        );
         assert_eq!(rules.gate_command.as_deref(), Some("x"));
     }
 

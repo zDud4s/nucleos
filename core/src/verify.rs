@@ -366,6 +366,38 @@ pub(crate) async fn resolve_commit(
     Ok(sha.to_owned())
 }
 
+/// The tree object `rev` names in `repo`: what a commit's content is, whatever its history.
+pub(crate) async fn tree_of(repo: &Path, rev: &str, deadline: Instant) -> Result<String, String> {
+    let spec = format!("{rev}^{{tree}}");
+    let resolved = git(repo, &["rev-parse", "--verify", "--quiet", &spec], deadline).await?;
+    let tree = resolved.stdout.trim();
+    if !resolved.succeeded() || tree.is_empty() {
+        return Err(format!("{rev} has no tree here"));
+    }
+    Ok(tree.to_owned())
+}
+
+/// `HEAD`'s tree when `worktree` has nothing uncommitted, `None` when it has anything: a tracked
+/// edit, a staged one or an untracked file (ignored files do not count, git does not list them).
+async fn clean_tree(worktree: &Path, deadline: Instant) -> Result<Option<String>, String> {
+    let status = git(
+        worktree,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+        deadline,
+    )
+    .await?;
+    if !status.succeeded() {
+        return Err(format!(
+            "could not read the worktree's status: {}",
+            status.output_tail
+        ));
+    }
+    if !status.stdout.is_empty() {
+        return Ok(None);
+    }
+    tree_of(worktree, "HEAD", deadline).await.map(Some)
+}
+
 /// The commit `own` and `scope` diff against.
 ///
 /// In order: what the caller named; the base the daemon recorded when it created this worktree
@@ -525,10 +557,54 @@ pub(crate) async fn submit(
     caller: Caller,
     args: &VerifyArgs,
 ) -> Result<i64, VerifyError> {
+    let (id, _) = submit_checked(executor, caller, args).await?;
+    Ok(id)
+}
+
+/// Whether `worktree`'s test map is, right now, the one `project_id`'s root holds
+/// (`job::map_is_trusted`). `false` on any doubt: no root recorded, an unreadable record, a join
+/// error.
+async fn map_trusted_now(pool: &SqlitePool, project_id: &str, worktree: &Path) -> bool {
+    let project_root = match inspect::project_root(pool, project_id).await {
+        Ok(Some(root)) => PathBuf::from(root),
+        _ => return false,
+    };
+    let worktree = worktree.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::job::map_is_trusted(&worktree, &project_root))
+        .await
+        .unwrap_or(false)
+}
+
+/// `submit` that also says whether the plan was made from a map the daemon could vouch for at
+/// submit time: `true` only for a `test`/`scope` request whose worktree map was the root's (and its
+/// scripts untouched) when the map was loaded. `clean_tree` does not see ignored files, so a map
+/// (or a script its commands name) that is gitignored can be rewritten before the submit and put
+/// back before the ticket completes; the completion-time check alone would then bless a plan the
+/// root's map never made. A caller that holds its own tree (`gate_scope_ticketed`) must not
+/// confirm it when this is `false`.
+async fn submit_checked(
+    executor: &Arc<Executor>,
+    caller: Caller,
+    args: &VerifyArgs,
+) -> Result<(i64, bool), VerifyError> {
     let pool = &executor.pool;
     let deadline = Instant::now() + OPERATION_TIMEOUT;
     let (root, project_id) =
         resolve_worktree(pool, caller, args.worktree.as_deref(), deadline).await?;
+
+    // F3-12: read before anything else is, so the tree is the one the plan below is made from. An
+    // error is no tree; it never fails the request.
+    let submitted_tree = if args.kind == Kind::Test && args.scope == ScopeArg::Scope {
+        match clean_tree(&root, deadline).await {
+            Ok(tree) => tree,
+            Err(error) => {
+                tracing::info!(%error, "verify: cannot read the worktree's tree; none will be recorded");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let rules = match config::load_schedule_rules(executor.machine_root.as_deref(), &project_id) {
         Ok(rules) => rules,
@@ -546,6 +622,16 @@ pub(crate) async fn submit(
             .await
             .map_err(internal)?
     };
+
+    // F3-12: the map the plan is built from must be the root's at this moment, not only when the
+    // ticket ends. Untrusted here means no tree is held, so `confirm_measured_tree` never runs.
+    let map_trusted = submitted_tree.is_some()
+        && matches!(map, MapState::Valid(_))
+        && map_trusted_now(pool, &project_id, &root).await;
+    let submitted_tree = submitted_tree.filter(|_| map_trusted);
+    if !map_trusted && args.kind == Kind::Test && args.scope == ScopeArg::Scope {
+        tracing::info!("verify: the test map is not the root's at submit; no tree is recorded");
+    }
 
     let own_files = args.scope == ScopeArg::Own && args.files.is_some();
     let needs_base =
@@ -821,7 +907,99 @@ pub(crate) async fn submit(
         }
     }
 
-    Ok(id)
+    if let (Some(tree), Some(_)) = (submitted_tree, base.as_deref()) {
+        tokio::spawn(confirm_measured_tree(
+            executor.pool.clone(),
+            id,
+            root.clone(),
+            tree,
+        ));
+    }
+
+    Ok((id, map_trusted))
+}
+
+/// Records, once request `id`'s ticket is done, the tree its `test`/`scope` run measured, and only
+/// when the daemon can vouch that it measured that tree (F3-12, decision 2): the worktree was
+/// clean when the request was submitted (`submitted`), is clean now with the very same tree, and
+/// its test map is the one the project's root holds (`job::map_is_trusted`) — so what the groups
+/// ran is what the root's map says they run, not something the worktree wrote for itself.
+///
+/// Writes only on success; any failure or doubt leaves `measured_tree` NULL, and a NULL never
+/// covers anything. Idempotent: `set_measured_tree` writes only while the column is empty, so the
+/// detached copy `submit` spawns and the awaited one in `gate_scope_ticketed` may both run. A
+/// daemon restart halfway loses the proof, like the cache; the cost is one more gate.
+pub(crate) async fn confirm_measured_tree(
+    pool: SqlitePool,
+    id: i64,
+    worktree: PathBuf,
+    submitted: String,
+) {
+    let started = Instant::now();
+    let ticket = loop {
+        match read_ticket(&pool, id).await {
+            Ok(Some((ticket, _))) if ticket.done => break ticket,
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(error) => {
+                // Transient (a busy database): keep waiting rather than drop the proof.
+                tracing::warn!(%error, ticket = id, "verify: cannot read a ticket to record its tree");
+            }
+        }
+        if started.elapsed() >= SETTLE_LIMIT {
+            tracing::info!(ticket = id, "verify: gave up waiting to record a tree");
+            return;
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    };
+
+    let deadline = Instant::now() + OPERATION_TIMEOUT;
+    match clean_tree(&worktree, deadline).await {
+        Ok(Some(now)) if now == submitted => {}
+        Ok(_) => {
+            tracing::info!(
+                ticket = id,
+                "verify: the worktree moved during the run; no tree recorded"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::info!(ticket = id, %error, "verify: cannot re-read the worktree; no tree recorded");
+            return;
+        }
+    }
+
+    let project_root = match inspect::project_root(&pool, &ticket.project_id).await {
+        Ok(Some(root)) => PathBuf::from(root),
+        Ok(None) => {
+            tracing::info!(
+                ticket = id,
+                "verify: the project has no root; no tree recorded"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::info!(ticket = id, %error, "verify: cannot read the project's root; no tree recorded");
+            return;
+        }
+    };
+    let trusted = {
+        let worktree = worktree.clone();
+        tokio::task::spawn_blocking(move || crate::job::map_is_trusted(&worktree, &project_root))
+            .await
+            .unwrap_or(false)
+    };
+    if !trusted {
+        tracing::info!(
+            ticket = id,
+            "verify: the worktree's test map is not the root's; no tree recorded"
+        );
+        return;
+    }
+
+    if let Err(error) = verify_store::set_measured_tree(&pool, id, &submitted).await {
+        tracing::warn!(%error, ticket = id, "verify: cannot record a measured tree");
+    }
 }
 
 /// Waits for one unit and, if it went green over a worktree that did not move meanwhile, caches it.
@@ -923,6 +1101,42 @@ pub(crate) async fn read_ticket(
     let mut ticket = verify_plan::assemble(&request, &live);
     annotate_red_target(pool, &mut ticket).await;
     Ok(Some((ticket, request.caller)))
+}
+
+/// The proof that a tree was verified: the `verify` ticket that passed, and the base it diffed from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Evidence {
+    pub ticket: i64,
+    pub base: String,
+}
+
+/// The newest `verify` request that covers `tree` from one of `bases`, if any (F3-12, decisions 4
+/// and 9).
+///
+/// Covers means: the daemon recorded `tree` as that request's `measured_tree` (so it was a `test`
+/// kind, `scope` scope, clean-worktree, trusted-map request — see `confirm_measured_tree`), its
+/// base is one of `bases`, and its ticket is done with the verdict `passed`. `passed` already
+/// means at least one unit passed or was reused from the cache and none failed or errored, so
+/// `nothing_ran`, `failed`, `errored` and an unfinished ticket cover nothing. A base outside
+/// `bases` covers nothing either: the diff it measured is not the one the caller can trust.
+pub(crate) async fn covering_request(
+    pool: &SqlitePool,
+    project_id: &str,
+    tree: &str,
+    bases: &[&str],
+) -> sqlx::Result<Option<Evidence>> {
+    for (id, base) in verify_store::requests_measuring(pool, project_id, tree).await? {
+        if !bases.contains(&base.as_str()) {
+            continue;
+        }
+        let Some((ticket, _)) = read_ticket(pool, id).await? else {
+            continue;
+        };
+        if ticket.done && ticket.verdict.as_deref() == Some("passed") {
+            return Ok(Some(Evidence { ticket: id, base }));
+        }
+    }
+    Ok(None)
 }
 
 /// Marks each failed unit whose group (or the gate command) is already red on the project's
@@ -1111,8 +1325,15 @@ pub(crate) async fn gate_scope_ticketed(
         base: None,
         wait: false,
     };
-    let id = match submit(executor, caller, &args).await {
-        Ok(id) => id,
+    // F3-12 (decision 3): the merge queue's integration worktree can vanish right after its ticket
+    // ends, so the confirmation is awaited here as well as detached in `submit`. Idempotent. The
+    // tree is read before the submit, so it is the one the ticket is about to measure.
+    let before = clean_tree(worktree, Instant::now() + OPERATION_TIMEOUT)
+        .await
+        .ok()
+        .flatten();
+    let (id, map_trusted) = match submit_checked(executor, caller, &args).await {
+        Ok(submitted) => submitted,
         Err(error) => {
             tracing::warn!(
                 caller = %caller.label(),
@@ -1123,7 +1344,18 @@ pub(crate) async fn gate_scope_ticketed(
         }
     };
     let verdict = match wait_ticket(&executor.pool, id, wait).await {
-        Ok(Some((ticket, _))) => scope_outcome(&ticket),
+        Ok(Some((ticket, _))) => {
+            // Only a map that was the root's at submit time may be vouched for later; see
+            // `submit_checked`.
+            if ticket.done
+                && map_trusted
+                && let Some(tree) = before
+            {
+                confirm_measured_tree(executor.pool.clone(), id, worktree.to_path_buf(), tree)
+                    .await;
+            }
+            scope_outcome(&ticket)
+        }
         Ok(None) => ScopeVerdict::Measured(GateOutcome::Errored {
             reason: format!("scope verification ticket {id} vanished"),
         }),
@@ -2342,5 +2574,317 @@ tests:
             .await
             .unwrap();
         assert_eq!(priority, PRIORITY_AUTONOMOUS);
+    }
+
+    // F3-12 (decision 2): `verify_requests.measured_tree` is the daemon's record of the exact tree
+    // a `test`/`scope` request measured, written only from a clean worktree whose tree and map did
+    // not move while the ticket ran.
+
+    /// The tree object of `dir`'s HEAD, as git names it.
+    fn head_tree(dir: &Path) -> String {
+        git_in(dir, &["rev-parse", "HEAD^{tree}"])
+    }
+
+    /// The recorded tree of request `id`, read once.
+    async fn measured_once(pool: &SqlitePool, id: i64) -> Option<String> {
+        verify_store::measured_tree(pool, id).await.unwrap()
+    }
+
+    /// Polls until request `id` records a tree, for at most `WAIT`; `None` when it never does.
+    async fn wait_measured(pool: &SqlitePool, id: i64) -> Option<String> {
+        let started = Instant::now();
+        loop {
+            if let Some(tree) = measured_once(pool, id).await {
+                return Some(tree);
+            }
+            if started.elapsed() >= WAIT {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The ticket finished, `confirm_measured_tree` had time to decide, and nothing was recorded.
+    async fn assert_nothing_recorded(pool: &SqlitePool, id: i64) {
+        finished(pool, id).await;
+        let_settle_decide().await;
+        assert_eq!(measured_once(pool, id).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_clean_worktree_records_the_tree_its_scope_measured() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), true).await;
+
+        let request = args(
+            Kind::Test,
+            ScopeArg::Scope,
+            f.repo.path(),
+            None,
+            Some(&f.c1),
+        );
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+        let (ticket, _) = finished(&f.pool, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("passed"), "{ticket:?}");
+        assert_eq!(ticket.base.as_deref(), Some(f.c1.as_str()));
+        assert_eq!(
+            wait_measured(&f.pool, id).await,
+            Some(head_tree(f.repo.path()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dirty_worktree_records_no_tree() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), true).await;
+        // Untracked, and not ignored: a file nobody has added is part of what would be measured.
+        std::fs::write(f.repo.path().join("py/new.py"), "y = 2\n").unwrap();
+
+        let request = args(
+            Kind::Test,
+            ScopeArg::Scope,
+            f.repo.path(),
+            None,
+            Some(&f.c1),
+        );
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+
+        assert_nothing_recorded(&f.pool, id).await;
+    }
+
+    #[tokio::test]
+    async fn a_worktree_that_moves_during_the_run_records_no_tree() {
+        // No worker yet, so the ticket stays open while the tree changes underneath it.
+        let f = fixture(Some(&plain_map()), Some("git --version"), false).await;
+        let request = args(
+            Kind::Test,
+            ScopeArg::Scope,
+            f.repo.path(),
+            None,
+            Some(&f.c1),
+        );
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+
+        let root = f.repo.path();
+        std::fs::write(root.join("core/a.rs"), "fn a() { let _ = 2; }\n").unwrap();
+        git_in(root, &["commit", "-q", "-am", "three"]);
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+
+        assert_nothing_recorded(&f.pool, id).await;
+    }
+
+    #[tokio::test]
+    async fn a_worktree_whose_map_differs_from_the_root_records_no_tree() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = holder.path().join("side");
+        git_in(
+            f.repo.path(),
+            &["worktree", "add", "-q", "-b", "side", &path_arg(&side)],
+        );
+        // Still a valid map, but no longer the root's bytes.
+        let map_path = side.join(tests_map::MAP_FILE);
+        let mut map = std::fs::read_to_string(&map_path).unwrap();
+        map.push_str("# changed in the worktree\n");
+        std::fs::write(&map_path, map).unwrap();
+        git_in(&side, &["commit", "-q", "-am", "map"]);
+
+        let request = args(Kind::Test, ScopeArg::Scope, &side, None, Some(&f.c1));
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+
+        assert_nothing_recorded(&f.pool, id).await;
+    }
+
+    #[tokio::test]
+    async fn an_ignored_map_that_differs_at_submit_records_no_tree_even_if_restored() {
+        // No worker yet, so the ticket stays open while the map is put back.
+        let f = fixture(Some(&plain_map()), Some("git --version"), false).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = holder.path().join("side");
+        git_in(
+            f.repo.path(),
+            &["worktree", "add", "-q", "-b", "side", &path_arg(&side)],
+        );
+        // The worktree gitignores its map: the file stays on disk, out of `git status`, so a clean
+        // tree says nothing about the bytes it holds.
+        git_in(&side, &["rm", "-q", "--cached", tests_map::MAP_FILE]);
+        let ignore = format!("{}\n", tests_map::MAP_FILE);
+        std::fs::write(side.join(".gitignore"), ignore).unwrap();
+        git_in(&side, &["add", ".gitignore"]);
+        git_in(&side, &["commit", "-q", "-m", "ignore the map"]);
+
+        // Differs from the root's bytes at submit, still a valid map, and the tree stays clean.
+        let map_path = side.join(tests_map::MAP_FILE);
+        let root_map = std::fs::read(f.repo.path().join(tests_map::MAP_FILE)).unwrap();
+        let mut narrowed = String::from_utf8(root_map.clone()).unwrap();
+        narrowed.push_str("# changed in the worktree\n");
+        std::fs::write(&map_path, narrowed).unwrap();
+
+        let request = args(Kind::Test, ScopeArg::Scope, &side, None, Some(&f.c1));
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+
+        // Restored to the root's bytes before the ticket completes.
+        std::fs::write(&map_path, root_map).unwrap();
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+
+        assert_nothing_recorded(&f.pool, id).await;
+    }
+
+    #[tokio::test]
+    async fn only_a_test_scope_request_records_a_tree() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), true).await;
+
+        let check = args(
+            Kind::Check,
+            ScopeArg::Scope,
+            f.repo.path(),
+            None,
+            Some(&f.c1),
+        );
+        let id = submit(&f.ex, Caller::Owner, &check).await.unwrap();
+        assert_nothing_recorded(&f.pool, id).await;
+
+        // Own without files diffs from the base too, so only the scope differs from the case above.
+        let own = args(Kind::Test, ScopeArg::Own, f.repo.path(), None, Some(&f.c1));
+        let id = submit(&f.ex, Caller::Owner, &own).await.unwrap();
+        assert_nothing_recorded(&f.pool, id).await;
+    }
+
+    #[tokio::test]
+    async fn a_waited_daemon_scope_records_its_tree_before_returning() {
+        use crate::gate::GateOutcome;
+
+        let f = fixture(Some(&plain_map()), Some("git --version"), true).await;
+        // The daemon's own caller names no base; the worktree row supplies it.
+        insert_job_worktree(&f, &f.c1).await;
+
+        let verdict = gate_scope(&f.ex, Caller::Merge(1), f.repo.path(), WAIT).await;
+        assert!(
+            matches!(verdict, ScopeVerdict::Measured(GateOutcome::Passed)),
+            "{verdict:?}"
+        );
+
+        // Read once, at once: the awaited confirmation has to have written it already.
+        let id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM verify_requests")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            measured_once(&f.pool, id).await,
+            Some(head_tree(f.repo.path()))
+        );
+    }
+
+    // F3-12 (decisions 4 and 9): a passed `test`/`scope` request covers the tree it recorded, but
+    // only from a base the caller lists, and only when it ran something and nothing failed.
+
+    #[tokio::test]
+    async fn a_passed_scope_over_a_listed_base_covers_its_tree() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), true).await;
+        let request = args(
+            Kind::Test,
+            ScopeArg::Scope,
+            f.repo.path(),
+            None,
+            Some(&f.c1),
+        );
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+        let (ticket, _) = finished(&f.pool, id).await;
+        assert_eq!(ticket.verdict.as_deref(), Some("passed"), "{ticket:?}");
+        let tree = wait_measured(&f.pool, id)
+            .await
+            .expect("a tree was recorded");
+
+        let evidence = covering_request(&f.pool, "alpha", &tree, &[f.c1.as_str()])
+            .await
+            .unwrap()
+            .expect("the passed scope covers its own tree");
+
+        assert_eq!(evidence.ticket, id);
+        assert_eq!(evidence.base, f.c1);
+    }
+
+    #[tokio::test]
+    async fn a_passed_scope_over_another_base_covers_nothing() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), true).await;
+        let request = args(
+            Kind::Test,
+            ScopeArg::Scope,
+            f.repo.path(),
+            None,
+            Some(&f.c1),
+        );
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+        finished(&f.pool, id).await;
+        let tree = wait_measured(&f.pool, id)
+            .await
+            .expect("a tree was recorded");
+
+        let evidence = covering_request(&f.pool, "alpha", &tree, &[f.c2.as_str()])
+            .await
+            .unwrap();
+
+        assert!(evidence.is_none(), "{evidence:?}");
+    }
+
+    #[tokio::test]
+    async fn a_scope_that_ran_nothing_covers_nothing() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), true).await;
+        // c2 is HEAD: an empty diff, so no group is selected.
+        let request = args(
+            Kind::Test,
+            ScopeArg::Scope,
+            f.repo.path(),
+            None,
+            Some(&f.c2),
+        );
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+        let (ticket, _) = finished(&f.pool, id).await;
+        assert_eq!(ticket.verdict.as_deref(), Some("nothing_ran"), "{ticket:?}");
+        // The tree is still recorded: what it must not do is cover.
+        let tree = wait_measured(&f.pool, id)
+            .await
+            .expect("a tree was recorded");
+
+        let evidence = covering_request(&f.pool, "alpha", &tree, &[f.c2.as_str()])
+            .await
+            .unwrap();
+
+        assert!(evidence.is_none(), "{evidence:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_scope_covers_nothing() {
+        let failing = "version: 1
+tests:
+  groups:
+    core:
+      paths: [core/]
+      check: git --version
+      command: git no-such-subcommand
+    py:
+      paths: [py/]
+      check: git --version
+      command: git --version
+";
+        let f = fixture(Some(failing), Some("git --version"), true).await;
+        let request = args(
+            Kind::Test,
+            ScopeArg::Scope,
+            f.repo.path(),
+            None,
+            Some(&f.c1),
+        );
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+        let (ticket, _) = finished(&f.pool, id).await;
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        let tree = wait_measured(&f.pool, id)
+            .await
+            .expect("a tree was recorded");
+
+        let evidence = covering_request(&f.pool, "alpha", &tree, &[f.c1.as_str()])
+            .await
+            .unwrap();
+
+        assert!(evidence.is_none(), "{evidence:?}");
     }
 }
