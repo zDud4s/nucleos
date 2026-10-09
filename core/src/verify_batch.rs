@@ -16,7 +16,8 @@ pub struct TargetState<'a> {
 /// One first-parent commit of `(last_green, tip]`, oldest first.
 pub struct Commit {
     pub sha: String,
-    /// The full gate passed on exactly this sha before it was published.
+    /// The full gate passed on exactly this sha before it was published, or a daemon verification
+    /// of its exact tree passed over a green-or-covered base.
     pub covered: bool,
 }
 
@@ -81,6 +82,27 @@ pub fn decide(state: &TargetState<'_>, since_green: &[Commit]) -> Decision {
         commits: since_green.iter().map(|c| c.sha.clone()).collect(),
         fresh,
     })
+}
+
+/// Why a new batch gate waits instead of starting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hold {
+    /// The last gate started too recently for `postgate_min_interval_mins`.
+    Interval { remaining_secs: u64 },
+    /// `postgate_idle_command` answered that the machine is busy.
+    Busy,
+}
+
+/// Seconds left on the minimum interval between two batch-gate starts, or `None` when nothing
+/// holds: the interval is 0 (off), no gate ever started, or the last start is old enough. A
+/// negative `since_last_start_secs` (clock skew) counts as 0 s.
+pub fn interval_hold(min_interval_mins: u64, since_last_start_secs: Option<i64>) -> Option<u64> {
+    if min_interval_mins == 0 {
+        return None;
+    }
+    let since = u64::try_from(since_last_start_secs?).unwrap_or(0);
+    let window = min_interval_mins.saturating_mul(60);
+    (since < window).then(|| window - since)
 }
 
 #[cfg(test)]
@@ -218,5 +240,34 @@ mod tests {
         assert_eq!(b.base, None);
         assert_eq!(b.commits, vec!["a", "b", "c"]);
         assert_eq!(b.fresh, 3);
+    }
+
+    #[test]
+    fn an_interval_holds_only_while_the_last_start_is_recent() {
+        // 0 minutes switches the rule off, whatever the last start was.
+        assert_eq!(interval_hold(0, Some(0)), None);
+        assert_eq!(interval_hold(0, Some(5)), None);
+        assert_eq!(interval_hold(0, None), None);
+
+        // No earlier start: nothing to wait for.
+        assert_eq!(interval_hold(30, None), None);
+
+        // Recent: the remaining seconds, down to the last one.
+        assert_eq!(interval_hold(30, Some(0)), Some(1800));
+        assert_eq!(interval_hold(30, Some(600)), Some(1200));
+        assert_eq!(interval_hold(30, Some(1799)), Some(1));
+
+        // At and past the interval it lets go.
+        assert_eq!(interval_hold(30, Some(1800)), None);
+        assert_eq!(interval_hold(30, Some(7200)), None);
+
+        // A start in the future (clock step) counts as just now, not as a negative wait.
+        assert_eq!(interval_hold(30, Some(-90)), Some(1800));
+
+        assert_eq!(
+            Hold::Interval { remaining_secs: 4 },
+            Hold::Interval { remaining_secs: 4 }
+        );
+        assert_ne!(Hold::Busy, Hold::Interval { remaining_secs: 0 });
     }
 }

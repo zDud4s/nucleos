@@ -21,6 +21,16 @@
 //! the revert in the same transaction, the next ticks queue it as an `Op::Revert` and follow its
 //! ticket, and once the queue has published it `fix/<source>-<sha7>` is built on top of it. The
 //! correction run on that branch is opened by `run_correction_loop`, which holds an `AppState`.
+//!
+//! F3-12 spares a gate that would only repeat a proof. When a new tip appears, the tick asks
+//! whether a daemon `verify` already passed on that tip's exact tree over the last full green or the
+//! last covered tip (`verify::covering_request`); if so the tip is recorded as covered, with one
+//! feed line, and no gate runs. A cover never moves `last_green_sha`, so a later red still bisects
+//! from the last COMPLETE green. The check lives in the tick and not on the merge path: the proof
+//! may arrive before or after the land, it works with `gate_before_publish` off, and it adds
+//! nothing to the queue's critical path. Two opt-in calm rules (`postgate_min_interval_mins`,
+//! `postgate_idle_command`) hold only the start of a NEW batch gate, never a recheck, a bisection
+//! or a revert.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -50,8 +60,14 @@ pub(crate) const GATE_UNIT: &str = "gate_command";
 pub enum Step {
     /// `verify_batch::decide` found nothing to start.
     Idle(verify_batch::Idle),
-    /// The tip had already passed the full gate before publish; recorded as green, nothing run.
+    /// A daemon verification of the tip's exact tree passed over a green-or-covered base;
+    /// recorded, nothing run.
     Covered(String),
+    /// A new batch gate for `sha` is held back, for `hold`; the reason went to the feed once.
+    Held {
+        sha: String,
+        hold: verify_batch::Hold,
+    },
     /// A gate was submitted for `sha` as ticket `request`.
     Started { sha: String, request: i64 },
     /// The gate for `sha` is still running.
@@ -116,17 +132,24 @@ pub async fn tick(executor: &Arc<Executor>) -> Vec<Pass> {
 
     let mut passes = Vec::new();
     for (project_id, root) in roster {
-        match crate::config::load_schedule_rules(executor.machine_root.as_deref(), &project_id) {
-            Ok(rules) if rules.gate_after_land => {}
-            _ => continue,
-        }
-        let step = tick_project(executor, &project_id, Path::new(&root)).await;
+        let rules =
+            match crate::config::load_schedule_rules(executor.machine_root.as_deref(), &project_id)
+            {
+                Ok(rules) if rules.gate_after_land => rules,
+                _ => continue,
+            };
+        let step = tick_project(executor, &project_id, Path::new(&root), &rules).await;
         passes.push(Pass { project_id, step });
     }
     passes
 }
 
-async fn tick_project(executor: &Arc<Executor>, project_id: &str, project_root: &Path) -> Step {
+async fn tick_project(
+    executor: &Arc<Executor>,
+    project_id: &str,
+    project_root: &Path,
+    rules: &crate::config::AutopilotRules,
+) -> Step {
     let pool = &executor.pool;
     let deadline = Instant::now() + git_exec::OPERATION_TIMEOUT;
     let state = match verify_postgate::load(pool, project_id).await {
@@ -185,20 +208,93 @@ async fn tick_project(executor: &Arc<Executor>, project_id: &str, project_root: 
         last_attempted: stored.and_then(|s| s.last_attempted_sha.as_deref()),
         running: false,
     };
-    // The range `(last_green, tip]` is later work; the tip stands alone, not covered.
+    // F3-12: a new tip is covered when a daemon `verify` passed on its exact tree over a base the
+    // gate holds green or covered. Only asked for a tip the gate has not seen, and any error means
+    // no proof: the worst outcome is one more gate, never a false green.
+    let mut evidence: Option<verify::Evidence> = None;
+    if let Some(stored) = stored
+        && stored.last_green_sha.as_deref() != Some(tip.as_str())
+        && stored.last_attempted_sha.as_deref() != Some(tip.as_str())
+    {
+        let bases: Vec<&str> = [
+            stored.last_green_sha.as_deref(),
+            stored.covered_sha.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !bases.is_empty() {
+            let found = match verify::tree_of(project_root, &tip, deadline).await {
+                Ok(tree) => verify::covering_request(pool, project_id, &tree, &bases)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error),
+            };
+            match found {
+                Ok(found) => evidence = found,
+                Err(error) => {
+                    tracing::warn!(project = project_id, %error, "postgate: no covering proof");
+                }
+            }
+        }
+    }
+    // The range `(last_green, tip]` is later work; the tip stands alone, covered only by a proof.
     let since_green = [Commit {
         sha: tip.clone(),
-        covered: false,
+        covered: evidence.is_some(),
     }];
     match verify_batch::decide(&view, &since_green) {
         Decision::Idle(idle) => Step::Idle(idle),
         Decision::MarkCovered { sha } => {
-            match verify_postgate::mark_covered(pool, project_id, target.as_str(), &sha).await {
-                Ok(()) => Step::Covered(sha),
+            let Some(evidence) = evidence else {
+                return Step::Failed(format!("cover of {sha} has no proof"));
+            };
+            let summary = format!(
+                "post-merge gate on {}: {} was not gated. `verify` ticket {} passed on this exact \
+                 tree, from a clean worktree, over its diff from {}, which the gate holds green \
+                 or covered. The last full green stays {}, so a later red still bisects from \
+                 there.",
+                target.as_str(),
+                short(&sha),
+                evidence.ticket,
+                short(&evidence.base),
+                short(
+                    stored
+                        .and_then(|s| s.last_green_sha.as_deref())
+                        .unwrap_or("unknown")
+                ),
+            );
+            match verify_postgate::settle_covered(
+                pool,
+                project_id,
+                target.as_str(),
+                &sha,
+                &evidence.base,
+                &summary,
+            )
+            .await
+            {
+                Ok(true) => Step::Covered(sha),
+                Ok(false) => Step::Failed(format!(
+                    "cover of {sha} refused: the post-merge state moved"
+                )),
                 Err(error) => Step::Failed(format!("cannot mark {sha} covered: {error}")),
             }
         }
         Decision::Start(batch) => {
+            let target_name = target.as_str();
+            if let Some(held) = batch_hold(
+                pool,
+                project_id,
+                project_root,
+                target_name,
+                &batch.tip,
+                rules,
+            )
+            .await
+            {
+                return held;
+            }
             match verify_postgate::start(pool, project_id, target.as_str(), &batch.tip, None).await
             {
                 Ok(true) => launch(executor, project_id, project_root, &batch.tip, deadline).await,
@@ -206,6 +302,83 @@ async fn tick_project(executor: &Arc<Executor>, project_id: &str, project_root: 
                 Err(error) => Step::Failed(format!("cannot start the gate: {error}")),
             }
         }
+    }
+}
+
+/// How long the idle probe may run before the machine counts as busy.
+const IDLE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The two calm rules for a NEW batch gate (F3-12, decision 12), both off by default: the
+/// minimum interval since the last start, then the owner's idle command. `Some` is the step to
+/// return (a hold, or a failure to read the state); `None` lets the gate start. Each reason is
+/// written to the feed once per episode by `verify_postgate::hold`.
+async fn batch_hold(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    project_root: &Path,
+    target: &str,
+    tip: &str,
+    rules: &crate::config::AutopilotRules,
+) -> Option<Step> {
+    if rules.postgate_min_interval_mins > 0 {
+        let since = match verify_postgate::seconds_since_last_start(pool, project_id).await {
+            Ok(since) => since,
+            Err(error) => {
+                return Some(Step::Failed(format!("cannot read the last start: {error}")));
+            }
+        };
+        if let Some(remaining_secs) =
+            verify_batch::interval_hold(rules.postgate_min_interval_mins, since)
+        {
+            let summary = format!(
+                "post-merge gate on {target}: the next gate waits for the {} min interval since \
+                 the last one (about {} min left); merges that land meanwhile join the same gate.",
+                rules.postgate_min_interval_mins,
+                remaining_secs.div_ceil(60),
+            );
+            return match verify_postgate::hold(pool, project_id, target, "interval", &summary).await
+            {
+                Ok(_) => Some(Step::Held {
+                    sha: tip.to_owned(),
+                    hold: verify_batch::Hold::Interval { remaining_secs },
+                }),
+                Err(error) => Some(Step::Failed(format!("cannot record the hold: {error}"))),
+            };
+        }
+    }
+    if let Some(command) = rules.postgate_idle_command.as_deref()
+        && let Err(why) = machine_idle(command, project_root).await
+    {
+        let summary = format!(
+            "post-merge gate on {target}: the next gate waits for an idle machine (`{command}`: \
+             {why}); merges that land meanwhile join the same gate."
+        );
+        return match verify_postgate::hold(pool, project_id, target, "busy", &summary).await {
+            Ok(_) => Some(Step::Held {
+                sha: tip.to_owned(),
+                hold: verify_batch::Hold::Busy,
+            }),
+            Err(error) => Some(Step::Failed(format!("cannot record the hold: {error}"))),
+        };
+    }
+    None
+}
+
+/// Runs the owner's idle command in `root`: `Ok` only when it exits 0 within the probe timeout.
+/// Anything else (another exit, a start failure, the timeout) is "busy", with the reason.
+async fn machine_idle(command: &str, root: &Path) -> Result<(), String> {
+    let words = crate::gate::split_command(command)?;
+    let outcome = crate::gate::run_argv(&words, root, &[], IDLE_PROBE_TIMEOUT).await;
+    if let Some(error) = outcome.error {
+        return Err(error);
+    }
+    if outcome.timed_out {
+        return Err(format!("no answer in {} s", IDLE_PROBE_TIMEOUT.as_secs()));
+    }
+    match outcome.exit_code {
+        Some(0) => Ok(()),
+        Some(code) => Err(format!("exit {code}")),
+        None => Err("no exit code".to_owned()),
     }
 }
 
@@ -2549,5 +2722,212 @@ mod tests {
     fn correction_outcome_after_the_last_attempt_says_it_gave_up() {
         assert_eq!(correction_outcome(false, true), "gave up");
         assert_eq!(correction_outcome(false, false), "gave up");
+    }
+
+    /// F3-12: how many `postgate_held` lines the feed holds.
+    async fn held_lines(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'postgate_held'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// F3-12: plants what a passed daemon `verify` leaves behind: a `test`/`scope` ticket over
+    /// `base` whose only unit counts as passed (reused from a green run) and whose recorded tree is
+    /// the tree of `covered_tip`. Returns the ticket id.
+    async fn seed_proof(f: &Fixture, base: &str, covered_tip: &str) -> i64 {
+        use crate::verify_store::{self, NewRequest, PlannedUnit};
+
+        let worktree = f.root.to_string_lossy().into_owned();
+        let id = verify_store::insert_request(
+            &f.pool,
+            &NewRequest {
+                project_id: "alpha",
+                worktree: &worktree,
+                kind: "test",
+                scope: "scope",
+                base: Some(base),
+                priority: crate::verify_runs::PRIORITY_INTERACTIVE,
+                caller: "owner",
+                note: None,
+                unclaimed: &[],
+            },
+        )
+        .await
+        .unwrap();
+        let unit = PlannedUnit {
+            group: Some("g".to_owned()),
+            argv: vec!["git".to_owned(), "--version".to_owned()],
+            why: "paths: x".to_owned(),
+            fingerprint: Some("f".to_owned()),
+            cacheable: true,
+            run_id: Some(1),
+            cached_from: Some(1),
+            skipped: None,
+        };
+        verify_store::set_plan(&f.pool, id, &[unit]).await.unwrap();
+        let tree = git_in(&f.root, &["rev-parse", &format!("{covered_tip}^{{tree}}")]);
+        assert!(
+            verify_store::set_measured_tree(&f.pool, id, &tree)
+                .await
+                .unwrap()
+        );
+        id
+    }
+
+    #[tokio::test]
+    async fn a_tip_whose_tree_a_daemon_verification_passed_is_not_gated_and_the_feed_says_so_once()
+    {
+        let f = fixture(Some(GATE_ON)).await;
+        let first = git_in(&f.root, &["rev-parse", "HEAD~1"]);
+        verify_postgate::mark_covered(&f.pool, "alpha", "main", &first)
+            .await
+            .unwrap();
+        seed_proof(&f, &first, &f.tip).await;
+
+        let step = step_of(&f).await;
+        assert_eq!(step, Some(Step::Covered(f.tip.clone())));
+        assert_eq!(
+            count(&f.pool, "verify_requests").await,
+            1,
+            "only the seeded proof: no gate was submitted"
+        );
+        assert_eq!(held_lines(&f.pool).await, 1);
+        let summaries = feed_summaries(&f.pool).await;
+        assert!(
+            summaries.iter().any(|s| s.contains(&f.tip[..7])),
+            "the feed names the tip: {summaries:?}"
+        );
+
+        // A second look finds the tip attempted: still one line, still no gate.
+        assert_eq!(
+            step_of(&f).await,
+            Some(Step::Idle(verify_batch::Idle::UpToDate))
+        );
+        assert_eq!(held_lines(&f.pool).await, 1);
+        assert_eq!(count(&f.pool, "verify_requests").await, 1);
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.last_green_sha.as_deref(), Some(first.as_str()));
+        assert_eq!(s.covered_sha.as_deref(), Some(f.tip.as_str()));
+        assert_eq!(s.running_sha, None);
+    }
+
+    #[tokio::test]
+    async fn a_cover_chains_on_the_previous_covered_tip_and_the_green_stays() {
+        let f = fixture(Some(GATE_ON)).await;
+        let first = git_in(&f.root, &["rev-parse", "HEAD~1"]);
+        verify_postgate::mark_covered(&f.pool, "alpha", "main", &first)
+            .await
+            .unwrap();
+        seed_proof(&f, &first, &f.tip).await;
+        assert_eq!(step_of(&f).await, Some(Step::Covered(f.tip.clone())));
+
+        // A later merge, proven over the previously covered tip (not over the green).
+        let t2 = commit_file(&f.root, "b.txt", "x\n", "three");
+        seed_proof(&f, &f.tip, &t2).await;
+
+        assert_eq!(step_of(&f).await, Some(Step::Covered(t2.clone())));
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.covered_sha.as_deref(), Some(t2.as_str()));
+        assert_eq!(
+            s.last_green_sha.as_deref(),
+            Some(first.as_str()),
+            "a cover never moves the full green"
+        );
+        assert_eq!(
+            count(&f.pool, "verify_requests").await,
+            2,
+            "two seeded proofs, no gate"
+        );
+        assert_eq!(held_lines(&f.pool).await, 2);
+    }
+
+    #[tokio::test]
+    async fn with_an_interval_later_merges_wait_and_join_one_gate() {
+        let f = fixture(Some(
+            "gate_command: \"git --version\"\ngate_after_land: true\n\
+             postgate_min_interval_mins: 60\n",
+        ))
+        .await;
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+        tick_until(&f, |s| matches!(s, Step::Green(_))).await;
+        assert_eq!(count(&f.pool, "verify_requests").await, 1);
+
+        // Two merges land inside the interval: each tick holds, on the newest tip.
+        let c1 = commit_file(&f.root, "b.txt", "1\n", "three");
+        let step = step_of(&f).await;
+        assert!(
+            matches!(&step, Some(Step::Held { sha, hold: verify_batch::Hold::Interval { .. } }) if *sha == c1),
+            "{step:?}"
+        );
+        let c2 = commit_file(&f.root, "b.txt", "2\n", "four");
+        let step = step_of(&f).await;
+        assert!(
+            matches!(&step, Some(Step::Held { sha, hold: verify_batch::Hold::Interval { .. } }) if *sha == c2),
+            "{step:?}"
+        );
+        assert_eq!(held_lines(&f.pool).await, 1, "one line per episode");
+        assert_eq!(count(&f.pool, "verify_requests").await, 1);
+
+        // Once the interval has passed, ONE gate starts, for the latest tip.
+        sqlx::query("UPDATE postgate_state SET last_started_at = datetime('now','-2 hours')")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let step = tick_until(&f, |s| matches!(s, Step::Started { .. })).await;
+        let Step::Started { sha, .. } = step else {
+            unreachable!()
+        };
+        assert_eq!(sha, c2);
+        assert_eq!(count(&f.pool, "verify_requests").await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_busy_machine_holds_the_gate_and_an_idle_one_starts_it() {
+        let f = fixture(Some(
+            "gate_command: \"git --version\"\ngate_after_land: true\n\
+             postgate_idle_command: \"git no-such-subcommand\"\n",
+        ))
+        .await;
+
+        for _ in 0..2 {
+            let step = step_of(&f).await;
+            assert_eq!(
+                step,
+                Some(Step::Held {
+                    sha: f.tip.clone(),
+                    hold: verify_batch::Hold::Busy,
+                })
+            );
+        }
+        assert_eq!(held_lines(&f.pool).await, 1, "one line per episode");
+        assert_eq!(count(&f.pool, "verify_requests").await, 0);
+        let summaries = feed_summaries(&f.pool).await;
+        assert!(
+            summaries.iter().any(|s| s.contains("no-such-subcommand")),
+            "the feed names the command: {summaries:?}"
+        );
+
+        // The machine goes quiet: the same command now answers 0.
+        crate::project_state::write_for_test(
+            f._machine.path(),
+            "alpha",
+            crate::project_state::AUTOPILOT_FILE,
+            "gate_command: \"git --version\"\ngate_after_land: true\n\
+             postgate_idle_command: \"git --version\"\n",
+        );
+        let step = tick_until(&f, |s| matches!(s, Step::Started { .. })).await;
+        let Step::Started { sha, .. } = step else {
+            unreachable!()
+        };
+        assert_eq!(sha, f.tip);
+        assert_eq!(count(&f.pool, "verify_requests").await, 1);
     }
 }
