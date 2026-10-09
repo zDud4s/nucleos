@@ -111,6 +111,8 @@ export interface ProjectRules {
    * when the daemon is older than the shell.
    */
   postgate?: PostgateState | null;
+  /** Why the post-merge state could not be read; `postgate` is then null. Absent when it was read, or from an older daemon. */
+  postgate_error?: string;
   /** Who answers an approval a conversation on `auto` would otherwise put to a person. */
   judge: JudgeState;
   schedules: ScheduleView[];
