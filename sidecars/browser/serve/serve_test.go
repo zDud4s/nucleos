@@ -328,11 +328,11 @@ func TestOpenForwardsVisibleToTheDriver(t *testing.T) {
 	server := testServer(t, driver)
 
 	sent := opening("https://example.org/")
-	sent.Visible = true
+	sent.Placement.Visible = true
 	if response := post(t, server, "/open", sent, true); response.StatusCode != http.StatusOK {
 		t.Fatalf("open: got %d", response.StatusCode)
 	}
-	if len(driver.Opened) != 1 || !driver.Opened[0].Visible {
+	if len(driver.Opened) != 1 || !driver.Opened[0].Placement.Visible {
 		t.Fatalf("the driver did not receive visible: %+v", driver.Opened)
 	}
 }

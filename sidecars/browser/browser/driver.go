@@ -74,6 +74,9 @@ type Placement struct {
 	// Empty for an ephemeral profile, and it must be, for a reason narrower than Origins': a
 	// throwaway has no login in it, so there is nobody for a form to be submitted AS.
 	Writable []string `json:"writable,omitempty"`
+	// Visible runs the session's browser headful but still fenced (spec §4.1). The núcleo decides
+	// it, from the panel's choice; never the agent.
+	Visible bool `json:"visible,omitempty"`
 }
 
 // OpenRequest asks for a session on a URL, in the profile the núcleo chose.
@@ -81,9 +84,6 @@ type OpenRequest struct {
 	URL string `json:"url"`
 	// Placement is filled by the núcleo, never by the agent. See the package comment.
 	Placement Placement `json:"placement"`
-	// Visible asks for the agent's browser to run headful (spec §4.1), still fenced. Set by the
-	// núcleo from the panel's choice, never by the agent.
-	Visible bool `json:"visible,omitempty"`
 }
 
 // Session is what a caller gets back. RequestedURL and FinalURL are both reported because the trust

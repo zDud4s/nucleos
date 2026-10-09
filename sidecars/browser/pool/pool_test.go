@@ -590,10 +590,10 @@ func TestAnAttemptIsMadeEvenWithNoWindowToChaseIn(t *testing.T) {
 }
 
 func openVisibility(pool *Pool, placement browser.Placement, visible bool) (browser.Session, error) {
+	placement.Visible = visible
 	return pool.Open(context.Background(), browser.OpenRequest{
 		URL:       "https://example.org/",
 		Placement: placement,
-		Visible:   visible,
 	})
 }
 

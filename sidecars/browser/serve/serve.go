@@ -86,8 +86,6 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 type OpenRequest struct {
 	URL       string            `json:"url"`
 	Placement browser.Placement `json:"placement"`
-	// Visible asks for a headful, still fenced, browser. The núcleo sets it; see browser.OpenRequest.
-	Visible bool `json:"visible,omitempty"`
 }
 
 // SessionRequest names an existing session. Used by every verb after /open.
@@ -155,7 +153,6 @@ func openHandler(driver browser.Driver) http.HandlerFunc {
 		session, err := driver.Open(r.Context(), browser.OpenRequest{
 			URL:       request.URL,
 			Placement: request.Placement,
-			Visible:   request.Visible,
 		})
 		if err != nil {
 			writeDriverError(w, "open", err)

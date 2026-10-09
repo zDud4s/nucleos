@@ -187,7 +187,7 @@ func (p *Pool) Open(ctx context.Context, req browser.OpenRequest) (browser.Sessi
 	// and counted in its own right.
 	defer p.unreserve()
 
-	holder, err := p.acquire(ctx, req.Placement, policy, req.Visible)
+	holder, err := p.acquire(ctx, req.Placement, policy, req.Placement.Visible)
 	if err != nil {
 		return browser.Session{}, err
 	}
