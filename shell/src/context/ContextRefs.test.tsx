@@ -72,7 +72,7 @@ function afterDwell(): Promise<void> {
 }
 
 function calls(method: string): [string, RequestInit][] {
-  return daemon.apiFetch.mock.calls.filter(([, init]) => (init?.method ?? "GET") === method);
+  return (daemon.apiFetch.mock.calls as [string, RequestInit][]).filter(([, init]) => (init?.method ?? "GET") === method);
 }
 
 beforeEach(() => {
