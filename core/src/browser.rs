@@ -1239,9 +1239,26 @@ pub async fn post_snapshot(
             {
                 object.insert("wheel_returned".into(), serde_json::Value::Bool(true));
             }
+            tell_panel_once(&state, row.id, &mut value);
             axum::Json(value).into_response()
         }
         Err(error) => browser_error(error),
+    }
+}
+
+/// What the person typed in the panel and the note they left with the wheel, each told once to the
+/// agent's next read (spec browser-com-painel §4.3).
+fn tell_panel_once(state: &AppState, id: i64, value: &mut serde_json::Value) {
+    let messages = state.browser.seats.take_panel_messages(id);
+    let note = state.browser.seats.take_returned_note(id);
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if !messages.is_empty() {
+        object.insert("panel_messages".into(), serde_json::json!(messages));
+    }
+    if let Some(note) = note {
+        object.insert("wheel_note".into(), serde_json::Value::String(note));
     }
 }
 
@@ -1336,6 +1353,7 @@ pub async fn post_act(
             {
                 object.insert("wheel_returned".into(), serde_json::Value::Bool(true));
             }
+            tell_panel_once(&state, row.id, &mut value);
             axum::Json(value).into_response()
         }
         Err(error) => browser_error(error),

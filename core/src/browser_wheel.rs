@@ -523,7 +523,10 @@ pub async fn give_back(
 }
 
 /// Is the run that owns this session still going? Only then is there somebody to hand it back to.
-async fn run_is_live(pool: &SqlitePool, row: &SessionRow) -> Result<bool, WheelError> {
+pub(crate) async fn run_is_live(
+    pool: &SqlitePool,
+    row: &SessionRow,
+) -> Result<bool, WheelError> {
     let Some(run_id) = row.run_id else {
         return Ok(false);
     };
