@@ -222,9 +222,8 @@ describe("Charter - the drift guard", () => {
     const after = teamView({ members: ["controller", "auditor", "tax-analyst"] });
     await renderCharter(teamView(), { later: after });
 
-    const members = (await screen.findByLabelText("Members")) as HTMLSelectElement;
-    for (const option of Array.from(members.options)) option.selected = option.value === "controller";
-    fireEvent.change(members);
+    // Staff is a list of checkboxes now: untick everybody but the controller.
+    fireEvent.click(await screen.findByRole("checkbox", { name: /auditor/ }));
 
     fireEvent.click(await screen.findByRole("button", { name: "Save" }));
 
@@ -246,7 +245,7 @@ describe("Charter - the drift guard", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Save" }));
 
-    expect(await screen.findByText(/nothing was sent/)).toBeDefined();
+    expect(await screen.findByText(/nothing was saved/)).toBeDefined();
     expect(puts()).toHaveLength(0);
   });
 });

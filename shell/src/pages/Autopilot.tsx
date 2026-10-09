@@ -28,7 +28,7 @@ import {
   useShadowDecisions,
   type ClassTally,
 } from "../data/autopilot";
-import { useCreateJob, useLiveJobs, type Job } from "../data/fleet";
+import { useCancelSlotOwner, useCreateJob, useLiveJobs, type Job } from "../data/fleet";
 import {
   useBudget,
   useKillSwitch,
@@ -59,6 +59,7 @@ import {
   StateBadge,
   Teach,
   readState,
+  usd,
 } from "../ui";
 import { whereWaiting } from "../data/roster";
 import {
@@ -208,7 +209,7 @@ function RosterError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
     <ErrorNote>
-      the núcleo did not answer — nothing is known about the roster
+      The núcleo did not answer — nothing is known about the roster.
     </ErrorNote>
   );
 }
@@ -237,7 +238,7 @@ function KillBanner() {
       <span className="ap-banner-text">
         Nothing autonomous starts while this is on — no scheduled rule, no repo
         trigger, no job. The switch is under the rail, on every page. Everything
-        below is what *would* happen once it is released.
+        below is what <em>would</em> happen once it is released.
       </span>
     </p>
   );
@@ -250,7 +251,7 @@ function BudgetPausedBanner({ budget }: { budget: BudgetView }) {
         Autonomous work is held by the budget
       </span>
       <span className="ap-banner-text">
-        {budget.reason ?? "the núcleo did not say which ceiling"} — $
+        {budget.reason ?? "The núcleo did not say which ceiling"} — $
         {budget.window_spend_usd.toFixed(2)} spent this{" "}
         {PERIOD_NOUN[budget.period] ?? budget.period}
         {budget.limit_usd === null
@@ -281,28 +282,31 @@ function Ledger({
   pending: number | undefined;
 }) {
   const held = projects?.filter((row) => row.queue_full).length ?? 0;
-  const spend =
-    budget === undefined
-      ? undefined
-      : `$${budget.window_spend_usd.toFixed(2)} spent${
-          budget.limit_usd === null
-            ? ", no ceiling set"
-            : ` of $${budget.limit_usd.toFixed(2)} per ${PERIOD_NOUN[budget.period] ?? budget.period}`
-        }`;
-  if (pending === undefined && spend === undefined) return null;
+  if (pending === undefined && budget === undefined) return null;
   return (
-    <p className="ap-ledger">
+    <div className="ap-ledger">
       {pending !== undefined && (
-        <Link className="ap-link" to="/waiting">
-          {pending} to review across the roster
-        </Link>
+        <p className="ap-ledger-line">
+          <Link className="ap-link" to="/waiting">
+            {pending} to review across the roster
+          </Link>
+          {held > 0 &&
+            (held === 1 ? " — 1 project's queue full" : ` — ${held} projects' queues full`)}
+        </p>
       )}
-      {pending !== undefined &&
-        held > 0 &&
-        (held === 1 ? " — 1 project's queue full" : ` — ${held} projects' queues full`)}
-      {pending !== undefined && spend !== undefined && " · "}
-      {spend}
-    </p>
+      {/* The window's spend against its ceiling, drawn: at 80% the meter turns amber and says so. */}
+      {budget !== undefined && (
+        <div className="ap-ledger-budget">
+          <Meter
+            label={`Spent this ${PERIOD_NOUN[budget.period] ?? budget.period}`}
+            value={budget.window_spend_usd}
+            ceiling={budget.limit_usd}
+            tone="quantity"
+            format={usd}
+          />
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -714,8 +718,9 @@ function ProjectCarousel({
     .join(" ");
 
   return (
-    // The fan is the first thing under the header: no section title above it (the index says
-    // "1 of N"), and the index, the note and the setting all follow it rather than push it down.
+    // The setting for the project in focus is the first thing under the header, with the fan beside it
+    // (no section title above either: the index says "1 of N"). The fan is the roster's picture and
+    // the setting is the control, so the control is never pushed below the picture.
     <section className="ap-fan" aria-label="Projects">
       {answered && rows.length === 0 && (
         <Teach title="No project is under autopilot">
@@ -726,119 +731,125 @@ function ProjectCarousel({
           </p>
         </Teach>
       )}
-      {!answered && <p className="ap-loading">reading the roster…</p>}
+      {!answered && <p className="ap-loading">Reading the roster…</p>}
       {focused !== undefined && (
         <>
-          <div
-            ref={stageRef}
-            className={stageClass}
-            aria-hidden="true"
-            onPointerDown={onStageDown}
-            onPointerMove={onStageMove}
-            onPointerUp={onStageUp}
-            onPointerCancel={onStageUp}
-          >
-            {shown.map((row, at) => (
-              <article
-                key={row.project_id}
-                ref={(element) => {
-                  if (element === null) cards.current.delete(row.project_id);
-                  else cards.current.set(row.project_id, element);
-                }}
-                data-index={at}
-                className={at === index ? "ap-fan-card ap-fan-card-focus" : "ap-fan-card"}
-              >
-                <FanCard
-                  project={row}
-                  refused={refusals.has(row.project_id)}
-                  cardW={cfg.cardW}
-                />
-              </article>
-            ))}
+          {/* The setting leads, in the document and on the screen: project, mode, switch. The fan
+              is the picture of the roster and sits beside it (above ~1100px) or under it. */}
+          <div className="ap-fan-control">
+            <div
+              className="ap-fan-focus"
+              id={panelId}
+              role={many ? "tabpanel" : undefined}
+              aria-labelledby={many ? tabId(index) : undefined}
+            >
+              <FocusSetting
+                key={focused.project_id}
+                project={focused}
+                refused={refusals.get(focused.project_id)}
+                failed={failed === focused.project_id}
+                busy={setMode.isPending}
+                onChange={(mode, withRoot) => change(focused, mode, withRoot)}
+              />
+            </div>
+            {/* What each setting means, said once rather than on every card, in the map's words. */}
+            <p className="ap-note ap-fan-note">
+              Three settings and not two. <strong>Off</strong> means {MODE_MEANING.off}.{" "}
+              <strong>Shadow</strong> means {MODE_MEANING.shadow}.{" "}
+              <strong>Active</strong> means {MODE_MEANING.active}.
+            </p>
           </div>
 
-          {many && (
-            <>
-              <div className="ap-fan-index">
-                <div
-                  className="ap-fan-rail"
-                  role="tablist"
-                  aria-label="Projects, most urgent first"
-                  onKeyDown={onIndexKey}
-                  onPointerLeave={() => setPointedAt(null)}
+          <div className="ap-fan-view">
+            <div
+              ref={stageRef}
+              className={stageClass}
+              aria-hidden="true"
+              onPointerDown={onStageDown}
+              onPointerMove={onStageMove}
+              onPointerUp={onStageUp}
+              onPointerCancel={onStageUp}
+            >
+              {shown.map((row, at) => (
+                <article
+                  key={row.project_id}
+                  ref={(element) => {
+                    if (element === null) cards.current.delete(row.project_id);
+                    else cards.current.set(row.project_id, element);
+                  }}
+                  data-index={at}
+                  className={at === index ? "ap-fan-card ap-fan-card-focus" : "ap-fan-card"}
                 >
-                  {shown.map((row, at) => (
-                    <button
-                      key={row.project_id}
-                      ref={(element) => {
-                        tabs.current[at] = element;
-                      }}
-                      type="button"
-                      role="tab"
-                      id={tabId(at)}
-                      className={[
-                        "ap-fan-tick",
-                        `ap-fan-tick-${row.mode}`,
-                        ranks[at] === 0 ? "ap-fan-tick-exception" : "",
-                        at > 0 && ranks[at - 1] !== ranks[at] ? "ap-fan-tick-gap" : "",
-                      ]
-                        .filter((name) => name !== "")
-                        .join(" ")}
-                      aria-selected={at === index}
-                      aria-controls={panelId}
-                      tabIndex={at === index ? 0 : -1}
-                      onClick={() => onSelect(row.project_id)}
-                      onPointerEnter={() => setPointedAt(row.project_id)}
-                    >
-                      {/* The name is content, not `aria-label`: the tab is found by what it says. */}
-                      <span className="sr-only">
-                        {describeProject(row, refusals.has(row.project_id))}
-                      </span>
-                      <span className="ap-fan-tick-bar" />
-                    </button>
-                  ))}
-                </div>
-                <div className="ap-fan-index-meta">
-                  <span className="ap-fan-position">
-                    {index + 1} of {total}
-                  </span>
-                  <span className="ap-fan-hint">
-                    <kbd>←</kbd> <kbd>→</kbd> on the row, or drag the cards
-                  </span>
-                </div>
-              </div>
-              <p className="ap-fan-readout" aria-hidden="true">
-                {pointed === undefined ? null : (
-                  <>
-                    <strong>{pointed.project_id}</strong> —{" "}
-                    {readingOf(pointed, refusals.has(pointed.project_id))}
-                  </>
-                )}
-              </p>
-            </>
-          )}
+                  <FanCard
+                    project={row}
+                    refused={refusals.has(row.project_id)}
+                    cardW={cfg.cardW}
+                  />
+                </article>
+              ))}
+            </div>
 
-          {/* What each setting means, said once rather than on every card, in the map's words. */}
-          <p className="ap-note ap-fan-note">
-            Three settings and not two. <strong>Off</strong> means {MODE_MEANING.off}.{" "}
-            <strong>Shadow</strong> means {MODE_MEANING.shadow}.{" "}
-            <strong>Active</strong> means {MODE_MEANING.active}.
-          </p>
-
-          <div
-            className="ap-fan-focus"
-            id={panelId}
-            role={many ? "tabpanel" : undefined}
-            aria-labelledby={many ? tabId(index) : undefined}
-          >
-            <FocusSetting
-              key={focused.project_id}
-              project={focused}
-              refused={refusals.get(focused.project_id)}
-              failed={failed === focused.project_id}
-              busy={setMode.isPending}
-              onChange={(mode, withRoot) => change(focused, mode, withRoot)}
-            />
+            {many && (
+              <>
+                <div className="ap-fan-index">
+                  <div
+                    className="ap-fan-rail"
+                    role="tablist"
+                    aria-label="Projects, most urgent first"
+                    onKeyDown={onIndexKey}
+                    onPointerLeave={() => setPointedAt(null)}
+                  >
+                    {shown.map((row, at) => (
+                      <button
+                        key={row.project_id}
+                        ref={(element) => {
+                          tabs.current[at] = element;
+                        }}
+                        type="button"
+                        role="tab"
+                        id={tabId(at)}
+                        className={[
+                          "ap-fan-tick",
+                          `ap-fan-tick-${row.mode}`,
+                          ranks[at] === 0 ? "ap-fan-tick-exception" : "",
+                          at > 0 && ranks[at - 1] !== ranks[at] ? "ap-fan-tick-gap" : "",
+                        ]
+                          .filter((name) => name !== "")
+                          .join(" ")}
+                        aria-selected={at === index}
+                        aria-controls={panelId}
+                        tabIndex={at === index ? 0 : -1}
+                        onClick={() => onSelect(row.project_id)}
+                        onPointerEnter={() => setPointedAt(row.project_id)}
+                      >
+                        {/* The name is content, not `aria-label`: the tab is found by what it says. */}
+                        <span className="sr-only">
+                          {describeProject(row, refusals.has(row.project_id))}
+                        </span>
+                        <span className="ap-fan-tick-bar" />
+                      </button>
+                    ))}
+                  </div>
+                  <div className="ap-fan-index-meta">
+                    <span className="ap-fan-position">
+                      {index + 1} of {total}
+                    </span>
+                    <strong className="ap-fan-position-name">{focused.project_id}</strong>
+                    <span className="ap-fan-hint">
+                      <kbd>←</kbd> <kbd>→</kbd> on the row, or drag the cards
+                    </span>
+                  </div>
+                </div>
+                <p className="ap-fan-readout" aria-hidden="true">
+                  {pointed === undefined ? null : (
+                    <>
+                      <strong>{pointed.project_id}</strong> —{" "}
+                      {readingOf(pointed, refusals.has(pointed.project_id))}
+                    </>
+                  )}
+                </p>
+              </>
+            )}
           </div>
         </>
       )}
@@ -927,7 +938,7 @@ function FanVisor({ project }: { project: ProjectSummary }) {
   }
   return (
     <div className="ap-fan-visor">
-      <span className="ap-fan-visor-label">clearing the bar</span>
+      <span className="ap-fan-visor-label">classes ready</span>
       <div className="ap-fan-reading">
         {project.classes_total === 0 ? (
           <span className="ap-fan-figure ap-fan-figure-word">none yet</span>
@@ -1162,7 +1173,7 @@ function FocusSetting({
       )}
       {failed && (
         <ErrorNote>
-          the núcleo did not answer — this project&apos;s setting is unchanged
+          The núcleo did not answer — this project&apos;s setting is unchanged.
         </ErrorNote>
       )}
     </>
@@ -1188,7 +1199,7 @@ function ShadowReviewPanel({
     return (
       <Section label="Shadow decisions">
         {/* The selected row is the subject; name it because its light-theme mark has no fill weight, while "this project" is only for the first render. */}
-        <Quiet says={`nothing is waiting for a verdict on ${project?.project_id ?? "this project"}.`}>
+        <Quiet says={`Nothing is waiting for a verdict on ${project?.project_id ?? "this project"}.`}>
           <p className="ap-note">What the classifier decided while enforcing nothing. Answering these is the only thing that moves a project toward acting on its own — agreeing says the classifier read the action the way you would, disagreeing says it did not, and both are evidence.</p>
         </Quiet>
       </Section>
@@ -1206,7 +1217,7 @@ function ShadowReviewPanel({
         </>
       }
     >
-      {projectId === null && <Quiet says="choose a project above." />}
+      {projectId === null && <Quiet says="Choose a project above." />}
       {projectId !== null &&
         decisions.isError &&
         decisions.data === undefined && (
@@ -1215,7 +1226,7 @@ function ShadowReviewPanel({
       {projectId !== null &&
         !decisions.isError &&
         decisions.data === undefined && (
-          <p className="ap-loading">reading the shadow decisions…</p>
+          <p className="ap-loading">Reading the shadow decisions…</p>
         )}
       {rows.length > 0 && (
         <ul className="ap-list" aria-label="Shadow decisions">
@@ -1249,7 +1260,7 @@ function ShadowReviewPanel({
                 </div>
               </dl>
               {decision.reason === null || decision.reason.trim() === "" ? (
-                <Quiet says="the classifier recorded no reason" />
+                <Quiet says="The classifier recorded no reason." />
               ) : (
                 <p className="ap-reason">{decision.reason}</p>
               )}
@@ -1341,7 +1352,7 @@ function ScoreboardPanel({
   if (projectId !== null && scoreboard.data !== undefined && rows.length === 0) {
     return (
       <Section label="Scoreboard">
-        <Quiet says={`${project?.project_id ?? "this project"} has recorded no classified decision yet.`}>
+        <Quiet says={`${project?.project_id ?? "This project"} has recorded no classified decision yet.`}>
           <p className="ap-note">Read-only. The bar is {READINESS_MIN_REVIEWED} reviews at {READINESS_MIN_AGREE_PERCENT}% agreement per action class; the ready/total figure is the núcleo&apos;s own and gates the promote control.</p>
         </Quiet>
       </Section>
@@ -1362,7 +1373,7 @@ function ScoreboardPanel({
         )
       }
     >
-      {projectId === null && <Quiet says="choose a project above." />}
+      {projectId === null && <Quiet says="Choose a project above." />}
       {projectId !== null &&
         scoreboard.isError &&
         scoreboard.data === undefined && (
@@ -1371,7 +1382,7 @@ function ScoreboardPanel({
       {projectId !== null &&
         !scoreboard.isError &&
         scoreboard.data === undefined && (
-          <p className="ap-loading">reading the scoreboard…</p>
+          <p className="ap-loading">Reading the scoreboard…</p>
         )}
       {evidence.length > 0 && (
         <TallyTable label="Shadow evidence" rows={evidence} />
@@ -1498,7 +1509,7 @@ function TriggerKills() {
         <ListError error={kills.error} what="the trigger brakes" />
       )}
       {!kills.isError && kills.data === undefined && (
-        <p className="ap-loading">reading the trigger brakes…</p>
+        <p className="ap-loading">Reading the trigger brakes…</p>
       )}
       <Rows label="Trigger brakes">
         {TRIGGER_SCOPES.map((scope) => {
@@ -1542,7 +1553,7 @@ function TriggerKills() {
       </Rows>
       {setKill.isError && (
         <ErrorNote>
-          that brake was not changed — the núcleo refused or did not answer
+          That brake was not changed — the núcleo refused or did not answer.
         </ErrorNote>
       )}
     </Panel>
@@ -1572,7 +1583,7 @@ function JobsPanel({
   return (
     <Panel title="Jobs in flight" aside={<Count n={jobs.data?.length} />}>
       {jobs.isError && jobs.data === undefined && <ListError error={jobs.error} what="the jobs" />}
-      {jobs.data !== undefined && live.length === 0 && <Quiet says="nothing is running." />}
+      {jobs.data !== undefined && live.length === 0 && <Quiet says="Nothing is running. Start one below, or from the Fleet page." />}
       {live.length > 0 && (
         <ul className="ap-list" aria-label="Jobs in flight">
           {live.map((job) => (
@@ -1592,6 +1603,25 @@ function JobsPanel({
           value={prompt}
           onChange={(event) => setPrompt(event.target.value)}
         />
+        {/* Said before the click rather than after the 409, and right above the control it
+            explains. A project that is off starts nothing, and one whose queue is full defers
+            rather than refuses — two different reasons the button would not do what it says. */}
+        {target !== undefined && target.mode === "off" && (
+          <p className="ap-hedge">
+            {target.project_id} is off, so the núcleo would not start this.
+          </p>
+        )}
+        {target !== undefined && target.queue_full && (
+          <p className="ap-hedge">
+            {target.project_id} is holding {target.open_review_items} items waiting for review
+            {targetWaitingWhere === null ? "" : ` (${targetWaitingWhere})`} against its ceiling of{" "}
+            {target.wip_limit ?? "none"}.{" "}
+            <Link className="ap-link" to="/waiting">
+              Review {target.open_review_items === 1 ? "1 item" : `${target.open_review_items} items`}
+            </Link>{" "}
+            and the brake releases itself.
+          </p>
+        )}
         <Button
           variant="approve"
           intent="go"
@@ -1617,27 +1647,15 @@ function JobsPanel({
           Start a job
         </Button>
       </div>
-      {/* Said before the click rather than after the 409. A project that is off
-          starts nothing, and one whose queue is full defers rather than refuses
-          — two different reasons the button would not do what it says. */}
-      {target !== undefined && target.mode === "off" && (
-        <p className="ap-hedge">
-          {target.project_id} is off, so the núcleo would not start this.
-        </p>
-      )}
-      {target !== undefined && target.queue_full && (
-        <p className="ap-hedge">
-          {target.project_id} is holding {target.open_review_items} items waiting for review
-          {targetWaitingWhere === null ? "" : ` (${targetWaitingWhere})`} against its ceiling of{" "}
-          {target.wip_limit ?? "none"} — review something and the brake releases itself.
-        </p>
-      )}
       {create.isError && <JobError error={create.error} />}
     </Panel>
   );
 }
 
 function JobRow({ job }: { job: Job }) {
+  // A job is stopped through its own route (`POST /jobs/{id}/cancel`), never as a run: the job id
+  // and a run id are different numbers, and the wrong one would stop somebody else's work.
+  const cancel = useCancelSlotOwner();
   return (
     <Inset as="li" className="ap-job">
       <div className="ap-card-head">
@@ -1658,6 +1676,23 @@ function JobRow({ job }: { job: Job }) {
         {job.team_id !== null &&
           ` — ${job.team_name ?? job.team_id}, up to ${job.team_max_parallel ?? 1} at once`}
       </p>
+      <div className="ap-actions">
+        <ConfirmButton
+          label="Stop job"
+          confirmLabel="Stop this job"
+          subject={`#${job.id}`}
+          variant="danger"
+          intent="stop"
+          disabled={cancel.isPending}
+          onConfirm={() => cancel.mutate({ kind: "job", id: job.id })}
+        />
+        <Link className="ap-link" to="/fleet">
+          See it in Fleet
+        </Link>
+      </div>
+      {cancel.isError && (
+        <ErrorNote>The núcleo did not answer — job {job.id} was not stopped.</ErrorNote>
+      )}
     </Inset>
   );
 }
@@ -1665,7 +1700,7 @@ function JobRow({ job }: { job: Job }) {
 function JobError({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
-      <ErrorNote>the núcleo did not answer — no job was started</ErrorNote>
+      <ErrorNote>The núcleo did not answer — no job was started.</ErrorNote>
     );
   return (
     <RefusalNote
@@ -1696,7 +1731,7 @@ function ListError({ error, what }: { error: unknown; what: string }) {
     return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
     <ErrorNote>
-      the núcleo did not answer — nothing is known about {what}
+      The núcleo did not answer — nothing is known about {what}.
     </ErrorNote>
   );
 }

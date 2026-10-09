@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
+import * as control from "./KillSwitchControl";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { daemonFetch, daemonState, renderWithQuery } from "../test/harness";
 
@@ -138,5 +139,39 @@ describe("KillSwitchControl", () => {
 
     // Inline, under the control that caused it. There are no toasts in this app.
     expect(await screen.findByText(/kill switch is engaged/i)).toBeDefined();
+  });
+
+  it("Ctrl+Alt+K engages once and never releases", async () => {
+    expect((control as Record<string, unknown>).KILL_ENGAGE_EVENT).toBe("kill://engage");
+
+    daemon.apiFetch.mockImplementation(daemonFetch(daemonState({ kill: { engaged: false } })));
+    const { unmount } = renderWithQuery(<KillSwitchControl />);
+    await screen.findByRole("button", { name: "Kill switch" });
+
+    fireEvent.keyDown(document, { key: "k", code: "KeyK", ctrlKey: true, altKey: true });
+    await waitFor(() => {
+      expect(writes()).toEqual([{ engaged: true }]);
+    });
+    unmount();
+
+    // Cmd+Alt+K is the same chord on macOS.
+    daemon.apiFetch.mockReset();
+    daemon.apiFetch.mockImplementation(daemonFetch(daemonState({ kill: { engaged: false } })));
+    const meta = renderWithQuery(<KillSwitchControl />);
+    await screen.findByRole("button", { name: "Kill switch" });
+    fireEvent.keyDown(document, { key: "k", code: "KeyK", metaKey: true, altKey: true });
+    await waitFor(() => {
+      expect(writes()).toEqual([{ engaged: true }]);
+    });
+    meta.unmount();
+
+    // Already engaged: the chord engages only, so it must not write at all.
+    daemon.apiFetch.mockReset();
+    daemon.apiFetch.mockImplementation(daemonFetch(daemonState({ kill: { engaged: true } })));
+    renderWithQuery(<KillSwitchControl />);
+    await screen.findByRole("button", { name: /release kill switch/i });
+    fireEvent.keyDown(document, { key: "k", code: "KeyK", ctrlKey: true, altKey: true });
+    await afterDwell();
+    expect(writes()).toEqual([]);
   });
 });

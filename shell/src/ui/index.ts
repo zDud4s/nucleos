@@ -23,7 +23,7 @@ export { Inset, type InsetAs, type InsetProps } from "./Inset";
  * contrast between a ceiling something occupies and a rule applied per task,
  * and splitting them is how the next ceiling gets drawn as the wrong one.
  */
-export { LimitChip, Meter, usd, type LimitChipProps, type MeterProps, type MeterTone } from "./Meter";
+export { LimitChip, Meter, NEAR_CEILING, ceilingShare, usd, type LimitChipProps, type MeterProps, type MeterTone } from "./Meter";
 export { Modal, type ModalProps, type ModalSize } from "./Modal";
 export { TimeField, type TimeFieldProps } from "./TimeField";
 export { ModeSwitch, type ModeSwitchProps, type SwitchMode } from "./ModeSwitch";

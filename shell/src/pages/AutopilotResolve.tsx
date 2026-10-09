@@ -1,8 +1,11 @@
+import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
   RESOLVE_DATA_WARNING,
   RESOLVE_ENFORCE_RISK,
+  TYPESAFE_DEFINITION,
+  TYPESAFE_LEAVES,
   formatProbability,
   outcomesFor,
   readOutcome,
@@ -16,6 +19,7 @@ import {
 } from "../data/autopilot";
 import type { ProjectSummary } from "../data/system";
 import { Badge, Button, ConfirmButton, Count, ErrorNote, Inset, Panel, Quiet, RefusalNote, RelativeTime } from "../ui";
+import { DecisionDialog } from "./AutopilotJudge";
 
 /**
  * Spec B (`.ai/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md`, D11), one project:
@@ -35,10 +39,12 @@ export function ResolvePanel({
   const queue = useJudgeResolutions(projectId);
   const setMode = useSetProjectJudgeResolve();
   const setOutcome = useSetResolutionOutcome();
+  /** Whether the dialog for turning observing on is open: it sends data off this computer. */
+  const [asking, setAsking] = useState(false);
   if (projectId === null) {
     return (
       <Panel title="Resolving blocks">
-        <Quiet says="choose a project above." />
+        <Quiet says="Choose a project above." />
       </Panel>
     );
   }
@@ -60,15 +66,15 @@ export function ResolvePanel({
       )}
       <div className="ap-actions">
         {mode === "off" ? (
-          // Turning it on sends data off the machine, so it is armed, like the judge's Observe.
-          <ConfirmButton
-            label="Observe how blocks would be resolved"
-            confirmLabel="Send blocked commands and gate output to TypeSafe"
+          // Turning it on sends data off the machine, so it asks in a dialog, like the judge's watching.
+          <Button
             variant="ghost"
-            describedBy="resolve-data-warning"
+            aria-describedby="resolve-data-warning"
             disabled={setMode.isPending}
-            onConfirm={() => setMode.mutate({ project_id: projectId, judge_resolve: "observe" })}
-          />
+            onClick={() => setAsking(true)}
+          >
+            Observe how blocks would be resolved
+          </Button>
         ) : (
           <Button
             variant="ghost"
@@ -90,24 +96,36 @@ export function ResolvePanel({
         )}
       </div>
       {setMode.isError && <ResolveRefusal error={setMode.error} />}
-      <p className="ap-note">
-        <strong>Blocks to review</strong> <Count n={rows.length} />
-      </p>
+      {/* An empty queue is one quiet line; the heading and its count appear with the first block. */}
       {queue.data !== undefined && rows.length === 0 && (
-        <Quiet says="no block the resolver saw is waiting for you." />
+        <Quiet says="No block the resolver saw is waiting for you." />
       )}
       {rows.length > 0 && (
-        <ul className="ap-list" aria-label="Resolver blocks">
-          {rows.map((item) => (
-            <ResolutionCard
-              key={item.id}
-              item={item}
-              busy={setOutcome.isPending}
-              onAnswer={(outcome) => setOutcome.mutate({ id: item.id, outcome })}
-            />
-          ))}
-        </ul>
+        <>
+          <p className="ap-note">
+            <strong>Blocks to review</strong> <Count n={rows.length} />
+          </p>
+          <ul className="ap-list" aria-label="Resolver blocks">
+            {rows.map((item) => (
+              <ResolutionCard
+                key={item.id}
+                item={item}
+                busy={setOutcome.isPending}
+                onAnswer={(outcome) => setOutcome.mutate({ id: item.id, outcome })}
+              />
+            ))}
+          </ul>
+        </>
       )}
+      <DecisionDialog
+        open={asking}
+        onOpenChange={setAsking}
+        title="Send this project's blocked commands to TypeSafe?"
+        description={`${TYPESAFE_DEFINITION} If you continue, ${TYPESAFE_LEAVES}, plus the end of the gate output when a run fails its gate. Observing changes nothing a run does.`}
+        confirmLabel="Start observing"
+        confirmVariant="approve"
+        onConfirm={() => setMode.mutate({ project_id: projectId, judge_resolve: "observe" })}
+      />
       {setOutcome.isError && <ErrorNote>the review was not recorded</ErrorNote>}
     </Panel>
   );
@@ -179,7 +197,7 @@ function ResolutionCard({
 
 function ResolveRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — the resolver was not changed</ErrorNote>;
+    return <ErrorNote>The núcleo did not answer — the resolver was not changed.</ErrorNote>;
   }
   return (
     <RefusalNote

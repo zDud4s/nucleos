@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useRef, type ReactNode, type RefObject } from "react";
 import { XIcon } from "lucide-react";
 import { Dialog as DialogPrimitive } from "radix-ui";
 
@@ -21,6 +21,11 @@ export interface ModalProps {
   /** The answers — `Button`s, the primary one last — on the bottom edge, right-aligned. */
   footer?: ReactNode;
   size?: ModalSize;
+  /**
+   * Where focus lands on open, when the default is wrong. The default is the first field in the
+   * body, else the first button in the footer, else Radix's own choice.
+   */
+  initialFocus?: RefObject<HTMLElement | null>;
   children?: ReactNode;
 }
 
@@ -42,13 +47,38 @@ export interface ModalProps {
  * Animated with keyframes in `ui.css` on Radix's `data-state`, never a `<style>` element (the
  * production CSP refuses one), and not at all under reduced motion.
  */
-export function Modal({ open, onOpenChange, title, description, footer, size = "sm", children }: ModalProps) {
+export function Modal({
+  open,
+  onOpenChange,
+  title,
+  description,
+  footer,
+  size = "sm",
+  initialFocus,
+  children,
+}: ModalProps) {
+  const content = useRef<HTMLDivElement>(null);
+
+  // Radix focuses the first tabbable thing, which is the Close X. A form should open on its first
+  // field and a question on its safest answer, so the choice is made here.
+  const focusFirst = (event: Event) => {
+    const target =
+      initialFocus?.current ??
+      content.current?.querySelector<HTMLElement>(".ui-modal-body :is(input, select, textarea):not([disabled])") ??
+      content.current?.querySelector<HTMLElement>(".ui-modal-foot button:not([disabled])");
+    if (target === null || target === undefined) return;
+    event.preventDefault();
+    target.focus();
+  };
+
   return (
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="ui-modal-scrim" />
         <DialogPrimitive.Content
+          ref={content}
           className={`ui-modal ui-modal-${size}`}
+          onOpenAutoFocus={focusFirst}
           // Radix warns when there is no Description; omitting it is a legitimate choice here.
           {...(description === undefined ? { "aria-describedby": undefined } : {})}
         >

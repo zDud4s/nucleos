@@ -219,8 +219,8 @@ describe("Bench - the shell", () => {
     // and under one Save — sending half of a full replace wipes the other half.
     const charter = await openTab("Charter");
     expect(within(charter).getByLabelText("Mission")).toBeDefined();
-    expect(within(charter).getByLabelText("Members")).toBeDefined();
-    expect(within(charter).getByLabelText("send_email grant")).toBeDefined();
+    expect(within(charter).getByRole("group", { name: "Members" })).toBeDefined();
+    expect(within(charter).getByLabelText("Email grant")).toBeDefined();
 
     // And no tab is standing in for one that was never written.
     expect(screen.queryByText(/Not written yet/)).toBeNull();

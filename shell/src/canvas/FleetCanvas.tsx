@@ -206,6 +206,18 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
       : detail.kind === "wave"
         ? `worker of wave ${detail.waveId}`
         : `${slot.owner_kind} ${slot.owner_id}`;
+  // What the card is about, before the numbers that file it: the job's rule (the live listing
+  // carries that and no prompt, so a job somebody asked for by hand says so), a run's prompt, and
+  // for the owners that have no name of their own, the owner itself.
+  const name =
+    detail.kind === "job" || detail.kind === "item"
+      ? (detail.job.rule_name ?? "started by hand")
+      : detail.kind === "run"
+        ? detail.run.prompt_excerpt
+        : owner;
+  // The handle goes in the muted line below the name, in the mono face as the identifier it is.
+  // When the name already IS the owner, only the slot is left to say.
+  const handle = name === owner ? `slot ${slot.slot}` : `${owner} · slot ${slot.slot}`;
 
   return (
     <article
@@ -213,16 +225,15 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
       aria-label={`slot ${slot.slot} — ${owner}`}
     >
       <header className="fleet-card-head">
-        <span className="fleet-card-slot">slot {slot.slot}</span>
-        <span className="fleet-card-owner">{owner}</span>
+        <p className="fleet-card-name">{name}</p>
+        <p className="fleet-card-meta">
+          <span className="fleet-card-ident">{handle}</span>
+          {actions.stale && " · last known reading"}
+        </p>
       </header>
 
       {detail.kind === "job" && (
         <>
-          {/* What the job IS, before what it is doing. The live listing carries the rule that
-              started it and nothing else — no prompt — so a job somebody asked for by hand says
-              so rather than showing an empty line. */}
-          <p className="fleet-card-prompt">{detail.job.rule_name ?? "started by hand"}</p>
           <p className="fleet-card-line">
             {/* `slotReading`, the reading the slot rack lights this slot's pip with, so the
                 pip and this badge cannot disagree about one slot. The same below for a run,
@@ -253,7 +264,6 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
 
       {detail.kind === "run" && (
         <>
-          <p className="fleet-card-prompt">{detail.run.prompt_excerpt}</p>
           <p className="fleet-card-line">
             <StateBadge {...slotReading(detail)} />
             <span className="fleet-card-mode">{detail.run.mode}</span>
@@ -271,7 +281,6 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
           be the same list twice, opened and closed independently. */}
       {detail.kind === "item" && (
         <>
-          <p className="fleet-card-prompt">{detail.job.rule_name ?? "started by hand"}</p>
           <p className="fleet-card-line">
             {/* The ITEM's reading and never the job's, though the job's would be
                 one field away. A slot is held from the claim until the item is
@@ -377,10 +386,14 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
           screen may already have been given back. */}
       {cancellable !== null && !actions.stale && (
         <span className="fleet-card-actions">
+          {/* "Stop", not "Cancel": on a card Cancel reads as dismissing the card. Armed, it names
+              what will stop; Escape disarms it (ConfirmButton's own contract), which is the way
+              back out. */}
           <ConfirmButton
-            label="Cancel"
-            confirmLabel={`Cancel ${slot.owner_kind} ${slot.owner_id}?`}
+            label={`Stop ${slot.owner_kind}`}
+            confirmLabel={`Stop ${slot.owner_kind} ${slot.owner_id}?`}
             variant="ghost"
+            intent="stop"
             onConfirm={() => actions.cancel(cancellable)}
           />
         </span>

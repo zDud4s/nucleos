@@ -90,8 +90,15 @@
  * one list. Lifted out, the table below can align because every row has the
  * same rows in it.
  */
+.teams-console {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  margin-top: var(--space-4);
+}
+
 .teams-flight {
-  margin: var(--space-4) 0 0;
+  margin: 0;
   padding: var(--space-4);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -110,17 +117,11 @@
   color: var(--text-muted);
 }
 
-.teams-flight-count {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
-  color: var(--tone-active-fg);
-}
-
+/* No `gap` here: `.ui-rows` draws its separators as a hairline gap over a
+ * `--border` background, so widening the gap paints a thick grey band. */
 .teams-flight-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -134,8 +135,44 @@
  * sideways.
  */
 .teams-table-scroller {
-  margin: var(--space-5) 0 0;
   overflow-x: auto;
+}
+
+/* The table and the key to its marks, one block in the console's column. */
+.teams-table-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+/* What the marks mean, as one line of text above the table. */
+.teams-key {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.teams-key-title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.teams-key-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* The pulse's unit rides at the end of the same line. */
+.teams-key-pulse {
+  margin-left: auto;
 }
 
 .teams-table {
@@ -164,18 +201,23 @@
   vertical-align: top;
 }
 
-.teams-table tbody tr:hover {
-  background: var(--surface);
-}
-
 /*
   The row header: the department, and what it is for. Both lines always, so the
   next row starts at the same height on every row — see the note on the strip.
+
+  The name link is stretched over this whole cell, and the cell is what lights up
+  under the pointer. The old full-row hover promised a row you could click and the
+  row had no action; only this cell does, so only this cell answers.
 */
 .teams-row-name {
+  position: relative;
   min-width: 14rem;
   max-width: 24rem;
   font-weight: 400;
+}
+
+.teams-row-name:hover {
+  background: var(--surface);
 }
 
 .teams-row-name a {
@@ -185,8 +227,20 @@
   text-decoration: none;
 }
 
+.teams-row-name a::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  cursor: pointer;
+}
+
 .teams-row-name a:hover {
   text-decoration: underline;
+}
+
+.teams-row-name a:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
 }
 
 /*
@@ -200,9 +254,14 @@
   -webkit-line-clamp: 1;
   overflow: hidden;
   margin-top: var(--space-1);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   line-height: var(--leading-normal);
   color: var(--text-muted);
+  /* Above the stretched link, or the overlay would swallow the title that carries the full text. */
+  position: relative;
+  z-index: 1;
+  width: fit-content;
+  max-width: 100%;
 }
 
 .teams-row-unwritten {
@@ -217,20 +276,6 @@
   text-align: right !important;
 }
 
-/*
-  A column's unit, under its name. Its own line and out of the uppercase the header
-  is set in, so it reads as a key to the marks below rather than as a second header:
-  the header says what the column is, this says what one mark in it counts.
-*/
-.teams-col-key {
-  display: block;
-  font-size: var(--text-xs);
-  font-weight: 400;
-  letter-spacing: normal;
-  text-transform: none;
-  color: var(--text-faint);
-}
-
 .teams-figure {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
@@ -242,9 +287,11 @@
   color: var(--text-faint);
 }
 
-/* At the ceiling. `1 / 1` and `0 / 1` are one glyph apart and are not the same news. */
+/* At the ceiling. `1 / 1` and `0 / 1` are one glyph apart and are not the same news.
+ * Paused, not pending: pending is the one tone that asks for a person, and a
+ * full department is held by its ceiling, not waiting on anyone. */
 .teams-figure-full {
-  color: var(--tone-pending-fg);
+  color: var(--tone-paused-fg);
 }
 
 /* Nobody on the roster is an ordinary first state; the mark and sentence say why work cannot start. */
@@ -262,19 +309,73 @@
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: var(--space-3);
+  gap: var(--space-1) var(--space-4);
   margin: 0;
   padding: 0;
   list-style: none;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  white-space: nowrap;
+  font-size: var(--text-sm);
 }
 
 .teams-alone-item {
   display: inline-flex;
-  align-items: baseline;
-  gap: var(--space-1);
+  align-items: center;
+  gap: var(--space-2);
+  white-space: nowrap;
+}
+
+/*
+  A mark is a shape drawn here, not a glyph: filled acts, half drafts, a ring cannot.
+  Thirteen px so the half and the ring cannot be mistaken for each other at table size.
+  `currentColor` throughout, so a mark takes its item's rung of ink and never needs one
+  of its own.
+*/
+.teams-mark {
+  flex: none;
+  box-sizing: border-box;
+  width: 0.8125rem;
+  height: 0.8125rem;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  line-height: 1;
+}
+
+.teams-mark-allow {
+  background: currentColor;
+}
+
+.teams-mark-propose {
+  background: linear-gradient(to right, currentColor 50%, transparent 50%);
+}
+
+.teams-mark-none {
+  background: transparent;
+}
+
+/* A routine is a clock, not a power — a diamond and not a disc, filled when armed. */
+.teams-mark-rule,
+.teams-mark-rule-off {
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: 1px;
+  transform: rotate(45deg);
+}
+
+.teams-mark-rule {
+  background: currentColor;
+}
+
+.teams-mark-rule-off {
+  background: transparent;
+}
+
+.teams-mark-unmapped {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-style: dashed;
+  background: transparent;
+  font-size: var(--text-xs);
+  font-weight: 600;
 }
 
 /* Does it on its own. The only one at full strength — that is the news. */
@@ -320,6 +421,18 @@
 .teams-row-pulse {
   width: 120px;
   min-width: 120px;
+  /* The bars are flushed right inside their svg, so the column's edge is the right one. */
+  text-align: right;
+}
+
+.teams-col-pulse {
+  text-align: right !important;
+}
+
+/* A department that has run nothing: a plain fact, where the dashed rail read as a broken chart. */
+.teams-pulse-none {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
 /* ========================================================= charter bits == */
@@ -387,14 +500,24 @@
   font-style: italic;
 }
 
+/* The task's title is the content, so it takes the text colour and leaves the accent for the
+   pointer: in cyan it competed with the state badge beside it for the same job. */
 .teams-task-what {
   flex: 1 1 18rem;
+  color: var(--text);
+  text-decoration: none;
 }
 
+.teams-task-what:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+/* A relative time and a round number: the body face, tabular, not an identifier. */
 .teams-task-when {
   margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
   color: var(--text-faint);
 }
 
@@ -410,15 +533,17 @@
   padding: 0 var(--space-1);
 }
 
+/* Spans the panel: the columns share the width instead of huddling at the left edge. */
 .teams-matrix {
+  width: 100%;
   border-collapse: collapse;
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
 }
 
 .teams-matrix-caption {
   margin-bottom: var(--space-3);
   text-align: left;
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   color: var(--text-faint);
 }
 
@@ -429,7 +554,7 @@
 .teams-matrix-col {
   padding: 0 var(--space-2) var(--space-2);
   font-family: var(--font-display);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   white-space: nowrap;
   color: var(--text-muted);
@@ -446,10 +571,16 @@
 
 .teams-matrix-cell,
 .teams-matrix-count {
-  padding: var(--space-1) var(--space-2);
+  padding: var(--space-1) var(--space-3);
   text-align: center;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+}
+
+/* The marks are the content of these cells; the counts keep the table's size. */
+.teams-matrix-cell {
+  font-size: var(--text-base);
+  line-height: 1.2;
 }
 
 /**
@@ -466,6 +597,20 @@
 .teams-matrix-leads {
   color: var(--text);
   font-weight: var(--weight-semibold);
+}
+
+/* The director also says so, in a word under the mark: `◉` against `●` differed by a hairline
+   ring. The word is decoration for the eye — the cell already says "directs" to a screen reader,
+   so the alternative text after the slash keeps it from being read twice. */
+.teams-matrix-leads::after {
+  content: "lead";
+  content: "lead" / "";
+  display: block;
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
 }
 
 .teams-matrix-staff {
@@ -1435,4 +1580,102 @@
   font-size: var(--text-sm);
   font-weight: 600;
   color: var(--text);
+}
+
+/* "required" next to a label, in words: an asterisk is a colour-and-glyph convention nobody
+   reads aloud. Not uppercase, unlike the label it follows. */
+/* The "required" marker is drawn, not written into the label, so the control's accessible name
+   stays exactly "Mission"; aria-required on the control carries it for assistive tech. */
+.teams-label[data-required="true"]::after {
+  content: "  b7  required";
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--text-muted);
+}
+
+/* Why the submit button is unavailable. It takes the footer's free width and wraps rather than
+   pushing the buttons off the edge. */
+.teams-foot-why {
+  flex: 1 1 14rem;
+  margin: 0;
+  align-self: center;
+  text-align: left;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+}
+
+/* Members as a checkbox list: a native `select multiple` showed mono ids beside a title-cased
+   name and needed a modifier key to pick two. */
+.teams-members {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.teams-members legend {
+  padding: 0;
+  margin-bottom: var(--space-1);
+}
+
+.teams-check-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 12rem;
+  overflow-y: auto;
+  margin: 0;
+  padding: var(--space-1);
+  list-style: none;
+  border: 1px solid var(--border-field, var(--border));
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.teams-check {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.teams-check:hover {
+  background: var(--border);
+}
+
+.teams-check input {
+  flex: none;
+  accent-color: var(--text-muted);
+}
+
+.teams-check input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.teams-check-name {
+  color: var(--text);
+}
+
+.teams-check-note {
+  min-width: 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* A power's human name, with the daemon's identifier muted beside it. */
+.teams-grant-label {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.teams-grant-ident {
+  font-family: var(--font-mono);
+  color: var(--text-faint);
 }

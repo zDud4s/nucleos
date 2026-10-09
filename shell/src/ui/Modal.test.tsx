@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { Button } from "./Button";
+import { createRef } from "react";
 import { Modal } from "./Modal";
 
 describe("Modal", () => {
@@ -54,5 +55,46 @@ describe("Modal", () => {
   it("wears the size it was given", () => {
     render(<Modal open onOpenChange={() => {}} title="Form" size="md" />);
     expect(screen.getByRole("dialog").classList.contains("ui-modal-md")).toBe(true);
+  });
+
+  it("opens with focus on the first field, else the first footer button, else initialFocus", async () => {
+    const { unmount } = render(
+      <Modal open onOpenChange={() => {}} title="Form" footer={<Button>Save</Button>}>
+        <p>intro</p>
+        <input aria-label="Name" />
+        <input aria-label="Other" />
+      </Modal>,
+    );
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText("Name")));
+    unmount();
+
+    const second = render(
+      <Modal
+        open
+        onOpenChange={() => {}}
+        title="Ask"
+        footer={
+          <>
+            <Button>Cancel</Button>
+            <Button variant="danger-solid">Delete</Button>
+          </>
+        }
+      >
+        <p>Sure?</p>
+      </Modal>,
+    );
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" })));
+    second.unmount();
+
+    const ref = createRef<HTMLButtonElement>();
+    render(
+      <Modal open onOpenChange={() => {}} title="Pick" initialFocus={ref}>
+        <p>body</p>
+        <button type="button" ref={ref}>
+          Chosen
+        </button>
+      </Modal>,
+    );
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Chosen" })));
   });
 });

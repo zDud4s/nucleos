@@ -18,6 +18,10 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
+/// The event the tray's "Engage kill switch" item emits and `KillSwitchControl.tsx` listens to.
+/// `tray_kill_event_matches_the_shell` holds the two spellings equal.
+const KILL_ENGAGE_EVENT: &str = "kill://engage";
+
 /// Marker for "autostart has been decided once". Its EXISTENCE is the whole
 /// state: after the first launch the answer belongs to the user, whatever it is.
 const AUTOSTART_MARKER: &str = "autostart-initialised";
@@ -143,8 +147,10 @@ pub fn run() {
             // A tray icon is required wherever closing the window hides it: it is the way back to the
             // window and the way out of the app. On Linux closing exits instead (see CLOSE).
             let show_item = MenuItem::with_id(app, "show", "Show NucleOS", true, None::<&str>)?;
+            let kill_item =
+                MenuItem::with_id(app, "kill", "Engage kill switch", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let menu = Menu::with_items(app, &[&show_item, &kill_item, &quit_item])?;
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
@@ -154,6 +160,11 @@ pub fn run() {
                 .on_menu_event(|app, event| {
                     if event.id() == "show" {
                         show_main(app);
+                    } else if event.id() == "kill" {
+                        // The window first: the listener lives in the webview, which a hidden
+                        // window may not be running. The in-window control stays authoritative.
+                        show_main(app);
+                        let _ = app.emit(KILL_ENGAGE_EVENT, ());
                     } else if event.id() == "quit" {
                         app.exit(0);
                     }
@@ -490,5 +501,24 @@ mod tests {
                 assert!(hooks.contains(&kill), "hooks.nsh never runs: {kill}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    /// The tray's "Engage kill switch" item and the shell's listener must name the same event,
+    /// or the menu entry fires into nothing.
+    #[test]
+    fn tray_kill_event_matches_the_shell() {
+        let shell = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../src/app/KillSwitchControl.tsx"
+        ))
+        .expect("the shell's kill switch control is readable");
+        assert!(
+            shell.contains(super::KILL_ENGAGE_EVENT),
+            "KillSwitchControl.tsx must listen to {}",
+            super::KILL_ENGAGE_EVENT
+        );
     }
 }

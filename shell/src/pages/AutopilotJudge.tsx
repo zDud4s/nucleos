@@ -1,9 +1,13 @@
+import { useId, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
+  JUDGE_ENFORCE_DIALOG,
   JUDGE_RESIDUAL_RISK,
   READINESS_MIN_AGREE_PERCENT,
   READINESS_MIN_REVIEWED,
+  TYPESAFE_DEFINITION,
+  TYPESAFE_LEAVES,
   formatProbability,
   readJudgeBand,
   readJudgeOpinion,
@@ -17,7 +21,20 @@ import {
   type JudgeVerdict,
 } from "../data/autopilot";
 import type { ProjectSummary } from "../data/system";
-import { Badge, ConfirmButton, Count, ErrorNote, Inset, Panel, Quiet, RefusalNote, RelativeTime } from "../ui";
+import {
+  Badge,
+  Button,
+  ConfirmButton,
+  Count,
+  ErrorNote,
+  Inset,
+  Modal,
+  Panel,
+  Quiet,
+  RefusalNote,
+  RelativeTime,
+  Section,
+} from "../ui";
 
 /**
  * Spec A, on the Autopilot page: whether a model is asked about this project's tool calls, how
@@ -26,12 +43,68 @@ import { Badge, ConfirmButton, Count, ErrorNote, Inset, Panel, Quiet, RefusalNot
  * Every number is the núcleo's (`judge::readiness`); this file only shows them.
  */
 
-const MODES: { mode: JudgeMode; label: string; confirm: string }[] = [
-  { mode: "off", label: "Off", confirm: "Stop asking the judge" },
-  // D11: observing is opt-in because it sends each judged call off this machine.
-  { mode: "observe", label: "Observe", confirm: "Send each judged call to TypeSafe" },
-];
-const ENFORCE = { label: "Enforce", confirm: "Let the judge decide — I accept the risk above" };
+/** How the judge's three modes read on the switch: the project switch's verbs, one set for the page. */
+const MODE_LABEL: Record<JudgeMode, string> = {
+  off: "Turn off",
+  observe: "Watch in shadow",
+  enforce: "Let it act",
+};
+
+/** How the current mode reads in a sentence. The daemon's values (`off/observe/enforce`) are unchanged. */
+const MODE_NOW: Record<JudgeMode, string> = {
+  off: "off",
+  observe: "watching in shadow",
+  enforce: "acting",
+};
+
+/**
+ * A decision that deserves more than a second click: a real dialog, Cancel first and the
+ * consequential answer last. Cancel is the first footer button, so it is where focus lands.
+ * Used for the two changes that cost something outside the app: data leaving the machine, and
+ * a risk the owner accepts.
+ */
+export function DecisionDialog({
+  open,
+  onOpenChange,
+  title,
+  description,
+  confirmLabel,
+  confirmVariant,
+  onConfirm,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  title: string;
+  description: ReactNode;
+  confirmLabel: string;
+  confirmVariant: "approve" | "danger-solid";
+  onConfirm: () => void;
+}) {
+  return (
+    <Modal
+      open={open}
+      onOpenChange={onOpenChange}
+      title={title}
+      description={description}
+      footer={
+        <>
+          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button
+            variant={confirmVariant}
+            onClick={() => {
+              onOpenChange(false);
+              onConfirm();
+            }}
+          >
+            {confirmLabel}
+          </Button>
+        </>
+      }
+    />
+  );
+}
 
 export function JudgePanel({
   projectId,
@@ -42,10 +115,13 @@ export function JudgePanel({
 }) {
   const status = useJudgeStatus(projectId);
   const setJudge = useSetProjectJudge();
+  /** The change waiting on its dialog: only the two that cost something outside the app open one. */
+  const [asking, setAsking] = useState<"observe" | "enforce" | null>(null);
+  const prereqId = useId();
   if (projectId === null) {
     return (
       <Panel title="Judge">
-        <Quiet says="choose a project above." />
+        <Quiet says="Choose a project above." />
       </Panel>
     );
   }
@@ -53,21 +129,85 @@ export function JudgePanel({
   const readiness = status.data?.readiness;
   const active = project?.mode === "active";
   const enforceShut = !active || readiness?.ready !== true;
+  const busy = setJudge.isPending;
+  // What stands between the owner and the third segment, said under the control it locks.
+  const needs: string[] = [];
+  if (!active) needs.push("an active project");
+  if (readiness?.ready !== true) {
+    needs.push(
+      `${READINESS_MIN_REVIEWED} reviewed at ${READINESS_MIN_AGREE_PERCENT}% agreement` +
+        (readiness === undefined ? "" : ` (${readiness.reviewed} reviewed so far, ${readiness.agree} agreed)`),
+    );
+  }
+  const apply = (mode: JudgeMode) => setJudge.mutate({ project_id: projectId, judge: mode });
   return (
     <Panel title="Judge" aside={<span className="ap-project-name">{projectId}</span>}>
       <p className="ap-note">
-        A model asked about each tool call the classifier left open. Observing sends each such call
-        to TypeSafe and changes nothing; enforcing lets its answer stand, except for the classes
-        and guards it may refuse but never approve.
+        A model asked about each tool call the classifier left open. Watching in shadow sends each
+        such call to TypeSafe — {TYPESAFE_LEAVES} — and changes nothing; letting it act lets its
+        answer stand, except for the classes and guards it may refuse but never approve.{" "}
+        {TYPESAFE_DEFINITION}
       </p>
       {status.isError && status.data === undefined && (
-        <ErrorNote>the núcleo did not answer — nothing is known about the judge</ErrorNote>
+        <ErrorNote>The núcleo did not answer — nothing is known about the judge.</ErrorNote>
       )}
       {current !== undefined && (
         <p className="ap-reason">
-          The judge is <strong>{current}</strong> for {projectId}.
+          The judge is <strong>{MODE_NOW[current]}</strong> for {projectId}.
         </p>
       )}
+      <div className="ap-judge-control">
+        {/* One switch, the project switch's shape: the current mode is pressed, never disabled, and
+            a mode that is not open says why right under the control. */}
+        <div className="ui-switch" role="group" aria-label="Judge mode">
+          {current === "off" ? (
+            <button type="button" className="ui-switch-seg" aria-pressed>
+              {MODE_LABEL.off}
+            </button>
+          ) : (
+            <span className="ui-switch-seg-wrap">
+              <ConfirmButton
+                label={MODE_LABEL.off}
+                confirmLabel="Stop asking the judge"
+                variant="ghost"
+                disabled={busy}
+                onConfirm={() => apply("off")}
+              />
+            </span>
+          )}
+          <button
+            type="button"
+            className="ui-switch-seg"
+            aria-pressed={current === "observe"}
+            aria-disabled={busy ? "true" : undefined}
+            onClick={() => {
+              if (busy || current === "observe") return;
+              setAsking("observe");
+            }}
+          >
+            {MODE_LABEL.observe}
+          </button>
+          <button
+            type="button"
+            className="ui-switch-seg"
+            aria-pressed={current === "enforce"}
+            aria-disabled={busy || (enforceShut && current !== "enforce") ? "true" : undefined}
+            aria-describedby={enforceShut ? prereqId : "judge-residual-risk"}
+            onClick={() => {
+              if (busy || enforceShut || current === "enforce") return;
+              setAsking("enforce");
+            }}
+          >
+            {MODE_LABEL.enforce}
+          </button>
+        </div>
+        {enforceShut && (
+          <p id={prereqId} className="ap-reason">
+            Letting the judge act needs {needs.join(" and ")}.
+          </p>
+        )}
+      </div>
+      {setJudge.isError && <JudgeRefusal error={setJudge.error} />}
       {/* Review item E(i): the setting is photographed onto each run at launch (D2). */}
       <p className="ap-note">
         A change here reaches this project's next runs; runs already working keep the setting they
@@ -82,8 +222,8 @@ export function JudgePanel({
       {readiness !== undefined && (
         <>
           <p className="ap-note">
-            {readiness.reviewed} distinct actions reviewed, {readiness.agree} agreed — enforce needs{" "}
-            {READINESS_MIN_REVIEWED} at {READINESS_MIN_AGREE_PERCENT}%, on an active project.
+            {readiness.reviewed} distinct actions reviewed, {readiness.agree} agreed — letting it act
+            needs {READINESS_MIN_REVIEWED} at {READINESS_MIN_AGREE_PERCENT}%, on an active project.
           </p>
           {readiness.by_class.length > 0 && (
             <dl className="ap-decision-facts" aria-label="Agreement by class">
@@ -102,28 +242,24 @@ export function JudgePanel({
       <p className="ap-note" id="judge-residual-risk">
         {JUDGE_RESIDUAL_RISK}
       </p>
-      <div className="ap-actions">
-        {MODES.map(({ mode, label, confirm }) => (
-          <ConfirmButton
-            key={mode}
-            label={label}
-            confirmLabel={confirm}
-            variant="ghost"
-            disabled={setJudge.isPending || current === mode}
-            onConfirm={() => setJudge.mutate({ project_id: projectId, judge: mode })}
-          />
-        ))}
-        {/* Enforce is its own button so its danger is written where it is drawn. */}
-        <ConfirmButton
-          label={ENFORCE.label}
-          confirmLabel={ENFORCE.confirm}
-          variant="danger"
-          describedBy="judge-residual-risk"
-          disabled={setJudge.isPending || current === "enforce" || enforceShut}
-          onConfirm={() => setJudge.mutate({ project_id: projectId, judge: "enforce" })}
-        />
-      </div>
-      {setJudge.isError && <JudgeRefusal error={setJudge.error} />}
+      <DecisionDialog
+        open={asking === "observe"}
+        onOpenChange={(open) => !open && setAsking(null)}
+        title="Send this project's commands to TypeSafe?"
+        description={`${TYPESAFE_DEFINITION} If you continue, ${TYPESAFE_LEAVES}. The judge only watches: it changes nothing a run does.`}
+        confirmLabel={MODE_LABEL.observe}
+        confirmVariant="approve"
+        onConfirm={() => apply("observe")}
+      />
+      <DecisionDialog
+        open={asking === "enforce"}
+        onOpenChange={(open) => !open && setAsking(null)}
+        title={`Let the judge approve commands for ${projectId}?`}
+        description={`${JUDGE_ENFORCE_DIALOG} Turning this on accepts that risk for this project.`}
+        confirmLabel={MODE_LABEL.enforce}
+        confirmVariant="danger-solid"
+        onConfirm={() => apply("enforce")}
+      />
     </Panel>
   );
 }
@@ -151,12 +287,17 @@ export function JudgeReviewPanel({ projectId }: { projectId: string | null }) {
   const verdicts = useJudgeVerdicts(projectId);
   const answer = useSetJudgeVerdict();
   const rows = verdicts.data ?? [];
+  // An empty queue is a quiet line, like the other review panels, not a panel with a zero in it.
+  if (projectId !== null && verdicts.data !== undefined && rows.length === 0) {
+    return (
+      <Section label="Judge verdicts">
+        <Quiet says="No verdict of the judge is waiting for you." />
+      </Section>
+    );
+  }
   return (
     <Panel title="Judge verdicts" aside={<Count n={projectId === null ? undefined : rows.length} />}>
-      {projectId === null && <Quiet says="choose a project above." />}
-      {projectId !== null && verdicts.data !== undefined && rows.length === 0 && (
-        <Quiet says="no verdict of the judge is waiting for you." />
-      )}
+      {projectId === null && <Quiet says="Choose a project above." />}
       {rows.length > 0 && (
         <ul className="ap-list" aria-label="Judge verdicts">
           {rows.map((verdict) => (

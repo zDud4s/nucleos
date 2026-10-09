@@ -408,6 +408,12 @@ const SHOTS_TO_TAKE = [
   /* The governance cockpit: the fan first under the header, and the brakes whose columns have to
      line up from row to row — a thing only a stylesheet can get wrong. */
   ["09h-autopilot", { path: "/autopilot" }],
+  ["09n-autopilot-light", { path: "/autopilot", theme: "light" }],
+  /* The first screen and the fleet, both themes: their stat cards and meters carry the threshold cue. */
+  ["09j-home", { path: "/" }],
+  ["09k-home-light", { path: "/", theme: "light" }],
+  ["09l-fleet", { path: "/fleet" }],
+  ["09m-fleet-light", { path: "/fleet", theme: "light" }],
   /* A run still going: the stage row centred over the page, and the live tail read as events
      rather than as the stream-json it arrives in. */
   ["09i-run-live", { path: "/runs/2" }],
