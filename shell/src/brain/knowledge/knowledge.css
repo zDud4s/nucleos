@@ -38,6 +38,12 @@
   margin-top: var(--space-4);
 }
 
+/* The Memory section sits under a form on the agent editor and the Charter; it
+   keeps its own distance rather than leaning on the form's last note. */
+.learned-memory {
+  margin-top: var(--space-4);
+}
+
 .learned-group-head {
   display: flex;
   align-items: center;

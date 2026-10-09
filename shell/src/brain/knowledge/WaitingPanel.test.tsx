@@ -255,4 +255,49 @@ describe("WaitingPanel - scope chooser", () => {
     fireEvent.change(id, { target: { value: "nucleos" } });
     expect(approve.hasAttribute("disabled")).toBe(false);
   });
+
+  it("scope chooser clears the id when the kind moves off the declared one", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({
+          id: 1,
+          status: "proposed",
+          proposal_id: 11,
+          scope_kind: "project",
+          scope_id: "nucleos",
+        }),
+      ]),
+    );
+
+    await renderWaiting();
+    const kind = await screen.findByRole("combobox", { name: "Approve into" });
+    const approve = screen.getByRole("button", { name: "Approve" });
+
+    fireEvent.change(kind, { target: { value: "agent" } });
+    expect((screen.getByRole("textbox", { name: "Scope id" }) as HTMLInputElement).value).toBe("");
+    expect(approve.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(approve);
+    expect(posts()).toEqual([]);
+
+    fireEvent.change(kind, { target: { value: "project" } });
+    expect((screen.getByRole("textbox", { name: "Scope id" }) as HTMLInputElement).value).toBe(
+      "nucleos",
+    );
+    expect(approve.hasAttribute("disabled")).toBe(false);
+  });
+
+  it("scope chooser names the row it decides", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({ id: 1, status: "proposed", proposal_id: 11, title: "First lesson" }),
+        known({ id: 2, status: "proposed", proposal_id: 12, title: "Second lesson" }),
+      ]),
+    );
+
+    await renderWaiting();
+    const first = await screen.findByRole("group", { name: "Scope for First lesson" });
+    const second = screen.getByRole("group", { name: "Scope for Second lesson" });
+    expect(first.querySelector("select")).not.toBeNull();
+    expect(second.querySelector("select")).not.toBeNull();
+  });
 });

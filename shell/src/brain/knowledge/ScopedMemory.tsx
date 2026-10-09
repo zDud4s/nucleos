@@ -46,7 +46,7 @@ export function ScopedMemory({ scopeKind, scopeId }: ScopedMemoryProps) {
   }
 
   return (
-    <section className="learned-group" aria-label="Memory">
+    <section className="learned-group learned-memory" aria-label="Memory">
       <h3>Memory</h3>
       {body}
     </section>

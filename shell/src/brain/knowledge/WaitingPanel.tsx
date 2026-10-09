@@ -127,6 +127,7 @@ export function WaitingPanel({ rows }: WaitingPanelProps) {
                       ) : (
                         <RowDecisions
                           proposalId={row.proposal_id}
+                          title={row.title}
                           declaredKind={row.scope_kind}
                           declaredId={row.scope_id}
                           approve={approve}
@@ -152,9 +153,12 @@ export function WaitingPanel({ rows }: WaitingPanelProps) {
  * The kind starts at the row's declared one when that can be approved with an
  * id, and at "as declared" otherwise (a machine row has no id to give); with
  * "as declared" the approval carries no scope and the daemon keeps the row's own.
+ * Moving to another kind empties the id: the declared id names something of the
+ * declared kind, and carried across it would approve into a scope nobody chose.
  */
 function RowDecisions({
   proposalId,
+  title,
   declaredKind,
   declaredId,
   approve,
@@ -162,6 +166,7 @@ function RowDecisions({
   deciding,
 }: {
   proposalId: number;
+  title: string;
   declaredKind: Known["scope_kind"];
   declaredId: string | null;
   approve: { mutate: (input: ApproveInput) => void };
@@ -175,11 +180,15 @@ function RowDecisions({
 
   return (
     <>
-      <span className="learned-scope-chooser">
+      <span className="learned-scope-chooser" role="group" aria-label={`Scope for ${title}`}>
         <select
           aria-label="Approve into"
           value={kind}
-          onChange={(event) => setKind(event.target.value)}
+          onChange={(event) => {
+            const next = event.target.value;
+            setKind(next);
+            setId(next === declaredKind ? (declaredId ?? "") : "");
+          }}
           disabled={deciding}
         >
           {!declaredApprovable && <option value="">as declared</option>}
