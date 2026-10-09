@@ -15,6 +15,14 @@ beforeEach(() => {
   daemon.apiFetch.mockReset();
 });
 
+/**
+ * The spend meter row. Spend is a ceiling, so the redesign draws it as a full-width labelled
+ * meter row linking to /system, not as a fourth StatCard (no `article`).
+ */
+async function spendRow(): Promise<HTMLElement> {
+  return await screen.findByRole("link", { name: /^Spend/ });
+}
+
 /** The card with this label, once its query has landed. */
 async function card(label: string): Promise<HTMLElement> {
   return await screen.findByRole("article", { name: label });
@@ -48,13 +56,15 @@ describe("Home", () => {
     expect((await card("Waiting on you")).textContent).toContain(
       "decisions held for you — not records, and not the calendar",
     );
-    expect(within(await card("Window spend")).getByText("$1.42")).toBeDefined();
+    const spend = await spendRow();
+    expect(within(spend).getByText(/\$1\.42/)).toBeDefined();
+    expect(spend.getAttribute("href")).toBe("/system");
 
-    // Five now, and the fifth is not a fifth reading of §6.1: "Subsystems healthy" is
+    // Four cards now plus the spend meter row (not an article): "Subsystems healthy" is
     // System's own headline, on the first screen because that is where somebody finds out
-    // a subsystem is down. The four above are still the four, and still say what §6.1
+    // a subsystem is down. The readings of §6.1 are still all there and still say what §6.1
     // says they say.
-    expect(screen.getAllByRole("article")).toHaveLength(5);
+    expect(screen.getAllByRole("article")).toHaveLength(4);
   });
 
   it("the headline counts the whole waiting queue", async () => {
@@ -80,11 +90,9 @@ describe("Home", () => {
     expect((await card("Waiting on you")).textContent).toContain(
       "decisions held for you — not records, and not the calendar",
     );
-    const door = screen
-      .getAllByRole("link", { name: "Waiting" })
-      .find((link) => link.closest("p") !== null)
-      ?.closest("p");
-    expect(door?.textContent).toContain("every decision that stopped to ask you something, in one queue");
+    // The card is itself the door to the queue; the separate "Where to look next" sentence was
+    // removed by the redesign.
+    expect(screen.getByRole("link", { name: "Waiting on you" }).getAttribute("href")).toBe("/waiting");
   });
 
   it("reads an absent ceiling as no ceiling, never as zero", async () => {
@@ -94,7 +102,7 @@ describe("Home", () => {
 
     await renderWithRouter(<Home />);
 
-    const spend = await card("Window spend");
+    const spend = await spendRow();
     // `null` means nothing will ever stop the spend; `0.00` means nothing will
     // ever run. Rendering the first as the second invents a policy nobody set.
     expect(within(spend).getByText(/no ceiling/)).toBeDefined();
@@ -106,18 +114,19 @@ describe("Home", () => {
       daemonFetch(daemonState({ budget: { ...daemonState().budget, window_spend_usd: 4.1, limit_usd: 5 } })),
     );
     const first = await renderWithRouter(<Home />);
-    const spend = await card("Window spend");
+    const spend = await spendRow();
     const fill = spend.querySelector(".ui-gauge-fill") as HTMLElement;
     expect(fill.style.width).toBe("82%");
     expect(spend.querySelector(".ui-gauge")?.className).toContain("ui-gauge-quantity");
-    expect(spend.querySelector(".ui-gauge-head")).toBeNull();
+    // The head (label and "$4.10 / $5.00") is now part of the row, not written beside it.
+    expect(spend.querySelector(".ui-gauge-head")?.textContent).toContain("$4.10 / $5.00");
     first.unmount();
 
     daemon.apiFetch.mockImplementation(
       daemonFetch(daemonState({ budget: { ...daemonState().budget, limit_usd: null } })),
     );
     await renderWithRouter(<Home />);
-    expect((await card("Window spend")).querySelector(".ui-gauge")).toBeNull();
+    expect((await spendRow()).querySelector(".ui-gauge-fill")).toBeNull();
   });
 
   it("shows an em dash rather than a zero while nothing has been read", async () => {
@@ -127,9 +136,10 @@ describe("Home", () => {
 
     await renderWithRouter(<Home />);
 
-    for (const label of ["Projects", "Shadow decisions pending", "Waiting on you", "Window spend"]) {
+    for (const label of ["Projects", "Shadow decisions pending", "Waiting on you"]) {
       expect(within(await card(label)).getByText("—")).toBeDefined();
     }
+    expect(within(await spendRow()).getByText("—")).toBeDefined();
   });
 
   it("says out loud when a ceiling is holding autonomous work", async () => {
@@ -169,14 +179,15 @@ describe("Home", () => {
     // which one, and the answer is three words long — so the sentence says it, and the
     // sentence is the way there.
     const door = await screen.findByRole("link", {
-      name: /1 subsystem down \(browser_sidecar\), 1 degraded/,
+      // The redesign writes subsystems as a person would: `browser_sidecar` -> "browser".
+      name: /1 subsystem down \(browser\), 1 degraded/,
     });
     expect(door.getAttribute("href")).toBe("/system");
 
     // The waiting clause is still appended to it: the worst fact leads the sentence, it
     // does not replace it.
     expect(door.closest("p")?.textContent).toBe(
-      "1 subsystem down (browser_sidecar), 1 degraded; nothing waiting on you",
+      "1 subsystem down (browser), 1 degraded; nothing waiting on you",
     );
 
     /*
@@ -231,7 +242,7 @@ describe("Home", () => {
     expect(card_.querySelector(".ui-stat-detail .ui-wrong")).not.toBeNull();
   });
 
-  it("an all-clear keeps the mode sentence and all five cards", async () => {
+  it("an all-clear keeps the mode sentence and all four cards and the spend row", async () => {
     const answer = daemonFetch(
       daemonState({
         projects: [
@@ -262,7 +273,8 @@ describe("Home", () => {
 
     // And the cards do not recede. A card that appeared only when something was wrong
     // would teach the reader that an absent card is an absent fact.
-    expect(screen.getAllByRole("article")).toHaveLength(5);
+    expect(screen.getAllByRole("article")).toHaveLength(4);
+    await spendRow();
 
     // Nor does the healthy card wear the tone. A figure that is always red says nothing
     // when something actually goes wrong.
@@ -284,7 +296,8 @@ describe("Home", () => {
     // would be acting on. A control here would be pressed by somebody looking at
     // the state of five seconds ago.
     expect(screen.queryAllByRole("button")).toHaveLength(0);
-    expect(screen.getByRole("link", { name: /Autopilot/ })).toBeDefined();
-    expect(screen.getByRole("link", { name: /Waiting/ })).toBeDefined();
+    // Each reading is a link to its page (no more "Where to look next").
+    expect(screen.getByRole("link", { name: "Shadow decisions pending" }).getAttribute("href")).toBe("/autopilot");
+    expect(screen.getByRole("link", { name: "Waiting on you" }).getAttribute("href")).toBe("/waiting");
   });
 });

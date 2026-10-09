@@ -1052,6 +1052,7 @@ function rules(overrides: Partial<ProjectRules>): ProjectRules {
     gate_command: null,
     gate_before_publish: false,
     ide_verify: false,
+    postgate: null,
     judge: { state: "default" },
     schedules: [],
     repo_triggers: [],
@@ -1070,6 +1071,19 @@ const ALPHA_RULES: ProjectRules = rules({
   gate_before_publish: true,
   wip_limit: 4,
   open_review_items: 3,
+  postgate: {
+    target: "main",
+    last_green: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    running: null,
+    red_groups: ["core"],
+    red_since: "b2c3d4e5f60718293a4b5c6d7e8f90123456789a",
+    red_sha: "c3d4e5f60718293a4b5c6d7e8f90123456789abc",
+    red_base: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    phase: null,
+    culprit: "b2c3d4e5f60718293a4b5c6d7e8f90123456789a",
+    candidates: [],
+    also_suspect: [],
+  },
   schedules: [
     {
       name: "nightly-tidy",

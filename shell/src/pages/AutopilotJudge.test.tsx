@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
@@ -48,7 +48,11 @@ describe("the judge's panel", () => {
     expect(await screen.findByText(/9 distinct actions reviewed, 9 agreed/)).toBeDefined();
     expect(screen.getByText("unrecognized")).toBeDefined();
     expect(screen.getByText(JUDGE_RESIDUAL_RISK)).toBeDefined();
-    expect((screen.getByRole("button", { name: "Enforce" }) as HTMLButtonElement).disabled).toBe(true);
+    // The switch segment stays focusable and inert (aria-disabled), and a click opens no dialog.
+    const enforce = screen.getByRole("button", { name: "Let it act" });
+    expect(enforce.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(enforce);
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("says when the project's rules cannot be read, and that a change reaches only its next runs", async () => {
@@ -67,9 +71,11 @@ describe("the judge's panel", () => {
       initialPath: "/autopilot",
     });
 
-    fireEvent.click(await screen.findByRole("button", { name: "Observe" }));
-    await waitPastTheDwell();
-    fireEvent.click(screen.getByRole("button", { name: /Send each judged call to TypeSafe/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Watch in shadow" }));
+    // Data leaves the machine, so the change is confirmed in a dialog, never by the switch alone.
+    const dialog = await screen.findByRole("dialog");
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/autopilot/judge", expect.anything());
+    fireEvent.click(within(dialog).getByRole("button", { name: "Watch in shadow" }));
 
     await waitFor(() =>
       expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/judge", {

@@ -2,9 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 
@@ -101,6 +102,34 @@ pub fn timezone_named(name: Option<&str>) -> Result<Tz, String> {
     }
 }
 
+/// PURE: the instant a one-shot rule fires at, `None` when the rule has no `at:`.
+///
+/// ISO 8601 with an offset is taken as written; a naive `YYYY-MM-DDTHH:MM[:SS]` is read in the
+/// rule's own zone (UTC when absent). An error is returned, not guessed around, so the arming
+/// check can announce it once.
+pub fn at_instant(rule: &ScheduleRule) -> Option<Result<DateTime<Utc>, String>> {
+    let at = rule.at.as_deref()?;
+    let at = at.trim();
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(at) {
+        return Some(Ok(parsed.with_timezone(&Utc)));
+    }
+    let naive = NaiveDateTime::parse_from_str(at, "%Y-%m-%dT%H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(at, "%Y-%m-%dT%H:%M"));
+    let Ok(naive) = naive else {
+        return Some(Err(format!("'{at}' is not an ISO 8601 date-time")));
+    };
+    let zone = match rule_timezone(rule) {
+        Ok(zone) => zone,
+        Err(error) => return Some(Err(error)),
+    };
+    Some(
+        zone.from_local_datetime(&naive)
+            .earliest()
+            .map(|local| local.with_timezone(&Utc))
+            .ok_or_else(|| format!("'{at}' does not exist in {zone}")),
+    )
+}
+
 /// PURE: when a rule fires next after `since`, or why it never will.
 ///
 /// The same parse, the same zone handling and the same anchor as `due_rules` — deliberately, because
@@ -112,6 +141,16 @@ pub fn timezone_named(name: Option<&str>) -> Result<Tz, String> {
 /// therefore invisible: the rule simply never runs, and nothing anywhere says so. Returned here, it
 /// becomes something a person can read.
 pub fn next_fire(rule: &ScheduleRule, since: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+    if let Some(at) = at_instant(rule) {
+        let at = at?;
+        return if at > since {
+            Ok(at)
+        } else {
+            Err(format!(
+                "a one-shot rule fires at most once; its at ({at}) is not after {since}"
+            ))
+        };
+    }
     next_occurrence(&rule.cron, rule.timezone.as_deref(), since)
 }
 
@@ -150,6 +189,24 @@ pub fn due_rules<'a>(
     rules
         .iter()
         .filter_map(|rule| {
+            // A one-shot rule: due while armed before its instant and the instant has passed. The
+            // claim stamps `last_fired_at = now >= at`, so it can never be due again.
+            if let Some(at) = at_instant(rule) {
+                let at = match at {
+                    Ok(at) => at,
+                    Err(error) => {
+                        tracing::debug!(
+                            rule_name = %rule.name,
+                            error = %error,
+                            "skipping a one-shot schedule rule with an unreadable at"
+                        );
+                        return None;
+                    }
+                };
+                let last = last_fired.get(&rule.name)?;
+                return (*last < at && at <= now).then_some((rule, at));
+            }
+
             let cron = match rule.cron.parse::<Cron>() {
                 Ok(cron) => cron,
                 // Debug, not warn: this runs every 30 seconds for as long as the rule exists, and
@@ -326,6 +383,258 @@ async fn start_job(
         },
     )
     .await
+}
+
+/// How much of a command's output is kept on `scheduler_state` and shown in the rules view.
+const COMMAND_OUTPUT_TAIL_BYTES: usize = 4096;
+
+/// The `(project root, project, rule)` triples whose command is running right now. In memory on
+/// purpose: it dies with the daemon, and so do the children (`kill_on_drop` plus the process-tree
+/// killer), so there is nothing a restart could leave stale. The root is part of the key so that two
+/// independent daemons (or test states) in one process never share a slot, while one daemon still
+/// holds exactly one slot per rule.
+static COMMANDS_IN_FLIGHT: OnceLock<Mutex<HashSet<(String, String, String)>>> = OnceLock::new();
+
+fn in_flight() -> std::sync::MutexGuard<'static, HashSet<(String, String, String)>> {
+    COMMANDS_IN_FLIGHT
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn command_in_flight(project_root: &str, project_id: &str, rule_name: &str) -> bool {
+    in_flight().contains(&(
+        project_root.to_string(),
+        project_id.to_string(),
+        rule_name.to_string(),
+    ))
+}
+
+/// Holds a rule's slot in [`COMMANDS_IN_FLIGHT`] and gives it back however the task ends.
+struct InFlight((String, String, String));
+
+impl InFlight {
+    /// `None` when the rule's command is already running.
+    fn take(project_root: &str, project_id: &str, rule_name: &str) -> Option<Self> {
+        let key = (
+            project_root.to_string(),
+            project_id.to_string(),
+            rule_name.to_string(),
+        );
+        in_flight().insert(key.clone()).then_some(Self(key))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        in_flight().remove(&self.0);
+    }
+}
+
+/// The last `max` bytes of `text`, moved forward to a character boundary.
+fn tail_of(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+/// Writes a command rule's outcome onto its `scheduler_state` row.
+async fn record_command_result(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    rule_name: &str,
+    outcome: &str,
+    exit_code: Option<i64>,
+    output: &str,
+) {
+    let output = crate::redact::redact_secrets(output);
+    // Redact the whole output first, then cut: a secret straddling the cut would otherwise leave
+    // its in-tail suffix too short for the redactor to recognise.
+    let output = tail_of(&output, COMMAND_OUTPUT_TAIL_BYTES);
+    if let Err(error) = sqlx::query(
+        "UPDATE scheduler_state
+         SET command_outcome = ?, command_exit_code = ?, command_output = ?, command_ended_at = ?
+         WHERE project_id = ? AND rule_name = ?",
+    )
+    .bind(outcome)
+    .bind(exit_code)
+    .bind(output)
+    .bind(Utc::now().to_rfc3339())
+    .bind(project_id)
+    .bind(rule_name)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(
+            project_id = %project_id,
+            rule_name = %rule_name,
+            %error,
+            "failed to record a scheduled command's result"
+        );
+    }
+}
+
+/// Judges a `command:` rule's command, then runs it on a spawned task so the tick never waits on
+/// it. No agent run and no job is created. The window is already claimed when this is called.
+///
+/// Refused unless the classifier says `allow`: the project's shell rules are the owner's lever for
+/// a script the classifier does not know, and an unreadable rules table refuses too.
+async fn fire_command(
+    state: &AppState,
+    project_id: &str,
+    project_root: &str,
+    rule: &ScheduleRule,
+    command: &str,
+    catch_up: bool,
+    late: chrono::Duration,
+) {
+    let cwd = match rule.cwd.as_deref() {
+        Some(relative) => Path::new(project_root).join(relative),
+        None => Path::new(project_root).to_path_buf(),
+    };
+    let lateness = if catch_up {
+        format!(" (catch-up, {} late)", humanize_lateness(late))
+    } else {
+        String::new()
+    };
+
+    let refusal = match crate::project_policy::shell_rules(&state.pool, project_id).await {
+        Ok(rules) => {
+            let judged = crate::classifier::classify(
+                "Bash",
+                &serde_json::json!({ "command": command }),
+                Some(&cwd),
+                &crate::github::Policy::empty(),
+                &rules,
+                crate::classifier::Unrecognized::AsksAPerson,
+            );
+            if judged.decision.decision == "allow" {
+                None
+            } else {
+                Some((
+                    judged.action_class.to_string(),
+                    format!(
+                        "{}/{}: {}",
+                        judged.decision.decision, judged.action_class, judged.reason
+                    ),
+                ))
+            }
+        }
+        Err(error) => Some((
+            "unreadable-shell-rules".to_string(),
+            format!("the project's shell rules could not be read: {error}"),
+        )),
+    };
+    if let Some((action_class, detail)) = refusal {
+        record_command_result(
+            &state.pool,
+            project_id,
+            &rule.name,
+            "refused",
+            None,
+            &detail,
+        )
+        .await;
+        let _ = crate::feed::append(
+            &state.pool,
+            Some(project_id),
+            "command_finished",
+            &format!(
+                "scheduled command '{}' was refused ({action_class}) and did not run{lateness}; \
+                 to let it run unattended, declare it allowed for this project \
+                 (POST /projects/{project_id}/shell-rules)",
+                rule.name
+            ),
+            None,
+            None,
+        )
+        .await;
+        return;
+    }
+
+    // Built BEFORE the task and moved into it, so the slot is released however the task ends.
+    let Some(guard) = InFlight::take(project_root, project_id, &rule.name) else {
+        tracing::info!(
+            project_id = %project_id,
+            rule_name = %rule.name,
+            "a scheduled command is still running; not starting it again"
+        );
+        return;
+    };
+    let pool = state.pool.clone();
+    let project_id = project_id.to_string();
+    let rule_name = rule.name.clone();
+    let command = command.to_string();
+    tokio::spawn(async move {
+        let _guard = guard;
+        let (outcome, exit_code, output, summary) = match crate::gate::split_command(&command) {
+            Err(error) => (
+                "errored",
+                None,
+                error.clone(),
+                format!("could not be measured: {error}"),
+            ),
+            Ok(words) => {
+                let ran = crate::gate::run_argv(
+                    &words,
+                    &cwd,
+                    &[],
+                    crate::project_commands::COMMAND_TIMEOUT,
+                )
+                .await;
+                if ran.timed_out {
+                    (
+                        "errored",
+                        None,
+                        format!(
+                            "timed out after {} seconds\n{}",
+                            crate::project_commands::COMMAND_TIMEOUT.as_secs(),
+                            ran.tail
+                        ),
+                        "could not be measured: it timed out".to_string(),
+                    )
+                } else if let Some(error) = ran.error {
+                    (
+                        "errored",
+                        None,
+                        error.clone(),
+                        format!("could not be measured: {error}"),
+                    )
+                } else {
+                    match ran.exit_code {
+                        Some(0) => ("passed", Some(0), ran.tail, "passed".to_string()),
+                        Some(code) => (
+                            "failed",
+                            Some(i64::from(code)),
+                            ran.tail,
+                            format!("failed with exit {code}"),
+                        ),
+                        None => (
+                            "errored",
+                            None,
+                            format!("killed by a signal\n{}", ran.tail),
+                            "could not be measured: it was killed by a signal".to_string(),
+                        ),
+                    }
+                }
+            }
+        };
+        record_command_result(&pool, &project_id, &rule_name, outcome, exit_code, &output).await;
+        let _ = crate::feed::append(
+            &pool,
+            Some(&project_id),
+            "command_finished",
+            &format!("scheduled command '{rule_name}' {summary}{lateness}"),
+            None,
+            None,
+        )
+        .await;
+    });
 }
 
 pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
@@ -574,12 +883,23 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
             // comes due, so the only sign of a typo was a `warn!` every 30 seconds for as long as
             // the rule existed — which is the same as no sign at all, in a log nobody is watching
             // while they wonder why their automation stopped. The feed is where a person looks.
-            let unreadable = rule
-                .cron
-                .parse::<Cron>()
-                .err()
-                .map(|error| format!("an unreadable cron ({}): {error}", rule.cron))
-                .or_else(|| rule_timezone(rule).err());
+            let unreadable = match rule.at.as_deref() {
+                // A one-shot whose instant is already behind us cannot be told apart from a typo,
+                // and firing it "now" could replay something the owner meant for last week.
+                Some(at) => match at_instant(rule) {
+                    Some(Err(error)) => Some(format!("an unreadable at ({error})")),
+                    Some(Ok(instant)) if instant <= now => {
+                        Some(format!("an at already in the past ({at})"))
+                    }
+                    _ => None,
+                },
+                None => rule
+                    .cron
+                    .parse::<Cron>()
+                    .err()
+                    .map(|error| format!("an unreadable cron ({}): {error}", rule.cron)),
+            }
+            .or_else(|| rule_timezone(rule).err());
             if let Some(problem) = unreadable {
                 let _ = crate::feed::append(
                     &state.pool,
@@ -597,14 +917,21 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
 
             // Armed regardless, so this branch runs once rather than every tick. A rule that cannot
             // be read is still a rule the user wrote, and forgetting it would only mean announcing
-            // it again in 30 seconds.
+            // it again in 30 seconds. A one-shot whose `at` was already behind us is armed AT that
+            // instant rather than at `now`: `last_fired_at == at` is never due (due needs
+            // `last < at`) and, unlike `now`, still tells it apart from a rule that fired (the
+            // claim stamps a time after `at`), so the rules view can say it never fires.
+            let armed_at = match at_instant(rule) {
+                Some(Ok(instant)) if instant <= now => instant,
+                _ => now,
+            };
             if let Err(error) = sqlx::query(
                 "INSERT INTO scheduler_state (project_id, rule_name, last_fired_at, last_head_sha)
                  VALUES (?, ?, ?, ?)",
             )
             .bind(&project_id)
             .bind(&rule.name)
-            .bind(now.to_rfc3339())
+            .bind(armed_at.to_rfc3339())
             .bind(head_sha.as_deref())
             .execute(&state.pool)
             .await
@@ -634,6 +961,16 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                     project_id = %project_id,
                     rule_name = %rule.name,
                     "duplicate schedule rule name suppressed within scheduler tick"
+                );
+                continue;
+            }
+            // Before the claim, so a still-running command spends no window: the next tick sees it
+            // due again and asks again.
+            if rule.command.is_some() && command_in_flight(&project_root, &project_id, &rule.name) {
+                tracing::info!(
+                    project_id = %project_id,
+                    rule_name = %rule.name,
+                    "a scheduled command is still running; not starting it again"
                 );
                 continue;
             }
@@ -757,6 +1094,23 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                     );
                     continue;
                 }
+            }
+
+            // A `command:` rule starts no agent: it is judged, then run as an argv with a timeout.
+            // The mode match above already skipped Off; a command ignores `cwd:`'s shadow meaning
+            // (it is resolved against the project root inside `fire_command`) and `run_mode`.
+            if let Some(command) = rule.command.as_deref() {
+                fire_command(
+                    state,
+                    &project_id,
+                    &project_root,
+                    rule,
+                    command,
+                    catch_up,
+                    now.signed_duration_since(due_at),
+                )
+                .await;
+                continue;
             }
 
             // A rule with a `graph:` block starts a job instead of a run — but only when the run it
@@ -1472,6 +1826,298 @@ mod tests {
         assert_eq!(runs, 0, "an unreadable rule must not fire either");
     }
 
+    /// Seeds a project whose only rule is the one-shot `rule_yaml` (named `once`). `armed` is the
+    /// `scheduler_state.last_fired_at` the rule was armed with; `None` leaves no row, as for a rule
+    /// the scheduler has never seen.
+    async fn seed_one_shot(
+        state: &AppState,
+        project_root: &FsPath,
+        mode: &str,
+        rule_yaml: &str,
+        armed: Option<&str>,
+    ) {
+        write_rules(state, "proj", &format!("schedules:\n{rule_yaml}"));
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('proj', ?, ?)",
+        )
+        .bind(mode)
+        .bind(project_root.to_string_lossy().as_ref())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        if let Some(armed) = armed {
+            sqlx::query(
+                "INSERT INTO scheduler_state (project_id, rule_name, last_fired_at)
+                 VALUES ('proj', 'once', ?)",
+            )
+            .bind(armed)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    const ONE_SHOT_PROMPT: &str =
+        "  - name: once\n    at: '2026-07-18T10:05:00Z'\n    prompt: go\n";
+
+    /// `last_fired_at` is the whole memory of a one-shot: the claim stamps it at or after `at`, and
+    /// `scheduler_tick` is called again with no loop state, which is what a restart looks like.
+    #[tokio::test]
+    async fn a_one_shot_rule_fires_once_and_a_restart_does_not_fire_it_again() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let (state, _home) = test_state(None).await;
+        seed_one_shot(
+            &state,
+            project.path(),
+            "shadow",
+            ONE_SHOT_PROMPT,
+            Some(&timestamp("2026-07-18T10:00:00Z").to_rfc3339()),
+        )
+        .await;
+
+        scheduler_tick(&state, timestamp("2026-07-18T10:06:00Z")).await;
+        assert_eq!(run_count(&state).await, 1, "the instant passed: it fires");
+
+        scheduler_tick(&state, timestamp("2026-07-18T10:07:00Z")).await;
+        scheduler_tick(&state, timestamp("2026-07-19T10:07:00Z")).await;
+        assert_eq!(
+            run_count(&state).await,
+            1,
+            "a one-shot never fires a second time, whatever the later ticks"
+        );
+    }
+
+    /// The daemon was down across the instant: the first tick after it starts runs the rule late,
+    /// and an active project is demoted to a plan-only catch-up exactly as a missed cron window is.
+    #[tokio::test]
+    async fn a_missed_one_shot_fires_on_the_first_tick_after_start_as_a_catch_up() {
+        let project = tempfile::tempdir().expect("create active project");
+        let (state, _home) = test_state(None).await;
+        seed_one_shot(
+            &state,
+            project.path(),
+            "active",
+            ONE_SHOT_PROMPT,
+            Some(&timestamp("2026-07-18T10:00:00Z").to_rfc3339()),
+        )
+        .await;
+
+        scheduler_tick(&state, timestamp("2026-07-18T14:00:00Z")).await;
+
+        assert_eq!(run_count(&state).await, 1);
+        let (mode, prompt): (String, String) = sqlx::query_as("SELECT mode, prompt FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "shadow", "a catch-up may only propose");
+        assert!(prompt.contains("CATCH-UP"), "got: {prompt}");
+        assert!(prompt.ends_with("go"), "got: {prompt}");
+    }
+
+    /// An `at` that is already behind us when the rule is first seen cannot be told apart from a
+    /// typo, so it is reported once where a person looks and never fires.
+    #[tokio::test]
+    async fn an_at_already_past_when_first_seen_is_reported_and_never_fires() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let (state, _home) = test_state(None).await;
+        seed_one_shot(
+            &state,
+            project.path(),
+            "shadow",
+            "  - name: once\n    at: '2026-07-18T09:00:00Z'\n    prompt: go\n",
+            None,
+        )
+        .await;
+
+        for time in ["10:00:00", "10:01:00", "10:02:00"] {
+            scheduler_tick(&state, timestamp(&format!("2026-07-18T{time}Z"))).await;
+        }
+
+        let entries: Vec<String> = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE kind = 'schedule_rule_invalid' ORDER BY id",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(entries.len(), 1, "once, not once per tick: {entries:?}");
+        assert!(entries[0].contains("once"), "{}", entries[0]);
+        assert!(entries[0].contains("never fire"), "{}", entries[0]);
+        assert_eq!(run_count(&state).await, 0, "a past at must not fire");
+    }
+
+    /// Polls `command_ended_at` because the command runs on a spawned task, not inside the tick.
+    async fn wait_for_command_result(
+        state: &AppState,
+    ) -> (Option<String>, Option<i64>, Option<String>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let row: (Option<String>, Option<i64>, Option<String>, Option<String>) =
+                sqlx::query_as(
+                    "SELECT command_outcome, command_exit_code, command_output, command_ended_at
+                 FROM scheduler_state WHERE project_id = 'proj' AND rule_name = 'once'",
+                )
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if row.3.is_some() {
+                return (row.0, row.1, row.2);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scheduled command never recorded a result"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    const ONE_SHOT_COMMAND: &str =
+        "  - name: once\n    at: '2026-07-18T10:05:00Z'\n    command: git --version\n";
+
+    /// A command rule starts no agent: no `runs` row, and its result is what the rules view shows.
+    #[tokio::test]
+    async fn a_command_rule_runs_without_creating_an_agent_run() {
+        let container = space_free_tempdir("nucleos-scheduler-command-");
+        let (state, _home) = test_state(None).await;
+        seed_one_shot(
+            &state,
+            container.path(),
+            "shadow",
+            ONE_SHOT_COMMAND,
+            Some(&timestamp("2026-07-18T10:00:00Z").to_rfc3339()),
+        )
+        .await;
+
+        scheduler_tick(&state, timestamp("2026-07-18T10:06:00Z")).await;
+
+        let (outcome, exit_code, output) = wait_for_command_result(&state).await;
+        assert_eq!(outcome.as_deref(), Some("passed"));
+        assert_eq!(exit_code, Some(0));
+        assert!(
+            output
+                .as_deref()
+                .is_some_and(|tail| tail.contains("git version")),
+            "got: {output:?}"
+        );
+        assert_eq!(run_count(&state).await, 0, "a command is not an agent run");
+        let finished: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'command_finished'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(finished >= 1, "the result must reach the feed");
+    }
+
+    /// The command is judged before it is spawned. A project deny rule refuses it: nothing runs and
+    /// the refusal is recorded, synchronously, so no polling is needed.
+    #[tokio::test]
+    async fn a_refused_scheduled_command_does_not_run_and_is_recorded_as_refused() {
+        let container = space_free_tempdir("nucleos-scheduler-refused-");
+        let (state, _home) = test_state(None).await;
+        seed_one_shot(
+            &state,
+            container.path(),
+            "shadow",
+            ONE_SHOT_COMMAND,
+            Some(&timestamp("2026-07-18T10:00:00Z").to_rfc3339()),
+        )
+        .await;
+        crate::project_policy::declare_shell_rule(
+            &state.pool,
+            "proj",
+            None,
+            "git --version",
+            crate::project_policy::Verdict::Deny,
+            None,
+        )
+        .await
+        .unwrap();
+
+        scheduler_tick(&state, timestamp("2026-07-18T10:06:00Z")).await;
+
+        let (outcome, exit_code, output): (Option<String>, Option<i64>, Option<String>) =
+            sqlx::query_as(
+                "SELECT command_outcome, command_exit_code, command_output
+                 FROM scheduler_state WHERE project_id = 'proj' AND rule_name = 'once'",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(outcome.as_deref(), Some("refused"));
+        assert_eq!(exit_code, None, "a refused command has no exit code");
+        assert!(
+            !output.unwrap_or_default().contains("git version"),
+            "a refused command must not have run"
+        );
+        assert_eq!(run_count(&state).await, 0);
+    }
+
+    /// A past `at` is armed at its own instant, not at the arming time: that is what lets the rules
+    /// view tell "never fires" (`last_fired_at == at`) from "fired" (`last_fired_at > at`).
+    #[tokio::test]
+    async fn a_past_at_seen_first_is_armed_at_its_own_instant() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let (state, _home) = test_state(None).await;
+        seed_one_shot(
+            &state,
+            project.path(),
+            "shadow",
+            "  - name: once\n    at: '2026-07-18T09:00:00Z'\n    prompt: go\n",
+            None,
+        )
+        .await;
+
+        scheduler_tick(&state, timestamp("2026-07-18T10:00:00Z")).await;
+
+        let armed: Option<String> = sqlx::query_scalar(
+            "SELECT last_fired_at FROM scheduler_state WHERE project_id = 'proj' AND rule_name = 'once'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let armed = chrono::DateTime::parse_from_rfc3339(&armed.expect("the rule must be armed"))
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(armed, timestamp("2026-07-18T09:00:00Z"));
+        assert_eq!(run_count(&state).await, 0, "a past at must not fire");
+    }
+
+    /// The output is redacted before it is cut to its tail: cut first, a token straddling the cut
+    /// loses its prefix and the surviving suffix no longer looks like a secret.
+    #[tokio::test]
+    async fn a_secret_straddling_the_output_cut_is_redacted_whole() {
+        let container = space_free_tempdir("nucleos-scheduler-straddle-");
+        let (state, _home) = test_state(None).await;
+        seed_one_shot(
+            &state,
+            container.path(),
+            "shadow",
+            ONE_SHOT_COMMAND,
+            Some(&timestamp("2026-07-18T10:00:00Z").to_rfc3339()),
+        )
+        .await;
+        // `ghp_` plus 36 letters is whole-token redacted; its last 20 letters alone match nothing.
+        let body = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ";
+        let secret = format!("ghp_{body}");
+        // 100 bytes of padding, the 40-byte secret, then 4066 bytes: the 4096-byte tail starts 10
+        // bytes into the secret, so 30 of its characters survive the cut.
+        let output = format!("{}{secret}{}", ".".repeat(100), " ".repeat(4066));
+        assert_eq!(output.len() - COMMAND_OUTPUT_TAIL_BYTES, 110);
+
+        record_command_result(&state.pool, "proj", "once", "passed", Some(0), &output).await;
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT command_output FROM scheduler_state WHERE project_id = 'proj' AND rule_name = 'once'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let stored = stored.unwrap_or_default();
+        assert!(
+            !stored.contains(&body[16..]),
+            "the in-tail suffix of the secret leaked: {stored:?}"
+        );
+    }
+
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -1493,6 +2139,8 @@ mod tests {
             cwd: None,
             timezone: None,
             graph: None,
+            at: None,
+            command: None,
         }
     }
 
@@ -1501,6 +2149,61 @@ mod tests {
             timezone: Some(timezone.to_string()),
             ..rule(name, cron)
         }
+    }
+
+    /// A one-shot rule is due exactly while it is armed before its instant and the instant has
+    /// passed. `last_fired_at` is the only memory: once the claim stamps it at or after `at`, the
+    /// rule can never be due again, and that is what survives a restart.
+    #[test]
+    fn an_at_rule_is_due_once_and_never_after_it_fired() {
+        let rules = vec![ScheduleRule {
+            cron: String::new(),
+            at: Some("2026-10-22T09:00:00Z".to_string()),
+            ..rule("once", "")
+        }];
+        let fires_today = HashMap::new();
+        let at = timestamp("2026-10-22T09:00:00Z");
+
+        // Armed on 10-08, the instant has passed a minute ago: due, paired with its instant.
+        let mut last_fired = HashMap::new();
+        last_fired.insert("once".to_string(), timestamp("2026-10-08T00:00:00Z"));
+        let due = due_rules(
+            &rules,
+            &last_fired,
+            &fires_today,
+            timestamp("2026-10-22T09:01:00Z"),
+            MIN_INTERVAL,
+            DAILY_CAP,
+        );
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1, at);
+
+        // Already fired (the claim stamped last_fired_at after `at`): never due again, however
+        // late the check.
+        let mut last_fired = HashMap::new();
+        last_fired.insert("once".to_string(), timestamp("2026-10-22T09:01:00Z"));
+        let due = due_rules(
+            &rules,
+            &last_fired,
+            &fires_today,
+            timestamp("2026-10-23T09:00:00Z"),
+            MIN_INTERVAL,
+            DAILY_CAP,
+        );
+        assert!(due.is_empty());
+
+        // Before the instant: not due yet.
+        let mut last_fired = HashMap::new();
+        last_fired.insert("once".to_string(), timestamp("2026-10-08T00:00:00Z"));
+        let due = due_rules(
+            &rules,
+            &last_fired,
+            &fires_today,
+            timestamp("2026-10-22T08:59:00Z"),
+            MIN_INTERVAL,
+            DAILY_CAP,
+        );
+        assert!(due.is_empty());
     }
 
     /// UTC is the one answer that is wrong twice a year for most of the world. `0 8 * * *` written

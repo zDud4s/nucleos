@@ -34,6 +34,18 @@
  */
 export type MeterTone = "active" | "pending" | "danger" | "quantity";
 
+/** The share of a spend ceiling at which a quantity starts to read as "near". */
+export const NEAR_CEILING = 0.8;
+
+/** Where a reading stands against its ceiling: under, near (>= 80%), or over (>= 100%). */
+export function ceilingShare(value: number, ceiling: number): "under" | "near" | "over" {
+  if (ceiling <= 0) return value > 0 ? "over" : "under";
+  const share = value / ceiling;
+  if (share >= 1) return "over";
+  if (share >= NEAR_CEILING) return "near";
+  return "under";
+}
+
 export interface MeterProps {
   /** What is being occupied — "at work", "waiting on you". Also the accessible name. */
   label: string;
@@ -99,6 +111,19 @@ export function Meter({ label, value, ceiling, tone, format, head = true }: Mete
   const classes = ["ui-gauge", `ui-gauge-${tone}`];
   if (full) classes.push("ui-gauge-full");
 
+  // Only a quantity runs out. Occupancy is a count against a limit and never escalates.
+  const standing = tone === "quantity" && ceiling > 0 ? ceilingShare(value, ceiling) : "under";
+  if (standing === "near") classes.push("ui-gauge-near");
+  if (standing === "over") classes.push("ui-gauge-over");
+  // The cue and its sentence ride with the head: a caller that hides the head (`head={false}`)
+  // writes the figures itself, and a second percentage beside them would be said twice.
+  const said =
+    !head || standing === "under"
+      ? ""
+      : standing === "near"
+        ? `, ${Math.round((value / ceiling) * 100)}% — near the ceiling`
+        : ", at the ceiling";
+
   return (
     <p className={classes.join(" ")}>
       {head && (
@@ -109,9 +134,12 @@ export function Meter({ label, value, ceiling, tone, format, head = true }: Mete
           </span>
         </span>
       )}
-      <span className="ui-gauge-track" role="img" aria-label={`${label}: ${write(value)} of ${write(ceiling)}`}>
+      <span className="ui-gauge-track" role="img" aria-label={`${label}: ${write(value)} of ${write(ceiling)}${said}`}>
         <span className="ui-gauge-fill" style={{ width: `${percent}%` }} />
       </span>
+      {head && standing !== "under" && (
+        <span className="ui-gauge-cue">{Math.round((value / ceiling) * 100)}%</span>
+      )}
     </p>
   );
 }

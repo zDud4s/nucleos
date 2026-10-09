@@ -137,6 +137,17 @@
   filter: drop-shadow(0 6px 18px rgba(0, 0, 0, 0.35));
 }
 
+/* On a light page the soft shadow alone leaves the notch's edge under 3:1 against the ground, so
+   the drawing gets a 1px --border-strong outline: four 1px drop-shadows, one per side, because a
+   filter cannot spread and the rail is three boxes that must read as one shape. */
+@media (prefers-color-scheme: light) {
+  .quota-notch-rail {
+    filter: drop-shadow(1px 0 0 var(--border-strong)) drop-shadow(-1px 0 0 var(--border-strong))
+      drop-shadow(0 1px 0 var(--border-strong)) drop-shadow(0 -1px 0 var(--border-strong))
+      drop-shadow(0 6px 18px rgba(0, 0, 0, 0.2));
+  }
+}
+
 /* The rail is the notch's handle (`QuotaNotch`, the drag); the cursor is how that is found out. */
 /* Flush with the edge it hangs from, whichever that is; side by side on the top and bottom. */
 .quota-notch[data-edge="left"] .quota-notch-rail {
@@ -2423,15 +2434,118 @@
 
 /* ------------------------------------------------------------------ home -- */
 
+/* Three tiers instead of five equal tiles (which left a fifth card orphaned on its own row):
+   the lead pair, a quieter pair, and the spend meter row. Each tier fills its own width, so
+   no window size strands a card. */
 .app-home-stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: var(--space-4);
   margin-bottom: var(--space-6);
 }
 
-/* The two quicklink CARDS were here — a bordered block per door, each with a display-face
-   title and a paragraph, drawn at the same weight as the four readings above them. Two
-   links do not need a frame each to be found, and the frames made the first screen read
-   as six things of equal importance when four of them are the news and two are doors.
-   What replaced them is a `Section` with two `ui-button-link`s and their sentences. */
+.app-home-lead,
+.app-home-quiet {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.app-home-lead {
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+}
+
+.app-home-quiet {
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+}
+
+/* A cell stretches whatever it holds to the row's height, so paired cards stay level. A
+   transparent border stands where `.ui-stale` draws its dashed one, so a card does not shift
+   by a pixel when a poll fails and recovers. */
+.app-home-cell {
+  display: flex;
+  min-width: 0;
+  border-radius: var(--radius-lg);
+}
+
+.app-home-cell:not(.ui-stale) {
+  border: 1px solid transparent;
+}
+
+.app-home-cell > * {
+  flex: 1;
+  min-width: 0;
+}
+
+.app-home-cell .ui-stat {
+  height: 100%;
+}
+
+/* Lead: the figure at full display size and room around it. */
+.app-home-lead .ui-stat {
+  padding: var(--space-5) var(--space-6);
+  box-shadow: var(--shadow-md);
+}
+
+.app-home-lead .ui-stat-value {
+  /* One step above the token scale's top: the lead pair must out-size everything below it. */
+  font-size: 2.75rem;
+}
+
+.app-home-lead .ui-stat-label {
+  color: var(--text);
+}
+
+/* Something is down: a red edge in addition to the glyph and the words in the detail. */
+.app-home-cell-wrong .ui-stat {
+  border-color: var(--tone-danger-fg);
+}
+
+/* Quiet: standing readings. No lift, no fill, a smaller figure — present, not shouting. */
+.app-home-quiet .ui-stat {
+  padding: var(--space-3) var(--space-4);
+  background: transparent;
+  box-shadow: none;
+}
+
+.app-home-quiet .ui-stat-value {
+  font-size: var(--text-xl);
+}
+
+/* Spend: a labelled meter row, the whole row a link to System. */
+.app-home-spend {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  color: inherit;
+  text-decoration: none;
+}
+
+.app-home-spend:hover {
+  border-color: var(--border-strong);
+}
+
+.app-home-spend:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.app-home-spend-unread {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.app-home-spend-title {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* The two quicklink cards and then the "Where to look next" list were here. The cards now are
+   the doors (`StatCard to`), so the list that repeated the sidebar is gone. */

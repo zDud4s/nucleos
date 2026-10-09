@@ -34,7 +34,7 @@ describe("the resolver's switch", () => {
     expect(await screen.findByText(RESOLVE_DATA_WARNING)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Observe how blocks would be resolved" }));
     await waitPastTheDwell();
-    fireEvent.click(screen.getByRole("button", { name: /Send blocked commands and gate output to TypeSafe/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Start observing" }));
 
     await waitFor(() =>
       expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/judge-resolve", {
@@ -46,7 +46,7 @@ describe("the resolver's switch", () => {
 
   it("asks for a project before it offers anything, and never asks the núcleo about none", async () => {
     await renderWithRouter(<ResolvePanel projectId={null} project={undefined} />, { initialPath: "/autopilot" });
-    expect(screen.getByText("choose a project above.")).toBeTruthy();
+    expect(screen.getByText("Choose a project above.")).toBeTruthy();
     expect(screen.queryByRole("button")).toBeNull();
     expect(daemon.apiFetch).not.toHaveBeenCalled();
   });

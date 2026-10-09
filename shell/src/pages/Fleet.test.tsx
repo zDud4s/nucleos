@@ -343,12 +343,15 @@ describe("Fleet — columns", () => {
 
     await renderWithRouter(<Fleet />);
 
-    const house = await screen.findByRole("article", { name: "In flight" });
-    expect(within(house).getByText("2/5")).toBeDefined();
+    // The house's capacity is the headline's last clause now (the "In flight" tile is gone).
+    await waitFor(async () =>
+      expect(await headlineText()).toBe("2 in flight of 5 across all projects; room for 3 more"),
+    );
 
-    // Capacity is what the core says it is: the header counts slots, not cards.
+    // Capacity is what the core says it is: the column head draws one pip per slot of the limit
+    // and says in words how many are held, from the core's slots and not from the cards.
     const alpha = await screen.findByRole("region", { name: "alpha column" });
-    expect(within(alpha).getByText("2/2")).toBeDefined();
+    expect(alpha.querySelector(".fleet-column-head")!.textContent).toContain("2 of 2 slots held");
     expect(within(alpha).getByRole("article", { name: /job 41/ })).toBeDefined();
     // A worktree run holds a slot without being a job — a page that counted
     // jobs would say `1/2` about a project that is already full.
@@ -357,9 +360,10 @@ describe("Fleet — columns", () => {
     expect(within(held).getByRole("link", { name: "Open in Runs" }).getAttribute("href")).toBe("/runs/7");
 
     // An idle project is a line in the rack, not a column: four empty columns were what pushed a
-    // column with a problem in it off the screen.
+    // column with a problem in it off the screen. Beside busy columns the rack is the idle list.
     expect(screen.queryByRole("region", { name: "beta column" })).toBeNull();
-    const rack = screen.getByRole("region", { name: "Slots by project" });
+    const rack = screen.getByRole("region", { name: "Idle projects" });
+    expect(within(rack).queryByRole("link", { name: "alpha" })).toBeNull();
     const beta = within(rack).getByRole("link", { name: "beta" });
     expect(beta.getAttribute("href")).toBe("/projects/beta/state");
     expect(beta.closest("li")!.textContent).toContain("0 of 3 slots held, room for 3");
@@ -650,7 +654,7 @@ describe("Fleet — columns", () => {
     // No `/items/<id>/cancel` exists, and the number would aim the one route
     // there is at somebody else's run. The gesture that stops this work is the
     // job's, on the job's card.
-    expect(within(mine).queryByRole("button", { name: "Cancel" })).toBeNull();
+    expect(within(mine).queryByRole("button", { name: /^(Stop|Cancel)/ })).toBeNull();
   });
 
   it("an item's card leads with which item of which job it is, and links to where the conflict is resolved", async () => {
@@ -709,7 +713,11 @@ describe("Fleet — columns", () => {
     const state = fleetState({
       concurrency: {
         house: { limit: 4, held: 2 },
-        projects: [column({ slots: [slot({ slot: 0, owner_id: 41 }), slot({ slot: 1, owner_id: 55 })] })],
+        // Room left in alpha: New job is offered only where a project would take a job, so a full
+        // project shows the "No project can start jobs" notice in its place.
+        projects: [
+          column({ limit: 3, slots: [slot({ slot: 0, owner_id: 41 }), slot({ slot: 1, owner_id: 55 })] }),
+        ],
       },
       jobs: [job({ id: 41 }), job({ id: 55 })],
       exclusions: [exclusion()],
@@ -724,7 +732,7 @@ describe("Fleet — columns", () => {
     const card = await screen.findByRole("article", { name: "slot 0 — job 41" });
     // The controls are here while the reading is the daemon's.
     expect(screen.getByRole("button", { name: "New job" })).toBeDefined();
-    expect(within(card).getByRole("button", { name: "Cancel" })).toBeDefined();
+    expect(within(card).getByRole("button", { name: "Stop job" })).toBeDefined();
     expect(within(card).getByRole("button", { name: "Lift" })).toBeDefined();
 
     answering = false;
@@ -744,7 +752,7 @@ describe("Fleet — columns", () => {
     // And every action that would act on capacity nobody can vouch for is gone
     // rather than disabled — it fails before the click instead of after it.
     expect(screen.queryByRole("button", { name: "New job" })).toBeNull();
-    expect(within(after).queryByRole("button", { name: "Cancel" })).toBeNull();
+    expect(within(after).queryByRole("button", { name: /^Stop / })).toBeNull();
     expect(within(after).queryByRole("button", { name: "Lift" })).toBeNull();
   });
 
@@ -806,9 +814,12 @@ describe("Fleet — columns", () => {
 
     await renderWithRouter(<Fleet />);
 
-    const spend = await screen.findByRole("article", { name: "Window spend" });
-    await waitFor(() => expect(within(spend).getByText("$1.42")).toBeDefined());
-    expect(within(spend).getByRole("img", { name: "Window spend: $1.42 of $5.00" })).toBeDefined();
+    // The spend is a gauge in the header strip now, labelled "Spend today", not a tile.
+    const img = await screen.findByRole("img", { name: "Spend today: $1.42 of $5.00" });
+    const spend = img.closest(".fleet-spend") as HTMLElement;
+    expect(within(spend).getByText("Spend today")).toBeDefined();
+    expect(spend.textContent).toContain("$1.42");
+    expect(spend.textContent).toContain("$5.00");
   });
 
   it("teaches what the page is for when no project is registered, and offers neither control", async () => {
@@ -843,13 +854,22 @@ describe("Fleet — columns", () => {
 /* -------------------------------------------------------------- the rack -- */
 
 describe("Fleet — the slot rack", () => {
-  async function findRack(): Promise<HTMLElement> {
-    return await screen.findByRole("region", { name: "Slots by project" });
+  /**
+   * The rack beside busy columns lists only the idle projects ("Idle projects"); over the canvas
+   * it lists every project ("Slots by project"), because the canvas has no column heads.
+   */
+  async function findRack(name: "Idle projects" | "Slots by project" = "Idle projects"): Promise<HTMLElement> {
+    return await screen.findByRole("region", { name });
   }
 
-  /** A project's line in the rack, found by its name's link. */
-  function entryOf(rack: HTMLElement, name: string): HTMLElement {
-    return within(rack).getByRole("link", { name }).closest("li")!;
+  /**
+   * A project's line: its column's head when it is busy (the rack's row merged into it), else its
+   * line in the rack, found by its name's link.
+   */
+  function entryOf(rack: HTMLElement | null, name: string): HTMLElement {
+    const column = screen.queryByRole("region", { name: `${name} column` });
+    if (column !== null) return column.querySelector<HTMLElement>(".fleet-column-head")!;
+    return within(rack!).getByRole("link", { name }).closest("li")!;
   }
 
   /** Each pip's tone in order, `free` for a hollow one. */
@@ -896,15 +916,19 @@ describe("Fleet — the slot rack", () => {
     daemon.apiFetch.mockImplementation(fleetFetch(mixedFleet()));
 
     await renderWithRouter(<Fleet />);
-    const rack = await findRack();
+    const idle = await findRack();
     await screen.findByRole("region", { name: "quiet column" });
 
     // The columns rank: the leak first, then the busiest.
     expect(
       screen.getAllByRole("region", { name: / column$/ }).map((region) => region.getAttribute("aria-label")),
     ).toEqual(["quiet column", "busy column", "calm column"]);
-    // The rack does not. Every project, by id — the order `/concurrency` sends them in — so a
-    // project is always where it was, whatever just went wrong in it.
+    // Beside the columns the rack keeps only the project that has no column head to carry it.
+    expect(within(idle).getAllByRole("link").map((link) => link.textContent)).toEqual(["delta"]);
+    // Over the canvas it lists every project, by id — the order `/concurrency` sends them in — so
+    // a project is always where it was, whatever just went wrong in it.
+    fireEvent.click(screen.getByRole("radio", { name: "Canvas" }));
+    const rack = await findRack("Slots by project");
     expect(within(rack).getAllByRole("link").map((link) => link.textContent)).toEqual([
       "busy",
       "calm",
@@ -920,7 +944,8 @@ describe("Fleet — the slot rack", () => {
     const rack = await findRack();
     await screen.findByRole("region", { name: "quiet column" });
 
-    // One pip per slot of the limit: lit for what is held, hollow for what is free.
+    // One pip per slot of the limit: lit for what is held, hollow for what is free. A busy
+    // project's are in its column head, an idle one's in the rack.
     expect(pipsOf(entryOf(rack, "busy"))).toEqual(["active", "active", "active"]);
     expect(pipsOf(entryOf(rack, "calm"))).toEqual(["active", "free"]);
     expect(pipsOf(entryOf(rack, "delta"))).toEqual(["free", "free"]);
@@ -948,7 +973,7 @@ describe("Fleet — the slot rack", () => {
     );
     expect(entryOf(rack, "busy").textContent).not.toContain("room for");
     // The link's own name is the project, and nothing else.
-    expect(within(quiet).getByRole("link").textContent).toBe("quiet");
+    expect(within(entryOf(rack, "delta")).getByRole("link").textContent).toBe("delta");
   });
 
   it("past eight slots draws only the held pips, with the count beside them", async () => {
@@ -970,7 +995,8 @@ describe("Fleet — the slot rack", () => {
     );
 
     await renderWithRouter(<Fleet />);
-    const alpha = entryOf(await findRack(), "alpha");
+    await screen.findByRole("region", { name: "alpha column" });
+    const alpha = entryOf(null, "alpha");
 
     expect(pipsOf(alpha)).toEqual(["active", "active", "active"]);
     expect(within(alpha).getByText("3/12").className).toBe("ui-pips-count");
@@ -1003,9 +1029,11 @@ describe("Fleet — the slot rack", () => {
     );
 
     await renderWithRouter(<Fleet />);
+    // A busy project with room is room: alpha holds one of two, and its column head offers it.
+    const alpha = await screen.findByRole("button", { name: "New job in alpha" });
+    expect(alpha.closest(".fleet-column-head")).not.toBeNull();
+    // An idle one offers it from the rack.
     const rack = await findRack();
-    // A busy project with room is room: alpha holds one of two.
-    const alpha = await within(rack).findByRole("button", { name: "New job in alpha" });
     expect(within(rack).getByRole("button", { name: "New job in bravo" })).toBeDefined();
     // A full one says nothing at all, neither a button nor a word: its pips already say it.
     const charlie = entryOf(rack, "charlie");
@@ -1062,10 +1090,12 @@ describe("Fleet — the slot rack", () => {
     await renderWithRouter(<Fleet />);
     const rack = await findRack();
 
-    // Shadow and off are said by the mode's badge on the same line, so the entry adds no word of
-    // its own — only the absent button. A missing folder has no badge to say it, so it is written.
+    // Shadow is named by the mode's badge on the same line and its meaning for a job is said in
+    // two words, "plan-only", beside the absent button; the full sentence stays in the select.
+    // Off has no word at all. A missing folder has no badge to say it, so it is written.
     const charlie = entryOf(rack, "charlie");
     await waitFor(() => expect(within(charlie).getByText("shadow")).toBeDefined());
+    expect(within(charlie).getByText("plan-only")).toBeDefined();
     expect(within(charlie).queryByText("in shadow")).toBeNull();
     expect(within(charlie).queryByRole("button")).toBeNull();
     expect(within(entryOf(rack, "delta")).getByText("no folder")).toBeDefined();
@@ -1107,12 +1137,13 @@ describe("Fleet — the slot rack", () => {
     );
 
     await renderWithRouter(<Fleet />);
-    const rack = await findRack();
+    // alpha holds a slot, so it is a column and its head carries what the rack's line would.
+    await screen.findByRole("region", { name: "alpha column" });
 
-    await waitFor(() => expect(within(rack).queryByRole("link", { name: "echo" })).toBeNull());
-    expect(within(rack).getByRole("link", { name: "alpha" })).toBeDefined();
-    expect(pipsOf(entryOf(rack, "alpha"))).toEqual(["active", "free"]);
-    expect(within(entryOf(rack, "alpha")).queryByRole("button")).toBeNull();
+    await waitFor(() => expect(screen.queryByRole("link", { name: "echo" })).toBeNull());
+    expect(screen.queryByRole("region", { name: "echo column" })).toBeNull();
+    expect(pipsOf(entryOf(null, "alpha"))).toEqual(["active", "free"]);
+    expect(within(entryOf(null, "alpha")).queryByRole("button")).toBeNull();
   });
 
   it("takes every New job out of the rack while the view is stale, and keeps the reasons and the pips", async () => {
@@ -1142,11 +1173,11 @@ describe("Fleet — the slot rack", () => {
     expect(await screen.findByText(/view is stale — last good read/)).toBeDefined();
     // Removed, not disabled: the room it would ask for is room nobody can vouch for.
     expect(screen.queryByRole("button", { name: "New job in alpha" })).toBeNull();
-    const rack = screen.getByRole("region", { name: "Slots by project" });
+    const rack = screen.getByRole("region", { name: "Idle projects" });
     expect(within(rack).getByRole("list").className).toContain("fleet-rack-stale");
     // Still named, still reachable, still showing the mode that says why the other one cannot take
     // a job — and the pips stay, because a rack gone blank would read as every slot given back.
-    expect(within(rack).getByRole("link", { name: "alpha" })).toBeDefined();
+    expect(screen.getByRole("region", { name: "alpha column" })).toBeDefined();
     expect(within(entryOf(rack, "charlie")).getByText("shadow")).toBeDefined();
     expect(pipsOf(entryOf(rack, "alpha"))).toEqual(["active", "free"]);
   });
@@ -1164,7 +1195,7 @@ describe("Fleet — the slot rack", () => {
     expect(screen.getByText(/the núcleo refuses every new job until it is released/)).toBeDefined();
   });
 
-  it("is the page's body when nothing is in flight anywhere, with no columns and no Idle list", async () => {
+  it("is the page's body when nothing is in flight anywhere, with no columns and one list of idle projects", async () => {
     daemon.apiFetch.mockImplementation(
       fleetFetch(
         fleetState({
@@ -1186,12 +1217,13 @@ describe("Fleet — the slot rack", () => {
 
     expect(document.querySelector(".fleet-columns")).toBeNull();
     expect(screen.queryAllByRole("region", { name: / column$/ })).toHaveLength(0);
+    expect(screen.getByText("Nothing in flight right now.")).toBeDefined();
     expect(within(rack).getAllByRole("link").map((link) => link.textContent)).toEqual(["alpha", "bravo", "charlie"]);
     expect(pipsOf(entryOf(rack, "alpha"))).toEqual(["free", "free", "free"]);
     expect(await headlineText()).toBe("nothing in flight; room for 6");
-    // The list the rack replaced is not drawn beside it, under any name.
-    expect(screen.queryByRole("region", { name: /^Idle/ })).toBeNull();
-    expect(screen.queryByRole("heading", { name: /^Idle/ })).toBeNull();
+    // The rack is the one list of idle projects: the list it replaced is not drawn beside it.
+    expect(screen.getAllByRole("region", { name: /^Idle/ })).toHaveLength(1);
+    expect(screen.getAllByRole("heading", { name: /^Idle/ })).toHaveLength(1);
   });
 
   it("stands above the canvas too, with the same lamps", async () => {
@@ -1199,7 +1231,7 @@ describe("Fleet — the slot rack", () => {
 
     await renderWithRouter(<Fleet />);
     await screen.findByRole("region", { name: "quiet column" });
-    fireEvent.click(screen.getByRole("button", { name: "Canvas" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Canvas" }));
 
     await waitFor(() => expect(document.querySelector(".fleet-canvas")).not.toBeNull());
     expect(screen.queryByRole("region", { name: "quiet column" })).toBeNull();
@@ -1263,7 +1295,9 @@ describe("Fleet — the headline", () => {
         "1 slot held by nothing, awaiting reconciliation; 1 observed overlap between trees; " +
           "1 item did not merge; 1 job awaiting approval; 1 job held by an exclusion; " +
           "the kill switch is engaged — no new job starts; " +
-          "5 in flight of 8 across all projects; room for 3 more",
+          // Room in the house is not a project that takes a job: alpha is full, bravo is full and
+          // has no summary, so the sentence says none can start.
+          "5 in flight of 8 across all projects; room for 3 more, none startable",
       ),
     );
     // The one clause somebody can act on is a door to where it is acted on.
@@ -1321,15 +1355,14 @@ describe("Fleet — the headline", () => {
 
     await renderWithRouter(<Fleet />);
 
-    const said = await screen.findByText(/items to review across the roster/);
+    const said = await screen.findByText(/items to review across projects/);
     expect(said.textContent).toBe(
-      "2 in flight of 5 across all projects; room for 3 more; 5 items to review across the roster",
+      "2 in flight of 5 across all projects; room for 3 more, none startable; 5 items to review across projects",
     );
 
-    // The card is the same fact in the same words, so the two cannot drift apart.
-    const card = screen.getByRole("article", { name: "To review" });
-    expect(within(card).getByText("5")).toBeDefined();
-    expect(within(card).getByText("across the roster")).toBeDefined();
+    // The "To review" tile is gone: the headline is the one place the page says it, so there is
+    // no second copy to drift apart from it.
+    expect(screen.queryByRole("article", { name: "To review" })).toBeNull();
   });
 });
 
@@ -1605,12 +1638,12 @@ describe("Fleet — cancelling", () => {
     const { queryClient } = await renderWithRouter(<Fleet />);
     const card = await screen.findByRole("article", { name: "slot 1 — run 7" });
 
-    fireEvent.click(within(card).getByRole("button", { name: "Cancel" }));
+    fireEvent.click(within(card).getByRole("button", { name: "Stop run" }));
     // Real timers rather than fake ones: the page polls, and the wait is the
     // interlock's 300ms dwell, which swallows a click arriving as the tail of a
     // double-click. Clicking through it without waiting would confirm nothing.
     await pastTheDwell();
-    fireEvent.click(within(card).getByRole("button", { name: "Cancel run 7?" }));
+    fireEvent.click(within(card).getByRole("button", { name: "Stop run 7?" }));
 
     await waitFor(() => {
       expect(daemon.apiText).toHaveBeenCalledWith("/runs/7/cancel", { method: "POST" });
@@ -1679,7 +1712,7 @@ describe("the fleet canvas", () => {
 
     await renderWithRouter(<Fleet />);
     await screen.findByRole("region", { name: "alpha column" });
-    fireEvent.click(screen.getByRole("button", { name: "Canvas" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Canvas" }));
 
     // Asserted on what xyflow is handed rather than on its DOM: jsdom gives the pane no size,
     // so the library lays out no node wrappers here. It turns `ariaLabel` into the wrapper's

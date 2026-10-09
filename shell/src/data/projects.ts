@@ -62,6 +62,21 @@ export interface RepoTriggerView {
   last_sha: string | null;
 }
 
+/** The post-merge gate's state for one project's target, as the rules read serves it. */
+export interface PostgateState {
+  target: string;
+  last_green: string | null;
+  running: string | null;
+  red_groups: string[];
+  red_since: string | null;
+  red_sha: string | null;
+  red_base: string | null;
+  phase: "flake_check" | "bisect" | null;
+  culprit: string | null;
+  candidates: string[];
+  also_suspect: string[];
+}
+
 /** Everything a project will do without being asked, and what is holding it back. */
 export interface ProjectRules {
   project_id: string;
@@ -91,6 +106,11 @@ export interface ProjectRules {
    * older one does not report it — the toggle then offers no control.
    */
   ide_verify?: boolean;
+  /**
+   * The post-merge gate's state for the project's target: `null` when it has never run, absent
+   * when the daemon is older than the shell.
+   */
+  postgate?: PostgateState | null;
   /** Who answers an approval a conversation on `auto` would otherwise put to a person. */
   judge: JudgeState;
   schedules: ScheduleView[];

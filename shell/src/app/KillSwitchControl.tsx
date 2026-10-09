@@ -1,7 +1,12 @@
+import { listen } from "@tauri-apps/api/event";
 import { OctagonX, Play } from "lucide-react";
+import { useEffect, useRef } from "react";
 import { isApiRefusal } from "../data/client";
 import { useKillSwitch, useSetKillSwitch } from "../data/system";
 import { Button, ConfirmButton, ErrorNote, RefusalNote } from "../ui";
+
+/** The tray's "Engage kill switch" item emits this; `src-tauri/src/lib.rs` names the same string. */
+export const KILL_ENGAGE_EVENT = "kill://engage";
 
 /**
  * The stop.
@@ -22,6 +27,9 @@ import { Button, ConfirmButton, ErrorNote, RefusalNote } from "../ui";
  * Feedback is inline, under the button that caused it. There are no toasts in
  * this app: a message that appears in a corner is a message about nothing in
  * particular, and it leaves before anyone looks up.
+ *
+ * It can also be reached without the window: Ctrl+Alt+K (Cmd+Alt+K on macOS) and the tray item
+ * both engage, and neither ever releases.
  */
 export function KillSwitchControl() {
   const kill = useKillSwitch();
@@ -29,6 +37,41 @@ export function KillSwitchControl() {
   const engaged = kill.data?.engaged;
 
   const failure = set.error;
+
+  // The two ways in that are not a click. Held in a ref so the listeners subscribe once and still
+  // see the current state; both engage only, and only when not already engaged.
+  const engage = useRef(() => {});
+  engage.current = () => {
+    if (engaged === true || set.isPending) return;
+    set.mutate(true);
+  };
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.altKey && (event.ctrlKey || event.metaKey) && event.code === "KeyK") {
+        event.preventDefault();
+        engage.current();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+
+    let stop: (() => void) | undefined;
+    let gone = false;
+    listen(KILL_ENGAGE_EVENT, () => engage.current())
+      .then((off) => {
+        if (gone) off();
+        else stop = off;
+      })
+      // Swallowed: subscribing needs a Tauri runtime, and a browser or a test harness has none.
+      // What is lost is the tray item; the button and the chord are unaffected.
+      .catch(() => undefined);
+
+    return () => {
+      gone = true;
+      document.removeEventListener("keydown", onKey);
+      stop?.();
+    };
+  }, []);
 
   return (
     <div className="app-kill">
@@ -65,7 +108,7 @@ export function KillSwitchControl() {
           variant="danger"
           onClick={() => set.mutate(true)}
           disabled={set.isPending}
-          title="Stop everything autonomous, now"
+          title="Stop everything autonomous, now (Ctrl+Alt+K, Cmd+Alt+K on macOS)"
         >
           <OctagonX className="app-kill-icon" strokeWidth={1.5} aria-hidden="true" />
           Kill switch

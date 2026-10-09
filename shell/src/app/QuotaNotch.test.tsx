@@ -239,6 +239,17 @@ describe("QuotaNotch", () => {
     expect(container.querySelector(".quota-notch-detail")).toBeNull();
   });
 
+  /** A bare percentage under a ring is a number nobody can attribute: say the window in words. */
+  it("the rest figure names its window in words", async () => {
+    answer({ providers: [claude()] });
+    const { container, findByText } = renderWithQuery(<QuotaNotch />);
+    await findByText(/claude: 7d 46% /);
+
+    const headline = container.querySelector(".quota-notch-headline") as HTMLElement;
+    const said = `${headline.getAttribute("aria-label") ?? ""} ${headline.getAttribute("title") ?? ""}`;
+    expect(said).toContain("56% of the 5-hour window used");
+  });
+
   /** The long window is the news when it is the fuller one, whatever the short one has left. */
   it("names the long window at rest when that is the one running out", async () => {
     answer({

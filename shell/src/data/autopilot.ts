@@ -292,6 +292,18 @@ export const JUDGE_RESIDUAL_RISK =
   "file — and that code can reach the network. Nothing but an operating-system network sandbox " +
   "closes this, and there is none yet. Turning enforce on accepts this risk for this project.";
 
+/** What TypeSafe is, said once; every panel and dialog that sends it something uses this phrase. */
+export const TYPESAFE_DEFINITION = "TypeSafe is the outside service that runs the judge model.";
+
+/** The consequence of asking TypeSafe, in the words both armed labels and both dialogs share. */
+export const TYPESAFE_LEAVES = "your commands and their output leave this computer";
+
+/** The two sentences the Enforce dialog leads with; the full risk stays on the panel. */
+export const JUDGE_ENFORCE_DIALOG =
+  "If the judge is fooled by text the agent read, it can approve a command that runs code the agent " +
+  "wrote in the workspace, and that code can reach the network. Nothing but an operating-system " +
+  "network sandbox prevents this, and there is none yet.";
+
 export function readJudgeBand(verdict: JudgeVerdict): string {
   if (verdict.band === "deny") return "would refuse";
   return verdict.capped ? "would allow — held back by a guard" : "would allow";

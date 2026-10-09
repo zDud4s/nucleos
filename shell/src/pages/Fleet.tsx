@@ -15,13 +15,7 @@ import {
   type Concurrency,
   type ProjectConcurrency,
 } from "../data/fleet";
-import {
-  useBudget,
-  useKillSwitch,
-  useProjects,
-  type BudgetView,
-  type ProjectSummary,
-} from "../data/system";
+import { useBudget, useKillSwitch, useProjects, type ProjectSummary } from "../data/system";
 import { useTeams } from "../data/teams";
 import {
   FleetActionsProvider,
@@ -50,7 +44,6 @@ import {
   RelativeTime,
   SlotPips,
   StaleNote,
-  StatCard,
   StateBadge,
   Teach,
   usd,
@@ -144,6 +137,14 @@ export function Fleet() {
   // `create_job`), failing closed — so the daemon stays the authority either way.
   const engaged = kill.data?.engaged === true;
   const hasProjects = capacity !== undefined && capacity.projects.length > 0;
+  // Room in the house is not a project that can take a job: shadow, off, a missing folder and a
+  // full project all refuse `POST /jobs`. New job is offered only when `whyNoJob` lets one through.
+  const startable =
+    capacity !== undefined &&
+    capacity.projects.some(
+      (project) =>
+        whyNoJob(project, projects.data?.find((row) => row.project_id === project.project_id)) === null,
+    );
   const waiting = projects.data?.reduce((total, project) => total + project.open_review_items, 0);
 
   const actions: FleetActions = {
@@ -182,18 +183,34 @@ export function Fleet() {
         // sentence is not announced.
         headline={
           <span role="status" aria-live="polite">
-            {headline({ capacity, totals: model.totals, engaged, stale, waiting })}
+            {headline({ capacity, totals: model.totals, engaged, stale, startable, waiting })}
           </span>
         }
-        actions={
-          // Neither control means anything without a project to look at or to start work in,
-          // so an empty or unread fleet offers neither. New job is also gone — not disabled —
-          // while the view is stale: the room it would ask for is room nobody can vouch for,
-          // and `StaleNote` below is what says why it went.
-          hasProjects ? (
-            <>
-              <ViewSwitch view={view} onChange={setView} />
-              {!stale && (
+        // Only the view switch: the spend and the can't-start notice live in the strip below, so
+        // the header is a title, a headline and one control, aligned on the title's line.
+        actions={hasProjects ? <ViewSwitch view={view} onChange={setView} /> : undefined}
+      />
+
+      {/* The status strip: spend on the left, and on the right either the New job button or the
+          reason there is none. Neither start control means anything without a project, and New
+          job is gone — not disabled — while the view is stale: the room it would ask for is room
+          nobody can vouch for, and `StaleNote` below says why it went. */}
+      {(budget.data !== undefined || (hasProjects && !stale)) && (
+        <div className="fleet-strip">
+          {budget.data !== undefined && (
+            <div className="fleet-spend">
+              <Meter
+                label="Spend today"
+                value={budget.data.window_spend_usd}
+                ceiling={budget.data.limit_usd}
+                tone="quantity"
+                format={usd}
+              />
+            </div>
+          )}
+          {hasProjects && !stale && (
+            <div className="fleet-strip-act">
+              {startable ? (
                 <Button
                   id={openerId}
                   intent="go"
@@ -205,11 +222,13 @@ export function Fleet() {
                 >
                   New job
                 </Button>
+              ) : (
+                <NoStart projects={capacity?.projects ?? []} summaries={projects.data} />
               )}
-            </>
-          ) : undefined
-        }
-      />
+            </div>
+          )}
+        </div>
+      )}
 
       {stale && <StaleNote dataUpdatedAt={concurrency.dataUpdatedAt} />}
 
@@ -226,34 +245,6 @@ export function Fleet() {
           onClose={closeComposer}
         />
       )}
-
-      <div className="fleet-meter">
-        <StatCard
-          label="In flight"
-          value={capacity === undefined ? undefined : `${capacity.house.held}/${capacity.house.limit}`}
-          detail="slots held across all projects"
-        />
-        <StatCard
-          label="Window spend"
-          value={budget.data === undefined ? undefined : usd(budget.data.window_spend_usd)}
-          detail={ceiling(budget.data)}
-          // The bar only where there is a ceiling to fill. With none, the line above already
-          // says "no ceiling", and an open rail beside it would say it a second time.
-          bar={
-            budget.data !== undefined && budget.data.limit_usd !== null ? (
-              <Meter
-                label="Window spend"
-                value={budget.data.window_spend_usd}
-                ceiling={budget.data.limit_usd}
-                tone="quantity"
-                format={usd}
-                head={false}
-              />
-            ) : undefined
-          }
-        />
-        <StatCard label="To review" value={waiting} detail="across the roster" />
-      </div>
 
       {concurrency.isError && capacity === undefined && (
         <CapacityError error={concurrency.error} at={concurrency.errorUpdatedAt} />
@@ -274,6 +265,8 @@ export function Fleet() {
 
       {/* Above both views: which project has room, and what is in each slot, is a question
           neither arrangement answers at a glance, and the rack does not change with the view. */}
+      {/* In the columns view a busy project is its column's head, so the rack keeps only the idle
+          ones; the canvas has no column heads, so there it keeps every project. */}
       {hasProjects && (
         <SlotRack
           columns={model.columns}
@@ -281,6 +274,7 @@ export function Fleet() {
           stale={stale}
           panelId={panelId}
           onNewJob={openComposer}
+          only={view === "columns" ? "idle" : "all"}
         />
       )}
 
@@ -297,7 +291,13 @@ export function Fleet() {
             }}
           />
         ) : (
-          <Columns columns={model.columns} projects={projects.data} />
+          <Columns
+            columns={model.columns}
+            projects={projects.data}
+            stale={stale}
+            panelId={panelId}
+            onNewJob={openComposer}
+          />
         ))}
     </FleetActionsProvider>
   );
@@ -306,32 +306,148 @@ export function Fleet() {
 /** Which of the two ways of looking at the fleet is open. */
 type FleetView = "columns" | "canvas";
 
+const VIEWS: { id: FleetView; label: string }[] = [
+  { id: "columns", label: "Columns" },
+  { id: "canvas", label: "Canvas" },
+];
+
 /**
- * `aria-pressed` and not a shade alone: which of the two is open has to be announced, not only
- * coloured. The app's one segmented control (`.ui-switch`), the same the Runs scope uses, so
- * this page no longer draws a pill-shaped one of its own.
+ * An exclusive choice, so a radio group and not two toggles: one stop in the tab order, the arrow
+ * keys move the choice, and `aria-checked` says which is open rather than a shade alone. The
+ * app's one segmented control (`.ui-switch`) draws it; `ui.css` styles its pressed mark off
+ * `aria-pressed`, so `.fleet-view-seg` repeats that mark for `aria-checked` and gives both
+ * segments one width.
  */
 function ViewSwitch({ view, onChange }: { view: FleetView; onChange: (next: FleetView) => void }) {
+  const segments = useRef<(HTMLButtonElement | null)[]>([]);
+
+  function choose(index: number) {
+    const wrapped = (index + VIEWS.length) % VIEWS.length;
+    onChange(VIEWS[wrapped].id);
+    segments.current[wrapped]?.focus();
+  }
+
   return (
-    <div className="ui-switch" role="group" aria-label="How to look at the fleet">
-      <button
-        type="button"
-        className="ui-switch-seg"
-        aria-pressed={view === "columns"}
-        onClick={() => onChange("columns")}
-      >
-        Columns
-      </button>
-      <button
-        type="button"
-        className="ui-switch-seg"
-        aria-pressed={view === "canvas"}
-        onClick={() => onChange("canvas")}
-      >
-        Canvas
-      </button>
+    <div className="ui-switch" role="radiogroup" aria-label="How to look at the fleet">
+      {VIEWS.map(({ id, label }, index) => (
+        <button
+          key={id}
+          ref={(node) => {
+            segments.current[index] = node;
+          }}
+          type="button"
+          role="radio"
+          className="ui-switch-seg fleet-view-seg"
+          aria-checked={view === id}
+          tabIndex={view === id ? 0 : -1}
+          onClick={() => onChange(id)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+              event.preventDefault();
+              choose(index + 1);
+            } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+              event.preventDefault();
+              choose(index - 1);
+            } else if (event.key === "Home") {
+              event.preventDefault();
+              choose(0);
+            } else if (event.key === "End") {
+              event.preventDefault();
+              choose(VIEWS.length - 1);
+            }
+          }}
+        >
+          {label}
+        </button>
+      ))}
     </div>
   );
+}
+
+/**
+ * Why no project can start a job, in place of the New job button.
+ *
+ * Shown only when room exists in the house but every project refuses (`whyNoJob`): an enabled
+ * button there would earn a refusal the page already knows. The link goes to Autopilot when a
+ * project's mode is the reason, because that is where the mode is changed.
+ */
+function NoStart({
+  projects,
+  summaries,
+}: {
+  projects: ProjectConcurrency[];
+  summaries: ProjectSummary[] | undefined;
+}) {
+  const reasons = projects.map((project) => {
+    const summary = summaries?.find((row) => row.project_id === project.project_id);
+    const mode = summary?.mode;
+    const why =
+      mode === "shadow"
+        ? "is in shadow"
+        : mode === "off"
+          ? "has autopilot off"
+          : summary !== undefined && summary.project_root === null
+            ? "has no folder"
+            : "is full";
+    return { text: `${project.project_id} ${why}`, mode: mode === "shadow" || mode === "off" };
+  });
+  const shown = reasons.slice(0, 2).map((reason) => reason.text);
+  const more = reasons.length - shown.length;
+  return (
+    <p className="fleet-nostart">
+      No project can start jobs: {shown.join(", ")}
+      {more > 0 && ` and ${more} more`}
+      {reasons.some((reason) => reason.mode) && (
+        <>
+          {" · "}
+          <Link to="/autopilot">Autopilot</Link>
+        </>
+      )}
+    </p>
+  );
+}
+
+/** What each held slot's pip is lit with, in slot order so a pip keeps its place while it is held. */
+function heldReadings(cards: FleetColumn["cards"]) {
+  return [...cards]
+    .sort((left, right) => left.slot.slot - right.slot.slot)
+    .map((card) => slotReading(card.detail));
+}
+
+/**
+ * A project's New job, aimed, or the short reason there is none. A `+` rather than the words:
+ * "New job" on every startable line was the loudest text on a strip that is meant to recede, and
+ * it is named with the project because five buttons all called "New job" are five of one name.
+ */
+function ProjectAction({
+  project,
+  summary,
+  stale,
+  panelId,
+  onNewJob,
+}: {
+  project: ProjectConcurrency;
+  summary: ProjectSummary | undefined;
+  stale: boolean;
+  panelId: string;
+  onNewJob: (from: HTMLElement, project: string) => void;
+}) {
+  const refusal = whyNoJob(project, summary);
+  if (refusal === null) {
+    return (
+      <>
+        {!stale && (
+          <IconButton
+            label={`New job in ${project.project_id}`}
+            icon={Plus}
+            aria-controls={panelId}
+            onClick={(event) => onNewJob(event.currentTarget, project.project_id)}
+          />
+        )}
+      </>
+    );
+  }
+  return <>{refusal.short !== null && <span className="fleet-rack-why">{refusal.short}</span>}</>;
 }
 
 /* ------------------------------------------------------------------- rack -- */
@@ -369,18 +485,22 @@ function SlotRack({
   stale,
   panelId,
   onNewJob,
+  only,
 }: {
   columns: FleetColumn[];
   projects: ProjectSummary[] | undefined;
   stale: boolean;
   panelId: string;
   onNewJob: (from: HTMLElement, project: string) => void;
+  /** `idle` leaves out a project that has a column, whose head already carries its pips. */
+  only: "idle" | "all";
 }) {
   const titleId = useId();
   // Code-unit order, which is how `ids.sort()` compares Rust strings: the rack and the reading agree
   // byte for byte rather than by some locale's idea of alphabetical.
   const entries = [...columns]
     .filter(({ project, cards }) => cards.length > 0 || !isSwitchedOff(project, projects))
+    .filter(({ idle }) => only === "all" || idle)
     .sort((left, right) => {
       const [a, b] = [left.project.project_id, right.project.project_id];
       return a < b ? -1 : a > b ? 1 : 0;
@@ -388,19 +508,16 @@ function SlotRack({
   if (entries.length === 0) return null;
   return (
     <section className="fleet-rack" aria-labelledby={titleId}>
-      {/* Named for the ear and not the eye: to anybody looking the pips are the heading, and a
-          screen reader's list of headings needs a name to jump to. */}
-      <h2 id={titleId} className="sr-only">
-        Slots by project
+      {/* Beside busy columns the rack is the idle projects and says so; on its own it is named
+          for the ear and not the eye: to anybody looking the pips are the heading, and a screen
+          reader's list of headings needs a name to jump to. */}
+      <h2 id={titleId} className={only === "idle" ? "fleet-rack-title" : "sr-only"}>
+        {only === "idle" ? "Idle projects" : "Slots by project"}
       </h2>
       <ul className={stale ? "fleet-rack-list fleet-rack-stale" : "fleet-rack-list"}>
         {entries.map(({ project, cards }) => {
           const summary = projects?.find((row) => row.project_id === project.project_id);
-          const refusal = whyNoJob(project, summary);
-          // In slot order, so a pip keeps its place for as long as its slot is held.
-          const held = [...cards]
-            .sort((left, right) => left.slot.slot - right.slot.slot)
-            .map((card) => slotReading(card.detail));
+          const held = heldReadings(cards);
           return (
             <li key={project.project_id} className="fleet-rack-entry">
               <Link
@@ -423,20 +540,13 @@ function SlotRack({
               </span>
               <SlotPips held={held} limit={project.limit} />
               <span className="fleet-rack-act">
-                {refusal === null
-                  ? !stale && (
-                      // A `+` rather than the words: "New job" on every startable line was the
-                      // loudest text on a strip whose job is to recede, and it would not fit its
-                      // column. Named with the project, because five buttons all called "New job"
-                      // are five of the same name to anybody not looking at the line they sit on.
-                      <IconButton
-                        label={`New job in ${project.project_id}`}
-                        icon={Plus}
-                        aria-controls={panelId}
-                        onClick={(event) => onNewJob(event.currentTarget, project.project_id)}
-                      />
-                    )
-                  : refusal.short !== null && <span className="fleet-rack-why">{refusal.short}</span>}
+                <ProjectAction
+                  project={project}
+                  summary={summary}
+                  stale={stale}
+                  panelId={panelId}
+                  onNewJob={onNewJob}
+                />
               </span>
             </li>
           );
@@ -460,12 +570,20 @@ function SlotRack({
 function Columns({
   columns,
   projects,
+  stale,
+  panelId,
+  onNewJob,
 }: {
   columns: FleetColumn[];
   projects: ProjectSummary[] | undefined;
+  stale: boolean;
+  panelId: string;
+  onNewJob: (from: HTMLElement, project: string) => void;
 }) {
   const busy = columns.filter((column) => !column.idle);
-  if (busy.length === 0) return null;
+  // Said rather than left blank: an empty page under the headline reads as a page that failed to
+  // load, and "nothing in flight" is the all-is-well answer.
+  if (busy.length === 0) return <p className="fleet-quiet">Nothing in flight right now.</p>;
   return (
     <div className="fleet-columns">
       {busy.map((column) => (
@@ -473,6 +591,9 @@ function Columns({
           key={column.project.project_id}
           column={column}
           summary={projects?.find((project) => project.project_id === column.project.project_id)}
+          stale={stale}
+          panelId={panelId}
+          onNewJob={onNewJob}
         />
       ))}
     </div>
@@ -482,10 +603,8 @@ function Columns({
 /**
  * One project's capacity, its safety posture, and its cards.
  *
- * The header counts `project.slots.length` and **not** the cards. A project can
- * read `1/2` with no card for one daemon tick, and that is the right behaviour:
- * capacity is what the core says it is, and counting the cards would make the
- * header agree with the screen and disagree with reality.
+ * The head's pips are drawn from the cards, with the limit from `project.limit`: a slot with no
+ * card for one daemon tick reads as a hollow pip until the next poll, the same as in the rack.
  *
  * The autopilot mode sits next to the name because it is the fact that decides what this project
  * may do on its own — the safety layer, where the work is. It comes from `/projects`, and when that
@@ -494,13 +613,21 @@ function Columns({
 function ProjectColumn({
   column,
   summary,
+  stale,
+  panelId,
+  onNewJob,
 }: {
   column: FleetColumn;
   summary: ProjectSummary | undefined;
+  stale: boolean;
+  panelId: string;
+  onNewJob: (from: HTMLElement, project: string) => void;
 }) {
   const { project, cards, notes } = column;
   return (
     <section className="fleet-column" aria-label={`${project.project_id} column`}>
+      {/* The rack's row for this project, merged in: the name, the mode, the pips and the project's
+          own New job, so the same project is not drawn twice one above the other. */}
       <header className="fleet-column-head">
         <h2 className="fleet-column-title">{project.project_id}</h2>
         {summary !== undefined && (
@@ -509,8 +636,17 @@ function ProjectColumn({
             <StateBadge domain="autopilot" state={summary.mode} />
           </span>
         )}
-        <span className="fleet-column-count">
-          {project.slots.length}/{project.limit}
+        <span className="fleet-column-pips">
+          <SlotPips held={heldReadings(cards)} limit={project.limit} />
+        </span>
+        <span className="fleet-column-act">
+          <ProjectAction
+            project={project}
+            summary={summary}
+            stale={stale}
+            panelId={panelId}
+            onNewJob={onNewJob}
+          />
         </span>
       </header>
       {/* A fact about the whole project, said once here rather than on every card. */}
@@ -638,7 +774,9 @@ export function whyNoJob(
     return { said: "autopilot off — jobs start only when it is active", short: null };
   }
   if (summary?.mode === "shadow") {
-    return { said: "in shadow — jobs start only when the autopilot is active", short: null };
+    // Said beside the badge as well: "shadow" names the mode, "plan-only" names what it means for
+    // a job, and the second is the reason the New job button is not offered.
+    return { said: "in shadow — jobs start only when the autopilot is active", short: "plan-only" };
   }
   if (summary !== undefined && summary.project_root === null) {
     return { said: "no folder recorded", short: "no folder" };
@@ -994,18 +1132,6 @@ function MutationNote({ error, what }: { error: unknown; what: string }) {
   return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
 }
 
-/**
- * The ceiling line under the spend.
- *
- * `limit_usd === null` is **no ceiling** and is never rendered as a zero: a
- * ceiling of `0.00` stops all autonomous work, no ceiling stops none of it.
- */
-function ceiling(spend: BudgetView | undefined): string | undefined {
-  if (spend === undefined) return undefined;
-  if (spend.limit_usd === null) return `no ceiling · ${spend.period}`;
-  return `of ${usd(spend.limit_usd)} · ${spend.period}`;
-}
-
 /* --------------------------------------------------------------- headline -- */
 
 interface HeadlineFacts {
@@ -1013,6 +1139,8 @@ interface HeadlineFacts {
   totals: Exceptions;
   engaged: boolean;
   stale: boolean;
+  /** Whether any project would take a job now; room in the house alone is not that. */
+  startable: boolean;
   waiting: number | undefined;
 }
 
@@ -1037,7 +1165,14 @@ function counted(count: number, one: string, many: string): string {
  * `ReactNode` and not `string` because of the colour and the door. Every clause is short and
  * counted; the page never says "attention" or "warning" — it says what is so.
  */
-function headline({ capacity, totals, engaged, stale, waiting }: HeadlineFacts): ReactNode {
+function headline({
+  capacity,
+  totals,
+  engaged,
+  stale,
+  startable,
+  waiting,
+}: HeadlineFacts): ReactNode {
   if (capacity === undefined) return undefined;
   const clauses: ReactNode[] = [];
 
@@ -1072,13 +1207,16 @@ function headline({ capacity, totals, engaged, stale, waiting }: HeadlineFacts):
 
   const { held, limit } = capacity.house;
   const room = limit - held;
+  // Room that no project can use is said as such, so "room for 3" never sits beside a page that
+  // offers no way to start one.
+  const none = startable ? "" : ", none startable";
   clauses.push(
     held === 0
-      ? `nothing in flight; room for ${limit}`
-      : `${held} in flight of ${limit} across all projects; ${room <= 0 ? "no room for another" : `room for ${room} more`}`,
+      ? `nothing in flight; room for ${limit}${none}`
+      : `${held} in flight of ${limit} across all projects; ${room <= 0 ? "no room for another" : `room for ${room} more${none}`}`,
   );
   if (waiting !== undefined && waiting > 0) {
-    clauses.push(`${counted(waiting, "item", "items")} to review across the roster`);
+    clauses.push(`${counted(waiting, "item", "items")} to review across projects`);
   }
 
   return clauses.map((clause, index) => (

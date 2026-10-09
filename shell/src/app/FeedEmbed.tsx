@@ -44,7 +44,7 @@ export function FeedEmbed({ lines = EMBED_LINES }: FeedEmbedProps) {
       title="Lately"
       aside={
         <Link className="ap-link" to="/feed">
-          the whole feed
+          The whole feed
         </Link>
       }
     >
@@ -63,11 +63,38 @@ export function FeedEmbed({ lines = EMBED_LINES }: FeedEmbedProps) {
   );
 }
 
+/**
+ * A daemon summary, written for a person. The núcleo's lines carry markdown backticks around
+ * a literal (`completed`) and a hedged plural ("3 item(s)"); neither belongs on screen.
+ */
+function plainSummary(summary: string): string {
+  return summary
+    .replace(/`/g, "")
+    .replace(/\b(\d+) item\(s\)/g, (_all, count: string) =>
+      count === "1" ? "1 item" : `${count} items`,
+    )
+    .replace(/item\(s\)/g, "items");
+}
+
 function FeedLine({ entry }: { entry: FeedEntry }) {
+  const summary = plainSummary(entry.summary);
   return (
     <li className="ap-feed-line">
       <KindBadge kind={entry.kind} />
-      <span className="ap-feed-summary">{entry.summary}</span>
+      <span className="ap-feed-summary">
+        {/* The same door the Feed page gives these rows: `/runs/{id}` exists. */}
+        {entry.run_id === null ? (
+          summary
+        ) : (
+          <Link
+            to={`/runs/${String(entry.run_id)}`}
+            className="ap-link"
+            aria-label={`${summary} — open run ${String(entry.run_id)}`}
+          >
+            {summary}
+          </Link>
+        )}
+      </span>
       <RelativeTime at={entry.created_at} />
     </li>
   );

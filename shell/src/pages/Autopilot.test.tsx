@@ -267,6 +267,14 @@ function panel(): HTMLElement {
   return screen.getByRole("tabpanel");
 }
 
+/**
+ * The project's mode switch. The Judge panel below carries a switch with the same verbs, so a
+ * bare role query for "Let it act" finds two; the project's is the group named "Autopilot mode".
+ */
+function modeSwitch(): HTMLElement {
+  return screen.getByRole("group", { name: "Autopilot mode" });
+}
+
 /** The panel's gate. Always one, whatever the project's mode. */
 function gate(): HTMLElement {
   const found = panel().querySelectorAll<HTMLElement>(".ap-fan-gate");
@@ -373,7 +381,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     expect(words).not.toContain("acting");
 
     // And the panels below follow the project the fan opened on.
-    expect(await screen.findByText("nothing is waiting for a verdict on bravo.")).toBeDefined();
+    expect(await screen.findByText("Nothing is waiting for a verdict on bravo.")).toBeDefined();
   });
 
   /**
@@ -496,7 +504,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
 
     await renderCockpit();
 
-    const offer = (await screen.findByRole("button", { name: "Let it act" })) as HTMLButtonElement;
+    const offer = within(await screen.findByRole("group", { name: "Autopilot mode" })).getByRole("button", { name: "Let it act" }) as HTMLButtonElement;
     expect(offer.getAttribute("aria-disabled")).toBe("true");
     expect(offer.disabled).toBe(false);
     offer.focus();
@@ -557,7 +565,8 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     });
 
     await renderCockpit();
-    fireEvent.click(await screen.findByRole("button", { name: "Watch in shadow" }));
+    await screen.findByRole("group", { name: "Autopilot mode" });
+    fireEvent.click(within(modeSwitch()).getByRole("button", { name: "Watch in shadow" }));
 
     const note = await waitFor(() => {
       const found = document.querySelector<HTMLElement>(".ap-fan-refusal");
@@ -611,7 +620,8 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     await renderCockpit();
 
     expect(screen.queryByLabelText("Folder for alpha")).toBeNull();
-    fireEvent.click(await screen.findByRole("button", { name: "Let it act" }));
+    await screen.findByRole("group", { name: "Autopilot mode" });
+    fireEvent.click(within(modeSwitch()).getByRole("button", { name: "Let it act" }));
 
     // Clicks inside the 300 ms dwell are swallowed and leave the control armed,
     // so retrying until it disarms is safe.
@@ -717,7 +727,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
 
     // The gate is always two lines tall, one sentence or two, so the switch below it never moves
     // as the fan turns from a short gate to a long one.
-    expect(body(/\.ap-fan-gate\s*\{([^}]*)\}/)).toMatch(/min-height:\s*calc\(\s*2lh\s*\+/);
+    expect(body(/\.ap-fan-gate\s*\{([^}]*)\}/)).toMatch(/min-height:\s*2lh\b/);
     expect(body(/\.ap-headline\s*\{([^}]*)\}/)).toMatch(/min-height:\s*2lh\b/);
   });
 
@@ -727,8 +737,10 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
 
     await renderCockpit();
 
-    expect(await screen.findByText(/of \$5\.00 per day/)).toBeDefined();
-    expect(screen.queryByText(/per dai/)).toBeNull();
+    // The ledger draws the spend as a meter now; its figures ride in the track's label.
+    expect(await screen.findByRole("img", { name: /^Spent this day: .* of \$5\.00/ })).toBeDefined();
+    expect(screen.queryByText(/dai\b/)).toBeNull();
+    expect(screen.queryByRole("img", { name: /dai\b/ })).toBeNull();
   });
 });
 
@@ -857,7 +869,7 @@ describe("Autopilot - the empty panels", () => {
 
     await renderCockpit();
 
-    expect(await screen.findByText("nothing is waiting for a verdict on alpha.")).toBeDefined();
+    expect(await screen.findByText("Nothing is waiting for a verdict on alpha.")).toBeDefined();
     expect(screen.getByText("alpha has recorded no classified decision yet.")).toBeDefined();
     expect(screen.queryByText(/on this project/)).toBeNull();
   });

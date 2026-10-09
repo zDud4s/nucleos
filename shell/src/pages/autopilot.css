@@ -23,11 +23,25 @@
   gap: var(--space-4);
 }
 
-/* The two facts that outlived the stat cards, said as one line under the carousel. */
+/* The two facts that outlived the stat cards: the review count as a line, the window's spend as a
+   meter, side by side when there is room and stacked when there is not. */
 .ap-ledger {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-5);
+}
+
+.ap-ledger-line {
   margin: 0;
   font-size: var(--text-sm);
   color: var(--text-muted);
+}
+
+.ap-ledger-budget {
+  flex: 1 1 16rem;
+  max-width: 30rem;
 }
 
 /* =============================================================== banners == */
@@ -63,6 +77,11 @@
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
   color: var(--text-muted);
+}
+
+.ap-banner-text em {
+  font-style: italic;
+  color: var(--text);
 }
 
 /* The emergency stop: the only thing on this page that suspends everything. */
@@ -174,11 +193,10 @@
  * a control simply does not do what its neighbours do.
  */
 .ap-hedge {
-  margin: var(--space-2) 0 0;
-  font-size: var(--text-xs);
+  margin: 0;
+  font-size: var(--text-sm);
   line-height: var(--leading-normal);
-  color: var(--text-faint);
-  font-style: italic;
+  color: var(--text-muted);
 }
 
 /* ================================================================= lists == */
@@ -233,7 +251,21 @@
 .ap-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: var(--space-2);
+}
+
+/* The judge's switch and the reason a segment is shut, kept together. */
+.ap-judge-control {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.ap-judge-control > .ap-reason {
+  max-width: var(--measure-prose);
 }
 
 /* --------------------------------------------------- the project-root input -- */
@@ -291,11 +323,69 @@
  * production CSP allows; nothing here is animated by a stylesheet except the index's tick height.
  */
 
-/* Stage first, then the index that walks it, then the setting for the card in focus. */
+/**
+ * The setting for the project in focus, then the fan that pictures the roster. One column, the
+ * control first; above ~1100px the control takes the left column and the fan the rest, so the switch
+ * is on the first screen whatever the fan's height. The fan stays — it is the roster at a glance.
+ */
 .ap-fan {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
+}
+
+.ap-fan > :not(.ap-fan-control, .ap-fan-view) {
+  grid-column: 1 / -1;
+}
+
+.ap-fan-control {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
+  min-width: 0;
+}
+
+/* The fan's wrapper takes no box: the stage is a grid item of its own (right column, beside the
+   control) and the index line and readout span the whole content width under both, centred. */
+.ap-fan-view {
+  display: contents;
+}
+
+.ap-fan-index,
+.ap-fan-readout {
+  grid-column: 1 / -1;
+  justify-self: center;
+  max-width: 100%;
+}
+
+.ap-fan-readout {
+  margin-top: calc(var(--space-3) * -1);
+}
+
+.ap-fan-index {
+  margin-top: calc(var(--space-2) * -1);
+}
+
+@media (min-width: 1100px) {
+  .ap-fan {
+    grid-template-columns: minmax(22rem, 28rem) minmax(0, 1fr);
+    align-items: start;
+    column-gap: var(--space-5);
+  }
+}
+
+/* A short window: the fan keeps the top of its cards (name, mode, folder) and gives the rest of
+   the height back to the page. It is decorative, the index and the switch carry the task. */
+@media (max-height: 700px) {
+  .ap-fan-stage,
+  .ap-fan-stage-single {
+    height: calc(var(--ap-fan-card-h) * 0.45 + var(--space-4));
+  }
+
+  .ap-fan-card {
+    top: 0;
+    margin-top: var(--space-2);
+  }
 }
 
 /* The note about the three settings is prose, and takes prose's measure. */
@@ -320,28 +410,35 @@
  */
 .ap-fan-index {
   display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: var(--space-2) var(--space-4);
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  max-width: 100%;
 }
 
 .ap-fan-rail {
   display: flex;
+  flex-wrap: nowrap;
   align-items: flex-end;
   gap: 3px;
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
 
 .ap-fan-tick {
   position: relative;
   flex: 0 1 2.5rem;
-  min-width: 0.875rem;
-  height: 1.75rem;
+  min-width: 1.5rem;
+  height: 2rem;
   display: flex;
-  align-items: flex-end;
-  padding: 0 0 7px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+  padding: 0 0 5px;
   border: 0;
   border-radius: var(--radius-sm);
   background: none;
@@ -352,16 +449,35 @@
   margin-left: var(--space-3);
 }
 
+/* The mode as a shape as well as a colour: open circle off, half shadow, full acting. The empty
+   alternative text keeps the glyph out of the name, which the tab already carries. */
+.ap-fan-tick::before {
+  font-size: var(--text-sm);
+  line-height: 1;
+  color: var(--tone-off-fg);
+  content: "○";
+  content: "○" / "";
+}
+
+.ap-fan-tick-shadow::before {
+  color: var(--tone-shadow-fg);
+  content: "◐";
+  content: "◐" / "";
+}
+
+.ap-fan-tick-active::before {
+  color: var(--tone-active-fg);
+  content: "●";
+  content: "●" / "";
+}
+
 .ap-fan-tick-bar {
   display: block;
   width: 100%;
-  height: 6px;
+  height: 4px;
+  flex: none;
   border-radius: var(--radius-pill);
   background: var(--tone-off-fg);
-  /* The exception tick grows by scale, not height: a height transition re-lays the fan out on
-     every frame. It grows from the bottom, where the tick row aligns its bars. */
-  transform-origin: bottom;
-  transition: transform var(--dur-quick) var(--ease);
 }
 
 .ap-fan-tick-active .ap-fan-tick-bar {
@@ -373,7 +489,6 @@
 }
 
 .ap-fan-tick-exception .ap-fan-tick-bar {
-  transform: scaleY(2);
   background: var(--tone-paused-fg);
 }
 
@@ -402,7 +517,7 @@
   display: flex;
   align-items: baseline;
   gap: var(--space-3);
-  padding-bottom: 5px;
+  white-space: nowrap;
 }
 
 .ap-fan-position {
@@ -410,6 +525,14 @@
   font-size: var(--text-sm);
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.ap-fan-position-name {
+  font-family: var(--font-display);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
   white-space: nowrap;
 }
 
@@ -430,8 +553,8 @@
 /* The project the pointer is over, or the selected one. One line always, so hovering the index
    never moves the fan under it. */
 .ap-fan-readout {
-  margin: var(--space-1) 0 0;
-  min-height: 1.6em;
+  margin: 0;
+  min-height: 1.4em;
   font-size: var(--text-sm);
   color: var(--text-muted);
 }
@@ -453,7 +576,7 @@
   --ap-fan-card-w: 232px;
   --ap-fan-card-h: 316px;
   position: relative;
-  height: calc(var(--ap-fan-card-h) + 5rem);
+  height: calc(var(--ap-fan-card-h) + 4rem);
   overflow: hidden;
   touch-action: pan-y;
   user-select: none;
@@ -742,13 +865,16 @@
   gap: var(--space-3);
   width: 100%;
   max-width: 44rem;
-  margin-top: var(--space-2);
 }
 
 .ap-fan-focus-title {
   margin: 0;
   font-size: var(--text-sm);
   color: var(--text-muted);
+}
+
+.ap-fan-control > .ap-fan-note {
+  margin: 0;
 }
 
 .ap-fan-focus-title strong {
@@ -761,33 +887,23 @@
 }
 
 /**
- * The gate is always there, the full width of the column and at least two lines tall.
- *
- * It used to appear only for a project that was not acting, at the width of its own sentence — so
- * walking the fan moved everything below it by a box, and the page read as if the panels underneath
- * were the thing changing. Every project has something to say here; an acting one says how to stop
- * it. Its tone's full triple, and a note's 6px rather than an inline mark's 3px.
+ * The gate is the one consequence line under the project's name: what the setting means for it, or
+ * what stands in the way of the next one. A line of text and not a box — the pressed segment of the
+ * switch already says which mode this is, and a full-width tinted band said it a third time. It keeps
+ * two lines of room so the switch under it never moves as the fan turns.
  */
 .ap-fan-gate {
   align-self: stretch;
-  display: flex;
-  align-items: center;
-  min-height: calc(2lh + var(--space-4) + 2px);
+  min-height: 2lh;
   margin: 0;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--tone-active-border);
-  border-radius: var(--radius-md);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
-  color: var(--tone-active-fg);
-  background: var(--tone-active-bg);
+  color: var(--text);
 }
 
-/* Locked: the way to the third setting is not open yet, said in shadow's triple. */
+/* Locked: the way to the third setting is not open yet, said a rung quieter. */
 .ap-fan-gate-locked {
-  border-color: var(--tone-shadow-border);
-  color: var(--tone-shadow-fg);
-  background: var(--tone-shadow-bg);
+  color: var(--text-muted);
 }
 
 /* The bare 422, and the folder field that follows it, take the column's full width. `.ui-note`
@@ -1036,4 +1152,74 @@
   font-size: var(--text-sm);
   line-height: var(--leading-snug);
   color: var(--text);
+}
+
+/* ----------------------------------------------- a switch that never changes shape -- */
+
+/**
+ * Three fixed, equal segments. Measured cause of the "Let it act" segment changing width from card
+ * to card: it is a `ConfirmButton`, and a `ConfirmButton` reserves the wider of its resting label
+ * and its ARMED label ("Let <project> act") in one grid cell. The armed label carries the project
+ * id, so the segment was as wide as the focused project's name — a short name left it at its
+ * resting width, a long one stretched the whole track. (The pressed state is not it: the switch
+ * marks it with an inset rule and no weight change.) So the track is a fixed grid, the reserved
+ * hidden copy is taken out of the sizing, and the armed label is clipped with an ellipsis inside
+ * its segment — the full words are in the consequence line printed under the switch and in the
+ * accessible name. The Judge switch is the same component and gets the same track.
+ */
+.ap-fan-focus .ui-switch,
+.ap-judge-control .ui-switch {
+  display: inline-grid;
+  grid-template-columns: repeat(3, minmax(0, 9.5rem));
+  max-width: 100%;
+}
+
+.ap-judge-control .ui-switch {
+  grid-template-columns: repeat(3, minmax(0, 10.5rem));
+}
+
+.ap-fan-focus .ui-switch-seg,
+.ap-judge-control .ui-switch-seg {
+  min-width: 0;
+  text-align: center;
+}
+
+.ap-fan-focus .ui-switch-seg-wrap,
+.ap-judge-control .ui-switch-seg-wrap {
+  display: flex;
+  min-width: 0;
+}
+
+.ap-fan-focus .ui-switch-seg-wrap > .ui-confirm,
+.ap-judge-control .ui-switch-seg-wrap > .ui-confirm {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ap-fan-focus .ui-switch-seg-wrap .ui-button,
+.ap-judge-control .ui-switch-seg-wrap .ui-button {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.ap-fan-focus .ui-confirm-stack,
+.ap-judge-control .ui-confirm-stack {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.ap-fan-focus .ui-confirm-stack > [aria-hidden="true"],
+.ap-judge-control .ui-confirm-stack > [aria-hidden="true"] {
+  display: none;
+}
+
+.ap-fan-focus .ui-confirm-stack > :not([aria-hidden="true"]),
+.ap-judge-control .ui-confirm-stack > :not([aria-hidden="true"]) {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
 }

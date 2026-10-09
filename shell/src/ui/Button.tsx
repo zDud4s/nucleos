@@ -29,7 +29,7 @@ export type ButtonVariant = "approve" | "ghost" | "danger" | "danger-solid" | "l
  * weight is the same. Absent is the normal case — most buttons neither start
  * nor stop anything.
  */
-export type ButtonIntent = "go" | "stop";
+export type ButtonIntent = "go" | "stop" | "create";
 
 export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, "className"> {
   variant?: ButtonVariant;

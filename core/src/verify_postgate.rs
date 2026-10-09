@@ -54,6 +54,14 @@ impl RedPhase {
             _ => None,
         }
     }
+
+    /// The stored word for this phase, the inverse of `from_text`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RedPhase::FlakeCheck => "flake_check",
+            RedPhase::Bisect => "bisect",
+        }
+    }
 }
 
 fn probe_text(probe: Probe) -> &'static str {
@@ -116,6 +124,16 @@ impl State {
     /// A gate is running for this project.
     pub fn running(&self) -> bool {
         self.running_sha.is_some()
+    }
+
+    /// The note for a unit whose `key` (its group, or the gate command) is red on the target:
+    /// `already failing on <target>@<sha>`. `None` when `key` is not red or no sha is known.
+    pub fn already_failing(&self, key: &str) -> Option<String> {
+        if !self.red_groups.iter().any(|g| g == key) {
+            return None;
+        }
+        let sha = self.red_sha.as_ref().or(self.red_since_sha.as_ref())?;
+        Some(format!("already failing on {}@{}", self.target, sha))
     }
 
     /// A revert was started and its correction run has not been claimed yet: a new culprit must not
@@ -1171,5 +1189,48 @@ mod tests {
             Some("postgate-alpha")
         );
         assert_eq!(POSTGATE_PREFIX, "postgate-");
+    }
+
+    #[test]
+    fn already_failing_annotates_only_a_red_group_with_the_target_and_red_sha() {
+        let mut state = State {
+            project_id: "p".to_owned(),
+            target: "main".to_owned(),
+            last_green_sha: None,
+            last_attempted_sha: None,
+            running_sha: None,
+            running_request_id: None,
+            red_groups: vec!["core".to_owned()],
+            red_since_sha: Some("since0".to_owned()),
+            red_phase: None,
+            red_sha: Some("red1".to_owned()),
+            red_base_sha: None,
+            probe_sha: None,
+            probe_request_id: None,
+            probes: Vec::new(),
+            reported_sha: None,
+            culprit_sha: None,
+            candidates: Vec::new(),
+            also_suspect: Vec::new(),
+        };
+        assert_eq!(
+            state.already_failing("core").as_deref(),
+            Some("already failing on main@red1")
+        );
+        assert_eq!(state.already_failing("py"), None);
+
+        // Without a confirmed red sha the red-since sha is the fallback.
+        state.red_sha = None;
+        assert_eq!(
+            state.already_failing("core").as_deref(),
+            Some("already failing on main@since0")
+        );
+
+        // With neither there is no sha to cite, so no annotation.
+        state.red_since_sha = None;
+        assert_eq!(state.already_failing("core"), None);
+
+        assert_eq!(RedPhase::FlakeCheck.as_str(), "flake_check");
+        assert_eq!(RedPhase::Bisect.as_str(), "bisect");
     }
 }

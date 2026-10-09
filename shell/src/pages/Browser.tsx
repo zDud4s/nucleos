@@ -471,6 +471,7 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
     return (
       <div className="browser-bar-block">
         <Quiet says="no project is registered yet — a window opens on a project's profile." />
+        {unavailable && <SidecarTrouble health={health} />}
       </div>
     );
   }
