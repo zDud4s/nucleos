@@ -66,6 +66,13 @@ pub struct VerifyArgs {
     pub base: Option<String>,
     #[serde(default = "yes")]
     pub wait: bool,
+    /// F3-13: the daemon picks the base itself, from the post-merge gate's state for the project's
+    /// land target (`cover_base`), so a green run over it can stand as evidence for the tip it
+    /// measured. Only a `test`/`scope` request with no `base` and no `files`, over a clean
+    /// worktree whose map is the root's, may ask for it; anything else is refused before a row or
+    /// a unit exists.
+    #[serde(default)]
+    pub cover: bool,
 }
 
 /// The body of `POST /verify/status`.
@@ -469,6 +476,90 @@ pub(crate) async fn resolve_base(
     )))
 }
 
+/// The base a `cover` request diffs from: the post-merge gate's newest proof for the project's land
+/// target that the worktree descends from (F3-13).
+///
+/// The candidates are `covered_sha` and `last_green_sha`; each must resolve here and be an ancestor
+/// of the worktree's `HEAD`. When both qualify the newer one wins. A diff from an older green is a
+/// superset of the branch's own diff, so a base that is too old only ever selects more groups.
+async fn cover_base(
+    pool: &SqlitePool,
+    project_id: &str,
+    project_root: &Path,
+    worktree_root: &Path,
+    deadline: Instant,
+) -> Result<String, VerifyError> {
+    let Some(state) = verify_postgate::load(pool, project_id)
+        .await
+        .map_err(internal)?
+    else {
+        return Err(VerifyError::Unprocessable(format!(
+            "the post-merge gate holds no green for {project_id}"
+        )));
+    };
+    let branch = land::integration_branch(pool, project_id, project_root, deadline)
+        .await
+        .map_err(VerifyError::Unprocessable)?;
+    if state.target != branch.as_str() {
+        return Err(VerifyError::Unprocessable(format!(
+            "the post-merge gate tracks {}, not {}; there is no green to cover from",
+            state.target,
+            branch.as_str()
+        )));
+    }
+
+    let mut kept: Vec<String> = Vec::new();
+    for candidate in [state.covered_sha, state.last_green_sha]
+        .into_iter()
+        .flatten()
+    {
+        let Ok(sha) = resolve_commit(worktree_root, &candidate, deadline).await else {
+            continue;
+        };
+        if kept.contains(&sha) {
+            continue;
+        }
+        if is_ancestor(worktree_root, &sha, "HEAD", deadline).await? {
+            kept.push(sha);
+        }
+    }
+
+    match kept.as_slice() {
+        [] => Err(VerifyError::Unprocessable(format!(
+            "no green or covered commit of {branch} is in this worktree's history; merge {branch} first",
+            branch = branch.as_str()
+        ))),
+        [only] => Ok(only.clone()),
+        [first, second] => {
+            // The newer of the two is the one the other is an ancestor of; unrelated proofs are
+            // both valid bases, and the first (`covered_sha`) is the more recently measured.
+            if is_ancestor(worktree_root, first, second, deadline).await? {
+                Ok(second.clone())
+            } else {
+                Ok(first.clone())
+            }
+        }
+        _ => unreachable!("there are two candidates at most"),
+    }
+}
+
+/// Whether `ancestor` is an ancestor of `descendant` (or the same commit) in `repo`.
+async fn is_ancestor(
+    repo: &Path,
+    ancestor: &str,
+    descendant: &str,
+    deadline: Instant,
+) -> Result<bool, VerifyError> {
+    git(
+        repo,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        deadline,
+    )
+    .await
+    .map(|result| result.succeeded())
+    .map_err(VerifyError::Unprocessable)
+}
+
 /// Splits git's `-z` output into its non-empty entries.
 fn nul_separated(stdout: &str) -> impl Iterator<Item = &str> {
     stdout.split('\0').filter(|entry| !entry.is_empty())
@@ -592,6 +683,18 @@ async fn submit_checked(
     let (root, project_id) =
         resolve_worktree(pool, caller, args.worktree.as_deref(), deadline).await?;
 
+    // F3-13: `cover` only narrows what F3-12's evidence rules accept; it never widens them.
+    if args.cover
+        && (args.kind != Kind::Test
+            || args.scope != ScopeArg::Scope
+            || args.base.is_some()
+            || args.files.is_some())
+    {
+        return Err(VerifyError::BadRequest(
+            "cover is a test/scope request with no base and no files".to_owned(),
+        ));
+    }
+
     // F3-12: read before anything else is, so the tree is the one the plan below is made from. An
     // error is no tree; it never fails the request.
     let submitted_tree = if args.kind == Kind::Test && args.scope == ScopeArg::Scope {
@@ -628,6 +731,18 @@ async fn submit_checked(
     let map_trusted = submitted_tree.is_some()
         && matches!(map, MapState::Valid(_))
         && map_trusted_now(pool, &project_id, &root).await;
+    // F3-13: a cover request is worth nothing without a tree to record, so it is refused here,
+    // before any row exists, rather than run and then not count.
+    if args.cover && submitted_tree.is_none() {
+        return Err(VerifyError::Unprocessable(
+            "cover needs a clean worktree: commit or remove what is uncommitted first".to_owned(),
+        ));
+    }
+    if args.cover && !map_trusted {
+        return Err(VerifyError::Unprocessable(
+            "cover needs the project root's test map in this worktree, unchanged".to_owned(),
+        ));
+    }
     let submitted_tree = submitted_tree.filter(|_| map_trusted);
     if !map_trusted && args.kind == Kind::Test && args.scope == ScopeArg::Scope {
         tracing::info!("verify: the test map is not the root's at submit; no tree is recorded");
@@ -643,17 +758,20 @@ async fn submit_checked(
             .ok_or_else(|| {
                 VerifyError::NotFound(format!("project {project_id} has no root recorded"))
             })?;
-        Some(
+        let project_root = Path::new(&project_root);
+        Some(if args.cover {
+            cover_base(pool, &project_id, project_root, &root, deadline).await?
+        } else {
             resolve_base(
                 pool,
                 &project_id,
-                Path::new(&project_root),
+                project_root,
                 &root,
                 args.base.as_deref(),
                 deadline,
             )
-            .await?,
-        )
+            .await?
+        })
     } else {
         None
     };
@@ -1324,6 +1442,7 @@ pub(crate) async fn gate_scope_ticketed(
         files: None,
         base: None,
         wait: false,
+        cover: false,
     };
     // F3-12 (decision 3): the merge queue's integration worktree can vanish right after its ticket
     // ends, so the confirmation is awaited here as well as detached in `submit`. Idempotent. The
@@ -1626,6 +1745,7 @@ tests:
             files: files.map(|files| files.iter().map(|file| (*file).to_owned()).collect()),
             base: base.map(str::to_owned),
             wait: true,
+            cover: false,
         }
     }
 
@@ -2747,6 +2867,217 @@ tests:
         let own = args(Kind::Test, ScopeArg::Own, f.repo.path(), None, Some(&f.c1));
         let id = submit(&f.ex, Caller::Owner, &own).await.unwrap();
         assert_nothing_recorded(&f.pool, id).await;
+    }
+
+    // F3-13: `cover` asks the daemon to choose the base itself, from the post-merge gate's state,
+    // so a green run over it can be taken as evidence for the tip it was measured against.
+
+    /// Marks `sha` as the post-merge gate's last full green on `main`.
+    async fn seed_green(pool: &SqlitePool, sha: &str) {
+        verify_postgate::mark_covered(pool, "alpha", "main", sha)
+            .await
+            .unwrap();
+    }
+
+    /// A side worktree branched from `main` (so it descends from both `c1` and `c2`) that carries
+    /// one committed `py/` change, so the diff from either is not empty. The tree is clean and its
+    /// map is the root's.
+    fn side_with_py_change(f: &Fixture, holder: &Path) -> PathBuf {
+        let side = holder.join("side");
+        git_in(
+            f.repo.path(),
+            &["worktree", "add", "-q", "-b", "side", &path_arg(&side)],
+        );
+        std::fs::write(side.join("py/b.py"), "x = 2\n").unwrap();
+        git_in(&side, &["commit", "-q", "-am", "py change"]);
+        side
+    }
+
+    /// The same request, asking the daemon to pick the base.
+    fn covering(request: VerifyArgs) -> VerifyArgs {
+        VerifyArgs {
+            cover: true,
+            ..request
+        }
+    }
+
+    fn unprocessable(error: VerifyError) -> String {
+        match error {
+            VerifyError::Unprocessable(reason) => reason,
+            other => panic!("expected Unprocessable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cover_request_takes_the_last_green_as_its_base() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), true).await;
+        seed_green(&f.pool, &f.c1).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_with_py_change(&f, holder.path());
+
+        let request = covering(args(Kind::Test, ScopeArg::Scope, &side, None, None));
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+        let (ticket, _) = finished(&f.pool, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("passed"), "{ticket:?}");
+        assert_eq!(ticket.base.as_deref(), Some(f.c1.as_str()));
+        let tree = wait_measured(&f.pool, id)
+            .await
+            .expect("a clean, trusted-map cover request records its tree");
+        assert_eq!(tree, head_tree(&side));
+        let evidence = covering_request(&f.pool, "alpha", &tree, &[f.c1.as_str()])
+            .await
+            .unwrap();
+        assert_eq!(
+            evidence,
+            Some(Evidence {
+                ticket: id,
+                base: f.c1.clone()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn cover_request_prefers_the_covered_tip_over_the_older_green() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), true).await;
+        seed_green(&f.pool, &f.c1).await;
+        sqlx::query("UPDATE postgate_state SET covered_sha = ? WHERE project_id = 'alpha'")
+            .bind(&f.c2)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_with_py_change(&f, holder.path());
+
+        let request = covering(args(Kind::Test, ScopeArg::Scope, &side, None, None));
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+        let (ticket, _) = finished(&f.pool, id).await;
+
+        // `c1` is an ancestor of `c2`, so `c2` is the newer of the two proofs.
+        assert_eq!(ticket.base.as_deref(), Some(f.c2.as_str()), "{ticket:?}");
+        assert_eq!(ticket.verdict.as_deref(), Some("passed"), "{ticket:?}");
+    }
+
+    #[tokio::test]
+    async fn cover_request_refuses_a_shape_that_is_not_a_test_scope_without_base_or_files() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), false).await;
+        seed_green(&f.pool, &f.c1).await;
+        let root = f.repo.path();
+
+        let wrong = [
+            (
+                "check kind",
+                args(Kind::Check, ScopeArg::Scope, root, None, None),
+            ),
+            (
+                "own scope",
+                args(Kind::Test, ScopeArg::Own, root, None, None),
+            ),
+            (
+                "a named base",
+                args(Kind::Test, ScopeArg::Scope, root, None, Some(&f.c1)),
+            ),
+            (
+                "named files",
+                args(Kind::Test, ScopeArg::Scope, root, Some(&["py/b.py"]), None),
+            ),
+        ];
+        for (what, request) in wrong {
+            let error = submit(&f.ex, Caller::Owner, &covering(request))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, VerifyError::BadRequest(_)),
+                "{what}: {error:?}"
+            );
+        }
+
+        assert_eq!(count(&f.pool, "verify_requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn cover_request_refuses_a_worktree_that_is_not_clean() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), false).await;
+        seed_green(&f.pool, &f.c1).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_with_py_change(&f, holder.path());
+        // Untracked and not ignored: part of what would be measured, in no commit.
+        std::fs::write(side.join("py/new.py"), "y = 3\n").unwrap();
+
+        let request = covering(args(Kind::Test, ScopeArg::Scope, &side, None, None));
+        let error = submit(&f.ex, Caller::Owner, &request).await.unwrap_err();
+
+        let reason = unprocessable(error);
+        assert!(reason.contains("clean worktree"), "{reason}");
+        assert_eq!(count(&f.pool, "verify_requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn cover_request_refuses_when_the_daemon_has_no_base_to_offer() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), false).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_with_py_change(&f, holder.path());
+        let request = covering(args(Kind::Test, ScopeArg::Scope, &side, None, None));
+
+        // No post-merge row at all.
+        let error = submit(&f.ex, Caller::Owner, &request).await.unwrap_err();
+        let reason = unprocessable(error);
+        assert!(reason.contains("holds no green"), "{reason}");
+
+        // A green that is a commit made on the root's `main` after `side` branched: it is not in
+        // the worktree's history, so it cannot be the base of the worktree's diff.
+        git_in(
+            f.repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "three"],
+        );
+        let c3 = git_in(f.repo.path(), &["rev-parse", "HEAD"]);
+        seed_green(&f.pool, &c3).await;
+        let error = submit(&f.ex, Caller::Owner, &request).await.unwrap_err();
+        let reason = unprocessable(error);
+        assert!(reason.contains("main"), "names the branch: {reason}");
+
+        // A gate that tracks another branch than the project's integration branch.
+        verify_postgate::mark_covered(&f.pool, "alpha", "elsewhere", &f.c1)
+            .await
+            .unwrap();
+        let error = submit(&f.ex, Caller::Owner, &request).await.unwrap_err();
+        unprocessable(error);
+
+        assert_eq!(count(&f.pool, "verify_requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn cover_request_refuses_a_worktree_whose_map_is_not_the_roots() {
+        let f = fixture(Some(&plain_map()), Some("git --version"), false).await;
+        seed_green(&f.pool, &f.c1).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_with_py_change(&f, holder.path());
+        // Still a valid map and a clean tree, but no longer the root's bytes.
+        let map_path = side.join(tests_map::MAP_FILE);
+        let mut map = std::fs::read_to_string(&map_path).unwrap();
+        map.push_str("# changed in the worktree\n");
+        std::fs::write(&map_path, map).unwrap();
+        git_in(&side, &["commit", "-q", "-am", "map"]);
+
+        let request = covering(args(Kind::Test, ScopeArg::Scope, &side, None, None));
+        let error = submit(&f.ex, Caller::Owner, &request).await.unwrap_err();
+
+        let reason = unprocessable(error);
+        assert!(reason.contains("test map"), "{reason}");
+        assert_eq!(count(&f.pool, "verify_requests").await, 0);
+    }
+
+    #[test]
+    fn verify_args_default_cover_to_false_and_still_deny_unknown_fields() {
+        let body = serde_json::json!({ "kind": "test", "scope": "scope" });
+        let parsed = serde_json::from_value::<VerifyArgs>(body).unwrap();
+        assert!(!parsed.cover);
+
+        let body = serde_json::json!({ "kind": "test", "scope": "scope", "cover": true });
+        assert!(serde_json::from_value::<VerifyArgs>(body).unwrap().cover);
+
+        let body = serde_json::json!({ "kind": "test", "scope": "scope", "bogus": 1 });
+        assert!(serde_json::from_value::<VerifyArgs>(body).is_err());
     }
 
     #[tokio::test]
