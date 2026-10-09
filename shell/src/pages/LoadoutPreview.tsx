@@ -1,7 +1,7 @@
 import { useId, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { apiFetch } from "../data/client";
-import { Badge, Button, ErrorNote, Field, Quiet } from "../ui";
+import { Button, ErrorNote, Field, Quiet } from "../ui";
 import "./loadout-preview.css";
 
 type PreviewBox = "team" | "job_node";
@@ -112,7 +112,7 @@ function PreviewResult({ answer }: { answer: LoadoutPreviewAnswer }) {
             {tools.map((tool) => (
               <li key={tool.name}>
                 <code>{tool.name}</code>
-                <Badge tone={tool.origin === "base" ? "off" : "info"}>{ORIGIN[tool.origin]}</Badge>
+                <span className="loadout-preview-muted">{ORIGIN[tool.origin]}</span>
               </li>
             ))}
           </ul>
@@ -131,7 +131,7 @@ function PreviewResult({ answer }: { answer: LoadoutPreviewAnswer }) {
                   {ref.kind}, {ref.owner_kind}
                   {ref.note ? ` — ${ref.note}` : ""}
                 </span>
-                {ref.state === "missing" && <Badge tone="danger">missing</Badge>}
+                {ref.state === "missing" && <span className="loadout-preview-missing">missing</span>}
               </li>
             ))}
           </ul>
