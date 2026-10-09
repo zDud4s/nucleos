@@ -95,6 +95,7 @@ const LANE_OF: Record<string, FeedLane> = {
   vcs_resolution_cancelled: "git",
   vcs_resolution_discarded: "git",
   land_resolution_failed: "git",
+  postgate_red: "git",
 
   team_run_started: "teams",
   team_run_finished: "teams",
