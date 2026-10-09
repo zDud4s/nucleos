@@ -996,8 +996,9 @@ struct Attempts {
     last: Instant,
 }
 
-/// Failed attempts per `(project, fix branch)`. In memory on purpose: no migration, and a daemon
-/// restart is a human act that may start over.
+/// Failed attempts per `(project, fix branch)`. In memory on purpose: no migration. A restart forgets
+/// the count, which only matters to a branch whose claim was given back: one that gave up keeps
+/// `fix_run_id = 0` in its row and stays given up.
 static CORRECTION_TRIES: LazyLock<Mutex<HashMap<(String, String), Attempts>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -1033,13 +1034,36 @@ fn record_failure(row: &PendingCorrection) -> u32 {
     attempts.count
 }
 
+/// `d` as the feed says it: whole minutes when it is a whole number of them, seconds otherwise.
+fn backoff_text(d: Duration) -> String {
+    match d.as_secs() {
+        60 => "1 minute".to_owned(),
+        s if s > 60 && s.is_multiple_of(60) => format!("{} minutes", s / 60),
+        1 => "1 second".to_owned(),
+        s => format!("{s} seconds"),
+    }
+}
+
+/// What the feed says comes next after a definitive failure. `retry`: attempts remain;
+/// `released`: the claim went back to `None`. A claim that could not be released stays at 0, and
+/// `open_corrections` only picks `fix_run_id IS NULL`, so nothing will try that branch again.
+fn correction_outcome(retry: bool, released: bool) -> String {
+    match (retry, released) {
+        (true, true) => format!("trying again in {}", backoff_text(CORRECTION_BACKOFF)),
+        (true, false) => "the claim could not be released, so nothing will retry it".to_owned(),
+        (false, _) => "gave up".to_owned(),
+    }
+}
+
 /// Opens one correction run for every prepared `fix/` branch that has none, and returns their ids.
 ///
 /// A branch is claimed (`fix_run_id = 0`) before its run is asked for, so a run is never attempted
 /// twice at once. A full project or disk gives the claim back and the next pass asks again; any
 /// other failure gives it back too, up to `CORRECTION_ATTEMPTS` times and `CORRECTION_BACKOFF`
-/// apart (counted in this process, so a restart starts over), and the last one leaves the claim at 0
-/// and says in the feed that it gave up. The kill switch and the budget stop
+/// apart, and the last one leaves the claim at 0 and says in the feed that it gave up. The count is
+/// kept in this process, so a restart resets it only for a branch whose claim was given back; a
+/// branch that gave up, or whose claim could not be released, keeps `fix_run_id = 0` across
+/// restarts and is not picked again. The kill switch and the budget stop
 /// it like any other run the daemon starts on its own; a switch that cannot be read stops it too.
 pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
     let pool = &state.pool;
@@ -1151,17 +1175,21 @@ pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
                 );
                 let count = record_failure(&row);
                 let retry = after_failure(count);
-                if retry && let Err(error) = set_fix_run(pool, &row, None).await {
-                    tracing::warn!(
-                        project = %row.project_id, %error,
-                        "postgate: cannot release a correction claim"
-                    );
-                }
-                let outcome = if retry {
-                    "trying again in 10 minutes"
+                let released = if retry {
+                    match set_fix_run(pool, &row, None).await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::warn!(
+                                project = %row.project_id, %error,
+                                "postgate: cannot release a correction claim"
+                            );
+                            false
+                        }
+                    }
                 } else {
-                    "gave up"
+                    false
                 };
+                let outcome = correction_outcome(retry, released);
                 let _ = crate::feed::append(
                     pool,
                     Some(&row.project_id),
@@ -2492,5 +2520,34 @@ mod tests {
             lines,
             "the second pass wrote nothing to the feed"
         );
+    }
+
+    /// F3-11: the backoff in the feed is derived from `CORRECTION_BACKOFF`, not typed by hand.
+    #[test]
+    fn backoff_text_names_whole_minutes_and_falls_back_to_seconds() {
+        assert_eq!(backoff_text(CORRECTION_BACKOFF), "10 minutes");
+        assert_eq!(backoff_text(Duration::from_secs(60)), "1 minute");
+        assert_eq!(backoff_text(Duration::from_secs(90)), "90 seconds");
+    }
+
+    /// F3-11: a released claim will be picked again, and the feed says when.
+    #[test]
+    fn correction_outcome_after_a_released_claim_names_the_backoff() {
+        assert_eq!(correction_outcome(true, true), "trying again in 10 minutes");
+    }
+
+    /// F3-11: a claim that could not be released stays at 0, so the feed must not promise a retry.
+    #[test]
+    fn correction_outcome_after_a_failed_release_says_nothing_will_retry() {
+        let outcome = correction_outcome(true, false);
+        assert!(!outcome.contains("trying again"), "{outcome}");
+        assert!(outcome.contains("nothing will retry"), "{outcome}");
+    }
+
+    /// F3-11: on the last attempt the feed gives up, whether or not a release was tried.
+    #[test]
+    fn correction_outcome_after_the_last_attempt_says_it_gave_up() {
+        assert_eq!(correction_outcome(false, true), "gave up");
+        assert_eq!(correction_outcome(false, false), "gave up");
     }
 }

@@ -83,6 +83,23 @@ describe("PostMergePanel", () => {
     expect(screen.queryByRole("heading", { name: "Post-merge gate" })).toBeNull();
   });
 
+  it("says the post-merge state could not be read, with the error, instead of drawing nothing", () => {
+    render(
+      <PostMergePanel
+        rules={rules({
+          postgate: null,
+          postgate_error: "the post-merge state could not be read; see the daemon log",
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Post-merge gate" })).toBeDefined();
+    expect(screen.getByText("The post-merge state could not be read.")).toBeDefined();
+    expect(screen.getByText(/see the daemon log/)).toBeDefined();
+    expect(screen.queryByText(/No result on/)).toBeNull();
+    expect(screen.queryByText(/is green/)).toBeNull();
+  });
+
   it("shows a red target with its groups, since, culprit and range, and offers no control", () => {
     render(
       <PostMergePanel
