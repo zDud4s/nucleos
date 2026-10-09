@@ -1,9 +1,12 @@
+import { useState } from "react";
 import { isApiRefusal } from "../../data/client";
 import {
+  APPROVABLE_SCOPES,
   groupWaiting,
   useApproveKnowledge,
   useDecideKnowledgeBatch,
   useRejectKnowledge,
+  type ApproveInput,
   type Known,
 } from "../../data/knowledge";
 import {
@@ -122,25 +125,14 @@ export function WaitingPanel({ rows }: WaitingPanelProps) {
                         // the row has to say in place of its two buttons.
                         <Quiet says="no question to answer — decide in the daemon" />
                       ) : (
-                        <>
-                          <Button
-                            variant="approve"
-                            onClick={() =>
-                              approve.mutate(row.proposal_id as number)
-                            }
-                            disabled={deciding}
-                          >
-                            Approve
-                          </Button>
-                          <Button
-                            onClick={() =>
-                              reject.mutate(row.proposal_id as number)
-                            }
-                            disabled={deciding}
-                          >
-                            Refuse
-                          </Button>
-                        </>
+                        <RowDecisions
+                          proposalId={row.proposal_id}
+                          declaredKind={row.scope_kind}
+                          declaredId={row.scope_id}
+                          approve={approve}
+                          reject={reject}
+                          deciding={deciding}
+                        />
                       )
                     }
                   />
@@ -150,6 +142,75 @@ export function WaitingPanel({ rows }: WaitingPanelProps) {
           );
         })}
       </Panel>
+    </>
+  );
+}
+
+/**
+ * Approve and Refuse for one row, with the scope the approval lands in.
+ *
+ * The kind starts at the row's declared one when that can be approved with an
+ * id, and at "as declared" otherwise (a machine row has no id to give); with
+ * "as declared" the approval carries no scope and the daemon keeps the row's own.
+ */
+function RowDecisions({
+  proposalId,
+  declaredKind,
+  declaredId,
+  approve,
+  reject,
+  deciding,
+}: {
+  proposalId: number;
+  declaredKind: Known["scope_kind"];
+  declaredId: string | null;
+  approve: { mutate: (input: ApproveInput) => void };
+  reject: { mutate: (proposalId: number) => void };
+  deciding: boolean;
+}) {
+  const declaredApprovable = (APPROVABLE_SCOPES as readonly string[]).includes(declaredKind);
+  const [kind, setKind] = useState<string>(declaredApprovable ? declaredKind : "");
+  const [id, setId] = useState<string>(declaredId ?? "");
+  const trimmed = id.trim();
+
+  return (
+    <>
+      <span className="learned-scope-chooser">
+        <select
+          aria-label="Approve into"
+          value={kind}
+          onChange={(event) => setKind(event.target.value)}
+          disabled={deciding}
+        >
+          {!declaredApprovable && <option value="">as declared</option>}
+          {APPROVABLE_SCOPES.map((scope) => (
+            <option key={scope} value={scope}>
+              {scope}
+            </option>
+          ))}
+        </select>
+        {kind !== "" && (
+          <input
+            type="text"
+            aria-label="Scope id"
+            value={id}
+            onChange={(event) => setId(event.target.value)}
+            disabled={deciding}
+          />
+        )}
+      </span>
+      <Button
+        variant="approve"
+        onClick={() =>
+          approve.mutate(kind === "" ? proposalId : { proposalId, scope: `${kind}:${trimmed}` })
+        }
+        disabled={deciding || (kind !== "" && trimmed === "")}
+      >
+        Approve
+      </Button>
+      <Button onClick={() => reject.mutate(proposalId)} disabled={deciding}>
+        Refuse
+      </Button>
     </>
   );
 }

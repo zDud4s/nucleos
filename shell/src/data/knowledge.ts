@@ -55,7 +55,13 @@ export type KnownLayer = "semantic" | "episodic" | "procedural" | "working";
  * Whose it is. Two columns rather than one, because a `job` is not
  * a project and a single nullable `project_id` could not say so.
  */
-export type KnownScope = "machine" | "project" | "job";
+export type KnownScope = "machine" | "project" | "team" | "agent" | "job";
+
+/** The scope kinds a pending refinement can be approved into, with an id. */
+export const APPROVABLE_SCOPES = ["project", "team", "agent"] as const;
+
+/** A proposal id alone approves as declared; with `scope` (`kind:id`) it is sent as the target. */
+export type ApproveInput = number | { proposalId: number; scope?: string };
 
 /**
  * A row's status.
@@ -379,9 +385,14 @@ function useKnowledgeDecision<Input, Result>(mutationFn: (input: Input) => Promi
  * and decides the question in one transaction.
  */
 export function useApproveKnowledge() {
-  return useKnowledgeDecision((proposalId: number) =>
-    apiFetch<{ refinement_id: number }>(`/proposals/${proposalId}/approve`, { method: "POST" }),
-  );
+  return useKnowledgeDecision((input: ApproveInput) => {
+    const proposalId = typeof input === "number" ? input : input.proposalId;
+    const scope = typeof input === "number" ? undefined : input.scope;
+    return apiFetch<{ refinement_id: number }>(
+      `/proposals/${proposalId}/approve`,
+      scope === undefined ? { method: "POST" } : { method: "POST", body: JSON.stringify({ scope }) },
+    );
+  });
 }
 
 /** No — kept as a refusal rather than as an absence. 204, so no body to read. */

@@ -13,6 +13,8 @@ import { Agents } from "./Agents";
 import { ApiRefusal } from "../data/client";
 import type { Agent, Employer } from "../data/agents";
 import { daemonFetch, daemonState, renderApp, renderWithQuery } from "../test/harness";
+import { known } from "../brain/knowledge/test-helpers";
+import type { Known } from "../data/knowledge";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -59,6 +61,7 @@ function agentsFetch(
   rows: Agent[],
   opts: {
     teams?: Employer[];
+    knowledge?: Known[];
     onCreate?: (body: Record<string, unknown>) => unknown;
     onUpdate?: (id: string, body: Record<string, unknown>) => unknown;
     onDelete?: (id: string) => unknown;
@@ -75,6 +78,7 @@ function agentsFetch(
   */
   return async (path, init) => {
     if (path === "/teams") return (opts.teams ?? []).map((row) => ({ ...row }));
+    if (path === "/knowledge") return (opts.knowledge ?? []).map((row) => ({ ...row }));
 
     if (path === "/agents" && init?.method === "POST") {
       const body = JSON.parse(init.body as string) as Record<string, unknown>;
@@ -587,6 +591,30 @@ describe("Agents - an empty catalogue", () => {
     expect(await screen.findByRole("heading", { name: "No agent has been hired yet" })).toBeDefined();
     expect(screen.getByText(/a name, a speciality/i)).toBeDefined();
     expect(screen.queryByRole("table")).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------- the own memory -- */
+
+describe("Agents - the agent's own memory", () => {
+  it("the agent editor shows the agent's own memory", async () => {
+    daemon.apiFetch.mockImplementation(
+      agentsFetch([agent()], {
+        knowledge: [
+          known({ id: 1, scope_kind: "agent", scope_id: "copywriter", title: "Copy is short" }),
+          known({ id: 2, scope_kind: "agent", scope_id: "other", title: "Someone else's habit" }),
+          known({ id: 3, scope_kind: "project", scope_id: "nucleos", title: "A project fact" }),
+        ],
+      }),
+    );
+    renderWithQuery(<Agents />);
+
+    const dialog = await openEditor("copywriter");
+    const memory = await within(dialog).findByRole("region", { name: "Memory" });
+
+    expect(await within(memory).findByText("Copy is short")).toBeDefined();
+    expect(within(memory).queryByText("Someone else's habit")).toBeNull();
+    expect(within(memory).queryByText("A project fact")).toBeNull();
   });
 });
 

@@ -163,3 +163,96 @@ describe("WaitingPanel", () => {
     expect(screen.queryByRole("button", { name: /Refuse all/ })).toBeNull();
   });
 });
+
+describe("WaitingPanel - scope chooser", () => {
+  const posts = () => daemon.apiFetch.mock.calls.filter(([, init]) => init?.method === "POST");
+
+  it("scope chooser sends the row's declared scope by default", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({
+          id: 1,
+          status: "proposed",
+          proposal_id: 11,
+          scope_kind: "project",
+          scope_id: "nucleos",
+        }),
+      ]),
+    );
+
+    await renderWaiting();
+    const kind = await screen.findByRole("combobox", { name: "Approve into" });
+    expect((kind as HTMLSelectElement).value).toBe("project");
+    expect((screen.getByRole("textbox", { name: "Scope id" }) as HTMLInputElement).value).toBe(
+      "nucleos",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    const [path, init] = posts()[0];
+    expect(path).toBe("/proposals/11/approve");
+    expect(JSON.parse(init.body as string).scope).toBe("project:nucleos");
+  });
+
+  it("scope chooser sends the scope the owner chose", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([known({ id: 1, status: "proposed", proposal_id: 11 })]),
+    );
+
+    await renderWaiting();
+    fireEvent.change(await screen.findByRole("combobox", { name: "Approve into" }), {
+      target: { value: "agent" },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "Scope id" }), {
+      target: { value: "copywriter" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    const [path, init] = posts()[0];
+    expect(path).toBe("/proposals/11/approve");
+    expect(JSON.parse(init.body as string).scope).toBe("agent:copywriter");
+  });
+
+  it("scope chooser approves a machine row with no scope until one is chosen", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({
+          id: 1,
+          status: "proposed",
+          proposal_id: 11,
+          scope_kind: "machine",
+          scope_id: null,
+        }),
+      ]),
+    );
+
+    await renderWaiting();
+    await screen.findByRole("combobox", { name: "Approve into" });
+    expect(screen.queryByRole("textbox", { name: "Scope id" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+
+    await waitFor(() => expect(posts()).toHaveLength(1));
+    expect(posts()[0][0]).toBe("/proposals/11/approve");
+    expect(posts()[0][1]).toEqual({ method: "POST" });
+  });
+
+  it("scope chooser disables approve while the id is empty", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([known({ id: 1, status: "proposed", proposal_id: 11 })]),
+    );
+
+    await renderWaiting();
+    const id = await screen.findByRole("textbox", { name: "Scope id" });
+    const approve = screen.getByRole("button", { name: "Approve" });
+    expect(approve.hasAttribute("disabled")).toBe(false);
+
+    fireEvent.change(id, { target: { value: "" } });
+    expect(approve.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(approve);
+    expect(posts()).toEqual([]);
+
+    fireEvent.change(id, { target: { value: "nucleos" } });
+    expect(approve.hasAttribute("disabled")).toBe(false);
+  });
+});

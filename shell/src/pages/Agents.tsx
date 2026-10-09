@@ -18,6 +18,7 @@ import {
   type Employment,
 } from "../data/agents";
 import { useTeams } from "../data/teams";
+import { ScopedMemory } from "../brain/knowledge/ScopedMemory";
 import {
   Button,
   ConfirmButton,
@@ -825,6 +826,8 @@ function AgentEditor({
         </p>
       </form>
       {update.isError && <SaveRefusal error={update.error} />}
+
+      <ScopedMemory scopeKind="agent" scopeId={agent.id} />
 
       {/*
         The delete, and what this page can see standing on it — before the
