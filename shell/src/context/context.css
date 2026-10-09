@@ -1,0 +1,59 @@
+/* The Context section sits under the Memory section on the agent editor and the Charter. */
+.context-refs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+
+.context-lede {
+  margin: 0;
+  max-width: var(--measure);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.context-head,
+.context-note {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.context-path {
+  overflow-wrap: anywhere;
+}
+
+.context-note {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.context-note-none {
+  color: var(--text-faint);
+}
+
+.context-add {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.context-add .ui-field {
+  flex: 1 1 14rem;
+}
+
+.context-kind {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* The flag is a word, not a badge: a badge tone is authored by the state map, and "missing" is a
+   fact about a path on disk, not a state the núcleo's machines move through. */
+.context-missing {
+  font-size: var(--text-xs);
+  color: var(--tone-danger-fg);
+}

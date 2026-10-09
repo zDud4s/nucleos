@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useAgents } from "../data/agents";
+import { ContextRefs } from "../context/ContextRefs";
 import { ScopedMemory } from "../brain/knowledge/ScopedMemory";
 import { isApiRefusal } from "../data/client";
 import {
@@ -180,6 +181,7 @@ export function Charter({ team, runs }: CharterProps) {
   return (
     <>
       <TeamForm existing={team} runs={runs} />
+      <ContextRefs ownerKind="team" ownerId={team.id} />
       <ScopedMemory scopeKind="team" scopeId={team.id} />
     </>
   );
