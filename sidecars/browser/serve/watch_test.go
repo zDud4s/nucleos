@@ -460,8 +460,8 @@ func TestWatchWritesMBeforeTheFirstFrameAndWhenItChanges(t *testing.T) {
 // TestWatchRecordKindsAreFixed. The kind bytes are the wire format; adding M and P must not move F
 // and E.
 func TestWatchRecordKindsAreFixed(t *testing.T) {
-	if RecordFrame != 'F' || RecordEnd != 'E' || RecordMeta != 'M' || RecordPrompt != 'P' {
-		t.Fatalf("record kinds drifted: F=%q E=%q M=%q P=%q", RecordFrame, RecordEnd, RecordMeta, RecordPrompt)
+	if RecordFrame != 'F' || RecordEnd != 'E' || RecordMeta != 'M' || RecordPrompt != 'P' || RecordPanel != 'N' {
+		t.Fatalf("record kinds drifted: F=%q E=%q M=%q P=%q N=%q", RecordFrame, RecordEnd, RecordMeta, RecordPrompt, RecordPanel)
 	}
 }
 

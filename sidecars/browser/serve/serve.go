@@ -66,6 +66,7 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 	mux.HandleFunc("/watch", authorized(cfg.DaemonToken, watchHandler(watcher)))
 
 	personRoutes(mux, cfg.DaemonToken, driver)
+	panelRoutes(mux, cfg.DaemonToken, driver)
 
 	server := &http.Server{
 		Addr:              cfg.Addr,

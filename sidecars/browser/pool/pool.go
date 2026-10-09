@@ -111,6 +111,8 @@ type Pool struct {
 	pending int
 	// watchers are the open Watch calls, so a session that ends can end its viewers (watch.go).
 	watchers map[browser.SessionID]map[*viewer]struct{}
+	// panelListeners are the open PanelEvents calls, ended the same way (panel.go).
+	panelListeners map[browser.SessionID]map[*panelListener]struct{}
 }
 
 // placed is one session: the browser it lives in, and the id THAT browser knows it by.
@@ -278,6 +280,7 @@ func (p *Pool) Close(ctx context.Context, id browser.SessionID) error {
 		return err
 	}
 	p.endWatchers(browser.EndClosed, id)
+	p.endPanelListeners(browser.PanelSessionClosed, id)
 	closeErr := session.holder.driver.Close(ctx, session.inner)
 	// A session closed while a person held it (core gives up on them) must not leave the profile
 	// marked, or every later open would be refused.
@@ -308,6 +311,7 @@ func (p *Pool) Shutdown(ctx context.Context) {
 	p.mu.Unlock()
 
 	p.endWatchers(browser.EndGone, gone...)
+	p.endPanelListeners(browser.PanelSessionClosed, gone...)
 	for _, holder := range holders {
 		<-holder.ready
 		if holder.driver != nil {

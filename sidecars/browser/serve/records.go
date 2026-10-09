@@ -23,6 +23,8 @@ const (
 	RecordMeta byte = 'M'
 	// RecordPrompt carries a prompt for the viewer to answer, as JSON.
 	RecordPrompt byte = 'P'
+	// RecordPanel carries one event of the panel channel (/panel/events), as JSON.
+	RecordPanel byte = 'N'
 )
 
 // MaxRecord bounds what ReadRecord will allocate for one record.
