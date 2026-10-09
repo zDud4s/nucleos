@@ -1,61 +1,431 @@
 /**
- * The Brain slice: the capture box, its filters and the note rows. `brain-` throughout.
- * No class appears in the component that is not defined below.
+ * The Brain page: a tally and the view switch in the header, the composer, and a desk of two
+ * columns — what you are looking through on the left, the one thing open on the right. `brain-`
+ * throughout. No class appears in the component that is not defined here, in
+ * `brain/unified-list.css`, `brain/force-graph.css`, `brain/capture.css` or `knowledge.css`.
+ *
+ * The right column is always there, open or not. A panel that appears only on selection moves
+ * the list sideways under the pointer that just clicked it — the row you chose jumps away from
+ * you, which is the opposite of what selecting it was for.
  */
-.brain-capture {
+
+/* ----------------------------------------------------------------- header -- */
+
+.brain-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+}
+
+/* Figures from the daemon: the figure in the display face, its unit in the body face. */
+.brain-tally {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-4);
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.brain-tally b {
+  margin-right: 0.3em;
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+/* The only figure that asks something of you takes the tone that means exactly that. */
+.brain-tally-asks,
+.brain-tally-asks b {
+  color: var(--tone-pending-fg);
+}
+
+/* ------------------------------------------------------------------- page -- */
+
+.brain-page {
+  /* Identity hues — a note, a knowledge layer, an entity. Shared by the list's row marks and the
+     graph's nodes so the two views read with one key. Declared here and on `.brain-force` (which
+     the canvas reads), never as a state tone: see `force-graph.css`. */
+  --brain-note: #8fb4ff;
+  --brain-k-semantic: #c49bff;
+  --brain-k-episodic: #ff9ec7;
+  --brain-k-procedural: #7fdcc0;
+  --brain-k-working: #f5c46b;
+  --brain-project: #f09168;
+  --brain-contact: #9fd36f;
+  --brain-mail: #7ec8e3;
+  --brain-file: #b9c0cc;
+
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-bottom: 16px;
+  gap: var(--space-5);
 }
 
-.brain-capture-label {
-  font-size: 11px;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+@media (prefers-color-scheme: light) {
+  .brain-page {
+    --brain-note: #2f62c9;
+    --brain-k-semantic: #7a3fd0;
+    --brain-k-episodic: #c23b7d;
+    --brain-k-procedural: #13836a;
+    --brain-k-working: #a06c00;
+    --brain-project: #b4531f;
+    --brain-contact: #4d8a17;
+    --brain-mail: #1f7fa3;
+    --brain-file: #5f6875;
+  }
 }
 
-.brain-capture-input {
-  width: 100%;
-  resize: vertical;
-  font: inherit;
-}
+/* --------------------------------------------------------------- composer -- */
 
-.brain-capture-foot {
+/**
+ * One box: the text, a rule, and a foot carrying the shortcut and the button. The field has no
+ * frame of its own inside it — a bordered field inside a bordered box is two boxes for one act —
+ * so the box itself takes the focus state.
+ */
+.brain-compose {
   display: flex;
-  align-items: center;
-  gap: 12px;
+  flex-direction: column;
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  transition: border-color var(--dur-quick) var(--ease);
 }
 
-.brain-filters {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 16px;
-  margin-bottom: 12px;
+.brain-compose:focus-within {
+  border-color: var(--border-strong);
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
 }
 
-.brain-search {
-  min-width: 220px;
-  font: inherit;
-}
-
-.brain-row {
+.brain-compose-input {
   display: block;
+  width: 100%;
+  min-height: 3.5rem;
+  max-height: 16rem;
+  /* Grows with what is written, down to two lines and up to the cap; WebView2 is Chromium. */
+  field-sizing: content;
+  padding: var(--space-4) var(--space-4) var(--space-3);
+  border: 0;
+  background: none;
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-md);
+  line-height: var(--leading-normal);
+  resize: none;
+  caret-color: var(--text);
 }
 
+.brain-compose-input:focus,
+.brain-compose-input:focus-visible {
+  outline: none;
+}
+
+.brain-compose-input::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+.brain-compose-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3) var(--space-2) var(--space-4);
+  border-top: var(--hairline) solid var(--border);
+}
+
+.brain-compose-hint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.brain-compose-hint kbd {
+  display: inline-block;
+  min-width: 1.5em;
+  padding: 0.05rem 0.35rem;
+  border: var(--hairline) solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+/* ------------------------------------------------------------------- desk -- */
+
+.brain-desk {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 23rem;
+  align-items: start;
+  gap: var(--space-5);
+}
+
+.brain-desk-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+/**
+ * The open item. Sticky, so a long list scrolls under it and what you picked stays in view; and
+ * capped at the window, scrolling inside itself, so its foot is never out of reach.
+ */
+.brain-aside {
+  position: sticky;
+  top: var(--space-4);
+  max-height: calc(100vh - var(--space-6));
+  overflow-y: auto;
+  padding: var(--space-5);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Holding the queue, the aside drops its own frame: the two panels inside are the cards, and a
+   card inside a card would read as one thing nested in another. */
+.brain-aside.brain-aside-asks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+}
+
+/* Close sits on its own line at the top of the open item: the way back to the queue. */
+.brain-aside-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin: calc(var(--space-2) * -1) calc(var(--space-2) * -1) var(--space-2) 0;
+}
+
+.brain-aside-close {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 1.75rem;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background-color var(--dur-quick) var(--ease), color var(--dur-quick) var(--ease);
+}
+
+.brain-aside-close:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--text);
+}
+
+.brain-aside-close:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.brain-aside-empty {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-6) var(--space-2);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* The graph's own empty answer is a `Quiet` line from `BrainPanel`; in the aside it takes the
+   same weight as the list's empty state rather than sitting in the corner. */
+.brain-aside > .ui-quiet {
+  padding: var(--space-6) var(--space-2);
+  text-align: center;
+}
+
+.brain-aside-empty p {
+  margin: 0;
+}
+
+.brain-aside-empty-title {
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+@media (max-width: 60rem) {
+  /* The tally and the switch need the header's width; below the breakpoint they drop under the
+     title instead of squeezing the headline into one word per line. */
+  .ui-page-header:has(.brain-head) {
+    flex-wrap: wrap;
+  }
+
+  .ui-page-header:has(.brain-head) .ui-page-actions {
+    flex-basis: 100%;
+  }
+
+  .brain-head {
+    flex-wrap: wrap;
+    justify-content: space-between;
+    width: 100%;
+    gap: var(--space-3);
+  }
+
+  .brain-desk {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .brain-aside {
+    position: static;
+    max-height: none;
+  }
+
+  /* In one column the queue goes first: under a long list it would never be seen. */
+  .brain-aside.brain-aside-asks {
+    order: -1;
+  }
+}
+
+/* ------------------------------------------------------------- graph bar -- */
+
+.brain-bar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.brain-bar-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+}
+
+.brain-bar-end {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.brain-bar-end .brain-chip {
+  font-family: var(--font-body);
+}
+
+.brain-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+/**
+ * A toggle chip: on is one rung up and the full text colour, off is the panel showing through
+ * and the label muted. A rung, never a hue — the dot beside a node kind is identity (the graph's
+ * key), not the chip's state, and it dims with the chip so "off" reads in the key as well.
+ */
+.brain-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0.22rem var(--space-3);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-pill);
+  background: none;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-quick) var(--ease),
+    border-color var(--dur-quick) var(--ease),
+    color var(--dur-quick) var(--ease);
+}
+
+.brain-chip:hover {
+  border-color: var(--text-faint);
+  color: var(--text);
+}
+
+.brain-chip[aria-pressed="true"] {
+  border-color: var(--border-strong);
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.brain-chip[aria-pressed="false"] .unified-mark {
+  opacity: var(--opacity-disabled);
+}
+
+/* Link types are a second, quieter rank under the line: mono, because they are the daemon's words. */
+.brain-chip-link {
+  padding: 0.12rem var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* ------------------------------------------------------------ item panel -- */
+
+.brain-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+.brain-panel h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  line-height: var(--leading-snug);
+  overflow-wrap: anywhere;
+}
+
+/* Section heads inside the panel: the app's section title, small and tracked. */
+.brain-panel h4 {
+  margin: 0;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.brain-panel-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-bottom: var(--space-4);
+  border-bottom: var(--hairline) solid var(--border);
+}
+
+/* The note itself, the thing you opened: the largest text on the panel, read rather than scanned. */
 .brain-text {
   margin: 0;
+  font-size: var(--text-md);
+  line-height: var(--leading-relaxed);
+  color: var(--text);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
 .brain-meta {
   display: flex;
-  gap: 12px;
-  margin-top: 4px;
-  font-size: 12px;
-  opacity: 0.7;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
 }
 
 .brain-origin,
@@ -63,15 +433,153 @@
   text-transform: lowercase;
 }
 
-/* The graph side: a bar above the canvas, the canvas, and the panel beside it. The canvas styles
-   itself (`brain/force-graph.css`). */
-.brain-graph { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 12px; }
-.brain-graph-main { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.brain-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
-.brain-local { display: flex; flex-direction: column; gap: 6px; }
-.brain-local-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; }
-.brain-local-head h4 { margin: 0; }
-.brain-node-tag { margin-left: 6px; font-size: 10px; text-transform: uppercase; }
-.brain-panel { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-.brain-panel ul { margin: 0; padding-left: 16px; }
-.brain-panel-form { display: flex; flex-wrap: wrap; gap: 6px; }
+.brain-meta-end {
+  margin-left: auto;
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+}
+
+.brain-sec {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.brain-node-tag {
+  margin-left: var(--space-2);
+  padding: 0 var(--space-2);
+  border: var(--hairline) solid var(--tone-off-border);
+  border-radius: var(--radius-pill);
+  background: var(--tone-off-bg);
+  color: var(--tone-off-fg);
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
+/* A link: its type in the daemon's words, what it points at, and its one action at the end. */
+.brain-links {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.brain-links li {
+  display: grid;
+  grid-template-columns: 5.5rem minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  border-top: var(--hairline) solid var(--border);
+  font-size: var(--text-sm);
+}
+
+.brain-links li:first-child {
+  border-top: 0;
+}
+
+.brain-link-type {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.brain-link-target {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.brain-link-target .ui-button-quiet {
+  text-align: left;
+}
+
+.brain-history {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.brain-history li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.brain-history-kind {
+  color: var(--text);
+}
+
+.brain-local {
+  gap: var(--space-2);
+}
+
+.brain-local-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+/* Teach and add-link: a row of controls that wraps as one, every control the same height. */
+.brain-panel-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.brain-addlink {
+  margin-top: var(--space-1);
+}
+
+.brain-panel-form > select,
+.brain-panel-form > input {
+  height: 2rem;
+  padding: 0 var(--space-2);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.brain-panel-form > input {
+  flex: 1 1 8rem;
+  min-width: 0;
+}
+
+/* Mono is for the daemon's values (a kind, an id, a path); a title is the owner's words. */
+.brain-panel-form > input.brain-prose-input {
+  font-family: var(--font-body);
+}
+
+.brain-panel-form > input::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+.brain-panel-form > select:focus-visible,
+.brain-panel-form > input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.brain-panel [role="status"] {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}

@@ -408,26 +408,15 @@ describe("Browser - health", () => {
 
     await renderBrowser();
 
-    const heading = await screen.findByRole("heading", { level: 2, name: "Browser health" });
-    const panel = heading.closest("section");
-    expect(panel).not.toBeNull();
+    // The line under the bar: the browser's own last failure and restart count, from the row of
+    // `GET /sidecars` matched by the literal "browser" — not the health probe's "browser_sidecar".
+    const line = (await screen.findByText(/exited: exit code: 1/)).closest("p");
+    expect(line).not.toBeNull();
+    expect(line?.textContent).toMatch(/3 restarts/);
 
-    // The daemon answered with THREE subsystems and this call site asked for
-    // ONE — the browser's own reason made it onto the page...
-    await waitFor(() => expect(panel?.textContent).toMatch(/not-running/));
-    // ...and the other subsystem's reason did not, proving it was filtered
-    // rather than merely drawn first.
-    expect(panel?.textContent).not.toMatch(/not-configured/);
-
-    // The sidecar's own prose — fetched only because the subsystem was not
-    // `ok` — is the browser's row from `GET /sidecars`, matched by the
-    // literal `"browser"`, not the health probe's own label `"browser_sidecar"`.
-    expect(panel?.textContent).toMatch(/exited: exit code: 1/);
-    expect(panel?.textContent).toMatch(/restarts\D*3/);
-
-    // `GET /sidecars` answered with a second row, "web", and only one
-    // "sidecar state" fact is on the page — the other row left no trace.
-    expect(panel?.textContent?.match(/sidecar state/g)).toHaveLength(1);
+    // The daemon answered with THREE subsystems and this call site asked for ONE: the other
+    // subsystem's reason is nowhere on the page, proving it was filtered rather than drawn first.
+    expect(screen.queryByText(/not-configured/)).toBeNull();
   });
 });
 
@@ -595,13 +584,14 @@ describe("Browser - the write grant", () => {
     expect(screen.queryByText(/with 0 files/)).toBeNull();
   });
 
-  /** A profile that has written nothing says so, rather than showing an empty box. */
-  it("says plainly when nothing has been submitted", async () => {
+  /** A profile that has written nothing shows no record at all, rather than a heading over nothing. */
+  it("shows no record when nothing has been submitted", async () => {
     daemon.apiFetch.mockImplementation(browserFetch(withProject({ sites: [site()] })));
 
     await renderBrowser();
 
-    expect(await screen.findByText(/nothing has been submitted from this profile/i)).toBeDefined();
+    await screen.findByRole("heading", { level: 2, name: "Site grants" });
+    expect(screen.queryByRole("heading", { level: 3, name: /submitted/i })).toBeNull();
   });
 });
 
@@ -673,13 +663,13 @@ describe("Browser - opening a window yourself", () => {
     expect(await screen.findByText(/nobody is at this machine/i)).toBeTruthy();
   });
 
-  it("will not submit an empty address and asks for no confirmation once one is typed", async () => {
-    let calls = 0;
+  it("opens a blank window when no address is given, and asks for no confirmation", async () => {
+    const bodies: string[] = [];
     daemon.apiFetch.mockImplementation(
       browserFetch(
         withProject({
-          onWindow: () => {
-            calls += 1;
+          onWindow: (body) => {
+            bodies.push(body);
             return session({ id: 9 });
           },
         }),
@@ -688,18 +678,36 @@ describe("Browser - opening a window yourself", () => {
 
     await renderBrowser();
 
+    // Nothing typed, and the button is live: the address is optional.
     const open = await screen.findByRole("button", { name: "Open a window" });
-    expect(open.hasAttribute("disabled")).toBe(true);
+    expect(open.hasAttribute("disabled")).toBe(false);
+    // One click and it opens — the label never changes, because nothing here is
+    // destructive and there is no arming step to pass through.
     fireEvent.click(open);
-    expect(calls).toBe(0);
+    expect(await screen.findByText(/opened session #9/i)).toBeTruthy();
+    expect(JSON.parse(bodies[0]).url).toBe("about:blank");
 
     fireEvent.change(screen.getByLabelText("Address to open"), {
       target: { value: "https://jira.example.com" },
     });
-    // One click and it opens — the label never changes, because nothing here is
-    // destructive and there is no arming step to pass through.
     fireEvent.click(screen.getByRole("button", { name: "Open a window" }));
-    expect(await screen.findByText(/opened session #9/i)).toBeTruthy();
-    expect(calls).toBe(1);
+    await waitFor(() => expect(bodies).toHaveLength(2));
+    expect(JSON.parse(bodies[1]).url).toBe("https://jira.example.com");
+  });
+});
+
+describe("Browser - the bar while the sidecar is down", () => {
+  it("says why a window cannot open, and leaves the button live", async () => {
+    const world = browserWorld({
+      projects: [project({ project_id: "alpha" })],
+      readout: { status: "degraded", subsystems: [{ name: "browser_sidecar", status: "down", reason: "not-running" }] },
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+
+    expect(await screen.findByText(/the browser is not running, so no window can open/i)).toBeDefined();
+    const button = screen.getByRole("button", { name: "Open a window" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
   });
 });

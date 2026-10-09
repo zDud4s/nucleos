@@ -49,3 +49,10 @@ c9fb1541066017314be860777604b2b4f40c4051:core/src/redact.rs:jwt:648
 # The same two fixtures, quoted in this file's own comment by the commit that listed them above.
 # The comment no longer quotes them; this is that commit's copy, which history keeps.
 3896289d0e182663300f649639ea6466d2f939c0:.gitleaksignore:stripe-access-token:39
+
+# Two fixtures that exist to prove a secret never leaves the place it was found: a Stripe-shaped
+# restricted key fed to a capture fact, and a GitHub-shaped PAT fed to a review, each test asserting
+# the value is absent from the question or the dossier built from it. Alphabet runs and digit
+# ladders, not keys. Not quoted here, or this file would become the next finding.
+f764d37de65f460b702ea97a2a8ef8867162e1c9:core/src/capture.rs:stripe-access-token:720
+4954af647b459583e54dde6dfecc2fde78ccd8ea:core/src/distill.rs:github-pat:2023

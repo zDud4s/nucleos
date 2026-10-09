@@ -83,8 +83,14 @@ pub(crate) enum Caller {
     Run(i64),
     /// The daemon's own item gate. `from_scope` never produces it, so no key can claim to be one.
     Job(i64),
+    /// The merge queue's gate before publish; `from_scope` never produces it.
+    Merge(i64),
     /// The daemon's post-merge gate. `from_scope` never produces it.
     Postgate,
+    /// The post-merge gate's recheck of a red sha. `from_scope` never produces it.
+    FlakeCheck,
+    /// One probe of the post-merge gate's bisection. `from_scope` never produces it.
+    Bisect,
 }
 
 impl Caller {
@@ -101,19 +107,23 @@ impl Caller {
     /// A person waiting at the keyboard goes ahead of an autonomous run (spec, "Prioridades").
     pub(crate) fn priority(self) -> i64 {
         match self {
+            Caller::Merge(_) => PRIORITY_AUTONOMOUS,
             Caller::Owner => PRIORITY_INTERACTIVE,
             Caller::Run(_) | Caller::Job(_) => PRIORITY_AUTONOMOUS,
-            Caller::Postgate => verify_runs::PRIORITY_POSTGATE,
+            Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => {
+                verify_runs::PRIORITY_POSTGATE
+            }
         }
     }
 
     /// How the request row records its caller, and what `may_read` compares against.
     pub(crate) fn label(self) -> String {
         match self {
+            Caller::Merge(id) => format!("merge:{id}"),
             Caller::Owner => "owner".to_owned(),
             Caller::Run(id) => format!("run:{id}"),
             Caller::Job(id) => format!("job:{id}"),
-            Caller::Postgate => "postgate".to_owned(),
+            Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => "postgate".to_owned(),
         }
     }
 
@@ -122,6 +132,8 @@ impl Caller {
     pub(crate) fn requested_by(self, scope: &str) -> String {
         match self {
             Caller::Postgate => verify_runs::REQUESTED_BY_POSTGATE.to_owned(),
+            Caller::FlakeCheck => verify_runs::REQUESTED_BY_FLAKE_CHECK.to_owned(),
+            Caller::Bisect => verify_runs::REQUESTED_BY_BISECT.to_owned(),
             _ => scope.to_owned(),
         }
     }
@@ -131,8 +143,13 @@ impl Caller {
 /// working on, and a ticket id is a guessable integer.
 pub(crate) fn may_read(caller: Caller, row_caller: &str) -> bool {
     match caller {
+        Caller::Merge(_) => row_caller == caller.label(),
         Caller::Owner => true,
-        Caller::Run(_) | Caller::Job(_) | Caller::Postgate => row_caller == caller.label(),
+        Caller::Run(_)
+        | Caller::Job(_)
+        | Caller::Postgate
+        | Caller::FlakeCheck
+        | Caller::Bisect => row_caller == caller.label(),
     }
 }
 
@@ -187,7 +204,7 @@ pub fn install(executor: Arc<Executor>) {
 }
 
 /// `None` until `main` installs the executor, which the handlers answer with 503.
-pub(crate) fn installed() -> Option<Arc<Executor>> {
+pub fn installed() -> Option<Arc<Executor>> {
     EXECUTOR.get().cloned()
 }
 
@@ -253,7 +270,12 @@ pub(crate) async fn resolve_worktree(
         }
         // The daemon names the job's worktree itself, and it is held to the same registered-
         // worktree-of-a-known-project check as the owner's.
-        Caller::Owner | Caller::Job(_) | Caller::Postgate => {
+        Caller::Merge(_)
+        | Caller::Owner
+        | Caller::Job(_)
+        | Caller::Postgate
+        | Caller::FlakeCheck
+        | Caller::Bisect => {
             let Some(asked) = asked else {
                 return Err(VerifyError::BadRequest("worktree is required".to_owned()));
             };
@@ -995,6 +1017,18 @@ pub(crate) async fn gate_job_scope(
     worktree: &Path,
     wait: Duration,
 ) -> ScopeVerdict {
+    gate_scope(executor, Caller::Job(job_id), worktree, wait).await
+}
+
+/// The `scope` gate behind `gate_job_scope`, for any daemon-side caller that names itself: the job
+/// item gate as `Caller::Job`, the merge queue's gate before publish as `Caller::Merge`. The
+/// caller's label is what lands in `verify_requests.caller`.
+pub(crate) async fn gate_scope(
+    executor: &Arc<Executor>,
+    caller: Caller,
+    worktree: &Path,
+    wait: Duration,
+) -> ScopeVerdict {
     use crate::gate::GateOutcome;
 
     let args = VerifyArgs {
@@ -1005,13 +1039,13 @@ pub(crate) async fn gate_job_scope(
         base: None,
         wait: false,
     };
-    let id = match submit(executor, Caller::Job(job_id), &args).await {
+    let id = match submit(executor, caller, &args).await {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(
-                job_id,
+                caller = %caller.label(),
                 reason = error.message(),
-                "scope verification could not be submitted; the item takes the full gate"
+                "scope verification could not be submitted; the caller takes the full gate"
             );
             return ScopeVerdict::Unavailable;
         }
@@ -1417,6 +1451,43 @@ tests:
             Scope::TeamRun("t".to_owned()),
         ] {
             assert_ne!(Caller::from_scope(&scope), Some(Caller::Postgate));
+        }
+    }
+
+    #[test]
+    fn the_flake_check_and_bisect_callers_run_at_postgate_priority_and_label_their_units() {
+        for caller in [Caller::FlakeCheck, Caller::Bisect] {
+            assert_eq!(caller.priority(), crate::verify_runs::PRIORITY_POSTGATE);
+            // The same owner as the gate's own tickets.
+            assert_eq!(caller.label(), "postgate");
+            assert!(may_read(caller, "postgate"));
+            assert!(!may_read(caller, "owner"));
+            assert!(!may_read(caller, "job:9"));
+        }
+        assert!(!may_read(Caller::Run(3), "postgate"));
+
+        assert_eq!(
+            Caller::FlakeCheck.requested_by("full"),
+            crate::verify_runs::REQUESTED_BY_FLAKE_CHECK
+        );
+        assert_eq!(Caller::FlakeCheck.requested_by("full"), "flake-check");
+        assert_eq!(
+            Caller::Bisect.requested_by("full"),
+            crate::verify_runs::REQUESTED_BY_BISECT
+        );
+        assert_eq!(Caller::Bisect.requested_by("full"), "bisect");
+
+        // No auth scope maps to them.
+        for scope in [
+            Scope::Control,
+            Scope::Run(9),
+            Scope::ApiToken(ApiTokenLevel::Admin),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+            Scope::TeamRun("t".to_owned()),
+        ] {
+            assert_ne!(Caller::from_scope(&scope), Some(Caller::FlakeCheck));
+            assert_ne!(Caller::from_scope(&scope), Some(Caller::Bisect));
         }
     }
 

@@ -1,12 +1,12 @@
 import { useState } from "react";
+import { Check, Search, X } from "lucide-react";
 import { useAllCaptures } from "../data/captures";
 import { useApproveKnowledge, useKnowledge, useRejectKnowledge, type Known, type KnownLayer } from "../data/knowledge";
 import { useOwnerNotes, useSearchOwnerNotes } from "../data/owner-notes";
-import { Button, ErrorNote, Panel, Quiet, RelativeTime, Row, Rows, Teach } from "../ui";
-import { CapturesWaiting } from "./CapturesWaiting";
+import { Button, ErrorNote, Quiet, RelativeTime, Row, Rows, Teach } from "../ui";
+import { Segments } from "./Segments";
 import { formatItem } from "./item-ref";
 import { MeasuredSummary } from "./knowledge/MeasuredSummary";
-import { WaitingPanel } from "./knowledge/WaitingPanel";
 import { filterItems, itemDate, itemId, scopeKey, toItems, type BrainItem, type ItemFilters } from "./unified";
 import "./unified-list.css";
 
@@ -57,7 +57,6 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
   const noteRows = (searching ? found.data : allNotes.data) ?? [];
   const known = knowledge.data ?? [];
   const items = filterItems(toItems(noteRows, known, captureRows.data ?? []), { type, state, layer, scope, q });
-  const waiting = known.filter((row) => row.status === "proposed");
   const deciding = approve.isPending || reject.isPending;
   const scopes = scopeOptions(known);
 
@@ -84,69 +83,55 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
       {(allNotes.isError || knowledge.isError || captureRows.isError) && (
         <ErrorNote>the núcleo did not answer — part of what is known is missing</ErrorNote>
       )}
-      <CapturesWaiting onSelect={onSelect} selected={selected} />
-      <WaitingPanel rows={waiting} />
-
-      <div className="unified-filters">
-        <div role="group" aria-label="Type">
-          {TYPE_FILTERS.map(([value, label]) => (
-            <Button key={value} variant="quiet" aria-pressed={type === value} onClick={() => setType(value)}>
-              {label}
-            </Button>
-          ))}
-        </div>
-        <div role="group" aria-label="State">
-          {STATE_FILTERS.map(([value, label]) => (
-            <Button key={value} variant="quiet" aria-pressed={state === value} onClick={() => setState(value)}>
-              {label}
-            </Button>
-          ))}
-        </div>
-        {type !== "note" && type !== "capture" && (
-          <>
-            <div role="group" aria-label="Layer">
-              {LAYER_FILTERS.map(([value, label]) => (
-                <Button key={value} variant="quiet" aria-pressed={layer === value} onClick={() => setLayer(value)}>
-                  {label}
-                </Button>
-              ))}
-            </div>
-            <label>
-              Scope{" "}
-              <select aria-label="Scope" value={scope} onChange={(event) => setScope(event.target.value)}>
-                <option value="all">All scopes</option>
-                {scopes.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </>
-        )}
-        <label>
-          Search{" "}
-          <input type="search" aria-label="Search" value={q} onChange={(event) => setQ(event.target.value)} />
+      <div className="unified-bar">
+        <Segments label="Type" value={type} options={TYPE_FILTERS} onChange={setType} />
+        <Segments label="State" value={state} options={STATE_FILTERS} onChange={setState} />
+        <label className="unified-search">
+          <Search aria-hidden="true" size={14} strokeWidth={1.75} />
+          <input
+            type="search"
+            aria-label="Search"
+            placeholder="Search notes, knowledge and questions"
+            value={q}
+            onChange={(event) => setQ(event.target.value)}
+          />
         </label>
+        {type === "knowledge" && (
+          <div className="unified-bar-knowledge">
+            <Segments label="Layer" value={layer} options={LAYER_FILTERS} onChange={setLayer} />
+            <select
+              className="unified-scope"
+              aria-label="Scope"
+              value={scope}
+              onChange={(event) => setScope(event.target.value)}
+            >
+              <option value="all">All scopes</option>
+              {scopes.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
       </div>
 
       {items.length === 0 ? (
         <Quiet says={searching ? "Nothing matches that." : "Nothing here for these filters."} />
       ) : (
-        <Panel title="Notes and knowledge">
-          <Rows label="Notes and knowledge">
-            {items.map((item) => (
-              <ItemRow
-                key={`${item.kind}:${itemId(item)}`}
-                item={item}
-                onSelect={onSelect}
-                deciding={deciding}
-                onApprove={(id) => approve.mutate(id)}
-                onReject={(id) => reject.mutate(id)}
-              />
-            ))}
-          </Rows>
-        </Panel>
+        <Rows label="Notes and knowledge" className="unified-rows">
+          {items.map((item) => (
+            <ItemRow
+              key={`${item.kind}:${itemId(item)}`}
+              item={item}
+              current={selected === itemRef(item)}
+              onSelect={onSelect}
+              deciding={deciding}
+              onApprove={(id) => approve.mutate(id)}
+              onReject={(id) => reject.mutate(id)}
+            />
+          ))}
+        </Rows>
       )}
 
       <details className="unified-summary">
@@ -159,19 +144,42 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
 
 interface ItemRowProps {
   item: BrainItem;
+  current: boolean;
   onSelect(item: string): void;
   deciding: boolean;
   onApprove(proposalId: number): void;
   onReject(proposalId: number): void;
 }
 
-function ItemRow({ item, onSelect, deciding, onApprove, onReject }: ItemRowProps) {
-  const ref =
-    item.kind === "note"
-      ? formatItem({ kind: "note", id: item.note.id })
-      : item.kind === "capture"
-        ? formatItem({ kind: "capture", id: item.capture.job_id })
-        : formatItem({ kind: "knowledge", id: item.known.id });
+function itemRef(item: BrainItem): string {
+  return item.kind === "note"
+    ? formatItem({ kind: "note", id: item.note.id })
+    : item.kind === "capture"
+      ? formatItem({ kind: "capture", id: item.capture.job_id })
+      : formatItem({ kind: "knowledge", id: item.known.id });
+}
+
+/**
+ * What a row says it is, and which identity hue its mark takes — the same hue its node takes on
+ * the graph (`force-graph.css`), so the list and the map share one key. A knowledge row names its
+ * layer, which is what decides how it is used; "knowledge" alone would say nothing a reader can act on.
+ */
+const LAYER_WORD: Record<KnownLayer, string> = {
+  semantic: "fact",
+  episodic: "measured",
+  procedural: "how-to",
+  working: "working",
+};
+
+function kindOf(item: BrainItem): { word: string; hue: string } {
+  if (item.kind === "note") return { word: "note", hue: "note" };
+  if (item.kind === "capture") return { word: "asked", hue: "capture" };
+  return { word: LAYER_WORD[item.known.layer], hue: `k-${item.known.layer}` };
+}
+
+function ItemRow({ item, current, onSelect, deciding, onApprove, onReject }: ItemRowProps) {
+  const ref = itemRef(item);
+  const kind = kindOf(item);
   const title =
     item.kind === "note"
       ? firstLine(item.note.text)
@@ -181,23 +189,26 @@ function ItemRow({ item, onSelect, deciding, onApprove, onReject }: ItemRowProps
   const proposalId =
     item.kind === "knowledge" && item.known.status === "proposed" ? item.known.proposal_id : null;
   return (
-    <Row className="unified-row">
-      <button type="button" className="unified-open" onClick={() => onSelect(ref)}>
-        <span className="unified-kind">{item.kind}</span>
+    <Row layout="line" current={current} className="unified-row">
+      <button type="button" className="unified-open" aria-current={current ? "true" : undefined} onClick={() => onSelect(ref)}>
+        <span className="unified-kind">
+          <span className={`unified-mark unified-mark-${kind.hue}`} aria-hidden="true" />
+          {kind.word}
+        </span>
         <span className="unified-title">{title}</span>
         <span className="unified-when">
           <RelativeTime at={itemDate(item)} />
         </span>
       </button>
       {proposalId !== null && (
-        <>
+        <span className="unified-decide">
           <Button variant="approve" aria-label={`Approve ${title}`} disabled={deciding} onClick={() => onApprove(proposalId)}>
-            ✓
+            <Check aria-hidden="true" size={14} strokeWidth={2} />
           </Button>
-          <Button aria-label={`Refuse ${title}`} disabled={deciding} onClick={() => onReject(proposalId)}>
-            ✗
+          <Button variant="ghost" aria-label={`Refuse ${title}`} disabled={deciding} onClick={() => onReject(proposalId)}>
+            <X aria-hidden="true" size={14} strokeWidth={2} />
           </Button>
-        </>
+        </span>
       )}
     </Row>
   );

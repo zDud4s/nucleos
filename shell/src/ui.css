@@ -295,6 +295,16 @@
 .ui-panel-body > .ui-rows {
   border: none;
   border-radius: 0;
+  /* The clip exists for the radius, which is gone here; keeping it would cut the rule below. */
+  overflow: visible;
+}
+
+/* With the inline padding gone, `.ui-current`'s 2px inset rule landed on the row's first letter.
+   The current row reaches back into the panel's own gutter by the same amount it pads, so the rule
+   sits in the gutter and the text stays exactly where every other row's is. */
+.ui-panel-body > .ui-rows > .ui-rows-row.ui-current {
+  margin-left: calc(-1 * var(--space-3));
+  padding-left: var(--space-3);
 }
 
 .ui-panel-body > .ui-rows > .ui-rows-row {

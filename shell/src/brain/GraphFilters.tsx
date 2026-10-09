@@ -1,5 +1,5 @@
 import type { GEdgeType, GFilters, GNodeKind } from "./graph-types";
-import { Button } from "../ui";
+import { Segments } from "./Segments";
 
 /**
  * The bar above the Brain graph: Estado, which kinds of node, which kinds of link, archived notes
@@ -22,6 +22,16 @@ export const EDGE_TYPES: readonly GEdgeType[] = [
 const EDGE_LABELS: Partial<Record<GEdgeType, string>> = {
   supersedes_k: "replaces (knowledge)",
   scope: "project scope",
+};
+
+/** Node kinds in the same case as the list's Type segments; link types stay the daemon's words. */
+const KIND_LABELS: Record<GNodeKind, string> = {
+  note: "Note",
+  knowledge: "Knowledge",
+  project: "Project",
+  contact: "Contact",
+  mail: "Mail",
+  file: "File",
 };
 
 const STATES: readonly (readonly [GFilters["state"], string])[] = [
@@ -57,56 +67,63 @@ export function GraphFilters({
 }) {
   return (
     <div className="brain-bar" data-testid="brain-bar">
-      <div role="group" aria-label="Graph state">
-        {STATES.map(([value, label]) => (
-          <Button
-            key={value}
-            variant="quiet"
-            aria-pressed={filters.state === value}
-            onClick={() => onFilters({ ...filters, state: value })}
+      <div className="brain-bar-line">
+        <Segments
+          label="Graph state"
+          value={filters.state}
+          options={STATES}
+          onChange={(state) => onFilters({ ...filters, state })}
+        />
+        <span className="brain-bar-end">
+          <button
+            type="button"
+            className="brain-chip"
+            aria-pressed={filters.showArchived}
+            onClick={() => onFilters({ ...filters, showArchived: !filters.showArchived })}
           >
-            {label}
-          </Button>
-        ))}
-      </div>
-      <div role="group" aria-label="Node kinds">
-        {NODE_KINDS.map((kind) => (
-          <Button
-            key={kind}
-            variant="quiet"
-            aria-pressed={filters.nodeKinds.has(kind)}
-            onClick={() => onFilters({ ...filters, nodeKinds: toggled(filters.nodeKinds, kind) })}
+            Show archived
+          </button>
+          <button
+            type="button"
+            className="brain-chip"
+            aria-pressed={filters.showOrphans}
+            onClick={() => onFilters({ ...filters, showOrphans: !filters.showOrphans })}
           >
-            {kind}
-          </Button>
-        ))}
+            Show orphans
+          </button>
+        </span>
       </div>
-      <div role="group" aria-label="Link types">
-        {EDGE_TYPES.map((type) => (
-          <Button
-            key={type}
-            variant="quiet"
-            aria-pressed={filters.edgeTypes.has(type)}
-            onClick={() => onFilters({ ...filters, edgeTypes: toggled(filters.edgeTypes, type) })}
-          >
-            {EDGE_LABELS[type] ?? type}
-          </Button>
-        ))}
+      <div className="brain-bar-line">
+        <div role="group" aria-label="Node kinds" className="brain-chips">
+          {NODE_KINDS.map((kind) => (
+            <button
+              key={kind}
+              type="button"
+              className="brain-chip"
+              aria-pressed={filters.nodeKinds.has(kind)}
+              onClick={() => onFilters({ ...filters, nodeKinds: toggled(filters.nodeKinds, kind) })}
+            >
+              <span className={`unified-mark unified-mark-${kind === "knowledge" ? "k-semantic" : kind}`} aria-hidden="true" />
+              {KIND_LABELS[kind]}
+            </button>
+          ))}
+        </div>
       </div>
-      <Button
-        variant="quiet"
-        aria-pressed={filters.showArchived}
-        onClick={() => onFilters({ ...filters, showArchived: !filters.showArchived })}
-      >
-        Show archived
-      </Button>
-      <Button
-        variant="quiet"
-        aria-pressed={filters.showOrphans}
-        onClick={() => onFilters({ ...filters, showOrphans: !filters.showOrphans })}
-      >
-        Show orphans
-      </Button>
+      <div className="brain-bar-line">
+        <div role="group" aria-label="Link types" className="brain-chips">
+          {EDGE_TYPES.map((type) => (
+            <button
+              key={type}
+              type="button"
+              className="brain-chip brain-chip-link"
+              aria-pressed={filters.edgeTypes.has(type)}
+              onClick={() => onFilters({ ...filters, edgeTypes: toggled(filters.edgeTypes, type) })}
+            >
+              {EDGE_LABELS[type] ?? type}
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

@@ -12,7 +12,7 @@
 # failed, holding a build slot that every other worktree was waiting for. NUCLEOS_GATE_KEEP_GOING=1
 # restores the old behaviour for a run that wants the whole list.
 #
-# Usage: scripts/gates.sh [core|sidecars|shell|tauri|hooks|security|all]   (default: all)
+# Usage: scripts/gates.sh [core|sidecars|shell|tauri|hooks|security|broker|all]   (default: all)
 set -uo pipefail
 
 failures=""
@@ -184,15 +184,25 @@ _slot_try() {
   return "$got"
 }
 
+heavy_broker() {
+  # heavy_broker <main>: true when <main> has the broker (both files) AND this machine runs it.
+  # The files are tracked, so their presence alone would switch it on in CI and in every fresh
+  # clone; the machine opts in by having the broker's state dir (created by its first run here,
+  # ${NUCLEOS_HEAVY_DIR:-~/.nucleos/heavy}) or by setting NUCLEOS_HEAVY=1.
+  [ -f "$1/scripts/heavy.py" ] && [ -f "$1/scripts/heavy_classify.py" ] || return 1
+  [ "${NUCLEOS_HEAVY:-}" = 1 ] && return 0
+  [ -d "${NUCLEOS_HEAVY_DIR:-${HOME:-/nonexistent}/.nucleos/heavy}" ]
+}
+
 heavy_run() {
   # heavy_run <command...>: hand the command to the machine-wide broker (<main>/scripts/heavy.py)
   # when the main checkout has one; otherwise fall back to the build slot (cargo) or run it plainly.
-  # NUCLEOS_HEAVY_MAIN overrides the main checkout, NUCLEOS_HEAVY_PYTHON the interpreter. Both
-  # broker files must exist, so a CI run or a fresh clone keeps the old behaviour.
+  # NUCLEOS_HEAVY_MAIN overrides the main checkout, NUCLEOS_HEAVY_PYTHON the interpreter. See
+  # heavy_broker for when the broker counts: a CI run or a fresh clone keeps the old behaviour.
   local main py
   main="${NUCLEOS_HEAVY_MAIN:-$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")}"
   if [ "${OS:-}" = Windows_NT ]; then py="${NUCLEOS_HEAVY_PYTHON:-python}"; else py="${NUCLEOS_HEAVY_PYTHON:-python3}"; fi
-  if [ -f "$main/scripts/heavy.py" ] && [ -f "$main/scripts/heavy_classify.py" ]; then
+  if heavy_broker "$main"; then
     "$py" "$main/scripts/heavy.py" -- "$@"
   elif [ "$1" = cargo ] || [ -n "${heavy_slot_any:-}" ]; then
     # build-slot.sh sets heavy_slot_any: whatever it is asked to run takes a slot, as before.
@@ -268,8 +278,8 @@ fi
 
 target="${1:-all}"
 case "$target" in
-  core|sidecars|shell|tauri|hooks|security|all) ;;
-  *) echo "usage: $0 [core|sidecars|shell|tauri|hooks|security|all]" >&2; exit 2 ;;
+  core|sidecars|shell|tauri|hooks|security|broker|all) ;;
+  *) echo "usage: $0 [core|sidecars|shell|tauri|hooks|security|broker|all]" >&2; exit 2 ;;
 esac
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -281,10 +291,11 @@ cd "$repo_root"
 # the crate from clean, at a median of 453s against 202s on a slot that had not changed hands
 # (broker log, 2026-10-03..08). Skipped when a session already holds this run (the test selector
 # opens one), when the broker is off, and where there is no broker (CI, a fresh clone).
-if [ -z "${NUCLEOS_HEAVY_HELD:-}" ] && [ "${NUCLEOS_HEAVY:-}" != 0 ]; then
+# The broker's own tests build nothing and drive brokers of their own, so `broker` never holds one.
+if [ -z "${NUCLEOS_HEAVY_HELD:-}" ] && [ "${NUCLEOS_HEAVY:-}" != 0 ] && [ "$target" != broker ]; then
   heavy_main="${NUCLEOS_HEAVY_MAIN:-$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")}"
   if [ "${OS:-}" = Windows_NT ]; then heavy_py="${NUCLEOS_HEAVY_PYTHON:-python}"; else heavy_py="${NUCLEOS_HEAVY_PYTHON:-python3}"; fi
-  if [ -f "$heavy_main/scripts/heavy.py" ] && [ -f "$heavy_main/scripts/heavy_classify.py" ]; then
+  if heavy_broker "$heavy_main"; then
     # The broker is a native program: under Git bash `$BASH` is `/usr/bin/bash`, which it cannot open.
     heavy_bash="$BASH"
     command -v cygpath >/dev/null 2>&1 && heavy_bash="$(cygpath -m "$BASH")"
@@ -448,6 +459,25 @@ if [ "$target" = security ]; then
   else
     # Never print a detected secret into a CI log: `--redact` is part of this gate's contract.
     run "security: secrets" . gitleaks detect --redact --no-banner
+  fi
+fi
+
+# The build broker's own tests (scripts/heavy.py and its hook). Not in `all`: they take about six
+# minutes, almost all of it real waiting on queues, locks and child processes, and they cover a
+# tool only the owner's machine runs; CI runs this target on its own Windows leg.
+if [ "$target" = broker ]; then
+  py=""
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1; then
+      py="$candidate"
+      break
+    fi
+  done
+  if [ -z "$py" ]; then
+    echo "python missing — the broker tests need it (scripts/doctor.sh reports this)" >&2
+    failures="$failures  broker: python not installed"$'\n'
+  else
+    run "broker: tests" . "$py" -m unittest discover -s scripts/heavy_tests -p 'test_heavy_*.py'
   fi
 fi
 

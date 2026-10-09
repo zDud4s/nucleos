@@ -7,7 +7,15 @@
 //!
 //! The gate it runs is the full one (`verify` scope `full`, the project's `gate_command`), as
 //! `Caller::Postgate` at priority 2, in the `postgate-<project>` worktree checked out at the land
-//! target's tip. The cache is never consulted. Bisection, flake re-runs and alerts are later work.
+//! target's tip. The cache is never consulted.
+//!
+//! A red (F3-3, spec §6.2) is handled in two persisted phases, one action per tick, and nothing is
+//! reverted. First the same sha is checked again (`Caller::FlakeCheck`): if it passes the red was
+//! not the target's, the sha counts green and nobody is told. Otherwise the first-parent commits of
+//! `(last green, red]` are bisected with `verify_bisect`, one full probe per step
+//! (`Caller::Bisect`), and the outcome goes to the owner as one `postgate_red` feed line. A probe
+//! left running is followed from its stored ticket, never submitted again, and while a red is being
+//! handled no new gate starts.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,9 +25,12 @@ use crate::git_exec;
 use crate::land;
 use crate::verify::{self, Caller, VerifyArgs};
 use crate::verify_batch::{self, Commit, Decision, TargetState};
+use crate::verify_bisect::{Bisection, Candidate, Next, Probe, Verdict};
 use crate::verify_exec::Executor;
+use crate::verify_flaky::{self, Rerun};
 use crate::verify_plan::{Kind, ScopeArg};
-use crate::verify_postgate;
+use crate::verify_postgate::{self, RedPhase, State};
+use crate::verify_runs::{STATUS_FAILED, STATUS_PASSED};
 
 /// How often the loop looks at the roster.
 pub const POSTGATE_POLL: Duration = Duration::from_secs(30);
@@ -46,6 +57,18 @@ pub enum Step {
     Abandoned { sha: String, reason: String },
     /// The tick could not read or write its state; nothing was changed by this step.
     Failed(String),
+    /// A red was found: the gate was submitted again on `sha`, as ticket `request`.
+    Recheck { sha: String, request: i64 },
+    /// The recheck passed: `sha` counts as green and nobody was told.
+    Flaky(String),
+    /// The recheck did not clear `sha`: the bisection begins.
+    Confirmed(String),
+    /// The bisection submitted a probe of `sha`, as ticket `request`.
+    Probe { sha: String, request: i64 },
+    /// The probe of `sha` finished and its result was recorded.
+    Probed { sha: String, probe: Probe },
+    /// The red on `sha` was reported to the owner and its handling is over.
+    Reported { sha: String, verdict: Verdict },
 }
 
 /// One project's step in one tick.
@@ -102,6 +125,14 @@ async fn tick_project(executor: &Arc<Executor>, project_id: &str, project_root: 
             return launch(executor, project_id, project_root, sha, deadline).await;
         };
         return follow(pool, project_id, sha, request).await;
+    }
+
+    // A red is being handled: see it through before looking at the tip, so a merge that lands
+    // meanwhile starts no gate and joins the next batch.
+    if let Some(state) = state.as_ref()
+        && state.red_phase.is_some()
+    {
+        return handle_red(executor, project_id, project_root, state).await;
     }
 
     let target = match land::integration_branch(pool, project_id, project_root, deadline).await {
@@ -206,23 +237,9 @@ async fn launch(
     deadline: Instant,
 ) -> Step {
     let pool = &executor.pool;
-    let tree = match git_exec::prepare_postgate_worktree(project_root, sha, deadline).await {
-        Ok(tree) => tree,
-        Err(reason) => return give_up(pool, project_id, sha, reason).await,
-    };
-    let args = VerifyArgs {
-        kind: Kind::Test,
-        scope: ScopeArg::Full,
-        worktree: Some(tree.to_string_lossy().into_owned()),
-        files: None,
-        base: None,
-        wait: false,
-    };
-    let request = match verify::submit(executor, Caller::Postgate, &args).await {
+    let request = match submit_full(executor, Caller::Postgate, project_root, sha, deadline).await {
         Ok(id) => id,
-        Err(error) => {
-            return give_up(pool, project_id, sha, error.message().to_owned()).await;
-        }
+        Err(reason) => return give_up(pool, project_id, sha, reason).await,
     };
     match verify_postgate::set_request(pool, project_id, sha, request).await {
         Ok(true) => Step::Started {
@@ -237,6 +254,29 @@ async fn launch(
     }
 }
 
+/// Prepares the postgate worktree at `sha` and submits the full gate for it as `caller`; returns
+/// the ticket id, or the reason nothing could be submitted.
+async fn submit_full(
+    executor: &Arc<Executor>,
+    caller: Caller,
+    project_root: &Path,
+    sha: &str,
+    deadline: Instant,
+) -> Result<i64, String> {
+    let tree = git_exec::prepare_postgate_worktree(project_root, sha, deadline).await?;
+    let args = VerifyArgs {
+        kind: Kind::Test,
+        scope: ScopeArg::Full,
+        worktree: Some(tree.to_string_lossy().into_owned()),
+        files: None,
+        base: None,
+        wait: false,
+    };
+    verify::submit(executor, caller, &args)
+        .await
+        .map_err(|error| error.message().to_owned())
+}
+
 /// Releases the slot of the gate running for `sha` without a verdict.
 async fn give_up(pool: &sqlx::SqlitePool, project_id: &str, sha: &str, reason: String) -> Step {
     tracing::warn!(project = project_id, sha, %reason, "postgate: gate abandoned");
@@ -246,6 +286,281 @@ async fn give_up(pool: &sqlx::SqlitePool, project_id: &str, sha: &str, reason: S
             reason,
         },
         Err(error) => Step::Failed(format!("cannot abandon the gate for {sha}: {error}")),
+    }
+}
+
+/// One action on the red being handled: follow the check or probe in flight, or start the next.
+/// Everything it needs is in `state`, so a restart lands here and picks up where it stopped.
+async fn handle_red(
+    executor: &Arc<Executor>,
+    project_id: &str,
+    project_root: &Path,
+    state: &State,
+) -> Step {
+    let pool = &executor.pool;
+    let deadline = Instant::now() + git_exec::OPERATION_TIMEOUT;
+    let (Some(phase), Some(red_sha)) = (state.red_phase, state.red_sha.as_deref()) else {
+        return Step::Failed("a red is being handled without its sha".to_owned());
+    };
+
+    // A check or probe is claimed: follow its ticket, or submit it if the daemon died before the
+    // ticket was stored.
+    if let Some(sha) = state.probe_sha.as_deref() {
+        let Some(request) = state.probe_request_id else {
+            return launch_probe(executor, project_id, project_root, phase, sha, deadline).await;
+        };
+        let ticket = match verify::read_ticket(pool, request).await {
+            Ok(Some((ticket, _))) => ticket,
+            // Nothing can be learned from a ticket that is gone: the probe could not tell.
+            Ok(None) => return settle(pool, project_id, phase, sha, "").await,
+            Err(error) => return Step::Failed(format!("cannot read ticket {request}: {error}")),
+        };
+        if !ticket.done {
+            return Step::Waiting {
+                sha: sha.to_owned(),
+            };
+        }
+        let status = ticket.verdict.as_deref().unwrap_or("");
+        return settle(pool, project_id, phase, sha, status).await;
+    }
+
+    match phase {
+        RedPhase::FlakeCheck => {
+            let claimed = verify_postgate::claim_probe(pool, project_id, red_sha).await;
+            match claimed {
+                Ok(true) => {
+                    launch_probe(executor, project_id, project_root, phase, red_sha, deadline).await
+                }
+                Ok(false) => Step::Waiting {
+                    sha: red_sha.to_owned(),
+                },
+                Err(error) => Step::Failed(format!("cannot claim the recheck: {error}")),
+            }
+        }
+        RedPhase::Bisect => {
+            bisect_step(executor, project_id, project_root, state, red_sha, deadline).await
+        }
+    }
+}
+
+/// Submits the check or probe already claimed for `sha` and stores its ticket. A launch that fails
+/// settles as inconclusive: nothing was measured, the same as `git bisect skip`.
+async fn launch_probe(
+    executor: &Arc<Executor>,
+    project_id: &str,
+    project_root: &Path,
+    phase: RedPhase,
+    sha: &str,
+    deadline: Instant,
+) -> Step {
+    let pool = &executor.pool;
+    let caller = match phase {
+        RedPhase::FlakeCheck => Caller::FlakeCheck,
+        RedPhase::Bisect => Caller::Bisect,
+    };
+    let request = match submit_full(executor, caller, project_root, sha, deadline).await {
+        Ok(id) => id,
+        Err(reason) => {
+            tracing::warn!(project = project_id, sha, %reason, "postgate: probe not launched");
+            return settle(pool, project_id, phase, sha, "").await;
+        }
+    };
+    match verify_postgate::set_probe_request(pool, project_id, sha, request).await {
+        Ok(true) => match phase {
+            RedPhase::FlakeCheck => Step::Recheck {
+                sha: sha.to_owned(),
+                request,
+            },
+            RedPhase::Bisect => Step::Probe {
+                sha: sha.to_owned(),
+                request,
+            },
+        },
+        // Settled by someone else between submit and now; the next tick reads it.
+        Ok(false) => Step::Waiting {
+            sha: sha.to_owned(),
+        },
+        Err(error) => Step::Failed(format!("cannot store ticket {request}: {error}")),
+    }
+}
+
+/// Records how the check or probe of `sha` ended; `status` is the ticket's verdict, empty when
+/// there was none. A refused write means someone else settled it, and the next tick reads that.
+async fn settle(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    phase: RedPhase,
+    sha: &str,
+    status: &str,
+) -> Step {
+    let waiting = || Step::Waiting {
+        sha: sha.to_owned(),
+    };
+    match phase {
+        RedPhase::FlakeCheck => {
+            // Only a pass clears the red. A recheck with no verdict proves nothing, so the
+            // original red stands and the bisection goes ahead.
+            if verify_flaky::rerun_verdict(status) == Rerun::Flaky {
+                match verify_postgate::flake_green(pool, project_id, sha).await {
+                    Ok(true) => Step::Flaky(sha.to_owned()),
+                    Ok(false) => waiting(),
+                    Err(error) => Step::Failed(format!("cannot record the flake: {error}")),
+                }
+            } else {
+                match verify_postgate::begin_bisect(pool, project_id, sha).await {
+                    Ok(true) => Step::Confirmed(sha.to_owned()),
+                    Ok(false) => waiting(),
+                    Err(error) => Step::Failed(format!("cannot begin the bisection: {error}")),
+                }
+            }
+        }
+        RedPhase::Bisect => {
+            let probe = match status {
+                STATUS_PASSED => Probe::Green,
+                STATUS_FAILED => Probe::Red,
+                _ => Probe::Inconclusive,
+            };
+            match verify_postgate::record_probe(pool, project_id, sha, probe).await {
+                Ok(true) => Step::Probed {
+                    sha: sha.to_owned(),
+                    probe,
+                },
+                Ok(false) => waiting(),
+                Err(error) => Step::Failed(format!("cannot record the probe: {error}")),
+            }
+        }
+    }
+}
+
+/// The bisection has no probe in flight: rebuild it from the stored probes and either claim the
+/// next sha to probe or report the verdict. Without a green base, or when git cannot list the
+/// range, there is nothing to bisect and the red is reported as inconclusive.
+async fn bisect_step(
+    executor: &Arc<Executor>,
+    project_id: &str,
+    project_root: &Path,
+    state: &State,
+    red_sha: &str,
+    deadline: Instant,
+) -> Step {
+    let pool = &executor.pool;
+    let inconclusive = || Verdict::Inconclusive {
+        candidates: Vec::new(),
+        also_suspect: Vec::new(),
+    };
+    let Some(base) = state.red_base_sha.as_deref() else {
+        return report_red(pool, project_id, state, red_sha, inconclusive()).await;
+    };
+    let commits = match git_exec::first_parent_commits(project_root, base, red_sha, deadline).await
+    {
+        Ok(commits) => commits,
+        Err(reason) => {
+            tracing::warn!(project = project_id, %reason, "postgate: cannot list the range");
+            return report_red(pool, project_id, state, red_sha, inconclusive()).await;
+        }
+    };
+    let mut bisection = Bisection::new(
+        commits
+            .into_iter()
+            .map(|(sha, changes_map)| Candidate { sha, changes_map })
+            .collect(),
+    );
+    for (sha, probe) in &state.probes {
+        if let Err(error) = bisection.record(sha, *probe) {
+            tracing::warn!(
+                project = project_id,
+                ?error,
+                "postgate: stored probe ignored"
+            );
+        }
+    }
+    match bisection.next() {
+        Next::Done(verdict) => report_red(pool, project_id, state, red_sha, verdict).await,
+        Next::Probe(sha) => {
+            let claimed = verify_postgate::claim_probe(pool, project_id, &sha).await;
+            match claimed {
+                Ok(true) => {
+                    let phase = RedPhase::Bisect;
+                    launch_probe(executor, project_id, project_root, phase, &sha, deadline).await
+                }
+                Ok(false) => Step::Waiting { sha },
+                Err(error) => Step::Failed(format!("cannot claim the probe: {error}")),
+            }
+        }
+    }
+}
+
+/// Stores `verdict` and tells the owner, in one transaction (`verify_postgate::report`).
+async fn report_red(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    state: &State,
+    red_sha: &str,
+    verdict: Verdict,
+) -> Step {
+    let summary = red_summary(
+        &state.target,
+        red_sha,
+        state.red_base_sha.as_deref(),
+        &verdict,
+    );
+    match verify_postgate::report(pool, project_id, red_sha, &verdict, &summary).await {
+        Ok(true) => Step::Reported {
+            sha: red_sha.to_owned(),
+            verdict,
+        },
+        Ok(false) => Step::Waiting {
+            sha: red_sha.to_owned(),
+        },
+        Err(error) => Step::Failed(format!("cannot report the red: {error}")),
+    }
+}
+
+/// `sha` cut to the ten characters the feed shows.
+fn short(sha: &str) -> &str {
+    sha.get(..10).unwrap_or(sha)
+}
+
+/// The shas of `list`, shortened and comma-separated.
+fn short_list(list: &[String]) -> String {
+    list.iter()
+        .map(|sha| short(sha))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The feed line for a red target. It always says that nothing was reverted: the owner decides.
+fn red_summary(target: &str, red: &str, base: Option<&str>, verdict: &Verdict) -> String {
+    let head = format!("post-merge gate red on {target} at {}", short(red));
+    let Some(base) = base else {
+        return format!("{head}: no green commit to bisect from. Nothing was reverted.");
+    };
+    let range = format!("range {}..{}", short(base), short(red));
+    let suspects = |also: &[String]| {
+        if also.is_empty() {
+            String::new()
+        } else {
+            format!(" (also suspect: {})", short_list(also))
+        }
+    };
+    match verdict {
+        Verdict::Culprit { sha, also_suspect } => format!(
+            "{head}: culprit {}{}; {range}. Nothing was reverted.",
+            short(sha),
+            suspects(also_suspect)
+        ),
+        Verdict::Inconclusive {
+            candidates,
+            also_suspect,
+        } if !candidates.is_empty() => format!(
+            "{head}: bisection inconclusive, candidates {}{}; {range}. Nothing was reverted.",
+            short_list(candidates),
+            suspects(also_suspect)
+        ),
+        Verdict::Inconclusive { .. } | Verdict::NoCandidates => format!(
+            "{head}: bisection inconclusive, the range could not be narrowed; {range}. \
+             Nothing was reverted."
+        ),
     }
 }
 
@@ -262,6 +577,11 @@ pub async fn run_postgate_worker(executor: Arc<Executor>) {
                 }
                 Step::Failed(error) => {
                     tracing::warn!(project = %pass.project_id, %error, "postgate: tick failed");
+                }
+                Step::Reported { sha, verdict } => {
+                    tracing::info!(
+                        project = %pass.project_id, %sha, ?verdict, "postgate: red reported"
+                    );
                 }
                 _ => {}
             }
@@ -629,5 +949,229 @@ mod tests {
             Some(Step::Idle(crate::verify_batch::Idle::UpToDate))
         );
         assert_eq!(count(&f.pool, "verify_requests").await, 0);
+    }
+
+    /// How many `verify_runs` units a given caller label produced.
+    async fn units_by(pool: &sqlx::SqlitePool, requested_by: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM verify_runs WHERE requested_by = ?")
+            .bind(requested_by)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Commits `content` into `file` on `main` and returns the new sha.
+    fn commit_file(root: &Path, file: &str, content: &str, message: &str) -> String {
+        std::fs::write(root.join(file), content).unwrap();
+        git_in(root, &["add", "-A"]);
+        git_in(root, &["commit", "-q", "-m", message]);
+        git_in(root, &["rev-parse", "HEAD"])
+    }
+
+    #[tokio::test]
+    async fn a_red_that_passes_on_recheck_counts_green_and_tells_nobody() {
+        // The gate passes only once the branch `pass` exists. Branches are shared by every
+        // worktree, so the postgate tree sees the one created in the fixture's repository.
+        let f = fixture(Some(
+            "gate_command: \"git rev-parse --verify --quiet refs/heads/pass\"\n\
+             gate_after_land: true\n",
+        ))
+        .await;
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+
+        tick_until(&f, |s| matches!(s, Step::Red { .. })).await;
+        git_in(&f.root, &["branch", "pass"]);
+
+        let step = tick_until(&f, |s| matches!(s, Step::Flaky(_))).await;
+        assert_eq!(step, Step::Flaky(f.tip.clone()));
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.last_green_sha.as_deref(), Some(f.tip.as_str()));
+        assert_eq!(s.red_phase, None);
+        assert!(s.red_groups.is_empty());
+        assert_eq!(count(&f.pool, "feed").await, 0, "a flake tells nobody");
+        assert_eq!(units_by(&f.pool, "flake-check").await, 1);
+        assert_eq!(units_by(&f.pool, "bisect").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_red_bisects_to_the_culprit_and_tells_the_owner() {
+        let f = fixture(Some(
+            "gate_command: \"git grep -q good -- a.txt\"\ngate_after_land: true\n",
+        ))
+        .await;
+        let c1 = commit_file(&f.root, "a.txt", "good\n", "c1");
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+        let step = tick_until(&f, |s| matches!(s, Step::Green(_))).await;
+        assert_eq!(step, Step::Green(c1.clone()));
+
+        let _c2 = commit_file(&f.root, "b.txt", "b\n", "c2");
+        let c3 = commit_file(&f.root, "a.txt", "bad\n", "c3 breaks the gate");
+        let c4 = commit_file(&f.root, "c.txt", "c\n", "c4");
+
+        let step = tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
+        assert_eq!(
+            step,
+            Step::Reported {
+                sha: c4.clone(),
+                verdict: crate::verify_bisect::Verdict::Culprit {
+                    sha: c3.clone(),
+                    also_suspect: Vec::new(),
+                },
+            }
+        );
+
+        assert_eq!(units_by(&f.pool, "flake-check").await, 1);
+        assert_eq!(units_by(&f.pool, "bisect").await, 2);
+        let lines: Vec<(Option<String>, String, String)> =
+            sqlx::query_as("SELECT project_id, kind, summary FROM feed")
+                .fetch_all(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(lines.len(), 1, "one line for the owner");
+        assert_eq!(lines[0].0.as_deref(), Some("alpha"));
+        assert_eq!(lines[0].1, "postgate_red");
+        assert!(
+            lines[0].2.contains(&c3[..10]),
+            "the culprit is named: {}",
+            lines[0].2
+        );
+        assert!(
+            lines[0].2.contains("Nothing was reverted"),
+            "{}",
+            lines[0].2
+        );
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.red_phase, None);
+        assert_eq!(s.culprit_sha.as_deref(), Some(c3.as_str()));
+        assert_eq!(s.last_green_sha.as_deref(), Some(c1.as_str()));
+        assert_eq!(
+            git_in(&f.root, &["rev-parse", "main"]),
+            c4,
+            "nothing was reverted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_red_with_no_green_baseline_is_reported_inconclusive_without_probing() {
+        let f = fixture(Some(
+            "gate_command: \"git no-such-subcommand\"\ngate_after_land: true\n",
+        ))
+        .await;
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+
+        let step = tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
+        assert_eq!(
+            step,
+            Step::Reported {
+                sha: f.tip.clone(),
+                verdict: crate::verify_bisect::Verdict::Inconclusive {
+                    candidates: Vec::new(),
+                    also_suspect: Vec::new(),
+                },
+            }
+        );
+        assert_eq!(units_by(&f.pool, "bisect").await, 0, "nothing to probe");
+        assert_eq!(count(&f.pool, "feed").await, 1, "the owner is told");
+        let summary: String = sqlx::query_scalar("SELECT summary FROM feed")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert!(summary.contains("no green commit"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn a_bisect_probe_left_running_across_a_restart_is_followed_not_resubmitted() {
+        let f = fixture(Some(GATE_ON)).await;
+        let base = f.tip.clone();
+        let c2 = commit_file(&f.root, "b.txt", "b\n", "c2");
+        let c3 = commit_file(&f.root, "c.txt", "c\n", "c3");
+        // The daemon "died" mid-bisection: green at the base, red at c3, candidates [c2, c3].
+        verify_postgate::mark_covered(&f.pool, "alpha", "main", &base)
+            .await
+            .unwrap();
+        assert!(
+            verify_postgate::start(&f.pool, "alpha", "main", &c3, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            verify_postgate::finish_red(&f.pool, "alpha", &c3, &["gate_command".to_owned()])
+                .await
+                .unwrap()
+        );
+        assert!(
+            verify_postgate::begin_bisect(&f.pool, "alpha", &c3)
+                .await
+                .unwrap()
+        );
+
+        // No executor yet: the probe is submitted once and then only polled.
+        let step = step_of(&f).await.expect("a pass for alpha");
+        assert!(
+            matches!(&step, Step::Probe { sha, .. } if *sha == c2),
+            "the middle candidate is probed first: {step:?}"
+        );
+        assert_eq!(count(&f.pool, "verify_requests").await, 1);
+        assert!(matches!(step_of(&f).await, Some(Step::Waiting { .. })));
+
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+        let step = tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
+        assert_eq!(
+            step,
+            Step::Reported {
+                sha: c3.clone(),
+                verdict: crate::verify_bisect::Verdict::Culprit {
+                    sha: c3.clone(),
+                    also_suspect: Vec::new(),
+                },
+            }
+        );
+        assert_eq!(
+            count(&f.pool, "verify_requests").await,
+            1,
+            "the running probe was followed, never resubmitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_new_gate_starts_while_a_red_is_being_handled() {
+        let f = fixture(Some(GATE_ON)).await;
+        // A red on the current tip, waiting for its recheck. No executor: nothing finishes.
+        assert!(
+            verify_postgate::start(&f.pool, "alpha", "main", &f.tip, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            verify_postgate::finish_red(&f.pool, "alpha", &f.tip, &["gate_command".to_owned()])
+                .await
+                .unwrap()
+        );
+        // A merge lands meanwhile.
+        let newer = commit_file(&f.root, "b.txt", "b\n", "newer");
+        assert_ne!(newer, f.tip);
+
+        let step = step_of(&f).await.expect("a pass for alpha");
+        assert!(
+            matches!(&step, Step::Recheck { sha, .. } if *sha == f.tip),
+            "the red is rechecked at its own sha, not the new tip: {step:?}"
+        );
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.running_sha, None, "no new gate was started");
+        assert_eq!(s.last_attempted_sha.as_deref(), Some(f.tip.as_str()));
+        assert_eq!(s.red_sha.as_deref(), Some(f.tip.as_str()));
+        assert_eq!(count(&f.pool, "verify_requests").await, 1);
     }
 }

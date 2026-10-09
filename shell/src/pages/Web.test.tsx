@@ -18,7 +18,7 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
-import { Web } from "./Web";
+import { Web, looksLikeUrl } from "./Web";
 import { createAppQueryClient } from "../app/queryClient";
 import type { Page } from "../data/web";
 
@@ -116,32 +116,70 @@ describe("Web — the reader", () => {
   });
 });
 
-/* ------------------------------------------------------------------ search -- */
+/* ----------------------------------------------------------------- the bar -- */
 
-describe("Web — search", () => {
-  it("keeps the search field's name without repeating the panel", async () => {
-    daemon.apiFetch.mockImplementation(async (path: string) => {
-      if (path === "/web/pages") return [];
-      return [];
-    });
-
-    await renderWeb("/web");
-
-    expect(screen.getByLabelText("Search query")).toBeInstanceOf(HTMLInputElement);
-    expect(screen.getByText("Search", { selector: ".ui-field-label" }).classList.contains("ui-field-said")).toBe(true);
+describe("Web — the one field", () => {
+  it("tells an address from words by its shape", () => {
+    for (const url of ["https://example.com", "http://a.b/c?d=1", "example.com", "docs.rs/sqlx/latest", "localhost.test:8080/x"]) {
+      expect(looksLikeUrl(url)).toBe(true);
+    }
+    for (const words of ["", "   ", "sqlx", "quarterly report", "sqlite wal.mode notes", "https://a.b c"]) {
+      expect(looksLikeUrl(words)).toBe(false);
+    }
   });
 
-  it("the search box says what it searches", async () => {
+  it("is one named field that says both things it does", async () => {
     daemon.apiFetch.mockImplementation(async () => []);
 
     await renderWeb("/web");
 
-    expect(screen.getByRole("textbox", { name: "Search query" }).getAttribute("placeholder")).toContain("search");
+    const field = screen.getByRole("textbox", { name: "Read an address or filter the archive" });
+    expect(field.getAttribute("placeholder")).toMatch(/address/);
+    expect(field.getAttribute("placeholder")).toMatch(/filter/);
+    // One field, not three: the read form and the filter box are gone.
+    expect(screen.getAllByRole("textbox")).toHaveLength(1);
   });
 
+  it("offers to read an address and to search the web for words", async () => {
+    daemon.apiFetch.mockImplementation(async () => []);
+
+    await renderWeb("/web");
+
+    const field = screen.getByRole("textbox", { name: "Read an address or filter the archive" });
+    fireEvent.change(field, { target: { value: "example.com/page" } });
+    expect(screen.getByRole("button", { name: "Read" })).toBeDefined();
+
+    fireEvent.change(field, { target: { value: "quarterly report" } });
+    expect(screen.getByRole("button", { name: "Search the web" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Read" })).toBeNull();
+  });
+
+  it("reads an address with a scheme added when it had none", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/web/read" && init?.method === "POST") return { ...page({ id: 7 }), trust: "raw", from_cache: false };
+      if (path === "/web/pages/7") return page({ id: 7 });
+      return [];
+    });
+
+    const { router } = await renderWeb("/web");
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Read an address or filter the archive" }), {
+      target: { value: "news.example.com/story" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Read" }));
+
+    await screen.findByText(/^Read and stored/);
+    const call = daemon.apiFetch.mock.calls.find(([path]) => path === "/web/read");
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ url: "https://news.example.com/story" });
+    expect(router.state.location.pathname).toBe("/web/pages/7");
+  });
+});
+
+/* ------------------------------------------------------------------ search -- */
+
+describe("Web — search", () => {
   it("reads an unavailable provider as search not configured, not as a failure", async () => {
     daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
-      if (path === "/web/pages") return [];
       if (path === "/web/search" && init?.method === "POST") {
         return {
           cached: [],
@@ -149,13 +187,15 @@ describe("Web — search", () => {
           results: [],
         };
       }
-      return undefined;
+      return [];
     });
 
     await renderWeb("/web");
 
-    fireEvent.change(screen.getByLabelText("Search query"), { target: { value: "quarterly report" } });
-    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Read an address or filter the archive" }), {
+      target: { value: "quarterly report" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Search the web" }));
 
     expect(
       await screen.findByText(
@@ -168,5 +208,36 @@ describe("Web — search", () => {
     expect(screen.queryByText(/núcleo did not answer/)).toBeNull();
     expect(screen.queryByText(/the núcleo refused this/)).toBeNull();
     expect(document.querySelector(".ui-note-refusal")).toBeNull();
+  });
+});
+
+/* --------------------------------------------------------------- the list -- */
+
+describe("Web — the archive list", () => {
+  it("badges only the quarantined row, and never squeezes the title out", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/web/pages") {
+        return [
+          { id: 1, final_url: "https://a.example/", host: "a.example", title: "a raw page", snippet: "s", trust_at_fetch: "raw", fetched_at: "2026-08-18T09:00:00Z" },
+          { id: 2, final_url: "https://b.example/", host: "b.example", title: "a quarantined page", snippet: "s", trust_at_fetch: "quarantined", fetched_at: "2026-08-18T09:00:00Z" },
+        ];
+      }
+      return [];
+    });
+
+    await renderWeb("/web");
+
+    expect(await screen.findByText("a raw page")).toBeDefined();
+    expect(screen.getAllByText("summarised before reaching the agent")).toHaveLength(1);
+    expect(screen.queryByText("full text reached the agent")).toBeNull();
+  });
+
+  it("teaches once, across the page, when nothing has been read", async () => {
+    daemon.apiFetch.mockImplementation(async () => []);
+
+    await renderWeb("/web");
+
+    expect(await screen.findByText("Nothing has been read yet")).toBeDefined();
+    expect(screen.queryByText("Nothing is open")).toBeNull();
   });
 });

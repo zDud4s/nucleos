@@ -837,11 +837,12 @@
  * put it, and only direct children, so a panel nested inside another keeps
  * whatever its container decided. The section-to-section pair covers quiet
  * Voice lists, which render as consecutive direct section children.
+ *
+ * A tab's panel is the page for whatever it holds, so it gets the same air. Without it the Web
+ * page's Sessions tab stacked four panels edge to edge: its panels are children of the tab, not
+ * of `.app-page`, and the rule never reached them.
  */
-.app-page > .ui-panel + .ui-panel,
-.app-page > .ui-panel + .ui-section,
-.app-page > .ui-section + .ui-panel,
-.app-page > .ui-section + .ui-section {
+:is(.app-page, .ui-tab-panel) > :is(.ui-panel, .ui-section) + :is(.ui-panel, .ui-section) {
   margin-top: var(--space-4);
 }
 

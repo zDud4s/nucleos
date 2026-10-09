@@ -21,6 +21,7 @@ import {
 import { useProjects } from "../data/system";
 import { Button, ConfirmButton, ErrorNote, Quiet, RefusalNote, RelativeTime } from "../ui";
 import { ForceGraph } from "./ForceGraph";
+import { Segments } from "./Segments";
 import { backlinks, buildModel, localModel } from "./graph-model";
 import type { GFilters, GModel, GNode } from "./graph-types";
 import { EDGE_TYPES, NODE_KINDS } from "./GraphFilters";
@@ -114,18 +115,21 @@ function OtherPanel({ node, model }: { node: GNode; model: GModel }) {
         {node.missing && <span className="brain-node-tag">gone</span>}
         {hidden && <span className="brain-node-tag">archived</span>}
       </h3>
-      <h4>Linked from</h4>
-      {from.length === 0 ? (
-        <Quiet says="Nothing links here." />
-      ) : (
-        <ul aria-label="Linked from">
-          {from.map(({ edge, source }) => (
-            <li key={edge.id}>
-              {source?.label ?? edge.source} ({edge.type})
-            </li>
-          ))}
-        </ul>
-      )}
+      <section className="brain-sec">
+        <h4>Linked from</h4>
+        {from.length === 0 ? (
+          <Quiet says="Nothing links here." />
+        ) : (
+          <ul aria-label="Linked from" className="brain-links">
+            {from.map(({ edge, source }) => (
+              <li key={edge.id}>
+                <span className="brain-link-type">{edge.type}</span>
+                <span className="brain-link-target">{source?.label ?? edge.source}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
     </div>
   );
 }
@@ -155,59 +159,75 @@ function NotePanel({
 
   return (
     <div className="brain-panel">
-      <p className="brain-text">{note.text}</p>
-      <div className="brain-meta">
-        <span className="brain-origin">{note.origin}</span>
-        <span className="brain-state">{note.state}</span>
-        <RelativeTime at={note.created_at} />
-      </div>
-      <Button
-        variant="quiet"
-        disabled={update.isPending}
-        onClick={() => update.mutate({ id, state: archived ? "active" : "archived" })}
-      >
-        {archived ? "Restore" : "Archive"}
-      </Button>
-      {update.isError && <Failure error={update.error} />}
+      <header className="brain-panel-head">
+        <p className="brain-text">{note.text}</p>
+        <div className="brain-meta">
+          <span className="brain-origin">{note.origin}</span>
+          <span className="brain-state">{note.state}</span>
+          <RelativeTime at={note.created_at} />
+          <span className="brain-meta-end">
+            <Button
+              variant="quiet"
+              disabled={update.isPending}
+              onClick={() => update.mutate({ id, state: archived ? "active" : "archived" })}
+            >
+              {archived ? "Restore" : "Archive"}
+            </Button>
+          </span>
+        </div>
+        {update.isError && <Failure error={update.error} />}
+      </header>
 
       {!archived && <Teach id={id} />}
 
       <LocalGraph id={id} wide={wide} onSelect={onSelect} />
 
-      <h4>History</h4>
-      <ol aria-label="History">
-        {history.map((event) => (
-          <li key={event.id}>
-            {event.kind}
-            {event.detail !== null && event.detail !== "" ? ` — ${event.detail}` : ""}{" "}
-            <RelativeTime at={event.at} />
-          </li>
-        ))}
-      </ol>
+      <section className="brain-sec">
+        <h4>Links out</h4>
+        {links_out.length === 0 && <Quiet says="No links out." />}
+        <ul aria-label="Links out" className="brain-links">
+          {links_out.map((link) => (
+            <li key={link.id}>
+              <span className="brain-link-type">{link.link_type}</span>
+              <span className="brain-link-target">
+                <TargetName link={link} graph={graph} />
+              </span>
+              <span className="brain-link-act">
+                <ConfirmButton
+                  label="Remove"
+                  confirmLabel="Remove link"
+                  subject={`#${link.id}`}
+                  variant="quiet"
+                  disabled={remove.isPending}
+                  onConfirm={() => remove.mutate(link.id)}
+                />
+              </span>
+            </li>
+          ))}
+        </ul>
+        {remove.isError && <Failure error={remove.error} />}
+        <AddLink id={id} />
+      </section>
 
-      <h4>Links out</h4>
-      {links_out.length === 0 && <Quiet says="No links out." />}
-      <ul aria-label="Links out">
-        {links_out.map((link) => (
-          <li key={link.id}>
-            {link.link_type} → <TargetName link={link} graph={graph} />{" "}
-            <ConfirmButton
-              label="Remove"
-              confirmLabel="Remove link"
-              subject={`#${link.id}`}
-              variant="quiet"
-              disabled={remove.isPending}
-              onConfirm={() => remove.mutate(link.id)}
-            />
-          </li>
-        ))}
-      </ul>
-      {remove.isError && <Failure error={remove.error} />}
+      <section className="brain-sec">
+        <h4>Links in</h4>
+        <LinksIn id={id} wide={wide} fallback={links_in} onSelect={onSelect} />
+      </section>
 
-      <h4>Links in</h4>
-      <LinksIn id={id} wide={wide} fallback={links_in} onSelect={onSelect} />
-
-      <AddLink id={id} />
+      <section className="brain-sec">
+        <h4>History</h4>
+        <ol aria-label="History" className="brain-history">
+          {history.map((event) => (
+            <li key={event.id}>
+              <span className="brain-history-kind">
+                {event.kind}
+                {event.detail !== null && event.detail !== "" ? ` — ${event.detail}` : ""}
+              </span>{" "}
+              <RelativeTime at={event.at} />
+            </li>
+          ))}
+        </ol>
+      </section>
     </div>
   );
 }
@@ -230,21 +250,23 @@ function LinksIn({
   const links = wide === undefined ? fallback : backlinks(wide, "note", String(id));
   if (links.length === 0) return <Quiet says="No links in." />;
   return (
-    <ul aria-label="Links in">
+    <ul aria-label="Links in" className="brain-links">
       {links.map((link) => {
         const source = wide?.notes.find((n) => n.id === link.note_id);
         const name = source !== undefined ? firstLine(source.text) : `note ${link.note_id}`;
         return (
           <li key={link.id}>
-            {link.link_type} ←{" "}
-            {onSelect !== undefined ? (
-              <Button variant="quiet" onClick={() => onSelect(`n:${link.note_id}`)}>
-                {name}
-              </Button>
-            ) : (
-              name
-            )}
-            {source?.state === "archived" && <span className="brain-node-tag">archived</span>}
+            <span className="brain-link-type">{link.link_type}</span>
+            <span className="brain-link-target">
+              {onSelect !== undefined ? (
+                <Button variant="quiet" onClick={() => onSelect(`n:${link.note_id}`)}>
+                  {name}
+                </Button>
+              ) : (
+                name
+              )}
+              {source?.state === "archived" && <span className="brain-node-tag">archived</span>}
+            </span>
           </li>
         );
       })}
@@ -257,6 +279,11 @@ function firstLine(text: string): string {
   const first = text.trim().split("\n")[0] ?? "";
   return first.length > 60 ? `${first.slice(0, 59)}…` : first || "(empty note)";
 }
+
+const DEPTHS: readonly (readonly [1 | 2, string])[] = [
+  [1, "Depth 1"],
+  [2, "Depth 2"],
+];
 
 /** The note's neighbourhood at depth 1 (or 2), drawn by the same canvas as the global graph. */
 function LocalGraph({
@@ -281,16 +308,10 @@ function LocalGraph({
   );
 
   return (
-    <section className="brain-local" aria-label="Local graph">
+    <section className="brain-sec brain-local" aria-label="Local graph">
       <div className="brain-local-head">
         <h4>Local graph</h4>
-        <div role="group" aria-label="Local graph depth">
-          {([1, 2] as const).map((value) => (
-            <Button key={value} variant="quiet" aria-pressed={depth === value} onClick={() => setDepth(value)}>
-              Depth {value}
-            </Button>
-          ))}
-        </div>
+        <Segments label="Local graph depth" value={depth} options={DEPTHS} onChange={setDepth} />
       </div>
       {local === null ? (
         <Quiet says="Loading the local graph…" />
@@ -327,7 +348,7 @@ function AddLink({ id }: { id: number }) {
 
   return (
     <form
-      className="brain-panel-form"
+      className="brain-panel-form brain-addlink"
       aria-label="Add link"
       onSubmit={(event) => {
         event.preventDefault();
@@ -362,7 +383,7 @@ function AddLink({ id }: { id: number }) {
         value={ref}
         onChange={(event) => setRef(event.target.value)}
       />
-      <Button type="submit" variant="quiet" disabled={blank || add.isPending}>
+      <Button type="submit" variant="ghost" disabled={blank || add.isPending}>
         Add link
       </Button>
       {add.isError && <Failure error={add.error} />}
@@ -377,7 +398,9 @@ function Teach({ id }: { id: number }) {
   const [title, setTitle] = useState("");
 
   return (
-    <div className="brain-panel-form" role="group" aria-label="Teach the agent">
+    <section className="brain-sec" role="group" aria-label="Teach the agent">
+      <h4>Make it a lesson</h4>
+      <div className="brain-panel-form">
       <select
         aria-label="Lesson kind"
         value={kind}
@@ -389,12 +412,13 @@ function Teach({ id }: { id: number }) {
       </select>
       <input
         aria-label="Lesson title"
-        placeholder="title (optional)"
+        className="brain-prose-input"
+        placeholder="Title (optional)"
         value={title}
         onChange={(event) => setTitle(event.target.value)}
       />
       <Button
-        variant="quiet"
+        variant="ghost"
         disabled={teach.isPending}
         onClick={() =>
           teach.mutate({ id, kind, ...(title.trim() !== "" ? { title: title.trim() } : {}) })
@@ -402,12 +426,13 @@ function Teach({ id }: { id: number }) {
       >
         Teach the agent
       </Button>
+      </div>
       {teach.isSuccess && (
         <p role="status">
           Proposed — waiting for your approval in <Link to="/brain" search={{ item: `knowledge:${teach.data.knowledge_id}` }}>the Brain</Link>
         </p>
       )}
       {teach.isError && <Failure error={teach.error} sentences={TEACH_SENTENCES} />}
-    </div>
+    </section>
   );
 }
