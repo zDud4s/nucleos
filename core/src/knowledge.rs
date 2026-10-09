@@ -1404,6 +1404,23 @@ pub async fn all(pool: &SqlitePool) -> sqlx::Result<Vec<Known>> {
     .await
 }
 
+/// Every row of exactly one scope, in every status, newest first: [`all`], narrowed to the
+/// `(scope_kind, scope_id)` of `scope`, so a screen showing one agent's or one team's memory is
+/// not at the mercy of how many rows every other scope has.
+pub async fn in_scope(pool: &SqlitePool, scope: &Scope) -> sqlx::Result<Vec<Known>> {
+    let (kind, id) = scope.columns();
+    // `AssertSqlSafe`, audited: the only interpolation is [`COLUMNS`], a literal.
+    sqlx::query_as::<_, Known>(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM knowledge
+          WHERE scope_kind = ? AND scope_id IS ?
+          ORDER BY id DESC LIMIT 500"
+    )))
+    .bind(kind)
+    .bind(id)
+    .fetch_all(pool)
+    .await
+}
+
 /// What somebody is asking the store to learn.
 ///
 /// A struct and not eight positional arguments: the call site of the earlier shape was four string
@@ -1932,6 +1949,26 @@ async fn pending_knowledge(pool: &SqlitePool, proposal_id: i64) -> Result<i64, D
                 .and_then(serde_json::Value::as_i64)
         })
         .ok_or(DecisionError::Malformed)
+}
+
+/// Whether the row a pending refinement proposal names was declared in `scope`.
+///
+/// The refusals are [`approve`]'s: no such refinement proposal is `NotFound`, a decided one is
+/// `NotPending`, and one that names no row is `Malformed`.
+pub async fn declared_in(
+    pool: &SqlitePool,
+    proposal_id: i64,
+    scope: &Scope,
+) -> Result<bool, DecisionError> {
+    let knowledge_id = pending_knowledge(pool, proposal_id).await?;
+    let (kind, id): (String, Option<String>) =
+        sqlx::query_as("SELECT scope_kind, scope_id FROM knowledge WHERE id = ?")
+            .bind(knowledge_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|_| DecisionError::Malformed)?;
+    let (want_kind, want_id) = scope.columns();
+    Ok(kind == want_kind && id == want_id)
 }
 
 /// A person said yes, and only now does anything reach a prompt.

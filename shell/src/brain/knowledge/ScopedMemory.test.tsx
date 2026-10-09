@@ -50,6 +50,21 @@ describe("ScopedMemory - own memory", () => {
     expect(region.textContent).toContain("2 more waiting for you in the Brain");
   });
 
+  it("own memory asks the núcleo for its own scope only", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith([
+        known({ id: 1, scope_kind: "agent", scope_id: "copywriter", title: "Copy is short" }),
+      ]),
+    );
+
+    await renderWithRouter(<ScopedMemory scopeKind="agent" scopeId="copywriter" />);
+    await screen.findByText("Copy is short");
+
+    const paths = daemon.apiFetch.mock.calls.map(([path]) => path);
+    expect(paths).toContain("/knowledge?scope_kind=agent&scope_id=copywriter");
+    expect(paths).not.toContain("/knowledge");
+  });
+
   it("own memory says so when the scope holds nothing", async () => {
     daemon.apiFetch.mockImplementation(
       daemonWith([

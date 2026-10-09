@@ -13,7 +13,7 @@ import { Agents } from "./Agents";
 import { ApiRefusal } from "../data/client";
 import type { Agent, Employer } from "../data/agents";
 import { daemonFetch, daemonState, renderApp, renderWithQuery } from "../test/harness";
-import { known } from "../brain/knowledge/test-helpers";
+import { known, knowledgeAnswer } from "../brain/knowledge/test-helpers";
 import type { Known } from "../data/knowledge";
 
 beforeEach(() => {
@@ -78,7 +78,8 @@ function agentsFetch(
   */
   return async (path, init) => {
     if (path === "/teams") return (opts.teams ?? []).map((row) => ({ ...row }));
-    if (path === "/knowledge") return (opts.knowledge ?? []).map((row) => ({ ...row }));
+    const listed = knowledgeAnswer(path, opts.knowledge ?? []);
+    if (listed !== undefined) return listed.map((row) => ({ ...row }));
 
     if (path === "/agents" && init?.method === "POST") {
       const body = JSON.parse(init.body as string) as Record<string, unknown>;

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { useKnowledge } from "../../data/knowledge";
+import { useScopedKnowledge } from "../../data/knowledge";
 import { Quiet, Rows } from "../../ui";
 import { KnownRow } from "./KnownRow";
 import "./knowledge.css";
@@ -16,7 +16,7 @@ export interface ScopedMemoryProps {
  * place to get the decision wrong.
  */
 export function ScopedMemory({ scopeKind, scopeId }: ScopedMemoryProps) {
-  const knowledge = useKnowledge();
+  const knowledge = useScopedKnowledge(scopeKind, scopeId);
 
   let body: ReactNode;
   if (knowledge.isError) {

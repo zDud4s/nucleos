@@ -351,6 +351,8 @@ export const keys = {
     /** `GET /distill/duplicates` — each row flagged a near-duplicate, and of which. */
     nearDuplicates: ["knowledge", "near-duplicates"] as const,
     detail: (id: number) => ["knowledge", "detail", id] as const,
+    /** `GET /knowledge?scope_kind=&scope_id=` — one agent's or team's rows, every status. */
+    scope: (kind: string, id: string) => ["knowledge", "scope", kind, id] as const,
   },
 
   /**

@@ -297,11 +297,27 @@ export interface KnowledgeHistory {
 
 /* ------------------------------------------------------------------ reads -- */
 
-/** Everything the store holds, in every status. */
-export function useKnowledge() {
+/**
+ * Everything the store holds, in every status. `enabled: false` reads only what
+ * the cache already has, for a caller that needs the list in one case only.
+ */
+export function useKnowledge(enabled = true) {
   return useQuery({
     queryKey: keys.knowledge.all,
     queryFn: () => apiFetch<Known[]>("/knowledge"),
+    refetchInterval: POLL.queue,
+    enabled,
+  });
+}
+
+/** One agent's or team's rows, in every status — `GET /knowledge` narrowed to that scope. */
+export function useScopedKnowledge(kind: "agent" | "team", id: string) {
+  return useQuery({
+    queryKey: keys.knowledge.scope(kind, id),
+    queryFn: () =>
+      apiFetch<Known[]>(
+        `/knowledge?${new URLSearchParams({ scope_kind: kind, scope_id: id }).toString()}`,
+      ),
     refetchInterval: POLL.queue,
   });
 }

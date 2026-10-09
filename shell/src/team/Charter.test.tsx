@@ -23,7 +23,7 @@ import { detectDrift, snapshotFromView } from "./drift";
 import { createAppQueryClient } from "../app/queryClient";
 import type { TeamView } from "../data/teams";
 import type { Known } from "../data/knowledge";
-import { known } from "../brain/knowledge/test-helpers";
+import { known, knowledgeAnswer } from "../brain/knowledge/test-helpers";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -70,7 +70,8 @@ async function renderCharter(seed: TeamView, opts: { later?: TeamView; knowledge
       ];
     }
     if (path === "/teams") return [state.team];
-    if (path === "/knowledge") return opts.knowledge ?? [];
+    const listed = knowledgeAnswer(path, opts.knowledge ?? []);
+    if (listed !== undefined) return listed;
     if (/^\/teams\/[^/]+$/.exec(path) !== null) {
       state.reads += 1;
       // The second read is the guard's re-read at submit — where the hire that

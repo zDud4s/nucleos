@@ -31,9 +31,10 @@ export function KnownRow({ row, decisions }: KnownRowProps) {
   // One cached query however many rows ask; only a distiller row reads its answer.
   const causes = useDistillCauses();
   const origin = distilledOrigin(row, causes.data ?? new Map());
-  // Same: shared cached queries. The title of the older row comes from the list already loaded.
+  // Same: shared cached queries. The title of the older row comes from the list already loaded,
+  // and only a near-duplicate asks for it, so a row shown under one scope never reads them all.
   const duplicateOf = useNearDuplicates().data?.get(row.id) ?? null;
-  const all = useKnowledge().data;
+  const all = useKnowledge(duplicateOf !== null).data;
   const duplicateTitle =
     duplicateOf === null ? null : (all?.find((other) => other.id === duplicateOf)?.title ?? null);
 

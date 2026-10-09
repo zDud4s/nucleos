@@ -51,7 +51,8 @@ export function daemonWith(
   return (path: string) => {
     if (path === "/distill/duplicates") return Promise.resolve(duplicates);
     if (path === "/distill/causes") return Promise.resolve(causes);
-    if (path === "/knowledge") return Promise.resolve(rows);
+    const listed = knowledgeAnswer(path, rows);
+    if (listed !== undefined) return Promise.resolve(listed);
     if (path.startsWith("/knowledge/")) {
       const id = Number(path.split("/")[2]);
       return Promise.resolve({
@@ -96,4 +97,18 @@ export function renderWaiting(): ReturnType<typeof renderWithRouter> {
 /** The measured summary of everything the daemon holds. */
 export function renderMeasured(): ReturnType<typeof renderWithRouter> {
   return renderWithRouter(<MeasuredSummary rows={lastRows.rows} />);
+}
+
+/**
+ * What `GET /knowledge` answers for `path`: every row, or — narrowed with
+ * `?scope_kind=&scope_id=` — that one scope's rows, the way the núcleo filters
+ * them. `undefined` when `path` is not a knowledge listing at all.
+ */
+export function knowledgeAnswer(path: string, rows: Known[]): Known[] | undefined {
+  if (path === "/knowledge") return rows;
+  if (!path.startsWith("/knowledge?")) return undefined;
+  const query = new URLSearchParams(path.slice("/knowledge?".length));
+  return rows.filter(
+    (row) => row.scope_kind === query.get("scope_kind") && row.scope_id === query.get("scope_id"),
+  );
 }

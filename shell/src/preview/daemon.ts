@@ -1,4 +1,5 @@
 import type { Agent } from "../data/agents";
+import type { Known } from "../data/knowledge";
 import type { ClassTally, JudgeResolveStatus, Resolution, JudgeStatus, JudgeVerdict } from "../data/autopilot";
 import type { Concurrency, Job, JobDetail, JobItem, RunSearchResult } from "../data/fleet";
 import type { MapImport, MapModule, ProjectMap } from "../data/project-map";
@@ -2301,6 +2302,38 @@ const FILES: Record<string, { name: string; is_dir: boolean; size_bytes: number;
   "mail-filing": [{ name: "from-accountant", is_dir: true, size_bytes: 0, modified: ago(3 * HOUR) }],
 };
 
+
+/**
+ * The knowledge store: what the Brain's queue waits on, and what the Memory
+ * section of the Auditor Sénior's editor and of Finanças's Charter shows.
+ */
+function known(row: Partial<Known> & Pick<Known, "id" | "scope_kind" | "scope_id" | "title" | "body" | "status">): Known {
+  return {
+    layer: "semantic", source: "run", generator: null, kind: "memory", proposal_id: null,
+    supersedes: null, origin_run_id: null, evidence: null, observations: null, fingerprint: null,
+    expires_after_runs: null, last_confirmed_at: null, shown_count: 0, outcome_count: 0,
+    green_count: 0, last_shown_at: null, created_at: ago(3 * DAY), activated_at: null,
+    ended_at: null, ...row,
+  };
+}
+
+const KNOWLEDGE: Known[] = [
+  known({ id: 1, scope_kind: "agent", scope_id: "auditor", status: "active", activated_at: ago(6 * DAY),
+    title: "Reconcile against the bank export, not the ledger", body: "The ledger lags a day; the bank export is the second source that settles a disagreement.", shown_count: 14, outcome_count: 9, green_count: 8 }),
+  known({ id: 2, scope_kind: "agent", scope_id: "auditor", status: "active", activated_at: ago(2 * DAY), layer: "procedural", kind: "skill",
+    title: "Quote the line that does not add up", body: "A finding names the row and the two numbers; a summary without them gets sent back.", shown_count: 5, outcome_count: 3, green_count: 3 }),
+  known({ id: 3, scope_kind: "agent", scope_id: "auditor", status: "proposed", proposal_id: 903,
+    title: "VAT returns close on the 20th", body: "Seen in three runs: the draft is rejected after the 20th of the following month." }),
+  known({ id: 4, scope_kind: "team", scope_id: "financas", status: "active", activated_at: ago(9 * DAY),
+    title: "Invoices above 5 000 EUR need a second signature", body: "The charter's own rule, learned from a refused payment in March.", shown_count: 21, outcome_count: 12, green_count: 11 }),
+  known({ id: 5, scope_kind: "team", scope_id: "financas", status: "active", activated_at: ago(1 * DAY), layer: "episodic",
+    title: "The supplier portal is down on Sunday nights", body: "Runs scheduled then fail on login; move them to Monday morning.", shown_count: 2, outcome_count: 1, green_count: 1 }),
+  known({ id: 6, scope_kind: "project", scope_id: "nucleos", status: "proposed", proposal_id: 901, source: "distiller", generator: "refine",
+    title: "Run http.rs tests in the bin target", body: "`cargo test --lib` never reaches them; `--bin nucleos-core` does." }),
+  known({ id: 7, scope_kind: "machine", scope_id: null, status: "proposed", proposal_id: 902, source: "consolidator",
+    title: "Git's bash is the POSIX shell here", body: "`bash` on PATH is WSL; name Git's bash.exe explicitly." }),
+];
+
 export function answer(path: string, init?: RequestInit): unknown {
   /*
     The house's capacity, with nobody holding a slot. It is here so the Codigo
@@ -2824,6 +2857,14 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/proposals/team-actions") return TEAM_ACTION_PROPOSALS;
   if (path === "/proposals/recruits") return RECRUITS;
   if (path === "/agents") return AGENTS;
+  if (splitQuery(path)[0] === "/knowledge") {
+    /* Narrowed the way the núcleo narrows it: one agent's or team's rows, every status. */
+    const [, query] = splitQuery(path);
+    if (!query.has("scope_kind")) return KNOWLEDGE;
+    return KNOWLEDGE.filter(
+      (row) => row.scope_kind === query.get("scope_kind") && row.scope_id === query.get("scope_id"),
+    );
+  }
   if (path === "/autopilot/budget") {
     /*
       `satisfies` and not a bare literal, because this is the one fixture that

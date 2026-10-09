@@ -418,6 +418,9 @@ const SHOTS_TO_TAKE = [
      things this page exists for at once. */
   ["12-catalogue-editor", { path: "/agents", press: "Auditor Sénior" }],
   ["13-catalogue-editor-light", { path: "/agents", press: "Auditor Sénior", theme: "light" }],
+  // The Brain's queue: a row per scope kind, each with the scope it would be approved into.
+  ["14-brain-waiting", { path: "/brain" }],
+  ["14a-brain-waiting-light", { path: "/brain", theme: "light" }],
   ["14-catalogue-new", { path: "/agents", press: "New agent" }],
 
   /* The inspector. Four views over four deliberately awkward projects: `alpha`
