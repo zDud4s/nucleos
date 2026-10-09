@@ -20,6 +20,7 @@ import {
 import { useTeams } from "../data/teams";
 import { ContextRefs } from "../context/ContextRefs";
 import { ScopedMemory } from "../brain/knowledge/ScopedMemory";
+import { ScopedTools } from "../brain/knowledge/ScopedTools";
 import {
   Button,
   ConfirmButton,
@@ -830,6 +831,7 @@ function AgentEditor({
 
       <ContextRefs ownerKind="agent" ownerId={agent.id} />
       <ScopedMemory scopeKind="agent" scopeId={agent.id} />
+      <ScopedTools ownerKind="agent" ownerId={agent.id} />
 
       {/*
         The delete, and what this page can see standing on it — before the
