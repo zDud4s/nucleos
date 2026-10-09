@@ -498,10 +498,8 @@ impl BrowserClient {
     ) -> Result<Session, BrowserError> {
         let mut placement = serde_json::to_value(placement)
             .map_err(|error| BrowserError::Failed(error.to_string()))?;
-        if visible {
-            if let Some(object) = placement.as_object_mut() {
-                object.insert("visible".into(), serde_json::Value::Bool(true));
-            }
+        if visible && let Some(object) = placement.as_object_mut() {
+            object.insert("visible".into(), serde_json::Value::Bool(true));
         }
         self.call(
             "/open",
