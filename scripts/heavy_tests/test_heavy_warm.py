@@ -518,6 +518,121 @@ class WarmTests(unittest.TestCase):
         self.assertEqual(self.queue_names(), [])
         self.assertEqual(self.log_rows(), [])
 
+    # ---- a running warm yields to a real request -------------------------------------
+    def seed_log(self, argv: list[str], runs: int = 3, run_s: float = 600.0) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        with open(self.state / "log.jsonl", "a", encoding="utf-8") as f:
+            for _ in range(runs):
+                f.write(json.dumps({"v": 1, "argv": argv, "run_s": run_s, "exit": 0}) + "\n")
+
+    def preempted_warm_rows(self) -> list[dict]:
+        return [r for r in self.log_rows()
+                if r.get("warm") and r.get("preempted") and r.get("exit") == 75]
+
+    def lock_records(self) -> list[dict]:
+        wt = self.state / "wt"
+        out: list[dict] = []
+        for f in (sorted(wt.glob("*.lock")) if wt.exists() else []):
+            try:
+                out.append(json.loads(f.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                pass
+        return out
+
+    # 9
+    def test_a_running_warm_is_preempted_for_a_capacity_waiter_and_requeues(self) -> None:
+        # The warm holds the whole machine (cargo = weight 2 of 2). A real request that can
+        # only wait for capacity must not sit behind a background pre-build for its length:
+        # the warm is stopped, the request runs, and the warm queues again behind it.
+        rc, out, _ = self.warm(self.repo_a, capacity=2)
+        self.assertEqual(rc, 0, out)
+        self.assert_started("no-run")
+        real = self.broker("real", self.repo_c, prio=1, capacity=2)
+        self.assertTrue(wait_for(lambda: self.started("real"), timeout=30),
+                        "a real request stayed behind a running warm")
+        self.assertTrue(wait_for(lambda: bool(self.preempted_warm_rows()), timeout=30),
+                        f"no preempted warm row: {self.log_rows()}")
+        self.stop("real")
+        self.assertEqual(real.wait(timeout=30), 0)
+        self.assertTrue(wait_for(lambda: self.order().count("no-run") == 2),
+                        f"the warm did not queue again: {self.order()}")
+        self.assert_order(["no-run", "real", "no-run"])
+        self.stop("no-run")
+        self.assertTrue(
+            wait_for(lambda: any(r.get("warm") and r.get("exit") == 0 for r in self.log_rows())),
+            f"the requeued warm never finished: {self.log_rows()}")
+        last = [r for r in self.log_rows() if r.get("warm")][-1]
+        self.assertEqual(last.get("exit"), 0, last)
+        self.assertFalse(last.get("preempted"), last)
+
+    # 10
+    def test_a_running_warm_is_preempted_for_a_waiter_on_its_worktree_lock(self) -> None:
+        # Room for both (capacity 4), but they want the same worktree: the run waits for the
+        # lock the warm holds. The warm is the compile it wants, yet it is estimated at ten
+        # minutes - the agent must neither be told to give up (a warm is exempt from the
+        # long-holder exit) nor wait for it.
+        argv = ["cargo", "check", "w2"]
+        self.seed_log(argv)
+        rc, out, _ = self.warm(self.repo_a, argv=argv, capacity=4)
+        self.assertEqual(rc, 0, out)
+        self.assert_started("w2")
+        same = subprocess.Popen(
+            [sys.executable, str(HEAVY), "--prio", "1", "--agent", "main", "--kind", "cargo",
+             "--wait-max", "60", "--", "cargo", "check", "same"],
+            env=self.env(4), cwd=str(self.repo_a),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.procs.append(same)
+        self.assertTrue(wait_for(lambda: self.started("same"), timeout=30),
+                        "a real run stayed behind a running warm on its worktree lock")
+        self.assertIsNone(same.poll(), "the run exited instead of waiting for its turn")
+        self.assertTrue(wait_for(lambda: bool(self.preempted_warm_rows()), timeout=30),
+                        f"no preempted warm row: {self.log_rows()}")
+        self.stop("same")
+        out_same, err_same = same.communicate(timeout=30)
+        self.assertEqual(same.returncode, 0, err_same)
+        self.assertTrue(wait_for(lambda: self.order().count("w2") == 2),
+                        f"the warm did not run again after the real run: {self.order()}")
+        self.assert_order(["w2", "same", "w2"])
+
+    # 11
+    def test_a_warm_with_room_beside_it_is_not_preempted(self) -> None:
+        # capacity 4: the warm (2) and a real cargo run (2) fit side by side, and they are in
+        # different worktrees - there is nothing to yield for.
+        rc, out, _ = self.warm(self.repo_a, capacity=4)
+        self.assertEqual(rc, 0, out)
+        self.assert_started("no-run")
+        real = self.broker("real", self.repo_c, prio=1, capacity=4)
+        self.assert_started("real")
+        time.sleep(2.0)
+        self.assertEqual([r for r in self.log_rows() if r.get("preempted")], [])
+        self.assert_order(["no-run", "real"])
+        # While it runs the warm says so on its lock record: that is how a waiter tells a
+        # background pre-build from a real run.
+        self.assertTrue(any(r.get("warm") is True for r in self.lock_records()),
+                        f"no lock record marks the warm: {self.lock_records()}")
+        self.stop("real")
+        self.assertEqual(real.wait(timeout=30), 0)
+
+    # 12
+    def test_the_logged_target_dir_is_normalised(self) -> None:
+        # `C:/x/./` and `c:\x` are one directory; the log must give one spelling, or a
+        # report grouping rows by target_dir counts it twice.
+        # A tree with no crate in it gets no fingerprint, so the directory is logged as the
+        # caller spelled it - the case where the spelling matters (a fingerprinted run logs a
+        # resolved path already).
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        subprocess.run(["git", "init", "-q", str(plain)], check=True, capture_output=True)
+        base = os.path.realpath(self.td).replace("\\", "/")
+        value = base + "/./"
+        p = self.broker("td", plain, FAKE_FAST="1", CARGO_TARGET_DIR=value)
+        out, err = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 0, err)
+        rows = [r for r in self.log_rows() if "td" in (r.get("argv") or [])]
+        self.assertEqual(len(rows), 1, self.log_rows())
+        self.assertEqual(rows[0].get("target_dir"), os.path.normcase(os.path.normpath(value)))
+
 
 if __name__ == "__main__":
     unittest.main()

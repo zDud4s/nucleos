@@ -426,6 +426,111 @@ class LockTests(unittest.TestCase):
         self.stop("out")
         self.assertEqual(self.finish(out)[0], 0)
 
+    def seed_log(self, argv: list[str], runs: int = 3, run_s: float = 600.0) -> None:
+        """Previous successful runs of `argv`, as the broker would have logged them."""
+        self.state.mkdir(parents=True, exist_ok=True)
+        with open(self.state / "log.jsonl", "a", encoding="utf-8") as f:
+            for _ in range(runs):
+                f.write(json.dumps({"v": 1, "argv": argv, "run_s": run_s, "exit": 0}) + "\n")
+
+    def test_an_agent_behind_a_long_holder_fails_fast_with_an_estimate(self) -> None:
+        # The log says this command takes ten minutes; an agent that can wait 30 s behind it
+        # is told at once (and told how long is left) rather than idling to a timeout.
+        self.seed_log([str(self.cargo), "check", "h"])
+        h = self.broker("h", self.repo_a, agent="other")
+        self.assert_started("h")
+        t0 = time.time()
+        ag = self.broker("ag", self.repo_a, agent="main", wait_max="30")
+        rc, _, err = self.finish(ag)
+        self.assertEqual(rc, 75, err)
+        self.assertLess(time.time() - t0, 10, "the agent waited behind a long holder")
+        self.assertFalse(self.started("ag"))
+        self.assertIn(f"pid {h.pid}", err)
+        self.assertIn("agent other", err)
+        self.assertIn("check h", err)
+        self.assertIn("estimated", err)
+
+        # Without an agent (a person, the daemon) the old behaviour stays: it waits its turn.
+        out = self.broker("out", self.repo_a)
+        self.waiters(1)
+        self.assert_stays_waiting("out")
+        self.stop("h")
+        self.assertEqual(self.finish(h)[0], 0)
+        self.assert_started("out")
+        self.stop("out")
+        self.assertEqual(self.finish(out)[0], 0)
+
+    def test_a_lock_timeout_names_the_holder(self) -> None:
+        # No history of the holder's command, so there is no estimate and no early exit: the
+        # agent waits out its cap, and the timeout says who it was waiting for.
+        h = self.broker("h", self.repo_a)
+        self.assert_started("h")
+        t0 = time.time()
+        ag = self.broker("ag", self.repo_a, agent="main", wait_max="2")
+        rc, _, err = self.finish(ag)
+        self.assertEqual(rc, 75, err)
+        self.assertGreaterEqual(time.time() - t0, 1.5, "gave up before its wait cap")
+        self.assertFalse(self.started("ag"))
+        self.assertIn(f"pid {h.pid}", err)
+        self.assertIn("check h", err)
+
+    def test_the_gate_message_names_the_holder(self) -> None:
+        hw = self.hold("hw", self.repo_a)
+        self.assert_started("hw")
+        ag = self.broker("ag", self.repo_a, agent="main", wait_max="30")
+        rc, _, err = self.finish(ag)
+        self.assertEqual(rc, 75, err)
+        self.assertFalse(self.started("ag"))
+        self.assertIn("gate", err)
+        # One holder line, the same shape everywhere: who, which agent, what, for how long.
+        self.assertRegex(err, rf"pid {hw.pid}, agent \S+, `[^`]+`, running \d+s")
+
+    def waiter_dirs(self) -> list[Path]:
+        wt = self.state / "wt"
+        return sorted(wt.glob("*.waiters")) if wt.exists() else []
+
+    def test_last_waiter_leaving_removes_the_waiters_dir(self) -> None:
+        # The broker used to leave an empty `wt/<hash>.waiters` behind when its last waiter
+        # went: the dir has to follow the waiter out, not outlive the contention.
+        a1 = self.broker("a1", self.repo_a)
+        self.assert_started("a1")
+        a2 = self.broker("a2", self.repo_a)
+        self.waiters(1)
+        self.stop("a1")
+        self.assert_started("a2")
+        self.stop("a2")
+        self.assertEqual(self.finish(a1)[0], 0)
+        self.assertEqual(self.finish(a2)[0], 0)
+        self.assertTrue(
+            wait_for(lambda: self.waiter_dirs() == [], timeout=10), "waiters dir left behind"
+        )
+
+    def test_an_uncontended_lock_leaves_no_waiters_dir(self) -> None:
+        # Nobody ever waits, and the dir used to be made on every poll all the same.
+        a1 = self.broker("a1", self.repo_a)
+        self.assert_started("a1")
+        self.stop("a1")
+        self.assertEqual(self.finish(a1)[0], 0)
+        self.assertEqual(self.waiter_dirs(), [])
+
+    def test_entries_of_a_vanished_dir_is_empty(self) -> None:
+        # The broker removes empty `.waiters` dirs; a reader outside the Mutex can see
+        # `is_dir()` pass and then lose the dir before `iterdir()`.
+        import importlib.util
+        import pathlib
+        from unittest import mock
+
+        spec = importlib.util.spec_from_file_location("heavy_entries_under_test", HEAVY)
+        heavy = importlib.util.module_from_spec(spec)
+        sys.modules["heavy_entries_under_test"] = heavy
+        self.addCleanup(sys.modules.pop, "heavy_entries_under_test", None)
+        spec.loader.exec_module(heavy)
+
+        gone = self.tmp / "gone.waiters"
+        self.assertEqual(heavy._entries(gone), [])
+        with mock.patch.object(pathlib.Path, "is_dir", return_value=True):
+            self.assertEqual(heavy._entries(gone), [])
+
 
 if __name__ == "__main__":
     unittest.main()
