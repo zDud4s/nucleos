@@ -47,6 +47,7 @@ pub mod concurrency;
 pub mod config;
 pub mod consolidate;
 pub mod contacts;
+pub mod context_refs;
 pub mod council;
 pub mod daemon_client;
 pub mod detect;
