@@ -170,7 +170,6 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     job_gate_scoped: { tone: "info", label: "job gated by scope" },
     // A post-merge gate went red and was bisected to a merge (`verify_postgate.rs`). Nothing was
     // reverted, so it is a failure the owner must look at, not a recovered state.
-    postgate_red: { tone: "danger", label: "post-merge gate red" },
     // A round in which no item passed has nothing for a review to judge, so none runs (job 27,
     // 2026-09-14: a review read a reverted tree and reported "no work was done"). A fact, not a
     // failure: the red items already said so.

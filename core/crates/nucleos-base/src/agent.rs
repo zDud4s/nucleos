@@ -265,12 +265,54 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), AgentError>
         return Err(AgentError::InUse);
     }
 
+    // The delete and the memory archive share one transaction: a delete that fails or finds nothing
+    // rolls back with the transaction, so the memory is archived only when the owner really went.
+    let mut tx = pool.begin().await?;
     let result = sqlx::query("DELETE FROM agents WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
         return Err(AgentError::NotFound);
+    }
+    archive_owner_memory(&mut tx, "agent", id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Archives the live memory (`active` and `proposed` rows) of an owner that is being deleted, and
+/// writes one `knowledge_events` row per transition. Spec §4.4: plain SQL in the caller's own
+/// transaction, so the archive commits or rolls back together with the delete. Rows in any other
+/// status (rejected, already archived) are left alone.
+pub async fn archive_owner_memory(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    scope_kind: &str,
+    scope_id: &str,
+) -> sqlx::Result<()> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, status FROM knowledge
+          WHERE scope_kind = ? AND scope_id = ? AND status IN ('active', 'proposed')",
+    )
+    .bind(scope_kind)
+    .bind(scope_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (knowledge_id, from_status) in rows {
+        sqlx::query("UPDATE knowledge SET status = 'archived', ended_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(knowledge_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+             VALUES (?, ?, 'archived', 'owner deleted', ?)",
+        )
+        .bind(knowledge_id)
+        .bind(&from_status)
+        .bind(&now)
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(())
 }
@@ -480,5 +522,108 @@ mod tests {
         let spare = create(&pool, request("analyst")).await.unwrap();
         team_with(&pool, &director.id, &member.id).await;
         delete(&pool, &spare.id).await.unwrap();
+    }
+
+    /// One `knowledge` row of the given scope and status, shaped like `loadout.rs`'s `seed`.
+    async fn seed_knowledge(
+        pool: &sqlx::SqlitePool,
+        scope_kind: &str,
+        scope_id: &str,
+        status: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', ?, ?, 'owner', 'memory', 'a memory', 'body', ?,
+                     '2026-08-19T00:00:00+00:00')",
+        )
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn knowledge_status(pool: &sqlx::SqlitePool, id: i64) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, ended_at FROM knowledge WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The `(from_status, to_status)` pairs recorded for one knowledge row, oldest first.
+    async fn knowledge_transitions(
+        pool: &sqlx::SqlitePool,
+        id: i64,
+    ) -> Vec<(Option<String>, String)> {
+        sqlx::query_as(
+            "SELECT from_status, to_status FROM knowledge_events WHERE knowledge_id = ? ORDER BY id",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Spec §4.4: deleting an agent archives the memory that was scoped to it, in the same
+    /// transaction, and touches nothing else. The `team` row carrying the agent's id proves the
+    /// scope kind is honoured and not only the id; the `rejected` row proves a row that is already
+    /// out of candidacy keeps the status it earned.
+    #[tokio::test]
+    async fn deleting_an_agent_archives_its_memory_and_nothing_else() {
+        let pool = pool().await;
+        let spare = create(&pool, request("analyst")).await.unwrap();
+        let other = create(&pool, request("copywriter")).await.unwrap();
+        let active = seed_knowledge(&pool, "agent", &spare.id, "active").await;
+        let proposed = seed_knowledge(&pool, "agent", &spare.id, "proposed").await;
+        let rejected = seed_knowledge(&pool, "agent", &spare.id, "rejected").await;
+        let others = seed_knowledge(&pool, "agent", &other.id, "active").await;
+        let team_row = seed_knowledge(&pool, "team", &spare.id, "active").await;
+
+        delete(&pool, &spare.id).await.unwrap();
+
+        for id in [active, proposed] {
+            let (status, ended_at) = knowledge_status(&pool, id).await;
+            assert_eq!(status, "archived", "row {id}");
+            assert!(ended_at.is_some(), "row {id} must carry an ended_at");
+        }
+        assert_eq!(knowledge_status(&pool, rejected).await.0, "rejected");
+        assert_eq!(knowledge_status(&pool, others).await.0, "active");
+        assert_eq!(knowledge_status(&pool, team_row).await.0, "active");
+
+        assert_eq!(
+            knowledge_transitions(&pool, active).await,
+            [(Some("active".to_owned()), "archived".to_owned())]
+        );
+        assert_eq!(
+            knowledge_transitions(&pool, proposed).await,
+            [(Some("proposed".to_owned()), "archived".to_owned())]
+        );
+        for id in [rejected, others, team_row] {
+            assert!(
+                knowledge_transitions(&pool, id).await.is_empty(),
+                "row {id}"
+            );
+        }
+    }
+
+    /// Spec §4.4: the archive rides the same transaction as the delete, so a refused delete leaves
+    /// the memory exactly as it was, with no event written.
+    #[tokio::test]
+    async fn an_agent_that_cannot_be_deleted_keeps_its_memory() {
+        let pool = pool().await;
+        let director = create(&pool, request("head")).await.unwrap();
+        let member = create(&pool, request("copywriter")).await.unwrap();
+        team_with(&pool, &director.id, &member.id).await;
+        let memory = seed_knowledge(&pool, "agent", &director.id, "active").await;
+
+        let outcome = delete(&pool, &director.id).await;
+
+        assert!(matches!(outcome, Err(AgentError::InUse)), "{outcome:?}");
+        assert_eq!(knowledge_status(&pool, memory).await.0, "active");
+        assert!(knowledge_transitions(&pool, memory).await.is_empty());
     }
 }

@@ -597,9 +597,12 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
         ));
     }
 
+    // Every statement below, the memory archive included, shares one transaction: a delete that
+    // finds no team rolls the whole of it back.
+    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM team_members WHERE team_id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     // The alçada goes with the team it described. There is no equivalent worry about
     // `team_actions`: an action belongs to a RUN, and the check above already refuses to delete a
@@ -607,7 +610,7 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
     // actions, pending or otherwise.
     sqlx::query("DELETE FROM team_grants WHERE team_id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     // This team's own rules go with it — a rule that starts a department which no longer exists
     // fires at nothing, every window, for ever.
@@ -616,11 +619,11 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
            (SELECT id FROM team_triggers WHERE team_id = ?)",
     )
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM team_triggers WHERE team_id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     // Rules that fire ON this team are DISARMED and not deleted — the opposite treatment, for the
     // opposite reason. Such a rule still describes something its author wanted and has merely lost
@@ -632,15 +635,18 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
     )
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     let result = sqlx::query("DELETE FROM teams WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
         return Err(TeamError::NotFound);
     }
+    // Spec §4.4: the team's memory is archived with it, in this same transaction.
+    crate::agent::archive_owner_memory(&mut tx, "team", id).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -3102,20 +3108,29 @@ async fn spawn_agent(
         crate::speed::Capacity::solo()
     });
 
-    // Section 6 gives department agents machine knowledge only. Append it to the prompt because
-    // state.runner may be Codex, and leave no trace because an agent turn is not an outcome (D15).
-    let prompt = match crate::brief::for_prompt(
+    // Spec 2026-10-08 section 6: a department agent reads the machine's knowledge, its team's and
+    // its own, and no project's. Append it to the prompt because state.runner may be Codex. Since
+    // R3 a team agent leaves a trace of what it was shown (this supersedes D15 for departments),
+    // so a later outcome can credit the rows that were in front of it.
+    let loadout = crate::loadout::resolve(
         &state.pool,
-        &crate::knowledge::Context::for_project(None),
-        &prompt,
-        "team",
+        &crate::loadout::LoadoutInput {
+            agent: Some(&agent.id),
+            team: Some(&run.team_id),
+            project: None,
+            job: None,
+            task_text: &prompt,
+            node: None,
+            files: &[],
+        },
     )
-    .await
-    .and_then(|briefing| briefing.block)
+    .await;
+    if let Some(brief) = loadout.brief.as_ref()
+        && let Err(error) = crate::brief::record(&state.pool, run_id, None, &brief.trace).await
     {
-        Some(block) => format!("{prompt}{block}"),
-        None => prompt,
-    };
+        tracing::warn!(team_run = %run.id, run_id, %error, "could not record what the team agent was shown");
+    }
+    let prompt = format!("{prompt}{}", loadout.block);
 
     let request = crate::runner::RunRequest {
         prompt,
@@ -7627,8 +7642,9 @@ mod tests {
         }
     }
 
+    /// R3 supersedes D15 here: a department agent's briefing is traced like any other run's.
     #[tokio::test]
-    async fn a_department_agent_is_told_what_the_house_knows_and_leaves_no_trace() {
+    async fn a_department_agent_is_told_what_the_house_knows_and_leaves_a_trace() {
         let (mut state, _root) = state_with_root().await;
         let runner = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
         state.runner = runner.clone();
@@ -7694,7 +7710,7 @@ mod tests {
                         .fetch_one(&state.pool)
                         .await
                         .unwrap();
-                assert_eq!(traces, 0);
+                assert_eq!(traces, 1, "R3: the one machine row it was shown is traced");
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -8036,6 +8052,77 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(decision.as_deref(), Some("rt_team"));
+    }
+
+    /// A team member reads its own memory and its team's, nobody else's, and the briefing leaves a
+    /// trace that names the rows it considered.
+    #[tokio::test]
+    async fn a_team_member_is_briefed_with_its_own_and_its_teams_memory_and_leaves_a_trace() {
+        let (mut state, _root) = state_with_root().await;
+        let fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        state.runner = fake.clone();
+        let run = team_run_for_member(&state, "tr-loadout").await;
+        let agent = crate::agent::Agent {
+            engine: "claude".to_owned(),
+            model: Some("claude-sonnet-5".to_owned()),
+            ..local_member("unused")
+        };
+
+        let mut ids = Vec::new();
+        for (scope_kind, scope_id, title) in [
+            ("agent", "researcher", "zanzibar researcher-note"),
+            ("team", "marketing", "zanzibar marketing-note"),
+            ("agent", "someone-else", "zanzibar someone-else-note"),
+            ("team", "sales", "zanzibar sales-note"),
+        ] {
+            let result = sqlx::query(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES ('semantic', ?, ?, 'owner', 'memory', ?, 'body', 'active',
+                         '2026-08-19T00:00:00+00:00')",
+            )
+            .bind(scope_kind)
+            .bind(scope_id)
+            .bind(title)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            ids.push(result.last_insert_rowid());
+        }
+        let (someone_else, sales) = (ids[2], ids[3]);
+
+        let (run_id, session_id) = open_run(&state, &run.id, "zanzibar", false).await.unwrap();
+        spawn_agent(&state, &run, &agent, run_id, session_id, "zanzibar".into()).await;
+        settled_run(&state, run_id).await;
+
+        let prompt = fake
+            .last_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the member's launch received a prompt");
+        assert!(prompt.contains("researcher-note"), "{prompt}");
+        assert!(prompt.contains("marketing-note"), "{prompt}");
+        assert!(!prompt.contains("someone-else-note"), "{prompt}");
+        assert!(!prompt.contains("sales-note"), "{prompt}");
+
+        let traced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_knowledge WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert!(traced > 0, "the briefing left no trace for the run");
+        for foreign in [someone_else, sales] {
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM run_knowledge WHERE run_id = ? AND knowledge_id = ?",
+            )
+            .bind(run_id)
+            .bind(foreign)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+            assert_eq!(rows, 0, "row {foreign} belongs to no link of this member");
+        }
     }
 
     /// A member whose factory has no local route fails carrying the refusal's OWN sentence.
@@ -8765,5 +8852,135 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refusal.0, StatusCode::NOT_FOUND);
+    }
+
+    /// One `knowledge` row of the given scope and status, shaped like `loadout.rs`'s `seed`.
+    async fn seed_knowledge(
+        pool: &sqlx::SqlitePool,
+        scope_kind: &str,
+        scope_id: &str,
+        status: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', ?, ?, 'owner', 'memory', 'a memory', 'body', ?,
+                     '2026-08-19T00:00:00+00:00')",
+        )
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn knowledge_status(pool: &sqlx::SqlitePool, id: i64) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, ended_at FROM knowledge WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The `(from_status, to_status)` pairs recorded for one knowledge row, oldest first.
+    async fn knowledge_transitions(
+        pool: &sqlx::SqlitePool,
+        id: i64,
+    ) -> Vec<(Option<String>, String)> {
+        sqlx::query_as(
+            "SELECT from_status, to_status FROM knowledge_events WHERE knowledge_id = ? ORDER BY id",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Spec §4.4: deleting a team archives the memory that was scoped to it, in the same
+    /// transaction, and touches nothing else. The `agent` row carrying the team's id proves the
+    /// scope kind is honoured and not only the id; the `rejected` row proves a row that is already
+    /// out of candidacy keeps the status it earned.
+    #[tokio::test]
+    async fn deleting_a_team_archives_its_memory_and_nothing_else() {
+        let (state, _root) = state_with_root().await;
+        let t = marketing(&state).await.team.id;
+        insert_agent(&state, "second-director", "claude").await;
+        let u = create(
+            &state.pool,
+            TeamRequest {
+                name: "Support".to_owned(),
+                mission: "answer people".to_owned(),
+                director_agent_id: "second-director".to_owned(),
+                max_rounds: 3,
+                max_parallel: 2,
+                budget_usd: None,
+                max_open_actions: DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
+                grants: Vec::new(),
+                members: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .team
+        .id;
+        let active = seed_knowledge(&state.pool, "team", &t, "active").await;
+        let proposed = seed_knowledge(&state.pool, "team", &t, "proposed").await;
+        let rejected = seed_knowledge(&state.pool, "team", &t, "rejected").await;
+        let others = seed_knowledge(&state.pool, "team", &u, "active").await;
+        let agent_row = seed_knowledge(&state.pool, "agent", &t, "active").await;
+
+        delete(&state.pool, &t).await.unwrap();
+
+        for id in [active, proposed] {
+            let (status, ended_at) = knowledge_status(&state.pool, id).await;
+            assert_eq!(status, "archived", "row {id}");
+            assert!(ended_at.is_some(), "row {id} must carry an ended_at");
+        }
+        assert_eq!(knowledge_status(&state.pool, rejected).await.0, "rejected");
+        assert_eq!(knowledge_status(&state.pool, others).await.0, "active");
+        assert_eq!(knowledge_status(&state.pool, agent_row).await.0, "active");
+
+        assert_eq!(
+            knowledge_transitions(&state.pool, active).await,
+            [(Some("active".to_owned()), "archived".to_owned())]
+        );
+        assert_eq!(
+            knowledge_transitions(&state.pool, proposed).await,
+            [(Some("proposed".to_owned()), "archived".to_owned())]
+        );
+        for id in [rejected, others, agent_row] {
+            assert!(
+                knowledge_transitions(&state.pool, id).await.is_empty(),
+                "row {id}"
+            );
+        }
+    }
+
+    /// Spec §4.4: the archive rides the same transaction as the delete, so a refused delete leaves
+    /// the memory exactly as it was, with no event written.
+    #[tokio::test]
+    async fn a_team_with_runs_on_record_keeps_its_memory() {
+        let (state, _root) = state_with_root().await;
+        let team = marketing(&state).await.team.id;
+        sqlx::query(
+            "INSERT INTO team_runs (id, team_id, request, workspace, token, state,
+                                    created_at, updated_at)
+             VALUES ('tr-finished', ?, 'write it', 'ws', 'a-secret', 'done',
+                     '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
+        )
+        .bind(&team)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let memory = seed_knowledge(&state.pool, "team", &team, "active").await;
+
+        let outcome = delete(&state.pool, &team).await;
+
+        assert!(matches!(outcome, Err(TeamError::Invalid(_))), "{outcome:?}");
+        assert_eq!(knowledge_status(&state.pool, memory).await.0, "active");
+        assert!(knowledge_transitions(&state.pool, memory).await.is_empty());
     }
 }

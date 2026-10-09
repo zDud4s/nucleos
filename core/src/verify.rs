@@ -1477,6 +1477,25 @@ tests:
     }
 
     #[test]
+    fn a_merge_caller_is_autonomous_labelled_by_its_request_and_reads_only_its_own_tickets() {
+        assert_eq!(Caller::Merge(7).priority(), PRIORITY_AUTONOMOUS);
+        assert_eq!(Caller::Merge(7).label(), "merge:7");
+        assert!(may_read(Caller::Merge(7), "merge:7"));
+        assert!(!may_read(Caller::Merge(7), "merge:8"));
+        assert!(!may_read(Caller::Merge(7), "owner"));
+        assert!(!may_read(Caller::Merge(7), "run:7"));
+        assert_eq!(Caller::Merge(7).requested_by("x"), "x");
+        // No key maps to a merge: only the daemon's own merge gate can be one.
+        for scope in [
+            Scope::Control,
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::Admin),
+        ] {
+            assert_ne!(Caller::from_scope(&scope), Some(Caller::Merge(7)));
+        }
+    }
+
+    #[test]
     fn the_postgate_caller_runs_at_postgate_priority_and_no_key_can_claim_it() {
         assert_eq!(
             Caller::Postgate.priority(),

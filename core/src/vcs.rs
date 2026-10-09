@@ -607,6 +607,11 @@ pub enum Origin {
     // The Tauri app is NOT this, despite owning the `shell/` directory: it holds the control token
     // and arrives through `vcs_origin` as `Human`, which is why the name was free.
     Shell,
+    /// The daemon acting on the owner's standing order — today only the post-merge gate's revert,
+    /// which exists because the owner turned `revert_on_red` on. Turning the switch on is the
+    /// consent, so the request needs no approval of its own, and it is not recorded as `Human`
+    /// because nobody clicked anything.
+    Daemon,
     Run(i64),
     // Constructed by Chunk 4, when jobs submit requests of their own.
     #[allow(dead_code)]
@@ -619,6 +624,7 @@ impl Origin {
         match self {
             Origin::Human => "human",
             Origin::Shell => "shell",
+            Origin::Daemon => "daemon",
             Origin::Run(_) => "run",
             Origin::Job(_) => "job",
         }
