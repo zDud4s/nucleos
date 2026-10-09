@@ -2438,9 +2438,22 @@ pub fn parse_council_config(
 #[serde(deny_unknown_fields)]
 pub struct ScheduleRule {
     pub name: String,
+    /// Recurring schedule. Empty means the rule is one-shot and carries `at:` instead.
+    #[serde(default)]
     pub cron: String,
+    /// The agent's instruction. Empty means the rule runs `command:` instead.
+    #[serde(default)]
     pub prompt: String,
     pub cwd: Option<String>,
+    /// One-shot alternative to `cron:`: ISO 8601 with an offset, or a naive
+    /// `YYYY-MM-DDTHH:MM[:SS]` read in `timezone` (UTC when absent). Fires once, at or after the
+    /// instant (late if the daemon was down), and never again.
+    #[serde(default)]
+    pub at: Option<String>,
+    /// Alternative to `prompt:`: an argv-spawned command, no LLM session. Judged by the
+    /// classifier before it runs; runs in `cwd` (relative to the project root) or the root.
+    #[serde(default)]
+    pub command: Option<String>,
     /// The IANA zone the cron is read in — `Europe/Lisbon`, `America/New_York`.
     ///
     /// Absent means UTC, which is what every rule written before this field already meant, so no
@@ -2879,6 +2892,44 @@ fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
         ));
     }
     for rule in &rules.schedules {
+        let invalid = |reason: &str| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("schedule `{}`: {reason}", rule.name),
+            )
+        };
+        let has_cron = !rule.cron.trim().is_empty();
+        if has_cron && rule.at.is_some() {
+            return Err(invalid(
+                "give either cron: or at:, not both; cron: recurs and at: fires once",
+            ));
+        }
+        if !has_cron && rule.at.is_none() {
+            return Err(invalid("needs cron: (recurring) or at: (once)"));
+        }
+        let has_prompt = !rule.prompt.trim().is_empty();
+        if has_prompt && rule.command.is_some() {
+            return Err(invalid(
+                "give either prompt: or command:, not both; prompt: starts an agent and command: runs a program",
+            ));
+        }
+        if !has_prompt && rule.command.is_none() {
+            return Err(invalid(
+                "needs prompt: (an agent run) or command: (a program)",
+            ));
+        }
+        if let Some(command) = rule.command.as_deref() {
+            if rule.graph.is_some() {
+                return Err(invalid(
+                    "graph: needs a prompt, so it cannot go with command:",
+                ));
+            }
+            if let Err(fault) =
+                crate::project_commands::validate(&rule.name, command, rule.cwd.as_deref())
+            {
+                return Err(invalid(&format!("command: {fault}")));
+            }
+        }
         let Some(budget) = rule.graph.as_ref().and_then(|graph| graph.budget_usd) else {
             continue;
         };
@@ -4788,6 +4839,83 @@ resolve_effort: \"  \"
 
         let rules = load_schedule_rules(Some(dir.path()), "p").unwrap();
         assert_eq!(rules.schedules[0].cwd, None);
+    }
+
+    /// A rule is either recurring (`cron:`) or one-shot (`at:`). Both is ambiguous and neither
+    /// has no time at all, so each is refused at parse time, naming the rule.
+    #[test]
+    fn a_schedule_rule_takes_cron_or_at_but_never_both_or_neither() {
+        let cron_only = parse_schedule_rules(
+            "schedules:\n  - name: r1\n    cron: \"0 8 * * *\"\n    prompt: p\n",
+        )
+        .unwrap();
+        assert_eq!(cron_only.schedules[0].at, None);
+
+        let at_only = parse_schedule_rules(
+            "schedules:\n  - name: r1\n    at: \"2026-10-22T09:00:00Z\"\n    prompt: p\n",
+        )
+        .unwrap();
+        assert_eq!(
+            at_only.schedules[0].at.as_deref(),
+            Some("2026-10-22T09:00:00Z")
+        );
+        assert!(at_only.schedules[0].cron.is_empty());
+
+        let both = parse_schedule_rules(
+            "schedules:\n  - name: r1\n    cron: \"0 8 * * *\"\n    at: \"2026-10-22T09:00:00Z\"\n    prompt: p\n",
+        )
+        .unwrap_err();
+        assert_eq!(both.kind(), std::io::ErrorKind::InvalidData);
+        assert!(both.to_string().contains("r1"), "{both}");
+        assert!(both.to_string().contains("either cron: or at:"), "{both}");
+
+        let neither =
+            parse_schedule_rules("schedules:\n  - name: r1\n    prompt: p\n").unwrap_err();
+        assert_eq!(neither.kind(), std::io::ErrorKind::InvalidData);
+        assert!(neither.to_string().contains("r1"), "{neither}");
+        assert!(neither.to_string().contains("needs cron:"), "{neither}");
+    }
+
+    /// A rule either starts an agent (`prompt:`) or runs a command (`command:`). A command has no
+    /// agent, so it cannot carry a graph, and its text must pass the project-command validation.
+    #[test]
+    fn a_schedule_rule_takes_prompt_or_command_but_never_both_or_neither() {
+        let command_only = parse_schedule_rules(
+            "schedules:\n  - name: r1\n    at: \"2026-10-22T09:00:00Z\"\n    command: git --version\n",
+        )
+        .unwrap();
+        assert_eq!(
+            command_only.schedules[0].command.as_deref(),
+            Some("git --version")
+        );
+        assert!(command_only.schedules[0].prompt.is_empty());
+
+        let both = parse_schedule_rules(
+            "schedules:\n  - name: r1\n    at: \"2026-10-22T09:00:00Z\"\n    prompt: p\n    command: git --version\n",
+        )
+        .unwrap_err();
+        assert_eq!(both.kind(), std::io::ErrorKind::InvalidData);
+        assert!(both.to_string().contains("r1"), "{both}");
+
+        let neither =
+            parse_schedule_rules("schedules:\n  - name: r1\n    at: \"2026-10-22T09:00:00Z\"\n")
+                .unwrap_err();
+        assert_eq!(neither.kind(), std::io::ErrorKind::InvalidData);
+        assert!(neither.to_string().contains("r1"), "{neither}");
+
+        let with_graph = parse_schedule_rules(
+            "schedules:\n  - name: r1\n    at: \"2026-10-22T09:00:00Z\"\n    command: git --version\n    graph:\n      budget_usd: 1.0\n",
+        )
+        .unwrap_err();
+        assert_eq!(with_graph.kind(), std::io::ErrorKind::InvalidData);
+        assert!(with_graph.to_string().contains("r1"), "{with_graph}");
+
+        let bad_cwd = parse_schedule_rules(
+            "schedules:\n  - name: r1\n    at: \"2026-10-22T09:00:00Z\"\n    command: git --version\n    cwd: ../outside\n",
+        )
+        .unwrap_err();
+        assert_eq!(bad_cwd.kind(), std::io::ErrorKind::InvalidData);
+        assert!(bad_cwd.to_string().contains("r1"), "{bad_cwd}");
     }
 
     /// The state between "no file" and "broken file". serde_yaml reports a document-less stream as

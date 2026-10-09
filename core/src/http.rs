@@ -3853,6 +3853,22 @@ struct RuleRunState {
     last_head_sha: Option<String>,
     fires_date: Option<String>,
     fires_today: i64,
+    command_outcome: Option<String>,
+    command_exit_code: Option<i64>,
+    command_output: Option<String>,
+    command_ended_at: Option<String>,
+}
+
+/// What a scheduled `command:` rule did the last time it ran.
+#[derive(serde::Serialize)]
+struct ScheduleCommandView {
+    /// `passed`, `failed`, `errored` or `refused`.
+    outcome: String,
+    /// `null` when the command never produced one (refused, timed out, killed).
+    exit_code: Option<i64>,
+    /// The redacted tail of its output, or the reason it was refused.
+    output: Option<String>,
+    ended_at: String,
 }
 
 /// One scheduled rule, with what the daemon knows about it having run.
@@ -3860,6 +3876,12 @@ struct RuleRunState {
 struct ScheduleView {
     name: String,
     cron: String,
+    /// The one-shot instant, exactly as written in the rules file; empty for a recurring rule.
+    at: Option<String>,
+    /// The program a command rule runs instead of a prompt.
+    command: Option<String>,
+    /// The last result of a command rule; `null` until it has run.
+    last_command: Option<ScheduleCommandView>,
     prompt: String,
     cwd: Option<String>,
     timezone: Option<String>,
@@ -3980,7 +4002,8 @@ async fn get_project_rules(
     let rules_path = crate::project_state::display_path(&id, crate::project_state::AUTOPILOT_FILE);
 
     let state_rows: Vec<RuleRunState> = sqlx::query_as(
-        "SELECT rule_name, last_fired_at, last_head_sha, fires_date, fires_today
+        "SELECT rule_name, last_fired_at, last_head_sha, fires_date, fires_today,
+                command_outcome, command_exit_code, command_output, command_ended_at
            FROM scheduler_state
           WHERE project_id = ?",
     )
@@ -4012,18 +4035,52 @@ async fn get_project_rules(
                 .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
                 .map(|stamp| stamp.with_timezone(&chrono::Utc))
                 .unwrap_or(now);
-            let (next_fire_at, problem) = match crate::scheduler::next_fire(rule, since) {
-                Ok(next) => (Some(next.to_rfc3339()), None),
-                Err(problem) => (None, Some(problem)),
+            // A one-shot whose instant parses and is after its recorded last fire has already run:
+            // nothing is left to fire and nothing is wrong, so it shows neither a next fire nor the
+            // "at most once" problem `next_fire` reports for it. A last fire EQUAL to the instant
+            // is the arming of an `at` that was already past when the daemon first saw it: it never
+            // fires, and says so.
+            let one_shot_order = last_fired_at
+                .as_deref()
+                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+                .and_then(|fired| match crate::scheduler::at_instant(rule) {
+                    Some(Ok(at)) => Some((fired.with_timezone(&chrono::Utc), at)),
+                    _ => None,
+                })
+                .map(|(fired, at)| (fired.cmp(&at), at));
+            let (next_fire_at, problem) = match one_shot_order {
+                Some((std::cmp::Ordering::Greater, _)) => (None, None),
+                Some((std::cmp::Ordering::Equal, _)) => (
+                    None,
+                    Some(format!(
+                        "its at ({}) was already in the past when the daemon first saw it; it never fires",
+                        rule.at.as_deref().unwrap_or_default()
+                    )),
+                ),
+                _ => match crate::scheduler::next_fire(rule, since) {
+                    Ok(next) => (Some(next.to_rfc3339()), None),
+                    Err(problem) => (None, Some(problem)),
+                },
             };
             // A count carrying another day's date is a count of nothing — the daemon resets by
             // comparing rather than by sweeping at midnight, so this reads it the same way.
             let fires_today = recorded
                 .filter(|row| row.fires_date.as_deref() == Some(today.as_str()))
                 .map_or(0, |row| row.fires_today);
+            let last_command = recorded.and_then(|row| {
+                Some(ScheduleCommandView {
+                    outcome: row.command_outcome.clone()?,
+                    exit_code: row.command_exit_code,
+                    output: row.command_output.clone(),
+                    ended_at: row.command_ended_at.clone()?,
+                })
+            });
             ScheduleView {
                 name: rule.name.clone(),
                 cron: rule.cron.clone(),
+                at: rule.at.clone(),
+                command: rule.command.clone(),
+                last_command,
                 prompt: rule.prompt.clone(),
                 cwd: rule.cwd.clone(),
                 timezone: rule.timezone.clone(),
@@ -19752,6 +19809,144 @@ mod tests {
         // The healthy one answers with a time, not a complaint.
         assert!(schedules[2]["problem"].is_null());
         assert!(schedules[2]["next_fire_at"].is_string());
+    }
+
+    /// A one-shot `at:` rule with a `command:` has no cron and no prompt, and the view must still
+    /// show what it will do, when, and what the last run of that command produced.
+    #[tokio::test]
+    async fn the_rules_view_shows_a_one_shot_command_rule_and_its_last_result() {
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
+        let _dir = project_with_rules(
+            &state,
+            "alpha",
+            "schedules:\n\
+             \x20 - name: once\n\
+             \x20   at: '2030-01-01T09:00:00Z'\n\
+             \x20   command: git --version\n",
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO scheduler_state \
+             (project_id, rule_name, last_fired_at, command_outcome, command_exit_code, \
+              command_output, command_ended_at) \
+             VALUES ('alpha', 'once', '2026-10-08T00:00:00Z', 'passed', 0, 'git version 2', \
+              '2026-10-08T00:00:05Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (status, body) = read_rules(state, "alpha").await;
+        assert_eq!(status, StatusCode::OK);
+        drop(home);
+
+        let rule = &body["schedules"][0];
+        assert_eq!(rule["name"], "once");
+        assert_eq!(rule["at"], "2030-01-01T09:00:00Z");
+        assert_eq!(rule["command"], "git --version");
+        assert_eq!(rule["cron"], "");
+        assert_eq!(rule["prompt"], "");
+        assert!(rule["problem"].is_null(), "problem: {}", rule["problem"]);
+        let next = chrono::DateTime::parse_from_rfc3339(rule["next_fire_at"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let at = chrono::DateTime::parse_from_rfc3339("2030-01-01T09:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(next, at);
+        let last = &rule["last_command"];
+        assert_eq!(last["outcome"], "passed");
+        assert_eq!(last["exit_code"], 0);
+        assert_eq!(last["output"], "git version 2");
+        assert_eq!(last["ended_at"], "2026-10-08T00:00:05Z");
+    }
+
+    /// A one-shot that already fired completed successfully: it has no next fire time, and that is
+    /// not a fault, so the view must not attach a `problem` to it.
+    #[tokio::test]
+    async fn a_one_shot_that_already_fired_shows_no_next_fire_and_no_problem() {
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
+        let _dir = project_with_rules(
+            &state,
+            "alpha",
+            "schedules:\n\
+             \x20 - name: once\n\
+             \x20   at: '2026-10-01T09:00:00Z'\n\
+             \x20   command: git --version\n",
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO scheduler_state \
+             (project_id, rule_name, last_fired_at, command_outcome, command_exit_code, \
+              command_output, command_ended_at) \
+             VALUES ('alpha', 'once', '2026-10-01T09:00:30Z', 'passed', 0, 'git version 2', \
+              '2026-10-01T09:00:35Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (status, body) = read_rules(state, "alpha").await;
+        assert_eq!(status, StatusCode::OK);
+        drop(home);
+
+        let rule = &body["schedules"][0];
+        assert_eq!(rule["name"], "once");
+        assert!(
+            rule["next_fire_at"].is_null(),
+            "next_fire_at: {}",
+            rule["next_fire_at"]
+        );
+        assert!(
+            rule["problem"].is_null(),
+            "a fired one-shot must not look broken, problem: {}",
+            rule["problem"]
+        );
+        assert_eq!(rule["last_fired_at"], "2026-10-01T09:00:30Z");
+    }
+
+    /// A past `at` is armed with `last_fired_at == at`: the rule never ran, and the view must say so
+    /// instead of showing a blank that looks like a rule that fired.
+    #[tokio::test]
+    async fn a_one_shot_armed_past_shows_that_it_never_fires() {
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
+        let _dir = project_with_rules(
+            &state,
+            "alpha",
+            "schedules:\n\
+             \x20 - name: once\n\
+             \x20   at: '2026-10-01T09:00:00Z'\n\
+             \x20   command: git --version\n",
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO scheduler_state (project_id, rule_name, last_fired_at) \
+             VALUES ('alpha', 'once', '2026-10-01T09:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (status, body) = read_rules(state, "alpha").await;
+        assert_eq!(status, StatusCode::OK);
+        drop(home);
+
+        let rule = &body["schedules"][0];
+        assert!(
+            rule["next_fire_at"].is_null(),
+            "next_fire_at: {}",
+            rule["next_fire_at"]
+        );
+        assert!(
+            rule["problem"]
+                .as_str()
+                .is_some_and(|problem| problem.contains("already in the past")),
+            "problem: {}",
+            rule["problem"]
+        );
     }
 
     /// `deny_unknown_fields` exists so a typo is an error instead of an empty ruleset — but the

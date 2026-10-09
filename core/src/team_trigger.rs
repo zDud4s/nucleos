@@ -415,6 +415,8 @@ fn as_rule(trigger: &TeamTrigger) -> crate::config::ScheduleRule {
         cwd: None,
         timezone: trigger.timezone.clone(),
         graph: None,
+        at: None,
+        command: None,
     }
 }
 
