@@ -1,0 +1,327 @@
+/*
+ * "Add a project", inside its dialog. Steps two and three were native radios and checkboxes under
+ * paragraphs of prose; here each choice is a row that can be pointed at, the facts about the folder
+ * are one quiet block, and the action sits at the bottom right where a dialog's answer goes.
+ */
+
+/* What the folder is, as one sunken block of facts. */
+.np-repo {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+
+.np-repo-fact {
+  display: grid;
+  grid-template-columns: 6.5rem minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: baseline;
+}
+
+.np-repo-fact dt {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.np-repo-fact dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.np-repo-fact dd.font-mono {
+  font-size: var(--text-xs);
+}
+
+/* A sub-part of a step: a small title, a line of help, then its choices. */
+.np-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.np-group-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.np-group-n {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.np-hint {
+  margin: 0;
+  max-width: var(--measure);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+.np-group .np-hint {
+  margin-top: calc(-1 * var(--space-1));
+}
+
+/* A choice as a row: the whole row is the target, and the chosen one is outlined. */
+.np-options {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.np-option {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition:
+    border-color var(--dur-quick) var(--ease),
+    background-color var(--dur-quick) var(--ease);
+}
+
+.np-option:hover {
+  border-color: var(--border-strong);
+}
+
+.np-option:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-quiet);
+}
+
+.np-option input,
+.np-command input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.np-option-name {
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+.np-option-meta {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+/* The commands: one bordered list, a row each, the source pushed to the right. */
+.np-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.np-command {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  transition: background-color var(--dur-quick) var(--ease);
+}
+
+.np-command + .np-command {
+  border-top: 1px solid var(--border);
+}
+
+.np-command:hover {
+  background: var(--surface-sunken);
+}
+
+.np-command input {
+  align-self: center;
+}
+
+.np-command-name {
+  flex: none;
+  min-width: 4.5rem;
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+.np-command-line {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.np-command-source {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+}
+
+/* Step three's two fields, side by side while there is room. */
+.np-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: var(--space-4);
+  align-items: start;
+}
+
+/* A setting as a row: what it is on the left, its control on the right. */
+.np-setting {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3) var(--space-5);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.np-setting-text {
+  display: flex;
+  flex: 1 1 18rem;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.np-setting-label {
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.np-stepper {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.np-stepper-value {
+  min-width: 2.5rem;
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+/* The one promise about trust, said once and quietly. */
+.np-callout {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+.np-callout > :first-child {
+  flex: none;
+}
+
+/* What pressing the button will write, read before signing it. */
+.np-receipt {
+  padding: var(--space-3) var(--space-4);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+}
+
+.np-receipt-title {
+  margin: 0 0 var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.np-receipt-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.np-receipt-item {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 var(--space-2);
+  padding-left: var(--space-4);
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+.np-receipt-item::before {
+  content: "";
+  position: absolute;
+  top: 0.55em;
+  left: 0;
+  width: 6px;
+  height: 6px;
+  border: 1px solid var(--text-muted);
+  border-radius: 50%;
+}
+
+.np-receipt-item[data-status="done"]::before {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.np-receipt-status {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.np-receipt-item[data-status="stopped here"] .np-receipt-status {
+  color: var(--tone-paused-fg);
+}
+
+/* The dialog's answer: bottom right, with the reason it cannot be given yet beside it. */
+.np-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  padding-top: var(--space-2);
+}
+
+.np-actions-why {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+/*
+  A step heading takes focus when the step appears, so a screen reader hears where it landed. It is
+  not a control, and the app's focus ring around it read as a stray frame — the global ring is
+  what this beats, hence the selector's weight.
+*/
+.np-step-title[tabindex="-1"]:focus,
+.np-step-title[tabindex="-1"]:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
