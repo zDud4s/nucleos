@@ -167,6 +167,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     job_item_conflicted: { tone: "paused", label: "job item did not merge" },
     job_item_orphaned: { tone: "off", label: "job item never attempted" },
     job_gate_failed: { tone: "danger", label: "job gate failed" },
+    job_gate_scoped: { tone: "info", label: "job gated by scope" },
     // A post-merge gate went red and was bisected to a merge (`verify_postgate.rs`). Nothing was
     // reverted, so it is a failure the owner must look at, not a recovered state.
     // A round in which no item passed has nothing for a review to judge, so none runs (job 27,
@@ -215,6 +216,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     quota_blind: { tone: "info", label: "quota brake ran blind" },
     // Worktrees.
     worktree_gate_failed: { tone: "danger", label: "worktree gate failed" },
+    worktree_gate_scoped: { tone: "info", label: "worktree gated by scope" },
     worktree_provision_failed: { tone: "danger", label: "worktree could not be made" },
     worktree_workflow_missing: { tone: "danger", label: "worktree has no workflow" },
     worktree_released: { tone: "off", label: "worktree released" },

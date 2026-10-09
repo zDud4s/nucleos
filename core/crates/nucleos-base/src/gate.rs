@@ -105,6 +105,32 @@ fn tampered_gate_script(
     None
 }
 
+/// The first script among `commands` that differs from the project root's copy, or cannot be
+/// compared, with the reason; `None` when every repo-relative file the commands name is
+/// byte-identical.
+///
+/// The same defence `run_gate` applies to the gate command, for callers that run commands they did
+/// not write (a test map's group commands). A command that does not split is reported rather than
+/// skipped: a line this check cannot read is a line it cannot vouch for.
+pub fn tampered_command_scripts<'a>(
+    project_root: &Path,
+    worktree: &Path,
+    commands: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    for command in commands {
+        let words = match split_command(command) {
+            Ok(words) => words,
+            Err(reason) => return Some(format!("command `{command}` cannot be read: {reason}")),
+        };
+        let (_, words) = split_environment(words);
+        let scripts = worktree_scripts(worktree, &words);
+        if let Some(reason) = tampered_gate_script(project_root, worktree, &scripts) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
 /// Leading `NAME=value` words, taken off the front of the command they precede.
 ///
 /// A gate command is spawned directly and never through a shell, so a project that needs a variable

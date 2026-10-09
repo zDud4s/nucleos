@@ -2740,6 +2740,13 @@ pub struct AutopilotRules {
     /// (F3-8); nothing in the daemon sets it.
     #[serde(default)]
     pub revert_on_red: bool,
+    /// Whether the last item of a job and a run's final gate are measured by `verify scope` over
+    /// their diff instead of the full gate. Off by default. Read through `scoped_final()` only: it
+    /// has an effect only together with `gate_after_land`, which measures the whole target after
+    /// landing and is the net behind a partial measurement. Turning it on is the owner's decision
+    /// (F3-8); nothing in the daemon sets it.
+    #[serde(default)]
+    pub scoped_final_gate: bool,
     /// Whether a job asks if the owner is at the keyboard before it starts its next node.
     ///
     /// `Option`, and the absent case is the brake ON. That is deliberately not the same as
@@ -2774,6 +2781,13 @@ pub struct AutopilotRules {
 }
 
 impl AutopilotRules {
+    /// Whether the final gate of a job or a run is scoped: the switch AND `gate_after_land`.
+    /// A reader rather than a field read, because a caller that took `scoped_final_gate` straight
+    /// off the struct would skip the full gate with no post-merge gate behind it.
+    pub fn scoped_final(&self) -> bool {
+        self.scoped_final_gate && self.gate_after_land
+    }
+
     /// Whether the attention brake applies, resolving the unconfigured case to ON.
     ///
     /// A reader rather than a field read for the reason `gate_retries` is one: a caller that took
@@ -4990,6 +5004,36 @@ resolve_effort: \"  \"
                 .unwrap();
         assert!(rules.revert_on_red);
         assert!(rules.gate_after_land);
+        assert_eq!(rules.gate_command.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn scoped_final_gate_is_off_by_default_and_needs_gate_after_land() {
+        assert!(!AutopilotRules::default().scoped_final_gate);
+        assert!(!AutopilotRules::default().scoped_final());
+
+        // Files written before the switch existed parse unchanged, with it off.
+        let rules = parse_schedule_rules("gate_command: x\ngate_after_land: true\n").unwrap();
+        assert!(
+            !rules.scoped_final_gate,
+            "an existing file must not turn it on"
+        );
+        assert!(!rules.scoped_final());
+
+        // The switch alone is not enough: without the post-merge gate there is no net.
+        let rules = parse_schedule_rules("gate_command: x\nscoped_final_gate: true\n").unwrap();
+        assert!(rules.scoped_final_gate);
+        assert!(!rules.scoped_final(), "no gate_after_land, no scoped final");
+
+        // gate_after_land alone changes nothing either.
+        let rules = parse_schedule_rules("gate_command: x\ngate_after_land: true\n").unwrap();
+        assert!(!rules.scoped_final());
+
+        let rules = parse_schedule_rules(
+            "gate_command: x\ngate_after_land: true\nscoped_final_gate: true\n",
+        )
+        .unwrap();
+        assert!(rules.scoped_final());
         assert_eq!(rules.gate_command.as_deref(), Some("x"));
     }
 

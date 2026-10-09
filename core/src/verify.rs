@@ -1040,6 +1040,31 @@ pub(crate) fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
     }
 }
 
+/// The one sentence the feed carries when a final gate (a job's last item, a run) tried `verify
+/// scope` instead of the full gate, so the owner can tell which gate measured the work. `subject`
+/// names what was gated ("job 3 at item 2", "run 7").
+pub(crate) fn scoped_final_note(subject: &str, verdict: &ScopeVerdict) -> String {
+    use crate::gate::GateOutcome;
+
+    match verdict {
+        ScopeVerdict::Measured(GateOutcome::Passed) => format!(
+            "{subject} was gated by `verify scope` over its diff instead of the full gate, and it passed; the full gate runs on the target after landing (gate_after_land)"
+        ),
+        ScopeVerdict::Measured(GateOutcome::Failed { exit_code, .. }) => format!(
+            "{subject} was gated by `verify scope` over its diff instead of the full gate, and it failed with exit code {exit_code}"
+        ),
+        ScopeVerdict::Measured(GateOutcome::Errored { reason }) => format!(
+            "{subject} was gated by `verify scope` over its diff instead of the full gate, but `verify scope` could not measure it: {reason}"
+        ),
+        ScopeVerdict::NothingRan => format!(
+            "{subject}: the test map selects no group for its diff, so `verify scope` measured nothing here; the full gate runs on the target after landing (gate_after_land)"
+        ),
+        ScopeVerdict::Unavailable => format!(
+            "{subject}: `verify scope` could not be submitted, so the full gate measures it"
+        ),
+    }
+}
+
 /// Gates a job item over its worktree's diff from its recorded base: `scope` of kind `test`,
 /// cached, at autonomous priority. A ticket that does not finish within `wait` is an `Errored`
 /// outcome, never a pass; the units it queued keep running and may still fill the cache. A request
@@ -1642,6 +1667,46 @@ tests:
 
         let nothing = ticket(true, Some("nothing_ran"), Vec::new());
         assert!(matches!(scope_outcome(&nothing), ScopeVerdict::NothingRan));
+    }
+
+    #[test]
+    fn scoped_final_note_names_scope_and_the_post_merge_gate() {
+        use crate::gate::GateOutcome;
+
+        let passed = scoped_final_note("run 7", &ScopeVerdict::Measured(GateOutcome::Passed));
+        assert!(passed.contains("run 7"), "{passed}");
+        assert!(passed.contains("verify scope"), "{passed}");
+        assert!(passed.contains("passed"), "{passed}");
+        assert!(passed.contains("gate_after_land"), "{passed}");
+
+        let failed = scoped_final_note(
+            "run 7",
+            &ScopeVerdict::Measured(GateOutcome::Failed {
+                exit_code: 3,
+                output: "boom".into(),
+            }),
+        );
+        assert!(failed.contains("verify scope"), "{failed}");
+        assert!(failed.contains("failed"), "{failed}");
+        assert!(failed.contains('3'), "{failed}");
+
+        let errored = scoped_final_note(
+            "run 7",
+            &ScopeVerdict::Measured(GateOutcome::Errored {
+                reason: "executor gone".into(),
+            }),
+        );
+        assert!(errored.contains("verify scope"), "{errored}");
+        assert!(errored.contains("executor gone"), "{errored}");
+
+        let nothing = scoped_final_note("run 7", &ScopeVerdict::NothingRan);
+        assert!(nothing.contains("verify scope"), "{nothing}");
+        assert!(nothing.contains("measured nothing"), "{nothing}");
+        assert!(nothing.contains("gate_after_land"), "{nothing}");
+
+        let unavailable = scoped_final_note("run 7", &ScopeVerdict::Unavailable);
+        assert!(unavailable.contains("verify scope"), "{unavailable}");
+        assert!(unavailable.contains("full gate"), "{unavailable}");
     }
 
     #[test]
