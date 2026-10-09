@@ -164,7 +164,9 @@ pub enum Op {
     /// operation here that the daemon queues for itself**: the post-merge gate enqueues it when a
     /// bisection confirms a culprit and the project's `revert_on_red` is on. It is not in
     /// `GIT_OP_KINDS`, so no project declares it, and `from_request` refuses it, so no tool call
-    /// asks for it.
+    /// asks for it. It is not unreachable from outside, though: `POST /vcs/requests`
+    /// deserializes an `Op` directly, so a Run-scoped key can submit one (it is held at
+    /// `awaiting_approval`) and a Control or Admin key can submit one too.
     ///
     /// `-m 1` and nothing else: the queue's merges are always `--no-ff`, so the first parent is the
     /// line the merge landed on. The revert is a new commit on top of `target`, which makes the
