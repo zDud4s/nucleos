@@ -2564,6 +2564,7 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                             project_root,
                             &integration_worktree(project_root),
                             crate::state::DEFAULT_GATE_TIMEOUT,
+                            crate::state::DEFAULT_GATE_TIMEOUT,
                             land_target,
                             self.verify.as_ref(),
                         )
@@ -2635,16 +2636,37 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                 rebase(project_root, branch.as_str(), onto.as_str(), deadline).await
             }
             // No gate here: a revert returns a tree that has been green before, and the post-merge
-            // gate measures the new tip like any other.
+            // gate measures the new tip like any other. A revert that changes the test map still
+            // waits for the owner, exactly as the merge it undoes did.
             crate::vcs::Op::Revert { merge_sha, target } => {
-                match compute_revert(project_root, merge_sha.as_str(), target.as_str(), deadline)
-                    .await
+                let computed = match compute_revert(
+                    project_root,
+                    merge_sha.as_str(),
+                    target.as_str(),
+                    deadline,
+                )
+                .await
                 {
-                    Ok(computed) => {
-                        publish(project_root, target.as_str(), computed, deadline).await
+                    Ok(computed) => computed,
+                    Err(outcome) => return outcome,
+                };
+                match map_change(project_root, &computed, deadline).await {
+                    Err(outcome) => return outcome,
+                    Ok(Some(blob))
+                        if lands_on_the_integration_branch(request, target)
+                            && request.approved_map_blob.as_deref() != Some(blob.as_str()) =>
+                    {
+                        return Outcome::AwaitingOwner {
+                            reason: format!(
+                                "this revert changes {}; it lands once the owner approves it",
+                                crate::tests_map::MAP_FILE
+                            ),
+                            map_blob: blob,
+                        };
                     }
-                    Err(outcome) => outcome,
+                    Ok(_) => {}
                 }
+                publish(project_root, target.as_str(), computed, deadline).await
             }
         }
     }
@@ -2670,9 +2692,9 @@ impl crate::vcs::VcsExecutor for GitExecutor {
 /// **With `gate_after_land` on and a merge into the land target (`land_target`), spec §6.1 applies:**
 /// a `Valid` test map on the integration worktree means a cached `verify scope` stands in for the
 /// full gate, because the post-merge worker runs the full gate on the published sha anyway. No map,
-/// no executor, or a `scope` that cannot be submitted falls back to the full `gate_command`, and
-/// that result is `FullCovering`: the caller marks the published sha as covered. With the switch off
-/// nothing here changes.
+/// no executor, a `scope` that cannot be submitted, or one that reaches no verdict in time
+/// (`scope_wait`) falls back to the full `gate_command`, and that result is `FullCovering`: the
+/// caller marks the published sha as covered. With the switch off nothing here changes.
 ///
 /// **Three refusals rather than one, and each is a different sentence to its reader.**
 /// - The rules file exists and will not parse: we cannot tell whether this repository wanted its
@@ -2707,6 +2729,7 @@ async fn gate_the_merge(
     project_root: &Path,
     integration: &Path,
     timeout: Duration,
+    scope_wait: Duration,
     land_target: Option<&str>,
     verify: Option<&std::sync::Arc<crate::verify_exec::Executor>>,
 ) -> Result<MergeGate, Outcome> {
@@ -2746,7 +2769,7 @@ async fn gate_the_merge(
                 executor,
                 crate::verify::Caller::Merge(request_id),
                 integration,
-                timeout,
+                scope_wait,
             )
             .await
             {
@@ -2759,9 +2782,13 @@ async fn gate_the_merge(
                 crate::verify::ScopeVerdict::Measured(crate::gate::GateOutcome::Errored {
                     reason,
                 }) => {
-                    return Err(refuse(format!(
-                        "the merge could not be measured, so nothing was published: {reason}"
-                    )));
+                    // "Not measured" is not "passed", but it is no reason to refuse either while
+                    // the full gate can still measure the merge.
+                    tracing::warn!(
+                        vcs_request_id = request_id,
+                        %reason,
+                        "the merge's scope verification reached no verdict; measuring with the                          full gate instead"
+                    );
                 }
                 crate::verify::ScopeVerdict::Unavailable => {}
             }
@@ -4381,6 +4408,51 @@ gate_command: git --version
         assert_eq!(state.last_green_sha.as_deref(), Some(published.as_str()));
     }
 
+    /// F3-9: a `scope` that is submitted but reaches no verdict in time (nothing drains the verify
+    /// queue here, so its units stay `queued`) is not a reason to refuse the merge: the full gate
+    /// runs instead, and what ran is the full gate, so it is covered.
+    #[tokio::test]
+    async fn a_scope_that_reaches_no_verdict_falls_back_to_the_full_gate_and_covers_it() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-slow-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        commit_map_on_master(&repo, GREEN_GATE);
+        write_autopilot_rules(
+            container.path(),
+            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        // No `run_executor`: the scope's units are accepted and never run.
+        let executor = crate::verify_exec::Executor::new(
+            pool.clone(),
+            crate::config::VerifyConfig::default(),
+            Some(container.path().to_path_buf()),
+        );
+        compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect("compute the merge the gate measures");
+
+        let gate = gate_the_merge(
+            Some(container.path()),
+            Some(&pool),
+            7,
+            "alpha",
+            &repo,
+            &integration_worktree(&repo),
+            Duration::from_secs(120),
+            Duration::from_millis(300),
+            Some("master"),
+            Some(&executor),
+        )
+        .await;
+
+        assert!(matches!(gate, Ok(MergeGate::FullCovering)), "{gate:?}");
+        assert_eq!(request_callers(&pool).await, vec!["merge:7".to_owned()]);
+        assert_eq!(merge_gate_rows(&pool).await, 1, "the full gate ran");
+    }
+
     /// A merge that is not into the land target (`integration_branch` names another branch) keeps
     /// today's full gate, asks the verify queue nothing and marks nothing covered.
     #[tokio::test]
@@ -4871,6 +4943,11 @@ gate_command: git --version
 
     /// Queues a `Revert` of `merge_sha` on `master` through the real executor.
     async fn revert_through_the_queue(repo: &Path, merge_sha: &str) -> Outcome {
+        revert_approved(repo, merge_sha, None).await
+    }
+
+    /// The same, carrying the map blob the owner approved (if any).
+    async fn revert_approved(repo: &Path, merge_sha: &str, approved: Option<&str>) -> Outcome {
         use crate::vcs::VcsExecutor;
         GitExecutor::default()
             .execute(&crate::vcs::ClaimedRequest {
@@ -4883,10 +4960,64 @@ gate_command: git --version
                 project_root: repo.to_string_lossy().into_owned(),
                 from_resolution: false,
                 run_id: None,
-                approved_map_blob: None,
+                approved_map_blob: approved.map(str::to_owned),
                 integration_branch: None,
             })
             .await
+    }
+
+    /// Lands `feat/x` plus a `nucleos.tests.yaml` committed on it into `master` with a real
+    /// `--no-ff` merge, and returns the merge commit: reverting it deletes the map.
+    fn land_a_merge_that_adds_the_map(repo: &Path) -> String {
+        git_must(repo, &["checkout", "feat/x"]);
+        std::fs::write(repo.join(crate::tests_map::MAP_FILE), "version: 1\n").expect("write map");
+        git_must(repo, &["add", "-A"]);
+        git_must(repo, &["commit", "-m", "add the map on the branch"]);
+        git_must(repo, &["checkout", "master"]);
+        git_must(repo, &["merge", "--no-ff", "-m", "land", "feat/x"]);
+        sha_of(repo, "master")
+    }
+
+    /// F3-9: a revert whose merge added the test map would delete it, and that is a map change
+    /// like any other: it waits for the owner, and the target does not move.
+    #[tokio::test]
+    async fn a_revert_that_changes_the_test_map_waits_for_the_owner() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-revert-map-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let landed = land_a_merge_that_adds_the_map(&repo);
+
+        match revert_through_the_queue(&repo, &landed).await {
+            Outcome::AwaitingOwner { map_blob, .. } => assert_eq!(map_blob, DELETED_MAP),
+            other => panic!("a revert that changes the map must wait for the owner, got {other:?}"),
+        }
+
+        assert_eq!(sha_of(&repo, "master"), landed, "master moved");
+    }
+
+    /// F3-9: the same revert, with the owner's approval of exactly that content, publishes.
+    #[tokio::test]
+    async fn an_approved_revert_of_a_map_change_publishes() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-revert-map-ok-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let landed = land_a_merge_that_adds_the_map(&repo);
+
+        match revert_approved(&repo, &landed, Some(DELETED_MAP)).await {
+            Outcome::Succeeded { sha, .. } => {
+                let reverted = sha.expect("a revert names what it published");
+                assert_ne!(reverted, landed);
+                assert_eq!(sha_of(&repo, "master"), reverted);
+            }
+            other => panic!("an approved revert must publish, got {other:?}"),
+        }
+
+        assert!(
+            !repo.join(crate::tests_map::MAP_FILE).exists(),
+            "the map is gone from the checkout"
+        );
     }
 
     /// D4: a revert is computed in the integration worktree and published by the same
