@@ -22,8 +22,9 @@
 //! ticket, and once the queue has published it `fix/<source>-<sha7>` is built on top of it. The
 //! correction run on that branch is opened by `run_correction_loop`, which holds an `AppState`.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::git_exec;
@@ -983,11 +984,62 @@ async fn set_fix_run(
     .map(|_| ())
 }
 
+/// How many times a `fix/` branch's correction run is asked for after definitive failures.
+const CORRECTION_ATTEMPTS: u32 = 3;
+
+/// The wait between two attempts on the same branch.
+const CORRECTION_BACKOFF: Duration = Duration::from_secs(10 * 60);
+
+/// What the process remembers of one branch's failed attempts.
+struct Attempts {
+    count: u32,
+    last: Instant,
+}
+
+/// Failed attempts per `(project, fix branch)`. In memory on purpose: no migration, and a daemon
+/// restart is a human act that may start over.
+static CORRECTION_TRIES: LazyLock<Mutex<HashMap<(String, String), Attempts>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn correction_tries() -> MutexGuard<'static, HashMap<(String, String), Attempts>> {
+    CORRECTION_TRIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn correction_key(row: &PendingCorrection) -> (String, String) {
+    (row.project_id.clone(), row.fix_branch.clone())
+}
+
+/// Whether a branch may be claimed now: it never failed, or its backoff is over.
+fn may_try(entry: Option<&Attempts>, now: Instant) -> bool {
+    entry.is_none_or(|attempts| now.duration_since(attempts.last) >= CORRECTION_BACKOFF)
+}
+
+/// Whether the claim is given back after the `count`-th definitive failure (false: give up).
+fn after_failure(count: u32) -> bool {
+    count < CORRECTION_ATTEMPTS
+}
+
+/// Notes one more definitive failure of `row`'s branch and returns how many there have been.
+fn record_failure(row: &PendingCorrection) -> u32 {
+    let mut tries = correction_tries();
+    let attempts = tries.entry(correction_key(row)).or_insert(Attempts {
+        count: 0,
+        last: Instant::now(),
+    });
+    attempts.count += 1;
+    attempts.last = Instant::now();
+    attempts.count
+}
+
 /// Opens one correction run for every prepared `fix/` branch that has none, and returns their ids.
 ///
-/// A branch is claimed (`fix_run_id = 0`) before its run is asked for, so a run is attempted once
-/// and never twice. A full project or disk gives the claim back and the next pass asks again; any
-/// other failure leaves the claim at 0 and says so in the feed. The kill switch and the budget stop
+/// A branch is claimed (`fix_run_id = 0`) before its run is asked for, so a run is never attempted
+/// twice at once. A full project or disk gives the claim back and the next pass asks again; any
+/// other failure gives it back too, up to `CORRECTION_ATTEMPTS` times and `CORRECTION_BACKOFF`
+/// apart (counted in this process, so a restart starts over), and the last one leaves the claim at 0
+/// and says in the feed that it gave up. The kill switch and the budget stop
 /// it like any other run the daemon starts on its own; a switch that cannot be read stops it too.
 pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
     let pool = &state.pool;
@@ -1025,6 +1077,13 @@ pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
     }
     let mut opened = Vec::new();
     for row in rows {
+        // A branch that failed definitively waits out its backoff before it is claimed again.
+        if !may_try(
+            correction_tries().get(&correction_key(&row)),
+            Instant::now(),
+        ) {
+            continue;
+        }
         let claimed = sqlx::query(
             "UPDATE postgate_state SET fix_run_id = 0, updated_at = CURRENT_TIMESTAMP \
              WHERE project_id = ? AND fix_branch = ? AND fix_run_id IS NULL",
@@ -1056,6 +1115,7 @@ pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
         .await;
         match started {
             Ok(run_id) => {
+                correction_tries().remove(&correction_key(&row));
                 if let Err(error) = set_fix_run(pool, &row, Some(run_id)).await {
                     tracing::warn!(
                         project = %row.project_id, run_id, %error,
@@ -1089,12 +1149,26 @@ pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
                     project = %row.project_id, ?error,
                     "postgate: the correction run could not be opened"
                 );
+                let count = record_failure(&row);
+                let retry = after_failure(count);
+                if retry && let Err(error) = set_fix_run(pool, &row, None).await {
+                    tracing::warn!(
+                        project = %row.project_id, %error,
+                        "postgate: cannot release a correction claim"
+                    );
+                }
+                let outcome = if retry {
+                    "trying again in 10 minutes"
+                } else {
+                    "gave up"
+                };
                 let _ = crate::feed::append(
                     pool,
                     Some(&row.project_id),
                     crate::verify_postgate::POSTGATE_RED_KIND,
                     &format!(
-                        "the correction run could not be opened: {error:?}; the work is on {}",
+                        "the correction run could not be opened: {error:?}; attempt {count} of \
+                         {CORRECTION_ATTEMPTS}, {outcome}; the work is on {}",
                         row.fix_branch
                     ),
                     None,
@@ -2326,5 +2400,97 @@ mod tests {
         assert_eq!(opened.len(), 1);
         let s = verify_postgate::load(pool, "alpha").await.unwrap().unwrap();
         assert_eq!(s.fix_run_id, Some(opened[0]));
+    }
+
+    /// F3-10: a definitive failure no longer leaves the claim at 0 for good. A branch may be
+    /// tried `CORRECTION_ATTEMPTS` times, `CORRECTION_BACKOFF` apart; after the last it is given up.
+    #[test]
+    fn correction_retry_allows_three_attempts_spaced_by_the_backoff() {
+        let base = Instant::now();
+        assert_eq!(CORRECTION_ATTEMPTS, 3);
+        assert_eq!(CORRECTION_BACKOFF, Duration::from_secs(10 * 60));
+
+        assert!(may_try(None, base), "a branch never tried is tried at once");
+
+        let tried = Attempts {
+            count: 1,
+            last: base,
+        };
+        assert!(!may_try(Some(&tried), base), "not in the same instant");
+        assert!(
+            !may_try(
+                Some(&tried),
+                base + CORRECTION_BACKOFF - Duration::from_secs(1)
+            ),
+            "not a second before the backoff is over"
+        );
+        assert!(
+            may_try(Some(&tried), base + CORRECTION_BACKOFF),
+            "once the backoff has passed"
+        );
+
+        assert!(after_failure(1), "the first failure releases the claim");
+        assert!(after_failure(2), "the second failure releases the claim");
+        assert!(!after_failure(3), "the third failure gives up");
+    }
+
+    /// F3-10: a branch that cannot be opened (it does not exist) is a definitive failure. The claim
+    /// goes back to `None` and the feed says it will try again; a second pass straight after opens
+    /// nothing and writes nothing, because the backoff has not elapsed.
+    #[tokio::test]
+    async fn open_corrections_releases_its_claim_after_a_definitive_failure_and_waits_the_backoff()
+    {
+        let f = correction_fixture().await;
+        let pool = &f.state.pool;
+        // The retry count is process-wide, so the branch name must not collide with another test.
+        let missing = format!(
+            "fix/missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        sqlx::query("UPDATE postgate_state SET fix_branch = ? WHERE project_id = 'alpha'")
+            .bind(&missing)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        assert!(open_corrections(&f.state).await.is_empty(), "nothing opens");
+        let s = verify_postgate::load(pool, "alpha").await.unwrap().unwrap();
+        assert_eq!(
+            s.fix_run_id, None,
+            "a definitive failure releases the claim instead of keeping it at 0"
+        );
+        assert_eq!(
+            count(pool, "runs").await,
+            1,
+            "the failed provisioning is kept as a failed run"
+        );
+        let lines = feed_summaries(pool).await;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("trying again") && l.contains(&missing)),
+            "the feed says it will try again and names the branch: {lines:?}"
+        );
+
+        assert!(
+            open_corrections(&f.state).await.is_empty(),
+            "the backoff has not elapsed"
+        );
+        let s = verify_postgate::load(pool, "alpha").await.unwrap().unwrap();
+        assert_eq!(s.fix_run_id, None, "the second pass did not even claim");
+        assert_eq!(
+            count(pool, "runs").await,
+            1,
+            "the backoff opens no second run"
+        );
+        assert_eq!(
+            feed_summaries(pool).await,
+            lines,
+            "the second pass wrote nothing to the feed"
+        );
     }
 }

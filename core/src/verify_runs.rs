@@ -404,6 +404,30 @@ pub async fn finish(
     Ok(())
 }
 
+/// Ends every still-`queued` row of one origin as `errored`, with `reason` as its output tail, and
+/// returns how many it ended. A `running` row is not touched: it finishes on its own and nobody
+/// reads the result any more. Racing `claim` is safe because both are `UPDATE`s conditioned on
+/// `status = 'queued'`, so a row is either claimed or cancelled, never both.
+pub async fn cancel_queued(
+    pool: &SqlitePool,
+    origin: &str,
+    origin_id: i64,
+    reason: &str,
+) -> sqlx::Result<u64> {
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE verify_runs SET status = 'errored', finished_at = ?, output_tail = ? \
+         WHERE origin = ? AND origin_id = ? AND status = 'queued'",
+    )
+    .bind(finished_at)
+    .bind(tail(reason))
+    .bind(origin)
+    .bind(origin_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// One row as a reader sees it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<State>> {
@@ -842,6 +866,66 @@ mod tests {
                 "boom".to_owned()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_queued_errors_only_this_origins_queued_rows() {
+        let pool = test_pool().await;
+        let mine = |origin_id: i64, argv: &str| {
+            let mut r = request(None, 1);
+            r.origin = ORIGIN_VERIFY.to_owned();
+            r.origin_id = Some(origin_id);
+            r.argv = vec![argv.to_owned()];
+            r
+        };
+        let queued_a = enqueue(&pool, &mine(5, "a"), 100).await.unwrap().id;
+        let queued_b = enqueue(&pool, &mine(5, "b"), 100).await.unwrap().id;
+        let running = enqueue(&pool, &mine(5, "c"), 100).await.unwrap().id;
+        claim(&pool, running).await.unwrap().unwrap();
+        let finished = enqueue(&pool, &mine(5, "d"), 100).await.unwrap().id;
+        claim(&pool, finished).await.unwrap().unwrap();
+        finish(&pool, finished, STATUS_PASSED, Some(0), 1, Some("ok"))
+            .await
+            .unwrap();
+        let other_ticket = enqueue(&pool, &mine(6, "e"), 100).await.unwrap().id;
+        let mut a_run = request(None, 1);
+        a_run.argv = vec!["f".to_owned()];
+        a_run.origin_id = Some(5);
+        let other_origin = enqueue(&pool, &a_run, 100).await.unwrap().id;
+
+        let cancelled = cancel_queued(
+            &pool,
+            ORIGIN_VERIFY,
+            5,
+            "cancelled: the full gate took over",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cancelled, 2);
+        for id in [queued_a, queued_b] {
+            let state = get(&pool, id).await.unwrap().unwrap();
+            assert_eq!(state.status, STATUS_ERRORED);
+            assert_eq!(
+                state.output_tail.as_deref(),
+                Some("cancelled: the full gate took over")
+            );
+            let finished_at: Option<String> =
+                sqlx::query_scalar("SELECT finished_at FROM verify_runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(finished_at.is_some(), "a cancelled row is terminal");
+        }
+        let status_of = |id: i64| {
+            let pool = pool.clone();
+            async move { get(&pool, id).await.unwrap().unwrap().status }
+        };
+        assert_eq!(status_of(running).await, STATUS_RUNNING);
+        assert_eq!(status_of(finished).await, STATUS_PASSED);
+        assert_eq!(status_of(other_ticket).await, STATUS_QUEUED);
+        assert_eq!(status_of(other_origin).await, STATUS_QUEUED);
     }
 
     #[test]
