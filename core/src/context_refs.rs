@@ -390,6 +390,106 @@ pub async fn loadout_owner(
     Ok(row.unwrap_or((None, None)))
 }
 
+// Spawn-time resolution (equipamento §4.3). A ref is "re-validated on every spawn": what it named
+// when it was saved says nothing about the disk today. A path that has vanished is not an error —
+// "missing paths appear in the index marked `(em falta)`; the run does not fail" — and
+// "`--add-dir` only for `dir` refs — a file ref would widen access to its parent".
+
+/// What a ref came to at spawn time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnState {
+    /// It resolves, and is still what it was saved as.
+    Active,
+    /// It resolves but nothing is there any more.
+    Missing,
+    /// It no longer passes the roots/`resolve_within` check, or changed kind: granted nothing.
+    Refused,
+}
+
+/// One ref of the spawning agent or team, re-resolved.
+#[derive(Debug, Clone)]
+pub struct SpawnRef {
+    pub owner_kind: OwnerKind,
+    /// The stored spelling, verbatim.
+    pub path: String,
+    /// `file` or `dir`, as saved.
+    pub kind: String,
+    pub note: Option<String>,
+    pub state: SpawnState,
+    /// The real path; only an `Active` ref has one.
+    pub real: Option<PathBuf>,
+}
+
+/// The refs of the spawning agent, then those of its team, each re-resolved against the roots its
+/// owner may reference. A missing or refused ref is returned marked as such, never as an error.
+pub async fn spawn_refs(
+    pool: &sqlx::SqlitePool,
+    managed_root: &Path,
+    agent_id: Option<&str>,
+    team_id: Option<&str>,
+) -> Result<Vec<SpawnRef>, sqlx::Error> {
+    let mut out = Vec::new();
+    for (owner, owner_id) in [(OwnerKind::Agent, agent_id), (OwnerKind::Team, team_id)] {
+        let Some(owner_id) = owner_id else {
+            continue;
+        };
+        let roots = allowed_roots(pool, managed_root, owner).await?;
+        for row in list(pool, owner, owner_id).await? {
+            let (state, real_path) = match resolve(&roots, Path::new(&row.path)) {
+                Err(_) => (SpawnState::Refused, None),
+                Ok(resolved) => match resolved.state {
+                    PathState::Missing => (SpawnState::Missing, None),
+                    // A ref grants what it was saved as and nothing wider: a file that became a
+                    // directory (or the reverse) is refused rather than silently re-typed.
+                    PathState::File if row.kind != "file" => (SpawnState::Refused, None),
+                    PathState::Dir if row.kind != "dir" => (SpawnState::Refused, None),
+                    PathState::File | PathState::Dir => {
+                        (SpawnState::Active, Some(real(&resolved.target)))
+                    }
+                },
+            };
+            out.push(SpawnRef {
+                owner_kind: owner,
+                path: row.path,
+                kind: row.kind,
+                note: row.note,
+                state,
+                real: real_path,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The directories to pass as `--add-dir`: active `dir` refs only, in order.
+pub fn add_dirs(refs: &[SpawnRef]) -> Vec<PathBuf> {
+    refs.iter()
+        .filter(|r| r.state == SpawnState::Active && r.kind == "dir")
+        .filter_map(|r| r.real.clone())
+        .collect()
+}
+
+/// The index handed to the run: one line per active or missing ref, refused ones left out.
+pub fn render_index(refs: &[SpawnRef]) -> String {
+    let mut lines = Vec::new();
+    for r in refs {
+        if r.state == SpawnState::Refused {
+            continue;
+        }
+        let mut line = format!("- {} ({})", r.path, r.kind);
+        if let Some(note) = &r.note {
+            line.push_str(" — ");
+            line.push_str(note);
+        }
+        if r.state == SpawnState::Missing {
+            // "(em falta)" is the spec's literal marker, kept in Portuguese on purpose.
+            line.push_str(" (em falta)");
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
 /// Why `read_context` returned no text.
 #[derive(Debug)]
 pub enum ReadError {
@@ -1163,6 +1263,254 @@ mod tests {
             (Some("writer".to_owned()), Some("marketing".to_owned()))
         );
         assert_eq!(loadout_owner(&pool, neither).await.unwrap(), (None, None));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Spawn-time resolution
+    // -----------------------------------------------------------------------------------------
+
+    /// A team with its own name and director, so a test can hold two of them.
+    async fn team_named(pool: &sqlx::SqlitePool, name: &str) -> String {
+        let director = agent(pool, &format!("{name} director")).await;
+        crate::team::create(
+            pool,
+            crate::team::TeamRequest {
+                name: name.to_owned(),
+                mission: "sell the thing".to_owned(),
+                director_agent_id: director,
+                max_rounds: 3,
+                max_parallel: 2,
+                budget_usd: None,
+                max_open_actions: crate::team::DEFAULT_MAX_OPEN_ACTIONS,
+                max_live_runs: 1,
+                grants: Vec::new(),
+                members: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .team
+        .id
+    }
+
+    /// Every ref is looked at again on every spawn: a file that vanished is listed as missing and
+    /// the spawn still happens, a directory that is still there is active with its real path.
+    #[tokio::test]
+    async fn spawn_refs_re_resolves_each_ref_and_marks_the_missing() {
+        let (_tmp, root, state) = fixture().await;
+        let pool = &state.pool;
+        let agent_id = agent(pool, "Writer").await;
+        let notes = root.join("notes.txt");
+        let docs = root.join("docs");
+        std::fs::write(&notes, "hello").unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        create(
+            pool,
+            &root,
+            OwnerKind::Agent,
+            &agent_id,
+            text(&notes),
+            Some("read first"),
+        )
+        .await
+        .unwrap();
+        create(pool, &root, OwnerKind::Agent, &agent_id, text(&docs), None)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(&notes).unwrap();
+
+        let refs = spawn_refs(pool, &root, Some(&agent_id), None)
+            .await
+            .expect("a missing ref must not fail the spawn");
+        assert_eq!(refs.len(), 2, "both refs are listed, got {refs:?}");
+
+        assert_eq!(refs[0].path, text(&notes));
+        assert_eq!(refs[0].kind, "file");
+        assert_eq!(refs[0].owner_kind, OwnerKind::Agent);
+        assert_eq!(refs[0].state, SpawnState::Missing);
+        assert_eq!(refs[0].real, None);
+        assert_eq!(refs[0].note.as_deref(), Some("read first"));
+
+        assert_eq!(refs[1].path, text(&docs));
+        assert_eq!(refs[1].kind, "dir");
+        assert_eq!(refs[1].owner_kind, OwnerKind::Agent);
+        assert_eq!(refs[1].state, SpawnState::Active);
+        assert_eq!(refs[1].real, Some(std::fs::canonicalize(&docs).unwrap()));
+    }
+
+    /// A ref saved while `root/docs` was a directory says nothing about what it is at spawn time:
+    /// once a junction out of the root has taken its place it is refused, and never granted.
+    #[tokio::test]
+    async fn spawn_refs_refuses_a_ref_replaced_by_a_junction() {
+        let (_tmp, root, state) = fixture().await;
+        let pool = &state.pool;
+        let agent_id = agent(pool, "Writer").await;
+        let docs = root.join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        create(pool, &root, OwnerKind::Agent, &agent_id, text(&docs), None)
+            .await
+            .unwrap();
+
+        std::fs::remove_dir_all(&docs).unwrap();
+        let (_keep, _outside) = junction_out(&root, "docs");
+
+        let refs = spawn_refs(pool, &root, Some(&agent_id), None)
+            .await
+            .unwrap();
+        assert_eq!(refs.len(), 1, "got {refs:?}");
+        assert_eq!(
+            refs[0].state,
+            SpawnState::Refused,
+            "a ref replaced by a junction must be refused, got {refs:?}"
+        );
+        assert!(
+            add_dirs(&refs).is_empty(),
+            "a refused ref must never become an --add-dir"
+        );
+    }
+
+    /// `--add-dir` takes a directory. A file ref would widen access to its whole parent, and a
+    /// directory that is gone has no real path to hand over.
+    #[tokio::test]
+    async fn add_dirs_lists_only_active_dir_refs() {
+        let (_tmp, root, state) = fixture().await;
+        let pool = &state.pool;
+        let agent_id = agent(pool, "Writer").await;
+        let file = root.join("a.txt");
+        let docs = root.join("docs");
+        let gone = root.join("gone");
+        std::fs::write(&file, "a").unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::create_dir(&gone).unwrap();
+        for path in [&file, &docs, &gone] {
+            create(pool, &root, OwnerKind::Agent, &agent_id, text(path), None)
+                .await
+                .unwrap();
+        }
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        let refs = spawn_refs(pool, &root, Some(&agent_id), None)
+            .await
+            .unwrap();
+        assert_eq!(refs.len(), 3, "got {refs:?}");
+        assert_eq!(
+            add_dirs(&refs),
+            vec![std::fs::canonicalize(&docs).unwrap()],
+            "only the active dir ref is an --add-dir, got {refs:?}"
+        );
+    }
+
+    /// The spawn carries its own agent's refs and its own team's, nobody else's.
+    #[tokio::test]
+    async fn spawn_refs_never_mixes_owners() {
+        let (_tmp, root, state) = fixture().await;
+        let pool = &state.pool;
+        let agent_a = agent(pool, "Alpha").await;
+        let agent_b = agent(pool, "Beta").await;
+        let team_x = team_named(pool, "Xray").await;
+        let team_y = team_named(pool, "Yankee").await;
+
+        let mut paths = Vec::new();
+        for (owner, owner_id, name) in [
+            (OwnerKind::Agent, &agent_a, "a.txt"),
+            (OwnerKind::Agent, &agent_b, "b.txt"),
+            (OwnerKind::Team, &team_x, "x.txt"),
+            (OwnerKind::Team, &team_y, "y.txt"),
+        ] {
+            let file = root.join(name);
+            std::fs::write(&file, name).unwrap();
+            create(pool, &root, owner, owner_id, text(&file), None)
+                .await
+                .unwrap();
+            paths.push(file);
+        }
+        let (a, b, x, y) = (&paths[0], &paths[1], &paths[2], &paths[3]);
+
+        let refs = spawn_refs(pool, &root, Some(&agent_a), Some(&team_y))
+            .await
+            .unwrap();
+        let seen: Vec<(OwnerKind, &str)> = refs
+            .iter()
+            .map(|r| (r.owner_kind, r.path.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![(OwnerKind::Agent, text(a)), (OwnerKind::Team, text(y))],
+            "the agent's refs come first, then the team's"
+        );
+        assert!(
+            refs.iter().all(|r| r.path != text(b) && r.path != text(x)),
+            "another owner's ref leaked into the spawn: {refs:?}"
+        );
+
+        assert!(
+            spawn_refs(pool, &root, None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no owner means no refs"
+        );
+    }
+
+    /// The index lists what a run may look at: active refs with their notes, missing ones flagged
+    /// so the agent does not go looking, and refused ones not at all.
+    #[test]
+    fn render_index_marks_missing_refs_and_omits_refused_ones() {
+        let refs = vec![
+            SpawnRef {
+                owner_kind: OwnerKind::Agent,
+                path: "/ctx/active-notes.txt".to_owned(),
+                kind: "file".to_owned(),
+                note: Some("read this first".to_owned()),
+                state: SpawnState::Active,
+                real: Some(PathBuf::from("/ctx/active-notes.txt")),
+            },
+            SpawnRef {
+                owner_kind: OwnerKind::Team,
+                path: "/ctx/vanished-dir".to_owned(),
+                kind: "dir".to_owned(),
+                note: None,
+                state: SpawnState::Missing,
+                real: None,
+            },
+            SpawnRef {
+                owner_kind: OwnerKind::Agent,
+                path: "/ctx/swapped-secret.txt".to_owned(),
+                kind: "file".to_owned(),
+                note: None,
+                state: SpawnState::Refused,
+                real: None,
+            },
+        ];
+
+        let index = render_index(&refs);
+        let active_line = index
+            .lines()
+            .find(|line| line.contains("/ctx/active-notes.txt"))
+            .unwrap_or_else(|| panic!("the active ref is listed, got {index:?}"));
+        assert!(
+            index.contains("read this first"),
+            "the note is listed, got {index:?}"
+        );
+        assert!(
+            !active_line.contains("(em falta)"),
+            "an active ref is not marked missing, got {active_line:?}"
+        );
+        let missing_line = index
+            .lines()
+            .find(|line| line.contains("/ctx/vanished-dir"))
+            .unwrap_or_else(|| panic!("the missing ref is listed, got {index:?}"));
+        assert!(
+            missing_line.contains("(em falta)"),
+            "the missing ref is marked, got {missing_line:?}"
+        );
+        assert!(
+            !index.contains("/ctx/swapped-secret.txt"),
+            "a refused ref must not be listed, got {index:?}"
+        );
+
+        assert_eq!(render_index(&[]), "");
     }
 
     // -----------------------------------------------------------------------------------------
