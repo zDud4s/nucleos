@@ -148,7 +148,8 @@ describe("KnownRow", () => {
     expect(await screen.findByText("possible duplicate")).toBeDefined();
     expect(screen.getAllByText("possible duplicate")).toHaveLength(1);
     const line = screen.getByText("possible duplicate").closest("p") as HTMLElement;
-    expect(line.textContent).toContain("the older learning");
+    // The older row's title is read only once the row is known to be a duplicate.
+    await waitFor(() => expect(line.textContent).toContain("the older learning"));
     fireEvent.click(within(line).getByRole("button", { name: "#2" }));
     await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/knowledge/2"));
   });

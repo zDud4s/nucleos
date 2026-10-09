@@ -22,6 +22,8 @@ import { Charter, takeTheirs, teamFormFromView } from "./Charter";
 import { detectDrift, snapshotFromView } from "./drift";
 import { createAppQueryClient } from "../app/queryClient";
 import type { TeamView } from "../data/teams";
+import type { Known } from "../data/knowledge";
+import { known, knowledgeAnswer } from "../brain/knowledge/test-helpers";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -56,7 +58,7 @@ function teamView(overrides: Partial<TeamView> = {}): TeamView {
  * which is the whole subject: the guard exists because the daemon's copy can
  * change while the form is open.
  */
-async function renderCharter(seed: TeamView, opts: { later?: TeamView } = {}) {
+async function renderCharter(seed: TeamView, opts: { later?: TeamView; knowledge?: Known[] } = {}) {
   const state = { team: seed, reads: 0 };
 
   daemon.apiFetch.mockImplementation(async (path: string) => {
@@ -68,6 +70,8 @@ async function renderCharter(seed: TeamView, opts: { later?: TeamView } = {}) {
       ];
     }
     if (path === "/teams") return [state.team];
+    const listed = knowledgeAnswer(path, opts.knowledge ?? []);
+    if (listed !== undefined) return listed;
     if (/^\/teams\/[^/]+$/.exec(path) !== null) {
       state.reads += 1;
       // The second read is the guard's re-read at submit — where the hire that
@@ -247,6 +251,26 @@ describe("Charter - the drift guard", () => {
 
     expect(await screen.findByText(/nothing was saved/)).toBeDefined();
     expect(puts()).toHaveLength(0);
+  });
+});
+
+/* ------------------------------------------------------------- memory -- */
+
+describe("Charter - the team's own memory", () => {
+  it("the charter shows the team's own memory", async () => {
+    await renderCharter(teamView(), {
+      knowledge: [
+        known({ id: 1, scope_kind: "team", scope_id: "financas", title: "Close the books monthly" }),
+        known({ id: 2, scope_kind: "team", scope_id: "outra", title: "Another team's rule" }),
+        known({ id: 3, scope_kind: "agent", scope_id: "financas", title: "An agent with the same id" }),
+      ],
+    });
+
+    const memory = await screen.findByRole("region", { name: "Memory" });
+
+    expect(await within(memory).findByText("Close the books monthly")).toBeDefined();
+    expect(within(memory).queryByText("Another team's rule")).toBeNull();
+    expect(within(memory).queryByText("An agent with the same id")).toBeNull();
   });
 });
 

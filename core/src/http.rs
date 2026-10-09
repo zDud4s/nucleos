@@ -14618,6 +14618,85 @@ struct ApproveBody {
     hire: Option<crate::agent::AgentRequest>,
     /// Only a browser-wheel approval reads it: `"shell"` or `"window"`.
     seat: Option<String>,
+    /// Only a `refinement` approval reads it: `agent:<id>`, `team:<id>` or `project:<id>`.
+    scope: Option<String>,
+}
+
+/// The scope a refinement approval asked for, or `None` when `raw` names none a refinement can
+/// live in (`machine`, `job:7`, a missing id, no colon at all).
+fn refinement_target(raw: &str) -> Option<crate::knowledge::Scope> {
+    let (kind, id) = raw.split_once(':')?;
+    if id.is_empty() {
+        return None;
+    }
+    match kind {
+        "project" => Some(crate::knowledge::Scope::Project(id.to_owned())),
+        "team" => Some(crate::knowledge::Scope::Team(id.to_owned())),
+        "agent" => Some(crate::knowledge::Scope::Agent(id.to_owned())),
+        _ => None,
+    }
+}
+
+/// 422 when `scope` names an agent or a team the núcleo does not have. A project is not checked:
+/// a project id is whatever a run was started with, and has no table of its own to be missing from.
+async fn refuse_unknown_owner(
+    pool: &sqlx::SqlitePool,
+    scope: &crate::knowledge::Scope,
+) -> Result<(), (StatusCode, String)> {
+    let (sql, noun, owner) = match scope {
+        crate::knowledge::Scope::Agent(owner) => {
+            ("SELECT 1 FROM agents WHERE id = ?", "agent", owner)
+        }
+        crate::knowledge::Scope::Team(owner) => ("SELECT 1 FROM teams WHERE id = ?", "team", owner),
+        _ => return Ok(()),
+    };
+    let found: Option<i64> = sqlx::query_scalar(sql)
+        .bind(owner)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "checking the scope an approval names failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the scope could not be checked".to_owned(),
+            )
+        })?;
+    match found {
+        Some(_) => Ok(()),
+        None => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("there is no {noun} `{owner}` to keep this refinement"),
+        )),
+    }
+}
+
+/// What the refinement door says when deciding refuses. `Malformed` after a real move can only be
+/// the move itself (a successor stays where its predecessor lived); otherwise the proposal names
+/// no row.
+fn refinement_refusal(
+    error: crate::knowledge::DecisionError,
+    id: i64,
+    was_rescoped: bool,
+) -> (StatusCode, String) {
+    match error {
+        crate::knowledge::DecisionError::NotFound => {
+            (StatusCode::NOT_FOUND, format!("there is no proposal {id}"))
+        }
+        crate::knowledge::DecisionError::NotPending => (
+            StatusCode::CONFLICT,
+            "this proposal has already been decided".to_owned(),
+        ),
+        crate::knowledge::DecisionError::Malformed => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            if was_rescoped {
+                "this refinement replaces an earlier one, so it can only be approved in the scope \
+                 it was declared in"
+                    .to_owned()
+            } else {
+                "this proposal does not name a refinement".to_owned()
+            },
+        ),
+    }
 }
 
 async fn post_proposal_approve(
@@ -14627,9 +14706,9 @@ async fn post_proposal_approve(
     // kinds through this door send nothing.
     body: Option<Json<ApproveBody>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (edited, seat) = match body {
-        Some(Json(body)) => (body.hire, body.seat),
-        None => (None, None),
+    let (edited, seat, rescope) = match body {
+        Some(Json(body)) => (body.hire, body.seat, body.scope),
+        None => (None, None, None),
     };
     // Two kinds of proposal share this table and this door, and they are decided by entirely
     // different machinery: an action approval resumes a paused run, a contact merge joins two
@@ -14662,24 +14741,42 @@ async fn post_proposal_approve(
         // refinement and decides the proposal in one transaction. Uncancellable for the reason the
         // others give — a dropped request must not leave the proposal and the layer disagreeing
         // about whether the agent was allowed to learn something.
+        let target = rescope
+            .as_deref()
+            .map(|raw| {
+                refinement_target(raw).ok_or_else(|| {
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!(
+                            "`{raw}` is not a scope a refinement can be approved into: agent:<id>, team:<id> or project:<id>"
+                        ),
+                    )
+                })
+            })
+            .transpose()?;
+        // A scope naming an agent or a team must name one that exists; and a scope equal to the
+        // declared one is the plain approval, so a refusal below can only be about the move.
+        let target = match target {
+            Some(scope) => {
+                refuse_unknown_owner(&state.pool, &scope).await?;
+                match crate::knowledge::declared_in(&state.pool, id, &scope).await {
+                    Ok(true) => None,
+                    Ok(false) => Some(scope),
+                    Err(error) => return Err(refinement_refusal(error, id, false)),
+                }
+            }
+            None => None,
+        };
+        let was_rescoped = target.is_some();
         let state = state.clone();
-        let activated =
-            uncancellable(async move { crate::knowledge::approve(&state.pool, id).await })
-                .await
-                .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
+        let activated = uncancellable(async move {
+            crate::knowledge::approve_as(&state.pool, id, target.as_ref()).await
+        })
+        .await
+        .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
         return match activated {
             Ok(refinement_id) => Ok(Json(serde_json::json!({ "refinement_id": refinement_id }))),
-            Err(crate::knowledge::DecisionError::NotFound) => {
-                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
-            }
-            Err(crate::knowledge::DecisionError::NotPending) => Err((
-                StatusCode::CONFLICT,
-                "this proposal has already been decided".to_owned(),
-            )),
-            Err(crate::knowledge::DecisionError::Malformed) => Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "this proposal does not name a refinement".to_owned(),
-            )),
+            Err(error) => Err(refinement_refusal(error, id, was_rescoped)),
         };
     }
     if kind == "calendar-event" {
@@ -15554,20 +15651,38 @@ struct LeaveNoteResponse {
     note_id: i64,
 }
 
+#[derive(serde::Deserialize)]
+struct KnowledgeNarrow {
+    scope_kind: Option<String>,
+    scope_id: Option<String>,
+}
+
 /// Everything the layer holds, in every status.
 ///
 /// Not filtered to `active`, deliberately: the reviewable history IS the feature, and a screen that
 /// showed only what is in force could not answer "what did it try to learn that I said no to".
+///
+/// `?scope_kind=&scope_id=` narrows it to one project, team or agent: both or neither, or 422.
 async fn list_knowledge(
     State(state): State<AppState>,
+    Query(narrow): Query<KnowledgeNarrow>,
 ) -> Result<Json<Vec<crate::knowledge::Known>>, StatusCode> {
-    crate::knowledge::all(&state.pool)
-        .await
-        .map(Json)
-        .map_err(|error| {
-            tracing::warn!(%error, "listing refinements failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    let scope = match (narrow.scope_kind, narrow.scope_id) {
+        (None, None) => None,
+        (Some(kind), Some(id)) => Some(
+            refinement_target(&format!("{kind}:{id}")).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?,
+        ),
+        _ => return Err(StatusCode::UNPROCESSABLE_ENTITY),
+    };
+    match &scope {
+        Some(scope) => crate::knowledge::in_scope(&state.pool, scope).await,
+        None => crate::knowledge::all(&state.pool).await,
+    }
+    .map(Json)
+    .map_err(|error| {
+        tracing::warn!(%error, "listing refinements failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 async fn get_run_knowledge(
@@ -37807,6 +37922,322 @@ mod tests {
             Some(run_id),
             "the run that declared it must be on the row"
         );
+    }
+
+    /// A pending refinement declared in project `p`: `(knowledge_id, proposal_id)`.
+    async fn pending_refinement(
+        state: &AppState,
+        title: &str,
+        supersedes: Option<i64>,
+    ) -> (i64, i64) {
+        crate::knowledge::propose(
+            &state.pool,
+            crate::knowledge::Declaration {
+                project_id: Some("p"),
+                origin_run_id: None,
+                kind: crate::knowledge::Kind::Prompt,
+                title,
+                body: "body",
+                reasoning: "because",
+                supersedes,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// `(status, scope_kind, scope_id)` of a knowledge row.
+    async fn knowledge_placement(
+        state: &AppState,
+        knowledge_id: i64,
+    ) -> (String, String, Option<String>) {
+        sqlx::query_as("SELECT status, scope_kind, scope_id FROM knowledge WHERE id = ?")
+            .bind(knowledge_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn proposal_status(state: &AppState, proposal_id: i64) -> String {
+        sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// The owner can approve a pending refinement into a scope other than the one it declared.
+    #[tokio::test]
+    async fn scoped_approval_moves_the_refinement_into_the_chosen_scope() {
+        let state = test_state().await;
+        agent_in(&state.pool, "a").await;
+        let (knowledge_id, proposal_id) = pending_refinement(&state, "moves scope", None).await;
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{proposal_id}/approve"),
+            Some(serde_json::json!({"scope": "agent:a"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["refinement_id"], knowledge_id);
+        let (row_status, scope_kind, scope_id) = knowledge_placement(&state, knowledge_id).await;
+        assert_eq!(row_status, "active");
+        assert_eq!(scope_kind, "agent");
+        assert_eq!(scope_id.as_deref(), Some("a"));
+        assert_eq!(proposal_status(&state, proposal_id).await, "approved");
+    }
+
+    /// No body at all is today's approval: the row keeps the scope it declared.
+    #[tokio::test]
+    async fn scoped_approval_absent_keeps_the_declared_scope() {
+        let state = test_state().await;
+        let (knowledge_id, proposal_id) = pending_refinement(&state, "keeps scope", None).await;
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{proposal_id}/approve"),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (row_status, scope_kind, scope_id) = knowledge_placement(&state, knowledge_id).await;
+        assert_eq!(row_status, "active");
+        assert_eq!(scope_kind, "project");
+        assert_eq!(scope_id.as_deref(), Some("p"));
+    }
+
+    /// A `scope` the door cannot turn into agent/team/project is refused before any write.
+    #[tokio::test]
+    async fn scoped_approval_with_an_unusable_scope_is_422_and_writes_nothing() {
+        let state = test_state().await;
+        let (knowledge_id, proposal_id) = pending_refinement(&state, "unusable", None).await;
+
+        for scope in ["machine", "job:7", "agent:", "team", "nonsense"] {
+            let (status, body) = call(
+                state.clone(),
+                "POST",
+                &format!("/proposals/{proposal_id}/approve"),
+                Some(serde_json::json!({ "scope": scope })),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{scope}: {body}");
+            let (row_status, scope_kind, scope_id) =
+                knowledge_placement(&state, knowledge_id).await;
+            assert_eq!(row_status, "proposed", "{scope} must not activate the row");
+            assert_eq!(scope_kind, "project", "{scope} must not move the row");
+            assert_eq!(scope_id.as_deref(), Some("p"));
+            assert_eq!(
+                proposal_status(&state, proposal_id).await,
+                "pending",
+                "{scope} must not decide the proposal"
+            );
+        }
+    }
+
+    /// `approve_as` refuses to move a row that supersedes another; the door answers 422.
+    #[tokio::test]
+    async fn scoped_approval_refused_by_approve_as_is_422() {
+        let state = test_state().await;
+        team_in(&state.pool, "t").await;
+        let (_, old_proposal) = pending_refinement(&state, "the old rule", None).await;
+        let old = crate::knowledge::approve(&state.pool, old_proposal)
+            .await
+            .unwrap();
+        let (knowledge_id, proposal_id) =
+            pending_refinement(&state, "the new rule", Some(old)).await;
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{proposal_id}/approve"),
+            Some(serde_json::json!({"scope": "team:t"})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (row_status, scope_kind, _) = knowledge_placement(&state, knowledge_id).await;
+        assert_eq!(row_status, "proposed");
+        assert_eq!(scope_kind, "project");
+        assert_eq!(proposal_status(&state, proposal_id).await, "pending");
+    }
+
+    /// A scoped approval of something already decided is 409; of something that is not there, 404.
+    #[tokio::test]
+    async fn scoped_approval_of_a_decided_or_missing_proposal_is_409_or_404() {
+        let state = test_state().await;
+        agent_in(&state.pool, "a").await;
+        let (_, proposal_id) = pending_refinement(&state, "decided twice", None).await;
+        crate::knowledge::approve(&state.pool, proposal_id)
+            .await
+            .unwrap();
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/proposals/{proposal_id}/approve"),
+            Some(serde_json::json!({"scope": "agent:a"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+        let (status, body) = call(
+            state,
+            "POST",
+            "/proposals/999999/approve",
+            Some(serde_json::json!({"scope": "agent:a"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    /// An agent seeded so a scope can name it.
+    async fn agent_in(pool: &sqlx::SqlitePool, agent_id: &str) {
+        let now = "2026-10-09T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                                 created_at, updated_at)
+             VALUES (?, ?, 'remembering', 'recall', 'claude', 'inherit', ?, ?)",
+        )
+        .bind(agent_id)
+        .bind(format!("Agent {agent_id}"))
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// [`call`], for a refusal: the status and the plain-text body it carries.
+    async fn call_text(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// An agent or team the núcleo has never heard of is not a place to keep a lesson.
+    #[tokio::test]
+    async fn scoped_approval_into_an_agent_or_team_that_does_not_exist_is_422_and_writes_nothing() {
+        let state = test_state().await;
+        let (knowledge_id, proposal_id) = pending_refinement(&state, "nobody home", None).await;
+
+        for (scope, says) in [
+            ("agent:ghost", "no agent `ghost`"),
+            ("team:ghost", "no team `ghost`"),
+        ] {
+            let (status, text) = call_text(
+                state.clone(),
+                "POST",
+                &format!("/proposals/{proposal_id}/approve"),
+                serde_json::json!({ "scope": scope }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{scope}: {text}");
+            assert!(text.contains(says), "{scope}: {text}");
+            let (row_status, scope_kind, _) = knowledge_placement(&state, knowledge_id).await;
+            assert_eq!(row_status, "proposed");
+            assert_eq!(scope_kind, "project");
+            assert_eq!(proposal_status(&state, proposal_id).await, "pending");
+        }
+    }
+
+    /// A proposal that names no refinement says so, whatever scope it was asked into.
+    #[tokio::test]
+    async fn scoped_approval_of_a_proposal_naming_no_refinement_says_so() {
+        let state = test_state().await;
+        agent_in(&state.pool, "a").await;
+        let (_, proposal_id) = pending_refinement(&state, "lost its row", None).await;
+        sqlx::query("UPDATE proposals SET tool_input = '{}' WHERE id = ?")
+            .bind(proposal_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        for scope in ["agent:a", "project:p"] {
+            let (status, text) = call_text(
+                state.clone(),
+                "POST",
+                &format!("/proposals/{proposal_id}/approve"),
+                serde_json::json!({ "scope": scope }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{scope}: {text}");
+            assert!(
+                text.contains("does not name a refinement"),
+                "{scope}: {text}"
+            );
+        }
+    }
+
+    /// `GET /knowledge` narrowed to one scope answers that scope's rows in every status, and
+    /// nobody else's; a scope a row cannot live in is refused.
+    #[tokio::test]
+    async fn knowledge_list_narrowed_to_one_scope_answers_only_that_scope() {
+        let state = test_state().await;
+        let (mine, mine_proposal) = pending_refinement(&state, "mine", None).await;
+        crate::knowledge::approve_as(
+            &state.pool,
+            mine_proposal,
+            Some(&crate::knowledge::Scope::Agent("a".to_owned())),
+        )
+        .await
+        .unwrap();
+        let (_, theirs_proposal) = pending_refinement(&state, "theirs", None).await;
+        crate::knowledge::approve_as(
+            &state.pool,
+            theirs_proposal,
+            Some(&crate::knowledge::Scope::Agent("b".to_owned())),
+        )
+        .await
+        .unwrap();
+        pending_refinement(&state, "the project's", None).await;
+
+        let (status, body) = call(
+            state.clone(),
+            "GET",
+            "/knowledge?scope_kind=agent&scope_id=a",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<i64> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![mine]);
+
+        for uri in [
+            "/knowledge?scope_kind=job&scope_id=7",
+            "/knowledge?scope_kind=agent",
+            "/knowledge?scope_id=a",
+        ] {
+            let (status, body) = call(state.clone(), "GET", uri, None).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {body}");
+        }
     }
 
     /// Only a run declares (owner decision 2026-09-23).
