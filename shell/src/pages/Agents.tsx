@@ -833,6 +833,7 @@ function AgentEditor({
       <ContextRefs ownerKind="agent" ownerId={agent.id} />
       <ScopedMemory scopeKind="agent" scopeId={agent.id} />
       <ScopedTools ownerKind="agent" ownerId={agent.id} />
+      <LoadoutPreview agentId={agent.id} />
 
       {/*
         The delete, and what this page can see standing on it — before the
@@ -853,7 +854,6 @@ function AgentEditor({
         />
       </div>
       {del.isError && <DeleteRefusal error={del.error} />}
-      <LoadoutPreview agentId={agent.id} />
     </Modal>
   );
 }
