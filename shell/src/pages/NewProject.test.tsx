@@ -2,7 +2,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+const tauri = vi.hoisted(() => ({ isTauri: vi.fn(() => false), pickFolder: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), isTauri: tauri.isTauri }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: tauri.pickFolder }));
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
 vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),
@@ -34,7 +36,7 @@ async function openWizard(overrides: Partial<DaemonState> = {}, initialPath = "/
 
 async function look(path = "C:/Projects/thing") {
   fireEvent.change(await screen.findByLabelText("Folder"), { target: { value: path } });
-  fireEvent.click(screen.getByRole("button", { name: "look" }));
+  fireEvent.click(screen.getByRole("button", { name: "Look" }));
 }
 
 describe("suggestedId", () => {
@@ -113,7 +115,7 @@ describe("adding a project", () => {
     // The same name and the same control as the Settings block this number is found under next.
     const ceiling = screen.getByRole("group", { name: "Open-proposal ceiling" });
     fireEvent.click(within(ceiling).getByRole("button", { name: "Raise the ceiling" }));
-    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add it, in shadow" }));
 
     await waitFor(() => expect(state.projects.length).toBeGreaterThan(0));
     // The folder the filesystem resolved, not the string that was typed.
@@ -147,7 +149,7 @@ describe("adding a project", () => {
     // Twice on the page and deliberately: once in the banner explaining what would go wrong, and
     // once beside the button that is disabled because of it.
     expect((await screen.findAllByText(/already registered as/)).length).toBe(2);
-    const add = screen.getByRole("button", { name: "add it, in shadow" });
+    const add = screen.getByRole("button", { name: "Add it, in shadow" });
     expect(add).toHaveProperty("disabled", true);
     // The reason is the button's description, not a span a screen reader never reaches.
     const reason = document.getElementById(add.getAttribute("aria-describedby") ?? "");
@@ -184,7 +186,7 @@ describe("adding a project", () => {
     await openWizard({ detected: detected({ is_git: false }) });
     await look();
     expect(await screen.findByText(/only ever run in shadow/)).toBeTruthy();
-    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty(
+    expect(screen.getByRole("button", { name: "Add it, in shadow" })).toHaveProperty(
       "disabled",
       false,
     );
@@ -219,7 +221,7 @@ describe("adding a project", () => {
     await look();
 
     fireEvent.click(await screen.findByRole("checkbox", { name: /gate/ }));
-    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add it, in shadow" }));
 
     expect(await screen.findByText(/Registered as/)).toBeTruthy();
     expect(screen.getByText(/Registered as/).textContent).toBe(
@@ -236,7 +238,7 @@ describe("adding a project", () => {
     expect(state.declared).toEqual([]);
 
     // No second press on offer: it would register again and re-send what landed.
-    expect(screen.queryByRole("button", { name: "add it, in shadow" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add it, in shadow" })).toBeNull();
     expect(
       screen.getByRole("link", { name: "Finish setting up thing on its page" }).getAttribute("href"),
     ).toBe("/projects/thing/state");
@@ -246,7 +248,7 @@ describe("adding a project", () => {
   it("keeps the button when the registration itself was refused", async () => {
     const { state } = await openWizard({ detected: detected() });
     await look();
-    await screen.findByRole("button", { name: "add it, in shadow" });
+    await screen.findByRole("button", { name: "Add it, in shadow" });
     const answers = daemonFetch(state);
     daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) => {
       if (path === "/autopilot/state" && init?.method === "POST") {
@@ -254,11 +256,11 @@ describe("adding a project", () => {
       }
       return answers(path, init);
     });
-    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add it, in shadow" }));
 
     expect(await screen.findByText(/did not say which prerequisite is missing/)).toBeTruthy();
     expect(screen.queryByText(/Registered as/)).toBeNull();
-    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", false);
+    expect(screen.getByRole("button", { name: "Add it, in shadow" })).toHaveProperty("disabled", false);
   });
 
   /**
@@ -279,12 +281,12 @@ describe("adding a project", () => {
     await look();
 
     expect(await screen.findByText(/while it is the núcleo refuses to record a workflow/)).toBeTruthy();
-    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", true);
+    expect(screen.getByRole("button", { name: "Add it, in shadow" })).toHaveProperty("disabled", true);
     expect(screen.getByText("the kill switch would refuse the workflow")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "leave the workflow for later" }));
     expect(screen.getByRole("radio", { name: /adopt none of them/ })).toHaveProperty("checked", true);
-    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add it, in shadow" }));
 
     await waitFor(() => expect(state.projects.length).toBe(1));
     expect(state.adopted).toEqual([]);
@@ -310,12 +312,12 @@ describe("adding a project", () => {
     const id = (await screen.findByLabelText("Project id")) as HTMLInputElement;
     fireEvent.change(id, { target: { value: "My Project" } });
     expect(id.getAttribute("aria-invalid")).toBe("true");
-    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", true);
+    expect(screen.getByRole("button", { name: "Add it, in shadow" })).toHaveProperty("disabled", true);
     expect(screen.getByText(/not an id yet/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "use my-project" }));
     expect(id.value).toBe("my-project");
-    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add it, in shadow" }));
     await waitFor(() => expect(state.projects[0]?.project_id).toBe("my-project"));
   });
 
@@ -328,7 +330,7 @@ describe("adding a project", () => {
     await look();
 
     expect(await screen.findByText(/would move that project here/)).toBeTruthy();
-    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", true);
+    expect(screen.getByRole("button", { name: "Add it, in shadow" })).toHaveProperty("disabled", true);
   });
 
   /** "No ceiling" is a real answer on the project's page, so it is one here too — sent as null. */
@@ -339,7 +341,7 @@ describe("adding a project", () => {
     fireEvent.click(await screen.findByRole("button", { name: "no ceiling" }));
     expect(screen.getByText("off")).toBeTruthy();
     expect(screen.getByText("no open-proposal ceiling")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add it, in shadow" }));
     await waitFor(() => expect(state.projects[0]).toMatchObject({ wip_limit: null }));
   });
 
@@ -379,7 +381,7 @@ describe("adding a project", () => {
     fireEvent.change(gate, { target: { value: "npm run ci" } });
     expect(screen.getByText(/onboarded with the gate/).textContent).toContain("npm run ci");
 
-    fireEvent.click(screen.getByRole("button", { name: "add it, in shadow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add it, in shadow" }));
     await waitFor(() => expect(state.projects.length).toBe(1));
     expect(state.onboarded).toEqual([
       { projectId: "thing", project_root: "C:/Projects/thing", gate_command: "npm run ci" },
@@ -393,11 +395,11 @@ describe("adding a project", () => {
       onboardRefusal: { status: 409, code: "hook_unwritable", detail: "settings.json is not JSON" },
     });
     await look();
-    fireEvent.click(await screen.findByRole("button", { name: "add it, in shadow" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Add it, in shadow" }));
 
     expect(await screen.findByText("hook_unwritable")).toBeTruthy();
     expect(screen.queryByText(/Registered as/)).toBeNull();
-    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", false);
+    expect(screen.getByRole("button", { name: "Add it, in shadow" })).toHaveProperty("disabled", false);
   });
 
   /** Steps two and three arrive below the focus; focus goes to them, so they are heard. */
@@ -412,10 +414,10 @@ describe("adding a project", () => {
   it("holds the button when the path is edited after it was read", async () => {
     await openWizard({ detected: detected() });
     await look();
-    await screen.findByRole("button", { name: "add it, in shadow" });
+    await screen.findByRole("button", { name: "Add it, in shadow" });
 
     fireEvent.change(screen.getByLabelText("Folder"), { target: { value: "C:/Projects/other" } });
-    expect(screen.getByRole("button", { name: "add it, in shadow" })).toHaveProperty("disabled", true);
+    expect(screen.getByRole("button", { name: "Add it, in shadow" })).toHaveProperty("disabled", true);
     expect(screen.getByText(/edited after it was read/)).toBeTruthy();
   });
 
@@ -430,5 +432,33 @@ describe("adding a project", () => {
       "C:/Projects/back",
     );
     expect(await screen.findByDisplayValue("back")).toBeTruthy();
+  });
+
+  /** Inside the app, the folder can be chosen in the system's own picker, and is read at once. */
+  it("browses for the folder with the native picker and reads what was chosen", async () => {
+    tauri.isTauri.mockReturnValue(true);
+    tauri.pickFolder.mockResolvedValue("C:/Projects/picked");
+    try {
+      await openWizard({ detected: detected({ root: "C:/Projects/picked" }) });
+      fireEvent.click(await screen.findByRole("button", { name: "Browse…" }));
+
+      await waitFor(() =>
+        expect(((screen.getByLabelText("Folder")) as HTMLInputElement).value).toBe("C:/Projects/picked"),
+      );
+      expect(tauri.pickFolder).toHaveBeenCalledWith(expect.objectContaining({ directory: true, multiple: false }));
+      expect(await screen.findByDisplayValue("picked")).toBeTruthy();
+    } finally {
+      tauri.isTauri.mockReturnValue(false);
+    }
+  });
+
+  /** Outside it there is no picker that answers with a path, so the button says so instead of failing silently. */
+  it("outside the app, Browse explains that the picker lives in the desktop app", async () => {
+    tauri.pickFolder.mockClear();
+    await openWizard();
+    fireEvent.click(await screen.findByRole("button", { name: "Browse…" }));
+
+    expect(await screen.findByText(/only opens in the desktop app/)).toBeTruthy();
+    expect(tauri.pickFolder).not.toHaveBeenCalled();
   });
 });

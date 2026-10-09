@@ -2,8 +2,11 @@ import { useRef, type ReactNode, type RefObject } from "react";
 import { XIcon } from "lucide-react";
 import { Dialog as DialogPrimitive } from "radix-ui";
 
-/** `sm` for a question and its two answers; `md` for a short form. Anything bigger is a page. */
-export type ModalSize = "sm" | "md";
+/**
+ * `sm` for a question and its two answers; `md` for a short form; `lg` for a short flow of a few
+ * steps that still belongs over the page it starts from (adding a project). Anything bigger is a page.
+ */
+export type ModalSize = "sm" | "md" | "lg";
 
 export interface ModalProps {
   /** Controlled: the page holds whether it is open, so a mutation can close it when it lands. */

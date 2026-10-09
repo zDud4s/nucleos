@@ -2545,6 +2545,10 @@ ol.ui-well {
   max-width: 34rem;
 }
 
+.ui-modal-lg {
+  max-width: 46rem;
+}
+
 /* The panel's heading row, with the close button where the panel's aside sits. */
 .ui-modal-head {
   display: flex;

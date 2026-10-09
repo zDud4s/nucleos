@@ -1,4 +1,5 @@
 import type { Agent } from "../data/agents";
+import type { Detected } from "../data/detect";
 import type { Known } from "../data/knowledge";
 import type { LoadoutTool } from "../data/loadout-tools";
 import type { ClassTally, JudgeResolveStatus, Resolution, JudgeStatus, JudgeVerdict } from "../data/autopilot";
@@ -2590,6 +2591,33 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path.startsWith("/email/cursor?")) return { uidvalidity: 1_694_512_331, last_uid: 48_213 };
 
   if (path === "/projects") return PROJECTS;
+
+  /*
+    "Add a project"'s reading of a folder. Without it the path fell through to a route that answered
+    something else, and the wizard threw on the missing `root` the moment anybody pressed "look".
+    Any folder is a git repository with a pipeline and three commands, so steps two and three have
+    something to show; the root is the folder asked about, as the núcleo resolves it.
+  */
+  if (path.startsWith("/projects/detect?")) {
+    const root = (splitQuery(path)[1].get("path") ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+    const detected: Detected = {
+      root,
+      is_git: true,
+      remote: "git@github.com:owner/" + (root.split("/").pop() ?? "project") + ".git",
+      branch: "main",
+      head: "4f2a9c1",
+      harnesses: [{ path: ".ai", what: "a written-down pipeline", files: 42 }],
+      commands: [
+        { name: "test", command: "npm test", source: "package.json" },
+        { name: "lint", command: "npm run lint", source: "package.json" },
+        { name: "build", command: "npm run build", source: "package.json" },
+      ],
+      commands_omitted: 0,
+      gate: { command: "npm test", source: "package.json" },
+      taken_by: null,
+    };
+    return detected;
+  }
 
   /*
     The files root, filled — every other page's shots had content and this one only ever had

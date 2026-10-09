@@ -432,6 +432,15 @@
   pointer-events: none;
 }
 
+/* Over the rows, which now sit above the scrub: the playhead is never drawn under a selected row. */
+.feed-trace-playhead {
+  z-index: 2;
+}
+
+.feed-trace-rows .feed-trace-label {
+  pointer-events: auto;
+}
+
 .feed-trace-rule {
   position: absolute;
   top: 0;
@@ -475,8 +484,14 @@
   white-space: nowrap;
 }
 
+/*
+  Above the scrub layer, so a mark can be pointed at and its card opens; transparent to the pointer
+  everywhere else, so a drag on a row's empty track still reaches the scrub beneath and moves time.
+*/
 .feed-trace-rows {
   position: relative;
+  z-index: 1;
+  pointer-events: none;
   margin: 0;
   padding: var(--space-1) 0 var(--space-2);
   list-style: none;
@@ -875,15 +890,20 @@
 /**
  * The selected sequence, read line by line, with the facts a row cannot hold beside it.
  *
- * Hairline-ruled like the list below it and not carded: it is the same kind of reading, one
- * sequence deep. At the app's breakpoint the facts fall under the lines.
+ * Carded like the trace it opens from, so it reads as that row opened rather than as the head of
+ * the list under it — uncarded, the two hairline-ruled tables ran into each other. At the app's
+ * breakpoint the facts fall under the lines.
  */
 .feed-detail {
   container: feed-detail / inline-size;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 17rem;
+  grid-template-columns: minmax(0, 1fr) 15rem;
   gap: var(--space-5);
   margin-bottom: var(--space-6);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
 }
 
 .feed-detail-main {
@@ -916,17 +936,16 @@
   margin: 0;
   padding: 0;
   list-style: none;
-  border-top: 1px solid var(--border);
 }
 
 .feed-detail-line {
   display: grid;
-  grid-template-columns: 3.25rem 13rem minmax(0, 1fr);
-  column-gap: var(--space-4);
+  grid-template-columns: 3rem 10.5rem minmax(0, 1fr);
+  column-gap: var(--space-3);
   row-gap: var(--space-1);
   align-items: baseline;
-  padding: var(--space-2) var(--space-2);
-  border-bottom: 1px solid var(--border);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border);
   transition: opacity var(--dur-settle) var(--ease);
 }
 
@@ -959,6 +978,7 @@
 }
 
 .feed-detail-side {
+  align-self: start;
   padding-left: var(--space-5);
   border-left: 1px solid var(--border);
   font-size: var(--text-sm);
@@ -1017,7 +1037,7 @@
 
 /* The list's own heading: the record, after the trace and the sequence opened from it. */
 .feed-every {
-  margin: var(--space-6) 0 0;
+  margin: var(--space-6) 0 var(--space-1);
   font-family: var(--font-display);
   font-size: var(--text-lg);
   font-weight: var(--weight-bold);
@@ -1104,11 +1124,11 @@
  */
 .feed-line {
   display: grid;
-  grid-template-columns: 3.25rem 13rem minmax(0, 1fr);
-  column-gap: var(--space-4);
+  grid-template-columns: 3rem 10.5rem minmax(0, 1fr);
+  column-gap: var(--space-3);
   row-gap: var(--space-1);
   align-items: baseline;
-  padding: var(--space-3) var(--space-2);
+  padding: var(--space-2) var(--space-2);
   border-bottom: 1px solid var(--border);
   transition: background-color var(--dur-settle) var(--ease);
 }
@@ -1123,7 +1143,7 @@
 }
 
 .feed-line-routine {
-  padding-block: var(--space-2);
+  padding-block: var(--space-1);
 }
 
 .feed-line-time {
@@ -1263,11 +1283,20 @@
  */
 .feed-routine {
   display: grid;
-  grid-template-columns: 3.25rem minmax(0, 1fr);
-  column-gap: var(--space-4);
+  grid-template-columns: 3rem minmax(0, 1fr);
+  column-gap: var(--space-3);
   align-items: baseline;
-  padding: var(--space-2);
+  padding: 2px var(--space-2);
   border-bottom: 1px solid var(--border);
+}
+
+/*
+  Folded, routine is an aside between the exceptions and is set a size down — at full row weight
+  every other row of the list was a fold, and the lines that matter were lost among them.
+*/
+.feed-routine > .feed-line-time {
+  font-size: var(--text-xs);
+  opacity: 0.7;
 }
 
 .feed-routine-toggle {
@@ -1281,7 +1310,7 @@
   background: none;
   color: var(--text-muted);
   font-family: inherit;
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   text-align: left;
   cursor: pointer;
 }
@@ -1292,6 +1321,8 @@
 
 .feed-routine-chevron {
   flex: none;
+  width: 12px;
+  height: 12px;
   transition: transform var(--dur-quick) var(--ease);
 }
 
@@ -1301,7 +1332,7 @@
 
 .feed-routine-n {
   flex: none;
-  color: var(--text);
+  color: var(--text-muted);
   font-weight: var(--weight-medium);
 }
 
@@ -1323,16 +1354,9 @@
   border-bottom: 0;
 }
 
-@container feed-days (max-width: 40rem) {
-  .feed-routine {
-    grid-template-columns: 3rem minmax(0, 1fr);
-    column-gap: var(--space-3);
-  }
-}
-
 /* A silence longer than two hours, between the two lines it separates. */
 .feed-gap {
-  padding: var(--space-3) var(--space-2) var(--space-3) calc(3.25rem + var(--space-4) + var(--space-2));
+  padding: var(--space-2) var(--space-2) var(--space-2) calc(3rem + var(--space-3) + var(--space-2));
   border-bottom: 1px solid var(--border);
   color: var(--text-muted);
   font-size: var(--text-xs);
@@ -1358,7 +1382,7 @@
 }
 
 .feed-seen::before {
-  flex: 0 0 3.25rem;
+  flex: 0 0 3rem;
 }
 
 .feed-seen-text {

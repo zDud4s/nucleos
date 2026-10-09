@@ -170,10 +170,10 @@ const DETAIL_ROUTES: {
 }[] = [
   { path: "/runs/$runId", component: RunDetail },
   /*
-    Adding a project is a page and not a dialog, for the same reason the eject guard is a panel:
-    §3.2 of the frontend spec. It is also three steps long and one of them is a folder path somebody
-    may want to go and look up — a modal that had to be dismissed to do that would lose the other
-    two. It sits under `/projects/` because that is what it is about, and cannot be confused with a
+    Adding a project has a route but draws a dialog: the roster, with the wizard on the shared
+    `Modal` over it (owner's call 2026-10-09, overriding the earlier page-not-dialog reading of
+    §3.2). The route keeps `?path=` and every link to it working, and closing the dialog goes back
+    to `/projects`. It sits under `/projects/` because that is what it is about, and cannot be confused with a
     project called `new`: that one would be `/projects/new/state`, three segments rather than two.
   */
   { path: "/projects/new", component: NewProject },
