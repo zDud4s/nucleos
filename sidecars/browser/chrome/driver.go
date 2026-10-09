@@ -179,6 +179,8 @@ type session struct {
 	// with the rest of the per-document state: a submission navigates, so resetting on navigation
 	// would throw away the record of the very thing that caused it.
 	writes []browser.Write
+	// panel is what a visible session keeps for its panel, or nil for a session without one.
+	panel *panelState
 }
 
 // contextKey names one execution context. The id is unique within a target and not across them, so
@@ -279,6 +281,7 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 	conn.OnEvent(driver.onDialog)
 	conn.OnEvent(driver.onScreencastFrame)
 	conn.OnEvent(driver.onFileChooser)
+	conn.OnEvent(driver.onPanelEvent)
 	driver.startSweep()
 	return driver, nil
 }
@@ -377,6 +380,10 @@ func (d *Driver) onEvent(event cdp.Event) {
 			d.mu.Lock()
 			d.personTargets[params.TargetInfo.TargetID] = params.SessionID
 			d.mu.Unlock()
+			// The person's popup carries the panel too, armed while it is still paused.
+			if _, err := d.conn.Call(ctx, params.SessionID, "Runtime.enable", nil); err == nil {
+				d.armPanel(ctx, params.SessionID)
+			}
 			if params.WaitingForDebugger {
 				_, _ = d.conn.Call(ctx, params.SessionID, "Runtime.runIfWaitingForDebugger", nil)
 			}
@@ -444,6 +451,13 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	// Before the navigation, because the shim has to be in place before the document that will use
 	// it exists. Arming after would leave the first page — the one the agent asked for — unserved.
 	d.armFerry(ctx, cdpSession)
+	d.mu.Lock()
+	visible := d.visible
+	d.mu.Unlock()
+	if visible {
+		// Before the navigation too: the first document has to come up with its panel.
+		d.armPanel(ctx, cdpSession)
+	}
 	mainFrame := d.mainFrameOf(ctx, cdpSession)
 
 	d.mu.Lock()
@@ -463,6 +477,9 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		// Anything refused before this session existed belongs to the sweep or to another session.
 		reportedUpTo: d.refusalTotal,
 	}
+	if visible {
+		entry.panel = newPanelState()
+	}
 	if d.personBegun {
 		// A person was handed the browser while this target was being made. The sole-session check
 		// did not see it, so it is refused here, before anything navigates with the fence lifted.
@@ -478,6 +495,9 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	d.targets[target.TargetID] = id
 	d.cdpToSession[cdpSession] = id
 	d.mu.Unlock()
+	if visible {
+		d.adoptPanelWorlds(cdpSession)
+	}
 
 	// Counted BEFORE the navigation, so a refusal the fence raises while the navigation is in
 	// flight is attributable to it and not lost.
@@ -726,6 +746,11 @@ func (d *Driver) Close(ctx context.Context, id browser.SessionID) error {
 	entry, err := d.lookup(id)
 	if err != nil {
 		return err
+	}
+	// Before the target goes: Chromium then reports it destroyed, and that is not the person closing
+	// the window.
+	if entry.panel != nil {
+		d.endPanel(entry.panel, browser.PanelSessionClosed)
 	}
 	_, callErr := d.conn.Call(ctx, cdp.BrowserSession, "Target.closeTarget", map[string]any{
 		"targetId": entry.target,

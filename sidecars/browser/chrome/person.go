@@ -122,6 +122,7 @@ func (d *Driver) BeginPerson(ctx context.Context, id browser.SessionID) error {
 		if d.personSwitch != nil {
 			d.personSwitch(true)
 		}
+		d.pushState(ctx, id)
 		return nil
 	}
 
@@ -228,5 +229,8 @@ func (d *Driver) EndPerson(ctx context.Context, id browser.SessionID) (browser.R
 		entry.mode = browser.ModeAgent
 	}
 	d.mu.Unlock()
+	if d.visible {
+		d.pushState(ctx, id)
+	}
 	return browser.Returned{Chain: state.recorder.Chain()}, nil
 }
