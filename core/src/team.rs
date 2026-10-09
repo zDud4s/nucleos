@@ -597,8 +597,8 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
         ));
     }
 
-    // Every statement below, the memory archive included, shares one transaction: a delete that
-    // finds no team rolls the whole of it back.
+    // Every statement below, the loadout rows and memory archive included, shares one
+    // transaction: a delete that finds no team rolls the whole of it back.
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM team_members WHERE team_id = ?")
         .bind(id)
@@ -637,6 +637,7 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
     .bind(id)
     .execute(&mut *tx)
     .await?;
+    crate::tool_loadout::delete_for_owner(&mut tx, "team", id).await?;
     let result = sqlx::query("DELETE FROM teams WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)
@@ -8982,5 +8983,72 @@ mod tests {
         assert!(matches!(outcome, Err(TeamError::Invalid(_))), "{outcome:?}");
         assert_eq!(knowledge_status(&state.pool, memory).await.0, "active");
         assert!(knowledge_transitions(&state.pool, memory).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loadout_deleting_a_team_removes_its_tools_and_events() {
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO agents
+                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
+             VALUES ('director', 'Director', 'plans', 'p', 'claude', NULL, 'mcp_only',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for id in ["marketing", "sales"] {
+            sqlx::query(
+                "INSERT INTO teams
+                     (id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
+                      created_at, updated_at)
+                 VALUES (?, ?, 'sell', 'director', 3, 2, NULL,
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mut rows = Vec::new();
+        for owner in ["marketing", "sales"] {
+            let row = sqlx::query(
+                "INSERT INTO loadout_tools (owner_kind, owner_id, tool, status, source, created_at)
+                 VALUES ('team', ?, 'web_read', 'active', 'owner', '2026-01-01T00:00:00Z')",
+            )
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            sqlx::query(
+                "INSERT INTO loadout_tool_events (tool_row_id, from_status, to_status, at)
+                 VALUES (?, NULL, 'active', '2026-01-01T00:00:00Z')",
+            )
+            .bind(row)
+            .execute(&pool)
+            .await
+            .unwrap();
+            rows.push(row);
+        }
+
+        delete(&pool, "marketing").await.unwrap();
+
+        let tools = "SELECT COUNT(*) FROM loadout_tools WHERE id = ?";
+        let events = "SELECT COUNT(*) FROM loadout_tool_events WHERE tool_row_id = ?";
+        for (sql, row, expected, what) in [
+            (tools, rows[0], 0_i64, "the deleted team's tool row stayed"),
+            (events, rows[0], 0, "the deleted team's events stayed"),
+            (tools, rows[1], 1, "another team's tool row went"),
+            (events, rows[1], 1, "another team's events went"),
+        ] {
+            let found: i64 = sqlx::query_scalar(sql)
+                .bind(row)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(found, expected, "{what}");
+        }
     }
 }

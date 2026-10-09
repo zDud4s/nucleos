@@ -127,11 +127,14 @@ const VIA_PARENT: &[(&str, &str, &str)] = &[
     // parent that is itself project-scoped, and `knowledge` is not — the store keeps its scope in
     // two columns. See the two statements written out in `remove`.
     ("run_knowledge", "run_id", "runs"),
+    // A run's frozen tool loadout (migration 0190). It belongs to the project through its run only,
+    // exactly like `run_knowledge`; the CASCADE would take it anyway, listing it keeps the forget explicit.
+    ("run_loadout", "run_id", "runs"),
 ];
 
 /// What a project has on record, in the nouns somebody would recognise.
 ///
-/// Not every one of the forty-two tables the forget clears: `scheduler_state` and
+/// Not every table the forget clears: `scheduler_state` and
 /// `repo_trigger_state` are bookkeeping nobody has ever seen a screen for, and a count of them
 /// would be a number that makes the decision harder rather than easier. These seven are the ones
 /// this app has surfaces for, so each one is a thing the reader can picture losing.
@@ -261,7 +264,7 @@ where
 /// **`defer_foreign_keys` is what makes the forget expressible at all.** `storage.rs` runs with
 /// `foreign_keys` on, and a project's own history references itself in both directions — a run
 /// naming its successor, a job naming the runs that are its items — so there is no order in which
-/// forty-two immediate deletes all succeed. Deferred, the checks all happen at `COMMIT`, by which
+/// the immediate deletes all succeed. Deferred, the checks all happen at `COMMIT`, by which
 /// point everything that had to go has gone. It also means the one failure left is the honest one:
 /// something OUTSIDE this project's history still points into it, and the commit refuses rather than
 /// leaving a dangling reference.

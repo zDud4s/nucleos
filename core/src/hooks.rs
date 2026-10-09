@@ -770,16 +770,25 @@ pub async fn pretooluse_decision(
 }
 
 /// Whether `tool_name` is one of the job-node tools: `mcp__nucleos__<name>` for a `<name>` in
-/// `mcp_tools::JOB_NODE_TOOLS`, matched as a WHOLE name and never by prefix or wildcard.
+/// `mcp_tools::JOB_NODE_BASE`, matched as a WHOLE name and never by prefix or wildcard.
 ///
-/// This is the ONE `mcp__` name an unattended run may call, and it is a branch in
+/// This is the base list an unattended run may call, and it is a branch in
 /// `pretooluse_decision` and not a classifier class: the classifier is pure and per-tool, and a
 /// class would also have to be kept away from the judge and the scoreboard. A widening of
-/// `JOB_NODE_TOOLS` widens this by construction, so that list is the thing review must watch.
+/// `JOB_NODE_BASE` widens this by construction, so that list is the thing review must watch. The
+/// extras (`JOB_NODE_EXTRAS`) are admitted only from the run's loadout, see `job_node_extra`.
 fn is_job_node_tool(tool_name: &str) -> bool {
     tool_name
         .strip_prefix("mcp__nucleos__")
-        .is_some_and(|name| crate::mcp_tools::JOB_NODE_TOOLS.contains(&name))
+        .is_some_and(|name| crate::mcp_tools::JOB_NODE_BASE.contains(&name))
+}
+
+/// The `<n>` of a whole-segment `mcp__nucleos__<n>` that names a job-node extra, else `None`.
+fn job_node_extra(tool_name: &str) -> Option<&str> {
+    tool_name
+        .strip_prefix("mcp__nucleos__")
+        .filter(|name| !name.contains("__"))
+        .filter(|name| crate::mcp_tools::JOB_NODE_EXTRAS.contains(name))
 }
 
 /// The job a run belongs to, `None` for a run that is not a job's node (or whose row is gone).
@@ -1033,6 +1042,85 @@ async fn pretooluse_decision_from(
                     decision: "allow".to_owned(),
                     reason: "a job's run may record a finding".to_owned(),
                 });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    run_id = run_id,
+                    %error,
+                    "pretooluse-decision: failed to resolve the run's job — failing closed"
+                );
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: "could not resolve the run's job — failing closed".to_owned(),
+                });
+            }
+        }
+    }
+
+    // A job's node may also call an EXTRA tool its run's loadout lists. Same preconditions as the
+    // base branch; a tool that is not listed is refused with the way to ask for it.
+    if let Some(extra) = job_node_extra(&payload.tool_name)
+        && is_in_flight
+        && crate::runs::runs_unattended(&mode)
+    {
+        match job_id_of(&state.pool, run_id).await {
+            Ok(Some(job_id)) => {
+                match crate::tool_loadout::run_lists_tool(&state.pool, run_id, extra).await {
+                    Ok(true) => {
+                        let effect = crate::mcp_tools::effect_of_call(
+                            &state.pool,
+                            extra,
+                            &payload.tool_input,
+                        )
+                        .await;
+                        if effect == crate::mcp_tools::ToolEffect::ReadsUntrusted
+                            && let Err(error) =
+                                crate::runs::mark_untrusted_context(&state.pool, run_id).await
+                        {
+                            tracing::warn!(
+                                run_id = run_id,
+                                tool = extra,
+                                %error,
+                                "pretooluse-decision: could not record that a job node read third-party content - refusing the read"
+                            );
+                            return Json(Decision {
+                                decision: "deny".to_owned(),
+                                reason: "could not record that this run read third-party content"
+                                    .to_owned(),
+                            });
+                        }
+                        tracing::info!(
+                            run_id = run_id,
+                            job_id = job_id,
+                            tool = extra,
+                            "pretooluse-decision: allowed a job-node extra tool its loadout lists"
+                        );
+                        return Json(Decision {
+                            decision: "allow".to_owned(),
+                            reason: "this run's loadout lists it".to_owned(),
+                        });
+                    }
+                    Ok(false) => {
+                        return Json(Decision {
+                            decision: "deny".to_owned(),
+                            reason: format!(
+                                "{extra} is not available to an autonomous run: it is not in this run's loadout; ask the owner for it with request_tool"
+                            ),
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            run_id = run_id,
+                            %error,
+                            "pretooluse-decision: failed to read the run's loadout — failing closed"
+                        );
+                        return Json(Decision {
+                            decision: "deny".to_owned(),
+                            reason: "could not read the run's loadout — failing closed".to_owned(),
+                        });
+                    }
+                }
             }
             Ok(None) => {}
             Err(error) => {
@@ -3070,7 +3158,9 @@ async fn council_decision(state: &AppState, payload: &PreToolUsePayload) -> Json
 /// reads alone.
 ///
 /// **Two questions, and this branch used to answer only the first.** Which tools a department may
-/// reach is `TEAM_TOOLS`, and `auth::TEAM_ROUTES` refuses the rest without anybody's cooperation.
+/// reach is `TEAM_BASE` (now also holding `request_tool`, a `WritesOwn` that lands in the
+/// `ReadsOwn | WritesOwn` arm) plus whatever `TEAM_EXTRAS` the run's loadout lists, and
+/// `auth::TEAM_ROUTES` refuses the rest without anybody's cooperation.
 /// Whether it may still ACT, having read, was answered nowhere on the cloud path: this function
 /// allowed every name on the list unconditionally, and the doc that stood here said `TEAM_TOOLS`
 /// carried no `Acts` — true when it was written, false since the alçada landed.
@@ -3098,11 +3188,50 @@ async fn council_decision(state: &AppState, payload: &PreToolUsePayload) -> Json
 /// Whole segment and not a prefix, for the reason `assistant_decision` records: an MCP server named
 /// `nucleos__x` produces `mcp__nucleos__x__…`, which passes a prefix test and is not this server.
 async fn team_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<Decision> {
-    let permitted = payload
+    use crate::mcp_tools::Admission;
+
+    let named = payload
         .tool_name
         .strip_prefix("mcp__nucleos__")
-        .filter(|tool| !tool.contains("__"))
-        .filter(|tool| crate::mcp_tools::TEAM_TOOLS.contains(tool));
+        .filter(|tool| !tool.contains("__"));
+    let admission = named.map(|tool| {
+        crate::mcp_tools::box_admission(
+            crate::mcp_tools::TEAM_BASE,
+            crate::mcp_tools::TEAM_EXTRAS,
+            tool,
+        )
+    });
+
+    let permitted = match (named, admission) {
+        (Some(tool), Some(Admission::Base)) => Some(tool),
+        (Some(tool), Some(Admission::Extra)) => {
+            // An extra is admitted only when this run's loadout lists it; a lookup that fails
+            // refuses, like every other unreadable state below.
+            match crate::tool_loadout::run_lists_tool(&state.pool, payload.run_id, tool).await {
+                Ok(true) => Some(tool),
+                Ok(false) => {
+                    return Json(Decision {
+                        decision: "deny".to_owned(),
+                        reason: "not in this run's loadout; ask the owner for it with request_tool"
+                            .to_owned(),
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        run_id = payload.run_id,
+                        tool,
+                        %error,
+                        "pretooluse-decision: could not read a team agent's loadout - failing closed"
+                    );
+                    return Json(Decision {
+                        decision: "deny".to_owned(),
+                        reason: "could not read the run's loadout — failing closed".to_owned(),
+                    });
+                }
+            }
+        }
+        _ => None,
+    };
 
     let Some(tool) = permitted else {
         // Debug and not warn, for the reason the council's branch gives: a specialist reaching for
@@ -5744,6 +5873,98 @@ mod tests {
         }
         for tool in ["mcp__nucleos__verify__x", "mcp__other__verify"] {
             let verdict = decide(&app, &call(run_id, tool, serde_json::json!({}))).await;
+            assert_eq!(verdict.decision, "deny", "{tool}");
+        }
+    }
+
+    /// The job-node base tools (including `request_tool`) need no `run_loadout` row.
+    #[tokio::test]
+    async fn loadout_job_node_base_tools_need_no_row() {
+        let state = test_state().await;
+        let (_job_id, run_id) = in_flight_job_node(&state).await;
+        let app = test_router(state);
+        for tool in ["mcp__nucleos__request_tool", "mcp__nucleos__verify_status"] {
+            let verdict = decide(&app, &call(run_id, tool, serde_json::json!({}))).await;
+            assert_eq!(verdict.decision, "allow", "{tool}");
+        }
+    }
+
+    /// An extra tool is denied without a row, and with a row that does not list it.
+    #[tokio::test]
+    async fn loadout_job_node_extra_without_a_row_is_denied() {
+        let state = test_state().await;
+        let (_job_id, run_id) = in_flight_job_node(&state).await;
+        let app = test_router(state.clone());
+        let verdict = decide(
+            &app,
+            &call(run_id, "mcp__nucleos__web_read", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "deny", "no row");
+
+        sqlx::query(
+            "INSERT INTO run_loadout (run_id, agent_id, team_id, tools, resolved_at)
+             VALUES (?, NULL, NULL, '[\"verify\"]', '2026-10-08T00:00:00Z')",
+        )
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let verdict = decide(
+            &app,
+            &call(run_id, "mcp__nucleos__web_read", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "deny", "row without web_read");
+    }
+
+    /// A listed extra tool is allowed, and because it reads untrusted text the run is marked.
+    #[tokio::test]
+    async fn loadout_job_node_extra_listed_is_allowed_and_marks_the_run() {
+        let state = test_state().await;
+        let (_job_id, run_id) = in_flight_job_node(&state).await;
+        sqlx::query(
+            "INSERT INTO run_loadout (run_id, agent_id, team_id, tools, resolved_at)
+             VALUES (?, NULL, NULL, '[\"web_read\"]', '2026-10-08T00:00:00Z')",
+        )
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let app = test_router(state.clone());
+        let verdict = decide(
+            &app,
+            &call(run_id, "mcp__nucleos__web_read", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(verdict.decision, "allow");
+        assert!(
+            crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "web_read must mark the run as having read untrusted text"
+        );
+    }
+
+    /// A team agent may ask for tools (`request_tool` is in the team base); nothing else widens.
+    #[tokio::test]
+    async fn loadout_team_agent_may_call_request_tool_and_others_stay_denied() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::team::TEAM_MODE, None, None, None).await;
+        let app = test_router(state.clone());
+        let verdict = orchestrator_tool(&app, run_id, "request_tool", serde_json::json!({})).await;
+        assert_eq!(verdict.decision, "allow", "request_tool");
+
+        sqlx::query(
+            "INSERT INTO run_loadout (run_id, agent_id, team_id, tools, resolved_at)
+             VALUES (?, NULL, NULL, '[\"note_finding\"]', '2026-10-08T00:00:00Z')",
+        )
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        for tool in ["note_finding", "create_run"] {
+            let verdict = orchestrator_tool(&app, run_id, tool, serde_json::json!({})).await;
             assert_eq!(verdict.decision, "deny", "{tool}");
         }
     }
