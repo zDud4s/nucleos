@@ -606,7 +606,11 @@ pub struct ReadContextRequest {
 ///
 /// The run is the key's own, or the node named by `RUN_ID_HEADER` for a team key;
 /// `auth::loadout_admits` already checked that its `run_loadout` row lists `read_context`. The
-/// route sits in no fixed scope table, so an owner key or an unlisted run never reaches it.
+/// route sits in no fixed scope table: run and team-run keys reach it only through
+/// `auth::LOADOUT_ROUTES`, so a run whose `run_loadout` does not list `read_context` is refused.
+/// Full-control keys (`Scope::Control`, admin API tokens) are admitted everywhere by
+/// `auth::grants` and also reach it, naming the run by `RUN_ID_HEADER`; that grants them nothing
+/// they did not already have.
 pub async fn post_read_context(
     State(state): State<AppState>,
     axum::Extension(scope): axum::Extension<crate::auth::Scope>,
