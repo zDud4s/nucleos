@@ -3003,6 +3003,15 @@ export function answer(path: string, init?: RequestInit): unknown {
     if (splitQuery(path)[1].get("include_archived") !== "true") return NOTES_GRAPH;
     return { ...NOTES_GRAPH, notes: OWNER_NOTES } satisfies NotesGraph;
   }
+  /* One agent's or team's context files; the second is gone from disk, which is the case worth photographing. */
+  const contextRefs = /^\/context-refs\/(agent|team)\/([^/]+)$/.exec(path);
+  if (contextRefs !== null && init?.method === undefined) {
+    const [, kind, id] = contextRefs;
+    return [
+      { id: 1, owner_kind: kind, owner_id: id, path: "C:/Users/ana/AppData/Local/nucleos/files/brief.md", kind: "file", note: "the house style", created_at: ago(2 * DAY), state: "file" },
+      { id: 2, owner_kind: kind, owner_id: id, path: "C:/Users/ana/AppData/Local/nucleos/files/old-drafts", kind: "dir", note: null, created_at: ago(5 * DAY), state: "missing" },
+    ];
+  }
   if (path === "/knowledge") return KNOWLEDGE;
   if (path === "/capture-requests") return OPEN_CAPTURES;
   if (path === "/capture-requests?state=all") return OPEN_CAPTURES;

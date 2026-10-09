@@ -18,6 +18,7 @@ import {
   type Employment,
 } from "../data/agents";
 import { useTeams } from "../data/teams";
+import { ContextRefs } from "../context/ContextRefs";
 import { ScopedMemory } from "../brain/knowledge/ScopedMemory";
 import {
   Button,
@@ -827,6 +828,7 @@ function AgentEditor({
       </form>
       {update.isError && <SaveRefusal error={update.error} />}
 
+      <ContextRefs ownerKind="agent" ownerId={agent.id} />
       <ScopedMemory scopeKind="agent" scopeId={agent.id} />
 
       {/*
