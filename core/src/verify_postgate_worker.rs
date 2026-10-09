@@ -697,7 +697,7 @@ async fn revert_step(
 }
 
 /// Submits the revert of `merge_sha` to the vcs queue and stores its ticket. It goes in as the
-/// owner's standing order (`Origin::Human`): turning `revert_on_red` on is that order.
+/// owner's standing order (`Origin::Daemon`): turning `revert_on_red` on is that order.
 ///
 /// A request already queued for this culprit (a crash between the submit and the store of its
 /// ticket) is adopted instead of submitted again. Before the first submit the kill switch is read
@@ -746,8 +746,38 @@ async fn queue_revert(
     {
         return waiting();
     }
-    let still_on = crate::config::load_schedule_rules(executor.machine_root.as_deref(), project_id)
-        .is_ok_and(|rules| rules.revert_on_red);
+    let still_on =
+        match crate::config::load_schedule_rules(executor.machine_root.as_deref(), project_id) {
+            Ok(rules) => rules.revert_on_red,
+            Err(error) => {
+                // Unreadable is not "off": hold the revert and say so, so it goes ahead once the
+                // rules can be read again and the switch is still on.
+                let rules_path = crate::project_state::display_path(
+                    project_id,
+                    crate::project_state::AUTOPILOT_FILE,
+                );
+                let summary = format!(
+                    "post-merge gate on {target}: the revert of {} is held because {rules_path} \
+                     could not be read ({error}). Nothing was reverted yet; it goes ahead once \
+                     the rules can be read and revert_on_red is still on.",
+                    short(merge_sha),
+                    target = state.target
+                );
+                if let Err(error) = crate::feed::append(
+                    pool,
+                    Some(project_id),
+                    crate::verify_postgate::POSTGATE_RED_KIND,
+                    &summary,
+                    None,
+                    None,
+                )
+                .await
+                {
+                    tracing::warn!(%error, "postgate: cannot tell the owner the revert is held");
+                }
+                return waiting();
+            }
+        };
     if !still_on {
         let summary = format!(
             "post-merge gate on {target}: the revert of {} was NOT made because revert_on_red \
@@ -771,7 +801,7 @@ async fn queue_revert(
         merge_sha: sha,
         target,
     };
-    let request = match vcs::submit_declared(pool, &repo, &op, Origin::Human).await {
+    let request = match vcs::submit_declared(pool, &repo, &op, Origin::Daemon).await {
         Ok(id) => id,
         Err(error) => return Step::Failed(format!("cannot queue the revert: {error}")),
     };
@@ -797,12 +827,21 @@ async fn revert_failed(
     reason: String,
 ) -> Step {
     let summary = format!(
-        "post-merge gate on {target}: the revert of {} failed ({reason}). No correction branch \
-         was made; check {target} before acting.",
+        "post-merge gate on {target}: the revert of {}{} failed ({reason}). No correction \
+         branch was made; check {target} before acting.",
         short(merge_sha),
+        ticket_note(state),
         target = state.target
     );
     settle_failed_revert(pool, project_id, merge_sha, &summary, reason).await
+}
+
+/// ` (vcs request #N)` when the state holds the revert's ticket, nothing otherwise.
+fn ticket_note(state: &State) -> String {
+    state
+        .revert_request_id
+        .map(|id| format!(" (vcs request #{id})"))
+        .unwrap_or_default()
 }
 
 /// Clears the revert state of `merge_sha` and writes `summary` to the feed.
@@ -862,10 +901,7 @@ async fn fix_branch_step(
     let target = &state.target;
     match git_exec::prepare_fix_branch(project_root, revert_sha, &branch, deadline).await {
         Ok(_) => {
-            let ticket = state
-                .revert_request_id
-                .map(|id| format!(" (vcs request #{id})"))
-                .unwrap_or_default();
+            let ticket = ticket_note(state);
             let summary = format!(
                 "post-merge gate on {target}: reverted culprit {} as {}{ticket}; correction \
                  branch {branch} is ready and a correction run will open on it.",
@@ -884,9 +920,10 @@ async fn fix_branch_step(
         }
         Err(reason) => {
             let summary = format!(
-                "post-merge gate on {target}: the revert of {} is on {target} as {}, but the \
+                "post-merge gate on {target}: the revert of {}{} is on {target} as {}, but the \
                  correction branch {branch} was not created ({reason}).",
                 short(merge_sha),
+                ticket_note(state),
                 short(revert_sha)
             );
             settle_failed_revert(pool, project_id, merge_sha, &summary, reason).await
@@ -1028,7 +1065,7 @@ pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
                 let _ = crate::feed::append(
                     pool,
                     Some(&row.project_id),
-                    verify_postgate::POSTGATE_RED_KIND,
+                    crate::verify_postgate::POSTGATE_RED_KIND,
                     &format!("correction run {run_id} opened on {}", row.fix_branch),
                     Some(run_id),
                     None,
@@ -1055,7 +1092,7 @@ pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
                 let _ = crate::feed::append(
                     pool,
                     Some(&row.project_id),
-                    verify_postgate::POSTGATE_RED_KIND,
+                    crate::verify_postgate::POSTGATE_RED_KIND,
                     &format!(
                         "the correction run could not be opened: {error:?}; the work is on {}",
                         row.fix_branch
@@ -1790,7 +1827,7 @@ mod tests {
     }
 
     /// With the switch on, exactly one `revert` is queued for the culprit, by the daemon on the
-    /// owner's standing order (`human`, already `queued`), and the feed says what is about to be
+    /// owner's standing order (`daemon`, already `queued`), and the feed says what is about to be
     /// undone rather than "nothing was reverted".
     #[tokio::test]
     async fn with_the_revert_switch_on_a_culprit_queues_one_revert_and_the_feed_says_so() {
@@ -1813,7 +1850,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "exactly one request: {rows:?}");
         assert_eq!(rows[0].0, request);
         assert_eq!(rows[0].1, "revert");
-        assert_eq!(rows[0].2, "human");
+        assert_eq!(rows[0].2, "daemon");
         assert_eq!(rows[0].3, "queued");
         assert!(rows[0].4.contains(&c3), "the args name the culprit");
 
@@ -1897,6 +1934,52 @@ mod tests {
         assert_eq!(s.revert_merge_sha, None);
         assert_eq!(s.revert_request_id, None);
         assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c4);
+    }
+
+    /// F3-9: rules that cannot be read at the moment of the submit do not drop the revert as if the
+    /// switch were off. It is held (`Waiting`), nothing is queued, the feed says the rules could not
+    /// be read, and once they are readable again the revert goes ahead.
+    #[tokio::test]
+    async fn a_pending_revert_is_held_when_the_rules_cannot_be_read() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, c4) = confirmed_culprit(&f).await;
+
+        crate::project_state::write_for_test(
+            f._machine.path(),
+            "alpha",
+            crate::project_state::AUTOPILOT_FILE,
+            "gate_after_land: true\nrevert_on_red: [\n",
+        );
+        let state = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let step = revert_step(&f.ex, "alpha", &f.root, &state).await;
+        assert!(
+            matches!(step, Step::Waiting { ref sha } if *sha == c3),
+            "{step:?}"
+        );
+
+        assert!(queue_rows(&f.pool).await.is_empty(), "nothing is queued");
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.revert_merge_sha.as_deref(), Some(c3.as_str()));
+        let lines = feed_summaries(&f.pool).await;
+        let last = lines.last().expect("the owner is told");
+        assert!(last.contains("could not be read"), "{last}");
+        assert!(!last.contains("turned off"), "{last}");
+        assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c4);
+
+        crate::project_state::write_for_test(
+            f._machine.path(),
+            "alpha",
+            crate::project_state::AUTOPILOT_FILE,
+            REVERT_ON,
+        );
+        tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        assert_eq!(queue_rows(&f.pool).await.len(), 1);
     }
 
     /// A crash between the submit and the store of the ticket leaves a queued revert with no id in
@@ -2025,6 +2108,10 @@ mod tests {
         let last = lines.last().expect("the owner is told");
         assert!(last.contains("the revert conflicted"), "{last}");
         assert!(last.to_lowercase().contains("fail"), "{last}");
+        assert!(
+            last.contains(&format!("vcs request #{request}")),
+            "the line names the vcs request: {last}"
+        );
 
         assert_eq!(
             git_in(&f.root, &["branch", "--list", "fix/*"]),
