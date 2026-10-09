@@ -805,8 +805,14 @@ mod tests {
     use crate::job::ItemState;
     use crate::knowledge::{Context, Scope, Scored};
 
-    const BRIEFED_CONTEXTS: &[&str] =
-        &["assistant.rs", "council.rs", "job.rs", "runs.rs", "team.rs"];
+    const BRIEFED_CONTEXTS: &[&str] = &[
+        "assistant.rs",
+        "council.rs",
+        "job.rs",
+        "loadout.rs",
+        "runs.rs",
+        "team.rs",
+    ];
     const UNBRIEFED_LAUNCHERS: &[(&str, &str)] = &[(
         "map_intent.rs",
         "map derivation is deliberately unbriefed because it creates the map that later scopes briefing",
@@ -2050,18 +2056,20 @@ mod tests {
             .iter()
             .filter(|(name, source)| {
                 name != "brief.rs"
-                    && (source.contains("brief::of(") || source.contains("brief::for_prompt("))
+                    && (source.contains("brief::of(")
+                        || source.contains("brief::for_prompt(")
+                        || source.contains("loadout::resolve("))
             })
             .map(|(name, _)| name.clone())
             .collect::<BTreeSet<_>>();
         if let Some(file) = callers.difference(&expected).next() {
             panic!(
-                "{file} calls brief::of/brief::for_prompt but is absent from BRIEFED_CONTEXTS; add the context to the constant"
+                "{file} calls brief::of/brief::for_prompt/loadout::resolve but is absent from BRIEFED_CONTEXTS; add the context to the constant"
             );
         }
         if let Some(file) = expected.difference(&callers).next() {
             panic!(
-                "{file} is in BRIEFED_CONTEXTS but no longer calls brief::of/brief::for_prompt; remove the stale entry or restore briefing"
+                "{file} is in BRIEFED_CONTEXTS but no longer calls brief::of/brief::for_prompt/loadout::resolve; remove the stale entry or restore briefing"
             );
         }
 
@@ -2077,7 +2085,7 @@ mod tests {
         for file in &launchers {
             if !expected.contains(file) && !unbriefed.contains(file) {
                 panic!(
-                    "{file} builds a RunRequest and is in neither BRIEFED_CONTEXTS nor UNBRIEFED_LAUNCHERS: brief it through brief::for_prompt, or list it as unbriefed with the reason"
+                    "{file} builds a RunRequest and is in neither BRIEFED_CONTEXTS nor UNBRIEFED_LAUNCHERS: brief it through brief::for_prompt or loadout::resolve, or list it as unbriefed with the reason"
                 );
             }
         }
@@ -2093,7 +2101,7 @@ mod tests {
                 && (source.contains("knowledge::select(") || source.contains("knowledge::render("))
             {
                 panic!(
-                    "{file} produces a knowledge block outside brief.rs; route it through brief::of or brief::for_prompt"
+                    "{file} produces a knowledge block outside brief.rs; route it through brief::of, brief::for_prompt or loadout::resolve"
                 );
             }
             if file != "knowledge.rs"

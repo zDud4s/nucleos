@@ -89,6 +89,7 @@ pub use nucleos_base::join;
 pub mod judge;
 pub mod knowledge;
 pub mod land;
+pub mod loadout;
 pub mod local_agent;
 pub use nucleos_base::logging;
 pub mod machine_config;

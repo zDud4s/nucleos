@@ -3102,20 +3102,29 @@ async fn spawn_agent(
         crate::speed::Capacity::solo()
     });
 
-    // Section 6 gives department agents machine knowledge only. Append it to the prompt because
-    // state.runner may be Codex, and leave no trace because an agent turn is not an outcome (D15).
-    let prompt = match crate::brief::for_prompt(
+    // Spec 2026-10-08 section 6: a department agent reads the machine's knowledge, its team's and
+    // its own, and no project's. Append it to the prompt because state.runner may be Codex. Since
+    // R3 a team agent leaves a trace of what it was shown (this supersedes D15 for departments),
+    // so a later outcome can credit the rows that were in front of it.
+    let loadout = crate::loadout::resolve(
         &state.pool,
-        &crate::knowledge::Context::for_project(None),
-        &prompt,
-        "team",
+        &crate::loadout::LoadoutInput {
+            agent: Some(&agent.id),
+            team: Some(&run.team_id),
+            project: None,
+            job: None,
+            task_text: &prompt,
+            node: None,
+            files: &[],
+        },
     )
-    .await
-    .and_then(|briefing| briefing.block)
+    .await;
+    if let Some(brief) = loadout.brief.as_ref()
+        && let Err(error) = crate::brief::record(&state.pool, run_id, None, &brief.trace).await
     {
-        Some(block) => format!("{prompt}{block}"),
-        None => prompt,
-    };
+        tracing::warn!(team_run = %run.id, run_id, %error, "could not record what the team agent was shown");
+    }
+    let prompt = format!("{prompt}{}", loadout.block);
 
     let request = crate::runner::RunRequest {
         prompt,
@@ -7627,8 +7636,9 @@ mod tests {
         }
     }
 
+    /// R3 supersedes D15 here: a department agent's briefing is traced like any other run's.
     #[tokio::test]
-    async fn a_department_agent_is_told_what_the_house_knows_and_leaves_no_trace() {
+    async fn a_department_agent_is_told_what_the_house_knows_and_leaves_a_trace() {
         let (mut state, _root) = state_with_root().await;
         let runner = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
         state.runner = runner.clone();
@@ -7694,7 +7704,7 @@ mod tests {
                         .fetch_one(&state.pool)
                         .await
                         .unwrap();
-                assert_eq!(traces, 0);
+                assert_eq!(traces, 1, "R3: the one machine row it was shown is traced");
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -8036,6 +8046,77 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(decision.as_deref(), Some("rt_team"));
+    }
+
+    /// A team member reads its own memory and its team's, nobody else's, and the briefing leaves a
+    /// trace that names the rows it considered.
+    #[tokio::test]
+    async fn a_team_member_is_briefed_with_its_own_and_its_teams_memory_and_leaves_a_trace() {
+        let (mut state, _root) = state_with_root().await;
+        let fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        state.runner = fake.clone();
+        let run = team_run_for_member(&state, "tr-loadout").await;
+        let agent = crate::agent::Agent {
+            engine: "claude".to_owned(),
+            model: Some("claude-sonnet-5".to_owned()),
+            ..local_member("unused")
+        };
+
+        let mut ids = Vec::new();
+        for (scope_kind, scope_id, title) in [
+            ("agent", "researcher", "zanzibar researcher-note"),
+            ("team", "marketing", "zanzibar marketing-note"),
+            ("agent", "someone-else", "zanzibar someone-else-note"),
+            ("team", "sales", "zanzibar sales-note"),
+        ] {
+            let result = sqlx::query(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES ('semantic', ?, ?, 'owner', 'memory', ?, 'body', 'active',
+                         '2026-08-19T00:00:00+00:00')",
+            )
+            .bind(scope_kind)
+            .bind(scope_id)
+            .bind(title)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            ids.push(result.last_insert_rowid());
+        }
+        let (someone_else, sales) = (ids[2], ids[3]);
+
+        let (run_id, session_id) = open_run(&state, &run.id, "zanzibar", false).await.unwrap();
+        spawn_agent(&state, &run, &agent, run_id, session_id, "zanzibar".into()).await;
+        settled_run(&state, run_id).await;
+
+        let prompt = fake
+            .last_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the member's launch received a prompt");
+        assert!(prompt.contains("researcher-note"), "{prompt}");
+        assert!(prompt.contains("marketing-note"), "{prompt}");
+        assert!(!prompt.contains("someone-else-note"), "{prompt}");
+        assert!(!prompt.contains("sales-note"), "{prompt}");
+
+        let traced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_knowledge WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert!(traced > 0, "the briefing left no trace for the run");
+        for foreign in [someone_else, sales] {
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM run_knowledge WHERE run_id = ? AND knowledge_id = ?",
+            )
+            .bind(run_id)
+            .bind(foreign)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+            assert_eq!(rows, 0, "row {foreign} belongs to no link of this member");
+        }
     }
 
     /// A member whose factory has no local route fails carrying the refusal's OWN sentence.
