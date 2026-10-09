@@ -597,9 +597,11 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
         ));
     }
 
+    // One transaction: the team and its loadout rows go together or not at all.
+    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM team_members WHERE team_id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     // The alçada goes with the team it described. There is no equivalent worry about
     // `team_actions`: an action belongs to a RUN, and the check above already refuses to delete a
@@ -607,7 +609,7 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
     // actions, pending or otherwise.
     sqlx::query("DELETE FROM team_grants WHERE team_id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     // This team's own rules go with it — a rule that starts a department which no longer exists
     // fires at nothing, every window, for ever.
@@ -616,11 +618,11 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
            (SELECT id FROM team_triggers WHERE team_id = ?)",
     )
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM team_triggers WHERE team_id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     // Rules that fire ON this team are DISARMED and not deleted — the opposite treatment, for the
     // opposite reason. Such a rule still describes something its author wanted and has merely lost
@@ -632,15 +634,17 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
     )
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    crate::tool_loadout::delete_for_owner(&mut tx, "team", id).await?;
     let result = sqlx::query("DELETE FROM teams WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
         return Err(TeamError::NotFound);
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -8765,5 +8769,72 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refusal.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn loadout_deleting_a_team_removes_its_tools_and_events() {
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO agents
+                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
+             VALUES ('director', 'Director', 'plans', 'p', 'claude', NULL, 'mcp_only',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for id in ["marketing", "sales"] {
+            sqlx::query(
+                "INSERT INTO teams
+                     (id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
+                      created_at, updated_at)
+                 VALUES (?, ?, 'sell', 'director', 3, 2, NULL,
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mut rows = Vec::new();
+        for owner in ["marketing", "sales"] {
+            let row = sqlx::query(
+                "INSERT INTO loadout_tools (owner_kind, owner_id, tool, status, source, created_at)
+                 VALUES ('team', ?, 'web_read', 'active', 'owner', '2026-01-01T00:00:00Z')",
+            )
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            sqlx::query(
+                "INSERT INTO loadout_tool_events (tool_row_id, from_status, to_status, at)
+                 VALUES (?, NULL, 'active', '2026-01-01T00:00:00Z')",
+            )
+            .bind(row)
+            .execute(&pool)
+            .await
+            .unwrap();
+            rows.push(row);
+        }
+
+        delete(&pool, "marketing").await.unwrap();
+
+        let tools = "SELECT COUNT(*) FROM loadout_tools WHERE id = ?";
+        let events = "SELECT COUNT(*) FROM loadout_tool_events WHERE tool_row_id = ?";
+        for (sql, row, expected, what) in [
+            (tools, rows[0], 0_i64, "the deleted team's tool row stayed"),
+            (events, rows[0], 0, "the deleted team's events stayed"),
+            (tools, rows[1], 1, "another team's tool row went"),
+            (events, rows[1], 1, "another team's events went"),
+        ] {
+            let found: i64 = sqlx::query_scalar(sql)
+                .bind(row)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(found, expected, "{what}");
+        }
     }
 }

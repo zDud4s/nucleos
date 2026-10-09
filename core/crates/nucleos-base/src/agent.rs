@@ -265,13 +265,27 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), AgentError>
         return Err(AgentError::InUse);
     }
 
+    let mut tx = pool.begin().await?;
+    // Mirrors `tool_loadout::delete_for_owner` in the core, which this crate cannot call.
+    sqlx::query(
+        "DELETE FROM loadout_tool_events WHERE tool_row_id IN
+           (SELECT id FROM loadout_tools WHERE owner_kind = 'agent' AND owner_id = ?)",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM loadout_tools WHERE owner_kind = 'agent' AND owner_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     let result = sqlx::query("DELETE FROM agents WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
         return Err(AgentError::NotFound);
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -480,5 +494,51 @@ mod tests {
         let spare = create(&pool, request("analyst")).await.unwrap();
         team_with(&pool, &director.id, &member.id).await;
         delete(&pool, &spare.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loadout_deleting_an_agent_removes_its_tools_and_events() {
+        let pool = pool().await;
+        let gone = create(&pool, request("copywriter")).await.unwrap();
+        let kept = create(&pool, request("analyst")).await.unwrap();
+        let mut rows = Vec::new();
+        for owner in [&gone.id, &kept.id] {
+            let row = sqlx::query(
+                "INSERT INTO loadout_tools (owner_kind, owner_id, tool, status, source, created_at)
+                 VALUES ('agent', ?, 'web_read', 'active', 'owner', '2026-01-01T00:00:00Z')",
+            )
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            sqlx::query(
+                "INSERT INTO loadout_tool_events (tool_row_id, from_status, to_status, at)
+                 VALUES (?, NULL, 'active', '2026-01-01T00:00:00Z')",
+            )
+            .bind(row)
+            .execute(&pool)
+            .await
+            .unwrap();
+            rows.push(row);
+        }
+
+        delete(&pool, &gone.id).await.unwrap();
+
+        let tools = "SELECT COUNT(*) FROM loadout_tools WHERE id = ?";
+        let events = "SELECT COUNT(*) FROM loadout_tool_events WHERE tool_row_id = ?";
+        for (sql, row, expected, what) in [
+            (tools, rows[0], 0_i64, "the deleted agent's tool row stayed"),
+            (events, rows[0], 0, "the deleted agent's events stayed"),
+            (tools, rows[1], 1, "another agent's tool row went"),
+            (events, rows[1], 1, "another agent's events went"),
+        ] {
+            let found: i64 = sqlx::query_scalar(sql)
+                .bind(row)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(found, expected, "{what}");
+        }
     }
 }

@@ -162,6 +162,7 @@ pub mod test_select;
 pub use nucleos_base::testdb;
 pub use nucleos_base::tests_map;
 pub mod token_efficiency;
+pub mod tool_loadout;
 pub use nucleos_base::transcribe;
 pub mod triage;
 pub use nucleos_base::trust;

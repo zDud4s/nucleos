@@ -9,6 +9,8 @@ pub enum McpBox {
     /// An interactive (IDE/terminal) session's box: it serves `EVERY_BOX_TOOLS` and nothing else,
     /// and every call is held to this absolute worktree path. See `worktree_for_call`.
     Worktree(String),
+    /// A team agent's NODE run id; the box serves `TEAM_BASE` and `TEAM_EXTRAS`.
+    Team(i64),
 }
 
 pub struct NucleosTools {
@@ -333,6 +335,14 @@ struct FindingParams {
     fact: String,
     /// Concrete records that support the fact; the daemon validates their shape and existence.
     evidence: Vec<EvidenceRef>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+struct RequestToolParams {
+    /// The name of the one NucleOS tool you would like.
+    tool: String,
+    /// Why the work needs it.
+    reason: String,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -979,6 +989,19 @@ impl NucleosTools {
             .map(|evidence| serde_json::json!({"t": evidence.t, "id": evidence.id}))
             .collect();
         json_result(self.client.note_finding(&fact, &evidence).await)
+    }
+
+    #[tool(
+        description = "Ask the owner for ONE NucleOS tool that your box could serve but you were \
+                       not given. It is NOT granted now: nothing changes in this run, and at most \
+                       a later run gets it if the owner says yes. Name the tool and say what the \
+                       work needs it for. A refusal says why, in a sentence you can act on."
+    )]
+    async fn request_tool(
+        &self,
+        Parameters(RequestToolParams { tool, reason }): Parameters<RequestToolParams>,
+    ) -> String {
+        json_result(self.client.request_tool(&tool, &reason).await)
     }
 
     #[tool(
@@ -2071,8 +2094,79 @@ pub const JOB_NODE_TOOLS: &[&str] = &["note_finding", "verify", "verify_status"]
 /// these two are not a job node's privilege the way a finding is.
 pub const EVERY_BOX_TOOLS: &[&str] = &["verify", "verify_status"];
 
+/// What a team agent's box serves by default: today's `TEAM_TOOLS` plus the door that asks for more.
+pub const TEAM_BASE: &[&str] = &[
+    "get_email",
+    "get_email_queue",
+    "latest_models",
+    "list_files",
+    "propose_action",
+    "propose_teammate",
+    "read_team_file",
+    "report_to_owner",
+    "request_tool",
+    "send_team_note",
+    "suggest_model",
+    "web_read",
+    "web_search",
+];
+
+/// What a team agent's box may be granted on top of `TEAM_BASE`. Empty this phase, tool by tool:
+/// - every `Acts` tool is out (decisions.md 2026-08-16: the team surface stays read-only);
+/// - project reads, shadow reads, job tools, `get_council`/`list_*`, budget and kill are out by the
+///   teams design and pinned by tests;
+/// - `github_read` rides the owner's Control door (decisions 2026-08-20);
+/// - `browser_*` need a `project_id` a team lacks;
+/// - `verify`/`verify_status` need a worktree;
+/// - `vcs_ticket` needs a `vcs_request`;
+/// - `recall` is the first candidate once knowledge scoping is agent/team-aware.
+pub const TEAM_EXTRAS: &[&str] = &[];
+
+/// What a job node's box serves by default: today's `JOB_NODE_TOOLS` plus the request door.
+pub const JOB_NODE_BASE: &[&str] = &["note_finding", "request_tool", "verify", "verify_status"];
+
+/// What a job node's box may be granted on top of `JOB_NODE_BASE`. `web_read` is `ReadsUntrusted`
+/// and needs no human-approval path.
+pub const JOB_NODE_EXTRAS: &[&str] = &["web_read"];
+
+/// Names only the narrowed boxes serve; the unboxed server never announces them.
+pub const BOX_ONLY_TOOLS: &[&str] = &["request_tool"];
+
+/// Where a tool stands against one box's loadout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Base,
+    Extra,
+    Outside,
+}
+
+/// Sorts one tool into the base, the extras, or outside the loadout. Pure.
+pub fn box_admission(base: &[&str], extras: &[&str], tool: &str) -> Admission {
+    if base.contains(&tool) {
+        Admission::Base
+    } else if extras.contains(&tool) {
+        Admission::Extra
+    } else {
+        Admission::Outside
+    }
+}
+
+/// The base and extras of a box that has a loadout; `None` for the boxes that have none.
+pub fn box_lists(served: &McpBox) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    match served {
+        McpBox::Team(_) => Some((TEAM_BASE, TEAM_EXTRAS)),
+        McpBox::JobNode(_) => Some((JOB_NODE_BASE, JOB_NODE_EXTRAS)),
+        McpBox::All | McpBox::Worktree(_) => None,
+    }
+}
+
+/// Whether a name is one of NucleOS's own tools (as opposed to a CLI builtin or a foreign one).
+pub fn is_nucleos_tool(name: &str) -> bool {
+    TOOL_EFFECTS.iter().any(|(tool, _)| *tool == name)
+}
+
 /// Whether a box announces and dispatches one name. `McpBox::All` is the whole server except the
-/// named job-node tools that `EVERY_BOX_TOOLS` does not give back.
+/// named job-node tools that `EVERY_BOX_TOOLS` does not give back, and the box-only tools.
 ///
 /// Lifted out of `NucleosTools::serves` when a second caller appeared that has no instance to ask:
 /// `advertised_schema_chars` prices what a box WOULD announce, from a launch site that never builds
@@ -2081,8 +2175,15 @@ pub const EVERY_BOX_TOOLS: &[&str] = &["verify", "verify_status"];
 /// way to observe the other.
 fn served_in_box(served: &McpBox, tool: &str) -> bool {
     match served {
-        McpBox::All => !JOB_NODE_TOOLS.contains(&tool) || EVERY_BOX_TOOLS.contains(&tool),
+        McpBox::All => {
+            (!JOB_NODE_TOOLS.contains(&tool) || EVERY_BOX_TOOLS.contains(&tool))
+                && !BOX_ONLY_TOOLS.contains(&tool)
+        }
+        // The job-node box keeps today's tools until wave B1 writes each run's `run_loadout`; the
+        // hook and the routes already admit `JOB_NODE_BASE` plus `JOB_NODE_EXTRAS` from that row, and
+        // B1 widens this arm to them.
         McpBox::JobNode(_) => JOB_NODE_TOOLS.contains(&tool),
+        McpBox::Team(_) => TEAM_BASE.contains(&tool) || TEAM_EXTRAS.contains(&tool),
         McpBox::Worktree(_) => EVERY_BOX_TOOLS.contains(&tool),
     }
 }
@@ -2434,6 +2535,8 @@ const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // there is no context for a stranger's words to be laundered INTO. That is what makes this a
     // report rather than a relay, and it is why `send_to_chat` one line down keeps its `Acts`.
     ("report_to_owner", ToolEffect::WritesOwn),
+    // It writes a proposal row the owner decides; it grants nothing and reaches nothing outside.
+    ("request_tool", ToolEffect::WritesOwn),
     // `WritesOwn` and NOT `Acts`, and the line below it is the reason the two differ. Both put words
     // in front of a model that did not write them; what separates them is what that model can then
     // do. `send_to_chat` lands in a conversation a PERSON reads, whose next turn holds the whole
@@ -3048,6 +3151,13 @@ pub fn box_from_args(args: &[String]) -> Result<McpBox, String> {
                 .map(McpBox::JobNode)
                 .map_err(|error| format!("--job {id} is not a job id: {error}"))
         }
+        "team" => {
+            let id = flag_value(args, "--run")
+                .ok_or_else(|| "--box team needs --run <id> to say which run".to_owned())?;
+            id.parse::<i64>()
+                .map(McpBox::Team)
+                .map_err(|error| format!("--run {id} is not a run id: {error}"))
+        }
         "worktree" => {
             let path = flag_value(args, "--worktree").ok_or_else(|| {
                 "--box worktree needs --worktree <absolute path> to say which worktree".to_owned()
@@ -3061,7 +3171,7 @@ pub fn box_from_args(args: &[String]) -> Result<McpBox, String> {
             }
         }
         _ => Err(format!(
-            "--box {kind} is not a box this server knows; the boxes are `job-node` and `worktree`"
+            "--box {kind} is not a box this server knows; the boxes are `job-node`, `team` and `worktree`"
         )),
     }
 }
@@ -3130,6 +3240,136 @@ mod tests {
         }
     }
 
+    /// The new loadout lists: bases extend today's lists by the box-only door, extras are
+    /// disjoint from the base and never act.
+    #[test]
+    fn loadout_bases_extend_todays_lists_and_extras_are_disjoint_and_never_act() {
+        for name in TEAM_TOOLS {
+            assert!(TEAM_BASE.contains(name), "{name} left TEAM_BASE");
+        }
+        let mut team_added: Vec<&str> = TEAM_BASE
+            .iter()
+            .copied()
+            .filter(|n| !TEAM_TOOLS.contains(n))
+            .collect();
+        team_added.sort_unstable();
+        assert_eq!(team_added, ["request_tool"]);
+
+        for name in JOB_NODE_TOOLS {
+            assert!(JOB_NODE_BASE.contains(name), "{name} left JOB_NODE_BASE");
+        }
+        let mut job_added: Vec<&str> = JOB_NODE_BASE
+            .iter()
+            .copied()
+            .filter(|n| !JOB_NODE_TOOLS.contains(n))
+            .collect();
+        job_added.sort_unstable();
+        assert_eq!(job_added, ["request_tool"]);
+
+        for (base, extras) in [(TEAM_BASE, TEAM_EXTRAS), (JOB_NODE_BASE, JOB_NODE_EXTRAS)] {
+            for extra in extras {
+                assert!(!base.contains(extra), "{extra} is both base and extra");
+                assert_ne!(
+                    tool_effect(extra),
+                    ToolEffect::Acts,
+                    "extra {extra} acts, and an extra is granted by a person's click"
+                );
+            }
+            for name in base.iter().chain(extras) {
+                assert!(is_nucleos_tool(name), "{name} is not a NucleOS tool");
+            }
+        }
+    }
+
+    /// A team agent is offered exactly its base and its extras.
+    #[test]
+    fn loadout_team_box_serves_base_and_extras_only() {
+        for (name, _) in TOOL_EFFECTS {
+            assert_eq!(
+                served_in_box(&McpBox::Team(1), name),
+                TEAM_BASE.contains(name) || TEAM_EXTRAS.contains(name),
+                "the team box classified {name} incorrectly"
+            );
+        }
+    }
+
+    /// The job-node box keeps today's surface until wave B1 writes each run's loadout; the hook
+    /// and the routes already admit `JOB_NODE_BASE` plus `JOB_NODE_EXTRAS` from `run_loadout`.
+    #[test]
+    fn loadout_job_node_box_stays_as_today_until_its_loadout_is_written() {
+        assert!(!served_in_box(&McpBox::JobNode(1), "request_tool"));
+        assert!(!served_in_box(&McpBox::JobNode(1), "web_read"));
+        for (name, _) in TOOL_EFFECTS {
+            assert_eq!(
+                served_in_box(&McpBox::JobNode(1), name),
+                JOB_NODE_TOOLS.contains(name),
+                "the job-node box classified {name} incorrectly"
+            );
+        }
+    }
+
+    /// `request_tool` only makes sense inside a box; the unboxed server loses it and nothing else.
+    #[test]
+    fn loadout_unboxed_server_never_serves_request_tool_and_keeps_every_other_name() {
+        assert!(!served_in_box(&McpBox::All, "request_tool"));
+        assert!(served_in_box(&McpBox::All, "web_read"));
+        for (name, _) in TOOL_EFFECTS {
+            assert_eq!(
+                served_in_box(&McpBox::All, name),
+                (!JOB_NODE_TOOLS.contains(name) || EVERY_BOX_TOOLS.contains(name))
+                    && !BOX_ONLY_TOOLS.contains(name),
+                "the unboxed server classified {name} incorrectly"
+            );
+        }
+    }
+
+    /// `--box team --run <id>` names the team agent's node run; nothing is guessed.
+    #[test]
+    fn loadout_team_box_is_read_from_the_launch_arguments() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            box_from_args(&args(&["--mcp-tools", "--box", "team", "--run", "42"])),
+            Ok(McpBox::Team(42))
+        );
+        assert!(box_from_args(&args(&["--box", "team"])).is_err());
+        assert!(box_from_args(&args(&["--box", "team", "--run", "abc"])).is_err());
+    }
+
+    /// The request door writes only into NucleOS's own state, and it is registered.
+    #[test]
+    fn loadout_request_tool_is_writes_own() {
+        assert_eq!(tool_effect("request_tool"), ToolEffect::WritesOwn);
+        assert!(every_tool_name().iter().any(|n| n == "request_tool"));
+    }
+
+    /// Admission sorts a tool into the base, the extras, or outside the loadout.
+    #[test]
+    fn loadout_box_admission_separates_base_extra_and_outside() {
+        assert_eq!(
+            box_admission(JOB_NODE_BASE, JOB_NODE_EXTRAS, "verify"),
+            Admission::Base
+        );
+        assert_eq!(
+            box_admission(JOB_NODE_BASE, JOB_NODE_EXTRAS, "web_read"),
+            Admission::Extra
+        );
+        assert_eq!(
+            box_admission(JOB_NODE_BASE, JOB_NODE_EXTRAS, "create_run"),
+            Admission::Outside
+        );
+        assert_eq!(box_lists(&McpBox::All), None);
+        assert_eq!(box_lists(&McpBox::Team(1)), Some((TEAM_BASE, TEAM_EXTRAS)));
+        assert_eq!(
+            box_lists(&McpBox::JobNode(1)),
+            Some((JOB_NODE_BASE, JOB_NODE_EXTRAS))
+        );
+    }
+
     /// A tool that can only be answered inside a job would answer "no job" to the cloud assistant
     /// and council, which is worse than never offering it; every other name remains unboxed.
     #[test]
@@ -3145,7 +3385,8 @@ mod tests {
         {
             assert_eq!(
                 served_in_box(&McpBox::All, name),
-                !JOB_NODE_TOOLS.contains(&name) || EVERY_BOX_TOOLS.contains(&name),
+                (!JOB_NODE_TOOLS.contains(&name) || EVERY_BOX_TOOLS.contains(&name))
+                    && !BOX_ONLY_TOOLS.contains(&name),
                 "the unboxed server classified {name} incorrectly"
             );
         }
@@ -3905,6 +4146,7 @@ mod tests {
                 "recall",
                 "reject_proposal",
                 "report_to_owner",
+                "request_tool",
                 // The pair a reader will want to tell apart, and they are next to each other by
                 // accident of the alphabet rather than by kinship. `send_team_note` is
                 // `WritesOwn` and reaches another node of the caller's own department;
@@ -5328,6 +5570,11 @@ mod tests {
                 .iter()
                 .any(|name| name == "note_finding")
         );
+        assert!(
+            !advertised(&unboxed)
+                .iter()
+                .any(|name| name == "request_tool")
+        );
     }
 
     #[tokio::test]
@@ -5661,8 +5908,9 @@ mod tests {
             .list_all()
             .into_iter()
             .filter(|tool| {
-                !JOB_NODE_TOOLS.contains(&tool.name.as_ref())
-                    || EVERY_BOX_TOOLS.contains(&tool.name.as_ref())
+                (!JOB_NODE_TOOLS.contains(&tool.name.as_ref())
+                    || EVERY_BOX_TOOLS.contains(&tool.name.as_ref()))
+                    && !BOX_ONLY_TOOLS.contains(&tool.name.as_ref())
             })
             .map(|tool| tool.name.into_owned())
             .collect();
