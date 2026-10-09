@@ -1916,6 +1916,7 @@ async fn main() {
         std::sync::Arc::new(git_exec::GitExecutor {
             machine_root: machine_config_root.clone(),
             pool: Some(state.pool.clone()),
+            verify: verify::installed(),
             ..git_exec::GitExecutor::default()
         }),
     ));
