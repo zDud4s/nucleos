@@ -435,7 +435,7 @@ pub struct RunRequest {
     /// Only read when `mcp_config` is `Some`, because that is the only branch that writes
     /// `--allowedTools` at all. A narrowing passed without an MCP config narrows nothing, which is
     /// the harmless direction.
-    pub allowed_mcp_tools: Option<&'static [&'static str]>,
+    pub allowed_mcp_tools: Option<Vec<String>>,
     /// Keep background tasks even though nothing can wake this run once its turn ends.
     ///
     /// Set by chat turns only: a person is watching, and a task that dies with the turn is still
@@ -855,7 +855,7 @@ pub fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
         args.push("--mcp-config".to_string());
         args.push(path.to_string_lossy().into_owned());
         args.push("--allowedTools".to_string());
-        args.push(match request.allowed_mcp_tools {
+        args.push(match &request.allowed_mcp_tools {
             None => "mcp__nucleos__*".to_string(),
             Some(names) => names
                 .iter()
@@ -4058,11 +4058,7 @@ pub struct Launch {
 /// The test double for `CommandRunner`. `#[cfg(test)]` because every user of it is a test — building
 /// it into the daemon would ship a runner that can fake a run's outcome.
 #[cfg(any(test, feature = "testkit"))]
-pub type JobMcpLaunch = (
-    Option<std::path::PathBuf>,
-    Option<i64>,
-    Option<&'static [&'static str]>,
-);
+pub type JobMcpLaunch = (Option<std::path::PathBuf>, Option<i64>, Option<Vec<String>>);
 
 #[cfg(any(test, feature = "testkit"))]
 #[derive(Default)]
@@ -4393,7 +4389,7 @@ impl CommandRunner for FakeCommandRunner {
         *self.last_job_mcp.lock().unwrap() = Some((
             request.mcp_config.clone(),
             request.mcp_job,
-            request.allowed_mcp_tools,
+            request.allowed_mcp_tools.clone(),
         ));
         *self.last_tool_policy.lock().unwrap() = Some(request.tool_policy);
         *self.last_session_id.lock().unwrap() = request.session_id.clone();
@@ -5199,7 +5195,8 @@ mod tests {
         let flag = wide.windows(2).find(|w| w[0] == "--allowedTools").unwrap();
         assert_eq!(flag[1], "mcp__nucleos__*");
 
-        request.allowed_mcp_tools = Some(&["list_files", "read_team_file"]);
+        request.allowed_mcp_tools =
+            Some(vec!["list_files".to_owned(), "read_team_file".to_owned()]);
         let narrow = cli_args(&request, "claude-sonnet-5");
         let flag = narrow
             .windows(2)
@@ -5221,7 +5218,7 @@ mod tests {
     #[test]
     fn narrowing_a_request_with_no_mcp_server_adds_no_flag() {
         let mut request = baseline_run_request();
-        request.allowed_mcp_tools = Some(&["list_files"]);
+        request.allowed_mcp_tools = Some(vec!["list_files".to_owned()]);
         assert!(
             !cli_args(&request, "claude-sonnet-5")
                 .iter()
@@ -7705,7 +7702,12 @@ mod tests {
     fn a_job_node_request_allows_exactly_the_finding_and_verify_tools() {
         let mut request = baseline_run_request();
         request.mcp_config = Some(PathBuf::from("C:/tmp/job-node.json"));
-        request.allowed_mcp_tools = Some(crate::mcp_tools::JOB_NODE_TOOLS);
+        request.allowed_mcp_tools = Some(
+            crate::mcp_tools::JOB_NODE_TOOLS
+                .iter()
+                .map(|tool| (*tool).to_owned())
+                .collect(),
+        );
 
         let args = cli_args(&request, "claude-sonnet-5");
         let allowed = args

@@ -426,8 +426,10 @@ pub async fn post_search(
 /// receive a stranger's prose UNQUARANTINED: `trust::decide` returns `Raw` only to
 /// `Requester::Owner`. That is the exact laundering the teams design classifies `read_team_file` as
 /// `ReadsUntrusted` to prevent, walking in through the side door.
+///
+/// A run key reaches `/web/read` only through a loadout, and its reads are never the owner's.
 fn requester_for(scope: &Scope, owner_is_present: bool) -> Requester {
-    if matches!(scope, Scope::TeamRun(_)) {
+    if matches!(scope, Scope::TeamRun(_) | Scope::Run(_)) {
         return Requester::Autonomous;
     }
     if owner_is_present {
@@ -772,7 +774,6 @@ mod tests {
     fn every_other_scope_still_asks_whether_the_owner_is_present() {
         for scope in [
             Scope::Control,
-            Scope::Run(7),
             Scope::Service(crate::auth::Service::Email),
             Scope::ApiToken(ApiTokenLevel::Admin),
         ] {
@@ -787,6 +788,15 @@ mod tests {
                 "{scope:?} with nobody there is autonomous"
             );
         }
+    }
+
+    /// A run that holds `web_read` through its loadout is an agent, not the person at the screen:
+    /// it must never be handed raw prose because the owner happens to be present.
+    #[test]
+    fn loadout_a_run_key_never_reads_the_web_as_the_owner() {
+        let run = Scope::Run(3);
+        assert_eq!(requester_for(&run, true), Requester::Autonomous);
+        assert_eq!(requester_for(&run, false), Requester::Autonomous);
     }
 
     fn now() -> chrono::DateTime<chrono::Utc> {

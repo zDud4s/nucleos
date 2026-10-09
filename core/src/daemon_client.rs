@@ -636,6 +636,53 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
+    /// Ask the owner for one NucleOS tool this box can serve but was not given.
+    ///
+    /// The run is not an argument: `request` sets the run header, so a run can only ask for itself.
+    /// A refusal is read back as the error text, the way `declare_refinement` does, because it says
+    /// why.
+    pub async fn request_tool(&self, tool: &str, reason: &str) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/loadout/tool-requests")
+            .json(&serde_json::json!({ "tool": tool, "reason": reason }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+
+    /// Read one context file the calling run was given.
+    ///
+    /// The run is not an argument: `request` sets the run header, so a run can only read the refs
+    /// of its own loadout. A refusal is read back as the error text because it says why.
+    pub async fn read_context(&self, path: &str) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/context/read")
+            .json(&serde_json::json!({ "path": path }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+
     // The browser pillar's five agent verbs (spec §6.1).
     //
     // # What is NOT here, and why each absence is load-bearing
