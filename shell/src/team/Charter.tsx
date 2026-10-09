@@ -322,6 +322,16 @@ function TeamForm({
 
   const shared = (teams.data ?? []).filter((other) => other.id !== existing?.id);
 
+  // Every agent that exists, plus any ticked member the catalogue no longer has, so a stale
+  // member can still be unticked rather than silently riding along in the request.
+  const known = agents.data ?? [];
+  const members = [
+    ...known.map((agent) => ({ id: agent.id, name: agent.name, speciality: agent.speciality })),
+    ...form.members
+      .filter((id) => !known.some((agent) => agent.id === id))
+      .map((id) => ({ id, name: id, speciality: "no longer in the catalogue" })),
+  ];
+
   return (
     <form
       id={dialog?.formId}
@@ -334,19 +344,21 @@ function TeamForm({
       <Section
         flat={dialog !== undefined}
         title="Identity"
-        note="The id is slugged from the first name this team ever had, and renaming never changes it."
+        note="Renaming a team later is safe: it keeps its link and its history."
       >
-        <Field label="Name">
+        <Field label="Name" required>
           <input
             className="teams-input"
+            aria-required="true"
             value={form.name}
             onChange={(event) => edit("name", { name: event.target.value })}
           />
         </Field>
-        <Field label="Mission">
+        <Field label="Mission" required>
           <textarea
             className="teams-textarea"
             rows={2}
+            aria-required="true"
             value={form.mission}
             onChange={(event) => edit("mission", { mission: event.target.value })}
           />
@@ -356,11 +368,12 @@ function TeamForm({
       <Section
         flat={dialog !== undefined}
         title="Leadership"
-        note="A director that has been deleted is why a task refuses to start — the daemon names it in the refusal."
+        note="The director plans each task and hands out the work. Without one, this team cannot start a task."
       >
-        <Field label="Director">
+        <Field label="Director" required>
           <select
             className="teams-select"
+            aria-required="true"
             value={form.directorAgentId}
             onChange={(event) => edit("directorAgentId", { directorAgentId: event.target.value })}
           >
@@ -377,27 +390,38 @@ function TeamForm({
       <Section
         flat={dialog !== undefined}
         title="Staff"
-        note="Sent whole on every save. A specialist can serve several teams — where else they serve is shown beside each one."
+        note="Who this team can give work to. A specialist can serve several teams — where else they work is shown below. Saving replaces the whole roster with what is ticked."
       >
-        <Field label="Members">
-          <select
-            className="teams-select"
-            multiple
-            aria-label="Members"
-            value={form.members}
-            onChange={(event) =>
-              edit("members", {
-                members: Array.from(event.target.selectedOptions, (option) => option.value),
-              })
-            }
-          >
-            {(agents.data ?? []).map((agent) => (
-              <option key={agent.id} value={agent.id}>
-                {agent.name}
-              </option>
-            ))}
-          </select>
-        </Field>
+        <fieldset className="teams-members">
+          <legend className="teams-label">Members</legend>
+          {members.length === 0 ? (
+            <p className="teams-note">No specialists exist yet — hire one on the Agents page first.</p>
+          ) : (
+            <ul className="teams-check-list">
+              {members.map((agent) => (
+                <li key={agent.id}>
+                  <label className="teams-check">
+                    <input
+                      type="checkbox"
+                      checked={form.members.includes(agent.id)}
+                      onChange={(event) =>
+                        edit("members", {
+                          members: event.target.checked
+                            ? [...form.members, agent.id]
+                            : form.members.filter((id) => id !== agent.id),
+                        })
+                      }
+                    />
+                    <span className="teams-check-name">{agent.name}</span>
+                    {agent.speciality !== "" && (
+                      <span className="teams-check-note">{agent.speciality}</span>
+                    )}
+                  </label>
+                </li>
+              ))}
+            </ul>
+          )}
+        </fieldset>
         {form.members.length > 0 && (
           <div className="teams-charter-people">
             {form.members.map((id) => {
@@ -421,7 +445,7 @@ function TeamForm({
       <Section
         flat={dialog !== undefined}
         title="Powers"
-        note="What it may do without asking. The absence of a row IS the refusal — there is no deny."
+        note="What this team may do without asking you. Does it: acts on its own. Asks first: drafts it and waits for your OK. Asks you: cannot act, you do it."
       >
         <Grants grants={form.grants} onChange={(grants) => edit("grants", { grants })} />
       </Section>
@@ -429,9 +453,9 @@ function TeamForm({
       <Section
         flat={dialog !== undefined}
         title="Limits"
-        note="Two different kinds. One has something in it right now; the other applies to each task, from zero, every time."
+        note="Some limits cap how much the team does at once; the others cap what each single task may use, counting from zero every time."
       >
-        <p className="teams-charter-label">Occupancy</p>
+        <p className="teams-charter-label">At once</p>
         <div className="teams-charter-limits">
           <Field label="Max live runs (1-4)">
             <input
@@ -529,7 +553,7 @@ function TeamForm({
       {unreadable && (
         <ErrorNote>
           the núcleo did not answer when this form asked what the team looks like now — nothing
-          was sent, because saving is a full replace and there was nothing to compare against
+          was saved, so nothing of theirs could be overwritten by mistake
         </ErrorNote>
       )}
 
@@ -637,22 +661,44 @@ function Section({
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({
+  label,
+  required = false,
+  children,
+}: {
+  label: string;
+  required?: boolean;
+  children: React.ReactNode;
+}) {
   return (
     <label className="teams-field">
-      <span className="teams-label">{label}</span>
+      <span className="teams-label">
+        {label}
+        {required && <span className="teams-required"> · required</span>}
+      </span>
       {children}
     </label>
   );
 }
 
 /**
+ * The human name of each grantable kind, shared with the console so the table and the dialog say
+ * the same thing. The identifier the daemon uses stays visible, muted, beside it in the dialog.
+ */
+export const POWER_LABEL: Record<(typeof GRANTABLE_ACTIONS)[number], string> = {
+  calendar_event: "Calendar",
+  file_document: "Documents",
+  send_email: "Email",
+};
+
+/**
  * One row per grantable action, three states: nothing / asks first / does it.
  *
  * The absence of a grant row IS the denial — there is no `deny` mode
  * (`core/src/team.rs:375`). `propose` reads "asks first", `allow` reads "does
- * it", and nothing at all is the third, which is why the empty option is
- * spelled out rather than being a blank line at the top of the list.
+ * it", and nothing at all is "asks you", the same three words the console's
+ * table uses, which is why the empty option is spelled out rather than being a
+ * blank line at the top of the list.
  */
 function Grants({ grants, onChange }: { grants: TeamGrant[]; onChange: (grants: TeamGrant[]) => void }) {
   return (
@@ -661,10 +707,13 @@ function Grants({ grants, onChange }: { grants: TeamGrant[]; onChange: (grants: 
         const current = grants.find((grant) => grant.kind === kind)?.mode ?? "";
         return (
           <li className="teams-grant" key={kind}>
-            <span className="teams-grant-name">{kind}</span>
+            <span className="teams-grant-label">
+              {POWER_LABEL[kind]}
+              <span className="teams-grant-ident">{kind}</span>
+            </span>
             <select
               className="teams-select teams-grant-modes"
-              aria-label={`${kind} grant`}
+              aria-label={`${POWER_LABEL[kind]} grant`}
               value={current}
               onChange={(event) => {
                 const value = event.target.value;
@@ -672,7 +721,7 @@ function Grants({ grants, onChange }: { grants: TeamGrant[]; onChange: (grants: 
                 onChange(value === "" ? rest : [...rest, { kind, mode: value }]);
               }}
             >
-              <option value="">nothing — it asks you</option>
+              <option value="">asks you</option>
               {GRANT_MODES.map((mode) => (
                 <option key={mode} value={mode}>
                   {mode === "propose" ? "asks first" : "does it"}

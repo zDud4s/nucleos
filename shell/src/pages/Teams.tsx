@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
-import { NewDepartment } from "../team/Charter";
+import { NewDepartment, POWER_LABEL } from "../team/Charter";
 import { RosterMatrix, headcountOf, specialistsOf } from "../team/RosterMatrix";
 import {
   GRANTABLE_ACTIONS,
@@ -36,6 +36,7 @@ import {
 import "./teams.css";
 
 const NEW_TEAM_FORM = "new-team-form";
+const CREATE_WHY = "new-team-why";
 
 /**
  * Teams — the console. `/teams` and nothing else; `/teams/$teamId` is the bench
@@ -108,7 +109,12 @@ export function Teams() {
         title="Teams"
         headline={headlineFor(rows, allRuns, openActions, teams.data !== undefined)}
         actions={
-          <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog">
+          <Button
+            variant="approve"
+            intent="create"
+            onClick={() => setCreating(true)}
+            aria-haspopup="dialog"
+          >
             New team
           </Button>
         }
@@ -127,11 +133,18 @@ export function Teams() {
         size="md"
         footer={
           <>
+            {/* Why the button below is unavailable, said where the eye already is. */}
+            {!formState.canSubmit && (
+              <p className="teams-foot-why" id={CREATE_WHY}>
+                Name the team, say what it is for and choose a director to continue.
+              </p>
+            )}
             <Button onClick={() => setCreating(false)}>Cancel</Button>
             <Button
               type="submit"
               form={NEW_TEAM_FORM}
-              intent="go"
+              intent="create"
+              aria-describedby={formState.canSubmit ? undefined : CREATE_WHY}
               disabled={!formState.canSubmit || formState.busy}
             >
               {formState.busy ? "Creating…" : "Create team"}
@@ -155,7 +168,9 @@ export function Teams() {
           </p>
         </Teach>
       ) : (
-        <>
+        // One column with one gap, so the strip, the table and the matrix never butt against
+        // each other and no block carries its own margin to make room.
+        <div className="teams-console">
           <InFlight teams={rows} runs={allRuns} />
           <DepartmentTable
             teams={rows}
@@ -166,7 +181,7 @@ export function Teams() {
           <Panel title="Who works where">
             <RosterMatrix teams={rows} />
           </Panel>
-        </>
+        </div>
       )}
     </>
   );
@@ -242,9 +257,8 @@ function InFlight({ teams, runs }: { teams: TeamView[]; runs: TeamRun[] }) {
 
   return (
     <section className="teams-flight" aria-label="In flight">
-      <h2 className="teams-flight-title">
-        In flight <span className="teams-flight-count">{live.length}</span>
-      </h2>
+      {/* No count here: the headline above already says how many are at work. */}
+      <h2 className="teams-flight-title">In flight</h2>
       <ul className="ui-rows teams-flight-list">
         {live.map((run) => (
           <li key={run.id} className="ui-rows-row">
@@ -287,10 +301,13 @@ function LiveTask({ run, team }: { run: TeamRun; team: TeamView | null }) {
         <Link className="teams-task-what" to={`/team-runs/${run.id}`}>
           {run.request}
         </Link>
-        <StateBadge domain="team_run" state={run.state} />
+        {/* The department's own word, "at work", as in the table and the headline; the
+            task's phase (planning, delivering) moves to the line below as plain text. */}
+        <StateBadge domain="department" state="working" />
       </div>
       <p className="teams-task-when">
-        round {run.round} · started <RelativeTime at={run.created_at} />
+        {run.state === "working" ? "" : `${run.state} · `}round {run.round} · started{" "}
+        <RelativeTime at={run.created_at} />
       </p>
       {detail.data === undefined ? (
         <Quiet says="reading what it has spent…" />
@@ -333,7 +350,26 @@ function DepartmentTable({
   actions: TeamAction[];
 }) {
   return (
-    <div className="teams-table-scroller">
+    <section className="teams-table-block" aria-label="Teams">
+      {/* The key to the marks, out of the header cell and above the table, where it reads as a
+          sentence instead of squatting under a column title. */}
+      <ul className="teams-key" aria-label="What the marks mean">
+        <li className="teams-key-title">On its own:</li>
+        <li className="teams-key-item">
+          <Mark mode="allow" /> does it
+        </li>
+        <li className="teams-key-item">
+          <Mark mode="propose" /> asks first
+        </li>
+        <li className="teams-key-item">
+          <Mark mode="none" /> asks you
+        </li>
+        <li className="teams-key-item">
+          <Mark mode="rule" /> routines armed
+        </li>
+        <li className="teams-key-item teams-key-pulse">Pulse: a bar per day with runs, newest on the right</li>
+      </ul>
+      <div className="teams-table-scroller">
       <table className="teams-table">
         <caption className="sr-only">Every team, with what it is doing now</caption>
         <thead>
@@ -349,14 +385,11 @@ function DepartmentTable({
             <th scope="col" className="teams-col-num">
               Waiting
             </th>
-            <th scope="col">
-              On its own<span className="teams-col-key">● does it · ◐ asks first · ○ asks you · ◆ routines armed</span>
-            </th>
-            {/* What the marks are, said once in the header rather than nowhere. A pulse
-                with no key is a shape a reader has to guess the unit of; the guess is
-                free to be wrong and nothing on the page corrects it. */}
-            <th scope="col">
-              Pulse<span className="teams-col-key">per day</span>
+            <th scope="col">On its own</th>
+            {/* Right-aligned because the bars are flushed right: a left-aligned title over
+                bars hugging the other edge reads as two columns. The unit is in the key above. */}
+            <th scope="col" className="teams-col-pulse">
+              Pulse
             </th>
           </tr>
         </thead>
@@ -372,7 +405,8 @@ function DepartmentTable({
           ))}
         </tbody>
       </table>
-    </div>
+      </div>
+    </section>
   );
 }
 
@@ -392,12 +426,16 @@ function DepartmentRow({
   return (
     <tr>
       <th scope="row" className="teams-row-name">
+        {/* The link's `::after` is stretched over this cell, so the whole name cell is the
+            target and the pointer says so. */}
         <Link to={`/teams/${team.id}`}>{team.name}</Link>
         {/* Drawn whether or not there is one: a remit that appeared on some rows
             and not others would start the next line at two different heights,
-            which is the defect the cards had. */}
+            which is the defect the cards had. The clamp cuts it to a line, so the full
+            text is in the title. */}
         <span
           className={team.mission === "" ? "teams-row-remit teams-row-unwritten" : "teams-row-remit"}
+          title={team.mission === "" ? undefined : team.mission}
         >
           {team.mission === "" ? "no remit written" : team.mission}
         </span>
@@ -420,14 +458,19 @@ function DepartmentRow({
         <OnItsOwn grants={team.grants} triggers={triggers} />
       </td>
       <td className="teams-row-pulse">
-        <Sparkline
-          values={pulseOf(runs)}
-          label={`${team.name}: ${pulseLabel(runs.length)}`}
-          labelHidden
-          titles={pulseTitles(runs)}
-          width={96}
-          height={20}
-        />
+        {runs.length === 0 ? (
+          // Not the sparkline's dashed rail: that reads as a broken chart, and "no tasks" is a fact.
+          <span className="teams-pulse-none">no tasks</span>
+        ) : (
+          <Sparkline
+            values={pulseOf(runs)}
+            label={`${team.name}: ${pulseLabel(runs.length)}`}
+            labelHidden
+            titles={pulseTitles(runs)}
+            width={96}
+            height={20}
+          />
+        )}
       </td>
     </tr>
   );
@@ -506,16 +549,17 @@ function OnItsOwn({ grants, triggers }: { grants: TeamGrant[]; triggers: TeamTri
       {GRANTABLE_ACTIONS.map((kind) => {
         const mode = modeOf(grants, kind);
         const said = MODE_SAID[mode];
+        const name = POWER_LABEL[kind];
         return (
           <li
             className={`teams-alone-item teams-alone-${mode}`}
             key={kind}
-            title={`${kind}: ${said}`}
+            title={`${name}: ${said}`}
           >
-            <span aria-hidden="true">{MODE_MARK[mode]}</span>
-            <span aria-hidden="true">{POWER_WORD[kind]}</span>
+            <Mark mode={mode} />
+            <span aria-hidden="true">{name}</span>
             <span className="sr-only">
-              {kind}: {said}
+              {name}: {said}
             </span>
           </li>
         );
@@ -543,26 +587,28 @@ function modeOf(grants: TeamGrant[], kind: string): Mode {
   return "unmapped";
 }
 
-/** Filled acts, half drafts, hollow cannot, and a question mark is this shell's own gap. */
-const MODE_MARK: Record<Mode, string> = {
-  allow: "●",
-  propose: "◐",
-  none: "○",
-  unmapped: "?",
-};
+/**
+ * Filled acts, half drafts, hollow cannot, and a question mark is this shell's own gap.
+ *
+ * Drawn as shapes in CSS and not as `●◐○` glyphs: at table size the half and the hollow disc
+ * were a hair apart, and a font is free to draw all three at different weights.
+ */
+function Mark({ mode }: { mode: Mode | "rule" | "rule-off" }) {
+  if (mode === "unmapped") {
+    return (
+      <span className="teams-mark teams-mark-unmapped" aria-hidden="true">
+        ?
+      </span>
+    );
+  }
+  return <span className={`teams-mark teams-mark-${mode}`} aria-hidden="true" />;
+}
 
 const MODE_SAID: Record<Mode, string> = {
   allow: "does it",
   propose: "asks first",
   none: "asks you",
   unmapped: "this shell has no reading for that mode",
-};
-
-/** The short word for each grantable kind. The full name is in the title and beside it. */
-const POWER_WORD: Record<(typeof GRANTABLE_ACTIONS)[number], string> = {
-  calendar_event: "cal",
-  file_document: "doc",
-  send_email: "mail",
 };
 
 /**
@@ -582,7 +628,8 @@ function Routines({ armed, total }: { armed: number; total: number }) {
         className="teams-alone-item teams-alone-rule"
         title={`${total} routine${total === 1 ? "" : "s"}, none armed`}
       >
-        <span aria-hidden="true">◇</span>
+        <Mark mode="rule-off" />
+        <span aria-hidden="true">{total}</span>
         <span className="sr-only">
           {total} {total === 1 ? "routine" : "routines"}, none armed
         </span>
@@ -594,7 +641,7 @@ function Routines({ armed, total }: { armed: number; total: number }) {
       className="teams-alone-item teams-alone-rule teams-alone-armed"
       title={`${armed} armed routine${armed === 1 ? "" : "s"}`}
     >
-      <span aria-hidden="true">◆</span>
+      <Mark mode="rule" />
       <span aria-hidden="true">{armed}</span>
       <span className="sr-only">
         {armed} armed {armed === 1 ? "routine" : "routines"}

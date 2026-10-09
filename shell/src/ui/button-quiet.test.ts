@@ -20,4 +20,18 @@ describe("ui-button-quiet", () => {
       expect(treatment).not.toContain("var(--tone-");
     }
   });
+
+  it("keeps a 1.75rem target, the icon button is 1.75rem, and create draws a plus", () => {
+    expect(block).toContain("min-height: 1.75rem");
+
+    const iconStart = css.indexOf(".ui-icon-button {");
+    const icon = css.slice(iconStart, css.indexOf("}", iconStart) + 1);
+    expect(iconStart).toBeGreaterThan(-1);
+    expect(icon).toContain("1.75rem");
+
+    const createStart = css.indexOf(".ui-button-create::before {");
+    expect(createStart).toBeGreaterThan(-1);
+    const create = css.slice(createStart, css.indexOf("}", createStart) + 1);
+    expect(create).toContain('content: "+"');
+  });
 });

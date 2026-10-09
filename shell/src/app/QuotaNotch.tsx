@@ -595,7 +595,16 @@ export function QuotaNotch({ host = "contained", onMove, line, place, onPlace }:
                   about what is left to spend. The fullest rather than the shorter, because the
                   constraint that binds first is what a glance needs.
                 */}
-                <span className="quota-notch-headline">
+                <span
+                  className="quota-notch-headline"
+                  {...(worst === undefined
+                    ? {}
+                    : {
+                        role: "img",
+                        "aria-label": restSentence(worst),
+                        title: restSentence(worst),
+                      })}
+                >
                   {worst === undefined ? (
                     <span className="quota-notch-headline-percent quota-notch-headline-absent">—</span>
                   ) : (
@@ -746,4 +755,12 @@ function describe(window: QuotaWindow): string {
   if (window.stale) return `${used} (this window has since reset)`;
   if (window.resets_at === null) return used;
   return `${used}, resets ${new Date(window.resets_at).toLocaleString()}`;
+}
+
+/** "56% of the 5-hour window used": the figure at rest, with its window in words. */
+function restSentence(worst: { used: number; name: string }): string {
+  const window = /^(\d+)h$/.exec(worst.name);
+  const days = /^(\d+)d$/.exec(worst.name);
+  const named = window ? `${window[1]}-hour` : days ? `${days[1]}-day` : worst.name;
+  return `${Math.round(worst.used * 100)}% of the ${named} window used`;
 }

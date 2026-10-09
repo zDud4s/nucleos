@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { StateBadgeProps } from "./StateBadge";
 import { readState } from "./state-map";
 
@@ -34,6 +35,7 @@ export interface SlotPipsProps {
  * badge's label. The labels are the pips' hover text too.
  */
 export function SlotPips({ held, limit }: SlotPipsProps) {
+  const [shown, setShown] = useState(false);
   const lamps = held.map(({ domain, state }) => {
     const reading = readState(domain, state);
     return { tone: reading?.tone ?? "off", label: reading?.label ?? (state ?? "").trim() };
@@ -47,7 +49,42 @@ export function SlotPips({ held, limit }: SlotPipsProps) {
     (room > 0 ? `, room for ${room}` : "");
 
   return (
-    <span className="ui-pips">
+    <span
+      className="ui-pips"
+      // Focusable, and the reading shows while it is hovered or focused: a pip's state used to
+      // live in a `title` on a span nobody could reach with a keyboard, and nowhere visible for
+      // anyone not holding a pointer still over it. Focus reads the sr-only sentence below aloud.
+      tabIndex={0}
+      style={{ position: "relative" }}
+      onMouseEnter={() => setShown(true)}
+      onMouseLeave={() => setShown(false)}
+      onFocus={() => setShown(true)}
+      onBlur={() => setShown(false)}
+    >
+      {shown && (
+        // Out of the flow so showing it moves nothing beside the pips; the sentence is the same
+        // one the sr-only copy carries, hence hidden from assistive tech here.
+        <span
+          aria-hidden="true"
+          className="ui-pips-count"
+          style={{
+            position: "absolute",
+            top: "100%",
+            left: 0,
+            zIndex: 2,
+            marginLeft: 0,
+            padding: "0.125rem 0.375rem",
+            border: "1px solid var(--border-strong)",
+            borderRadius: "var(--radius-sm)",
+            background: "var(--surface-raised)",
+            color: "var(--text)",
+            fontFamily: "var(--font-body)",
+            fontSize: "var(--text-sm)",
+          }}
+        >
+          {sentence}
+        </span>
+      )}
       <span className="ui-pips-row" aria-hidden="true">
         {lamps.map((lamp, index) => (
           <span

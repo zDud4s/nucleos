@@ -1,6 +1,8 @@
+import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { FeedEmbed } from "../app/FeedEmbed";
+import { keys } from "../data/keys";
 import {
   isAggregateTimeout,
   useBudget,
@@ -12,20 +14,20 @@ import {
   type SubsystemReadout,
 } from "../data/system";
 import { useWaitingCount } from "../data/waiting";
-import { Meter, PageHeader, Section, StatCard, usd } from "../ui";
-import { headlineFor as systemHeadline } from "./System";
+import { Meter, PageHeader, StaleNote, StatCard, ceilingShare, usd } from "../ui";
 
 /**
- * The first screen: four numbers and two doors.
+ * The first screen: what needs you, whether the machine is well, and what it has spent.
  *
  * Home is a *reading*, not a console — nothing on this page mutates anything.
  * That is a deliberate constraint rather than an accident of what has been
  * built: the screen the app opens on is the one people look at while doing
  * something else, and a stop/start control on it would eventually be pressed by
  * someone who was looking at the state of five seconds ago. Every action lives
- * one click away, on the page that also shows you what you are acting on.
+ * one click away, on the page that also shows you what you are acting on — and each
+ * reading here is a link to that page, which navigates and mutates nothing.
  *
- * All three queries run at the fast cadence, because all three are answers to
+ * All four queries run at the fast cadence, because all four are answers to
  * "what is the machine doing right now".
  */
 export function Home() {
@@ -33,6 +35,10 @@ export function Home() {
   const waiting = useWaitingCount();
   const budget = useBudget();
   const health = useSystemHealth();
+  // `useWaitingCount` hands back only the number, which cannot tell "not asked yet" from "asked
+  // and refused". This observer shares its query (same key, never fetches on its own) so the
+  // card can say which of the two it is.
+  const waitingRead = useQuery({ queryKey: keys.waiting.count, enabled: false });
 
   const roster = projects.data;
   const spend = budget.data;
@@ -46,110 +52,126 @@ export function Home() {
   // holding one.
   const shadowDecisions = roster?.reduce((total, project) => total + project.pending, 0);
 
+  // A failed poll over old data keeps the old figure on screen; say so, per card and once
+  // under the header with the age of the oldest good read.
+  const projectsStale = isStale(projects);
+  const waitingStale = isStale(waitingRead);
+  const budgetStale = isStale(budget);
+  const healthStale = isStale(health);
+  const staleReads = [
+    projectsStale ? projects.dataUpdatedAt : null,
+    waitingStale ? waitingRead.dataUpdatedAt : null,
+    budgetStale ? budget.dataUpdatedAt : null,
+    healthStale ? health.dataUpdatedAt : null,
+  ].filter((at): at is number => at !== null);
+  const oldestRead = staleReads.length === 0 ? null : Math.min(...staleReads);
+
+  const notHealthy = subsystems?.filter(
+    (row) => row.status === "down" || row.status === "degraded",
+  ).length;
+  const notConfigured = subsystems?.filter((row) => row.status === "disabled").length;
+  const faulty = wrongClause(health.data) !== null;
+
   return (
     <>
       <PageHeader title="Home" headline={headline(roster, waiting, spend, health.data)} />
+      {oldestRead !== null && <StaleNote dataUpdatedAt={oldestRead} />}
 
       {/*
-        Five cards, always five. They do not recede when everything is well, and that is a
-        decision rather than an omission: the four autopilot readings are standing readings, not
-        exceptions, and a card that appeared only when something was wrong would teach the reader
-        that an absent card is an absent fact — the opposite of the honesty this page is being
-        fixed for. What was lying here was the headline; the cards were already right.
+        Three tiers, always the same three. What can need you today leads, large: the queue that
+        holds your decisions and whether the machine under it is well. The two autopilot
+        readings are standing readings and sit quieter beneath. Spend is a ceiling, so it is a
+        labelled meter row rather than a fourth figure. Nothing recedes when everything is well,
+        and that is a decision rather than an omission: a card that appeared only when something
+        was wrong would teach the reader that an absent card is an absent fact. What was lying
+        here was the headline; the cards were already right.
 
         A conditional card would also change the page's shape under the eyes of somebody halfway
         down it, which is the invariant `project/ModeState.tsx:31-34` already defends for a
         project page.
       */}
       <div className="app-home-stats">
-        <StatCard
-          label="Projects"
-          value={roster?.length}
-          detail={
-            active === undefined || shadow === undefined ? undefined : `${active} active · ${shadow} shadow`
-          }
-        />
-        <StatCard
-          label="Shadow decisions pending"
-          value={shadowDecisions}
-          detail="what the autopilot would have done, waiting to be read"
-        />
-        <StatCard
-          label="Waiting on you"
-          value={waiting}
-          // What the number IS, not a table of contents for another page. Four lists are outside it
-          // and for three different reasons: skipped and refused are records, calendar events have no
-          // listing route, and a parked run is the run side of an approval already counted.
-          detail={waiting === undefined ? undefined : waiting === 0 ? "nothing waiting on you" : "decisions held for you — not records, and not the calendar"}
-        />
-        <StatCard
-          label="Window spend"
-          value={spend === undefined ? undefined : `$${spend.window_spend_usd.toFixed(2)}`}
-          detail={ceiling(spend)}
-          bar={
-            spend === undefined || spend.limit_usd === null ? undefined : (
-              <Meter
-                label="window spend"
-                value={spend.window_spend_usd}
-                ceiling={spend.limit_usd}
-                tone="quantity"
-                format={usd}
-                head={false}
-              />
-            )
-          }
-        />
-        {/*
-          The fifth, and the one that is not about the autopilot: whether the machine
-          under it is well. `headlineFor` is System's own sentence, imported rather than
-          rewritten — the first screen is where somebody finds out a subsystem is down,
-          and two screens describing one readout in two ways is how a person learns to
-          check both.
-        */}
-        <StatCard
-          label="Subsystems healthy"
-          value={
-            subsystems === undefined || healthy === undefined
-              ? undefined
-              : `${healthy}/${subsystems.length}`
-          }
-          /* One device for one piece of news: the clause that is wrong wears the tone and the
-             figure stays the figure. See the note under `.ui-stat-detail` in `ui.css`. */
-          detail={
-            wrongClause(health.data) === null ? (
-              systemHeadline(health.data)
-            ) : (
-              <span className="ui-wrong">{systemHeadline(health.data)}</span>
-            )
-          }
-        />
+        <div className="app-home-lead">
+          <Cell stale={waitingStale}>
+            <StatCard
+              label="Waiting on you"
+              value={waiting}
+              to="/waiting"
+              unread={unreadNote(waitingRead)}
+              // What the number IS, not a table of contents for another page. Four lists are outside it
+              // and for three different reasons: skipped and refused are records, calendar events have no
+              // listing route, and a parked run is the run side of an approval already counted.
+              detail={
+                waiting === undefined
+                  ? undefined
+                  : waiting === 0
+                    ? "nothing waiting on you"
+                    : "decisions held for you — not records, and not the calendar"
+              }
+            />
+          </Cell>
+          {/*
+            Whether the machine under the autopilot is well. The count is Home's own sentence and
+            not System's: System writes a headline for the whole page, this is one card's detail,
+            and the names of what is wrong are already in the headline above.
+          */}
+          <Cell stale={healthStale} wrong={faulty}>
+            <StatCard
+              label="Subsystems healthy"
+              value={
+                subsystems === undefined || healthy === undefined
+                  ? undefined
+                  : `${healthy}/${subsystems.length}`
+              }
+              to="/system"
+              unread={unreadNote(health)}
+              /* One device for one piece of news: the clause that is wrong wears the tone and the
+                 figure stays the figure. See the note under `.ui-stat-detail` in `ui.css`. */
+              detail={
+                subsystems === undefined ? undefined : (
+                  <HealthDetail
+                    readout={health.data}
+                    total={subsystems.length}
+                    notHealthy={notHealthy ?? 0}
+                    notConfigured={notConfigured ?? 0}
+                  />
+                )
+              }
+            />
+          </Cell>
+        </div>
+
+        <div className="app-home-quiet">
+          <Cell stale={projectsStale}>
+            <StatCard
+              label="Projects"
+              value={roster?.length}
+              to="/projects"
+              unread={unreadNote(projects)}
+              detail={
+                active === undefined || shadow === undefined
+                  ? undefined
+                  : `${active} active · ${shadow} shadow`
+              }
+            />
+          </Cell>
+          <Cell stale={projectsStale}>
+            <StatCard
+              label="Shadow decisions pending"
+              value={shadowDecisions}
+              to="/autopilot"
+              unread={unreadNote(projects)}
+              detail="what the autopilot would have done, waiting to be read"
+            />
+          </Cell>
+        </div>
+
+        <Cell stale={budgetStale}>
+          <SpendRow spend={spend} read={budget} />
+        </Cell>
       </div>
 
-      {/*
-        Two doors, and no cards around them. They were bordered blocks with a title and a
-        paragraph each — the same weight as the four readings above, for two links that
-        say where a link goes. A `Section` puts them under a heading with no frame, which
-        is what a list of two places is.
-      */}
-      <Section label="Where to look next">
-        <div className="flex flex-col gap-2">
-          <p className="text-sm text-text-muted">
-            <Link to="/autopilot" className="ui-button ui-button-link">
-              Autopilot
-            </Link>{" "}
-            — the mode of every project, the bar one has to clear to leave shadow, and the
-            ceilings that hold work back.
-          </p>
-          <p className="text-sm text-text-muted">
-            <Link to="/waiting" className="ui-button ui-button-link">
-              Waiting
-            </Link>{" "}
-            — every decision that stopped to ask you something, in one queue.
-          </p>
-        </div>
-      </Section>
-
-      {/* What has actually happened, which is the question the four figures above raise
+      {/* What has actually happened, which is the question the figures above raise
           and none of them answers. Five lines, not the cockpit's ten: this is the last
           block of the first screen, not a feed reader. */}
       <FeedEmbed lines={5} />
@@ -157,18 +179,103 @@ export function Home() {
   );
 }
 
+/** A failed poll that still holds an earlier good read: the figure on screen is old. */
+function isStale(read: { isError: boolean; data: unknown }): boolean {
+  return read.isError && read.data !== undefined;
+}
+
+/** Why a figure is missing: still reading, or the núcleo did not answer. */
+function unreadNote(read: { isError: boolean }): string {
+  return read.isError ? "the núcleo did not answer" : "reading…";
+}
+
 /**
- * The ceiling line under the spend.
- *
- * `limit_usd === null` is **no ceiling**, and it is never rendered as a zero or
- * as a missing value. A ceiling of `0.00` stops all autonomous work; no ceiling
- * stops none of it. Printing the first where the second is true — or the other
- * way round — is the shell inventing a spending policy.
+ * One grid cell. Stale data gets `.ui-stale` (a dashed edge, never dimmed text) and a fault
+ * gets a red edge on top of the glyph and the words, so colour is never the only signal.
  */
-function ceiling(spend: BudgetView | undefined): string | undefined {
-  if (spend === undefined) return undefined;
-  if (spend.limit_usd === null) return `no ceiling · ${spend.period}`;
-  return `of $${spend.limit_usd.toFixed(2)} · ${spend.period}`;
+function Cell({
+  stale,
+  wrong = false,
+  children,
+}: {
+  stale: boolean;
+  wrong?: boolean;
+  children: ReactNode;
+}) {
+  const classes = ["app-home-cell"];
+  if (stale) classes.push("ui-stale");
+  if (wrong) classes.push("app-home-cell-wrong");
+  return <div className={classes.join(" ")}>{children}</div>;
+}
+
+/**
+ * The health card's line. Counts only: which subsystems are down is the headline's job and
+ * `/system`'s, and a subsystem nobody configured is counted apart because it is not a fault.
+ */
+function HealthDetail({
+  readout,
+  total,
+  notHealthy,
+  notConfigured,
+}: {
+  readout: HealthReadout | undefined;
+  total: number;
+  notHealthy: number;
+  notConfigured: number;
+}) {
+  const apart = notConfigured > 0 ? ` · ${String(notConfigured)} not configured` : "";
+  if (readout !== undefined && isAggregateTimeout(readout)) {
+    return (
+      <span className="ui-wrong">
+        <span aria-hidden="true">{"⚠︎"} </span>
+        the health readout timed out
+      </span>
+    );
+  }
+  if (notHealthy === 0) {
+    return <>{`all configured subsystems healthy${apart}`}</>;
+  }
+  return (
+    <>
+      <span className="ui-wrong">
+        <span aria-hidden="true">{"⚠︎"} </span>
+        {`${String(notHealthy)} of ${String(total)} not healthy`}
+      </span>
+      {apart}
+    </>
+  );
+}
+
+/**
+ * Spend, as a labelled meter row. The ceiling is the news, so the bar is the figure: `Meter`
+ * escalates by itself at 80% and 100% and writes the percentage beside the bar.
+ */
+function SpendRow({
+  spend,
+  read,
+}: {
+  spend: BudgetView | undefined;
+  read: { isError: boolean };
+}) {
+  return (
+    <Link to="/system" className="app-home-spend">
+      {spend === undefined ? (
+        <span className="app-home-spend-unread">
+          <span className="app-home-spend-title">Spend</span>
+          <span aria-hidden="true">—</span>
+          <span className="sr-only">not read</span> {unreadNote(read)}
+        </span>
+      ) : (
+        <Meter
+          label={`Spend · ${spend.period}`}
+          value={spend.window_spend_usd}
+          ceiling={spend.limit_usd}
+          tone="quantity"
+          format={usd}
+        />
+      )}
+    </Link>
+  );
 }
 
 /**
@@ -179,7 +286,7 @@ function ceiling(spend: BudgetView | undefined): string | undefined {
  * read. Which is why the order it picks in is a ladder and not a preference:
  *
  *   1. the worst live fact about the machine — a subsystem down, or degraded;
- *   2. a ceiling holding autonomous work;
+ *   2. a ceiling holding autonomous work, or about to;
  *   3. the modes the projects are in.
  *
  * A subsystem being down outranks a ceiling holding work because one says the
@@ -232,18 +339,40 @@ function headline(
   if (spend?.paused === true) {
     return `autonomous work is held — ${spend.reason ?? "a ceiling is holding it"}`;
   }
-  if (roster === undefined) return undefined;
 
-  const active = roster.filter((project) => project.mode === "active").length;
-  const shadow = roster.filter((project) => project.mode === "shadow").length;
+  // Before the pause, not after: a ceiling that is about to hold work is the moment to say so.
+  const standing =
+    spend === undefined || spend.limit_usd === null || spend.limit_usd <= 0
+      ? "under"
+      : ceilingShare(spend.window_spend_usd, spend.limit_usd);
+  const nearing =
+    standing === "near"
+      ? "spend is near its ceiling"
+      : standing === "over"
+        ? "spend is at its ceiling"
+        : null;
+
+  if (roster === undefined) return nearing === null ? undefined : `${nearing}${tail}`;
+
+  const activeCount = roster.filter((project) => project.mode === "active").length;
+  const shadowCount = roster.filter((project) => project.mode === "shadow").length;
 
   const modes =
-    active === 0 && shadow === 0
+    activeCount === 0 && shadowCount === 0
       ? "the autopilot is off in every project"
-      : `${active} acting, ${shadow} in shadow`;
+      : `${activeCount} acting, ${shadowCount} in shadow`;
 
-  if (waiting === undefined) return modes;
-  return `${modes}${tail}`;
+  const lead = nearing === null ? modes : `${nearing}; ${modes}`;
+  if (waiting === undefined) return lead;
+  return `${lead}${tail}`;
+}
+
+/**
+ * What a subsystem is called to a person. The readout's names are identifiers
+ * (`browser_sidecar`); the sidecar suffix is plumbing and the underscores are not words.
+ */
+function displayName(name: string): string {
+  return name.replace(/_sidecar$/, "").replace(/_/g, " ");
 }
 
 /**
@@ -265,7 +394,7 @@ function wrongClause(readout: HealthReadout | undefined): string | null {
   if (down.length === 0 && degraded.length === 0) return null;
   const parts: string[] = [];
   if (down.length > 0) {
-    const named = down.map((row) => row.name).join(", ");
+    const named = down.map((row) => displayName(row.name)).join(", ");
     parts.push(`${String(down.length)} subsystem${down.length === 1 ? "" : "s"} down (${named})`);
   }
   if (degraded.length > 0) parts.push(`${String(degraded.length)} degraded`);

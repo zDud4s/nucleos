@@ -1,3 +1,4 @@
+import { Link } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 
 export interface StatCardProps {
@@ -16,14 +17,18 @@ export interface StatCardProps {
   detail?: ReactNode;
   /** A bar under the reading, for a figure that runs against a ceiling. */
   bar?: ReactNode;
+  /** Makes the whole card a link to this route; the card's label names the link. */
+  to?: string;
+  /** The detail shown while `value` is `undefined`: why the figure could not be read. */
+  unread?: ReactNode;
 }
 
 /**
  * A number, what it counts, and one line of context.
  *
- * The Home page is four of these and nothing else, which is the point: the
- * first screen is a *reading*, not a console. Nothing on a stat card is
- * clickable and nothing behind one mutates.
+ * The Home page is five of these and nothing else, which is the point: the
+ * first screen is a *reading*, not a console. A card may link to the page that holds the
+ * figure (`to`); nothing behind one mutates.
  *
  * No tone of its own. A card whose figure is bad news says so by wrapping its `detail` in
  * `.ui-wrong` at the call site, which is what every other wrong clause in the app does. The
@@ -31,13 +36,30 @@ export interface StatCardProps {
  * treatments is the thing round 9 fixed on the boundary readout, and `6/10` is a reading
  * that is true either way.
  */
-export function StatCard({ label, value, detail, bar }: StatCardProps) {
-  return (
+export function StatCard({ label, value, detail, bar, to, unread }: StatCardProps) {
+  const unreadFigure = value === undefined;
+  const shown = unreadFigure && unread !== undefined ? unread : detail;
+  const card = (
     <article className="ui-stat" aria-label={label}>
-      <p className="ui-stat-value">{value === undefined ? "—" : value}</p>
+      <p className="ui-stat-value">
+        {unreadFigure ? (
+          <>
+            <span aria-hidden="true">—</span>
+            <span className="sr-only">not read</span>
+          </>
+        ) : (
+          value
+        )}
+      </p>
       <p className="ui-stat-label">{label}</p>
-      {detail === undefined ? null : <p className="ui-stat-detail">{detail}</p>}
+      {shown === undefined ? null : <p className="ui-stat-detail">{shown}</p>}
       {bar === undefined ? null : bar}
     </article>
+  );
+  if (to === undefined) return card;
+  return (
+    <Link to={to} className="ui-stat-link" aria-label={label}>
+      {card}
+    </Link>
   );
 }

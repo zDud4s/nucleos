@@ -343,6 +343,7 @@
   border: 1px solid transparent;
   border-radius: var(--radius-pill);
   font-family: var(--font-body);
+  font-variant-numeric: tabular-nums;
   font-size: var(--text-xs);
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-wide);
@@ -587,7 +588,8 @@ a.ui-button:not(.ui-button-link):is(:hover, :focus-visible) {
    a control label; Muted is 6.9:1 and still recedes, because the underline is
    doing the finding. */
 .ui-button-quiet {
-  padding: 0;
+  min-height: 1.75rem;
+  padding: 0 0.25rem;
   background: none;
   border-color: transparent;
   color: var(--text-muted);
@@ -611,6 +613,12 @@ a.ui-button:not(.ui-button-link):is(:hover, :focus-visible) {
   line-height: 1;
 }
 
+.ui-button-create::before {
+  content: "+";
+  font-weight: var(--weight-bold);
+  line-height: 1;
+}
+
 .ui-button-stop::before {
   content: "■";
   font-size: 0.7em;
@@ -620,16 +628,16 @@ a.ui-button:not(.ui-button-link):is(:hover, :focus-visible) {
 /* ------------------------------------------------------------ iconbutton -- */
 
 /* A control that is only a glyph, at `.ui-button-quiet`'s weight: no box at rest and muted, the
-   text colour on a raised ground under the pointer. 1.5rem square because 24px is the smallest
-   target WCAG 2.2 accepts (2.5.8). The focus ring is `base.css`'s, and here it has a box to go
+   text colour on a raised ground under the pointer. 1.75rem square: above the 24px WCAG 2.2 accepts
+   (2.5.8) and nearer the pointer target the platform guidelines ask for. The focus ring is `base.css`'s, and here it has a box to go
    round rather than the bare glyph. */
 .ui-icon-button {
   display: inline-flex;
   flex: none;
   align-items: center;
   justify-content: center;
-  width: 1.5rem;
-  height: 1.5rem;
+  width: 1.75rem;
+  height: 1.75rem;
   padding: 0;
   border: 1px solid transparent;
   border-radius: var(--radius-md);
@@ -890,7 +898,7 @@ a.ui-button:not(.ui-button-link):is(:hover, :focus-visible) {
 
 .ui-section-title {
   font-family: var(--font-display);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-wider);
   text-transform: uppercase;
@@ -1337,7 +1345,7 @@ ol.ui-well {
 }
 
 .ui-stat-detail {
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   line-height: var(--leading-snug);
   /* 11px on --text-faint is 3.8:1 in light, under the 4.5:1 floor. */
   color: var(--text-muted);
@@ -1415,8 +1423,8 @@ ol.ui-well {
    seconds tick over. */
 .ui-reading-time,
 .ui-reading-raw {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
   color: var(--text-faint);
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
@@ -1545,7 +1553,7 @@ ol.ui-well {
   height: 6px;
   border-radius: var(--radius-pill);
   background: var(--surface-sunken);
-  box-shadow: inset 0 0 0 1px var(--border);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
 }
 
 .ui-gauge-fill {
@@ -1568,6 +1576,26 @@ ol.ui-well {
   background: var(--text-muted);
 }
 
+/* A quantity that runs out says so before it has: the fill takes a tone at 80% and again at the
+   ceiling, and `.ui-gauge-cue` writes the figure so the colour is never the only signal. */
+.ui-gauge-near .ui-gauge-fill {
+  background: var(--tone-pending-fg);
+}
+
+.ui-gauge-over .ui-gauge-fill {
+  background: var(--tone-danger-fg);
+}
+
+.ui-gauge-cue {
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.ui-gauge-over .ui-gauge-cue {
+  color: var(--tone-danger-fg);
+}
+
 /* Full is worth seeing without reading: the ceiling itself takes the tone. */
 .ui-gauge-full .ui-gauge-track {
   box-shadow: inset 0 0 0 1px var(--tone-paused-border);
@@ -1586,7 +1614,7 @@ ol.ui-well {
 }
 
 .ui-gauge-note {
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   color: var(--text-faint);
 }
 
@@ -2318,7 +2346,7 @@ ol.ui-well {
 .ui-field select {
   min-width: 14rem;
   padding: var(--space-2);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-field);
   /* Controls are 6px — the four-step radius ladder, not the 3px inline step. */
   border-radius: var(--radius-md);
   background: var(--surface);
@@ -2474,6 +2502,12 @@ ol.ui-well {
   z-index: var(--z-top);
   background: var(--scrim);
   backdrop-filter: blur(3px);
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .ui-modal-scrim {
+    backdrop-filter: none;
+  }
 }
 
 .ui-modal {
@@ -3009,4 +3043,78 @@ ol.ui-well {
 .ui-slider-tick[data-active] {
   color: var(--text);
   font-weight: 600;
+}
+
+/* ------------------------------------------------------------------ stat -- */
+
+/* A whole card that goes somewhere. The link adds no chrome of its own: the card is the target,
+   and hover and focus are drawn on the card's edge. */
+.ui-stat-link {
+  display: block;
+  border-radius: var(--radius-lg);
+  color: inherit;
+  text-decoration: none;
+}
+
+.ui-stat-link:hover .ui-stat {
+  border-color: var(--border-strong);
+}
+
+.ui-stat-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* ----------------------------------------------------------------- stale -- */
+
+/* Data that may be out of date. A dashed edge, not dimmed text: opacity would take a reading below
+   the contrast floor, and the edge is visible to someone who cannot separate the tones. */
+.ui-stale {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+}
+
+/* --------------------------------------------------------- forced colours -- */
+
+/* Windows high-contrast replaces every colour, and a tone carried only by background or fill
+   disappears with it. Each of these gets a system-colour edge or fill back. */
+@media (forced-colors: active) {
+  .ui-badge {
+    border: 1px solid CanvasText;
+  }
+
+  .ui-pip {
+    border: 1px solid CanvasText;
+    forced-color-adjust: none;
+    background: Canvas;
+  }
+
+  .ui-pip-active,
+  .ui-pip-shadow,
+  .ui-pip-pending,
+  .ui-pip-paused,
+  .ui-pip-danger,
+  .ui-pip-info {
+    background: Highlight;
+  }
+
+  :focus-visible {
+    outline: 2px solid Highlight;
+  }
+
+  .ui-gauge-track {
+    border: 1px solid CanvasText;
+  }
+
+  .ui-gauge-fill {
+    forced-color-adjust: none;
+    background: Highlight;
+    fill: Highlight;
+  }
+
+  .ui-switch-seg[aria-pressed="true"] {
+    forced-color-adjust: none;
+    background: Highlight;
+    color: HighlightText;
+  }
 }

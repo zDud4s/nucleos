@@ -84,6 +84,9 @@
 
   --border: #262b35;
   --border-strong: #39404d;
+  /* The edge of a form control: 3.9:1 on --surface, the 3:1 non-text floor (WCAG 1.4.11) that
+     --border-strong does not reach. */
+  --border-field: #6b7586;
 
   --text: #e7eaf0;
   --text-muted: #98a1b2;
@@ -249,6 +252,8 @@
 
     --border: #dcdfe6;
     --border-strong: #b4bbc7;
+    /* 3.3:1 on --surface. */
+    --border-field: #868f9d;
 
     --text: #12151b;
     --text-muted: #545d6c;

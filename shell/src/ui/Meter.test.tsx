@@ -87,3 +87,32 @@ describe("LimitChip", () => {
     expect(screen.queryByText("≤ $0.00")).toBeNull();
   });
 });
+
+describe("Meter near and over the ceiling", () => {
+  it("a quantity at 82% of its ceiling carries ui-gauge-near and a visible 82% cue", () => {
+    const { container } = render(<Meter label="window spend" value={4.1} ceiling={5} tone="quantity" format={usd} />);
+
+    const gauge = container.querySelector(".ui-gauge") as HTMLElement;
+    expect(gauge.className).toContain("ui-gauge-near");
+    expect(gauge.className).not.toContain("ui-gauge-over");
+    expect(container.querySelector(".ui-gauge-cue")?.textContent).toBe("82%");
+    expect(screen.getByRole("img", { name: "window spend: $4.10 of $5.00, 82% — near the ceiling" })).toBeDefined();
+  });
+
+  it("a quantity at or over its ceiling carries ui-gauge-over, and occupancy tones never escalate", () => {
+    const { container, rerender } = render(
+      <Meter label="window spend" value={5} ceiling={5} tone="quantity" format={usd} />,
+    );
+    let gauge = container.querySelector(".ui-gauge") as HTMLElement;
+    expect(gauge.className).toContain("ui-gauge-over");
+    expect(container.querySelector(".ui-gauge-cue")).not.toBeNull();
+    expect(screen.getByRole("img", { name: "window spend: $5.00 of $5.00, at the ceiling" })).toBeDefined();
+
+    // Occupancy is a count against a limit, not a reading that runs out: no escalation, no cue.
+    rerender(<Meter label="at work" value={5} ceiling={5} tone="active" />);
+    gauge = container.querySelector(".ui-gauge") as HTMLElement;
+    expect(gauge.className).not.toContain("ui-gauge-near");
+    expect(gauge.className).not.toContain("ui-gauge-over");
+    expect(container.querySelector(".ui-gauge-cue")).toBeNull();
+  });
+});
