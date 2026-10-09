@@ -141,6 +141,14 @@ describe("PostMergePanel", () => {
     expect(screen.queryByText(/is red at/)).toBeNull();
     expect(screen.queryByText(/Failing/)).toBeNull();
   });
+
+  it("says there is no result yet when a first gate is running and nothing is recorded", () => {
+    render(<PostMergePanel rules={rules({ postgate: postgate({ running: RED_SHA }) })} />);
+
+    expect(screen.getByText(/No result on/)).toBeDefined();
+    expect(screen.getByText(/A gate is running on/)).toBeDefined();
+    expect(screen.queryByText(/is green/)).toBeNull();
+  });
 });
 
 describe("OnItsOwn", () => {

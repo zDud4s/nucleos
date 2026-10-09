@@ -72,9 +72,13 @@ export function PostMergePanel({ rules }: { rules: ProjectRules }) {
           )}
           {state.red_sha != null && (
             <p className="pj-note">
-              Range: after{" "}
-              {state.red_base != null ? <Sha value={state.red_base} /> : "the start"}
-              , up to the red commit.
+              {state.red_base != null ? (
+                <>
+                  Range: after <Sha value={state.red_base} />, up to the red commit.
+                </>
+              ) : (
+                "Range: every commit up to the red one."
+              )}
             </p>
           )}
           {state.also_suspect.length > 0 && (
@@ -85,15 +89,13 @@ export function PostMergePanel({ rules }: { rules: ProjectRules }) {
         </>
       ) : (
         <p className="pj-wip-state">
-          <strong>{state.target}</strong> is green
           {state.last_green != null ? (
             <>
-              {" "}at <Sha value={state.last_green} />.
+              <strong>{state.target}</strong> is green at <Sha value={state.last_green} />.
             </>
           ) : (
-            "."
+            <>No result on <strong>{state.target}</strong> yet.</>
           )}
-          {state.last_green == null && " No green recorded yet."}
         </p>
       )}
       {state.running != null && (

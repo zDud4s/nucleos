@@ -62,7 +62,6 @@ export interface RepoTriggerView {
   last_sha: string | null;
 }
 
-/** Everything a project will do without being asked, and what is holding it back. */
 /** The post-merge gate's state for one project's target, as the rules read serves it. */
 export interface PostgateState {
   target: string;
@@ -78,6 +77,7 @@ export interface PostgateState {
   also_suspect: string[];
 }
 
+/** Everything a project will do without being asked, and what is holding it back. */
 export interface ProjectRules {
   project_id: string;
   project_root: string | null;

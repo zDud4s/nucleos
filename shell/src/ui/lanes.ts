@@ -45,6 +45,7 @@ export const FEED_LANES: readonly FeedLaneInfo[] = [
  * - `token_efficiency` names runs but judges a project's prompts over many of them; it is advice
  *   about configuration, so the machine lane, and not runs.
  * - `land_resolution_failed` is git: what failed was landing a resolution on the branch.
+ * - `postgate_red` is git: what went red is what reached the repository.
  * - `schedule_rule_invalid` sits in the mail lane, with the other lines about the outside world.
  * - `promotion_ready` is a project earning the next autopilot mode — the machine lane.
  */
