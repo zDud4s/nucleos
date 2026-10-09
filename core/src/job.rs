@@ -13625,6 +13625,10 @@ mod tests {
 
         seed_agent(&pool, "ana", "migrations", "careful").await;
         seed_crew(&pool, "crew", "ana", &[]).await;
+        // The foreign owners have rows too, so the isolation below is proven by scope filtering
+        // and not by the owner check dropping a link whose row is missing.
+        seed_agent(&pool, "bob", "frontend", "bold").await;
+        seed_crew(&pool, "other-crew", "bob", &[]).await;
 
         let job_id = seed_job_in(
             &pool,
@@ -13666,25 +13670,36 @@ mod tests {
         .await
         .unwrap();
         // "zanzibar" is in every row, so FTS gives it no weight: each in-scope note also needs a term of its own that the task text carries ("ana" for the agent, "quokka" for the team).
+        // The foreign rows carry the task's terms too ("zanzibar quokka ana"), so ranking alone
+        // could not keep them out: only the scope chain can.
+        let mut knowledge_ids = Vec::new();
         for (scope_kind, scope_id, title) in [
             ("agent", "ana", "zanzibar ana-note"),
             ("team", "crew", "zanzibar quokka crew-note"),
-            ("agent", "bob", "zanzibar bob-note"),
-            ("team", "other-crew", "zanzibar other-crew-note"),
+            ("agent", "bob", "zanzibar quokka ana bob-note"),
+            ("team", "other-crew", "zanzibar quokka other-crew-note"),
         ] {
-            sqlx::query(
+            let id: i64 = sqlx::query_scalar(
                 "INSERT INTO knowledge
                    (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
                  VALUES ('semantic', ?, ?, 'owner', 'memory', ?, 'body', 'active',
-                         '2026-08-19T00:00:00+00:00')",
+                         '2026-08-19T00:00:00+00:00')
+                 RETURNING id",
             )
             .bind(scope_kind)
             .bind(scope_id)
             .bind(title)
-            .execute(&pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
+            knowledge_ids.push(id);
         }
+        let (ana_id, crew_id, bob_id, other_id) = (
+            knowledge_ids[0],
+            knowledge_ids[1],
+            knowledge_ids[2],
+            knowledge_ids[3],
+        );
 
         let job = load_job(&pool, job_id).await.unwrap();
         advance(&state, &job, Utc::now()).await;
@@ -13707,6 +13722,33 @@ mod tests {
         assert!(!prompt.contains("other-crew-note"), "{prompt}");
         assert!(prompt.contains("ana-note"), "{prompt}");
         assert!(prompt.contains("crew-note"), "{prompt}");
+
+        // The trace says the same thing as the prompt: nothing of the foreign rows was even a
+        // candidate for this run, shown or not.
+        let foreign: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_knowledge WHERE run_id = ? AND knowledge_id IN (?, ?)",
+        )
+        .bind(run_id)
+        .bind(bob_id)
+        .bind(other_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            foreign, 0,
+            "another agent's or team's row reached the trace"
+        );
+        for (mine, name) in [(ana_id, "ana's"), (crew_id, "the team's")] {
+            let traced: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM run_knowledge WHERE run_id = ? AND knowledge_id = ?",
+            )
+            .bind(run_id)
+            .bind(mine)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(traced, 1, "{name} row {mine} is missing from the trace");
+        }
     }
 
     /// A real repository and a real worktree, because a node that cannot be provisioned would leave

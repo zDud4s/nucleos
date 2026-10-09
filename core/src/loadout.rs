@@ -38,9 +38,10 @@ pub struct Loadout {
     pub block: String,
 }
 
-/// Resolves the loadout for one spawn.
+/// Resolves the loadout for one spawn. An agent or team that has no row is skipped, and the skip
+/// is logged: its link leaves the chain, the others stay.
 pub async fn resolve(pool: &sqlx::SqlitePool, input: &LoadoutInput<'_>) -> Loadout {
-    match crate::brief::of(pool, &context_for(input), input.task_text).await {
+    match briefed(pool, input).await {
         Ok(brief) => Loadout {
             block: brief.block.clone().unwrap_or_default(),
             brief: Some(brief),
@@ -61,9 +62,48 @@ pub async fn resolve(pool: &sqlx::SqlitePool, input: &LoadoutInput<'_>) -> Loado
     }
 }
 
+/// Reads the brief for an input whose agent and team have been checked against their tables.
+async fn briefed(pool: &sqlx::SqlitePool, input: &LoadoutInput<'_>) -> sqlx::Result<Brief> {
+    let agent = agent_or_skip(pool, input.agent).await?;
+    let team = team_or_skip(pool, input.team).await?;
+    crate::brief::of(pool, &context_for(input, agent, team), input.task_text).await
+}
+
+/// The agent id when it has a row; `None` for no agent, and for one without a row (logged).
+async fn agent_or_skip<'a>(
+    pool: &sqlx::SqlitePool,
+    id: Option<&'a str>,
+) -> sqlx::Result<Option<&'a str>> {
+    let Some(id) = id else { return Ok(None) };
+    let row = sqlx::query_scalar::<_, i64>("SELECT 1 FROM agents WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    if row.is_none() {
+        tracing::warn!(agent = id, "agent has no row; its link is skipped");
+    }
+    Ok(row.map(|_| id))
+}
+
+/// The team id when it has a row; `None` for no team, and for one without a row (logged).
+async fn team_or_skip<'a>(
+    pool: &sqlx::SqlitePool,
+    id: Option<&'a str>,
+) -> sqlx::Result<Option<&'a str>> {
+    let Some(id) = id else { return Ok(None) };
+    let row = sqlx::query_scalar::<_, i64>("SELECT 1 FROM teams WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    if row.is_none() {
+        tracing::warn!(team = id, "team has no row; its link is skipped");
+    }
+    Ok(row.map(|_| id))
+}
+
 /// The selection context an input stands for: machine -> project -> team -> agent -> job, with
-/// every absent link left out.
-fn context_for(input: &LoadoutInput<'_>) -> Context {
+/// every absent link left out. `agent` and `team` are the checked values, not the input's.
+fn context_for(input: &LoadoutInput<'_>, agent: Option<&str>, team: Option<&str>) -> Context {
     let mut context = Context::for_project(input.project);
     if let Some(id) = input.job {
         context.chain.push(Scope::Job {
@@ -71,8 +111,8 @@ fn context_for(input: &LoadoutInput<'_>) -> Context {
             project: input.project.map(str::to_owned),
         });
     }
-    context.agent = input.agent.map(str::to_owned);
-    context.team = input.team.map(str::to_owned);
+    context.agent = agent.map(str::to_owned);
+    context.team = team.map(str::to_owned);
     context.node = input.node;
     context.files = input.files.to_vec();
     context
@@ -126,7 +166,43 @@ mod tests {
         job: i64,
     }
 
+    /// The owners `seed_all` writes knowledge for: agents "a" and "b", teams "x" and "y". The
+    /// resolver only follows a link whose owner has a row, so a test that wants a link to count
+    /// has to seed the owner as well as the knowledge.
+    async fn seed_owners(pool: &SqlitePool) {
+        let now = "2026-08-19T00:00:00+00:00";
+        for id in ["a", "b"] {
+            sqlx::query(
+                "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                                     created_at, updated_at)
+                 VALUES (?, ?, 'tests', 'work', 'claude', 'inherit', ?, ?)",
+            )
+            .bind(id)
+            .bind(format!("Agent {id}"))
+            .bind(now)
+            .bind(now)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        for id in ["x", "y"] {
+            sqlx::query(
+                "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds,
+                                    max_parallel, created_at, updated_at)
+                 VALUES (?, ?, 'ship it', 'a', 3, 2, ?, ?)",
+            )
+            .bind(id)
+            .bind(format!("Team {id}"))
+            .bind(now)
+            .bind(now)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
     async fn seed_all(pool: &SqlitePool) -> Ids {
+        seed_owners(pool).await;
         Ids {
             machine: seed(pool, "machine", None, "zanzibar machine-note")
                 .await
@@ -293,6 +369,104 @@ mod tests {
                 "row {outside} reached the trace without its link: {traced:?}"
             );
         }
+    }
+
+    /// Spec section 5.1: an agent or team that is named but has no row is a dangling link, and a
+    /// dangling link is skipped rather than followed. The rest of the chain still applies.
+    #[tokio::test]
+    async fn resolve_skips_an_agent_or_team_that_has_no_row() {
+        let pool = crate::testdb::fresh_pool().await;
+        let ghost = seed(&pool, "agent", Some("ghost"), "zanzibar ghost-note")
+            .await
+            .unwrap();
+        let phantom = seed(&pool, "team", Some("phantom"), "zanzibar phantom-note")
+            .await
+            .unwrap();
+        let machine = seed(&pool, "machine", None, "zanzibar machine-note")
+            .await
+            .unwrap();
+        let files: Vec<String> = Vec::new();
+
+        let loadout = resolve(
+            &pool,
+            &LoadoutInput {
+                agent: Some("ghost"),
+                team: Some("phantom"),
+                project: None,
+                job: None,
+                task_text: "zanzibar ghost phantom",
+                node: None,
+                files: &files,
+            },
+        )
+        .await;
+
+        assert!(
+            !loadout.block.contains("ghost-note"),
+            "a row-less agent's memory was rendered: {}",
+            loadout.block
+        );
+        assert!(
+            !loadout.block.contains("phantom-note"),
+            "a row-less team's memory was rendered: {}",
+            loadout.block
+        );
+        let traced = traced_ids(&loadout);
+        assert!(
+            !traced.contains(&ghost) && !traced.contains(&phantom),
+            "a link without an owner reached the trace: {traced:?}"
+        );
+        assert!(
+            traced.contains(&machine),
+            "the machine link still applies: {traced:?}"
+        );
+    }
+
+    /// Spec section 8: the textual threshold leaves out what the task does not mention, and a
+    /// briefing may come out empty. An empty block is still a briefing, not a read failure.
+    #[tokio::test]
+    async fn resolve_leaves_out_what_does_not_match_the_task_and_can_brief_nothing() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_owners(&pool).await;
+        seed(&pool, "agent", Some("a"), "zanzibar agent-a-note")
+            .await
+            .unwrap();
+        seed(&pool, "machine", None, "quokka unrelated")
+            .await
+            .unwrap();
+        let files: Vec<String> = Vec::new();
+        let asking = |task_text: &'static str| LoadoutInput {
+            agent: Some("a"),
+            team: None,
+            project: None,
+            job: None,
+            task_text,
+            node: None,
+            files: &files,
+        };
+
+        let matching = resolve(&pool, &asking("zanzibar")).await;
+        assert!(
+            matching.block.contains("agent-a-note"),
+            "{}",
+            matching.block
+        );
+        assert!(
+            !matching.block.contains("quokka unrelated"),
+            "a row the task does not mention was rendered: {}",
+            matching.block
+        );
+
+        let nothing = resolve(&pool, &asking("nothing here matches")).await;
+        assert!(
+            nothing.brief.is_some(),
+            "an empty briefing is still a briefing"
+        );
+        assert!(
+            nothing.block.is_empty(),
+            "nothing matched, yet a block was rendered: {}",
+            nothing.block
+        );
     }
 
     #[tokio::test]
