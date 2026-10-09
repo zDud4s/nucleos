@@ -222,6 +222,15 @@ pub async fn request(state: &AppState, session_id: i64, reason: &str) -> Result<
     )
     .await?;
     browser::attach_proposal(&state.pool, session_id, proposal).await?;
+    if row.visible {
+        // Best effort: the proposal is the authority, the panel's band is only a nicer way to see it.
+        crate::browser_panel::panel_push(
+            state,
+            &row.sidecar_id,
+            serde_json::json!({ "v": 1, "kind": "ask_wheel", "reason": reason }),
+        )
+        .await;
+    }
     Ok(proposal)
 }
 
@@ -245,6 +254,9 @@ pub async fn accept(state: &AppState, session_id: i64) -> Result<SessionRow, Whe
 pub enum SeatChoice {
     Shell,
     Window,
+    /// The chat panel of a visible browser window (spec browser-com-painel §4.1): no second window
+    /// and no nonce. A headless session is promoted into a visible one first.
+    Panel,
 }
 
 /// The approval with the seat spelled out (spec browser-volante §4.1).
@@ -276,6 +288,10 @@ pub async fn accept_with_seat(
         None if row.shell_eligible => SeatChoice::Shell,
         None => SeatChoice::Window,
     };
+
+    if seat == SeatChoice::Panel {
+        return accept_for_panel(state, &row).await;
+    }
 
     if seat == SeatChoice::Shell {
         // Same browser, no new Chrome: the row moves first, then the sidecar is told the person's
@@ -395,6 +411,99 @@ pub async fn accept_with_seat(
     Ok((live(&state.pool, session_id).await?, None))
 }
 
+/// The panel seat (spec browser-com-painel §4.1). A visible session keeps its browser and the person
+/// is begun on it; a headless one is promoted first — closed over there and opened again visible in
+/// the project's profile, the same row following it. The seat is the window, so there is no nonce.
+///
+/// A failure at either step is a failed delivery (spec §4.4a), never a return to the agent, with the
+/// reason noted on the proposal so the person can see why.
+async fn accept_for_panel(
+    state: &AppState,
+    row: &SessionRow,
+) -> Result<(SessionRow, Option<String>), WheelError> {
+    let session_id = row.id;
+
+    if !row.visible {
+        let project = row.project_id.clone().unwrap_or_default();
+        let sites = browser::admitted_origins(&state.pool, &project).await?;
+        let placement = Placement::project(&project, sites.read);
+        let url = landing(row);
+
+        // One browser per profile: the throwaway goes first, or the visible one cannot take the
+        // project's profile. A close that fails is not fatal, since the open below is what decides.
+        if let Err(error) = state.browser.client.close(&row.sidecar_id).await {
+            tracing::warn!(
+                session = session_id,
+                %error,
+                "the throwaway would not close before promotion"
+            );
+        }
+        let promoted = match state.browser.client.open_visible(&url, &placement).await {
+            Ok(promoted) => promoted,
+            Err(error) => {
+                let _ = browser::set_mode(
+                    &state.pool,
+                    &state.browser.modes,
+                    session_id,
+                    mode::WHEEL_REQUESTED,
+                    mode::DELIVERY_FAILED,
+                )
+                .await;
+                if let Some(proposal) = row.proposal_id {
+                    let _ = crate::proposals::note(
+                        &state.pool,
+                        proposal,
+                        &format!("the window would not open: {error}"),
+                    )
+                    .await;
+                }
+                return Err(WheelError::Sidecar(error));
+            }
+        };
+        browser::rebind_sidecar(&state.pool, session_id, &promoted.id, &placement.profile.id)
+            .await?;
+        browser::set_visible(&state.pool, session_id, true).await?;
+    }
+
+    if !browser::set_mode_seat(
+        &state.pool,
+        &state.browser.modes,
+        session_id,
+        mode::WHEEL_REQUESTED,
+        mode::HUMAN,
+        Some("window"),
+    )
+    .await?
+    {
+        return Err(WheelError::WrongState(
+            "this session's wheel was already handed over".to_string(),
+        ));
+    }
+    // The sidecar id is read again: a promotion changed it.
+    let current = live(&state.pool, session_id).await?;
+    if let Err(error) = state.browser.client.begin_person(&current.sidecar_id).await {
+        let _ = browser::set_mode(
+            &state.pool,
+            &state.browser.modes,
+            session_id,
+            mode::HUMAN,
+            mode::DELIVERY_FAILED,
+        )
+        .await;
+        if let Some(proposal) = row.proposal_id {
+            let _ = crate::proposals::note(
+                &state.pool,
+                proposal,
+                &format!("the panel seat would not begin: {error}"),
+            )
+            .await;
+        }
+        return Err(WheelError::Sidecar(error));
+    }
+    crate::browser_panel::start(state.clone(), current.id);
+    Ok((current, None))
+}
+
 /// The person moves a shell-seat session to a real window. Same mode (`human`), new seat.
 ///
 /// The agent's browser is closed and a headful one opens on the project's profile, exactly as at an
@@ -504,6 +613,12 @@ pub async fn give_back(
             row.mode
         )));
     }
+    if row.visible {
+        // The browser panel's session: the HTTP route carries no note (spec browser-com-painel §4.2).
+        return crate::browser_panel::give_back_from_panel(state, &row, None)
+            .await
+            .map(|()| Vec::new());
+    }
     if row.seat.as_deref() == Some("shell") {
         return give_back_from_shell(state, &row, to).await;
     }
@@ -523,10 +638,7 @@ pub async fn give_back(
 }
 
 /// Is the run that owns this session still going? Only then is there somebody to hand it back to.
-pub(crate) async fn run_is_live(
-    pool: &SqlitePool,
-    row: &SessionRow,
-) -> Result<bool, WheelError> {
+pub(crate) async fn run_is_live(pool: &SqlitePool, row: &SessionRow) -> Result<bool, WheelError> {
     let Some(run_id) = row.run_id else {
         return Ok(false);
     };
@@ -1972,6 +2084,466 @@ mod tests {
 
         let second = ask(state.clone()).await;
         assert!(second.get("wheel_returned").is_none(), "{second}");
+        db.close().await;
+    }
+
+    // ---- the browser panel's seat (spec browser-com-painel, P8) -------------------------------
+
+    /// A conversation, unarchived, with no directory of its own.
+    async fn panel_chat(state: &AppState, chat_id: &str) {
+        sqlx::query("INSERT INTO chats (chat_id, brain, created_at) VALUES (?, 'cloud', ?)")
+            .bind(chat_id)
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Run 7 (the run `panel_row` points at), in the given status, owned by `chat_id` when given.
+    async fn panel_run(state: &AppState, status: &str, chat_id: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, chat_id, created_at) \
+             VALUES (7, 'browse', ?, 'assistant', ?, '2026-08-16T10:00:00Z')",
+        )
+        .bind(status)
+        .bind(chat_id)
+        .execute(&state.pool)
+        .await
+        .expect("insert run");
+    }
+
+    /// One open row for project `acme` on sidecar id `s1`, opened by run 7, as the panel sees it.
+    async fn panel_row(
+        state: &AppState,
+        profile_kind: &str,
+        row_mode: &str,
+        seat: Option<&str>,
+        visible: bool,
+    ) -> i64 {
+        let profile_id = if profile_kind == "project" {
+            "acme"
+        } else {
+            "run-7"
+        };
+        sqlx::query(
+            "INSERT INTO browser_sessions \
+                (sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
+                 final_url, rule, mode, seat, visible, opened_at) \
+             VALUES ('s1', 7, 'acme', ?, ?, 'https://jira.example.org/login', \
+                     'https://jira.example.org/login', 'project-site', ?, ?, ?, \
+                     '2026-08-16T10:00:00Z')",
+        )
+        .bind(profile_kind)
+        .bind(profile_id)
+        .bind(row_mode)
+        .bind(seat)
+        .bind(i64::from(visible))
+        .execute(&state.pool)
+        .await
+        .expect("insert")
+        .last_insert_rowid()
+    }
+
+    async fn panel_fresh(state: &AppState, id: i64) -> SessionRow {
+        browser::session_row(&state.pool, id)
+            .await
+            .unwrap()
+            .expect("the row")
+    }
+
+    /// Everything the daemon said to a chat in the panel's name, oldest first.
+    async fn panel_deliveries(state: &AppState, chat_id: &str) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT prompt FROM runs WHERE chat_id = ? AND origin = 'browser-panel' ORDER BY id",
+        )
+        .bind(chat_id)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    fn panel_count(seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, verb: &str) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| seen.as_str() == verb)
+            .count()
+    }
+
+    /// The person hands the wheel back from the panel and nothing in the chain is new: the session
+    /// goes back to the agent, the keep question is settled on the spot, and the chat that owns the
+    /// session hears it.
+    #[tokio::test]
+    async fn give_back_from_the_panel_with_a_live_chat_owner_returns_to_the_agent() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        panel_chat(&state, "panel-chat-give-back-live").await;
+        panel_run(&state, "running", Some("panel-chat-give-back-live")).await;
+        let id = panel_row(&state, "project", mode::HUMAN, Some("window"), true).await;
+        let nonce = state.browser.seats.issue(id);
+        let row = panel_fresh(&state, id).await;
+
+        let _ = crate::browser_panel::give_back_from_panel(&state, &row, None).await;
+
+        assert!(
+            volante_saw(&seen, "person/end"),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        let row = panel_fresh(&state, id).await;
+        assert_eq!(row.mode, mode::AGENT);
+        assert_eq!(row.seat, None);
+        assert_eq!(row.closed_at, None, "the session stays open for the agent");
+        assert!(row.chain.is_some(), "the chain is recorded");
+        assert!(
+            row.chain_decided_at.is_some(),
+            "with nothing new to keep the question is settled and the note goes now"
+        );
+        assert!(!state.browser.seats.matches(id, &nonce));
+        let said = panel_deliveries(&state, "panel-chat-give-back-live").await;
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("the person handed the wheel back"),
+            "{said:?}"
+        );
+        db.close().await;
+    }
+
+    /// Nobody is left to hear it: the session closes as a plain return and nothing is delivered.
+    #[tokio::test]
+    async fn give_back_from_the_panel_with_a_dead_owner_closes() {
+        // An archived chat, and a run that has finished.
+        for archived_chat in [true, false] {
+            let (db, state, _) = wheeled(vec![], false).await;
+            if archived_chat {
+                panel_chat(&state, "gone-chat").await;
+                sqlx::query("UPDATE chats SET archived_at = '2026-08-17T00:00:00Z'")
+                    .execute(&state.pool)
+                    .await
+                    .unwrap();
+                panel_run(&state, "running", Some("gone-chat")).await;
+            } else {
+                panel_run(&state, "completed", None).await;
+            }
+            let id = panel_row(&state, "project", mode::HUMAN, Some("window"), true).await;
+            let row = panel_fresh(&state, id).await;
+
+            let _ = crate::browser_panel::give_back_from_panel(&state, &row, None).await;
+
+            let row = panel_fresh(&state, id).await;
+            assert!(row.closed_at.is_some(), "archived_chat={archived_chat}");
+            assert_ne!(row.mode, mode::AGENT, "archived_chat={archived_chat}");
+            assert_eq!(
+                volante_closed_reason(&state, id).await.as_deref(),
+                Some("wheel-returned"),
+                "archived_chat={archived_chat}"
+            );
+            assert!(
+                panel_deliveries(&state, "gone-chat").await.is_empty(),
+                "archived_chat={archived_chat}"
+            );
+            assert!(!state.browser.seats.take_returned(id));
+            assert!(state.browser.seats.take_panel_messages(id).is_empty());
+            db.close().await;
+        }
+    }
+
+    /// `SeatChoice::Panel` on a window that is already visible: no new browser, the person is begun
+    /// on the one that is there, and the seat is the window, which has no nonce.
+    #[tokio::test]
+    async fn the_panel_seat_begins_the_person_on_a_visible_session() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        let id = panel_row(&state, "project", mode::WHEEL_REQUESTED, None, true).await;
+
+        let (row, nonce) = accept_with_seat(&state, id, Some(SeatChoice::Panel))
+            .await
+            .expect("accept");
+
+        assert_eq!(row.mode, mode::HUMAN);
+        assert_eq!(row.seat.as_deref(), Some("window"));
+        assert_eq!(row.sidecar_id, "s1", "the same browser");
+        assert!(row.visible);
+        assert_eq!(nonce, None);
+        assert!(volante_saw(&seen, "person/begin"));
+        assert!(!volante_saw(&seen, "wheel/take"), "no second window");
+        assert_eq!(panel_count(&seen, "close"), 0, "nothing is promoted");
+        assert_eq!(panel_count(&seen, "open"), 0, "nothing is promoted");
+        db.close().await;
+    }
+
+    /// A headless session cannot be driven from the panel, so it is promoted: closed over there and
+    /// opened again visible in the project's profile, with the same row following it.
+    #[tokio::test]
+    async fn the_panel_seat_promotes_a_headless_session_into_the_project_profile() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        let id = panel_row(&state, "ephemeral", mode::WHEEL_REQUESTED, None, false).await;
+
+        let (row, nonce) = accept_with_seat(&state, id, Some(SeatChoice::Panel))
+            .await
+            .expect("accept");
+
+        assert_eq!(nonce, None);
+        assert_eq!(row.mode, mode::HUMAN);
+        assert_eq!(row.seat.as_deref(), Some("window"));
+        assert_eq!(row.profile_kind, "project");
+        assert_eq!(row.profile_id, "acme");
+        assert!(row.visible, "the row remembers the window is visible");
+        let calls = seen.lock().unwrap().clone();
+        let closed = calls.iter().position(|call| call == "close");
+        let opened = calls.iter().position(|call| call == "open");
+        assert!(
+            matches!((closed, opened), (Some(closed), Some(opened)) if closed < opened),
+            "the throwaway closes before the visible one opens: {calls:?}"
+        );
+        let begun = calls.iter().position(|call| call == "person/begin");
+        assert!(
+            matches!((opened, begun), (Some(opened), Some(begun)) if opened < begun),
+            "the person begins on the promoted browser: {calls:?}"
+        );
+        assert!(!calls.iter().any(|call| call == "wheel/take"), "{calls:?}");
+        db.close().await;
+    }
+
+    /// A chain with a host the project does not admit yet: the question goes to the person first, the
+    /// note waits for the answer, and the grant is made before the agent hears anything.
+    #[tokio::test]
+    async fn with_candidates_the_note_waits_for_keep_and_keep_grants_first() {
+        let (db, state, _) = wheeled(vec!["https://jira.example.org/login"], false).await;
+        panel_chat(&state, "panel-chat-with-candidates").await;
+        panel_run(&state, "running", Some("panel-chat-with-candidates")).await;
+        let id = panel_row(&state, "project", mode::HUMAN, Some("window"), true).await;
+        let row = panel_fresh(&state, id).await;
+
+        let _ = crate::browser_panel::give_back_from_panel(&state, &row, Some("all set")).await;
+
+        let row = panel_fresh(&state, id).await;
+        assert_eq!(row.mode, mode::AGENT);
+        assert_eq!(row.chain_decided_at, None, "the keep question is open");
+        assert!(
+            panel_deliveries(&state, "panel-chat-with-candidates")
+                .await
+                .is_empty(),
+            "the note waits for the answer"
+        );
+
+        let _ = crate::browser_panel::on_keep(&state, &row, true, false).await;
+
+        let allowed = browser::admitted_origins(&state.pool, "acme")
+            .await
+            .unwrap();
+        assert!(
+            allowed
+                .read
+                .iter()
+                .any(|origin| origin.contains("jira.example.org")),
+            "the grant is made: {allowed:?}"
+        );
+        assert!(panel_fresh(&state, id).await.chain_decided_at.is_some());
+        let said = panel_deliveries(&state, "panel-chat-with-candidates").await;
+        assert_eq!(said.len(), 1, "delivered once, after the grant: {said:?}");
+        assert!(said[0].contains("all set"), "{said:?}");
+
+        // Answering again neither grants nor delivers a second time.
+        let _ = crate::browser_panel::on_keep(&state, &row, true, false).await;
+        assert_eq!(
+            panel_deliveries(&state, "panel-chat-with-candidates")
+                .await
+                .len(),
+            1
+        );
+        db.close().await;
+    }
+
+    /// Giving back twice delivers once: the second call finds a row that is no longer the person's.
+    #[tokio::test]
+    async fn a_second_give_back_does_not_deliver_twice() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        panel_chat(&state, "panel-chat-second-give-back").await;
+        panel_run(&state, "running", Some("panel-chat-second-give-back")).await;
+        let id = panel_row(&state, "project", mode::HUMAN, Some("window"), true).await;
+        let row = panel_fresh(&state, id).await;
+
+        let _ = crate::browser_panel::give_back_from_panel(&state, &row, None).await;
+        let _ = crate::browser_panel::give_back_from_panel(&state, &row, None).await;
+
+        assert_eq!(
+            panel_deliveries(&state, "panel-chat-second-give-back")
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(panel_count(&seen, "person/end"), 1, "the stretch ends once");
+        assert_eq!(panel_fresh(&state, id).await.mode, mode::AGENT);
+        db.close().await;
+    }
+
+    /// A run with no chat has nobody to speak to, so the note rides on the wheel the agent is told
+    /// about with its next snapshot.
+    #[tokio::test]
+    async fn a_returned_wheel_on_a_run_carries_the_note() {
+        let (db, state, _) = wheeled(vec![], false).await;
+        panel_run(&state, "running", None).await;
+        let id = panel_row(&state, "project", mode::HUMAN, Some("window"), true).await;
+        let row = panel_fresh(&state, id).await;
+
+        let _ = crate::browser_panel::give_back_from_panel(&state, &row, Some("check the invoice"))
+            .await;
+
+        assert!(
+            state.browser.seats.take_returned(id),
+            "the wheel is announced"
+        );
+        let note = state.browser.seats.take_returned_note(id);
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains("check the invoice")),
+            "{note:?}"
+        );
+        assert!(state.browser.seats.take_returned_note(id).is_none(), "once");
+        db.close().await;
+    }
+
+    /// Taking the wheel from the panel: an approved request and an agent that is simply driving both
+    /// end with the person at the wheel, and the owner is told.
+    #[tokio::test]
+    async fn take_wheel_from_the_panel_moves_the_mode_and_tells_the_owner() {
+        // A requested wheel: the proposal is approved by the very act of taking it.
+        let (db, state, seen) = wheeled(vec![], false).await;
+        panel_chat(&state, "panel-chat-take-wheel").await;
+        panel_run(&state, "running", Some("panel-chat-take-wheel")).await;
+        let id = panel_row(&state, "project", mode::WHEEL_REQUESTED, None, true).await;
+        let proposal = crate::proposals::create_wheel_request(
+            &state.pool,
+            crate::proposals::WheelAsk {
+                run_id: Some(7),
+                project_id: "acme",
+                session_id: id,
+                requested_url: "https://jira.example.org/login",
+                final_url: "https://jira.example.org/login",
+                origin: "https://jira.example.org",
+                reasoning: "login",
+            },
+        )
+        .await
+        .expect("proposal");
+        browser::attach_proposal(&state.pool, id, proposal)
+            .await
+            .unwrap();
+        let row = panel_fresh(&state, id).await;
+
+        let _ = crate::browser_panel::take_from_panel(&state, &row).await;
+
+        let raised = crate::proposals::get(&state.pool, proposal)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(raised.status, "approved");
+        let row = panel_fresh(&state, id).await;
+        assert_eq!(row.mode, mode::HUMAN);
+        assert_eq!(row.seat.as_deref(), Some("window"));
+        assert!(volante_saw(&seen, "person/begin"));
+        let said = panel_deliveries(&state, "panel-chat-take-wheel").await;
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("the person took the wheel"), "{said:?}");
+        db.close().await;
+
+        // An agent that is driving: the mode moves, and tells the owner.
+        let (db, state, seen) = wheeled(vec![], false).await;
+        panel_chat(&state, "panel-chat-take-wheel").await;
+        panel_run(&state, "running", Some("panel-chat-take-wheel")).await;
+        let id = panel_row(&state, "project", mode::AGENT, None, true).await;
+        let row = panel_fresh(&state, id).await;
+
+        let _ = crate::browser_panel::take_from_panel(&state, &row).await;
+
+        let row = panel_fresh(&state, id).await;
+        assert_eq!(row.mode, mode::HUMAN);
+        assert_eq!(row.seat.as_deref(), Some("window"));
+        assert!(volante_saw(&seen, "person/begin"));
+        let said = panel_deliveries(&state, "panel-chat-take-wheel").await;
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("the person took the wheel"), "{said:?}");
+        db.close().await;
+
+        // If the person's stretch cannot begin, the agent keeps the wheel and nobody is told.
+        let (db, state, _) = wheeled_with(vec![], false, true).await;
+        panel_chat(&state, "panel-chat-take-wheel").await;
+        panel_run(&state, "running", Some("panel-chat-take-wheel")).await;
+        let id = panel_row(&state, "project", mode::AGENT, None, true).await;
+        let row = panel_fresh(&state, id).await;
+
+        let _ = crate::browser_panel::take_from_panel(&state, &row).await;
+
+        assert_eq!(panel_fresh(&state, id).await.mode, mode::AGENT);
+        assert!(
+            panel_deliveries(&state, "panel-chat-take-wheel")
+                .await
+                .is_empty()
+        );
+        db.close().await;
+    }
+
+    /// The run that opened the session has finished: the person may still take it, and it stays
+    /// theirs until they close the window. Nobody is told, because nobody is there.
+    #[tokio::test]
+    async fn a_finished_run_leaves_the_session_with_the_person() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        panel_run(&state, "completed", None).await;
+        let id = panel_row(&state, "project", mode::AGENT, None, true).await;
+        let row = panel_fresh(&state, id).await;
+
+        let _ = crate::browser_panel::take_from_panel(&state, &row).await;
+
+        let row = panel_fresh(&state, id).await;
+        assert_eq!(row.mode, mode::HUMAN);
+        assert_eq!(row.seat.as_deref(), Some("window"));
+        assert_eq!(row.closed_at, None, "the session is not closed under them");
+        assert!(volante_saw(&seen, "person/begin"));
+        assert!(state.browser.seats.take_panel_messages(id).is_empty());
+        assert!(state.browser.seats.take_returned_note(id).is_none());
+        db.close().await;
+    }
+
+    /// The person closes the browser: the row closes with its own reason and a live owner hears it;
+    /// a dead one is not spoken to.
+    #[tokio::test]
+    async fn person_closed_closes_the_row_and_tells_the_owner() {
+        let (db, state, _) = wheeled(vec![], false).await;
+        panel_chat(&state, "panel-chat-person-closed").await;
+        panel_run(&state, "running", Some("panel-chat-person-closed")).await;
+        let id = panel_row(&state, "project", mode::HUMAN, Some("window"), true).await;
+        let nonce = state.browser.seats.issue(id);
+        let row = panel_fresh(&state, id).await;
+
+        let _ = crate::browser_panel::on_person_closed(&state, &row).await;
+
+        assert!(panel_fresh(&state, id).await.closed_at.is_some());
+        assert_eq!(
+            volante_closed_reason(&state, id).await.as_deref(),
+            Some("person-closed")
+        );
+        assert!(!state.browser.seats.matches(id, &nonce));
+        let said = panel_deliveries(&state, "panel-chat-person-closed").await;
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("the person closed the browser"),
+            "{said:?}"
+        );
+        db.close().await;
+
+        // The owner is gone: the row still closes, and nothing is said.
+        let (db, state, _) = wheeled(vec![], false).await;
+        panel_run(&state, "completed", None).await;
+        let id = panel_row(&state, "project", mode::HUMAN, Some("window"), true).await;
+        let row = panel_fresh(&state, id).await;
+
+        let _ = crate::browser_panel::on_person_closed(&state, &row).await;
+
+        assert_eq!(
+            volante_closed_reason(&state, id).await.as_deref(),
+            Some("person-closed")
+        );
+        assert!(state.browser.seats.take_panel_messages(id).is_empty());
+        assert!(!state.browser.seats.take_returned(id));
         db.close().await;
     }
 }

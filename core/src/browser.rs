@@ -1180,7 +1180,24 @@ pub async fn post_open(
         now: &now.to_rfc3339(),
     };
     match open_with(&state.pool, &state.browser, ask, body.visible).await {
-        Ok(Opened::Session(row)) => axum::Json(row).into_response(),
+        Ok(Opened::Session(row)) => {
+            if row.visible {
+                crate::browser_panel::start(state.clone(), row.id);
+                crate::browser_panel::panel_push(
+                    &state,
+                    &row.sidecar_id,
+                    serde_json::json!({
+                        "v": 1,
+                        "kind": "message",
+                        "role": "action",
+                        "text": format!("browser: open {}", body.url),
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                    }),
+                )
+                .await;
+            }
+            axum::Json(row).into_response()
+        }
         Ok(Opened::Refused { rule, recoverable }) => (
             // 409 rather than 403: nothing about the credentials is wrong. The request cannot be
             // carried out in the state the machine is in, and `recoverable` says whether that state
@@ -1344,6 +1361,25 @@ pub async fn post_act(
                     row.project_id.as_deref(),
                     &result.writes,
                     &now,
+                )
+                .await;
+            }
+            if row.visible && result.outcome == "done" {
+                let target = if body.element_ref.is_empty() {
+                    result.url.as_str()
+                } else {
+                    body.element_ref.as_str()
+                };
+                crate::browser_panel::panel_push(
+                    &state,
+                    &row.sidecar_id,
+                    serde_json::json!({
+                        "v": 1,
+                        "kind": "message",
+                        "role": "action",
+                        "text": format!("browser: {} {}", body.kind, target).trim_end(),
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                    }),
                 )
                 .await;
             }

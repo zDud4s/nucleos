@@ -16,6 +16,8 @@ pub struct SeatState {
     returned: Mutex<HashSet<i64>>,
     panel_messages: Mutex<HashMap<i64, Vec<String>>>,
     returned_notes: Mutex<HashMap<i64, String>>,
+    held_returns: Mutex<HashMap<i64, String>>,
+    pumping: Mutex<HashSet<i64>>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -45,6 +47,16 @@ impl SeatState {
         }
     }
 
+    /// Claim the panel pump of a session: true for the first caller only, until `release_pump`.
+    pub fn claim_pump(&self, id: i64) -> bool {
+        locked(&self.pumping).insert(id)
+    }
+
+    /// Give the pump claim back, so a later start may read the panel again.
+    pub fn release_pump(&self, id: i64) {
+        locked(&self.pumping).remove(&id);
+    }
+
     /// Drop a session's nonce.
     pub fn forget(&self, id: i64) {
         locked(&self.nonces).remove(&id);
@@ -69,6 +81,17 @@ impl SeatState {
     /// Consume the note left with the wheel: `Some` once per `mark_returned_with_note`.
     pub fn take_returned_note(&self, id: i64) -> Option<String> {
         locked(&self.returned_notes).remove(&id)
+    }
+
+    /// Hold what the owner will be told about the returned wheel until the person has answered the
+    /// keep question: the grant is made before the agent hears anything.
+    pub fn hold_return(&self, id: i64, text: &str) {
+        locked(&self.held_returns).insert(id, text.to_string());
+    }
+
+    /// Consume the held return text: `Some` once per `hold_return`.
+    pub fn take_held_return(&self, id: i64) -> Option<String> {
+        locked(&self.held_returns).remove(&id)
     }
 
     /// Queue text the person typed in the panel for a run that has no chat to speak to.
