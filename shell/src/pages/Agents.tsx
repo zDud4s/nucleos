@@ -32,6 +32,7 @@ import {
   Teach,
 } from "../ui";
 import "./agents.css";
+import { LoadoutPreview } from "./LoadoutPreview";
 
 /**
  * Agents — the house catalogue.
@@ -848,6 +849,7 @@ function AgentEditor({
         />
       </div>
       {del.isError && <DeleteRefusal error={del.error} />}
+      <LoadoutPreview agentId={agent.id} />
     </Modal>
   );
 }
