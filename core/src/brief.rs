@@ -808,6 +808,7 @@ mod tests {
     const BRIEFED_CONTEXTS: &[&str] = &[
         "assistant.rs",
         "council.rs",
+        "http.rs",
         "job.rs",
         "loadout.rs",
         "runs.rs",

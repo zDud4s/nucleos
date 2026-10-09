@@ -1500,6 +1500,7 @@ mod tests {
             (Method::POST, "/loadout/tools/1/approve"),
             (Method::POST, "/loadout/tools/1/reject"),
             (Method::POST, "/loadout/tools/1/revoke"),
+            (Method::POST, "/loadout/preview"),
         ];
         for scope in [
             run,

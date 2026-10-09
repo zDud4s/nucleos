@@ -34,6 +34,7 @@ import {
   Teach,
 } from "../ui";
 import "./agents.css";
+import { LoadoutPreview } from "./LoadoutPreview";
 
 /**
  * Agents — the house catalogue.
@@ -832,6 +833,7 @@ function AgentEditor({
       <ContextRefs ownerKind="agent" ownerId={agent.id} />
       <ScopedMemory scopeKind="agent" scopeId={agent.id} />
       <ScopedTools ownerKind="agent" ownerId={agent.id} />
+      <LoadoutPreview agentId={agent.id} />
 
       {/*
         The delete, and what this page can see standing on it — before the

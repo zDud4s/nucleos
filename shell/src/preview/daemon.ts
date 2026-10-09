@@ -2469,6 +2469,28 @@ const SCOPED_KNOWLEDGE: Known[] = [
     title: "Git's bash is the POSIX shell here", body: "`bash` on PATH is WSL; name Git's bash.exe explicitly." }),
 ];
 
+/** What the agent page's loadout preview photographs: memory, one approved extra, one missing ref. */
+const LOADOUT_PREVIEW = {
+  agent_id: "copywriter",
+  team_id: null,
+  box: "job_node",
+  memory: "What you know:\n- Copy is short: one idea per sentence.",
+  block: [
+    "What you know:",
+    "- Copy is short: one idea per sentence.",
+    "",
+    "Context files you were given (open one with the read_context tool):",
+    "- C:/brand/voice.md (file) — the house voice",
+    "- C:/brand/old-launch.md (file) (em falta)",
+  ].join("\n"),
+  tools: [{ name: "read_context", origin: "base" }, { name: "request_tool", origin: "base" }, { name: "web_read", origin: "agent" }],
+  refs: [
+    { owner_kind: "agent", path: "C:/brand/voice.md", kind: "file", note: "the house voice", state: "active" },
+    { owner_kind: "agent", path: "C:/brand/old-launch.md", kind: "file", note: null, state: "missing" },
+  ],
+  add_dirs: [],
+};
+
 export const KNOWLEDGE: Known[] = [...PROJECT_KNOWLEDGE, ...SCOPED_KNOWLEDGE];
 
 /**
@@ -3017,6 +3039,7 @@ export function answer(path: string, init?: RequestInit): unknown {
     if (splitQuery(path)[1].get("include_archived") !== "true") return NOTES_GRAPH;
     return { ...NOTES_GRAPH, notes: OWNER_NOTES } satisfies NotesGraph;
   }
+  if (path === "/loadout/preview" && init?.method === "POST") return LOADOUT_PREVIEW;
   /* One agent's or team's context files; the second is gone from disk, which is the case worth photographing. */
   const contextRefs = /^\/context-refs\/(agent|team)\/([^/]+)$/.exec(path);
   if (contextRefs !== null && init?.method === undefined) {
