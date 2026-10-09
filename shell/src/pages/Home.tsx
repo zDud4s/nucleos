@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { FeedEmbed } from "../app/FeedEmbed";
@@ -36,9 +36,15 @@ export function Home() {
   const budget = useBudget();
   const health = useSystemHealth();
   // `useWaitingCount` hands back only the number, which cannot tell "not asked yet" from "asked
-  // and refused". This observer shares its query (same key, never fetches on its own) so the
-  // card can say which of the two it is.
-  const waitingRead = useQuery({ queryKey: keys.waiting.count, enabled: false });
+  // and refused". Read the state of its query (same key) without mounting a second observer: an
+  // observer with no queryFn would be a fetcher with nothing to fetch with. Home re-renders on
+  // every change of that query because `useWaitingCount` above is subscribed to it.
+  const waitingState = useQueryClient().getQueryState<unknown>(keys.waiting.count);
+  const waitingRead = {
+    isError: waitingState?.status === "error",
+    data: waitingState?.data,
+    dataUpdatedAt: waitingState?.dataUpdatedAt ?? 0,
+  };
 
   const roster = projects.data;
   const spend = budget.data;

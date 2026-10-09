@@ -354,8 +354,10 @@ describe("Teams - the table", () => {
     await renderTeams();
 
     const table = await departments();
-    const pulse = within(table).getByRole("columnheader", { name: /Pulse/ });
-    expect(pulse.querySelector(".teams-col-key")?.textContent).toBe("per day");
+    // The unit moved out of the header cell into the legend row above the table.
+    expect(within(table).getByRole("columnheader", { name: /Pulse/ })).toBeDefined();
+    const key = screen.getByRole("list", { name: "What the marks mean" });
+    expect(key.textContent).toContain("a bar per day");
 
     // Oldest first, plural where the count earns it, and the day spelled out.
     const said = [...table.querySelectorAll("svg title")].map((node) => node.textContent);
@@ -392,10 +394,10 @@ describe("Teams - the table", () => {
     await renderTeams();
 
     const table = await departments();
-    expect(within(table).getByText("send_email: does it")).toBeDefined();
-    expect(within(table).getByText("file_document: asks first")).toBeDefined();
+    expect(within(table).getByText("Email: does it")).toBeDefined();
+    expect(within(table).getByText("Documents: asks first")).toBeDefined();
     // No grant row at all IS the denial — there is no `deny` mode in the núcleo.
-    expect(within(table).getByText("calendar_event: asks you")).toBeDefined();
+    expect(within(table).getByText("Calendar: asks you")).toBeDefined();
   });
 
   it("the glyph column says what its glyphs mean", async () => {
@@ -403,7 +405,9 @@ describe("Teams - the table", () => {
 
     await renderTeams();
 
-    const header = within(await departments()).getByRole("columnheader", { name: /On its own/ });
+    await departments();
+    // The key left the header cell for a legend row above the table.
+    const header = screen.getByRole("list", { name: "What the marks mean" });
     expect(header.textContent).toContain("does it");
     expect(header.textContent).toContain("asks first");
     expect(header.textContent).toContain("asks you");

@@ -509,7 +509,7 @@
 }
 
 .teams-task-what:hover {
-  color: var(--accent);
+  color: var(--text);
   text-decoration: underline;
 }
 
@@ -1584,7 +1584,10 @@
 
 /* "required" next to a label, in words: an asterisk is a colour-and-glyph convention nobody
    reads aloud. Not uppercase, unlike the label it follows. */
-.teams-required {
+/* The "required" marker is drawn, not written into the label, so the control's accessible name
+   stays exactly "Mission"; aria-required on the control carries it for assistive tech. */
+.teams-label[data-required="true"]::after {
+  content: "  b7  required";
   text-transform: none;
   letter-spacing: normal;
   color: var(--text-muted);
@@ -1645,7 +1648,7 @@
 
 .teams-check input {
   flex: none;
-  accent-color: var(--accent);
+  accent-color: var(--text-muted);
 }
 
 .teams-check input:focus-visible {

@@ -672,9 +672,8 @@ function Field({
 }) {
   return (
     <label className="teams-field">
-      <span className="teams-label">
+      <span className="teams-label" data-required={required ? "true" : undefined}>
         {label}
-        {required && <span className="teams-required"> · required</span>}
       </span>
       {children}
     </label>
