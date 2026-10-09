@@ -557,6 +557,36 @@ pub(crate) async fn submit(
     caller: Caller,
     args: &VerifyArgs,
 ) -> Result<i64, VerifyError> {
+    let (id, _) = submit_checked(executor, caller, args).await?;
+    Ok(id)
+}
+
+/// Whether `worktree`'s test map is, right now, the one `project_id`'s root holds
+/// (`job::map_is_trusted`). `false` on any doubt: no root recorded, an unreadable record, a join
+/// error.
+async fn map_trusted_now(pool: &SqlitePool, project_id: &str, worktree: &Path) -> bool {
+    let project_root = match inspect::project_root(pool, project_id).await {
+        Ok(Some(root)) => PathBuf::from(root),
+        _ => return false,
+    };
+    let worktree = worktree.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::job::map_is_trusted(&worktree, &project_root))
+        .await
+        .unwrap_or(false)
+}
+
+/// `submit` that also says whether the plan was made from a map the daemon could vouch for at
+/// submit time: `true` only for a `test`/`scope` request whose worktree map was the root's (and its
+/// scripts untouched) when the map was loaded. `clean_tree` does not see ignored files, so a map
+/// (or a script its commands name) that is gitignored can be rewritten before the submit and put
+/// back before the ticket completes; the completion-time check alone would then bless a plan the
+/// root's map never made. A caller that holds its own tree (`gate_scope_ticketed`) must not
+/// confirm it when this is `false`.
+async fn submit_checked(
+    executor: &Arc<Executor>,
+    caller: Caller,
+    args: &VerifyArgs,
+) -> Result<(i64, bool), VerifyError> {
     let pool = &executor.pool;
     let deadline = Instant::now() + OPERATION_TIMEOUT;
     let (root, project_id) =
@@ -592,6 +622,16 @@ pub(crate) async fn submit(
             .await
             .map_err(internal)?
     };
+
+    // F3-12: the map the plan is built from must be the root's at this moment, not only when the
+    // ticket ends. Untrusted here means no tree is held, so `confirm_measured_tree` never runs.
+    let map_trusted = submitted_tree.is_some()
+        && matches!(map, MapState::Valid(_))
+        && map_trusted_now(pool, &project_id, &root).await;
+    let submitted_tree = submitted_tree.filter(|_| map_trusted);
+    if !map_trusted && args.kind == Kind::Test && args.scope == ScopeArg::Scope {
+        tracing::info!("verify: the test map is not the root's at submit; no tree is recorded");
+    }
 
     let own_files = args.scope == ScopeArg::Own && args.files.is_some();
     let needs_base =
@@ -876,7 +916,7 @@ pub(crate) async fn submit(
         ));
     }
 
-    Ok(id)
+    Ok((id, map_trusted))
 }
 
 /// Records, once request `id`'s ticket is done, the tree its `test`/`scope` run measured, and only
@@ -1292,8 +1332,8 @@ pub(crate) async fn gate_scope_ticketed(
         .await
         .ok()
         .flatten();
-    let id = match submit(executor, caller, &args).await {
-        Ok(id) => id,
+    let (id, map_trusted) = match submit_checked(executor, caller, &args).await {
+        Ok(submitted) => submitted,
         Err(error) => {
             tracing::warn!(
                 caller = %caller.label(),
@@ -1305,7 +1345,10 @@ pub(crate) async fn gate_scope_ticketed(
     };
     let verdict = match wait_ticket(&executor.pool, id, wait).await {
         Ok(Some((ticket, _))) => {
+            // Only a map that was the root's at submit time may be vouched for later; see
+            // `submit_checked`.
             if ticket.done
+                && map_trusted
                 && let Some(tree) = before
             {
                 confirm_measured_tree(executor.pool.clone(), id, worktree.to_path_buf(), tree)
@@ -2647,6 +2690,41 @@ tests:
 
         let request = args(Kind::Test, ScopeArg::Scope, &side, None, Some(&f.c1));
         let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+
+        assert_nothing_recorded(&f.pool, id).await;
+    }
+
+    #[tokio::test]
+    async fn an_ignored_map_that_differs_at_submit_records_no_tree_even_if_restored() {
+        // No worker yet, so the ticket stays open while the map is put back.
+        let f = fixture(Some(&plain_map()), Some("git --version"), false).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = holder.path().join("side");
+        git_in(
+            f.repo.path(),
+            &["worktree", "add", "-q", "-b", "side", &path_arg(&side)],
+        );
+        // The worktree gitignores its map: the file stays on disk, out of `git status`, so a clean
+        // tree says nothing about the bytes it holds.
+        git_in(&side, &["rm", "-q", "--cached", tests_map::MAP_FILE]);
+        let ignore = format!("{}\n", tests_map::MAP_FILE);
+        std::fs::write(side.join(".gitignore"), ignore).unwrap();
+        git_in(&side, &["add", ".gitignore"]);
+        git_in(&side, &["commit", "-q", "-m", "ignore the map"]);
+
+        // Differs from the root's bytes at submit, still a valid map, and the tree stays clean.
+        let map_path = side.join(tests_map::MAP_FILE);
+        let root_map = std::fs::read(f.repo.path().join(tests_map::MAP_FILE)).unwrap();
+        let mut narrowed = String::from_utf8(root_map.clone()).unwrap();
+        narrowed.push_str("# changed in the worktree\n");
+        std::fs::write(&map_path, narrowed).unwrap();
+
+        let request = args(Kind::Test, ScopeArg::Scope, &side, None, Some(&f.c1));
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+
+        // Restored to the root's bytes before the ticket completes.
+        std::fs::write(&map_path, root_map).unwrap();
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
 
         assert_nothing_recorded(&f.pool, id).await;
     }
