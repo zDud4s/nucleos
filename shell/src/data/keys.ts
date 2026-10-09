@@ -356,6 +356,18 @@ export const keys = {
   },
 
   /**
+   * The tools an agent or team has been equipped with, and the ones asked for
+   * — `GET /loadout/tools`. One root, so a decision refetches the section on an
+   * agent page, a Charter and the Brain's queue together.
+   */
+  loadoutTools: {
+    all: ["loadout-tools"] as const,
+    /** One status, optionally narrowed to one owner. */
+    list: (status: string, ownerKind: string | null, ownerId: string | null) =>
+      ["loadout-tools", status, ownerKind, ownerId] as const,
+  },
+
+  /**
    * The owner's own notes — `GET /owner-notes` and its graph. One root, so a
    * write to a note or a link refetches the list, the open note and the graph
    * together: a link edit changes all three.
