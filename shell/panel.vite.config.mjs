@@ -21,6 +21,8 @@ export default defineConfig(async (env) => {
       },
     },
     define: { "process.env.NODE_ENV": '"production"' },
+    // The bundle is one script; the app's public/ assets have no place in the sidecar.
+    publicDir: false,
     build: {
       outDir: "../sidecars/browser/panelui",
       emptyOutDir: false,
