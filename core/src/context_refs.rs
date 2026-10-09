@@ -29,6 +29,7 @@ use std::path::{Component, Path, PathBuf};
 use axum::Json;
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
+use tokio::io::AsyncReadExt;
 
 use crate::files::PathError;
 use crate::state::AppState;
@@ -242,6 +243,11 @@ pub async fn list(
     .await
 }
 
+/// The real path of `target`; a path that does not exist falls back to its own text.
+fn real(target: &Path) -> PathBuf {
+    std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf())
+}
+
 fn is_unique_violation(error: &sqlx::Error) -> bool {
     error
         .as_database_error()
@@ -279,6 +285,19 @@ pub async fn create(
         PathState::Dir => "dir",
         PathState::Missing => return Err(RefError::Missing),
     };
+
+    // The stored path is the caller's spelling, so the same file can be written several ways (a
+    // `\\?\` prefix, other separators, a `.` segment); only the real path says it is the same ref.
+    // The UNIQUE index below stays as the backstop for a race.
+    let resolved_real = real(&resolved.target);
+    for existing in list(pool, owner, owner_id).await.map_err(RefError::Db)? {
+        // A ref that no longer resolves cannot be the same file.
+        if let Ok(existing_path) = resolve(&roots, Path::new(&existing.path))
+            && real(&existing_path.target) == resolved_real
+        {
+            return Err(RefError::Duplicate);
+        }
+    }
 
     sqlx::query_as::<_, ContextRef>(
         "INSERT INTO context_refs (owner_kind, owner_id, path, kind, note, created_at)
@@ -426,17 +445,18 @@ pub async fn read_context(
             }
         };
 
+        // Coverage is judged on real paths: a junction inside a dir ref that points elsewhere has a
+        // lexical path under the ref and a real path outside it.
+        let requested_real = real(&requested.target);
         let covered = refs.iter().any(|carried| {
             // A ref that no longer resolves grants nothing.
             let Ok(carried_path) = resolve(&roots, Path::new(&carried.path)) else {
                 return false;
             };
-            if carried_path.root != requested.root {
-                return false;
-            }
+            let carried_real = real(&carried_path.target);
             match carried.kind.as_str() {
-                "file" => carried_path.relative == requested.relative,
-                "dir" => requested.relative.starts_with(&carried_path.relative),
+                "file" => carried_real == requested_real,
+                "dir" => requested_real.starts_with(&carried_real),
                 _ => false,
             }
         });
@@ -454,9 +474,22 @@ pub async fn read_context(
                 if length > MAX_CONTEXT_READ_BYTES {
                     return Err(ReadError::TooLarge { bytes: length });
                 }
-                tokio::fs::read_to_string(&requested.target)
+                // The length was checked before the read, and a file that grows in between must
+                // still not be read past the limit.
+                let file = tokio::fs::File::open(&requested.target)
                     .await
-                    .map_err(|error| ReadError::Io(error.to_string()))
+                    .map_err(|error| ReadError::Io(error.to_string()))?;
+                let mut buf = Vec::new();
+                file.take(MAX_CONTEXT_READ_BYTES + 1)
+                    .read_to_end(&mut buf)
+                    .await
+                    .map_err(|error| ReadError::Io(error.to_string()))?;
+                if buf.len() as u64 > MAX_CONTEXT_READ_BYTES {
+                    return Err(ReadError::TooLarge {
+                        bytes: buf.len() as u64,
+                    });
+                }
+                String::from_utf8(buf).map_err(|error| ReadError::Io(error.to_string()))
             }
         };
     }
@@ -1014,6 +1047,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_spelling_of_a_carried_path_is_a_duplicate() {
+        let (_tmp, root, state) = fixture().await;
+        let pool = &state.pool;
+        let agent_id = agent(pool, "Writer").await;
+        let notes = root.join("notes.txt");
+        std::fs::write(&notes, "n").unwrap();
+        create(pool, &root, OwnerKind::Agent, &agent_id, text(&notes), None)
+            .await
+            .unwrap();
+
+        #[cfg(windows)]
+        let respelled = PathBuf::from(
+            text(&notes)
+                .strip_prefix(r"\\?\")
+                .expect("canonical root is verbatim"),
+        );
+        #[cfg(not(windows))]
+        let respelled = PathBuf::from(format!("{}/./notes.txt", text(&root)));
+        assert_ne!(text(&respelled), text(&notes));
+        let result = create(
+            pool,
+            &root,
+            OwnerKind::Agent,
+            &agent_id,
+            text(&respelled),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(RefError::Duplicate)),
+            "the same file under another spelling must be a duplicate, got {result:?}"
+        );
+        assert_eq!(
+            list(pool, OwnerKind::Agent, &agent_id).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn http_update_note_and_delete_round_trip() {
         let (_tmp, root, state) = fixture().await;
         let owner = agent(&state.pool, "Writer").await;
@@ -1129,6 +1201,33 @@ mod tests {
         let inner = docs.join("sub").join("a.md");
         let read = read_context(pool, &root, run_id, text(&inner)).await;
         assert_eq!(read.expect("a file under a dir ref reads"), "inside");
+    }
+
+    /// A dir ref grants what is really under that directory, not everything the root holds. A
+    /// junction inside the referenced directory that points elsewhere in the same root must not
+    /// widen it.
+    #[tokio::test]
+    async fn read_context_confines_a_dir_ref_to_the_dir_it_names() {
+        let (_tmp, root, state) = fixture().await;
+        let pool = &state.pool;
+        let agent_id = agent(pool, "Writer").await;
+        let docs = root.join("docs");
+        let private = root.join("private");
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::create_dir(&private).unwrap();
+        std::fs::write(private.join("secret.txt"), "private").unwrap();
+        link_dir(&docs.join("way"), &private);
+        create(pool, &root, OwnerKind::Agent, &agent_id, text(&docs), None)
+            .await
+            .unwrap();
+        let run_id = run_for(pool, Some(&agent_id), None).await;
+
+        let through = docs.join("way").join("secret.txt");
+        let read = read_context(pool, &root, run_id, text(&through)).await;
+        assert!(
+            matches!(read, Err(ReadError::NotARef)),
+            "a junction inside a dir ref must not widen it, got {read:?}"
+        );
     }
 
     #[tokio::test]
