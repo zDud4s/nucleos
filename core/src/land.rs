@@ -318,6 +318,15 @@ pub async fn integration_branch_reading(
 /// weaken `integration_branch`'s "nothing lands until it is corrected" to "nothing lands *by
 /// default* until it is corrected".
 ///
+/// **A conflict resolution's landing is also admitted onto its escalation's target**
+/// (`escalation_target`, from `resolver::escalated_target`), listed or not. The table answers which
+/// branches a `--land` may *choose*; a resolution chooses nothing — the merge it answers was queued,
+/// admitted and run onto that target before it conflicted. Without this, run 900615 (2026-10-09)
+/// resolved a merge between two feature branches, passed its gate, and was refused here, leaving the
+/// session that queued the merge to land it by hand. Only that one branch: a resolution naming any
+/// other unlisted target is refused like any landing, and the value comes from the escalated row,
+/// never from the caller.
+///
 /// **What the refusal can and cannot claim.** `land_targets` swallows a read failure into an empty
 /// `Vec` and a `tracing::warn!` — failing toward refusing, which is the direction this house wants
 /// and which `project_policy` chose deliberately. The cost is that a database hiccup is
@@ -330,6 +339,7 @@ async fn resolve_target(
     project_id: &str,
     project_root: &Path,
     requested: Option<&str>,
+    escalation_target: Option<&str>,
     deadline: Instant,
 ) -> Result<Branch, String> {
     let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -337,7 +347,7 @@ async fn resolve_target(
     };
 
     let recorded = crate::project_policy::land_targets(pool, project_id).await;
-    if recorded.iter().any(|branch| branch == requested) {
+    if recorded.iter().any(|branch| branch == requested) || escalation_target == Some(requested) {
         // Validated BEFORE it reaches git, because `declare_land_target` trims a branch name but
         // does not check it: a name `Branch::new` rejects would otherwise be told it does not
         // exist, which sends the caller looking for a missing branch when the problem is the name
@@ -407,11 +417,19 @@ pub async fn submit(
     deadline: Instant,
 ) -> Result<i64, LandRefusal> {
     let source = Branch::new(source).map_err(LandRefusal::Refused)?;
+    let from_resolution =
+        crate::resolver::landing_is_a_resolution(pool, repo.project_id(), source.as_str()).await;
+    let escalation_target = if from_resolution {
+        crate::resolver::escalated_target(pool, repo.project_id(), source.as_str()).await
+    } else {
+        None
+    };
     let target = resolve_target(
         pool,
         repo.project_id(),
         project_root,
         requested_target,
+        escalation_target.as_deref(),
         deadline,
     )
     .await
@@ -440,9 +458,6 @@ pub async fn submit(
         source: source.clone(),
         target: target.clone(),
     };
-
-    let from_resolution =
-        crate::resolver::landing_is_a_resolution(pool, repo.project_id(), source.as_str()).await;
 
     let submission = if from_resolution {
         crate::vcs::submit_resolution(pool, repo, &op, Origin::Shell).await
