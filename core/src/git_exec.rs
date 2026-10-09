@@ -2690,11 +2690,14 @@ impl crate::vcs::VcsExecutor for GitExecutor {
 /// after a long gate its own git budget and owes one that did not exactly the budget it already had.
 ///
 /// **With `gate_after_land` on and a merge into the land target (`land_target`), spec §6.1 applies:**
-/// a `Valid` test map on the integration worktree means a cached `verify scope` stands in for the
-/// full gate, because the post-merge worker runs the full gate on the published sha anyway. No map,
-/// no executor, a `scope` that cannot be submitted, or one that reaches no verdict in time
-/// (`scope_wait`) falls back to the full `gate_command`, and that result is `FullCovering`: the
-/// caller marks the published sha as covered. With the switch off nothing here changes.
+/// a test map that `job::map_is_trusted` accepts against the project root (valid, byte-equal to the
+/// root's, and running no script that differs from the root's) means a cached `verify scope` stands
+/// in for the full gate, because the post-merge worker runs the full gate on the published sha
+/// anyway. No trusted map, no executor, a `scope` that cannot be submitted, or one that reaches no
+/// verdict in time (`scope_wait`) falls back to the full `gate_command`, and that result is
+/// `FullCovering`: the caller marks the published sha as covered. The fallback after a verdict that
+/// never came also cancels the scope units still queued, so they do not run beside the full gate.
+/// With the switch off nothing here changes.
 ///
 /// **Three refusals rather than one, and each is a different sentence to its reader.**
 /// - The rules file exists and will not parse: we cannot tell whether this repository wanted its
@@ -2762,17 +2765,25 @@ async fn gate_the_merge(
 
     let combine = rules.gate_after_land && land_target.is_some();
     if combine && let Some(executor) = verify {
-        let root = integration.to_path_buf();
-        let map = tokio::task::spawn_blocking(move || crate::tests_map::load(&root)).await;
-        if matches!(map, Ok(crate::tests_map::MapState::Valid(_))) {
-            match crate::verify::gate_scope(
+        let tree = integration.to_path_buf();
+        let root = project_root.to_path_buf();
+        let trusted = tokio::task::spawn_blocking(move || crate::job::map_is_trusted(&tree, &root))
+            .await
+            .unwrap_or(false);
+        if !trusted {
+            tracing::info!(
+                vcs_request_id = request_id,
+                "the merge carries no test map the project root vouches for (absent, invalid, or the map or a script its groups run differs from the root's copy); measuring with the full gate"
+            );
+        } else {
+            let (ticket, verdict) = crate::verify::gate_scope_ticketed(
                 executor,
                 crate::verify::Caller::Merge(request_id),
                 integration,
                 scope_wait,
             )
-            .await
-            {
+            .await;
+            match verdict {
                 crate::verify::ScopeVerdict::Measured(crate::gate::GateOutcome::Passed)
                 | crate::verify::ScopeVerdict::NothingRan => return Ok(MergeGate::Scope),
                 crate::verify::ScopeVerdict::Measured(crate::gate::GateOutcome::Failed {
@@ -2789,6 +2800,22 @@ async fn gate_the_merge(
                         %reason,
                         "the merge's scope verification reached no verdict; measuring with the full gate instead"
                     );
+                    if let Some(ticket) = ticket {
+                        let why = "cancelled: the merge's scope verification reached no verdict, so the full gate measured the merge instead";
+                        match crate::verify::cancel_queued_units(&executor.pool, ticket, why).await
+                        {
+                            Ok(cancelled) => tracing::info!(
+                                vcs_request_id = request_id,
+                                cancelled,
+                                "cancelled the scope units still queued behind the full gate"
+                            ),
+                            Err(error) => tracing::warn!(
+                                vcs_request_id = request_id,
+                                %error,
+                                "could not cancel the scope units still queued; they may run beside the full gate"
+                            ),
+                        }
+                    }
                 }
                 crate::verify::ScopeVerdict::Unavailable => {}
             }
@@ -4450,6 +4477,166 @@ gate_command: git --version
 
         assert!(matches!(gate, Ok(MergeGate::FullCovering)), "{gate:?}");
         assert_eq!(request_callers(&pool).await, vec!["merge:7".to_owned()]);
+        assert_eq!(merge_gate_rows(&pool).await, 1, "the full gate ran");
+    }
+
+    /// F3-10: when the scope reaches no verdict and the full gate measures the merge instead, the
+    /// scope's units still `queued` are cancelled, so they never run beside the full gate.
+    #[tokio::test]
+    async fn a_scope_that_reaches_no_verdict_cancels_its_queued_units() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-cancel-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        commit_map_on_master(&repo, GREEN_GATE);
+        write_autopilot_rules(
+            container.path(),
+            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        // No `run_executor`: the scope's units are accepted and never run.
+        let executor = crate::verify_exec::Executor::new(
+            pool.clone(),
+            crate::config::VerifyConfig::default(),
+            Some(container.path().to_path_buf()),
+        );
+        compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect("compute the merge the gate measures");
+
+        let gate = gate_the_merge(
+            Some(container.path()),
+            Some(&pool),
+            7,
+            "alpha",
+            &repo,
+            &integration_worktree(&repo),
+            Duration::from_secs(120),
+            Duration::from_millis(300),
+            Some("master"),
+            Some(&executor),
+        )
+        .await;
+
+        assert!(matches!(gate, Ok(MergeGate::FullCovering)), "{gate:?}");
+        let still_queued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM verify_runs WHERE origin = ? AND status = 'queued'",
+        )
+        .bind(crate::verify_runs::ORIGIN_VERIFY)
+        .fetch_one(&pool)
+        .await
+        .expect("count queued verify units");
+        assert_eq!(
+            still_queued, 0,
+            "no scope unit may stay queued beside the full gate"
+        );
+        let cancelled: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, output_tail FROM verify_runs WHERE origin = ?")
+                .bind(crate::verify_runs::ORIGIN_VERIFY)
+                .fetch_all(&pool)
+                .await
+                .expect("read the scope's units");
+        assert!(!cancelled.is_empty(), "the scope queued at least one unit");
+        for (status, tail) in cancelled {
+            assert_eq!(status, "errored");
+            assert!(
+                tail.as_deref().is_some_and(|t| t.contains("full gate")),
+                "the reason names the full gate: {tail:?}"
+            );
+        }
+    }
+
+    /// F3-10: a map the merge rewrote (it differs from the project root's copy) is not trusted, so
+    /// the merge takes the full gate and the verify queue is not asked.
+    #[tokio::test]
+    async fn a_merge_whose_map_differs_from_the_root_takes_the_full_gate() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-mapdiff-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        commit_map_on_master(&repo, GREEN_GATE);
+        write_autopilot_rules(
+            container.path(),
+            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        let executor = verify_executor(&pool, container.path());
+        compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect("compute the merge the gate measures");
+        let integration = integration_worktree(&repo);
+        let map = integration.join(crate::tests_map::MAP_FILE);
+        let mut text = std::fs::read_to_string(&map).expect("the integration tree carries the map");
+        text.push_str("# changed in the integration worktree\n");
+        std::fs::write(&map, text).expect("rewrite the map");
+
+        let gate = gate_the_merge(
+            Some(container.path()),
+            Some(&pool),
+            7,
+            "alpha",
+            &repo,
+            &integration,
+            Duration::from_secs(120),
+            Duration::from_secs(30),
+            Some("master"),
+            Some(&executor),
+        )
+        .await;
+
+        assert!(matches!(gate, Ok(MergeGate::FullCovering)), "{gate:?}");
+        assert!(
+            request_callers(&pool).await.is_empty(),
+            "an untrusted map must not reach the verify queue"
+        );
+        assert_eq!(merge_gate_rows(&pool).await, 1, "the full gate ran");
+    }
+
+    /// F3-10: a script the map's groups run that the merge changed (it differs from the root's
+    /// copy) is not trusted either: the merge takes the full gate.
+    #[tokio::test]
+    async fn a_merge_that_changes_a_script_the_map_runs_takes_the_full_gate() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-script-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        std::fs::write(repo.join("probe.txt"), "original\n").expect("write the probe");
+        commit_map_on_master(&repo, "git hash-object probe.txt");
+        write_autopilot_rules(
+            container.path(),
+            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        let executor = verify_executor(&pool, container.path());
+        compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect("compute the merge the gate measures");
+        let integration = integration_worktree(&repo);
+        std::fs::write(integration.join("probe.txt"), "changed by the merge\n")
+            .expect("rewrite the probe in the integration tree");
+
+        let gate = gate_the_merge(
+            Some(container.path()),
+            Some(&pool),
+            7,
+            "alpha",
+            &repo,
+            &integration,
+            Duration::from_secs(120),
+            Duration::from_secs(30),
+            Some("master"),
+            Some(&executor),
+        )
+        .await;
+
+        assert!(matches!(gate, Ok(MergeGate::FullCovering)), "{gate:?}");
+        assert!(
+            request_callers(&pool).await.is_empty(),
+            "a changed script must not reach the verify queue"
+        );
         assert_eq!(merge_gate_rows(&pool).await, 1, "the full gate ran");
     }
 

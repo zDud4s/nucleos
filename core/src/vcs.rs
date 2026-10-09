@@ -545,7 +545,7 @@ pub const GIT_OP_KINDS: [&str; 6] = ["merge", "push", "tag", "fetch", "rebase", 
 /// The operation kinds only the daemon queues. They are outside `GIT_OP_KINDS` on purpose: no
 /// project declares them, the picker never draws them and `Op::from_request` refuses them.
 /// `every_op_kind_is_in_the_declarable_catalogue` requires every kind to sit in one list or the
-/// other.
+/// other. `admit` refuses these kinds when they come from a run or a job origin.
 pub const DAEMON_OP_KINDS: [&str; 1] = ["revert"];
 
 /// One operation a project may declare, with the flag the shell draws it by.
@@ -634,6 +634,12 @@ impl Origin {
     /// have not been approved by anything yet.
     fn needs_approval(self) -> bool {
         matches!(self, Origin::Run(_) | Origin::Job(_))
+    }
+
+    /// Whether this origin may queue `op`. The daemon-only kinds (`DAEMON_OP_KINDS`) are refused to
+    /// the autonomous origins: a run or a job asking for a revert would be an agent undoing a merge.
+    fn may_queue(self, op: &Op) -> bool {
+        !(matches!(self, Origin::Run(_) | Origin::Job(_)) && DAEMON_OP_KINDS.contains(&op.kind()))
     }
 
     /// `run_id` is populated only for `Origin::Run`. A job id written into a column named
@@ -1658,6 +1664,13 @@ async fn admit<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
+    if !origin.may_queue(op) {
+        return Err(sqlx::Error::Protocol(format!(
+            "{} is queued only by the daemon itself (spec 2026-10-05 §6.2); a {} cannot ask for one",
+            op.kind(),
+            origin.as_str()
+        )));
+    }
     let created_at = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
         "INSERT INTO vcs_requests (op, args, project_id, project_root, repo_key, origin, run_id, status, created_at, from_resolution)
@@ -7172,6 +7185,53 @@ mod tests {
         );
         assert_eq!(ticket.status, "succeeded");
         assert_eq!(ticket.result_sha.as_deref(), Some("cafe"));
+    }
+
+    /// F3-10: a revert is the daemon's own operation (spec 2026-10-05 §6.2). `admit` is the one
+    /// INSERT behind all four doors, so a run or job origin is refused there and writes no row.
+    #[tokio::test]
+    async fn a_revert_from_a_run_or_job_origin_is_refused_and_writes_no_row() {
+        let pool = test_pool().await;
+        let repo = ResolvedRepo::synthetic("alpha", "C:/repo", "alpha");
+        let revert = || Op::Revert {
+            merge_sha: CommitSha::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            target: Branch::new("master").unwrap(),
+        };
+
+        assert!(
+            submit(&pool, &repo, &revert(), Origin::Run(7))
+                .await
+                .is_err()
+        );
+        assert!(
+            submit(&pool, &repo, &revert(), Origin::Job(7))
+                .await
+                .is_err()
+        );
+        assert!(
+            submit_declared(&pool, &repo, &revert(), Origin::Run(7))
+                .await
+                .is_err()
+        );
+        assert!(
+            submit_declared(&pool, &repo, &revert(), Origin::Job(7))
+                .await
+                .is_err()
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a refused revert leaves nothing in the queue");
+
+        submit_declared(&pool, &repo, &revert(), Origin::Daemon)
+            .await
+            .expect("the daemon's own revert is still admitted");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     /// A revert is published by the same compare-and-swap as a merge, so the target moving under

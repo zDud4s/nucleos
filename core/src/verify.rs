@@ -1088,6 +1088,19 @@ pub(crate) async fn gate_scope(
     worktree: &Path,
     wait: Duration,
 ) -> ScopeVerdict {
+    gate_scope_ticketed(executor, caller, worktree, wait)
+        .await
+        .1
+}
+
+/// `gate_scope` that also returns the ticket it submitted (`None` when it was `Unavailable`), for a
+/// caller that may need to cancel the units that ticket queued.
+pub(crate) async fn gate_scope_ticketed(
+    executor: &Arc<Executor>,
+    caller: Caller,
+    worktree: &Path,
+    wait: Duration,
+) -> (Option<i64>, ScopeVerdict) {
     use crate::gate::GateOutcome;
 
     let args = VerifyArgs {
@@ -1106,10 +1119,10 @@ pub(crate) async fn gate_scope(
                 reason = error.message(),
                 "scope verification could not be submitted; the caller takes the full gate"
             );
-            return ScopeVerdict::Unavailable;
+            return (None, ScopeVerdict::Unavailable);
         }
     };
-    match wait_ticket(&executor.pool, id, wait).await {
+    let verdict = match wait_ticket(&executor.pool, id, wait).await {
         Ok(Some((ticket, _))) => scope_outcome(&ticket),
         Ok(None) => ScopeVerdict::Measured(GateOutcome::Errored {
             reason: format!("scope verification ticket {id} vanished"),
@@ -1117,7 +1130,19 @@ pub(crate) async fn gate_scope(
         Err(error) => ScopeVerdict::Measured(GateOutcome::Errored {
             reason: format!("could not read scope verification ticket {id}: {error}"),
         }),
-    }
+    };
+    (Some(id), verdict)
+}
+
+/// Ends the still-queued units a verification ticket created, so they stop competing with a
+/// measurement that replaced them. Units the ticket joined from another request are not its own and
+/// are left alone.
+pub(crate) async fn cancel_queued_units(
+    pool: &SqlitePool,
+    ticket: i64,
+    reason: &str,
+) -> sqlx::Result<u64> {
+    verify_runs::cancel_queued(pool, ORIGIN_VERIFY, ticket, reason).await
 }
 
 fn refused(error: &VerifyError) -> (StatusCode, String) {

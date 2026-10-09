@@ -3978,6 +3978,9 @@ struct ProjectRules {
     /// The target branch's post-merge gate state, or `null` while the gate has never recorded one.
     /// Read-only: nothing on this route changes it.
     postgate: Option<PostgateView>,
+    /// Why the post-merge state could not be read; `postgate` is then null. Absent when it was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    postgate_error: Option<String>,
     /// Who answers an approval a conversation on `auto` would otherwise put to a person.
     judge: JudgeView,
     schedules: Vec<ScheduleView>,
@@ -4159,10 +4162,19 @@ async fn get_project_rules(
     let ide_verify = crate::autopilot::ide_verify_enabled(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let postgate = crate::verify_postgate::load(&state.pool, &id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map(PostgateView::from);
+    let (postgate, postgate_error) = match crate::verify_postgate::load(&state.pool, &id).await {
+        Ok(row) => (row.map(PostgateView::from), None),
+        Err(error) => {
+            tracing::warn!(
+                %error, project_id = %id,
+                "rules: cannot read the post-merge state; serving the rules without it"
+            );
+            (
+                None,
+                Some("the post-merge state could not be read; see the daemon log".to_owned()),
+            )
+        }
+    };
 
     Ok(Json(ProjectRules {
         project_id: id,
@@ -4174,6 +4186,7 @@ async fn get_project_rules(
         gate_before_publish: loaded.gate_before_publish,
         ide_verify,
         postgate,
+        postgate_error,
         judge,
         schedules,
         repo_triggers,
@@ -20176,6 +20189,30 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, 1);
+    }
+
+    /// F3-10: a failure reading the post-merge state must not take the whole rules read down with
+    /// it. The rules are served, `postgate` is null, and `postgate_error` says why it is null.
+    #[tokio::test]
+    async fn the_rules_read_serves_the_rules_when_the_post_merge_state_cannot_be_read() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'shadow')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE postgate_state")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = read_rules(state.clone(), "alpha").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["postgate"].is_null(), "nothing could be read: {body}");
+        assert!(
+            body["postgate_error"].is_string(),
+            "null must not pass for 'never ran': {body}"
+        );
     }
 
     /// The project page shows the target's post-merge state, read-only, from the rules read: no
