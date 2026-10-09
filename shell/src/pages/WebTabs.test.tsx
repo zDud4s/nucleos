@@ -23,25 +23,25 @@ beforeEach(() => {
 const TABLIST = "Web views";
 
 describe("the Web page tabs", () => {
-  it("renders one Web header with Archive and Sessions tabs", async () => {
+  it("renders one Web header with Sessions first and selected", async () => {
     await renderApp({ initialPath: "/web" });
 
     expect(await screen.findAllByRole("heading", { level: 1, name: "Web" })).toHaveLength(1);
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-    expect(screen.getByRole("tablist", { name: TABLIST })).toBeDefined();
-    expect(await screen.findByRole("tab", { name: "Archive", selected: true })).toBeDefined();
-    expect(screen.getByRole("tab", { name: "Sessions" })).toBeDefined();
+    const list = screen.getByRole("tablist", { name: TABLIST });
+    expect(within(list).getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["Sessions", "Archive"]);
+    expect(await screen.findByRole("tab", { name: "Sessions", selected: true })).toBeDefined();
   });
 
   it("switches tabs by moving the URL", async () => {
     const { router } = await renderApp({ initialPath: "/web" });
-    await screen.findByRole("tab", { name: "Archive", selected: true });
-
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "Sessions" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/web/sessions"));
-    expect(await screen.findByRole("heading", { level: 2, name: "Browser health" })).toBeDefined();
+    await screen.findByRole("tab", { name: "Sessions", selected: true });
+    expect(await screen.findByRole("heading", { level: 2, name: "Live sessions" })).toBeDefined();
 
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Archive" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/web/archive"));
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Sessions" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/web"));
   });
 
@@ -50,17 +50,24 @@ describe("the Web page tabs", () => {
     expect(await screen.findByRole("tab", { name: "Archive", selected: true })).toBeDefined();
     first.unmount();
 
-    await renderApp({ initialPath: "/web/sessions" });
+    const second = await renderApp({ initialPath: "/web/archive" });
+    expect(await screen.findByRole("tab", { name: "Archive", selected: true })).toBeDefined();
+    second.unmount();
+
+    await renderApp({ initialPath: "/web" });
     expect(await screen.findByRole("tab", { name: "Sessions", selected: true })).toBeDefined();
   });
 
-  it("redirects /browser to /web/sessions", async () => {
-    const { router } = await renderApp({ initialPath: "/browser" });
-    await waitFor(() => expect(router.state.location.pathname).toBe("/web/sessions"));
+  it("forwards /browser and the old /web/sessions to /web", async () => {
+    for (const path of ["/browser", "/web/sessions"]) {
+      const { router, unmount } = await renderApp({ initialPath: path });
+      await waitFor(() => expect(router.state.location.pathname).toBe("/web"));
+      unmount();
+    }
   });
 
   it("lights one Web rail entry on all three URLs", async () => {
-    for (const path of ["/web", "/web/pages/42", "/web/sessions"]) {
+    for (const path of ["/web", "/web/pages/42", "/web/archive"]) {
       const { router, unmount } = await renderApp({ initialPath: path });
       const rail = within(await screen.findByRole("navigation", { name: "Sections" }));
       await waitFor(() => expect(router.state.location.pathname).toBe(path));
@@ -73,16 +80,16 @@ describe("the Web page tabs", () => {
 
   it("keeps the tablist mounted and focus on the tab when switching by keyboard", async () => {
     const { router } = await renderApp({ initialPath: "/web" });
-    await screen.findByRole("tab", { name: "Archive", selected: true });
+    await screen.findByRole("tab", { name: "Sessions", selected: true });
 
     const list = screen.getByRole("tablist", { name: TABLIST });
-    const archive = screen.getByRole("tab", { name: "Archive" });
-    act(() => archive.focus());
-    fireEvent.keyDown(archive, { key: "ArrowRight" });
+    const sessions = screen.getByRole("tab", { name: "Sessions" });
+    act(() => sessions.focus());
+    fireEvent.keyDown(sessions, { key: "ArrowRight" });
 
-    await waitFor(() => expect(router.state.location.pathname).toBe("/web/sessions"));
-    expect(await screen.findByRole("tab", { name: "Sessions", selected: true })).toBeDefined();
+    await waitFor(() => expect(router.state.location.pathname).toBe("/web/archive"));
+    expect(await screen.findByRole("tab", { name: "Archive", selected: true })).toBeDefined();
     expect(screen.getByRole("tablist", { name: TABLIST })).toBe(list);
-    expect(document.activeElement).toBe(screen.getByRole("tab", { name: "Sessions" }));
+    expect(document.activeElement).toBe(screen.getByRole("tab", { name: "Archive" }));
   });
 });

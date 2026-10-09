@@ -11,7 +11,6 @@ import importlib.util
 import json
 import os
 import re
-import shlex
 import sys
 from pathlib import Path
 
@@ -40,13 +39,6 @@ DENY_ISOLATION = (
     "Launching a subagent with isolation: worktree is not permitted here; "
     "work in the current checkout."
 )
-
-# Leading NAME=value assignments and bash's `time [-p]` keyword: kept in front of the broker
-# call, so `time` still times the whole run, queue included.
-_ENV_PREFIX = re.compile(
-    r"""^(?:\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s"'])*|time(?:\s+-p)?(?=\s)))*""")
-_REDIRECT = re.compile(r"^(?:\d*|&)(?:>>?|<)")
-
 
 _BARE = re.compile(r"^[A-Za-z0-9_.\/+:@~][A-Za-z0-9_.\/+:@~-]*$")
 
@@ -87,70 +79,15 @@ def _load_classify():
 
 
 def split_segments(text, posix=True):
-    """Spans (start, end) of the segments of `text`, cut at `&&`, `||`, `;`, `|` and
-    newlines outside quotes. Raises ValueError on an unterminated quote."""
-    spans = []
-    start = 0
-    i = 0
-    n = len(text)
-    quote = None
-    while i < n:
-        c = text[i]
-        if quote:
-            if posix and quote == '"' and c == "\\":
-                i += 2
-                continue
-            if c == quote:
-                quote = None
-            i += 1
-            continue
-        if c in "'\"":
-            quote = c
-            i += 1
-            continue
-        if posix and c == "\\":
-            i += 2
-            continue
-        if not posix and c == "`":
-            i += 2
-            continue
-        two = text[i:i + 2]
-        if two in ("&&", "||"):
-            spans.append((start, i))
-            i += 2
-            start = i
-            continue
-        if c in ";|\n":
-            spans.append((start, i))
-            i += 1
-            start = i
-            continue
-        i += 1
-    if quote:
-        raise ValueError("unterminated quote")
-    spans.append((start, n))
-    return spans
+    return _load_classify().split_segments(text, posix)
+
+
+def _lead_end(body, posix):
+    return _load_classify().lead_end(body, posix)
 
 
 def _tokens(segment, posix):
-    if posix:
-        toks = shlex.split(segment, posix=True)
-    else:
-        toks = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"" else t
-                for t in shlex.split(segment, posix=False)]
-    out = []
-    skip = False
-    for t in toks:
-        if skip:
-            skip = False
-            continue
-        if _REDIRECT.match(t):
-            # A bare operator (`>`, `2>`) takes the next token as its target.
-            if re.fullmatch(r"(?:\d*|&)(?:>>?|<)", t):
-                skip = True
-            continue
-        out.append(t)
-    return out
+    return _load_classify().shell_tokens(segment, posix)
 
 
 def _wait_max(tool_input):
@@ -198,26 +135,36 @@ def decide(payload, main, broker_ok, py):
         return None
 
     judged = []
+    # A script or Makefile is read relative to where the command runs, so a plain `cd`
+    # before it is followed.
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     for start, end in spans:
         seg = command[start:end]
         try:
-            toks = _tokens(seg, posix)
+            toks = _tokens(seg[_lead_end(seg, posix):], posix)
         except ValueError:
             return None  # unparsable quoting: fail open, say nothing
         if toks and toks[0] == "export" and len(toks) > 1 and toks[1].startswith("PATH="):
             return None
-        judged.append((start, end, hc.classify(toks) if toks else hc.Verdict()))
+        if toks and toks[0].lower() in ("cd", "pushd", "set-location", "sl") and len(toks) == 2:
+            cwd = str(Path(cwd or os.getcwd()) / toks[1])
+        judged.append((start, end, hc.classify(toks, cwd=cwd) if toks else hc.Verdict()))
 
     rewrites = []
     for start, end, v in judged:
         if subagent:
+            # A cargo the raw-text check above could not see: inside a script or Makefile.
+            if v.heavy and v.kind == "cargo":
+                return _deny(DENY_CARGO)
             if v.gate or (v.heavy and not v.filtered):
                 return _deny(DENY_REASON)
             if v.heavy and not v.wrapped:
-                rewrites.append((start, end, 2))
+                rewrites.append((start, end, 2, v))
         else:
-            if v.heavy and not v.gate and not v.wrapped:
-                rewrites.append((start, end, 1))
+            # A gate found inside a wrapper beside an unbrokered heavy command does not
+            # excuse the wrapper: the heavy command is what the broker is for.
+            if v.heavy and not v.wrapped and (not v.gate or v.via):
+                rewrites.append((start, end, 1, v))
 
     if not rewrites or not broker_ok or main is None:
         return None
@@ -226,14 +173,21 @@ def decide(payload, main, broker_ok, py):
     broker = f'{_bare_interpreter(py)} "{Path(main).as_posix()}/scripts/heavy.py"'
     parts = []
     pos = 0
-    for start, end, prio in rewrites:
+    for start, end, prio, v in rewrites:
         seg = command[start:end]
         body = seg.lstrip()
         lead = seg[:len(seg) - len(body)]
         stripped = body.rstrip()
         trail = body[len(stripped):]
-        env = _ENV_PREFIX.match(stripped).group(0).strip()
-        rest = stripped[_ENV_PREFIX.match(stripped).end():].strip()
+        cut = _lead_end(stripped, posix)
+        env = stripped[:cut].strip()
+        rest = stripped[cut:].strip()
+        # The broker spawns a program: a builtin (`eval`, `iex`) becomes a child shell and a
+        # script runs through its interpreter.
+        if v.drop_word:
+            rest = re.sub(r"^\S+\s*", "", rest)
+        if v.run_with:
+            rest = f"{v.run_with} {rest}"
         envelope = f"{env} " if env else ""
         opts = f"--prio {prio} --agent {agent}"
         if subagent:

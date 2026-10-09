@@ -1,4 +1,5 @@
-import { useState, type ReactNode } from "react";
+import { useId, useState } from "react";
+import { Globe } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
@@ -68,12 +69,12 @@ export function Browser({ embedded = false }: { embedded?: boolean } = {}) {
   const health = useBrowserHealth();
   const [chainDialogue, setChainDialogue] = useState<{ sessionId: number; chain: string[] } | null>(null);
 
+  // The bar leads, as the archive's does: opening a window is what this tab is opened for, and an
+  // empty list of sessions above it was the first thing anybody read. A pending "keep these?" is
+  // the one thing that outranks the list, because the window it asks about has already closed.
   const body = (
     <>
-      <LiveSessions
-        view={sessions}
-        onReturned={(sessionId, chain) => setChainDialogue({ sessionId, chain })}
-      />
+      <OpenBar health={health} />
 
       {chainDialogue !== null && (
         <ChainDialogue
@@ -83,11 +84,12 @@ export function Browser({ embedded = false }: { embedded?: boolean } = {}) {
         />
       )}
 
-      <OpenAWindow />
+      <LiveSessions
+        view={sessions}
+        onReturned={(sessionId, chain) => setChainDialogue({ sessionId, chain })}
+      />
 
       <SiteGrants />
-
-      <BrowserHealth health={health} />
     </>
   );
 
@@ -132,31 +134,6 @@ function headline(rows: BrowserSession[] | undefined, subsystem: SubsystemReadou
   return asking === 0 ? `${rows.length} ${noun} open` : `${rows.length} ${noun} open — ${asking} asking for the wheel`;
 }
 
-/**
- * A panel's own prose — in front of a list that has something in it, one click
- * behind the line when it has not.
- *
- * The sentences are the same either way and what changes is where a reader
- * meets them. Above a populated list the note is what somebody needs *before*
- * pressing a button: that a wheel request is answered on Waiting and not here.
- * Above an empty one it is a paragraph explaining rows that are not there.
- * Keeping it rather than cutting it is the point of the disclosure — "nothing
- * is open right now" on its own reads as a list that failed to load, and the
- * paragraph is what makes the emptiness a fact. `System.tsx` has the same
- * helper, for the same reason.
- *
- * Not every note on this page belongs behind one, and the two that do not are
- * both about placement rather than about prose. `SiteGrants` puts its project
- * picker between the note and the list, so folding the note into the empty line
- * would lift an answer above the control that changes it; `OpenAWindow`'s
- * absence is the project registry's rather than that panel's own, so the "why?"
- * would be answering a question nobody asked there.
- */
-function PanelNote({ empty, says, children }: { empty: boolean; says: string; children: ReactNode }) {
-  if (empty) return <Quiet says={says}>{children}</Quiet>;
-  return <p className="browser-note">{children}</p>;
-}
-
 /** The daemon's own sentence, when it really sent one — `RunDetail.tsx`'s pattern. */
 function daemonProse(refusal: ApiRefusal): Record<string, string> {
   const detail = refusal.detail.trim();
@@ -170,7 +147,7 @@ function MutationNote({ error, what }: { error: unknown; what: string }) {
   return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
 }
 
-/* --------------------------------------------------------- 1. live sessions -- */
+/* --------------------------------------------------------- live sessions -- */
 
 const MODE_COPY: Record<BrowserSession["mode"], string> = {
   human: "you are driving",
@@ -192,11 +169,17 @@ function LiveSessions({
   const [watching, setWatching] = useState<number | null>(null);
 
   return (
-    <Panel title="Live sessions" aside={<Count n={view.data?.length} />}>
-      <PanelNote empty={view.data !== undefined && rows.length === 0} says="nothing is open right now.">
-        Every open browsing session, whatever is driving it — oldest first. A session asking for the
-        wheel is decided on <Link to="/waiting">Waiting</Link>; this page only shows that it is asking.
-      </PanelNote>
+    <Panel title="Live sessions" aside={rows.length > 0 ? <Count n={rows.length} /> : undefined}>
+      {/* The empty line says where a session comes from, which is the next step; "nothing is open"
+          alone read as a list that failed to load. */}
+      {view.data !== undefined && rows.length === 0 && (
+        <Quiet says="no windows are open — open one above, or an agent will when it needs a browser." />
+      )}
+      {rows.length > 0 && (
+        <p className="browser-note">
+          Oldest first. A session asking for the wheel is answered on <Link to="/waiting">Waiting</Link>.
+        </p>
+      )}
       {view.isError && view.data === undefined && <MutationNote error={view.error} what="nothing is known about the open sessions" />}
       {view.data === undefined && !view.isError && <p className="browser-loading">reading the open sessions…</p>}
       {rows.length > 0 && (
@@ -364,7 +347,7 @@ function SessionRow({
   );
 }
 
-/* ------------------------------------------------------- 2. chain dialogue -- */
+/* ------------------------------------------------------- chain dialogue -- */
 
 /**
  * "Keep these?" — the only way a site grant is ever created.
@@ -440,102 +423,153 @@ function ChainDialogue({
   );
 }
 
-/* -------------------------------------------------------------- 3. open a window -- */
+/* -------------------------------------------------------------- open a window -- */
 
 /**
- * The one door into this pillar that no agent asked for.
+ * The one door into this pillar that no agent asked for, as the tab's own bar — the archive leads
+ * with one field and so does this, so the two tabs read as one page.
  *
- * Deliberately plain — two fields and a button, no proposal and no confirmation — and the
- * plainness is the argument. Every ceremony elsewhere on this screen defends against an
- * AGENT having chosen a destination while carrying a stranger's words; here the person
- * typed the address, so there is nobody to approve. Asking them to approve their own
- * request is the ceremony that teaches people to click through the one that matters.
+ * Deliberately plain — a picker, a field and a button, no proposal and no confirmation — and the
+ * plainness is the argument. Every ceremony elsewhere on this screen defends against an AGENT
+ * having chosen a destination while carrying a stranger's words; here the person typed the
+ * address, so there is nobody to approve. Asking them to approve their own request is the
+ * ceremony that teaches people to click through the one that matters.
  *
- * What it is for: until it existed a profile could be repaired, never prepared — the only
- * way to log in was to wait for the agent to walk into the login first. What a session may
- * GRANT is unchanged; the window records where it went and the chain above still answers
- * on the way out.
+ * What it is for: until it existed a profile could be repaired, never prepared — the only way to
+ * log in was to wait for the agent to walk into the login first. What a session may GRANT is
+ * unchanged; the window records where it went and the chain still answers on the way out.
  *
- * Its own project picker rather than one lifted out of `SiteGrants`: the two answer
- * different questions, and choosing which project's grants to read should not move where
- * a window opens.
+ * The sidecar's state lives here and not in a panel of its own at the bottom of the page: down or
+ * not configured, the hint says so where it bites, with the last failure under it. The button stays
+ * live. Disabled, it read as "an empty address is not allowed" — the one thing the field promises
+ * is — and the daemon's own refusal, rendered below, says the rest if it is pressed anyway.
+ *
+ * Its own project picker rather than one lifted out of `SiteGrants`: the two answer different
+ * questions, and choosing which project's grants to read should not move where a window opens.
  */
-function OpenAWindow() {
+/**
+ * What a window opens on when nobody named an address: the address is optional, because the usual
+ * reason to open one is to go and log in somewhere, and typing it into this form first is a step
+ * the window's own address bar already does. `about:blank` is safe to record in the chain the
+ * window keeps: `origin_of` admits `https` origins only, so it can never be offered as a host.
+ */
+const BLANK_PAGE = "about:blank";
+
+function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
   const projects = useProjects();
   const [chosen, setChosen] = useState<string | undefined>(undefined);
   const [url, setUrl] = useState("");
   const open = useOpenWindow();
+  const hintId = useId();
   const options = projects.data ?? [];
   const projectId = chosen ?? options[0]?.project_id;
-  const ready = projectId !== undefined && url.trim() !== "" && !open.isPending;
+  const subsystem = health.data?.subsystem ?? null;
+  const unavailable = subsystem !== null && (subsystem.status === "down" || subsystem.status === "disabled");
+  const ready = projectId !== undefined && !open.isPending;
+
+  if (projects.data !== undefined && options.length === 0) {
+    return (
+      <div className="browser-bar-block">
+        <Quiet says="no project is registered yet — a window opens on a project's profile." />
+      </div>
+    );
+  }
 
   return (
-    <Panel title="Open a window yourself">
-      <p className="browser-note">
-        A real window on this project&apos;s profile, with no fence and nobody asking. Log in,
-        look around, then give it back above — the hosts it went through are offered to keep
-        on the way out, which is the only way the list below ever grows.
-      </p>
-
-      {projects.data !== undefined && options.length === 0 && <Quiet says="no project is registered yet." />}
-
-      {options.length > 0 && (
-        <form
-          className="browser-open"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (projectId === undefined || url.trim() === "" || open.isPending) return;
-            open.mutate({ projectId, url: url.trim() });
-          }}
+    <div className="browser-bar-block">
+      <form
+        className="browser-bar"
+        aria-label="Open a window"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (projectId === undefined || !ready) return;
+          open.mutate({ projectId, url: url.trim() === "" ? BLANK_PAGE : url.trim() });
+        }}
+      >
+        <select
+          aria-label="Project for the new window"
+          value={projectId ?? ""}
+          onChange={(event) => setChosen(event.target.value)}
         >
-          <label className="browser-field">
-            <span>Project</span>
-            <select
-              aria-label="Project for the new window"
-              value={projectId ?? ""}
-              onChange={(event) => setChosen(event.target.value)}
-            >
-              {options.map((option) => (
-                <option key={option.project_id} value={option.project_id}>
-                  {option.project_id}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <label className="browser-field">
-            <span>Address</span>
-            <input
-              type="text"
-              aria-label="Address to open"
-              placeholder="https://…"
-              value={url}
-              onChange={(event) => setUrl(event.target.value)}
-            />
-          </label>
-
-          <div className="browser-actions">
-            {/* A plain Button and not a ConfirmButton: this write is additive and
-                reversible — the window closes, and it grants nothing on its own. */}
-            <Button type="submit" variant="approve" disabled={!ready}>
-              Open a window
-            </Button>
-          </div>
-        </form>
-      )}
+          {options.map((option) => (
+            <option key={option.project_id} value={option.project_id}>
+              {option.project_id}
+            </option>
+          ))}
+        </select>
+        <label className="browser-bar-field">
+          <Globe aria-hidden="true" size={16} strokeWidth={1.75} />
+          <input
+            type="text"
+            aria-label="Address to open"
+            aria-describedby={hintId}
+            placeholder="Address to open — optional, leave empty for a blank window"
+            autoComplete="off"
+            spellCheck={false}
+            value={url}
+            onChange={(event) => setUrl(event.target.value)}
+          />
+        </label>
+        {/* A plain Button and not a ConfirmButton: this write is additive and reversible — the
+            window closes, and it grants nothing on its own. */}
+        <Button type="submit" variant="approve" disabled={!ready}>
+          {open.isPending ? "Opening…" : "Open a window"}
+        </Button>
+      </form>
+      <p id={hintId} className="browser-bar-hint">
+        {unavailable
+          ? subsystem.status === "disabled"
+            ? "The browser is not configured on this machine, so no window can open."
+            : "The browser is not running, so no window can open until it restarts."
+          : "A real window on the project's profile, driven by you. When you give it back, you choose which sites it keeps."}
+      </p>
+      {unavailable && <SidecarTrouble health={health} />}
 
       {open.data !== undefined && (
         <p className="browser-outcome" role="status">
-          opened session #{open.data.id} on the {open.data.profile_kind} profile{" "}
-          {open.data.profile_id} — give it back above when you are done
+          opened session #{open.data.id} on the {open.data.profile_kind} profile {open.data.profile_id} —
+          give it back below when you are done
         </p>
       )}
       {open.isError && <MutationNote error={open.error} what="the window could not be opened" />}
-    </Panel>
+    </div>
   );
 }
 
-/* ------------------------------------------------------------- 4. site grants -- */
+/**
+ * Why the sidecar is down, in one line under the hint: the last failure in the daemon's own words,
+ * how many times it has been restarted, and the door to the full record on System. It was a
+ * disclosure of five mono facts, which put a status page's table on a page that only needs to know
+ * whether a window can open. **One subsystem, `browser_sidecar`** — `health.rs` rejected folding
+ * the Chromium download and page reachability into it, so this says nothing about either.
+ */
+function SidecarTrouble({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
+  const sidecar = health.data?.sidecar ?? null;
+  const failure = sidecar?.last_failure ?? null;
+  const restarts = sidecar?.restarts ?? 0;
+
+  return (
+    <p className="browser-bar-trouble">
+      {failure !== null && (
+        <>
+          Last failure: <span className="browser-bar-failure">{failure}</span>
+          {" · "}
+        </>
+      )}
+      {restarts > 0 && (
+        <>
+          {restarts} restart{restarts === 1 ? "" : "s"}
+          {" · "}
+        </>
+      )}
+      <Link to="/system/$view" params={{ view: "health" }}>
+        Sidecar record on System
+      </Link>
+    </p>
+  );
+}
+
+/* ------------------------------------------------------------- site grants -- */
 
 function SiteGrants() {
   const projects = useProjects();
@@ -548,27 +582,34 @@ function SiteGrants() {
   const forget = useForgetProfile();
   const rows = sites.data ?? [];
 
+  // The picker sits in the panel's head, where the count was: it says whose grants these are, and
+  // on its own line at 20rem it was the widest thing in a panel that was usually empty.
+  const picker =
+    options.length > 0 ? (
+      <select
+        className="browser-head-select"
+        aria-label="Project whose grants are shown"
+        value={projectId ?? ""}
+        onChange={(event) => setChosen(event.target.value)}
+      >
+        {options.map((project) => (
+          <option key={project.project_id} value={project.project_id}>
+            {project.project_id}
+          </option>
+        ))}
+      </select>
+    ) : undefined;
+
   return (
-    <Panel title="Site grants" aside={<Count n={projectId === undefined ? undefined : sites.data?.length} />}>
+    <Panel title="Site grants" aside={picker}>
+      {/* Origins are shown exactly as recorded: a punycode host is never prettified back to the
+          glyphs it encodes. */}
       <p className="browser-note">
-        Where a project&apos;s profile has logged in — a destination it was let into, or an identity
-        provider a login passed through on the way. Origins are shown exactly as recorded; a punycode
-        host is never prettified back to the glyphs it encodes.
+        Sites this project&apos;s profile has logged into. Agents may read them; only the ones
+        marked &ldquo;submits forms&rdquo; may send anything.
       </p>
 
       {projects.data !== undefined && options.length === 0 && <Quiet says="no project is registered yet." />}
-      {options.length > 0 && (
-        <label className="browser-field">
-          <span>Project</span>
-          <select aria-label="Project" value={projectId ?? ""} onChange={(event) => setChosen(event.target.value)}>
-            {options.map((project) => (
-              <option key={project.project_id} value={project.project_id}>
-                {project.project_id}
-              </option>
-            ))}
-          </select>
-        </label>
-      )}
 
       {projectId !== undefined && (
         <>
@@ -679,6 +720,9 @@ function SiteRow({
 function WriteRecord({ projectId }: { projectId: string }) {
   const writes = useBrowserWrites(projectId);
   const rows = writes.data ?? [];
+  // Nothing submitted is the usual state, and a heading between two rules to say so was the
+  // heaviest thing in an empty panel. The record appears once there is something in it.
+  if (rows.length === 0 && !writes.isError) return null;
 
   return (
     // The rule above the heading is this page's; the heading and the rhythm
@@ -689,9 +733,6 @@ function WriteRecord({ projectId }: { projectId: string }) {
       <Section label="Submitted" level={3}>
         {writes.isError && rows.length === 0 && (
           <MutationNote error={writes.error} what="the record of submissions could not be read" />
-        )}
-        {writes.data !== undefined && rows.length === 0 && (
-          <Quiet says="nothing has been submitted from this profile." />
         )}
         {rows.length > 0 && (
           <Rows label="Submitted forms">
@@ -739,62 +780,5 @@ function WriteRow({ wrote }: { wrote: Written }) {
         </p>
       )}
     </Row>
-  );
-}
-
-/* ------------------------------------------------------------- 5. health -- */
-
-function BrowserHealth({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
-  const subsystem = health.data?.subsystem ?? null;
-  const sidecar = health.data?.sidecar ?? null;
-
-  return (
-    <Panel title="Browser health" variant="dim">
-      <p className="browser-note">
-        The one state this pillar actually measures: whether the browser sidecar is up. Nothing here
-        reports Chromium&apos;s download progress or whether a page can be reached — those are not
-        separate readings the daemon takes.
-      </p>
-      {health.data === undefined && !health.isError && <p className="browser-loading">reading…</p>}
-      {health.isError && health.data === undefined && <MutationNote error={health.error} what="nothing is known about the sidecar" />}
-      {subsystem !== null && (
-        <div className="browser-health-row">
-          <StateBadge domain="pillar" state={subsystem.status} />
-          {subsystem.reason !== undefined && <span className="browser-meta">reason: {subsystem.reason}</span>}
-        </div>
-      )}
-      {sidecar !== null && (
-        <dl className="browser-facts">
-          <div className="browser-fact">
-            <dt>sidecar state</dt>
-            <dd>{sidecar.state}</dd>
-          </div>
-          {sidecar.started_at !== null && (
-            <div className="browser-fact">
-              <dt>started</dt>
-              <dd>
-                <RelativeTime at={sidecar.started_at} />
-              </dd>
-            </div>
-          )}
-          <div className="browser-fact">
-            <dt>restarts</dt>
-            <dd>{sidecar.restarts}</dd>
-          </div>
-          {sidecar.last_failure !== null && (
-            <div className="browser-fact">
-              <dt>last failure</dt>
-              <dd>{sidecar.last_failure}</dd>
-            </div>
-          )}
-          {sidecar.last_line !== null && (
-            <div className="browser-fact">
-              <dt>last line</dt>
-              <dd>{sidecar.last_line}</dd>
-            </div>
-          )}
-        </dl>
-      )}
-    </Panel>
   );
 }

@@ -711,7 +711,7 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
     >
       {approve.isSuccess && approve.variables?.seat === "shell" && (
         <p className="waiting-outcome" role="status">
-          the shell has the wheel — <Link to="/web/sessions">drive it on Web</Link>
+          the shell has the wheel — <Link to="/web">drive it on Web</Link>
         </p>
       )}
       <Rows label="Wheel requests" className={dense(items.length) ? "waiting-dense" : undefined}>

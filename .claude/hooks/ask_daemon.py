@@ -33,6 +33,7 @@ All malformed-input, configuration, and daemon errors still fail closed ON THE P
 the one path where failing open would matter.
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -582,8 +583,121 @@ def report_outcome(payload: dict) -> None:
         pass
 
 
+# The IDE verify hint (F2c-3). A recorded verify-box beat makes the daemon write this machine file
+# (worktree -> project, gated tools with their allowed subcommands, gate entrypoints, expires_at);
+# this hook only READS it, locally, and only ever adds context - it never refuses and never
+# approves on this path. No daemon call and no token: the file already says whether the project
+# has the switch on (a beat is recorded only then) and whether the box is live (expires_at).
+HINTS_FILE_ENV = "NUCLEOS_VERIFY_HINTS_FILE"
+HINTS_FILE = "ide-verify-hints.json"  # equals verify_box::HINTS_FILE
+# Mirrors verify_guard::VALUE_FLAGS: global flags that swallow the next word.
+HINT_VALUE_FLAGS = ("-C", "--manifest-path", "--config", "--color", "-Z", "--prefix", "--cwd")
+VERIFY_HINT = (
+    "this project verifies through the daemon: call mcp__nucleos__verify to run this "
+    "worktree's build, test and gate commands in its queue and cache, and wait on it with "
+    "mcp__nucleos__verify_status. Nothing was refused; this command runs as written."
+)
+
+
+def hints_path() -> str:
+    override = os.environ.get(HINTS_FILE_ENV)
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".nucleos", HINTS_FILE)
+
+
+def _norm_path(path: str) -> str:
+    plain = str(path).replace("\\", "/")
+    if plain.startswith("//?/"):
+        plain = plain[4:]
+    plain = plain.rstrip("/")
+    return plain.lower() if os.name == "nt" else plain
+
+
+def _runs_verification(command: str, entry: dict) -> bool:
+    """Whether `command` runs one of the entry's gated tools or gate entrypoints.
+
+    Deliberately over-broad, like governed_git_verb: an over-match costs one sentence of context,
+    never a decision. A gated tool with allowed subcommands needs a subcommand that is not one of
+    them (a bare call or `--version` does not match); a tool with none matches any use.
+    """
+    tools = entry.get("tools")
+    tools = {str(k).lower(): v for k, v in tools.items()} if isinstance(tools, dict) else {}
+    entrypoints = entry.get("entrypoints")
+    if not isinstance(entrypoints, list):
+        entrypoints = []
+    entrypoints = [e.replace("\\", "/") for e in entrypoints if isinstance(e, str)]
+    segments = [command]
+    for separator in SEGMENT_SEPARATORS:
+        segments = [part for chunk in segments for part in chunk.split(separator)]
+    for segment in segments:
+        words = [w.strip("\"'") for w in segment.replace("\\", "/").split()]
+        for index, word in enumerate(words):
+            base = word.rsplit("/", 1)[-1].lower()
+            if base.endswith(".exe"):
+                base = base[:-4]
+            if base in tools:
+                allowed = tools[base] if isinstance(tools[base], list) else []
+                if not allowed:
+                    return True
+                rest = iter(words[index + 1:])
+                for follow in rest:
+                    if follow.startswith("+"):
+                        continue
+                    if follow.startswith("-"):
+                        if follow in HINT_VALUE_FLAGS:
+                            next(rest, None)
+                        continue
+                    if follow not in allowed:
+                        return True
+                    break
+            shown = word[2:] if word.startswith("./") else word
+            for gate in entrypoints:
+                if fnmatch.fnmatchcase(shown, gate) or shown == gate or shown.endswith("/" + gate):
+                    return True
+    return False
+
+
+def verify_hint(payload: dict, now=None) -> str:
+    """The hint text for a verification command in a worktree with a live box, else `""`.
+
+    Total: any failure reading the file or its contents is `""`, so a broken hint can never
+    cost a tool call.
+    """
+    try:
+        command = (payload.get("tool_input") or {}).get("command")
+        if payload.get("tool_name") not in ("Bash", "PowerShell") or not isinstance(command, str):
+            return ""
+        with open(hints_path(), encoding="utf-8") as handle:
+            file = json.load(handle)
+        worktrees = file["worktrees"]
+        if not isinstance(worktrees, dict):
+            return ""
+        moment = time.time() if now is None else now
+        cwd = _norm_path(payload.get("cwd") or os.getcwd())
+        for key, entry in worktrees.items():
+            if not isinstance(entry, dict):
+                continue
+            expires = entry.get("expires_at")
+            if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+                continue
+            if expires <= moment:
+                continue
+            root = _norm_path(key)
+            if cwd != root and not cwd.startswith(root + "/"):
+                continue
+            if _runs_verification(command, entry):
+                return VERIFY_HINT
+        return ""
+    except Exception:
+        return ""
+
+
 def interactive_session(payload: dict) -> None:
-    """A session a person opened. Refuses queue operations; may add context, never approves."""
+    """A session a person opened. Refuses queue operations; may add context, never approves.
+
+    The non-git branch may also add the verify hint (context only, never a decision).
+    """
     command = (payload.get("tool_input") or {}).get("command")
     if (
         payload.get("tool_name") not in ("Bash", "PowerShell")
@@ -591,8 +705,10 @@ def interactive_session(payload: dict) -> None:
         or not governed_git_verb(command)
     ):
         notice = settled_notice(payload)
-        if notice:
-            tell(notice)
+        hint = verify_hint(payload)
+        text = "\n\n".join(t for t in (notice, hint) if t)
+        if text:
+            tell(text)
         no_opinion()
 
     cwd = payload.get("cwd") or os.getcwd()

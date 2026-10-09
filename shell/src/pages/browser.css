@@ -94,51 +94,21 @@
   margin: var(--space-1) 0 0;
 }
 
-/**
- * The label rank — 11px uppercase at `--tracking-wide` — under two names: a
- * fact's column head and a field's own label.
- *
- * Grouped rather than shared with a primitive, because there is nothing to
- * share with: DESIGN.md records the missing input primitive as the largest
- * remaining hole in the component layer, and until `ui.css` has one, collecting
- * the selector is as far as a page can take it. Not the section-title rank,
- * which is the display face at `--tracking-wider` and belongs to
- * `.ui-section-title`.
- */
-.browser-fact dt,
-.browser-field {
+/* The label rank — 11px uppercase at `--tracking-wide` — for a fact's column head. Not the
+   section-title rank, which is the display face at `--tracking-wider` and belongs to
+   `.ui-section-title`. */
+.browser-fact dt {
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
   color: var(--text-faint);
 }
 
-.browser-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  max-width: 20rem;
-  margin: 0 0 var(--space-3);
-}
-
-.browser-field select,
-.browser-field input {
-  padding: var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--text-sm);
-  text-transform: none;
-  letter-spacing: normal;
-}
-
 /**
  * A line of small things sitting side by side: a card's head, a grant's head,
- * the row of buttons under either, and the health badge with its reason.
+ * and the row of buttons under either.
  *
- * One recipe and not four. The four were written out separately with the same
+ * One recipe and not three. They were written out separately with the same
  * declarations between them — the duplication this pass is treating, one file
  * further down. The only thing that ever differed is the session card's
  * `baseline`, which it keeps below: a mode name and the mono meta beside it are
@@ -146,8 +116,7 @@
  */
 .browser-card-head,
 .browser-row-head,
-.browser-actions,
-.browser-health-row {
+.browser-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -156,10 +125,6 @@
 
 .browser-card-head {
   align-items: baseline;
-}
-
-.browser-health-row {
-  margin: 0 0 var(--space-3);
 }
 
 /* What the last decision did — a receipt, not a state of the machine. */
@@ -257,13 +222,112 @@
   accent-color: var(--text);
 }
 
-/* ========================================================= open a window == */
+/* ================================================================ the bar == */
 
-/* Two fields and a button. The plainness is the argument — see `OpenAWindow`. */
-.browser-open {
+/**
+ * The tab's bar: the project, the address (optional, so it takes the room that is left) and the
+ * button, on one line with a hint under it — the archive's bar in `web.css`, at the same height,
+ * radius and type, so switching tabs moves nothing but what the field does. Not in a panel: a
+ * panel titled "Open a window" around one line of controls said the same thing twice.
+ */
+.browser-bar-block {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: var(--space-2);
+  margin-bottom: var(--space-5);
+}
+
+.browser-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.browser-bar select,
+.browser-head-select {
+  padding: 0 var(--space-2);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+}
+
+.browser-bar select {
+  height: 2.5rem;
+  flex: none;
+}
+
+.browser-bar-field {
+  position: relative;
+  display: flex;
+  flex: 1 1 18rem;
+  align-items: center;
+  min-width: 0;
+  color: var(--text-muted);
+}
+
+.browser-bar-field svg {
+  position: absolute;
+  left: var(--space-3);
+  pointer-events: none;
+}
+
+.browser-bar-field input {
+  width: 100%;
+  height: 2.5rem;
+  padding: 0 var(--space-3) 0 calc(var(--space-3) + 16px + var(--space-2));
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  transition: border-color var(--dur-quick) var(--ease);
+}
+
+.browser-bar select:hover,
+.browser-bar-field input:hover,
+.browser-head-select:hover {
+  border-color: var(--border-strong);
+}
+
+.browser-bar-field input::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+.browser-bar .ui-button {
+  height: 2.5rem;
+  flex: none;
+}
+
+.browser-bar-hint {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* Why the sidecar is down: the daemon's sentence in mono, as every daemon-produced string on this
+   page is, inside a muted line that reads as a footnote to the hint above it. */
+.browser-bar-trouble {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.browser-bar-failure {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text);
+}
+
+/* Site grants' project picker, in the panel's head: smaller than the bar's, as the head is. */
+.browser-head-select {
+  height: 2rem;
 }
 
 /* ------------------------------------------------------------- site grants == */
@@ -292,6 +356,16 @@
   margin-top: var(--space-4);
   padding-top: var(--space-3);
   border-top: 1px solid var(--border);
+}
+
+/* The way out of everything above it, at the trailing end and at its own width: stretched to
+   20rem it was the heaviest thing in a panel that usually lists nothing. Still red, and still
+   behind a confirmation. */
+.browser-forget {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-2);
 }
 
 /* A submission that carried a file, on the record screen.
