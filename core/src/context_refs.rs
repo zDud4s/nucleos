@@ -725,15 +725,47 @@ fn ref_error_response(error: RefError) -> (StatusCode, String) {
     }
 }
 
+/// A ref as the list route answers it: the row, plus what its path is on disk right now.
+#[derive(Debug, serde::Serialize)]
+pub struct ListedRef {
+    #[serde(flatten)]
+    pub context_ref: ContextRef,
+    /// Left out when there is no managed root to resolve against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<PathState>,
+}
+
 pub async fn list_refs(
     State(state): State<AppState>,
     UrlPath((owner_kind, owner_id)): UrlPath<(String, String)>,
-) -> Result<Json<Vec<ContextRef>>, (StatusCode, String)> {
+) -> Result<Json<Vec<ListedRef>>, (StatusCode, String)> {
     let owner = parse_owner(&owner_kind)?;
-    list(&state.pool, owner, &owner_id)
+    let refs = list(&state.pool, owner, &owner_id)
         .await
-        .map(Json)
-        .map_err(|error| ref_error_response(RefError::Db(error)))
+        .map_err(|error| ref_error_response(RefError::Db(error)))?;
+    let roots = match crate::door::files_root(&state) {
+        Ok(managed_root) => Some(
+            allowed_roots(&state.pool, managed_root, owner)
+                .await
+                .map_err(|error| ref_error_response(RefError::Db(error)))?,
+        ),
+        Err(_) => None,
+    };
+    let listed = refs
+        .into_iter()
+        .map(|context_ref| {
+            // A ref that no longer resolves grants nothing, which to its owner reads as gone.
+            let path_state = roots.as_ref().map(|roots| {
+                resolve(roots, Path::new(&context_ref.path))
+                    .map_or(PathState::Missing, |resolved| resolved.state)
+            });
+            ListedRef {
+                context_ref,
+                state: path_state,
+            }
+        })
+        .collect();
+    Ok(Json(listed))
 }
 
 pub async fn create_ref(
@@ -1171,6 +1203,45 @@ mod tests {
         let (status, listed) = call(&app, "GET", &uri, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(listed.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn http_list_reports_each_refs_path_state() {
+        let (_tmp, root, state) = fixture().await;
+        let agent_id = agent(&state.pool, "Writer").await;
+        std::fs::write(root.join("kept.txt"), "k").unwrap();
+        std::fs::write(root.join("gone.txt"), "g").unwrap();
+        std::fs::create_dir(root.join("docs")).unwrap();
+        let app = router(state);
+        let uri = format!("/context-refs/agent/{agent_id}");
+
+        for name in ["kept.txt", "gone.txt", "docs"] {
+            let path = root.join(name);
+            let (status, _) = call(
+                &app,
+                "POST",
+                &uri,
+                Some(serde_json::json!({ "path": text(&path) })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+
+        let (status, listed) = call(&app, "GET", &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let state_of = |suffix: &str| {
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["path"].as_str().unwrap().ends_with(suffix))
+                .map(|item| item["state"].clone())
+        };
+        assert_eq!(state_of("kept.txt"), Some(serde_json::json!("file")));
+        assert_eq!(state_of("docs"), Some(serde_json::json!("dir")));
+        assert_eq!(state_of("gone.txt"), Some(serde_json::json!("missing")));
+        assert_eq!(listed[0]["kind"], "file", "the row's own fields stay put");
     }
 
     #[tokio::test]
