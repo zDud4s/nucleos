@@ -280,6 +280,13 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), AgentError>
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    // Spec §4.4: the agent's context refs leave in the same transaction as the agent. Raw SQL
+    // because `context_refs` lives in the core crate, which this crate cannot depend on. A
+    // NotFound returns before the commit, and dropping the transaction rolls it back.
+    sqlx::query("DELETE FROM context_refs WHERE owner_kind = 'agent' AND owner_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     let result = sqlx::query("DELETE FROM agents WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)
@@ -683,5 +690,51 @@ mod tests {
                 .unwrap();
             assert_eq!(found, expected, "{what}");
         }
+    }
+
+    /// Spec §4.4: `context_refs` is polymorphic (`owner_kind`, `owner_id`), so no foreign key can
+    /// cascade it, and the owner's delete is what has to clear its rows. Deleting one agent
+    /// removes that agent's references and leaves another owner's untouched.
+    #[tokio::test]
+    async fn deleting_an_agent_removes_its_context_refs() {
+        let pool = pool().await;
+        let spare = create(&pool, request("spare")).await.unwrap();
+        let other = create(&pool, request("other")).await.unwrap();
+        for (owner, path) in [(&spare.id, "notes/spare.md"), (&other.id, "notes/other.md")] {
+            sqlx::query(
+                "INSERT INTO context_refs (owner_kind, owner_id, path, kind, note, created_at)
+                 VALUES ('agent', ?, ?, 'file', NULL, '2026-10-08T00:00:00Z')",
+            )
+            .bind(owner)
+            .bind(path)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        delete(&pool, &spare.id).await.unwrap();
+
+        let count = |owner: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM context_refs WHERE owner_kind = 'agent' AND owner_id = ?",
+                )
+                .bind(owner)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(
+            count(spare.id.clone()).await,
+            0,
+            "the deleted agent kept its refs"
+        );
+        assert_eq!(
+            count(other.id.clone()).await,
+            1,
+            "another agent's refs were touched"
+        );
     }
 }
