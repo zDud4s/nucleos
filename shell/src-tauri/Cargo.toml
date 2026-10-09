@@ -63,6 +63,8 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Wi
 tauri-plugin-updater = "2"
 # `process:allow-restart`, so the shell can relaunch itself once an update is installed.
 tauri-plugin-process = "2"
+# The native folder picker behind "Add a project"'s Browse button (`dialog:allow-open`).
+tauri-plugin-dialog = "2"
 
 [features]
 # CI builds the release bundle with this on. Dev and update-shell builds leave it off, so
