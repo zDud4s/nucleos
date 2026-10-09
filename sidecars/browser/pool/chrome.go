@@ -97,6 +97,10 @@ func (l ChromeLauncher) launch(ctx context.Context, dir string, policy fence.Pol
 		instance.stop(ctx)
 		return nil, err
 	}
+	if visible {
+		// The visible browser's person turn lifts the proxy too, in-process; see Driver.MakeVisible.
+		driver.MakeVisible(proxy.SetPerson)
+	}
 	instance.Driver = driver
 	return instance, nil
 }

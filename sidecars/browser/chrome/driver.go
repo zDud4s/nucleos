@@ -73,6 +73,14 @@ type Driver struct {
 	// true from the moment the fence is about to lift, so an Open that is mid-flight cannot slip in.
 	personBegun bool
 
+	// visible marks a driver whose browser has a window a person looks at (the panel). personSwitch is
+	// the proxy's person switch, moved by BeginPerson/EndPerson; personTargets are the popups the
+	// person opened, by target id, closed by EndPerson. All three are set by MakeVisible before any
+	// Open, personTargets guarded by mu.
+	visible       bool
+	personSwitch  func(bool)
+	personTargets map[string]cdp.SessionID
+
 	// swept closes when the profile has been cleared of service workers, and sweepErr says whether
 	// that succeeded. Open waits on it — see waitForSweep. sweepErr is written before the close and
 	// read only after it, which is what makes it safe without a lock.
@@ -360,7 +368,20 @@ func (d *Driver) onEvent(event cdp.Event) {
 	// popup is invisible by construction (§4.1), so there is no mode in which showing it would be
 	// honest. --block-new-web-contents already makes window.open return null; this is the second
 	// mechanism, and it is the one a test can assert without trusting a command-line flag.
+	//
+	// In a visible window the person's own popup is the exception: it is let through and resumed, and
+	// EndPerson closes it. The agent's popup stays closed while PAUSED (spike G4d: a resumed page has
+	// already run its first script), so that close must stay before any resume below.
 	if params.TargetInfo.Type == "page" && params.TargetInfo.OpenerID != "" {
+		if d.visible && owner != "" && d.personHolds(owner) {
+			d.mu.Lock()
+			d.personTargets[params.TargetInfo.TargetID] = params.SessionID
+			d.mu.Unlock()
+			if params.WaitingForDebugger {
+				_, _ = d.conn.Call(ctx, params.SessionID, "Runtime.runIfWaitingForDebugger", nil)
+			}
+			return
+		}
 		d.recordSessionRefusal(owner, browser.ConsequenceNewTarget,
 			"a page tried to open a new window; agent mode does not have one to show")
 		_, _ = d.conn.Call(ctx, cdp.BrowserSession, "Target.closeTarget", map[string]any{
