@@ -300,14 +300,27 @@
   color: var(--tone-paused-fg);
 }
 
-/* The dialog's answer: bottom right, with the reason it cannot be given yet beside it. */
+/*
+  The dialog's answer: bottom right, with the reason it cannot be given yet beside it. It stays
+  pinned to the dialog's bottom edge while step three scrolls under it — below the fold, the one
+  button the whole flow leads to was found only by scrolling. Edge to edge across the body's
+  padding, so what scrolls under it does not show at its sides.
+*/
 .np-actions {
+  position: sticky;
+  /* Sticky stops at the body's padding edge; the body's bottom padding is taken back so nothing
+     scrolls by underneath the bar. */
+  bottom: calc(-1 * var(--space-1));
+  z-index: 1;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: var(--space-3);
-  padding-top: var(--space-2);
+  margin: 0 calc(-1 * var(--space-5)) calc(-1 * var(--space-1));
+  padding: var(--space-3) var(--space-5);
+  border-top: 1px solid var(--border);
+  background: var(--surface);
 }
 
 .np-actions-why {

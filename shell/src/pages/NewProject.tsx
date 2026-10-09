@@ -148,7 +148,7 @@ export function NewProject() {
               {/* `aria-busy` and a word, not a spinner: `useDetect` runs three git commands against a
                   disk, and on a slow one a button that said nothing read as a button that did not
                   work. The name only changes while it is busy, so "Look" is what a voice finds. */}
-              <Button type="submit" intent="go" aria-busy={found.isFetching}>
+              <Button type="submit" variant="approve" aria-busy={found.isFetching}>
                 {found.isFetching ? "Looking…" : "Look"}
               </Button>
             </form>
@@ -798,7 +798,7 @@ function Found({
                 </span>
               )}
               <Button
-                intent="go"
+                variant="approve"
                 disabled={busy || blocker !== null}
                 aria-describedby={blocker === null ? undefined : reasonId}
                 onClick={() => void finish()}
