@@ -597,9 +597,13 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
         ));
     }
 
+    // One transaction for the whole cascade (spec §4.4): the team and everything that hangs off it,
+    // its context refs included, go together or not at all. A NotFound below returns before the
+    // commit, and dropping the transaction rolls it back.
+    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM team_members WHERE team_id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     // The alçada goes with the team it described. There is no equivalent worry about
     // `team_actions`: an action belongs to a RUN, and the check above already refuses to delete a
@@ -607,7 +611,12 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
     // actions, pending or otherwise.
     sqlx::query("DELETE FROM team_grants WHERE team_id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
+        .await?;
+    // The team's context refs go with it: they are owned rows with no foreign key to cascade from.
+    sqlx::query("DELETE FROM context_refs WHERE owner_kind = 'team' AND owner_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
         .await?;
     // This team's own rules go with it — a rule that starts a department which no longer exists
     // fires at nothing, every window, for ever.
@@ -616,11 +625,11 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
            (SELECT id FROM team_triggers WHERE team_id = ?)",
     )
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM team_triggers WHERE team_id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     // Rules that fire ON this team are DISARMED and not deleted — the opposite treatment, for the
     // opposite reason. Such a rule still describes something its author wanted and has merely lost
@@ -632,15 +641,16 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), TeamError> 
     )
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     let result = sqlx::query("DELETE FROM teams WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
         return Err(TeamError::NotFound);
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -5907,6 +5917,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// Spec §4.4: `context_refs` is polymorphic (`owner_kind`, `owner_id`), so no foreign key can
+    /// cascade it and deleting a team has to clear its own rows. A reference owned by one of its
+    /// members is that agent's, and stays.
+    #[tokio::test]
+    async fn deleting_a_team_removes_its_context_refs() {
+        let (state, _root) = state_with_root().await;
+        let team = marketing(&state).await;
+        for (kind, owner) in [("team", team.team.id.as_str()), ("agent", "copywriter")] {
+            sqlx::query(
+                "INSERT INTO context_refs (owner_kind, owner_id, path, kind, note, created_at)
+                 VALUES (?, ?, 'notes/brief.md', 'file', NULL, '2026-10-08T00:00:00Z')",
+            )
+            .bind(kind)
+            .bind(owner)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        delete(&state.pool, &team.team.id).await.unwrap();
+
+        let team_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM context_refs WHERE owner_kind = 'team' AND owner_id = ?",
+        )
+        .bind(&team.team.id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let agent_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM context_refs WHERE owner_kind = 'agent' AND owner_id = 'copywriter'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(team_rows, 0, "the deleted team kept its refs");
+        assert_eq!(
+            agent_rows, 1,
+            "a member agent's refs were removed with the team"
+        );
     }
 
     // -----------------------------------------------------------------------------------------

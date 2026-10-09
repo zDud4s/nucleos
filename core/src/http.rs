@@ -470,6 +470,16 @@ pub fn build_router(state: AppState) -> Router {
                 .put(crate::team::update_team)
                 .delete(crate::team::delete_team),
         )
+        // Owner-only: in no scope table. The route read_context runs behind is B1's.
+        .route(
+            "/context-refs/{owner_kind}/{owner_id}",
+            get(crate::context_refs::list_refs).post(crate::context_refs::create_ref),
+        )
+        .route(
+            "/context-refs/{owner_kind}/{owner_id}/{id}",
+            axum::routing::put(crate::context_refs::update_ref_note)
+                .delete(crate::context_refs::delete_ref),
+        )
         .route("/teams/{id}/runs", post(crate::team::post_team_run))
         .route("/team-runs", get(crate::team::list_team_runs))
         .route(
