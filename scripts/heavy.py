@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import statistics
@@ -604,8 +605,28 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
     mine = (int(rec["prio"]), arrival)
     queued = False
     last_report = t0
+    last_holder = None
+    est = None
+    est_key = None
+
+    def est_for(h):
+        # The estimate is only valid for the holder it was computed for.
+        return est if h is not None and (h.get("pid"), h.get("acquired")) == est_key else None
+
     try:
         while True:
+            # Read the history OUTSIDE the broker-wide Mutex: log.jsonl can be large and every
+            # other broker call waits on that Mutex. A raw peek (no liveness reap) is enough
+            # to key the estimate; the holder is re-read under the Mutex and trusted there.
+            try:
+                peek = json.loads(lock.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                peek = None
+            if isinstance(peek, dict):
+                pkey = (peek.get("pid"), peek.get("acquired"))
+                if pkey != est_key:
+                    est_key = pkey
+                    est = _holder_estimate(directory, peek)
             with Mutex(directory):
                 wdir.mkdir(parents=True, exist_ok=True)
                 holder = _read_lock(lock)
@@ -614,13 +635,25 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                     lock.write_text(json.dumps(dict(rec, acquired=time.time())),
                                     encoding="utf-8")
                     return True, time.time() - t0, arrival
+                if holder is not None:
+                    last_holder = holder
                 if holder is not None and holder.get("hold") and fail_on_hold:
-                    held_for = int(time.time() - float(holder.get("acquired") or time.time()))
                     sys.stderr.write(
-                        f"heavy: this worktree is held by a gate run (pid {holder.get('pid')}, "
-                        f"running {held_for // 60} min); nothing was compiled. A gate keeps its "
+                        f"heavy: this worktree is held by a gate run "
+                        f"({_holder_line(holder, est_for(holder))}); nothing was compiled. A gate keeps its "
                         "worktree until it ends - wait for it to finish rather than retrying, "
                         "and run nothing heavy here meanwhile.\n")
+                    return False, time.time() - t0, arrival
+                remaining = wait_cap - (time.time() - t0)
+                if (fail_on_hold and holder is not None
+                        and not (holder.get("warm") or holder.get("agent") == "warm")
+                        and est_for(holder) is not None and est_for(holder) > remaining):
+                    # The log says the holder outlasts this call's whole wait: waiting only
+                    # ends in the same exit 75, minutes later.
+                    sys.stderr.write(
+                        f"heavy: this worktree is held by {_holder_line(holder, est_for(holder))}; it will "
+                        f"not be free within this call's {int(remaining)}s wait - nothing was "
+                        "compiled. Wait for it to finish rather than retrying.\n")
                     return False, time.time() - t0, arrival
                 if holder is None:
                     ahead = [f for f, _ in _entries(wdir)
@@ -636,7 +669,10 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
             if now - t0 >= wait_cap:
                 sys.stderr.write(
                     f"heavy: waited {int(now - t0)}s for the worktree lock; nothing was "
-                    "compiled - try again, re-run with the Bash tool timeout set to 600000\n")
+                    "compiled - try again, re-run with the Bash tool timeout set to 600000"
+                    + (f" (held by {_holder_line(last_holder, est_for(last_holder))})"
+                       if last_holder else "")
+                    + "\n")
                 return False, now - t0, arrival
             if now - last_report >= 30:
                 last_report = now
@@ -912,12 +948,58 @@ def _isatty(stream) -> bool:
         return False
 
 
+def terminate_tree(job, proc, group: bool = False) -> None:
+    """Kill a child and everything it started. Never raises. `group` (POSIX): the child leads
+    its own session/process group, so the whole group is killed, not just the child."""
+    try:
+        if os.name == "nt":
+            if job is not None:
+                import ctypes
+                from ctypes import wintypes
+
+                k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+                k32.TerminateJobObject.restype = wintypes.BOOL
+                if k32.TerminateJobObject(job, 75):
+                    return
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=20)
+        else:
+            if group:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    return
+                except Exception:
+                    pass
+            proc.kill()
+    except Exception:
+        pass
+
+
+def _watch_yield(proc, job, in_job: bool, stats: dict, yield_check, stop,
+                 group: bool = False) -> None:
+    """Every 2 polls, ask `yield_check`; once it says yes, stop the child and say why."""
+    interval = 2 * _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
+    while not stop.wait(interval):
+        if proc.poll() is not None:
+            return
+        try:
+            yes = bool(yield_check())
+        except Exception:
+            yes = False
+        if yes and proc.poll() is None:
+            stats["preempted"] = True
+            terminate_tree(job if in_job else None, proc, group=group)
+            return
+
+
 def run_child(argv: list[str], env: dict | None, job, low: bool = False,
-              progress: Path | None = None) -> tuple[int, dict]:
+              progress: Path | None = None, yield_check=None) -> tuple[int, dict]:
     """Run argv, streaming stdout/stderr through; return (exit, stats). `low` runs it at
     below-normal CPU priority (Windows) with no console window of its own. With `progress`,
     that file holds, while it runs, the CPU its tree has used and what the output says about
-    units and tests; a cargo child is asked to draw its bar into the pipe for that."""
+    units and tests; a cargo child is asked to draw its bar into the pipe for that. With
+    `yield_check`, the child is stopped (stats["preempted"]) as soon as it returns True."""
     stats = _new_stats()
     # CreateProcess finds only `.exe` without an extension, so `npm`/`npx` (`.cmd` shims)
     # failed with WinError 2: resolve argv[0] through PATH and PATHEXT the way a shell would.
@@ -938,8 +1020,13 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     flags = 0
     if low and os.name == "nt":
         flags = 0x00004000 | 0x08000000  # BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW
+    # A child that may be preempted gets its own process group on POSIX, so killing it takes
+    # its compiler children too and not the broker (which already runs in its own session).
+    own_group = yield_check is not None and os.name != "nt"
+    popen_kw = {"start_new_session": True} if own_group else {}
     proc = subprocess.Popen(
-        argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags
+        argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
+        **popen_kw
     )
     try:
         in_job = assign_to_job(job, proc)
@@ -952,6 +1039,10 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     ]
     stop = threading.Event()
     writer = None
+    if yield_check is not None:
+        threading.Thread(target=_watch_yield,
+                         args=(proc, job, in_job, stats, yield_check, stop, own_group),
+                         daemon=True).start()
     if progress is not None:
         writer = threading.Thread(target=_write_progress, args=(progress, stats, stop, cpu),
                                   daemon=True)
@@ -959,6 +1050,9 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     for t in threads:
         t.start()
     code = proc.wait()
+    if code == 0 and stats.get("preempted"):
+        # It finished on its own between the watcher's poll and the kill: nothing was stopped.
+        stats.pop("preempted", None)
     for t in threads:
         t.join(timeout=10)
     stop.set()
@@ -1501,13 +1595,107 @@ def _log_argv(argv: list[str]) -> list[str]:
     return words
 
 
+def _norm_td(p) -> str:
+    """One spelling for a target dir: `C:/x/./` and `c:\\x` are the same directory."""
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+def _holder_line(holder: dict, est) -> str:
+    """Who holds a worktree lock, for the messages of a caller that has to wait for it."""
+    argv = " ".join(_log_argv([str(a) for a in (holder.get("argv") or [])]))[:160]
+    try:
+        age = int(time.time() - float(holder.get("acquired") or time.time()))
+    except (TypeError, ValueError):
+        age = 0
+    line = (f"pid {holder.get('pid')}, agent {holder.get('agent') or 'none'}, "
+            f"`{argv}`, running {age}s")
+    if est is not None and est > 0:
+        line += f", estimated {int(est)}s more"
+    return line
+
+
+def _holder_estimate(directory: Path, holder: dict) -> float | None:
+    """Seconds the holder's command still has to run, from the median of its earlier
+    finished runs in the log, less its age so far. None without such history."""
+    try:
+        want = _log_argv([str(a) for a in (holder.get("argv") or [])])
+        runs = []
+        path = directory / "log.jsonl"
+        if not path.exists() or not want:
+            return None
+        for line in path.read_bytes().decode("utf-8", "replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict) or row.get("argv") != want:
+                continue
+            if row.get("exit") in (75, None) or row.get("preempted"):
+                continue
+            try:
+                run_s = float(row.get("run_s") or 0)
+            except (TypeError, ValueError):
+                continue
+            if run_s > 0:
+                runs.append(run_s)
+        if not runs:
+            return None
+        age = time.time() - float(holder.get("acquired") or time.time())
+        return statistics.median(runs) - age
+    except Exception:
+        return None
+
+
 def append_log(row: dict, directory: Path) -> None:
+    """Append one row in ONE write that lands whole: with several brokers finishing at once,
+    buffered text-mode writes (split at the buffer size) interleaved their rows."""
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        with open(directory / "log.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
+        path = directory / "log.jsonl"
+        data = (json.dumps(row) + "\n").encode("utf-8")
+        if os.name == "nt" and _append_whole_nt(path, data):
+            return
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                     | getattr(os, "O_BINARY", 0), 0o666)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
     except Exception as exc:
         sys.stderr.write(f"heavy: could not write the log: {exc}\n")
+
+
+def _append_whole_nt(path: Path, data: bytes) -> bool:
+    """FILE_APPEND_DATA without FILE_WRITE_DATA: the kernel positions every write at the
+    current end of file itself, so two writers cannot overwrite each other. False on any
+    failure, and the caller falls back to os.write."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+            wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+        k32.CreateFileW.restype = ctypes.c_void_p
+        k32.WriteFile.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k32.WriteFile.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.restype = wintypes.BOOL
+        # FILE_APPEND_DATA, share read|write|delete, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL
+        h = k32.CreateFileW(str(path), 0x4, 0x7, None, 4, 0x80, None)
+        if h is None or h == ctypes.c_void_p(-1).value:
+            return False
+        try:
+            written = wintypes.DWORD(0)
+            ok = k32.WriteFile(h, data, len(data), ctypes.byref(written), None)
+            return bool(ok)  # a short write to a file is not a thing; never write twice
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
 
 
 def _int_prio(value, default=1) -> int:
@@ -1542,7 +1730,52 @@ def parse_args(args: list[str]):
     return opts, args[i:]
 
 
+def _warm_should_yield(directory: Path, lock_hash: str | None) -> bool:
+    """Should a RUNNING warm give way? Yes when a real (better than warm priority) request
+    waits on the worktree lock it holds, or when the next request in the queue is a real one
+    that does not fit beside it."""
+    with Mutex(directory):
+        if lock_hash:
+            _, wdir = _lock_paths(directory, lock_hash)
+            if any(_wkey(f)[0] < WARM_PRIO for f, _ in _entries(wdir, reap=False)):
+                return True
+        items = _entries(directory / "queue")
+        if not items:
+            return False
+        head = _queue_order(items, directory)[0]
+        if _effective_prios(directory, items).get(head[0].name, WARM_PRIO) >= WARM_PRIO:
+            return False
+        me = str(os.getpid())
+        others = sum(int(r.get("weight") or 1) for f, r in _entries(directory / "held")
+                     if f.name != me)
+        mine = sum(int(r.get("weight") or 1) for f, r in _entries(directory / "held")
+                   if f.name == me)
+        need = int(head[1].get("weight") or 1)
+        # Stopping this warm must actually make room: if the head still would not fit with
+        # the warm gone, killing it only wastes its work.
+        return others + mine + need > capacity() and others + need <= capacity()
+
+
+_PREEMPTED = object()  # `_broker_attempt` stopped a running warm for a real request
+
+
 def broker_run(args: list[str], held: bool = False) -> int:
+    """One attempt, or several: a warm that a real request preempted queues again behind it,
+    within the wait it was given at the start."""
+    deadline = None
+    while True:
+        code = _broker_attempt(args, held, deadline)
+        if code is not _PREEMPTED:
+            return code
+        opts, _ = parse_args(args)
+        if deadline is None:
+            deadline = time.time() + wait_max_s(opts["wait-max"], opts["agent"])
+        if time.time() >= deadline:
+            return EXIT_QUEUE_TIMEOUT
+        time.sleep(_env_float("NUCLEOS_HEAVY_POLL_S", 0.5))
+
+
+def _broker_attempt(args: list[str], held: bool = False, deadline: float | None = None):
     opts, argv = parse_args(args)
     if not argv:
         sys.stderr.write("heavy: no command given\n")
@@ -1593,6 +1826,8 @@ def broker_run(args: list[str], held: bool = False) -> int:
         directory.mkdir(parents=True, exist_ok=True)
         wait_token = wait_lock = 0.0
         cap = wait_max_s(opts["wait-max"], opts["agent"])
+        if deadline is not None:
+            cap = max(0.0, min(cap, deadline - time.time()))
         arrival = None
         _, ctime = proc_identity(os.getpid())
         rec = {
@@ -1645,6 +1880,8 @@ def broker_run(args: list[str], held: bool = False) -> int:
             lock_hash = worktree_hash(root)
             lrec = dict(rec, worktree=root, start=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                         hold=held)
+            if warm:
+                lrec["warm"] = True
             got, wait_lock, arrival = acquire_lock(directory, lock_hash, lrec, cap,
                                                    fail_on_hold=bool(opts["agent"]) and not held)
             if not got:
@@ -1820,7 +2057,7 @@ def broker_run(args: list[str], held: bool = False) -> int:
         if session:
             row["session"] = session
         if eff_td:
-            row["target_dir"] = eff_td
+            row["target_dir"] = _norm_td(eff_td)
     except Exception as exc:
         if lease is not None and env is not None:
             env.pop("CARGO_TARGET_DIR", None)  # the lease goes now: build without it
@@ -1838,8 +2075,12 @@ def broker_run(args: list[str], held: bool = False) -> int:
 
     t_run = time.time()
     try:
+        yield_check = None
+        if warm and holding and not nested and not held:
+            yield_check = lambda: _warm_should_yield(directory, lock_hash)  # noqa: E731
         code, stats = run_child(argv, env, job, low=warm,
-                                progress=directory / "progress" / str(os.getpid()))
+                                progress=directory / "progress" / str(os.getpid()),
+                                yield_check=yield_check)
     except OSError as exc:
         sys.stderr.write(f"heavy: {argv[0]}: {exc}\n")
         code, stats = 127, _new_stats()
@@ -1847,19 +2088,24 @@ def broker_run(args: list[str], held: bool = False) -> int:
     except BaseException:
         _release_all(directory, lock_hash, holding, lease)
         raise
+    preempted = bool(stats.get("preempted"))
+    if preempted:
+        code = EXIT_QUEUE_TIMEOUT  # a stopped warm: its exit is ours, not the killed tree's
     row.update({
         "run_s": round(time.time() - t_run, 3), "compiled": stats["compiled"],
         **{k: stats[k] for k in ("cpu_s", "prep_cpu_s") if k in stats},
         "fp_hit": hit, "fp_miss": hit and stats["compiled"], "exit": code,
         "argv0": argv[0], "argv": _log_argv(argv),
     })
+    if preempted:
+        row["preempted"] = True
     # Register and log BEFORE releasing: the lock's next owner reads the registry the moment
     # it holds the lock, and must see what this run just built.
     if fp is not None:
         _record_fingerprint(directory, fp, root, code, stats)
     append_log(row, directory)
     _release_all(directory, lock_hash, holding, lease)
-    return code
+    return _PREEMPTED if preempted else code
 
 
 def _record_fingerprint(directory: Path, fp, root: str, code: int, stats: dict) -> None:

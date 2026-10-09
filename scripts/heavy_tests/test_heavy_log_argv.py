@@ -6,8 +6,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -54,6 +56,50 @@ class LogArgvTests(unittest.TestCase):
         rows = [json.loads(l) for l in (directory / "log.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0]["argv"], ["npm", "test", "--x"])
+
+    def test_concurrent_append_log_rows_never_interleave(self) -> None:
+        # Six brokers finishing at once write rows far larger than a pipe buffer; each row
+        # must land whole, on its own line, whatever the others are doing.
+        writers, rows_each, pad = 6, 150, 20000
+        directory = Path(self.tmp) / "append-state"
+        script = Path(self.tmp) / "append_rows.py"
+        script.write_text(
+            "import importlib.util, os, sys, time\n"
+            "from pathlib import Path\n"
+            "spec = importlib.util.spec_from_file_location('heavy_w', sys.argv[1])\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "start = float(sys.argv[3])\n"
+            "while time.time() < start:\n"
+            "    pass\n"
+            f"for i in range({rows_each}):\n"
+            f"    mod.append_log({{'w': os.getpid(), 'i': i, 'pad': 'x' * {pad}}}, Path(sys.argv[2]))\n",
+            encoding="utf-8",
+        )
+        start = time.time() + 3.0
+        procs = [
+            subprocess.Popen(
+                [sys.executable, str(script), str(HEAVY), str(directory), repr(start)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for _ in range(writers)
+        ]
+        for p in procs:
+            _, err = p.communicate(timeout=240)
+            self.assertEqual(p.returncode, 0, err)
+        lines = (directory / "log.jsonl").read_bytes().decode("utf-8").split("\n")
+        self.assertEqual(lines[-1], "", "the last row has no newline")
+        lines = [l.rstrip("\r") for l in lines[:-1]]
+        self.assertEqual(len(lines), writers * rows_each)
+        seen = set()
+        for n, line in enumerate(lines):
+            try:
+                row = json.loads(line)
+            except ValueError as exc:
+                self.fail(f"line {n} is not one whole row ({exc}): {line[:80]!r}")
+            self.assertEqual(len(row["pad"]), pad)
+            seen.add((row["w"], row["i"]))
+        self.assertEqual(len(seen), writers * rows_each, "a row was lost or written twice")
 
 
 if __name__ == "__main__":

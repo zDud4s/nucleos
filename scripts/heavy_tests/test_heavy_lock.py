@@ -426,6 +426,65 @@ class LockTests(unittest.TestCase):
         self.stop("out")
         self.assertEqual(self.finish(out)[0], 0)
 
+    def seed_log(self, argv: list[str], runs: int = 3, run_s: float = 600.0) -> None:
+        """Previous successful runs of `argv`, as the broker would have logged them."""
+        self.state.mkdir(parents=True, exist_ok=True)
+        with open(self.state / "log.jsonl", "a", encoding="utf-8") as f:
+            for _ in range(runs):
+                f.write(json.dumps({"v": 1, "argv": argv, "run_s": run_s, "exit": 0}) + "\n")
+
+    def test_an_agent_behind_a_long_holder_fails_fast_with_an_estimate(self) -> None:
+        # The log says this command takes ten minutes; an agent that can wait 30 s behind it
+        # is told at once (and told how long is left) rather than idling to a timeout.
+        self.seed_log([str(self.cargo), "check", "h"])
+        h = self.broker("h", self.repo_a, agent="other")
+        self.assert_started("h")
+        t0 = time.time()
+        ag = self.broker("ag", self.repo_a, agent="main", wait_max="30")
+        rc, _, err = self.finish(ag)
+        self.assertEqual(rc, 75, err)
+        self.assertLess(time.time() - t0, 10, "the agent waited behind a long holder")
+        self.assertFalse(self.started("ag"))
+        self.assertIn(f"pid {h.pid}", err)
+        self.assertIn("agent other", err)
+        self.assertIn("check h", err)
+        self.assertIn("estimated", err)
+
+        # Without an agent (a person, the daemon) the old behaviour stays: it waits its turn.
+        out = self.broker("out", self.repo_a)
+        self.waiters(1)
+        self.assert_stays_waiting("out")
+        self.stop("h")
+        self.assertEqual(self.finish(h)[0], 0)
+        self.assert_started("out")
+        self.stop("out")
+        self.assertEqual(self.finish(out)[0], 0)
+
+    def test_a_lock_timeout_names_the_holder(self) -> None:
+        # No history of the holder's command, so there is no estimate and no early exit: the
+        # agent waits out its cap, and the timeout says who it was waiting for.
+        h = self.broker("h", self.repo_a)
+        self.assert_started("h")
+        t0 = time.time()
+        ag = self.broker("ag", self.repo_a, agent="main", wait_max="2")
+        rc, _, err = self.finish(ag)
+        self.assertEqual(rc, 75, err)
+        self.assertGreaterEqual(time.time() - t0, 1.5, "gave up before its wait cap")
+        self.assertFalse(self.started("ag"))
+        self.assertIn(f"pid {h.pid}", err)
+        self.assertIn("check h", err)
+
+    def test_the_gate_message_names_the_holder(self) -> None:
+        hw = self.hold("hw", self.repo_a)
+        self.assert_started("hw")
+        ag = self.broker("ag", self.repo_a, agent="main", wait_max="30")
+        rc, _, err = self.finish(ag)
+        self.assertEqual(rc, 75, err)
+        self.assertFalse(self.started("ag"))
+        self.assertIn("gate", err)
+        # One holder line, the same shape everywhere: who, which agent, what, for how long.
+        self.assertRegex(err, rf"pid {hw.pid}, agent \S+, `[^`]+`, running \d+s")
+
 
 if __name__ == "__main__":
     unittest.main()
