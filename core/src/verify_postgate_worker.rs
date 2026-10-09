@@ -471,6 +471,7 @@ async fn submit_full(
         files: None,
         base: None,
         wait: false,
+        cover: false,
     };
     verify::submit(executor, caller, &args)
         .await
