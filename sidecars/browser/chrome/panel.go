@@ -150,11 +150,12 @@ func (d *Driver) stateMessage(id browser.SessionID, p *panelState) json.RawMessa
 		host = u.Host
 	}
 	msg, _ := json.Marshal(struct {
-		Type      string `json:"type"`
+		V         int    `json:"v"`
+		Kind      string `json:"kind"`
 		Mode      string `json:"mode"`
 		Host      string `json:"host"`
 		Collapsed bool   `json:"collapsed"`
-	}{"state", mode, host, p.collapsed})
+	}{1, "state", mode, host, p.collapsed})
 	return msg
 }
 
@@ -236,11 +237,11 @@ func (d *Driver) panelCalled(on cdp.SessionID, contextID int64, payload string) 
 	p := entry.panel
 
 	var head struct {
-		Type      string `json:"type"`
+		Kind      string `json:"kind"`
 		Collapsed *bool  `json:"collapsed"`
 	}
 	_ = json.Unmarshal([]byte(payload), &head)
-	if head.Type == "collapse" {
+	if head.Kind == "collapse" {
 		// Handled here and not forwarded: collapsing is the panel's own, and the state goes back to
 		// every world so a reopened panel keeps it.
 		go func() {

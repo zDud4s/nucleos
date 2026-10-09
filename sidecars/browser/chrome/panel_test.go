@@ -148,20 +148,20 @@ func TestPanelBindingFromAnotherContextIsDropped(t *testing.T) {
 		return slices.Clone(heard)
 	}
 
-	binding(fake, cdpOf(driver, id), 70, `{"type":"say","text":"from the panel"}`)
+	binding(fake, cdpOf(driver, id), 70, `{"v":1,"kind":"say","text":"from the panel"}`)
 	eventually(t, "the panel's own message reaching its subscriber", 3*time.Second, func() bool {
 		return len(heardNow()) == 1
 	})
 
-	binding(fake, cdpOf(driver, id), 7, `{"type":"say","text":"from the page"}`)
-	binding(fake, cdpOf(driver, id), 99, `{"type":"say","text":"from a world nobody told the driver about"}`)
+	binding(fake, cdpOf(driver, id), 7, `{"v":1,"kind":"say","text":"from the page"}`)
+	binding(fake, cdpOf(driver, id), 99, `{"v":1,"kind":"say","text":"from a world nobody told the driver about"}`)
 	time.Sleep(200 * time.Millisecond)
 	if got := heardNow(); len(got) != 1 {
 		t.Errorf("a binding call from outside the panel world was delivered: %v", got)
 	}
 
 	// Still alive afterwards: the drop did not take the channel down with it.
-	binding(fake, cdpOf(driver, id), 70, `{"type":"say","text":"again"}`)
+	binding(fake, cdpOf(driver, id), 70, `{"v":1,"kind":"say","text":"again"}`)
 	eventually(t, "the panel's second message reaching its subscriber", 3*time.Second, func() bool {
 		return len(heardNow()) == 2
 	})
@@ -175,8 +175,8 @@ func TestANewPanelWorldIsReplayedTheHistory(t *testing.T) {
 	id := opened(t, driver).ID
 	ctx := context.Background()
 
-	first := json.RawMessage(`{"type":"say","text":"first-message"}`)
-	second := json.RawMessage(`{"type":"say","text":"second-message"}`)
+	first := json.RawMessage(`{"v":1,"kind":"say","text":"first-message"}`)
+	second := json.RawMessage(`{"v":1,"kind":"say","text":"second-message"}`)
 
 	// Said before any panel world exists: it can only reach a world through the replay.
 	if err := driver.PanelPush(ctx, id, first); err != nil {
@@ -221,7 +221,7 @@ func TestPanelStateFollowsBeginAndEndPerson(t *testing.T) {
 	eventually(t, "the panel's opening state", 3*time.Second, func() bool {
 		return len(pushesInto(fake, 70)) > 0
 	})
-	if joined := strings.Join(pushesInto(fake, 70), "\n"); !strings.Contains(joined, `"state"`) || !strings.Contains(joined, `"mode":"agent"`) {
+	if joined := strings.Join(pushesInto(fake, 70), "\n"); !strings.Contains(joined, `"kind":"state"`) || !strings.Contains(joined, `"mode":"agent"`) {
 		t.Fatalf("a new panel world was not told the state of an agent-driven session: %q", joined)
 	}
 
@@ -238,7 +238,7 @@ func TestPanelStateFollowsBeginAndEndPerson(t *testing.T) {
 	if len(pushes) <= before {
 		t.Fatalf("EndPerson returned and the panel was not told: %v", pushes)
 	}
-	if last := pushes[len(pushes)-1]; !strings.Contains(last, `"state"`) || !strings.Contains(last, `"mode":"agent"`) {
+	if last := pushes[len(pushes)-1]; !strings.Contains(last, `"kind":"state"`) || !strings.Contains(last, `"mode":"agent"`) {
 		t.Errorf("the last state the panel heard after EndPerson is not agent: %q", last)
 	}
 }
