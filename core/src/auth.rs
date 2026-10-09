@@ -698,6 +698,67 @@ const TEAM_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/web/read"),
 ];
 
+/// Routes that sit in NO fixed scope table: (method, route template, tool name). A run key reaches
+/// one only when the run's frozen loadout (`run_loadout`, written by the resolver) lists the tool;
+/// a team key only for a node of its own team run, named by `RUN_ID_HEADER`, whose loadout lists
+/// it. Every error fails closed, and `permits` stays pure: this door is decided in `require_token`
+/// by `loadout_admits`, which reads the database.
+const LOADOUT_ROUTES: &[(Method, &str, &str)] = &[
+    (Method::POST, "/loadout/tool-requests", "request_tool"),
+    (Method::POST, "/web/read", "web_read"),
+];
+
+/// The tool a loadout-gated route stands for, matched against the route template the router chose.
+fn loadout_tool_for(method: &Method, route: &str) -> Option<&'static str> {
+    LOADOUT_ROUTES
+        .iter()
+        .find(|(allowed, pattern, _)| {
+            allowed == method && path_matches(pattern, route, Target::Route)
+        })
+        .map(|(_, _, tool)| *tool)
+}
+
+/// Whether a key's frozen loadout admits a loadout-gated route. False for every other scope and
+/// for every error: a caller that cannot prove it holds the tool does not hold it.
+async fn loadout_admits(
+    pool: &sqlx::SqlitePool,
+    scope: &Scope,
+    method: &Method,
+    route: &str,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    let Some(tool) = loadout_tool_for(method, route) else {
+        return false;
+    };
+    match scope {
+        Scope::Run(id) => crate::tool_loadout::run_lists_tool(pool, *id, tool)
+            .await
+            .unwrap_or(false),
+        Scope::TeamRun(team_run_id) => {
+            let Some(node) = headers
+                .get(crate::daemon_client::RUN_ID_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<i64>().ok())
+            else {
+                return false;
+            };
+            let own: Result<Option<i64>, sqlx::Error> =
+                sqlx::query_scalar("SELECT 1 FROM runs WHERE id = ? AND team_run_id = ?")
+                    .bind(node)
+                    .bind(team_run_id)
+                    .fetch_optional(pool)
+                    .await;
+            if !matches!(own, Ok(Some(_))) {
+                return false;
+            }
+            crate::tool_loadout::run_lists_tool(pool, node, tool)
+                .await
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 /// A team run's key and the secret to store for it: `team:<team_run_id>.<secret>`.
 ///
 /// The prefix is not decoration. `resolve` picks the table by prefix — `api:` for durable keys, a
@@ -944,10 +1005,21 @@ pub async fn require_token(
     // Graded against the route the router chose, not the path the client typed: see
     // `permits_route` for the over-grant the raw path allowed. A request that matched no route has
     // no template and falls back to its path — it is headed for a 404 either way.
-    let allowed = match req.extensions().get::<MatchedPath>() {
+    let mut allowed = match req.extensions().get::<MatchedPath>() {
         Some(matched) => permits_route(&scope, req.method(), matched.as_str()),
         None => permits(&scope, req.method(), req.uri().path()),
     };
+    // The loadout door: only for a matched route, and only when the fixed tables said no.
+    if !allowed && let Some(matched) = req.extensions().get::<MatchedPath>() {
+        allowed = loadout_admits(
+            &state.pool,
+            &scope,
+            req.method(),
+            matched.as_str(),
+            req.headers(),
+        )
+        .await;
+    }
     if !allowed {
         tracing::warn!(
             ?scope,
@@ -1098,6 +1170,7 @@ mod tests {
             .route("/email/send", post(|| async {}))
             .route("/web/search", post(|| async {}))
             .route("/web/read", post(|| async {}))
+            .route("/loadout/tool-requests", post(|| async {}))
             .route("/team-files/read", post(|| async {}))
             // Registered with both methods, so the negative assertion below — a department may POST
             // an action and may not LIST the queue — is answered by `permits` rather than by the
@@ -1231,6 +1304,168 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    async fn post_status_with_run_header(
+        app: &Router,
+        uri: &str,
+        bearer: &str,
+        run_id: Option<&str>,
+    ) -> StatusCode {
+        let mut request = HttpRequest::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {bearer}"));
+        if let Some(run_id) = run_id {
+            request = request.header(crate::daemon_client::RUN_ID_HEADER, run_id);
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn list_loadout(state: &AppState, run_id: i64, tools: &str) {
+        sqlx::query(
+            "INSERT INTO run_loadout (run_id, agent_id, team_id, tools, resolved_at)
+             VALUES (?, NULL, NULL, ?, '2026-10-08T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(tools)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn node_run_of_team_run(state: &AppState, team_run_id: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at, team_run_id)
+             VALUES ('x', 'running', 'worktree', '2026-01-01T00:00:00Z', ?)",
+        )
+        .bind(team_run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn loadout_a_run_key_reaches_a_loadout_route_only_with_a_listing_row() {
+        let state = test_state("owner-token").await;
+        let app = protected_router(state.clone());
+        let (id, token) = running_run_with_token(&state).await;
+
+        for uri in ["/loadout/tool-requests", "/web/read"] {
+            assert_eq!(
+                post_status_with_run_header(&app, uri, &token, None).await,
+                StatusCode::FORBIDDEN,
+                "{uri} with no run_loadout row"
+            );
+        }
+
+        list_loadout(&state, id, r#"["verify"]"#).await;
+        for uri in ["/loadout/tool-requests", "/web/read"] {
+            assert_eq!(
+                post_status_with_run_header(&app, uri, &token, None).await,
+                StatusCode::FORBIDDEN,
+                "{uri} with a row that does not list its tool"
+            );
+        }
+
+        sqlx::query("UPDATE run_loadout SET tools = ? WHERE run_id = ?")
+            .bind(r#"["request_tool"]"#)
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            post_status_with_run_header(&app, "/loadout/tool-requests", &token, None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_status_with_run_header(&app, "/web/read", &token, None).await,
+            StatusCode::FORBIDDEN,
+            "listing request_tool does not list web_read"
+        );
+
+        sqlx::query("UPDATE run_loadout SET tools = ? WHERE run_id = ?")
+            .bind(r#"["web_read"]"#)
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            post_status_with_run_header(&app, "/web/read", &token, None).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn loadout_a_team_key_reaches_request_tool_only_for_its_own_listed_node() {
+        let state = test_state("owner-token").await;
+        let app = protected_router(state.clone());
+        let token = live_team_run_with_token(&state, "run-a").await;
+        let _other = live_team_run_with_token(&state, "run-b").await;
+        let uri = "/loadout/tool-requests";
+
+        let own_listed = node_run_of_team_run(&state, "run-a").await;
+        list_loadout(&state, own_listed, r#"["request_tool"]"#).await;
+        let foreign_listed = node_run_of_team_run(&state, "run-b").await;
+        list_loadout(&state, foreign_listed, r#"["request_tool"]"#).await;
+        let own_unlisted = node_run_of_team_run(&state, "run-a").await;
+
+        assert_eq!(
+            post_status_with_run_header(&app, uri, &token, Some(&own_listed.to_string())).await,
+            StatusCode::OK,
+            "its own node with a listing row"
+        );
+        assert_eq!(
+            post_status_with_run_header(&app, uri, &token, Some(&foreign_listed.to_string())).await,
+            StatusCode::FORBIDDEN,
+            "a node of another team run"
+        );
+        assert_eq!(
+            post_status_with_run_header(&app, uri, &token, Some(&own_unlisted.to_string())).await,
+            StatusCode::FORBIDDEN,
+            "its own node without a row"
+        );
+        assert_eq!(
+            post_status_with_run_header(&app, uri, &token, None).await,
+            StatusCode::FORBIDDEN,
+            "no run header"
+        );
+    }
+
+    #[test]
+    fn loadout_routes_and_owner_routes_are_in_no_scope_table() {
+        // Passes before the feature exists, by design: it pins that the tables stay pure and the
+        // loadout door is decided elsewhere.
+        let run = Scope::Run(7);
+        let team = Scope::TeamRun("team-1".to_owned());
+        assert!(!permits(&run, &Method::POST, "/loadout/tool-requests"));
+        assert!(!permits(&run, &Method::POST, "/web/read"));
+        assert!(!permits(&team, &Method::POST, "/loadout/tool-requests"));
+
+        let owner_routes = [
+            (Method::GET, "/loadout/tools"),
+            (Method::POST, "/loadout/tools/1/approve"),
+            (Method::POST, "/loadout/tools/1/reject"),
+            (Method::POST, "/loadout/tools/1/revoke"),
+        ];
+        for scope in [
+            run,
+            team,
+            Scope::Service(Service::Email),
+            Scope::Service(Service::Council),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            for (method, path) in &owner_routes {
+                assert!(!permits(&scope, method, path), "{scope:?} {method} {path}");
+            }
+        }
+        assert!(permits(&Scope::Control, &Method::GET, "/loadout/tools"));
     }
 
     const ROUTE_FAMILY_CASES: &[(&str, &str)] = &[
