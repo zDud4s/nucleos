@@ -1,5 +1,6 @@
 import type { Agent } from "../data/agents";
 import type { Known } from "../data/knowledge";
+import type { LoadoutTool } from "../data/loadout-tools";
 import type { ClassTally, JudgeResolveStatus, Resolution, JudgeStatus, JudgeVerdict } from "../data/autopilot";
 import type { Concurrency, Job, JobDetail, JobItem, RunSearchResult } from "../data/fleet";
 import type { MapImport, MapModule, ProjectMap } from "../data/project-map";
@@ -2469,6 +2470,19 @@ const KNOWLEDGE: Known[] = [
     title: "Git's bash is the POSIX shell here", body: "`bash` on PATH is WSL; name Git's bash.exe explicitly." }),
 ];
 
+/**
+ * The tools beyond the base: what the Tools section of the Auditor Sénior's editor and of
+ * Finanças's Charter shows, and what the Brain's "Tools to approve" waits on.
+ */
+const LOADOUT_TOOLS: LoadoutTool[] = [
+  { id: 1, owner_kind: "agent", owner_id: "auditor", tool: "web_read", status: "active", source: "request",
+    reason: "The supplier's VAT notice is a web page, not a file.", run_id: "412", created_at: ago(5 * DAY), decided_at: ago(4 * DAY) },
+  { id: 2, owner_kind: "team", owner_id: "financas", tool: "web_search", status: "active", source: "owner",
+    reason: null, run_id: null, created_at: ago(8 * DAY), decided_at: ago(8 * DAY) },
+  { id: 3, owner_kind: "agent", owner_id: "auditor", tool: "email_queue", status: "proposed", source: "request",
+    reason: "The finding has to reach the supplier before the 20th.", run_id: "431", created_at: ago(2 * HOUR), decided_at: null },
+];
+
 export function answer(path: string, init?: RequestInit): unknown {
   /*
     The house's capacity, with nobody holding a slot. It is here so the Codigo
@@ -3001,6 +3015,16 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (splitQuery(path)[0] === "/owner-notes/graph") {
     if (splitQuery(path)[1].get("include_archived") !== "true") return NOTES_GRAPH;
     return { ...NOTES_GRAPH, notes: OWNER_NOTES } satisfies NotesGraph;
+  }
+  if (splitQuery(path)[0] === "/loadout/tools" && init?.method === undefined) {
+    /* Narrowed the way the núcleo narrows it: by status and by owner. */
+    const query = splitQuery(path)[1];
+    return LOADOUT_TOOLS.filter(
+      (row) =>
+        (!query.has("status") || row.status === query.get("status")) &&
+        (!query.has("owner_kind") || row.owner_kind === query.get("owner_kind")) &&
+        (!query.has("owner_id") || row.owner_id === query.get("owner_id")),
+    );
   }
   if (path === "/knowledge") return KNOWLEDGE;
   if (path === "/capture-requests") return OPEN_CAPTURES;

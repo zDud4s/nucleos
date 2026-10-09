@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useAgents } from "../data/agents";
 import { ScopedMemory } from "../brain/knowledge/ScopedMemory";
+import { ScopedTools } from "../brain/knowledge/ScopedTools";
 import { isApiRefusal } from "../data/client";
 import {
   GRANTABLE_ACTIONS,
@@ -181,6 +182,7 @@ export function Charter({ team, runs }: CharterProps) {
     <>
       <TeamForm existing={team} runs={runs} />
       <ScopedMemory scopeKind="team" scopeId={team.id} />
+      <ScopedTools ownerKind="team" ownerId={team.id} />
     </>
   );
 }
