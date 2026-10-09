@@ -160,6 +160,20 @@ pub enum Op {
         branch: Branch,
         onto: Branch,
     },
+    /// Undoing a merge that is already on `target` (spec 2026-10-05 §6.2, D4), **and the only
+    /// operation here that the daemon queues for itself**: the post-merge gate enqueues it when a
+    /// bisection confirms a culprit and the project's `revert_on_red` is on. It is not in
+    /// `GIT_OP_KINDS`, so no project declares it, and `from_request` refuses it, so no tool call
+    /// asks for it.
+    ///
+    /// `-m 1` and nothing else: the queue's merges are always `--no-ff`, so the first parent is the
+    /// line the merge landed on. The revert is a new commit on top of `target`, which makes the
+    /// publish a fast-forward like any merge's, and the target moving meanwhile is requeued the
+    /// same way. `merge_sha` is an id and not a name, hence its own type.
+    Revert {
+        merge_sha: CommitSha,
+        target: Branch,
+    },
 }
 
 /// A branch name the daemon is willing to put on a git command line.
@@ -306,6 +320,49 @@ impl From<&str> for TagName {
     }
 }
 
+/// A full commit id the daemon is willing to put on a git command line.
+///
+/// Its own type because the argv gains a sha and not a ref: `Branch` would accept `master`, a short
+/// id or anything not starting with a dash, and a revert of the wrong thing is not a failure git
+/// reports. Exactly 40 (SHA-1) or 64 (SHA-256) lowercase hex digits, validated on every route in —
+/// including `Deserialize`, which is how a stored or posted row arrives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommitSha(String);
+
+impl CommitSha {
+    pub fn new(value: &str) -> Result<Self, String> {
+        let well_formed = matches!(value.len(), 40 | 64)
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if well_formed {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(format!(
+                "a commit id is 40 or 64 lowercase hex digits, not {value:?}"
+            ))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CommitSha {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        CommitSha::new(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The `Branch` counterpart, for the same reason: tests build commit ids from literals.
+#[cfg(any(test, feature = "testkit"))]
+impl From<&str> for CommitSha {
+    fn from(value: &str) -> Self {
+        CommitSha::new(value).expect("a test used an invalid commit id literal")
+    }
+}
+
 impl<'de> Deserialize<'de> for Branch {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Branch::new(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
@@ -354,6 +411,7 @@ impl Op {
             Op::Fetch { .. } => "fetch",
             Op::BranchDelete { .. } => "branch-delete",
             Op::Rebase { .. } => "rebase",
+            Op::Revert { .. } => "revert",
         }
     }
 
@@ -412,6 +470,12 @@ impl Op {
                 branch: named_branch(source, "rebase", "source")?,
                 onto: named_branch(target, "rebase", "target")?,
             }),
+            // Neither unknown nor deferred: the daemon performs it, and only the daemon asks.
+            "revert" => Err(
+                "revert is not something a caller asks for: the daemon's post-merge \
+                 gate queues it when a bisection confirms a culprit (spec 2026-10-05 §6.2)"
+                    .to_owned(),
+            ),
             // **What is left on the spec's list of nine is NOT a backlog, and this arm no longer
             // pretends it is.** Every name below has been decided against, each on its own grounds,
             // and the message says so — a caller told "not yet" waits for a version that is never
@@ -475,6 +539,12 @@ impl Op {
 /// seventh operation that never reached this list would be one the queue performs and no project
 /// can declare, and nothing else in the tree would say so.
 pub const GIT_OP_KINDS: [&str; 6] = ["merge", "push", "tag", "fetch", "rebase", "branch-delete"];
+
+/// The operation kinds only the daemon queues. They are outside `GIT_OP_KINDS` on purpose: no
+/// project declares them, the picker never draws them and `Op::from_request` refuses them.
+/// `every_op_kind_is_in_the_declarable_catalogue` requires every kind to sit in one list or the
+/// other.
+pub const DAEMON_OP_KINDS: [&str; 1] = ["revert"];
 
 /// One operation a project may declare, with the flag the shell draws it by.
 ///
@@ -2970,10 +3040,14 @@ pub async fn drain_once(
     // to an asker who, by the whole point of this pillar, is not watching for it. A merge is a
     // `git_exec::run_git` invocation the queue itself can redo for the cost of one more claim, so
     // it does: the SAME row goes back to `queued` and drops the slot, up to a ceiling, rather than
-    // ending on a message nobody reads. Scoped to `Op::Merge` — every other operation's "moved"
-    // is a different failure with a different remedy, and none of the rest publishes by
-    // compare-and-swap against a target this queue does not own the way it owns a merge's.
-    let outcome = if matches!(claimed.op, Op::Merge { .. }) && outcome_is_a_moved_target(&outcome) {
+    // ending on a message nobody reads. Scoped to `Op::Merge` and `Op::Revert` — a revert is
+    // computed in the integration worktree and published by the very same compare-and-swap, so a
+    // moved target means the same thing for it. Every other operation's "moved" is a different
+    // failure with a different remedy, and none of the rest publishes by compare-and-swap against
+    // a target this queue does not own the way it owns a merge's.
+    let outcome = if matches!(claimed.op, Op::Merge { .. } | Op::Revert { .. })
+        && outcome_is_a_moved_target(&outcome)
+    {
         match requeue_after_moved_target(pool, id).await {
             Ok(MovedTargetRetry::Requeued) => return true,
             Ok(MovedTargetRetry::CeilingReached(replacement)) => replacement,
@@ -3760,15 +3834,89 @@ mod tests {
                 branch: Branch::new("a").unwrap(),
                 onto: Branch::new("b").unwrap(),
             },
+            Op::Revert {
+                merge_sha: CommitSha::new(&"a".repeat(40)).unwrap(),
+                target: Branch::new("b").unwrap(),
+            },
         ];
         for op in &one_of_each {
             assert!(
-                GIT_OP_KINDS.contains(&op.kind()),
-                "{} is not declarable",
+                GIT_OP_KINDS.contains(&op.kind()) || DAEMON_OP_KINDS.contains(&op.kind()),
+                "{} is neither declarable nor a daemon-only operation",
                 op.kind()
             );
         }
-        assert_eq!(GIT_OP_KINDS.len(), one_of_each.len());
+        assert_eq!(
+            GIT_OP_KINDS.len() + DAEMON_OP_KINDS.len(),
+            one_of_each.len()
+        );
+    }
+
+    /// D4 of the post-merge gate: a revert is something the daemon queues, never something a
+    /// project declares. It must survive storage like any other operation, and it must sit in
+    /// the daemon-only vocabulary and OUT of the declarable one the picker draws from.
+    #[test]
+    fn a_revert_round_trips_through_storage_and_is_not_declarable() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let op = Op::Revert {
+            merge_sha: CommitSha::new(sha).unwrap(),
+            target: Branch::new("master").unwrap(),
+        };
+
+        assert_eq!(op.kind(), "revert");
+        let back = Op::from_stored(op.kind(), &op.to_args()).expect("a stored revert parses back");
+        assert_eq!(back, op);
+
+        let payload: serde_json::Value = serde_json::from_str(&op.to_args()).unwrap();
+        assert_eq!(payload["op"].as_str(), Some("revert"));
+        assert_eq!(payload["merge_sha"].as_str(), Some(sha));
+        assert_eq!(payload["target"].as_str(), Some("master"));
+
+        assert!(
+            !GIT_OP_KINDS.contains(&"revert"),
+            "a project must not be able to declare a revert"
+        );
+        assert!(DAEMON_OP_KINDS.contains(&"revert"));
+    }
+
+    /// Nobody asks for a revert through a tool call, and the commit it names is an id and never a
+    /// ref: the argv gains a sha, so a branch name, a short id or an option must not get in.
+    #[test]
+    fn a_revert_is_refused_from_a_tool_call_and_its_sha_must_be_a_full_hex_id() {
+        let full = "0123456789abcdef0123456789abcdef01234567";
+        let refused = Op::from_request("revert", Some(full), Some("master")).unwrap_err();
+        assert!(
+            refused.contains("post-merge gate"),
+            "the refusal must say who queues it: {refused}"
+        );
+        assert!(
+            !refused.contains("unknown") && !refused.contains("not yet"),
+            "neither an unknown operation nor a deferred one: {refused}"
+        );
+
+        // A SHA-1 (40) and a SHA-256 (64) object id are the only accepted lengths.
+        assert!(CommitSha::new(full).is_ok());
+        assert!(CommitSha::new(&"f".repeat(64)).is_ok());
+        let bad_ids: Vec<String> = vec![
+            String::new(),
+            "abc1234".to_string(),
+            "master".to_string(),
+            "--upstream=x".to_string(),
+            "A".repeat(40),
+            "g".repeat(40),
+            "a".repeat(41),
+            "a".repeat(39),
+        ];
+        for bad in &bad_ids {
+            assert!(CommitSha::new(bad).is_err(), "{bad:?} must be refused");
+        }
+
+        // The stored form is validated on the way back in as well.
+        let stored =
+            |sha: &str| format!(r#"{{"op":"revert","merge_sha":"{sha}","target":"master"}}"#);
+        assert!(Op::from_stored("revert", &stored(full)).is_ok());
+        assert!(Op::from_stored("revert", &stored("master")).is_err());
+        assert!(Op::from_stored("revert", &stored("abc1234")).is_err());
     }
 
     #[test]
@@ -4985,6 +5133,10 @@ mod tests {
                 branch: "feat/x".into(),
                 onto: "master".into(),
             },
+            Op::Revert {
+                merge_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                target: "master".into(),
+            },
         ];
 
         for op in &all {
@@ -5012,7 +5164,15 @@ mod tests {
         let kinds: Vec<&str> = all.iter().map(Op::kind).collect();
         assert_eq!(
             kinds,
-            ["merge", "push", "tag", "fetch", "branch-delete", "rebase"],
+            [
+                "merge",
+                "push",
+                "tag",
+                "fetch",
+                "branch-delete",
+                "rebase",
+                "revert"
+            ],
             "the `op` column's vocabulary is the one the door speaks"
         );
     }
@@ -7002,6 +7162,48 @@ mod tests {
             ticket.id, id,
             "the same ticket the caller was already holding"
         );
+        assert_eq!(ticket.status, "succeeded");
+        assert_eq!(ticket.result_sha.as_deref(), Some("cafe"));
+    }
+
+    /// A revert is published by the same compare-and-swap as a merge, so the target moving under
+    /// it is the same ordinary contention: the SAME row goes back to `queued` and lands on retry.
+    #[tokio::test]
+    async fn a_revert_whose_target_moved_is_requeued_like_a_merge() {
+        let pool = test_pool().await;
+        let revert = Op::Revert {
+            merge_sha: CommitSha::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            target: Branch::new("master").unwrap(),
+        };
+        let id = submit(
+            &pool,
+            &ResolvedRepo::synthetic("alpha", "C:/repo", "alpha"),
+            &revert,
+            Origin::Human,
+        )
+        .await
+        .unwrap();
+
+        let moved = FakeVcsExecutor::failing_with(
+            "master moved while the merge was being computed, so it was not published; resubmit",
+        );
+        assert!(drain_once(&pool, "alpha", &moved).await);
+        assert_eq!(
+            status_of(&pool, id).await,
+            "queued",
+            "a moved target is retried by the queue itself, for a revert as for a merge"
+        );
+        let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1);
+
+        let lands = FakeVcsExecutor::succeeding_with("cafe");
+        assert!(drain_once(&pool, "alpha", &lands).await);
+        let ticket = wait_for(&pool, id, Duration::ZERO).await.unwrap();
+        assert_eq!(ticket.id, id);
         assert_eq!(ticket.status, "succeeded");
         assert_eq!(ticket.result_sha.as_deref(), Some("cafe"));
     }

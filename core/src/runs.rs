@@ -2754,6 +2754,30 @@ pub async fn create_resolution_run(
     .await
 }
 
+/// Starts the correction run the post-merge gate opens over a reverted merge, in a worktree born on
+/// the `fix/` branch prepared for it.
+///
+/// Shape and shared reasoning in [`NewRun::provisioned`]. Nothing is claimed on the way in: the
+/// caller (`verify_postgate_worker::open_corrections`) claims the branch before it asks.
+pub async fn create_correction_run(
+    state: &AppState,
+    prompt: String,
+    project_id: String,
+    project_root: String,
+    correction: Correction,
+) -> Result<i64, CreateRunError> {
+    create_run_with(
+        state,
+        NewRun::provisioned(
+            prompt,
+            project_id,
+            project_root,
+            Provisioning::Correction(correction),
+        ),
+    )
+    .await
+}
+
 /// Starts one node of a job inside that job's existing worktree.
 ///
 /// Shape and shared reasoning in [`NewRun::provisioned`]. Its `mode = "worktree"` is deliberate
@@ -2816,6 +2840,15 @@ enum Provisioning {
     /// wrong commit: an item whose dependency has just landed on the job's branch would start
     /// without that work, and the dependency graph would be decorative.
     Item(JobItem),
+    /// A correction run: a worktree of its own, born on the `fix/` branch the post-merge gate
+    /// prepared. Standalone for the gate and the slot, `Item`-like only for the base.
+    Correction(Correction),
+}
+
+/// A correction run about to be given a tree of its own (F3-4, spec 2026-10-05 §6.2 D4).
+pub struct Correction {
+    /// The `fix/` branch the tree is born on, whose first commit is the revert of the revert.
+    pub base: String,
 }
 
 /// One item of a job, about to be given a tree of its own.
@@ -2835,21 +2868,28 @@ impl Provisioning {
     fn node(&self) -> Option<&JobNode> {
         match self {
             Self::Node(node) => Some(node),
-            Self::Resolution(_) | Self::Item(_) => None,
+            Self::Resolution(_) | Self::Item(_) | Self::Correction(_) => None,
         }
     }
 
     fn resolution(&self) -> Option<&Resolution> {
         match self {
             Self::Resolution(resolution) => Some(resolution),
-            Self::Node(_) | Self::Item(_) => None,
+            Self::Node(_) | Self::Item(_) | Self::Correction(_) => None,
         }
     }
 
     fn item(&self) -> Option<&JobItem> {
         match self {
             Self::Item(item) => Some(item),
-            Self::Node(_) | Self::Resolution(_) => None,
+            Self::Node(_) | Self::Resolution(_) | Self::Correction(_) => None,
+        }
+    }
+
+    fn correction(&self) -> Option<&Correction> {
+        match self {
+            Self::Correction(correction) => Some(correction),
+            Self::Node(_) | Self::Resolution(_) | Self::Item(_) => None,
         }
     }
 
@@ -2980,6 +3020,7 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
     let node = provisioning.as_ref().and_then(Provisioning::node);
     let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
     let item = provisioning.as_ref().and_then(Provisioning::item);
+    let correction = provisioning.as_ref().and_then(Provisioning::correction);
     // The house rule, asked once: everything but a job node brings a checkout of its own, and
     // therefore claims a slot, records a row and is charged disk for it. `None` — a standalone
     // run — brings one too.
@@ -3204,7 +3245,8 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
                 // `worktree::create_at` carries why that is not a preference.
                 let base = resolution
                     .map(|it| it.target.as_str())
-                    .or_else(|| item.map(|it| it.base.as_str()));
+                    .or_else(|| item.map(|it| it.base.as_str()))
+                    .or_else(|| correction.map(|it| it.base.as_str()));
                 // An item's name comes back, so its checkout and its branch may already be there —
                 // from the attempt this one is retrying, or from a crash between creating the tree
                 // and recording it. `adopt_or_create_at` is the difference between a retry that
@@ -6467,6 +6509,84 @@ pub mod tests {
             resolution_run_id_of(&state.pool, request).await.is_some(),
             "the attempt is spent even though no agent started — a second try hits the same wall"
         );
+    }
+
+    /// A correction run (F3-4, spec 2026-10-05 §6.2 D4) is born on the `fix/` branch the post-merge
+    /// gate prepared, not on wherever the project checkout stands. That branch's first commit is the
+    /// revert of the revert, so a run born anywhere else would start without the one thing it is
+    /// there to build on. The checkout is the run's own (a standalone run's, with its own slot).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_correction_run_is_born_on_its_fix_branch() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_container, repo) = init_contained_repo("nucleos-runs-correction-");
+        let fix = "fix/feat-x-1a2b3c4";
+        assert!(git_ok(
+            &repo,
+            &[OsStr::new("checkout"), OsStr::new("-b"), OsStr::new(fix)]
+        ));
+        std::fs::write(repo.join("fix.txt"), "the work the run builds on\n").expect("write fix");
+        assert!(git_ok(&repo, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("revert the revert")
+            ]
+        ));
+        let fix_tip = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("rev-parse the fix tip")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_owned();
+        // Back to the branch the checkout started on, so the project's HEAD is NOT the fix branch.
+        assert!(git_ok(&repo, &[OsStr::new("checkout"), OsStr::new("-")]));
+        let state = test_state_with(Some(Duration::from_secs(30)), Duration::from_secs(120)).await;
+
+        let run = create_correction_run(
+            &state,
+            "correct it".to_owned(),
+            "proj".to_owned(),
+            repo.to_string_lossy().into_owned(),
+            Correction {
+                base: fix.to_owned(),
+            },
+        )
+        .await
+        .expect("the correction run should start");
+
+        let worktree: String = sqlx::query_scalar("SELECT cwd FROM runs WHERE id = ?")
+            .bind(run)
+            .fetch_one(&state.pool)
+            .await
+            .expect("the run should have been given its worktree");
+        let worktree = FsPath::new(&worktree);
+        assert!(
+            worktree.join("fix.txt").exists(),
+            "the run has to start with the fix branch's work in its tree"
+        );
+        let head = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(worktree)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("rev-parse the run's head")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_owned();
+        assert_eq!(head, fix_tip, "the run is born exactly on the fix branch");
     }
 
     /// Wires this daemon's classifier hook into `dir`, the way a project that has onboarded has it:

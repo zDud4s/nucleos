@@ -1910,6 +1910,9 @@ async fn main() {
     tokio::spawn(verify_postgate_worker::run_postgate_worker(
         verify_executor.clone(),
     ));
+    // Opens the correction run of a `fix/` branch the gate worker prepared; with `revert_on_red` off
+    // for every project there is never one, and a pass reads an empty query.
+    tokio::spawn(verify_postgate_worker::run_correction_loop(state.clone()));
     tokio::spawn(verify_exec::run_executor(verify_executor));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),

@@ -100,12 +100,34 @@ pub struct State {
     pub culprit_sha: Option<String>,
     pub candidates: Vec<String>,
     pub also_suspect: Vec<String>,
+    /// The culprit being reverted (F3-4), the vcs ticket of that revert, the commit the queue
+    /// published for it, and the `fix/` branch built on that commit. All `None` unless
+    /// `revert_on_red` started a revert.
+    pub revert_merge_sha: Option<String>,
+    pub revert_request_id: Option<i64>,
+    pub revert_sha: Option<String>,
+    pub fix_branch: Option<String>,
+    /// The correction run of `fix_branch`: `None` until one is claimed, `Some(0)` while a claim has
+    /// no run yet, the run's id afterwards.
+    pub fix_run_id: Option<i64>,
 }
 
 impl State {
     /// A gate is running for this project.
     pub fn running(&self) -> bool {
         self.running_sha.is_some()
+    }
+
+    /// A revert was started and its correction run has not been claimed yet: a new culprit must not
+    /// start a second revert over it.
+    pub fn revert_in_flight(&self) -> bool {
+        self.revert_merge_sha.is_some() && self.fix_run_id.is_none()
+    }
+
+    /// A revert was started and its `fix/` branch does not exist yet: the worker still has to
+    /// queue the revert, follow it, or build the branch.
+    pub fn revert_pending(&self) -> bool {
+        self.revert_merge_sha.is_some() && self.fix_branch.is_none()
     }
 
     /// The view `verify_batch::decide` reads, for the target's current `tip`.
@@ -139,6 +161,11 @@ struct Row {
     culprit_sha: Option<String>,
     candidates: String,
     also_suspect: String,
+    revert_merge_sha: Option<String>,
+    revert_request_id: Option<i64>,
+    revert_sha: Option<String>,
+    fix_branch: Option<String>,
+    fix_run_id: Option<i64>,
 }
 
 /// A JSON column that cannot be decoded reads as empty, with a warning, like `red_groups`.
@@ -200,6 +227,11 @@ impl From<Row> for State {
             culprit_sha: row.culprit_sha,
             candidates,
             also_suspect,
+            revert_merge_sha: row.revert_merge_sha,
+            revert_request_id: row.revert_request_id,
+            revert_sha: row.revert_sha,
+            fix_branch: row.fix_branch,
+            fix_run_id: row.fix_run_id,
         }
     }
 }
@@ -210,7 +242,8 @@ pub async fn load(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<St
         "SELECT project_id, target, last_green_sha, last_attempted_sha, running_sha, \
                 running_request_id, red_groups, red_since_sha, red_phase, red_sha, red_base_sha, \
                 probe_sha, probe_request_id, probes, reported_sha, culprit_sha, candidates, \
-                also_suspect \
+                also_suspect, revert_merge_sha, revert_request_id, revert_sha, fix_branch, \
+                fix_run_id \
          FROM postgate_state WHERE project_id = ?",
     )
     .bind(project_id)
@@ -504,6 +537,32 @@ pub async fn report(
     verdict: &Verdict,
     summary: &str,
 ) -> sqlx::Result<bool> {
+    report_inner(pool, project_id, red_sha, verdict, summary, false).await
+}
+
+/// `report`, and when the verdict is a culprit that is not a repeat, the revert of that culprit is
+/// started in the same transaction: `revert_merge_sha` is set and the other four revert columns are
+/// cleared. The feed line therefore never says "reverting" without the state to back it, or the
+/// reverse. A repeated culprit starts nothing. The caller decides whether a revert may start at all
+/// (the switch, and none already in flight); this only writes it.
+pub async fn report_with_revert(
+    pool: &SqlitePool,
+    project_id: &str,
+    red_sha: &str,
+    verdict: &Verdict,
+    summary: &str,
+) -> sqlx::Result<bool> {
+    report_inner(pool, project_id, red_sha, verdict, summary, true).await
+}
+
+async fn report_inner(
+    pool: &SqlitePool,
+    project_id: &str,
+    red_sha: &str,
+    verdict: &Verdict,
+    summary: &str,
+    revert: bool,
+) -> sqlx::Result<bool> {
     let mut tx = pool.begin().await?;
     let earlier: Option<Option<String>> = sqlx::query_scalar(
         "SELECT culprit_sha FROM postgate_state \
@@ -547,6 +606,21 @@ pub async fn report(
         return Ok(false);
     }
     let repeats = culprit.is_some() && culprit == earlier.as_deref();
+    if revert
+        && !repeats
+        && let Some(culprit) = culprit
+    {
+        sqlx::query(
+            "UPDATE postgate_state SET \
+                 revert_merge_sha = ?, revert_request_id = NULL, revert_sha = NULL, \
+                 fix_branch = NULL, fix_run_id = NULL \
+             WHERE project_id = ?",
+        )
+        .bind(culprit)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     if !repeats {
         crate::feed::append_on(
             &mut tx,
@@ -558,6 +632,117 @@ pub async fn report(
         )
         .await?;
     }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Stores the vcs ticket of the revert of `merge_sha`. Refused (`false`) when no revert of that
+/// culprit is started, so a late ticket cannot attach itself to a revert that already ended.
+pub async fn set_revert_request(
+    pool: &SqlitePool,
+    project_id: &str,
+    merge_sha: &str,
+    request_id: i64,
+) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE postgate_state SET revert_request_id = ?, updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ? AND revert_merge_sha = ?",
+    )
+    .bind(request_id)
+    .bind(project_id)
+    .bind(merge_sha)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Stores the commit the queue published for the revert of `merge_sha`. Same compare-and-set as
+/// `set_revert_request`.
+pub async fn record_revert(
+    pool: &SqlitePool,
+    project_id: &str,
+    merge_sha: &str,
+    revert_sha: &str,
+) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE postgate_state SET revert_sha = ?, updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ? AND revert_merge_sha = ?",
+    )
+    .bind(revert_sha)
+    .bind(project_id)
+    .bind(merge_sha)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// The revert of `merge_sha` did not happen, or happened and left no branch: the five revert
+/// columns are cleared so the state is free again, and `summary` goes to the feed, in one
+/// transaction. Refused (`false`, nothing written) when no revert of that culprit is started.
+pub async fn fail_revert(
+    pool: &SqlitePool,
+    project_id: &str,
+    merge_sha: &str,
+    summary: &str,
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let done = sqlx::query(
+        "UPDATE postgate_state SET \
+             revert_merge_sha = NULL, revert_request_id = NULL, revert_sha = NULL, \
+             fix_branch = NULL, fix_run_id = NULL, updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ? AND revert_merge_sha = ?",
+    )
+    .bind(project_id)
+    .bind(merge_sha)
+    .execute(&mut *tx)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Ok(false);
+    }
+    crate::feed::append_on(
+        &mut tx,
+        Some(project_id),
+        POSTGATE_RED_KIND,
+        summary,
+        None,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Stores the `fix/` branch built on the revert of `merge_sha` and tells the owner (`summary`), in
+/// one transaction. Refused (`false`, nothing written) when no revert of that culprit is started.
+pub async fn set_fix_branch(
+    pool: &SqlitePool,
+    project_id: &str,
+    merge_sha: &str,
+    branch: &str,
+    summary: &str,
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let done = sqlx::query(
+        "UPDATE postgate_state SET fix_branch = ?, updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ? AND revert_merge_sha = ?",
+    )
+    .bind(branch)
+    .bind(project_id)
+    .bind(merge_sha)
+    .execute(&mut *tx)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Ok(false);
+    }
+    crate::feed::append_on(
+        &mut tx,
+        Some(project_id),
+        POSTGATE_RED_KIND,
+        summary,
+        None,
+        None,
+    )
+    .await?;
     tx.commit().await?;
     Ok(true)
 }
