@@ -4371,23 +4371,33 @@ fn item_gate(
     }
 }
 
-/// True when the job tree holds a valid test map that is byte-identical to the project root's.
+/// True when the job tree holds a valid test map that is byte-identical to the project root's, and
+/// every script its group commands name is too.
 ///
 /// Same reason as `tampered_gate_script`: a verdict must not depend on a file the work being
 /// measured may have rewritten. An agent that narrowed `nucleos.tests.yaml` would otherwise pick
-/// which tests judge it. Blocking: reads files from disk.
+/// which tests judge it, and one that rewrote `scripts/gates.sh` (what a map's commands run) would
+/// pick what they mean: the full gate refuses that, so a scoped one must not be easier to fool.
+/// Blocking: reads files from disk.
 pub(crate) fn map_is_trusted(worktree: &Path, project_root: &Path) -> bool {
-    if !matches!(
-        crate::tests_map::load(worktree),
-        crate::tests_map::MapState::Valid(_)
-    ) {
+    let crate::tests_map::MapState::Valid(map) = crate::tests_map::load(worktree) else {
         return false;
-    }
+    };
     let read = |root: &Path| std::fs::read(root.join(crate::tests_map::MAP_FILE));
     match (read(worktree), read(project_root)) {
-        (Ok(tree), Ok(root)) => tree == root,
-        _ => false,
+        (Ok(tree), Ok(root)) if tree == root => {}
+        _ => return false,
     }
+    let commands = map.tests.groups.values().flat_map(|group| {
+        [
+            Some(group.command.as_str()),
+            group.check.as_deref(),
+            group.select.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+    });
+    crate::gate::tampered_command_scripts(project_root, worktree, commands).is_none()
 }
 
 async fn gate_item(state: &AppState, job: &JobRow, ordinal: usize, items: usize) -> Step {
@@ -4516,7 +4526,7 @@ async fn gate_item_with(
             return Step::Stopped;
         }
         // The last item's gate is the one the owner reads as "the job passed", so the feed says
-        // which gate measured it, whatever the verdict (an unavailable scope says the full gate did).
+        // which gate measured it, whatever the verdict (an unavailable scope says the full gate follows).
         if last {
             say(
                 pool,
@@ -14295,6 +14305,47 @@ tests:
     }
 
     #[test]
+    fn a_map_whose_command_script_differs_from_the_project_roots_is_not_trusted() {
+        let map = "version: 1
+tests:
+  groups:
+    core:
+      paths: [core/]
+      check: git --version
+      command: sh scripts/gates.sh core
+";
+        let root = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        for (dir, script) in [
+            (
+                root.path(),
+                "echo a
+",
+            ),
+            (
+                tree.path(),
+                "echo a
+",
+            ),
+        ] {
+            std::fs::create_dir_all(dir.join("scripts")).unwrap();
+            std::fs::write(dir.join(crate::tests_map::MAP_FILE), map).unwrap();
+            std::fs::write(dir.join("scripts/gates.sh"), script).unwrap();
+        }
+        // The map and its script agree with the project's: trusted.
+        assert!(map_is_trusted(tree.path(), root.path()));
+
+        // Same map, but the script it runs was rewritten.
+        std::fs::write(
+            tree.path().join("scripts/gates.sh"),
+            "echo rewritten
+",
+        )
+        .unwrap();
+        assert!(!map_is_trusted(tree.path(), root.path()));
+    }
+
+    #[test]
     fn an_implement_node_is_told_to_verify_its_own_files_through_the_daemon() {
         let prompt = implement_prompt("x", 0, 2, "/wt/.nucleos", &[], None, None);
         assert!(prompt.contains("verify_status"), "{prompt}");
@@ -15468,6 +15519,49 @@ tests:
             "gate_command: git --version\nscoped_final_gate: true\n",
         )
         .await;
+
+        gate_item_with(&f.state, &f.job, 1, 2, Some(f.executor.clone())).await;
+
+        assert_eq!(scope_requests(&f.pool).await, Vec::<String>::new());
+        assert_eq!(full_gate_rows(&f.pool).await, 1);
+        assert!(scoped_feed(&f.pool).await.is_empty());
+    }
+
+    /// The map is the project's own, but a script its group commands run was rewritten in the job
+    /// tree: the last item takes the full gate, with no scope request.
+    #[tokio::test]
+    async fn gate_item_keeps_the_full_gate_on_the_last_item_when_a_map_script_was_rewritten() {
+        let f = scope_job_with(true, SCOPED_FINAL_RULES).await;
+        let root = PathBuf::from(&f.job.project_root);
+        let tree = tempfile::tempdir().unwrap();
+        let map = std::fs::read_to_string(root.join(crate::tests_map::MAP_FILE))
+            .unwrap()
+            .replace(
+                "command: git --version",
+                "command: sh scripts/gates.sh core",
+            );
+        for (dir, script) in [
+            (
+                root.as_path(),
+                "echo configured
+",
+            ),
+            (
+                tree.path(),
+                "echo rewritten
+",
+            ),
+        ] {
+            std::fs::create_dir_all(dir.join("scripts")).unwrap();
+            std::fs::write(dir.join(crate::tests_map::MAP_FILE), &map).unwrap();
+            std::fs::write(dir.join("scripts/gates.sh"), script).unwrap();
+        }
+        sqlx::query("UPDATE worktrees SET path = ? WHERE owner_kind = 'job' AND owner_id = ?")
+            .bind(tree.path().to_string_lossy().into_owned())
+            .bind(f.job.id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
 
         gate_item_with(&f.state, &f.job, 1, 2, Some(f.executor.clone())).await;
 

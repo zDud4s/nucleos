@@ -13022,6 +13022,54 @@ tests:
         assert_eq!(run_full_gate_rows(&f.pool).await, 1);
     }
 
+    /// The map is the project's own, byte for byte, but a script its group commands run was
+    /// rewritten in the worktree: the full gate refuses that, so the scoped one must not be easier
+    /// to fool. Full gate, no scope request.
+    #[tokio::test]
+    async fn run_gate_keeps_the_full_gate_when_a_script_the_map_runs_was_rewritten() {
+        let f = scoped_run(true).await;
+        let map = RUN_TEST_MAP.replace(
+            "command: git --version",
+            "command: sh scripts/gates.sh core",
+        );
+        let other_root = tempfile::tempdir().unwrap();
+        for (dir, script) in [
+            (
+                other_root.path(),
+                "echo configured
+",
+            ),
+            (
+                f.root.as_path(),
+                "echo rewritten
+",
+            ),
+        ] {
+            std::fs::create_dir_all(dir.join("scripts")).unwrap();
+            std::fs::write(dir.join(crate::tests_map::MAP_FILE), &map).unwrap();
+            std::fs::write(dir.join("scripts/gates.sh"), script).unwrap();
+        }
+
+        let outcome = gate_run_with(
+            &f.pool,
+            f.run_id,
+            Some("project-a"),
+            &f.root,
+            other_root.path(),
+            "git --version",
+            true,
+            Some(f.executor.clone()),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, crate::gate::GateOutcome::Passed),
+            "{outcome:?}"
+        );
+        assert_eq!(run_scope_requests(&f.pool).await, Vec::<String>::new());
+        assert_eq!(run_full_gate_rows(&f.pool).await, 1);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_failing_gate_is_announced_in_the_feed() {
         let _env_lock = crate::worktree::test_env_lock();

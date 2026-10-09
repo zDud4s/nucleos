@@ -1060,7 +1060,7 @@ pub(crate) fn scoped_final_note(subject: &str, verdict: &ScopeVerdict) -> String
             "{subject}: the test map selects no group for its diff, so `verify scope` measured nothing here; the full gate runs on the target after landing (gate_after_land)"
         ),
         ScopeVerdict::Unavailable => format!(
-            "{subject}: `verify scope` could not be submitted, so the full gate measured it"
+            "{subject}: `verify scope` could not be submitted, so the full gate measures it"
         ),
     }
 }
