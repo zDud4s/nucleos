@@ -477,11 +477,73 @@ impl BrowserClient {
     }
 
     pub async fn open(&self, url: &str, placement: &Placement) -> Result<Session, BrowserError> {
+        self.open_placed(url, placement, false).await
+    }
+
+    /// Opens a window the person can see. The sidecar reads `visible` INSIDE `placement`, so it goes
+    /// there and never as a top-level field (which would marshal fine and arrive nowhere).
+    pub async fn open_visible(
+        &self,
+        url: &str,
+        placement: &Placement,
+    ) -> Result<Session, BrowserError> {
+        self.open_placed(url, placement, true).await
+    }
+
+    async fn open_placed(
+        &self,
+        url: &str,
+        placement: &Placement,
+        visible: bool,
+    ) -> Result<Session, BrowserError> {
+        let mut placement = serde_json::to_value(placement)
+            .map_err(|error| BrowserError::Failed(error.to_string()))?;
+        if visible {
+            if let Some(object) = placement.as_object_mut() {
+                object.insert("visible".into(), serde_json::Value::Bool(true));
+            }
+        }
         self.call(
             "/open",
             &serde_json::json!({ "url": url, "placement": placement }),
         )
         .await
+    }
+
+    /// Pushes one message into the chat panel of a visible session.
+    pub async fn panel_push(
+        &self,
+        session: &str,
+        message: &serde_json::Value,
+    ) -> Result<(), BrowserError> {
+        let response = self
+            .post(
+                "/panel/push",
+                &serde_json::json!({ "session": session, "message": message }),
+            )
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(self.read_error(status, response).await)
+    }
+
+    /// Opens the panel's event stream for a session; handed back unread, like `watch`.
+    pub async fn panel_events(&self, session: &str) -> Result<reqwest::Response, BrowserError> {
+        let response = self
+            .stream_http
+            .post(format!("{}/panel/events", self.base))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "session": session }))
+            .send()
+            .await
+            .map_err(|error| BrowserError::Unreachable(error.to_string()))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        Err(self.read_error(status, response).await)
     }
 
     /// Read the page. `changes_only` asks for what moved since the previous snapshot of this
@@ -1080,6 +1142,42 @@ mod tests {
         assert_eq!(calls[1]["body"]["find"], "invoices");
         assert_eq!(calls[2]["body"]["ref"], "e5");
         assert_eq!(calls[5]["body"]["session_id"], "s1");
+    }
+
+    /// A visible open tells the sidecar so INSIDE `placement` (that is where the Go side reads it),
+    /// and never as a top-level `visible` — a field with no home there marshals fine and arrives
+    /// nowhere. The plain `open` stays headless: no `visible` at all, or false.
+    #[tokio::test]
+    async fn open_visible_sends_visible_true() {
+        let (address, seen) = stub_sidecar().await;
+        let client = BrowserClient::new(&address, "tok".into());
+        let placement = Placement::project("acme", vec!["https://jira.example.org".into()]);
+
+        client
+            .open_visible("https://jira.example.org/", &placement)
+            .await
+            .expect("open_visible");
+        client
+            .open("https://jira.example.org/", &placement)
+            .await
+            .expect("open");
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls[0]["verb"], "open");
+        assert_eq!(calls[0]["body"]["placement"]["visible"], true, "{}", calls[0]);
+        assert!(
+            calls[0]["body"].get("visible").is_none(),
+            "visible lives inside placement, not at the top level: {}",
+            calls[0]
+        );
+        assert_eq!(calls[0]["body"]["placement"]["profile"]["id"], "acme");
+        assert_eq!(calls[1]["verb"], "open");
+        assert_ne!(
+            calls[1]["body"]["placement"]["visible"], true,
+            "a plain open stays headless: {}",
+            calls[1]
+        );
+        assert!(calls[1]["body"].get("visible").is_none());
     }
 
     /// The other half of the round trip: a sidecar that is not there. A caller has to be able to

@@ -109,6 +109,9 @@ pub struct SessionRow {
     /// Where a person drives once the mode is `human`: `shell` or `window`. `None` until a person
     /// drives; rows from before the column existed are `window`.
     pub seat: Option<String>,
+    /// Opened as a window the person can see, with a chat panel on the right (spec
+    /// browser-com-painel). Headless sessions are `false`.
+    pub visible: bool,
     /// Whether the shell could take the seat: a lone open project-profile session. A second open
     /// session on the same profile would share its cookies, so neither qualifies.
     pub shell_eligible: bool,
@@ -495,6 +498,18 @@ pub async fn open(
     runtime: &BrowserRuntime,
     ask: Ask<'_>,
 ) -> Result<Opened, BrowserError> {
+    open_with(pool, runtime, ask, false).await
+}
+
+/// `open`, optionally as a window the person can see. A visible session always runs in the
+/// project's profile (the person takes part, so it needs the project's logins), whatever the policy's
+/// Ephemeral choice; the policy's refusals still return.
+pub async fn open_with(
+    pool: &SqlitePool,
+    runtime: &BrowserRuntime,
+    ask: Ask<'_>,
+    visible: bool,
+) -> Result<Opened, BrowserError> {
     let Ask {
         project_id,
         run_id,
@@ -527,13 +542,19 @@ pub async fn open(
             });
         }
     };
+    let profile = if visible { Profile::Project } else { profile };
 
     let row_id = insert_session(pool, run_id, project_id, url, decision.rule, profile, now)
         .await
         .map_err(|error| BrowserError::Failed(error.to_string()))?;
     let placement = placement_for(profile, project_id, run_id, row_id, &sites);
 
-    let session = match runtime.client.open(url, &placement).await {
+    let opened = if visible {
+        runtime.client.open_visible(url, &placement).await
+    } else {
+        runtime.client.open(url, &placement).await
+    };
+    let session = match opened {
         Ok(session) => session,
         Err(error) => {
             // The row exists and no session does. Closing it here rather than leaving it to the
@@ -546,7 +567,7 @@ pub async fn open(
     // The redirect trap, closed after the fact because it cannot be closed before it. If the request
     // was placed in the project profile and landed off the list, the fence refused the document —
     // nothing from that host ran in the profile — and the url is handed to a throwaway instead.
-    if profile == Profile::Project {
+    if profile == Profile::Project && !visible {
         let after =
             browser_policy::decide(url, &session.final_url, surface, requester, &sites.read);
         if matches!(after.outcome, Outcome::Open(Profile::Ephemeral)) {
@@ -556,10 +577,25 @@ pub async fn open(
         }
     }
 
+    if visible {
+        set_visible(pool, row_id, true)
+            .await
+            .map_err(|error| BrowserError::Failed(error.to_string()))?;
+    }
     let row = finish_session(pool, row_id, &placement, &session)
         .await
         .map_err(|error| BrowserError::Failed(error.to_string()))?;
     Ok(Opened::Session(Box::new(row)))
+}
+
+/// Mark a session row as visible (or not).
+pub async fn set_visible(pool: &SqlitePool, id: i64, visible: bool) -> sqlx::Result<()> {
+    sqlx::query("UPDATE browser_sessions SET visible = ? WHERE id = ?")
+        .bind(i64::from(visible))
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// The second half of the redirect downgrade: the same request, in a profile with nothing to lose.
@@ -702,7 +738,7 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
     let row = sqlx::query(
         "SELECT id, sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
                 final_url, rule, mode, refusal, proposal_id, chain, chain_decided_at, \
-                seat, \
+                seat, visible, \
                 (profile_kind = 'project' AND closed_at IS NULL AND \
                  (SELECT COUNT(*) FROM browser_sessions o \
                   WHERE o.profile_id = browser_sessions.profile_id \
@@ -730,6 +766,7 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
         chain: row.get("chain"),
         chain_decided_at: row.get("chain_decided_at"),
         seat: row.get("seat"),
+        visible: row.get::<i64, _>("visible") != 0,
         shell_eligible: row.get::<i64, _>("shell_eligible") != 0,
         opened_at: row.get("opened_at"),
         closed_at: row.get("closed_at"),
@@ -1077,8 +1114,13 @@ async fn close_row(pool: &SqlitePool, id: i64, reason: &str, now: &str) -> sqlx:
 pub struct OpenBody {
     pub project_id: String,
     pub url: String,
+    /// Still deserialised so an older caller does not fail, but IGNORED: the owning run comes from
+    /// the daemon-set header only (spec §4.0).
     #[serde(default)]
     pub run_id: Option<i64>,
+    /// Open a window the person can see, with a chat panel on the right.
+    #[serde(default)]
+    pub visible: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1120,12 +1162,15 @@ pub struct ActBody {
 /// `POST /browser/open`.
 pub async fn post_open(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<OpenBody>,
 ) -> axum::response::Response {
     let now = chrono::Utc::now();
     let ask = Ask {
         project_id: &body.project_id,
-        run_id: body.run_id,
+        // The header only (spec §4.0): a `run_id` in the body is a permission the caller would grant
+        // itself, so the body field is deserialised for compatibility and never read.
+        run_id: crate::door::sending_run_id_of(&headers),
         url: &body.url,
         // The assistant, always, in this version. Spec §6.0b: the autonomous path is a seam and not
         // a road, and the seam is `browser_policy`'s refusal rather than a branch here. When a
@@ -1134,7 +1179,7 @@ pub async fn post_open(
         requester: requester_now(&state, now).await,
         now: &now.to_rfc3339(),
     };
-    match open(&state.pool, &state.browser, ask).await {
+    match open_with(&state.pool, &state.browser, ask, body.visible).await {
         Ok(Opened::Session(row)) => axum::Json(row).into_response(),
         Ok(Opened::Refused { rule, recoverable }) => (
             // 409 rather than 403: nothing about the credentials is wrong. The request cannot be
@@ -1597,6 +1642,176 @@ mod tests {
             .filter(|call| call["verb"] == "open")
             .map(|call| call["body"]["placement"].clone())
             .collect()
+    }
+
+    /// An `AppState` over a temp database and a stubbed sidecar, for the handler tests below.
+    fn state_over(pool: sqlx::SqlitePool, browser: BrowserRuntime) -> AppState {
+        AppState {
+            token: crate::auth::Token("test-token".into()),
+            pool,
+            telegram_doctrine: None,
+            runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
+            run_handles: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            run_messages: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            run_tails: Default::default(),
+            files_root: None,
+            files_trash: None,
+            workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(browser),
+            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
+            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        }
+    }
+
+    /// Spec §4.0: the run that owns a session is the one the daemon says is calling, in the header,
+    /// and never one the body names — a body field is a permission the caller grants itself. The
+    /// body here claims run 99 and the header says 7; the throwaway profile is named after the run,
+    /// so the profile the sidecar was asked for shows which one won.
+    #[tokio::test]
+    async fn post_open_takes_the_run_from_the_header_not_the_body() {
+        let db = TempDb::new().await;
+        crate::attention::record_heartbeat(
+            &db.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("owner present");
+        let (runtime, seen) = stub_sidecar("https://news.example.net/").await;
+        let state = state_over(db.pool.clone(), runtime);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::daemon_client::RUN_ID_HEADER,
+            axum::http::HeaderValue::from_static("7"),
+        );
+        let response = post_open(
+            State(state),
+            headers,
+            axum::Json(OpenBody {
+                project_id: "acme".into(),
+                url: "https://news.example.net/".into(),
+                run_id: Some(99),
+                visible: false,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let sent = placements(&seen);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0]["profile"]["id"], "r7",
+            "the header's run owns the session: {:?}",
+            sent[0]
+        );
+        let stored: Option<i64> = sqlx::query_scalar("SELECT run_id FROM browser_sessions")
+            .fetch_one(&db.pool)
+            .await
+            .expect("the row");
+        assert_eq!(stored, Some(7));
+        db.close().await;
+    }
+
+    /// A visible open is for a person who will take part, and what they do there belongs in the
+    /// project's own profile — even for a url the policy would have sent to a throwaway.
+    #[tokio::test]
+    async fn a_visible_open_lands_in_the_project_profile_and_is_marked_visible() {
+        let db = TempDb::new().await;
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/browse/X-1".into()],
+            false,
+            NOW,
+        )
+        .await
+        .expect("grant");
+        let (runtime, seen) = stub_sidecar("https://news.example.net/").await;
+
+        let opened = open_with(
+            &db.pool,
+            &runtime,
+            Ask {
+                project_id: "acme",
+                run_id: Some(7),
+                url: "https://news.example.net/",
+                surface: Surface::Assistant,
+                requester: Requester::Owner,
+                now: NOW,
+            },
+            true,
+        )
+        .await
+        .expect("open");
+        let Opened::Session(row) = opened else {
+            panic!("a visible open of an allowed surface is a session");
+        };
+
+        let sent = placements(&seen);
+        assert_eq!(sent[0]["profile"]["kind"], "project", "{:?}", sent[0]);
+        assert_eq!(sent[0]["profile"]["id"], "acme");
+        assert_eq!(sent[0]["visible"], true, "{:?}", sent[0]);
+        assert_eq!(sent[0]["origins"][0], "https://jira.example.org:443");
+        let stored = session_row(&db.pool, row.id)
+            .await
+            .expect("query")
+            .expect("row");
+        assert!(stored.visible, "the row remembers the window is visible");
+        db.close().await;
+    }
+
+    /// The control for the test above: with no `visible` the open is what it always was — the same
+    /// profile the policy chose, nothing on the wire saying "window", and a row that says headless.
+    #[tokio::test]
+    async fn an_open_without_visible_is_headless_as_before() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_sidecar("https://news.example.net/").await;
+
+        let opened = open(
+            &db.pool,
+            &runtime,
+            Ask {
+                project_id: "acme",
+                run_id: Some(7),
+                url: "https://news.example.net/",
+                surface: Surface::Assistant,
+                requester: Requester::Owner,
+                now: NOW,
+            },
+        )
+        .await
+        .expect("open");
+        let Opened::Session(row) = opened else {
+            panic!("an ordinary open is a session");
+        };
+
+        let sent = placements(&seen);
+        assert_eq!(sent[0]["profile"]["kind"], "ephemeral", "{:?}", sent[0]);
+        assert_ne!(sent[0]["visible"], true, "{:?}", sent[0]);
+        let stored = session_row(&db.pool, row.id)
+            .await
+            .expect("query")
+            .expect("row");
+        assert!(!stored.visible);
+        db.close().await;
     }
 
     /// Spec §5.3a, and the shape that made the first version of `grant` wrong: a real login RETURNS
