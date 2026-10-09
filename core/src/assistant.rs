@@ -1848,6 +1848,26 @@ pub fn build_job_node_mcp_config(exe_path: &str, job_id: i64) -> serde_json::Val
     })
 }
 
+/// The throwaway MCP config a team agent's node run is launched with.
+pub fn build_team_mcp_config(exe_path: &str, run_id: i64) -> serde_json::Value {
+    let args = vec![
+        "--mcp-tools".to_string(),
+        "--box".to_string(),
+        "team".to_string(),
+        "--run".to_string(),
+        run_id.to_string(),
+    ];
+    serde_json::json!({
+        "mcpServers": {
+            "nucleos": {
+                "type": "stdio",
+                "command": exe_path,
+                "args": args
+            }
+        }
+    })
+}
+
 /// Which client sent a chat message, as the client states it.
 ///
 /// Stated rather than inferred, and that is why this type exists at all. A Telegram group id is
@@ -5277,6 +5297,27 @@ mod tests {
         assert_eq!(
             crate::mcp_tools::box_from_args(&args[1..]),
             Ok(crate::mcp_tools::McpBox::JobNode(7))
+        );
+    }
+
+    /// A team agent's node launches with its own box and the node run it belongs to; nothing is
+    /// guessed from the team run.
+    #[test]
+    fn loadout_a_team_node_config_names_its_box_and_run() {
+        let config = build_team_mcp_config("C:/x/n.exe", 42);
+        assert_eq!(config["mcpServers"]["nucleos"]["type"], "stdio");
+        assert_eq!(config["mcpServers"]["nucleos"]["command"], "C:/x/n.exe");
+        let args = config["mcpServers"]["nucleos"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args, ["--mcp-tools", "--box", "team", "--run", "42"]);
+        assert_eq!(
+            crate::mcp_tools::box_from_args(&args[1..]),
+            Ok(crate::mcp_tools::McpBox::Team(42))
         );
     }
 

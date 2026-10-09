@@ -470,7 +470,13 @@ pub fn build_router(state: AppState) -> Router {
                 .put(crate::team::update_team)
                 .delete(crate::team::delete_team),
         )
-        // Owner-only: in no scope table. The route read_context runs behind is B1's.
+        // Owner-only: in no scope table.
+        // `read_context` is the run-side door onto the same refs: it sits in no scope table either
+        // and is gated per run by `auth::LOADOUT_ROUTES` (the run's `run_loadout` must list it).
+        .route(
+            "/context/read",
+            post(crate::context_refs::post_read_context),
+        )
         .route(
             "/context-refs/{owner_kind}/{owner_id}",
             get(crate::context_refs::list_refs).post(crate::context_refs::create_ref),
@@ -39884,6 +39890,110 @@ mod tests {
         assert_eq!(
             post(serde_json::json!({ "tool": "Bash", "reason": "x" })).await,
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// `POST /context/read` hands a run one file its agent carries a ref to, and nothing else:
+    /// a sibling that is no ref is refused (422), and a run whose `run_loadout` row does not list
+    /// `read_context` never reaches the handler (403).
+    #[tokio::test]
+    async fn loadout_read_context_over_http_reads_a_ref_and_refuses_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let carried = root.join("carried.txt");
+        let sibling = root.join("sibling.txt");
+        std::fs::write(&carried, "the carried text").unwrap();
+        std::fs::write(&sibling, "not given to anyone").unwrap();
+
+        let state = with_files_root(test_state().await, root.clone());
+        loadout_seed_agent_and_team(&state.pool).await;
+        sqlx::query(
+            "INSERT INTO context_refs (owner_kind, owner_id, path, kind, note, created_at)
+             VALUES ('agent', 'scout', ?, 'file', NULL, '2026-10-08T00:00:00Z')",
+        )
+        .bind(carried.to_str().unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let job_id = add_job(&state.pool, "loadout-project").await;
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            let run_id = sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, job_id, created_at)
+                 VALUES ('x', 'running', 'worktree', ?, '2026-10-08T00:00:00Z')",
+            )
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            let (key, secret) = crate::auth::mint_run_token(run_id);
+            sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
+                .bind(&secret)
+                .bind(run_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            keys.push((run_id, key));
+        }
+        // Only the first run lists the tool; the second has no row at all.
+        sqlx::query(
+            "INSERT INTO run_loadout (run_id, agent_id, team_id, tools, resolved_at)
+             VALUES (?, 'scout', NULL, ?, '2026-10-08T00:00:00Z')",
+        )
+        .bind(keys[0].0)
+        .bind(r#"["read_context"]"#)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let post = |key: String, path: String| {
+            let state = state.clone();
+            async move {
+                let response = build_router(state)
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/context/read")
+                            .header("Authorization", format!("Bearer {key}"))
+                            .header("Content-Type", "application/json")
+                            .body(Body::from(serde_json::json!({ "path": path }).to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+                )
+            }
+        };
+
+        let (status, body) = post(keys[0].1.clone(), carried.to_str().unwrap().to_owned()).await;
+        assert_eq!(status, StatusCode::OK, "a ref the run was given: {body}");
+        assert_eq!(body["content"], "the carried text");
+
+        let (status, body) = post(keys[0].1.clone(), sibling.to_str().unwrap().to_owned()).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a sibling that is no ref: {body}"
+        );
+        assert!(
+            !body.to_string().contains("not given to anyone"),
+            "a refusal must not carry the file: {body}"
+        );
+
+        let (status, _) = post(keys[1].1.clone(), carried.to_str().unwrap().to_owned()).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a run with no row listing the tool"
         );
     }
 

@@ -1025,13 +1025,37 @@ async fn pretooluse_decision_from(
         return team_decision(&state, &payload).await;
     }
 
-    // A job's node may record a finding: the one `mcp__` tool an unattended run is allowed. Before
+    // A job's node may call its box's base tools (a finding, verification, `request_tool`,
+    // `read_context`): the `mcp__` tools an unattended run is allowed without a loadout row. Before
     // the classifier, like the branches above, so it never reaches the judge, never parks and writes
     // no scoreboard row (the scoreboard measures the classifier, and this is not its decision).
     // Anything short of ALL the conditions falls through and is refused as an unrecognised tool.
     if is_job_node_tool(&payload.tool_name) && is_in_flight && crate::runs::runs_unattended(&mode) {
         match job_id_of(&state.pool, run_id).await {
             Ok(Some(job_id)) => {
+                // A base tool that carries a third party's words (`read_context`) taints the run
+                // exactly as an extra does: the mark is what the later steps are judged against.
+                let bare = payload
+                    .tool_name
+                    .strip_prefix("mcp__nucleos__")
+                    .unwrap_or_default();
+                if crate::mcp_tools::effect_of_call(&state.pool, bare, &payload.tool_input).await
+                    == crate::mcp_tools::ToolEffect::ReadsUntrusted
+                    && let Err(error) =
+                        crate::runs::mark_untrusted_context(&state.pool, run_id).await
+                {
+                    tracing::warn!(
+                        run_id = run_id,
+                        tool = bare,
+                        %error,
+                        "pretooluse-decision: could not record that a job node read third-party content - refusing the read"
+                    );
+                    return Json(Decision {
+                        decision: "deny".to_owned(),
+                        reason: "could not record that this run read third-party content"
+                            .to_owned(),
+                    });
+                }
                 tracing::info!(
                     run_id = run_id,
                     job_id = job_id,
@@ -1040,7 +1064,7 @@ async fn pretooluse_decision_from(
                 );
                 return Json(Decision {
                     decision: "allow".to_owned(),
-                    reason: "a job's run may record a finding".to_owned(),
+                    reason: "a job's run may use its box's base tools".to_owned(),
                 });
             }
             Ok(None) => {}
@@ -5943,6 +5967,68 @@ mod tests {
                 .await
                 .unwrap(),
             "web_read must mark the run as having read untrusted text"
+        );
+    }
+
+    /// `read_context` is a job-node BASE tool, so it needs no `run_loadout` row at the hook, and
+    /// because the file it returns is a third party's text, the run is marked all the same.
+    #[tokio::test]
+    async fn loadout_job_node_read_context_is_allowed_and_marks_the_run() {
+        let state = test_state().await;
+        let (_job_id, run_id) = in_flight_job_node(&state).await;
+        let app = test_router(state.clone());
+        assert!(
+            !crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "a fresh run has read nothing untrusted"
+        );
+
+        let verdict = decide(
+            &app,
+            &call(
+                run_id,
+                "mcp__nucleos__read_context",
+                serde_json::json!({ "path": "C:\\ctx\\notes.txt" }),
+            ),
+        )
+        .await;
+        assert_eq!(verdict.decision, "allow", "{}", verdict.reason);
+        assert!(
+            crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "read_context must mark the run as having read untrusted text"
+        );
+    }
+
+    /// The team agent's hook already marks a `ReadsUntrusted` call; `read_context` joins the
+    /// team base, so it is allowed and marks the run too.
+    #[tokio::test]
+    async fn loadout_team_agent_read_context_is_allowed_and_marks_the_run() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, crate::team::TEAM_MODE, None, None, None).await;
+        let app = test_router(state.clone());
+        assert!(
+            !crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "a fresh run has read nothing untrusted"
+        );
+
+        let verdict = orchestrator_tool(
+            &app,
+            run_id,
+            "read_context",
+            serde_json::json!({ "path": "C:\\ctx\\notes.txt" }),
+        )
+        .await;
+        assert_eq!(verdict.decision, "allow", "{}", verdict.reason);
+        assert!(
+            crate::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "read_context must mark the run as having read untrusted text"
         );
     }
 

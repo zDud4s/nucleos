@@ -2840,11 +2840,13 @@ async fn open_run(
     Ok((id, session_id))
 }
 
-/// The MCP config a team run's cloud agents are launched with.
+/// The MCP config one team agent's invocation is launched with, and the file's lifetime.
 ///
-/// One per team run rather than one per invocation: every agent of a run holds the same key and the
-/// same tool list, so a file per node would be the same bytes written a dozen times.
-/// Where a team run's throwaway MCP config lives.
+/// One per NODE rather than one per team run: the server it starts is the Team box and it is named
+/// by the node's own run (`--box team --run <id>`), because the box decides what to serve from that
+/// run's `run_loadout` row. Every node therefore has a config no other node shares, and the guard
+/// removes it when the node's task ends — a daemon that runs for months would otherwise leave one
+/// in the temp directory for every invocation of every department it ever ran.
 ///
 /// **The process id is in the name, and it is not decoration.** The temp directory is shared by
 /// every process on the machine, so a name built only from the id is the SAME path in two of them
@@ -2852,22 +2854,33 @@ async fn open_run(
 /// runs while suites run, and several checkouts run suites at once, each with tests that use fixed
 /// ids. One deleting the other's config mid-turn is a failure with no cause visible anywhere near
 /// it. `transcribe.rs` already names its recordings this way, for the same reason.
-fn mcp_config_path(team_run_id: &str) -> std::path::PathBuf {
-    let safe: String = team_run_id
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
-        .collect();
-    std::env::temp_dir().join(format!("nucleos-team-{}-{safe}.json", std::process::id()))
+struct TeamNodeMcp {
+    path: std::path::PathBuf,
 }
 
-fn write_mcp_config(team_run_id: &str) -> std::io::Result<std::path::PathBuf> {
-    let path = mcp_config_path(team_run_id);
-    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-    // What narrows a department's surface is `--allowedTools` from `TEAM_TOOLS`, decided per node.
-    let body = serde_json::to_vec(&crate::assistant::build_mcp_config(&exe))
-        .map_err(std::io::Error::other)?;
-    crate::storage::write_atomic(&path, &body)?;
-    Ok(path)
+impl TeamNodeMcp {
+    fn write(team_run_id: &str, node_run_id: i64) -> std::io::Result<Self> {
+        let safe: String = team_run_id
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "nucleos-team-{}-{safe}-{node_run_id}.json",
+            std::process::id()
+        ));
+        let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+        // What narrows a department's surface is `--allowedTools`, taken from the node's loadout.
+        let body = serde_json::to_vec(&crate::assistant::build_team_mcp_config(&exe, node_run_id))
+            .map_err(std::io::Error::other)?;
+        crate::storage::write_atomic(&path, &body)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TeamNodeMcp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// The key this run's agents authenticate with: `team:<id>.<secret>`, rebuilt from the stored half.
@@ -3096,17 +3109,20 @@ async fn spawn_agent(
         return;
     }
 
-    let mcp_config = if with_tools {
-        match write_mcp_config(&run.id) {
-            Ok(path) => Some(path),
+    // The node's own config, held by a guard that goes into the launch task below so the file lives
+    // exactly as long as the node does.
+    let mcp_guard = if with_tools {
+        match TeamNodeMcp::write(&run.id, run_id) {
+            Ok(guard) => Some(guard),
             Err(error) => {
-                tracing::warn!(team_run = %run.id, %error, "could not write the team's MCP config");
+                tracing::warn!(team_run = %run.id, run_id, %error, "could not write the team agent's MCP config");
                 None
             }
         }
     } else {
         None
     };
+    let mcp_config = mcp_guard.as_ref().map(|guard| guard.path.clone());
 
     // What the session is told it may use. An unreadable row tells it the narrowest thing, a team
     // of one at `normal` — the direction that cannot overstate what `round_width` will open.
@@ -3129,6 +3145,17 @@ async fn spawn_agent(
             task_text: &prompt,
             node: None,
             files: &[],
+            // The tools and the context come out of the same resolution as the memory. A member
+            // with tools runs in the Team box; one without holds none, and "none" is recorded as
+            // an empty set like any other loadout. There is no working directory, so a folder ref
+            // is listed in the index but never added.
+            equipment: Some(crate::loadout::Equipment {
+                tool_policy: if with_tools { "mcp_only" } else { "none" },
+                base: crate::mcp_tools::TEAM_BASE,
+                extras: crate::mcp_tools::TEAM_EXTRAS,
+                managed_root: state.files_root.as_deref(),
+                has_cwd: false,
+            }),
         },
     )
     .await;
@@ -3136,6 +3163,12 @@ async fn spawn_agent(
         && let Err(error) = crate::brief::record(&state.pool, run_id, None, &brief.trace).await
     {
         tracing::warn!(team_run = %run.id, run_id, %error, "could not record what the team agent was shown");
+    }
+    // The row is written before the CLI starts: the route and the hook decide an extra from it, and
+    // a run that cannot prove it holds a tool does not hold it.
+    let run_tools = loadout.run.clone().unwrap_or_default();
+    if let Err(error) = crate::loadout::record(&state.pool, run_id, &run_tools).await {
+        tracing::warn!(team_run = %run.id, run_id, %error, "could not record the team agent's loadout");
     }
     let prompt = format!("{prompt}{}", loadout.block);
 
@@ -3150,11 +3183,9 @@ async fn spawn_agent(
         resume_session_id: None,
         mcp_config,
         mcp_job: None,
-        // Like the council seat this launch is modelled on: `write_mcp_config` above calls
-        // `assistant::build_mcp_config(&exe)`, so a member with tools is offered the whole
-        // surface. `allowed_mcp_tools` below narrows what the member may CALL, which is a
-        // different question from what its server announces — and it is the announcement that is
-        // paid for in the prompt.
+        // A member with tools is offered the Team box (`--box team --run <node>`), which serves
+        // only what its loadout row lists plus the box's base. `allowed_mcp_tools` below is that
+        // same set handed to the CLI as `--allowedTools`.
         tool_policy: if with_tools {
             crate::runner::ToolPolicy::McpOnly
         } else {
@@ -3184,14 +3215,18 @@ async fn spawn_agent(
         denied_tools: Vec::new(),
         session_name: None,
         context_window: None,
-        // The economy half of the boundary — see `mcp_tools::TEAM_TOOLS`.
-        allowed_mcp_tools: Some(crate::mcp_tools::TEAM_TOOLS),
+        // The loadout's effective set: the box's base plus what the owner approved for this agent
+        // or its team. Empty for a member without tools.
+        allowed_mcp_tools: Some(run_tools.tools.clone()),
         background_tasks: false,
     };
 
     let runner = state.runner.clone();
     let timeout = state.run_timeout;
     crate::runs::spawn_registered(state, run_id, async move {
+        // Moved in so the node's config file is removed when the task ends — normally, by timeout,
+        // or aborted by a cancel (which drops the future and with it the guard).
+        let _mcp_guard = mcp_guard;
         // Asked inside the task, so a slow adviser delays this seat and never the caller handing
         // out a round. `off` asks nothing and leaves the request as built above.
         // Its outcome is reported by `ingest_landed_items`, against the `route_decision_id` this
@@ -3664,11 +3699,6 @@ async fn finish(
     .execute(&state.pool)
     .await?;
 
-    // The config carries no secret — the key travels in the environment — but it is a file per run
-    // in the temp directory, and a daemon that runs for months would leave one for every department
-    // it ever ran.
-    let _ = std::fs::remove_file(mcp_config_path(&run.id));
-
     let _ = crate::feed::append(
         &state.pool,
         None,
@@ -4001,7 +4031,6 @@ pub async fn cancel(state: &AppState, id: &str) -> Result<(), TeamError> {
         .bind(id)
         .execute(&state.pool)
         .await?;
-    let _ = std::fs::remove_file(mcp_config_path(id));
     Ok(())
 }
 
@@ -8171,6 +8200,198 @@ mod tests {
             .unwrap();
             assert_eq!(rows, 0, "row {foreign} belongs to no link of this member");
         }
+    }
+
+    /// A cloud member whose tools are on, ready for the loadout tests below.
+    fn loadout_member(tool_policy: &str) -> crate::agent::Agent {
+        crate::agent::Agent {
+            engine: "claude".to_owned(),
+            model: Some("claude-sonnet-5".to_owned()),
+            tool_policy: tool_policy.to_owned(),
+            ..local_member("unused")
+        }
+    }
+
+    /// A `context_refs` row for an agent or a team, pointing at a file under the managed root.
+    async fn loadout_file_ref(
+        state: &AppState,
+        owner_kind: &str,
+        owner_id: &str,
+        name: &str,
+    ) -> String {
+        let root = state.files_root.clone().expect("the test state has a root");
+        let path = root.join(name);
+        std::fs::write(&path, "a context file").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        sqlx::query(
+            "INSERT INTO context_refs (owner_kind, owner_id, path, kind, note, created_at)
+             VALUES (?, ?, ?, 'file', NULL, '2026-10-09T00:00:00Z')",
+        )
+        .bind(owner_kind)
+        .bind(owner_id)
+        .bind(&path)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        path
+    }
+
+    /// What `run_loadout` froze for a run: the agent, the team and the sorted tool list.
+    async fn loadout_row_of(
+        state: &AppState,
+        run_id: i64,
+    ) -> (Option<String>, Option<String>, Vec<String>) {
+        let (agent, team, tools): (Option<String>, Option<String>, String) =
+            sqlx::query_as("SELECT agent_id, team_id, tools FROM run_loadout WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .expect("the member recorded a run_loadout row before it started");
+        let mut tools: Vec<String> = serde_json::from_str(&tools).expect("tools is a JSON array");
+        tools.sort();
+        (agent, team, tools)
+    }
+
+    fn loadout_team_base() -> Vec<String> {
+        let mut base: Vec<String> = crate::mcp_tools::TEAM_BASE
+            .iter()
+            .map(|tool| (*tool).to_owned())
+            .collect();
+        base.sort();
+        base
+    }
+
+    /// A team member launches in the Team box with the loadout it recorded: the row, the
+    /// allow-list the runner was handed and the prompt's context index all come from one
+    /// resolution, and the MCP config is the node's own, named by its run.
+    #[tokio::test]
+    async fn loadout_a_team_member_launches_with_its_loadout_and_box() {
+        let (mut state, _root) = state_with_root().await;
+        let fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        state.runner = fake.clone();
+        let run = team_run_for_member(&state, "tr-loadout-box").await;
+        let agent = loadout_member("mcp_only");
+        let own_file = loadout_file_ref(&state, "agent", "researcher", "researcher-brief.md").await;
+        let team_file = loadout_file_ref(&state, "team", "marketing", "marketing-style.md").await;
+
+        let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+        spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+        settled_run(&state, run_id).await;
+
+        // The row: owners, and exactly the team box's base with nothing approved.
+        let (row_agent, row_team, tools) = loadout_row_of(&state, run_id).await;
+        assert_eq!(row_agent.as_deref(), Some("researcher"));
+        assert_eq!(row_team.as_deref(), Some("marketing"));
+        assert_eq!(tools, loadout_team_base());
+
+        // The launch: the allow-list is the row's, and the config is the node's own.
+        let (config, job, allowed) = fake
+            .last_job_mcp
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the member's launch was recorded");
+        assert_eq!(job, None, "a team member is not a job node");
+        let mut allowed = allowed.expect("a member with tools launches with an allow-list");
+        allowed.sort();
+        assert_eq!(allowed, tools, "the launch must carry the loadout's tools");
+        let config = config.expect("a member with tools is offered an MCP server");
+        let name = config.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.ends_with(&format!("-{run_id}.json")),
+            "the config is the node's own, named by its run, not the team run's: {name}"
+        );
+
+        // The prompt: both refs are in the index, there is no directory to add without a cwd.
+        let prompt = fake.last_prompt.lock().unwrap().clone().expect("a prompt");
+        assert!(prompt.contains("Context files you were given"), "{prompt}");
+        assert!(prompt.contains(&own_file), "{prompt}");
+        assert!(prompt.contains(&team_file), "{prompt}");
+        assert_eq!(
+            fake.last_add_dirs.lock().unwrap().clone(),
+            Some(Vec::new()),
+            "a team member has no working directory, so no directory is added"
+        );
+    }
+
+    /// Another agent's approval row (a tool for the copywriter) and another agent's or team's refs
+    /// leave this member's row, allow-list and prompt exactly as they were: the base, nothing more.
+    #[tokio::test]
+    async fn loadout_a_team_member_never_receives_another_agents_tools_or_refs() {
+        let (mut state, _root) = state_with_root().await;
+        let fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        state.runner = fake.clone();
+        let run = team_run_for_member(&state, "tr-loadout-iso").await;
+        let agent = loadout_member("mcp_only");
+        loadout_file_ref(&state, "agent", "researcher", "researcher-brief.md").await;
+        loadout_file_ref(&state, "agent", "copywriter", "copywriter-private.md").await;
+        loadout_file_ref(&state, "team", "sales", "sales-private.md").await;
+        sqlx::query(
+            "INSERT INTO loadout_tools
+                 (owner_kind, owner_id, tool, status, source, reason, run_id, created_at)
+             VALUES ('agent', 'copywriter', 'web_read', 'active', 'owner', NULL, NULL,
+                     '2026-10-09T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+        spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+        settled_run(&state, run_id).await;
+
+        let (_, _, tools) = loadout_row_of(&state, run_id).await;
+        assert_eq!(
+            tools,
+            loadout_team_base(),
+            "nobody approved anything for this member: exactly the base"
+        );
+        let (_, _, allowed) = fake.last_job_mcp.lock().unwrap().clone().expect("a launch");
+        // web_read is in TEAM_BASE, so isolation is shown by the set being exactly the base.
+        let mut allowed = allowed.expect("a member with tools launches with an allow-list");
+        allowed.sort();
+        assert_eq!(
+            allowed,
+            loadout_team_base(),
+            "another agent's approval changes nothing in this member's launch"
+        );
+        let prompt = fake.last_prompt.lock().unwrap().clone().expect("a prompt");
+        assert!(prompt.contains("researcher-brief.md"), "{prompt}");
+        assert!(!prompt.contains("copywriter-private"), "{prompt}");
+        assert!(!prompt.contains("sales-private"), "{prompt}");
+    }
+
+    /// A member whose tools are off still leaves a row, and an empty one: a run that cannot prove
+    /// it holds a tool does not hold it, and "none" is a loadout like any other.
+    #[tokio::test]
+    async fn loadout_a_member_without_tools_records_an_empty_set() {
+        let (mut state, _root) = state_with_root().await;
+        let fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        state.runner = fake.clone();
+        let run = team_run_for_member(&state, "tr-loadout-none").await;
+        let agent = loadout_member("none");
+        loadout_file_ref(&state, "agent", "researcher", "researcher-brief.md").await;
+
+        let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+        spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+        settled_run(&state, run_id).await;
+
+        let (row_agent, row_team, tools) = loadout_row_of(&state, run_id).await;
+        assert_eq!(row_agent.as_deref(), Some("researcher"));
+        assert_eq!(row_team.as_deref(), Some("marketing"));
+        assert!(
+            tools.is_empty(),
+            "a member without tools holds none: {tools:?}"
+        );
+
+        assert_eq!(
+            *fake.last_mcp_config.lock().unwrap(),
+            None,
+            "no tools, no MCP server"
+        );
+        // Nothing to open a file with, so no index: the index is there only with the tool.
+        let prompt = fake.last_prompt.lock().unwrap().clone().expect("a prompt");
+        assert!(!prompt.contains("Context files you were given"), "{prompt}");
     }
 
     /// A member whose factory has no local route fails carrying the refusal's OWN sentence.

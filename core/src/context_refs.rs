@@ -598,6 +598,79 @@ pub async fn read_context(
 }
 
 #[derive(serde::Deserialize)]
+pub struct ReadContextRequest {
+    pub path: String,
+}
+
+/// `POST /context/read`: a run reads one context file its loadout owner carries.
+///
+/// The run is the key's own, or the node named by `RUN_ID_HEADER` for a team key;
+/// `auth::loadout_admits` already checked that its `run_loadout` row lists `read_context`. The
+/// route sits in no fixed scope table, so an owner key or an unlisted run never reaches it.
+pub async fn post_read_context(
+    State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ReadContextRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let run_id = match scope {
+        crate::auth::Scope::Run(id) => Some(id),
+        _ => headers
+            .get(crate::daemon_client::RUN_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<i64>().ok()),
+    };
+    let Some(run_id) = run_id else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let root = match crate::door::files_root(&state) {
+        Ok(root) => root,
+        Err(status) => {
+            return (status, "the files folder is not available".to_owned()).into_response();
+        }
+    };
+    let refused = |sentence: &str| (StatusCode::UNPROCESSABLE_ENTITY, sentence.to_owned());
+    match read_context(&state.pool, root, run_id, &body.path).await {
+        Ok(content) => {
+            Json(serde_json::json!({ "path": body.path, "content": content })).into_response()
+        }
+        Err(ReadError::NoOwner) => (
+            StatusCode::FORBIDDEN,
+            "this run carries no context files".to_owned(),
+        )
+            .into_response(),
+        Err(ReadError::NotARef) => {
+            refused("not one of the context files this run was given").into_response()
+        }
+        Err(ReadError::Refused(why)) => refused(match why {
+            Refusal::NotAbsolute => "the path must be absolute",
+            Refusal::OutsideRoots => "the path is outside the folders this run may read",
+            Refusal::Escapes => "the path leaves the folder it sits in",
+            Refusal::Unsafe => "the path has a name that cannot be used",
+        })
+        .into_response(),
+        Err(ReadError::Missing) => refused("nothing exists at that path").into_response(),
+        Err(ReadError::NotAFile) => {
+            refused("that path is a folder; name a file inside it").into_response()
+        }
+        Err(ReadError::TooLarge { bytes }) => refused(&format!(
+            "that file is {bytes} bytes; the most one read returns is {MAX_CONTEXT_READ_BYTES}"
+        ))
+        .into_response(),
+        Err(ReadError::Io(error)) => {
+            tracing::warn!(run_id, %error, "reading a context file failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(ReadError::Db(error)) => {
+            tracing::warn!(run_id, %error, "reading a context file failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
 pub struct CreateRefRequest {
     pub path: String,
     #[serde(default)]

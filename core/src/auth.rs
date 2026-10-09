@@ -704,6 +704,7 @@ const TEAM_ROUTES: &[(Method, &str)] = &[
 /// it. Every error fails closed, and `permits` stays pure: this door is decided in `require_token`
 /// by `loadout_admits`, which reads the database.
 const LOADOUT_ROUTES: &[(Method, &str, &str)] = &[
+    (Method::POST, "/context/read", "read_context"),
     (Method::POST, "/loadout/tool-requests", "request_tool"),
     (Method::POST, "/web/read", "web_read"),
 ];
@@ -1171,6 +1172,8 @@ mod tests {
             .route("/web/search", post(|| async {}))
             .route("/web/read", post(|| async {}))
             .route("/loadout/tool-requests", post(|| async {}))
+            // A stand-in: the door is decided by the run's `run_loadout` row, not by a scope table.
+            .route("/context/read", post(|| async {}))
             .route("/team-files/read", post(|| async {}))
             // Registered with both methods, so the negative assertion below — a department may POST
             // an action and may not LIST the queue — is answered by `permits` rather than by the
@@ -1401,6 +1404,46 @@ mod tests {
         );
     }
 
+    /// `read_context` is a loadout door like `request_tool`: a run key reaches it only while the
+    /// run's own `run_loadout` row lists the tool, and listing another tool opens nothing.
+    #[tokio::test]
+    async fn loadout_a_run_key_reaches_read_context_only_with_a_listing_row() {
+        let state = test_state("owner-token").await;
+        let app = protected_router(state.clone());
+        let (id, token) = running_run_with_token(&state).await;
+        let uri = "/context/read";
+
+        assert_eq!(
+            post_status_with_run_header(&app, uri, &token, None).await,
+            StatusCode::FORBIDDEN,
+            "no run_loadout row"
+        );
+
+        list_loadout(&state, id, r#"["request_tool"]"#).await;
+        assert_eq!(
+            post_status_with_run_header(&app, uri, &token, None).await,
+            StatusCode::FORBIDDEN,
+            "a row that lists only request_tool"
+        );
+
+        sqlx::query("UPDATE run_loadout SET tools = ? WHERE run_id = ?")
+            .bind(r#"["read_context"]"#)
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            post_status_with_run_header(&app, uri, &token, None).await,
+            StatusCode::OK,
+            "a row that lists read_context"
+        );
+        assert_eq!(
+            post_status_with_run_header(&app, "/loadout/tool-requests", &token, None).await,
+            StatusCode::FORBIDDEN,
+            "listing read_context does not list request_tool"
+        );
+    }
+
     #[tokio::test]
     async fn loadout_a_team_key_reaches_request_tool_only_for_its_own_listed_node() {
         let state = test_state("owner-token").await;
@@ -1446,6 +1489,11 @@ mod tests {
         assert!(!permits(&run, &Method::POST, "/loadout/tool-requests"));
         assert!(!permits(&run, &Method::POST, "/web/read"));
         assert!(!permits(&team, &Method::POST, "/loadout/tool-requests"));
+        assert!(!permits(&run, &Method::POST, "/context/read"));
+        assert!(!permits(&team, &Method::POST, "/context/read"));
+        // The owner's listing of an agent's context files is no scoped key's route either.
+        assert!(!permits(&run, &Method::GET, "/context-refs/agent/a"));
+        assert!(!permits(&team, &Method::GET, "/context-refs/agent/a"));
 
         let owner_routes = [
             (Method::GET, "/loadout/tools"),

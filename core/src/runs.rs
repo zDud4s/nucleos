@@ -647,9 +647,22 @@ pub fn run_env(
 pub struct JobNodeMcp {
     path: std::path::PathBuf,
     job_id: i64,
+    /// The tool names the CLI is allowed to call on the box's server. Today's fixed list until a
+    /// loadout narrows or widens it.
+    allowed: Vec<String>,
+    /// The directories the CLI is widened to with `--add-dir`; empty unless a loadout names some.
+    add_dirs: Vec<std::path::PathBuf>,
 }
 
 impl JobNodeMcp {
+    /// Launches with the tools and directories the node's resolved loadout names, instead of the
+    /// fixed list.
+    pub fn with_loadout(mut self, run: &crate::loadout::RunTools) -> Self {
+        self.allowed = run.tools.clone();
+        self.add_dirs = run.add_dirs.clone();
+        self
+    }
+
     /// None when the run belongs to no job, or the file could not be written (warn; the run then
     /// launches with no MCP server, as a team run does).
     pub fn for_run(run_id: i64, job_id: Option<i64>) -> Option<Self> {
@@ -667,7 +680,15 @@ impl JobNodeMcp {
             tracing::warn!(run_id, job_id, %error, "could not write job-node MCP config");
             return None;
         }
-        Some(Self { path, job_id })
+        Some(Self {
+            path,
+            job_id,
+            allowed: crate::mcp_tools::JOB_NODE_TOOLS
+                .iter()
+                .map(|tool| (*tool).to_owned())
+                .collect(),
+            add_dirs: Vec::new(),
+        })
     }
 }
 
@@ -2197,16 +2218,20 @@ fn spawn_run(
                 model: model.clone(),
                 effort: effort.clone(),
                 fallback_model: Vec::new(),
-                add_dirs: Vec::new(),
+                // The directories its loadout's context references name; none without one.
+                add_dirs: job_mcp
+                    .as_ref()
+                    .map(|mcp| mcp.add_dirs.clone())
+                    .unwrap_or_default(),
                 max_budget_usd: None,
                 agents: Vec::new(),
                 append_system_prompt: None,
                 denied_tools: Vec::new(),
                 session_name: None,
                 context_window: None,
-                // A job node sees exactly the tool its boxed server serves; every other run still
-                // has no server and therefore nothing to narrow.
-                allowed_mcp_tools: job_mcp.as_ref().map(|_| crate::mcp_tools::JOB_NODE_TOOLS),
+                // A job node sees exactly the tools its loadout lists (the box's fixed list when it
+                // has none); every other run still has no server and therefore nothing to narrow.
+                allowed_mcp_tools: job_mcp.as_ref().map(|mcp| mcp.allowed.clone()),
                 background_tasks: false,
             };
             // Driven by the request's own flag, and beside the spawn that decides it: which run may
@@ -2750,6 +2775,9 @@ pub struct JobNode {
     /// The queue position of the item this node implements, or `None` for a node with no item (plan,
     /// replan, review). Read for the llm-router's request, which names what already failed the item.
     pub item_ordinal: Option<usize>,
+    /// The tools and directories this node was resolved to by `job.rs`, recorded in `run_loadout`
+    /// here before the CLI starts. `None` launches with the box's fixed tools and no row.
+    pub loadout: Option<crate::loadout::RunTools>,
 }
 
 /// A conflict the daemon is about to hand an agent: which escalated request it came from, and the
@@ -2923,6 +2951,10 @@ pub struct JobItem {
     /// Named and not `Option`, because there is no honest default. `None` would mean the project
     /// checkout's HEAD, which is `master` — a commit that has none of this job's work in it.
     pub base: String,
+    /// The tools and directories this item's node was resolved to by `job.rs`, recorded in
+    /// `run_loadout` here before the CLI starts. `None` launches with the box's fixed tools and
+    /// no row.
+    pub loadout: Option<crate::loadout::RunTools>,
 }
 
 impl Provisioning {
@@ -3641,6 +3673,16 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
     } else {
         prompt
     };
+    // Written before the CLI starts, so the hook and the loadout routes find the row on the run's
+    // first call. A failed write is not fatal: the run then has its box's base tools only.
+    let run_tools = node
+        .and_then(|node| node.loadout.as_ref())
+        .or(item.and_then(|item| item.loadout.as_ref()));
+    if let Some(run_tools) = run_tools
+        && let Err(error) = crate::loadout::record(&state.pool, id, run_tools).await
+    {
+        tracing::warn!(run_id = id, %error, "could not record a run's loadout");
+    }
     spawn_run(
         state,
         runner,
@@ -3677,7 +3719,11 @@ async fn create_run_with(state: &AppState, run: NewRun<'_>) -> Result<i64, Creat
             node.as_ref()
                 .map(|node| node.job_id)
                 .or(item.as_ref().map(|item| item.job_id)),
-        ),
+        )
+        .map(|mcp| match run_tools {
+            Some(run_tools) => mcp.with_loadout(run_tools),
+            None => mcp,
+        }),
     );
 
     Ok(id)
@@ -6718,13 +6764,17 @@ pub mod tests {
         test_state_with(None, crate::state::DEFAULT_RUN_TIMEOUT).await
     }
 
+    /// `JOB_NODE_TOOLS` as the owned list a launch carries its allow-list in.
+    fn job_node_tools() -> Vec<String> {
+        crate::mcp_tools::JOB_NODE_TOOLS
+            .iter()
+            .map(|tool| (*tool).to_owned())
+            .collect()
+    }
+
     async fn wait_for_job_mcp(
         runner: &FakeCommandRunner,
-    ) -> (
-        Option<PathBuf>,
-        Option<i64>,
-        Option<&'static [&'static str]>,
-    ) {
+    ) -> (Option<PathBuf>, Option<i64>, Option<Vec<String>>) {
         for _ in 0..200 {
             if let Some(seen) = runner.last_job_mcp.lock().unwrap().clone() {
                 return seen;
@@ -6806,6 +6856,7 @@ pub mod tests {
                 worktree_path: info.path.to_string_lossy().into_owned(),
                 branch: info.branch.clone(),
                 item_ordinal: None,
+                loadout: None,
             },
         )
         .await
@@ -6890,6 +6941,7 @@ pub mod tests {
                 worktree_path: info.path.to_string_lossy().into_owned(),
                 branch: info.branch,
                 item_ordinal: None,
+                loadout: None,
             },
         )
         .await
@@ -6897,7 +6949,7 @@ pub mod tests {
 
         let (path, launched_job, tools) = wait_for_job_mcp(&runner).await;
         assert_eq!(launched_job, Some(job_id));
-        assert_eq!(tools, Some(crate::mcp_tools::JOB_NODE_TOOLS));
+        assert_eq!(tools, Some(job_node_tools()));
         let path = path.expect("a job node receives a per-run MCP config");
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -6911,6 +6963,107 @@ pub mod tests {
                 job_id.to_string()
             ])
         );
+    }
+
+    /// Wave B1: a job node that arrives with a resolved loadout has it written to `run_loadout`
+    /// before the CLI starts, and is launched with exactly its tools and its directories.
+    #[tokio::test(flavor = "current_thread")]
+    async fn loadout_a_job_node_with_a_loadout_records_it_and_launches_with_its_tools_and_dirs() {
+        let _env_lock = crate::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-loadout-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-runs-loadout-jobnode-");
+        let context_dir = space_free_tempdir("nucleos-runs-loadout-dir-");
+        let dir = context_dir.path().to_path_buf();
+        let (state, runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let project_root = repo.to_string_lossy().into_owned();
+        let job_id = crate::job::insert_job(
+            &state.pool,
+            &crate::job::NewJob {
+                project_id: "proj",
+                project_root: &project_root,
+                rule_name: Some("nightly"),
+                prompt: "advance the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner).await.unwrap();
+        crate::worktree::record(
+            &state.pool,
+            owner,
+            "proj",
+            &project_root,
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .unwrap();
+        let tools = vec!["note_finding".to_owned(), "web_read".to_owned()];
+
+        let run_id = create_job_node_run(
+            &state,
+            "plan the work".into(),
+            "proj".into(),
+            project_root,
+            JobNode {
+                job_id,
+                stage: "plan",
+                worktree_path: info.path.to_string_lossy().into_owned(),
+                branch: info.branch,
+                item_ordinal: None,
+                loadout: Some(crate::loadout::RunTools {
+                    agent: None,
+                    team: None,
+                    tools: tools.clone(),
+                    add_dirs: vec![dir.clone()],
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (path, launched_job, launched_tools) = wait_for_job_mcp(&runner).await;
+        assert_eq!(launched_job, Some(job_id));
+        assert_eq!(
+            launched_tools,
+            Some(tools.clone()),
+            "the launch must carry the loadout's tools, not the box's static list"
+        );
+        assert_eq!(
+            *runner.last_add_dirs.lock().unwrap(),
+            Some(vec![dir]),
+            "the loadout's directories must reach the launch"
+        );
+        assert!(
+            path.is_some(),
+            "a job node still receives a per-run MCP config"
+        );
+
+        // The row is the frozen record the hook and the routes read: the extra is listed there.
+        assert!(
+            crate::tool_loadout::run_lists_tool(&state.pool, run_id, "web_read")
+                .await
+                .unwrap(),
+            "run_loadout does not list the approved extra"
+        );
+        let stored: String = sqlx::query_scalar("SELECT tools FROM run_loadout WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Vec<String>>(&stored).unwrap(), tools);
     }
 
     #[tokio::test]
@@ -7029,7 +7182,7 @@ pub mod tests {
         .await;
         let (_, handoff_job, handoff_tools) = wait_for_job_mcp(&runner).await;
         assert_eq!(handoff_job, Some(job_id));
-        assert_eq!(handoff_tools, Some(crate::mcp_tools::JOB_NODE_TOOLS));
+        assert_eq!(handoff_tools, Some(job_node_tools()));
 
         *runner.last_job_mcp.lock().unwrap() = None;
         let paused = sqlx::query(
@@ -7060,7 +7213,7 @@ pub mod tests {
         resume_approved_run(&state, proposal).await.unwrap();
         let (_, resumed_job, resumed_tools) = wait_for_job_mcp(&runner).await;
         assert_eq!(resumed_job, Some(job_id));
-        assert_eq!(resumed_tools, Some(crate::mcp_tools::JOB_NODE_TOOLS));
+        assert_eq!(resumed_tools, Some(job_node_tools()));
     }
 
     async fn create_worktree_run(
@@ -7703,6 +7856,7 @@ pub mod tests {
                     item_id,
                     stage: "implement",
                     base: base.clone(),
+                    loadout: None,
                 },
             )
             .await
@@ -7827,6 +7981,7 @@ pub mod tests {
                 item_id,
                 stage: "implement",
                 base,
+                loadout: None,
             },
         )
         .await;
