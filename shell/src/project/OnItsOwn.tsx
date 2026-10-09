@@ -27,6 +27,7 @@ import {
   StateBadge,
 } from "../ui";
 import { IdeVerifyPanel } from "./IdeVerify";
+import { PostMergePanel } from "./PostMerge";
 /* The `pj-` family is this component's vocabulary as much as the inspector's. Imported here as
    well, so the component draws correctly wherever it is mounted — the project workspace is the
    next place, and it imports nothing from the inspector. */
@@ -38,7 +39,7 @@ import "../pages/projects.css";
  * Everything the inspector's `rules` view used to draw, lifted out whole so it can live where a
  * person goes to change how a project behaves. The inspector is a stop-gap for reading the tree —
  * `router.tsx` says the Código mode replaces it — and this is the one part of it that nothing
- * replaces: the rules that start work with nobody asking, the gate that measures it, the judge that
+ * replaces: the rules that start work with nobody asking, the gate that measures it, the post-merge gate, the judge that
  * answers for you on Auto, and the ceiling that stops it piling up, and the IDE verify switch beside them. Safety controls found only by
  * a link from a file browser are safety controls nobody finds.
  *
@@ -106,6 +107,7 @@ export function OnItsOwn({ projectId }: OnItsOwnProps) {
         command={rules.data.gate_command}
         beforePublish={rules.data.gate_before_publish}
       />
+      <PostMergePanel rules={rules.data} />
       <JudgePanel
         projectId={projectId}
         rules={rules.data}

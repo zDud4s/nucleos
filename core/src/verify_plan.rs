@@ -260,6 +260,10 @@ pub struct UnitReport {
     pub skipped_reason: Option<String>,
     pub run_id: Option<i64>,
     pub cached_from: Option<i64>,
+    /// Set on a failed unit whose group is already red on the target branch; it does not change
+    /// the unit's status or the ticket's verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub already_failing: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -291,6 +295,7 @@ fn report(unit: &PlannedUnit, live: &HashMap<i64, State>) -> UnitReport {
         skipped_reason: None,
         run_id: unit.run_id,
         cached_from: unit.cached_from,
+        already_failing: None,
     };
     if let Some(reason) = &unit.skipped {
         report.status = "skipped".into();

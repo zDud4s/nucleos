@@ -3888,6 +3888,42 @@ struct RepoTriggerView {
     last_sha: Option<String>,
 }
 
+/// A project's post-merge gate state as the rules read serves it: read-only, and whole.
+#[derive(serde::Serialize)]
+struct PostgateView {
+    target: String,
+    last_green: Option<String>,
+    /// The sha a post-merge gate is measuring right now.
+    running: Option<String>,
+    red_groups: Vec<String>,
+    red_since: Option<String>,
+    red_sha: Option<String>,
+    red_base: Option<String>,
+    /// `flake_check` or `bisect` while a red is being handled, else `null`.
+    phase: Option<&'static str>,
+    culprit: Option<String>,
+    candidates: Vec<String>,
+    also_suspect: Vec<String>,
+}
+
+impl From<crate::verify_postgate::State> for PostgateView {
+    fn from(state: crate::verify_postgate::State) -> Self {
+        PostgateView {
+            target: state.target,
+            last_green: state.last_green_sha,
+            running: state.running_sha,
+            red_groups: state.red_groups,
+            red_since: state.red_since_sha,
+            red_sha: state.red_sha,
+            red_base: state.red_base_sha,
+            phase: state.red_phase.map(|phase| phase.as_str()),
+            culprit: state.culprit_sha,
+            candidates: state.candidates,
+            also_suspect: state.also_suspect,
+        }
+    }
+}
+
 /// Everything a project will do without being asked, and everything currently holding it back.
 #[derive(serde::Serialize)]
 struct ProjectRules {
@@ -3917,6 +3953,9 @@ struct ProjectRules {
     /// Whether this project's IDE verify switch is on (`POST /projects/{id}/ide-verify`). Served
     /// read-only here so the owner's toggle can show it; nothing on this route flips it.
     ide_verify: bool,
+    /// The target branch's post-merge gate state, or `null` while the gate has never recorded one.
+    /// Read-only: nothing on this route changes it.
+    postgate: Option<PostgateView>,
     /// Who answers an approval a conversation on `auto` would otherwise put to a person.
     judge: JudgeView,
     schedules: Vec<ScheduleView>,
@@ -4063,6 +4102,10 @@ async fn get_project_rules(
     let ide_verify = crate::autopilot::ide_verify_enabled(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let postgate = crate::verify_postgate::load(&state.pool, &id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map(PostgateView::from);
 
     Ok(Json(ProjectRules {
         project_id: id,
@@ -4073,6 +4116,7 @@ async fn get_project_rules(
         gate_command: loaded.gate_command.clone(),
         gate_before_publish: loaded.gate_before_publish,
         ide_verify,
+        postgate,
         judge,
         schedules,
         repo_triggers,
@@ -19822,6 +19866,54 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, 1);
+    }
+
+    /// The project page shows the target's post-merge state, read-only, from the rules read: no
+    /// row is `null`, a row is served whole and reading it never changes it.
+    #[tokio::test]
+    async fn the_rules_read_serves_the_post_merge_state_and_null_without_one() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'shadow')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = read_rules(state.clone(), "alpha").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["postgate"].is_null(), "no row means null: {body}");
+
+        sqlx::query(
+            "INSERT INTO postgate_state \
+             (project_id, target, last_green_sha, red_groups, red_since_sha, red_sha, \
+              red_base_sha, culprit_sha, candidates, also_suspect) \
+             VALUES ('alpha', 'main', 'g0', '[\"core\",\"py\"]', 's0', 's1', 'b0', 'c9', \
+                     '[\"c8\",\"c9\"]', '[\"x7\"]')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (status, body) = read_rules(state.clone(), "alpha").await;
+        assert_eq!(status, StatusCode::OK);
+        let postgate = &body["postgate"];
+        assert_eq!(postgate["target"], "main");
+        assert_eq!(postgate["last_green"], "g0");
+        assert_eq!(postgate["red_groups"], serde_json::json!(["core", "py"]));
+        assert_eq!(postgate["red_since"], "s0");
+        assert_eq!(postgate["red_sha"], "s1");
+        assert_eq!(postgate["red_base"], "b0");
+        assert_eq!(postgate["culprit"], "c9");
+        assert_eq!(postgate["candidates"], serde_json::json!(["c8", "c9"]));
+        assert_eq!(postgate["also_suspect"], serde_json::json!(["x7"]));
+        assert!(postgate["phase"].is_null());
+        assert!(postgate["running"].is_null());
+
+        // Reading it leaves the row as it was.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM postgate_state")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     async fn set_wip_limit(state: AppState, id: &str, body: serde_json::Value) -> StatusCode {

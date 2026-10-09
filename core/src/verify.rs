@@ -31,6 +31,8 @@ use crate::vcs;
 use crate::verify_exec::Executor;
 use crate::verify_fingerprint;
 use crate::verify_plan::{self, Kind, PlanError, ScopeArg, Ticket};
+use crate::verify_postgate;
+use crate::verify_postgate_worker;
 use crate::verify_runs::{self, ORIGIN_VERIFY, PRIORITY_AUTONOMOUS, PRIORITY_INTERACTIVE};
 use crate::verify_store::{self, CacheKey, NewRequest, PlannedUnit};
 
@@ -908,8 +910,40 @@ pub(crate) async fn read_ticket(
             live.insert(run_id, state);
         }
     }
-    let ticket = verify_plan::assemble(&request, &live);
+    let mut ticket = verify_plan::assemble(&request, &live);
+    annotate_red_target(pool, &mut ticket).await;
     Ok(Some((ticket, request.caller)))
+}
+
+/// Marks each failed unit whose group (or the gate command) is already red on the project's
+/// target branch. Only the unit's note changes: its status and the ticket's verdict stay as
+/// they are. A failed read of the post-merge state never fails the ticket.
+async fn annotate_red_target(pool: &SqlitePool, ticket: &mut Ticket) {
+    if !ticket
+        .units
+        .iter()
+        .any(|unit| unit.status == verify_runs::STATUS_FAILED)
+    {
+        return;
+    }
+    let state = match verify_postgate::load(pool, &ticket.project_id).await {
+        Ok(Some(state)) => state,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "verify: cannot read the post-merge state");
+            return;
+        }
+    };
+    for unit in &mut ticket.units {
+        if unit.status != verify_runs::STATUS_FAILED {
+            continue;
+        }
+        let key = unit
+            .group
+            .as_deref()
+            .unwrap_or(verify_postgate_worker::GATE_UNIT);
+        unit.already_failing = state.already_failing(key);
+    }
 }
 
 /// Re-reads the ticket until it is done or `deadline` has passed, whichever comes first.
@@ -1486,6 +1520,7 @@ tests:
             skipped_reason: None,
             run_id: None,
             cached_from: None,
+            already_failing: None,
         }
     }
 
@@ -1965,6 +2000,80 @@ tests:
         assert_eq!(ticket.units[0].cached_from, None);
         assert_ne!(ticket.units[0].run_id, Some(ran));
         assert_eq!(ticket.verdict.as_deref(), Some("failed"));
+    }
+
+    /// Records that the post-merge gate found `alpha`'s target `main` red in `groups`, at `s1`.
+    async fn target_red_in(pool: &SqlitePool, groups: &[&str]) {
+        sqlx::query(
+            "INSERT INTO postgate_state (project_id, target, red_groups, red_since_sha, red_sha) \
+             VALUES ('alpha', 'main', ?, 's0', 's1')",
+        )
+        .bind(serde_json::to_string(groups).unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failure_in_a_group_red_on_the_target_is_annotated_and_stays_failed() {
+        let map = map_with("git definitely-not-a-git-subcommand", "");
+        let f = fixture(Some(&map), None, true).await;
+        target_red_in(&f.pool, &["core"]).await;
+
+        let id = submit(&f.ex, Caller::Owner, &own_core(&f)).await.unwrap();
+        let (ticket, _) = finished(&f.pool, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        assert_eq!(
+            ticket.units[0].already_failing.as_deref(),
+            Some("already failing on main@s1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_in_a_group_the_target_is_not_red_in_is_not_annotated() {
+        let map = map_with("git definitely-not-a-git-subcommand", "");
+        let f = fixture(Some(&map), None, true).await;
+        target_red_in(&f.pool, &["py"]).await;
+
+        let id = submit(&f.ex, Caller::Owner, &own_core(&f)).await.unwrap();
+        let (ticket, _) = finished(&f.pool, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        assert_eq!(ticket.units[0].already_failing, None);
+    }
+
+    #[tokio::test]
+    async fn without_a_postgate_row_a_failed_unit_serializes_with_no_annotation() {
+        let map = map_with("git definitely-not-a-git-subcommand", "");
+        let f = fixture(Some(&map), None, true).await;
+
+        let id = submit(&f.ex, Caller::Owner, &own_core(&f)).await.unwrap();
+        let (ticket, _) = finished(&f.pool, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        let json = serde_json::to_value(&ticket.units[0]).unwrap();
+        assert!(
+            json.get("already_failing").is_none(),
+            "the key must be absent: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_gate_command_is_annotated_when_the_target_gate_command_is_red() {
+        let f = fixture(None, Some("git definitely-not-a-git-subcommand"), true).await;
+        target_red_in(&f.pool, &["gate_command"]).await;
+
+        let request = args(Kind::Test, ScopeArg::Scope, f.repo.path(), None, None);
+        let id = submit(&f.ex, Caller::Owner, &request).await.unwrap();
+        let (ticket, _) = finished(&f.pool, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        assert_eq!(ticket.units[0].group, None);
+        assert_eq!(
+            ticket.units[0].already_failing.as_deref(),
+            Some("already failing on main@s1")
+        );
     }
 
     #[tokio::test]
