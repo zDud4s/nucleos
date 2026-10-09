@@ -239,6 +239,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     vcs_resolution_cancelled: { tone: "off", label: "conflict resolution stopped" },
     vcs_resolution_discarded: { tone: "danger", label: "resolution discarded changes" },
     land_resolution_failed: { tone: "danger", label: "resolution could not be landed" },
+    postgate_red: { tone: "danger", label: "target went red after a merge" },
     // Teams.
     team_run_started: { tone: "info", label: "team run started" },
     team_run_finished: { tone: "info", label: "team run settled" },
