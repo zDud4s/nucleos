@@ -76,7 +76,11 @@
   margin-top: calc(-1 * var(--space-1));
 }
 
-/* A choice as a row: the whole row is the target, and the chosen one is outlined. */
+/*
+  A choice as a row: the whole row is the target. The chosen one is marked the way the app marks
+  "this one" everywhere (`.ui-current`): a rule on the leading edge in the text colour, not cyan,
+  which is reserved for links.
+*/
 .np-options {
   display: grid;
   gap: var(--space-2);
@@ -101,14 +105,14 @@
 }
 
 .np-option:has(input:checked) {
-  border-color: var(--accent);
-  background: var(--accent-quiet);
+  border-color: var(--border-strong);
+  box-shadow: inset 2px 0 0 var(--text);
 }
 
 .np-option input,
 .np-command input {
   margin: 0;
-  accent-color: var(--accent);
+  accent-color: var(--text);
 }
 
 .np-option-name {
@@ -287,8 +291,8 @@
 }
 
 .np-receipt-item[data-status="done"]::before {
-  border-color: var(--accent);
-  background: var(--accent);
+  border-color: var(--text);
+  background: var(--text);
 }
 
 .np-receipt-status {
