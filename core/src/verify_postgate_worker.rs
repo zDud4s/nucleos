@@ -9,13 +9,18 @@
 //! `Caller::Postgate` at priority 2, in the `postgate-<project>` worktree checked out at the land
 //! target's tip. The cache is never consulted.
 //!
-//! A red (F3-3, spec §6.2) is handled in two persisted phases, one action per tick, and nothing is
-//! reverted. First the same sha is checked again (`Caller::FlakeCheck`): if it passes the red was
+//! A red (F3-3, spec §6.2) is handled in two persisted phases, one action per tick, and by default
+//! nothing is reverted (F3-4 adds the opt-in revert, below). First the same sha is checked again (`Caller::FlakeCheck`): if it passes the red was
 //! not the target's, the sha counts green and nobody is told. Otherwise the first-parent commits of
 //! `(last green, red]` are bisected with `verify_bisect`, one full probe per step
 //! (`Caller::Bisect`), and the outcome goes to the owner as one `postgate_red` feed line. A probe
 //! left running is followed from its stored ticket, never submitted again, and while a red is being
 //! handled no new gate starts.
+//!
+//! With the project's `revert_on_red` on (F3-4, D4), a culprit is also reverted: the report starts
+//! the revert in the same transaction, the next ticks queue it as an `Op::Revert` and follow its
+//! ticket, and once the queue has published it `fix/<source>-<sha7>` is built on top of it. The
+//! correction run on that branch is opened by `run_correction_loop`, which holds an `AppState`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use crate::git_exec;
 use crate::land;
+use crate::vcs::{self, Branch, CommitSha, Op, Origin};
 use crate::verify::{self, Caller, VerifyArgs};
 use crate::verify_batch::{self, Commit, Decision, TargetState};
 use crate::verify_bisect::{Bisection, Candidate, Next, Probe, Verdict};
@@ -69,6 +75,18 @@ pub enum Step {
     Probed { sha: String, probe: Probe },
     /// The red on `sha` was reported to the owner and its handling is over.
     Reported { sha: String, verdict: Verdict },
+    /// The culprit `merge_sha` is being reverted: the revert was queued as ticket `request`.
+    Reverting { merge_sha: String, request: i64 },
+    /// The queue published the revert of `merge_sha` as `revert_sha`.
+    Reverted {
+        merge_sha: String,
+        revert_sha: String,
+    },
+    /// The revert of `merge_sha` did not happen, or left no branch; the owner was told and the
+    /// revert state is free again.
+    RevertFailed { merge_sha: String, reason: String },
+    /// The correction branch `branch` was created on top of the published revert.
+    FixBranch { branch: String },
 }
 
 /// One project's step in one tick.
@@ -133,6 +151,14 @@ async fn tick_project(executor: &Arc<Executor>, project_id: &str, project_root: 
         && state.red_phase.is_some()
     {
         return handle_red(executor, project_id, project_root, state).await;
+    }
+
+    // A revert of a confirmed culprit is under way (F3-4): queue it, follow it, build the fix
+    // branch. As with a red, no new gate starts meanwhile: the revert changes the tip anyway.
+    if let Some(state) = state.as_ref()
+        && state.revert_pending()
+    {
+        return revert_step(executor, project_id, project_root, state).await;
     }
 
     let target = match land::integration_branch(pool, project_id, project_root, deadline).await {
@@ -449,14 +475,14 @@ async fn bisect_step(
         also_suspect: Vec::new(),
     };
     let Some(base) = state.red_base_sha.as_deref() else {
-        return report_red(pool, project_id, state, red_sha, inconclusive()).await;
+        return report_red(executor, project_id, state, red_sha, inconclusive()).await;
     };
     let commits = match git_exec::first_parent_commits(project_root, base, red_sha, deadline).await
     {
         Ok(commits) => commits,
         Err(reason) => {
             tracing::warn!(project = project_id, %reason, "postgate: cannot list the range");
-            return report_red(pool, project_id, state, red_sha, inconclusive()).await;
+            return report_red(executor, project_id, state, red_sha, inconclusive()).await;
         }
     };
     let mut bisection = Bisection::new(
@@ -475,7 +501,7 @@ async fn bisect_step(
         }
     }
     match bisection.next() {
-        Next::Done(verdict) => report_red(pool, project_id, state, red_sha, verdict).await,
+        Next::Done(verdict) => report_red(executor, project_id, state, red_sha, verdict).await,
         Next::Probe(sha) => {
             let claimed = verify_postgate::claim_probe(pool, project_id, &sha).await;
             match claimed {
@@ -490,21 +516,42 @@ async fn bisect_step(
     }
 }
 
-/// Stores `verdict` and tells the owner, in one transaction (`verify_postgate::report`).
+/// Stores `verdict` and tells the owner, in one transaction (`verify_postgate::report`). With the
+/// project's `revert_on_red` on, a culprit that is not already being reverted also starts its
+/// revert in that same transaction (`verify_postgate::report_with_revert`), and the line says so.
+/// With it off, and for every other verdict, the line and the state are exactly what they were
+/// before F3-4.
 async fn report_red(
-    pool: &sqlx::SqlitePool,
+    executor: &Arc<Executor>,
     project_id: &str,
     state: &State,
     red_sha: &str,
     verdict: Verdict,
 ) -> Step {
-    let summary = red_summary(
-        &state.target,
-        red_sha,
-        state.red_base_sha.as_deref(),
-        &verdict,
-    );
-    match verify_postgate::report(pool, project_id, red_sha, &verdict, &summary).await {
+    let pool = &executor.pool;
+    let base = state.red_base_sha.as_deref();
+    let reverting = matches!(verdict, Verdict::Culprit { .. })
+        && crate::config::load_schedule_rules(executor.machine_root.as_deref(), project_id)
+            .is_ok_and(|rules| rules.revert_on_red);
+    // A culprit always comes with a base (no base reports inconclusive); the check keeps the line
+    // and the state in step should that ever change.
+    let in_flight = reverting && state.revert_in_flight();
+    let start_revert = reverting && base.is_some() && !in_flight;
+    let mut summary = match (&verdict, base) {
+        (Verdict::Culprit { sha, also_suspect }, Some(base)) if start_revert => {
+            reverting_summary(&state.target, red_sha, base, sha, also_suspect)
+        }
+        _ => red_summary(&state.target, red_sha, base, &verdict),
+    };
+    if in_flight {
+        summary.push_str(" A revert started earlier is still in flight, so none was queued.");
+    }
+    let reported = if start_revert {
+        verify_postgate::report_with_revert(pool, project_id, red_sha, &verdict, &summary).await
+    } else {
+        verify_postgate::report(pool, project_id, red_sha, &verdict, &summary).await
+    };
+    match reported {
         Ok(true) => Step::Reported {
             sha: red_sha.to_owned(),
             verdict,
@@ -564,6 +611,479 @@ fn red_summary(target: &str, red: &str, base: Option<&str>, verdict: &Verdict) -
     }
 }
 
+/// The feed line for a culprit whose revert has just been started: what is about to be undone, on
+/// which branch, and that a correction run follows. Only the revert switch reaches it.
+fn reverting_summary(
+    target: &str,
+    red: &str,
+    base: &str,
+    culprit: &str,
+    also_suspect: &[String],
+) -> String {
+    let suspects = if also_suspect.is_empty() {
+        String::new()
+    } else {
+        format!(" (also suspect: {})", short_list(also_suspect))
+    };
+    format!(
+        "post-merge gate red on {target} at {}: culprit {}{suspects}; range {}..{}; \
+         reverting it on {target} through the queue, then a correction run follows on a \
+         fix/ branch.",
+        short(red),
+        short(culprit),
+        short(base),
+        short(red)
+    )
+}
+
+/// One action on the revert of a confirmed culprit: queue it, follow its ticket, or build the
+/// correction branch once the queue has published it. Everything it needs is in `state`, so a
+/// restart lands here and picks up where it stopped; a request is never submitted twice.
+async fn revert_step(
+    executor: &Arc<Executor>,
+    project_id: &str,
+    project_root: &Path,
+    state: &State,
+) -> Step {
+    let pool = &executor.pool;
+    let Some(merge_sha) = state.revert_merge_sha.as_deref() else {
+        return Step::Failed("a revert is pending without its culprit".to_owned());
+    };
+    if let Some(revert_sha) = state.revert_sha.as_deref() {
+        return fix_branch_step(executor, project_id, project_root, state, revert_sha).await;
+    }
+    let Some(request) = state.revert_request_id else {
+        return queue_revert(executor, project_id, state, merge_sha).await;
+    };
+    let ticket = match vcs::wait_for(pool, request, Duration::ZERO).await {
+        Ok(ticket) => ticket,
+        Err(sqlx::Error::RowNotFound) => {
+            let reason = format!("revert request {request} vanished");
+            return revert_failed(pool, project_id, state, merge_sha, reason).await;
+        }
+        Err(error) => {
+            return Step::Failed(format!("cannot read revert request {request}: {error}"));
+        }
+    };
+    if !vcs::TERMINAL_STATUSES.contains(&ticket.status.as_str()) {
+        return Step::Waiting {
+            sha: merge_sha.to_owned(),
+        };
+    }
+    match (ticket.status.as_str(), ticket.result_sha) {
+        ("succeeded", Some(revert_sha)) => {
+            match verify_postgate::record_revert(pool, project_id, merge_sha, &revert_sha).await {
+                Ok(true) => Step::Reverted {
+                    merge_sha: merge_sha.to_owned(),
+                    revert_sha,
+                },
+                Ok(false) => Step::Waiting {
+                    sha: merge_sha.to_owned(),
+                },
+                Err(error) => Step::Failed(format!("cannot record the revert: {error}")),
+            }
+        }
+        ("succeeded", None) => {
+            let reason = "the queue reported success without a commit".to_owned();
+            revert_failed(pool, project_id, state, merge_sha, reason).await
+        }
+        (status, _) => {
+            let reason = ticket
+                .failure_reason
+                .unwrap_or_else(|| format!("the request ended {status}"));
+            revert_failed(pool, project_id, state, merge_sha, reason).await
+        }
+    }
+}
+
+/// Submits the revert of `merge_sha` to the vcs queue and stores its ticket. It goes in as the
+/// owner's standing order (`Origin::Human`): turning `revert_on_red` on is that order.
+///
+/// A request already queued for this culprit (a crash between the submit and the store of its
+/// ticket) is adopted instead of submitted again. Before the first submit the kill switch is read
+/// fail-closed, and `revert_on_red` is read again: the owner may have turned it off since the
+/// report, and an autonomous publish to the target must honour that.
+async fn queue_revert(
+    executor: &Arc<Executor>,
+    project_id: &str,
+    state: &State,
+    merge_sha: &str,
+) -> Step {
+    let pool = &executor.pool;
+    let waiting = || Step::Waiting {
+        sha: merge_sha.to_owned(),
+    };
+    let existing = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM vcs_requests \
+         WHERE project_id = ? AND op = 'revert' AND json_extract(args, '$.merge_sha') = ? \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(merge_sha)
+    .fetch_optional(pool)
+    .await;
+    match existing {
+        Ok(Some(request)) => {
+            return match verify_postgate::set_revert_request(pool, project_id, merge_sha, request)
+                .await
+            {
+                Ok(true) => Step::Reverting {
+                    merge_sha: merge_sha.to_owned(),
+                    request,
+                },
+                Ok(false) => waiting(),
+                Err(error) => {
+                    Step::Failed(format!("cannot store revert request {request}: {error}"))
+                }
+            };
+        }
+        Ok(None) => {}
+        Err(error) => return Step::Failed(format!("cannot look for a queued revert: {error}")),
+    }
+    if crate::autopilot::kill_switch_engaged(pool)
+        .await
+        .unwrap_or(true)
+    {
+        return waiting();
+    }
+    let still_on = crate::config::load_schedule_rules(executor.machine_root.as_deref(), project_id)
+        .is_ok_and(|rules| rules.revert_on_red);
+    if !still_on {
+        let summary = format!(
+            "post-merge gate on {target}: the revert of {} was NOT made because revert_on_red \
+             was turned off before it was queued. Nothing was reverted and no correction branch \
+             was made.",
+            short(merge_sha),
+            target = state.target
+        );
+        let reason = "revert_on_red was turned off before the revert was queued".to_owned();
+        return settle_failed_revert(pool, project_id, merge_sha, &summary, reason).await;
+    }
+    let (Ok(sha), Ok(target)) = (CommitSha::new(merge_sha), Branch::new(&state.target)) else {
+        let reason = "the culprit or the target is not something the queue accepts".to_owned();
+        return revert_failed(pool, project_id, state, merge_sha, reason).await;
+    };
+    let repo = match vcs::resolve_repo(pool, project_id).await {
+        Ok(repo) => repo,
+        Err(error) => return Step::Failed(format!("cannot resolve the repository: {error:?}")),
+    };
+    let op = Op::Revert {
+        merge_sha: sha,
+        target,
+    };
+    let request = match vcs::submit_declared(pool, &repo, &op, Origin::Human).await {
+        Ok(id) => id,
+        Err(error) => return Step::Failed(format!("cannot queue the revert: {error}")),
+    };
+    match verify_postgate::set_revert_request(pool, project_id, merge_sha, request).await {
+        Ok(true) => Step::Reverting {
+            merge_sha: merge_sha.to_owned(),
+            request,
+        },
+        // Settled by someone else between submit and now; the next tick reads it.
+        Ok(false) => Step::Waiting {
+            sha: merge_sha.to_owned(),
+        },
+        Err(error) => Step::Failed(format!("cannot store revert request {request}: {error}")),
+    }
+}
+
+/// The revert of `merge_sha` did not happen: tell the owner why and free the state.
+async fn revert_failed(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    state: &State,
+    merge_sha: &str,
+    reason: String,
+) -> Step {
+    let summary = format!(
+        "post-merge gate on {target}: the revert of {} failed ({reason}). No correction branch \
+         was made; check {target} before acting.",
+        short(merge_sha),
+        target = state.target
+    );
+    settle_failed_revert(pool, project_id, merge_sha, &summary, reason).await
+}
+
+/// Clears the revert state of `merge_sha` and writes `summary` to the feed.
+async fn settle_failed_revert(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    merge_sha: &str,
+    summary: &str,
+    reason: String,
+) -> Step {
+    match verify_postgate::fail_revert(pool, project_id, merge_sha, summary).await {
+        Ok(true) => Step::RevertFailed {
+            merge_sha: merge_sha.to_owned(),
+            reason,
+        },
+        Ok(false) => Step::Waiting {
+            sha: merge_sha.to_owned(),
+        },
+        Err(error) => Step::Failed(format!("cannot record the failed revert: {error}")),
+    }
+}
+
+/// The name of the correction branch: `fix/<source>-<sha7>`, `source` being the branch the culprit
+/// was merged from (`merge` when the queue has no record of it) with its `/` turned into `-`, so
+/// that no ref ever has to live under another (`fix/feat` against `fix/feat/x`).
+fn fix_branch_name(source: Option<&str>, merge_sha: &str) -> String {
+    let source = source.unwrap_or("merge").replace('/', "-");
+    format!("fix/{source}-{}", merge_sha.get(..7).unwrap_or(merge_sha))
+}
+
+/// The revert is published: build `fix/...` on top of it and tell the owner, or free the state and
+/// say that the revert stands without a branch.
+async fn fix_branch_step(
+    executor: &Arc<Executor>,
+    project_id: &str,
+    project_root: &Path,
+    state: &State,
+    revert_sha: &str,
+) -> Step {
+    let pool = &executor.pool;
+    let Some(merge_sha) = state.revert_merge_sha.as_deref() else {
+        return Step::Failed("a revert is pending without its culprit".to_owned());
+    };
+    let deadline = Instant::now() + git_exec::OPERATION_TIMEOUT;
+    let source = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT json_extract(args, '$.source') FROM vcs_requests \
+         WHERE project_id = ? AND op = 'merge' AND status = 'succeeded' AND result_sha = ? \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(merge_sha)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_default()
+    .flatten();
+    let branch = fix_branch_name(source.as_deref(), merge_sha);
+    let target = &state.target;
+    match git_exec::prepare_fix_branch(project_root, revert_sha, &branch, deadline).await {
+        Ok(_) => {
+            let ticket = state
+                .revert_request_id
+                .map(|id| format!(" (vcs request #{id})"))
+                .unwrap_or_default();
+            let summary = format!(
+                "post-merge gate on {target}: reverted culprit {} as {}{ticket}; correction \
+                 branch {branch} is ready and a correction run will open on it.",
+                short(merge_sha),
+                short(revert_sha)
+            );
+            match verify_postgate::set_fix_branch(pool, project_id, merge_sha, &branch, &summary)
+                .await
+            {
+                Ok(true) => Step::FixBranch { branch },
+                Ok(false) => Step::Waiting {
+                    sha: merge_sha.to_owned(),
+                },
+                Err(error) => Step::Failed(format!("cannot record the fix branch: {error}")),
+            }
+        }
+        Err(reason) => {
+            let summary = format!(
+                "post-merge gate on {target}: the revert of {} is on {target} as {}, but the \
+                 correction branch {branch} was not created ({reason}).",
+                short(merge_sha),
+                short(revert_sha)
+            );
+            settle_failed_revert(pool, project_id, merge_sha, &summary, reason).await
+        }
+    }
+}
+
+/// A prepared `fix/` branch still waiting for its correction run.
+#[derive(sqlx::FromRow)]
+struct PendingCorrection {
+    project_id: String,
+    project_root: String,
+    target: String,
+    revert_merge_sha: Option<String>,
+    revert_sha: Option<String>,
+    fix_branch: String,
+    red_groups: String,
+}
+
+/// The task of a correction run: what was reverted, where the work stands, and how it ends.
+fn correction_prompt(row: &PendingCorrection) -> String {
+    let groups: Vec<String> = serde_json::from_str(&row.red_groups).unwrap_or_default();
+    let red = if groups.is_empty() {
+        "unknown".to_owned()
+    } else {
+        groups.join(", ")
+    };
+    format!(
+        "The post-merge gate on `{target}` went red and bisection pointed at merge {culprit}. The \
+         daemon reverted it on `{target}` as {revert}, and your worktree starts on branch `{fix}`, \
+         whose first commit reverts that revert, so the culprit's change is back in front of \
+         you.\n\n\
+         Failing gate groups: {red}.\n\n\
+         Fix the change so the gate passes, then run `verify scope` and land it normally.",
+        target = row.target,
+        culprit = row.revert_merge_sha.as_deref().unwrap_or("(unknown)"),
+        revert = row.revert_sha.as_deref().unwrap_or("(unknown)"),
+        fix = row.fix_branch,
+    )
+}
+
+/// Sets the correction run of `row`'s branch: its id once opened, `None` to give the claim back.
+async fn set_fix_run(
+    pool: &sqlx::SqlitePool,
+    row: &PendingCorrection,
+    value: Option<i64>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE postgate_state SET fix_run_id = ?, updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ? AND fix_branch = ?",
+    )
+    .bind(value)
+    .bind(&row.project_id)
+    .bind(&row.fix_branch)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Opens one correction run for every prepared `fix/` branch that has none, and returns their ids.
+///
+/// A branch is claimed (`fix_run_id = 0`) before its run is asked for, so a run is attempted once
+/// and never twice. A full project or disk gives the claim back and the next pass asks again; any
+/// other failure leaves the claim at 0 and says so in the feed. The kill switch and the budget stop
+/// it like any other run the daemon starts on its own; a switch that cannot be read stops it too.
+pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
+    let pool = &state.pool;
+    if crate::autopilot::kill_switch_engaged(pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Vec::new();
+    }
+    let rows = match sqlx::query_as::<_, PendingCorrection>(
+        "SELECT p.project_id, a.project_root, p.target, p.revert_merge_sha, p.revert_sha, \
+                p.fix_branch, p.red_groups \
+         FROM postgate_state p JOIN autopilot_state a ON a.project_id = p.project_id \
+         WHERE p.fix_branch IS NOT NULL AND p.fix_run_id IS NULL \
+         ORDER BY p.project_id",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "postgate: cannot look for correction branches");
+            return Vec::new();
+        }
+    };
+    // After the query, so an exhausted budget is only logged when a branch is actually waiting.
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    if let crate::budget::BudgetDecision::Pause { reason, .. } =
+        crate::quota::permits_new_run(state, chrono::Utc::now()).await
+    {
+        tracing::info!(%reason, "budget exhausted; no correction run opened this tick");
+        return Vec::new();
+    }
+    let mut opened = Vec::new();
+    for row in rows {
+        let claimed = sqlx::query(
+            "UPDATE postgate_state SET fix_run_id = 0, updated_at = CURRENT_TIMESTAMP \
+             WHERE project_id = ? AND fix_branch = ? AND fix_run_id IS NULL",
+        )
+        .bind(&row.project_id)
+        .bind(&row.fix_branch)
+        .execute(pool)
+        .await;
+        match claimed {
+            Ok(done) if done.rows_affected() == 1 => {}
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    project = %row.project_id, %error,
+                    "postgate: cannot claim a fix branch"
+                );
+                continue;
+            }
+        }
+        let started = crate::runs::create_correction_run(
+            state,
+            correction_prompt(&row),
+            row.project_id.clone(),
+            row.project_root.clone(),
+            crate::runs::Correction {
+                base: row.fix_branch.clone(),
+            },
+        )
+        .await;
+        match started {
+            Ok(run_id) => {
+                if let Err(error) = set_fix_run(pool, &row, Some(run_id)).await {
+                    tracing::warn!(
+                        project = %row.project_id, run_id, %error,
+                        "postgate: cannot record the correction run"
+                    );
+                }
+                let _ = crate::feed::append(
+                    pool,
+                    Some(&row.project_id),
+                    verify_postgate::POSTGATE_RED_KIND,
+                    &format!("correction run {run_id} opened on {}", row.fix_branch),
+                    Some(run_id),
+                    None,
+                )
+                .await;
+                opened.push(run_id);
+            }
+            // Nothing was spent: give the claim back and ask again on a later pass.
+            Err(
+                crate::runs::CreateRunError::Busy | crate::runs::CreateRunError::NoRoomOnDisk(_),
+            ) => {
+                if let Err(error) = set_fix_run(pool, &row, None).await {
+                    tracing::warn!(
+                        project = %row.project_id, %error,
+                        "postgate: cannot release a correction claim"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    project = %row.project_id, ?error,
+                    "postgate: the correction run could not be opened"
+                );
+                let _ = crate::feed::append(
+                    pool,
+                    Some(&row.project_id),
+                    verify_postgate::POSTGATE_RED_KIND,
+                    &format!(
+                        "the correction run could not be opened: {error:?}; the work is on {}",
+                        row.fix_branch
+                    ),
+                    None,
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+    opened
+}
+
+/// The loop `main` spawns beside the gate worker, because opening a run needs an `AppState` and the
+/// worker only holds an executor. With no `fix/` branch waiting, which is every project that has
+/// not turned `revert_on_red` on, a pass reads one empty query and stops.
+pub async fn run_correction_loop(state: crate::state::AppState) {
+    let mut interval = tokio::time::interval(POSTGATE_POLL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        for run_id in open_corrections(&state).await {
+            tracing::info!(run_id, "postgate: correction run opened");
+        }
+    }
+}
+
 /// The loop `main` spawns. A failing project is logged and never stops the loop.
 pub async fn run_postgate_worker(executor: Arc<Executor>) {
     let mut interval = tokio::time::interval(POSTGATE_POLL);
@@ -581,6 +1101,21 @@ pub async fn run_postgate_worker(executor: Arc<Executor>) {
                 Step::Reported { sha, verdict } => {
                     tracing::info!(
                         project = %pass.project_id, %sha, ?verdict, "postgate: red reported"
+                    );
+                }
+                Step::Reverting { merge_sha, request } => {
+                    tracing::info!(
+                        project = %pass.project_id, %merge_sha, request, "postgate: revert queued"
+                    );
+                }
+                Step::RevertFailed { merge_sha, reason } => {
+                    tracing::warn!(
+                        project = %pass.project_id, %merge_sha, %reason, "postgate: revert failed"
+                    );
+                }
+                Step::FixBranch { branch } => {
+                    tracing::info!(
+                        project = %pass.project_id, %branch, "postgate: fix branch ready"
                     );
                 }
                 _ => {}
@@ -1173,5 +1708,536 @@ mod tests {
         assert_eq!(s.last_attempted_sha.as_deref(), Some(f.tip.as_str()));
         assert_eq!(s.red_sha.as_deref(), Some(f.tip.as_str()));
         assert_eq!(count(&f.pool, "verify_requests").await, 1);
+    }
+
+    // --- F3-4: the revert of a confirmed culprit (spec 2026-10-05 §6.2, D4) ---
+
+    /// The rules of the confirmed-culprit scenarios: the gate passes while `a.txt` says `good`.
+    const REVERT_OFF: &str = "gate_command: \"git grep -q good -- a.txt\"\ngate_after_land: true\n";
+    const REVERT_ON: &str = "gate_command: \"git grep -q good -- a.txt\"\ngate_after_land: true\n\
+                             revert_on_red: true\n";
+
+    /// Drives `alpha` to a confirmed culprit: green at `c1`, then `c3` breaks the gate and `c4` lands
+    /// on top of it. Returns `(c3, c4)` once the owner has been told. The verify executor is left
+    /// running; the vcs queue's executor is not, so a queued revert stays `queued`.
+    async fn confirmed_culprit(f: &Fixture) -> (String, String) {
+        let c1 = commit_file(&f.root, "a.txt", "good\n", "c1");
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+        tick_until(f, |s| matches!(s, Step::Green(sha) if *sha == c1)).await;
+
+        commit_file(&f.root, "b.txt", "b\n", "c2");
+        let c3 = commit_file(&f.root, "a.txt", "bad\n", "c3 breaks the gate");
+        let c4 = commit_file(&f.root, "c.txt", "c\n", "c4");
+
+        let step = tick_until(f, |s| matches!(s, Step::Reported { .. })).await;
+        assert!(
+            matches!(
+                &step,
+                Step::Reported {
+                    verdict: crate::verify_bisect::Verdict::Culprit { sha, .. },
+                    ..
+                } if *sha == c3
+            ),
+            "the culprit is c3: {step:?}"
+        );
+        (c3, c4)
+    }
+
+    /// Every summary the feed holds, oldest first.
+    async fn feed_summaries(pool: &sqlx::SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT summary FROM feed ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// `(id, op, origin, status, args)` of every row in the vcs queue.
+    async fn queue_rows(pool: &sqlx::SqlitePool) -> Vec<(i64, String, String, String, String)> {
+        sqlx::query_as("SELECT id, op, origin, status, args FROM vcs_requests ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// With the switch off (every project today) the owner gets the same line as before F3-4 and
+    /// nothing else moves: no queued request, no revert columns, `main` where it was. This is the
+    /// default's whole contract, so it is pinned beside the tests that turn the switch on.
+    #[tokio::test]
+    async fn with_the_revert_switch_off_a_culprit_is_reported_and_nothing_is_queued() {
+        let f = fixture(Some(REVERT_OFF)).await;
+        let (c3, c4) = confirmed_culprit(&f).await;
+
+        let lines = feed_summaries(&f.pool).await;
+        assert_eq!(lines.len(), 1, "one line for the owner: {lines:?}");
+        assert!(lines[0].contains(&c3[..10]), "{}", lines[0]);
+        assert!(lines[0].contains("Nothing was reverted"), "{}", lines[0]);
+
+        // A further pass must not queue anything either.
+        let _ = step_of(&f).await;
+        assert!(queue_rows(&f.pool).await.is_empty(), "nothing is queued");
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.culprit_sha.as_deref(), Some(c3.as_str()));
+        assert_eq!(s.revert_merge_sha, None);
+        assert_eq!(s.revert_request_id, None);
+        assert_eq!(s.revert_sha, None);
+        assert_eq!(s.fix_branch, None);
+        assert_eq!(s.fix_run_id, None);
+        assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c4);
+    }
+
+    /// With the switch on, exactly one `revert` is queued for the culprit, by the daemon on the
+    /// owner's standing order (`human`, already `queued`), and the feed says what is about to be
+    /// undone rather than "nothing was reverted".
+    #[tokio::test]
+    async fn with_the_revert_switch_on_a_culprit_queues_one_revert_and_the_feed_says_so() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, c4) = confirmed_culprit(&f).await;
+
+        let lines = feed_summaries(&f.pool).await;
+        assert_eq!(lines.len(), 1, "one line for the owner: {lines:?}");
+        assert!(lines[0].contains(&c3[..10]), "{}", lines[0]);
+        assert!(lines[0].contains("reverting it on main"), "{}", lines[0]);
+        assert!(!lines[0].contains("Nothing was reverted"), "{}", lines[0]);
+
+        let step = tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        let Step::Reverting { merge_sha, request } = step else {
+            unreachable!("tick_until returned a step it was not asked for");
+        };
+        assert_eq!(merge_sha, c3);
+
+        let rows = queue_rows(&f.pool).await;
+        assert_eq!(rows.len(), 1, "exactly one request: {rows:?}");
+        assert_eq!(rows[0].0, request);
+        assert_eq!(rows[0].1, "revert");
+        assert_eq!(rows[0].2, "human");
+        assert_eq!(rows[0].3, "queued");
+        assert!(rows[0].4.contains(&c3), "the args name the culprit");
+
+        // Followed, never resubmitted.
+        assert!(matches!(step_of(&f).await, Some(Step::Waiting { .. })));
+        assert_eq!(queue_rows(&f.pool).await.len(), 1);
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.revert_merge_sha.as_deref(), Some(c3.as_str()));
+        assert_eq!(s.revert_request_id, Some(request));
+        assert_eq!(s.revert_sha, None);
+        assert_eq!(
+            git_in(&f.root, &["rev-parse", "main"]),
+            c4,
+            "the queue's executor is not running here: nothing has moved"
+        );
+    }
+
+    /// An engaged kill switch holds the revert before its first submit: nothing is queued, and it
+    /// goes ahead on the pass after the switch is released.
+    #[tokio::test]
+    async fn a_pending_revert_waits_while_the_kill_switch_is_engaged() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, _c4) = confirmed_culprit(&f).await;
+
+        crate::autopilot::set_kill_switch(&f.pool, true)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            assert!(matches!(step_of(&f).await, Some(Step::Waiting { .. })));
+        }
+        assert!(
+            queue_rows(&f.pool).await.is_empty(),
+            "nothing is queued under the kill switch"
+        );
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.revert_merge_sha.as_deref(), Some(c3.as_str()));
+        assert_eq!(s.revert_request_id, None);
+
+        crate::autopilot::set_kill_switch(&f.pool, false)
+            .await
+            .unwrap();
+        tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        assert_eq!(queue_rows(&f.pool).await.len(), 1);
+    }
+
+    /// `revert_on_red` turned off between the report and the submit: nothing is queued, the
+    /// pending revert is cleared, and the owner is told plainly that nothing was reverted.
+    #[tokio::test]
+    async fn a_pending_revert_is_dropped_when_the_switch_is_turned_off() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, c4) = confirmed_culprit(&f).await;
+
+        crate::project_state::write_for_test(
+            f._machine.path(),
+            "alpha",
+            crate::project_state::AUTOPILOT_FILE,
+            REVERT_OFF,
+        );
+        let step = tick_until(&f, |s| matches!(s, Step::RevertFailed { .. })).await;
+        let Step::RevertFailed { merge_sha, .. } = step else {
+            unreachable!("tick_until returned a step it was not asked for");
+        };
+        assert_eq!(merge_sha, c3);
+
+        assert!(queue_rows(&f.pool).await.is_empty(), "nothing is queued");
+        let lines = feed_summaries(&f.pool).await;
+        let last = lines.last().expect("the owner is told");
+        assert!(last.contains("NOT made"), "{last}");
+        assert!(last.contains("revert_on_red"), "{last}");
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.revert_merge_sha, None);
+        assert_eq!(s.revert_request_id, None);
+        assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c4);
+    }
+
+    /// A crash between the submit and the store of the ticket leaves a queued revert with no id in
+    /// the state: the restart adopts that row and does not submit a second one.
+    #[tokio::test]
+    async fn a_revert_already_queued_for_the_culprit_is_adopted_not_resubmitted() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, _c4) = confirmed_culprit(&f).await;
+
+        let repo = vcs::resolve_repo(&f.pool, "alpha").await.unwrap();
+        let op = Op::Revert {
+            merge_sha: CommitSha::new(&c3).unwrap(),
+            target: Branch::new("main").unwrap(),
+        };
+        let existing = vcs::submit_declared(&f.pool, &repo, &op, Origin::Human)
+            .await
+            .unwrap();
+
+        let step = tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        let Step::Reverting { request, .. } = step else {
+            unreachable!("tick_until returned a step it was not asked for");
+        };
+        assert_eq!(request, existing);
+        let rows = queue_rows(&f.pool).await;
+        assert_eq!(rows.len(), 1, "no second revert: {rows:?}");
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.revert_request_id, Some(existing));
+    }
+
+    /// Once the queue has published the revert, the worker prepares `fix/<source>-<sha7>`: a branch
+    /// whose tip is a revert of the revert, so it carries the culprit's tree again on top of the
+    /// target. Here there is no queued merge row to name the source, so the name falls back to
+    /// `merge`.
+    #[tokio::test]
+    async fn a_succeeded_revert_opens_a_fix_branch_whose_first_commit_reverts_the_revert() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, c4) = confirmed_culprit(&f).await;
+        let step = tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        let Step::Reverting { request, .. } = step else {
+            unreachable!("tick_until returned a step it was not asked for");
+        };
+
+        // What the queue would have published: a revert of the culprit on top of the target.
+        git_in(&f.root, &["revert", "--no-edit", &c3]);
+        let revert = git_in(&f.root, &["rev-parse", "HEAD"]);
+        sqlx::query("UPDATE vcs_requests SET status = 'succeeded', result_sha = ? WHERE id = ?")
+            .bind(&revert)
+            .bind(request)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        let step = tick_until(&f, |s| matches!(s, Step::FixBranch { .. })).await;
+        let expected = format!("fix/merge-{}", &c3[..7]);
+        assert_eq!(
+            step,
+            Step::FixBranch {
+                branch: expected.clone()
+            }
+        );
+
+        let branch_ref = format!("refs/heads/{expected}");
+        assert_eq!(
+            git_in(&f.root, &["rev-parse", &format!("{branch_ref}^1")]),
+            revert,
+            "the first commit sits directly on the revert"
+        );
+        assert_eq!(
+            git_in(&f.root, &["rev-parse", &format!("{branch_ref}^{{tree}}")]),
+            git_in(&f.root, &["rev-parse", &format!("{c4}^{{tree}}")]),
+            "reverting the revert puts the culprit's work back"
+        );
+        assert_eq!(
+            git_in(&f.root, &["rev-parse", "main"]),
+            revert,
+            "main is the revert and stays there"
+        );
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.revert_sha.as_deref(), Some(revert.as_str()));
+        assert_eq!(s.fix_branch.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            s.fix_run_id, None,
+            "no run yet: the correction loop opens it"
+        );
+        let lines = feed_summaries(&f.pool).await;
+        assert!(
+            lines.last().is_some_and(|line| line.contains(&expected)),
+            "the feed names the branch: {lines:?}"
+        );
+    }
+
+    /// A revert the queue could not perform is told to the owner with its reason, no branch is
+    /// made, and the state is free again: the same request is not retried and nothing is left half
+    /// open.
+    #[tokio::test]
+    async fn a_failed_revert_is_reported_and_no_branch_is_made() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, c4) = confirmed_culprit(&f).await;
+        let step = tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        let Step::Reverting { request, .. } = step else {
+            unreachable!("tick_until returned a step it was not asked for");
+        };
+
+        sqlx::query("UPDATE vcs_requests SET status = 'failed', failure_reason = ? WHERE id = ?")
+            .bind("the revert conflicted")
+            .bind(request)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        let step = tick_until(&f, |s| matches!(s, Step::RevertFailed { .. })).await;
+        let Step::RevertFailed { merge_sha, reason } = step else {
+            unreachable!("tick_until returned a step it was not asked for");
+        };
+        assert_eq!(merge_sha, c3);
+        assert!(reason.contains("the revert conflicted"), "{reason}");
+
+        let lines = feed_summaries(&f.pool).await;
+        let last = lines.last().expect("the owner is told");
+        assert!(last.contains("the revert conflicted"), "{last}");
+        assert!(last.to_lowercase().contains("fail"), "{last}");
+
+        assert_eq!(
+            git_in(&f.root, &["branch", "--list", "fix/*"]),
+            "",
+            "no branch is made"
+        );
+        assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c4);
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.revert_merge_sha, None);
+        assert_eq!(s.revert_request_id, None);
+        assert_eq!(s.revert_sha, None);
+        assert_eq!(s.fix_branch, None);
+        assert!(!s.revert_in_flight() && !s.revert_pending());
+
+        // Free means free: the next pass queues nothing.
+        let _ = step_of(&f).await;
+        assert_eq!(queue_rows(&f.pool).await.len(), 1, "never resubmitted");
+    }
+
+    /// Puts `NUCLEOS_MIN_FREE_DISK_GB` at 0 for a test, and back as it stood: the disk floor
+    /// measures the machine, not the code under test.
+    struct DiskFloorOff(Option<std::ffi::OsString>);
+
+    impl DiskFloorOff {
+        fn new() -> Self {
+            let previous = std::env::var_os("NUCLEOS_MIN_FREE_DISK_GB");
+            unsafe { std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "0") };
+            Self(previous)
+        }
+    }
+
+    impl Drop for DiskFloorOff {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", value),
+                    None => std::env::remove_var("NUCLEOS_MIN_FREE_DISK_GB"),
+                }
+            }
+        }
+    }
+
+    /// A project whose revert has landed and whose fix branch is prepared, waiting for its
+    /// correction run, with a real `AppState` to open it in.
+    struct CorrectionFixture {
+        // Field order is drop order: the lock is released last.
+        state: crate::state::AppState,
+        fix_branch: String,
+        _floor: DiskFloorOff,
+        _env: WorktreeRootEnv,
+        _roots: tempfile::TempDir,
+        _container: tempfile::TempDir,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    async fn correction_fixture() -> CorrectionFixture {
+        let lock = crate::worktree::test_env_lock();
+        let container = space_free_tempdir("nucleos-correction-");
+        let root = container.path().join("repo");
+        crate::git_exec::testkit::initialize_repo(&root);
+        let roots = space_free_tempdir("nucleos-correction-wt-");
+        let env = WorktreeRootEnv::set(roots.path());
+        let floor = DiskFloorOff::new();
+
+        let fix_branch = "fix/merge-1a2b3c4".to_owned();
+        let tip = git_in(&root, &["rev-parse", "HEAD"]);
+        git_in(&root, &["checkout", "-q", "-b", &fix_branch]);
+        std::fs::write(root.join("fix.txt"), "the work the run builds on\n").unwrap();
+        git_in(&root, &["add", "-A"]);
+        git_in(&root, &["commit", "-q", "-m", "revert the revert"]);
+        git_in(&root, &["checkout", "-q", "-"]);
+
+        let (state, _runner) = crate::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(30)),
+            Duration::from_secs(120),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) \
+             VALUES ('alpha', 'active', ?)",
+        )
+        .bind(root.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        verify_postgate::mark_covered(&state.pool, "alpha", "main", &tip)
+            .await
+            .unwrap();
+        // The state the worker leaves behind once the fix branch exists and no run does.
+        sqlx::query(
+            "UPDATE postgate_state SET culprit_sha = ?, revert_merge_sha = ?, \
+                    revert_request_id = 7, revert_sha = ?, fix_branch = ? \
+             WHERE project_id = 'alpha'",
+        )
+        .bind(&tip)
+        .bind(&tip)
+        .bind(&tip)
+        .bind(&fix_branch)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        CorrectionFixture {
+            state,
+            fix_branch,
+            _floor: floor,
+            _env: env,
+            _roots: roots,
+            _container: container,
+            _lock: lock,
+        }
+    }
+
+    /// One correction run per fix branch: it is opened on that branch, the id is recorded so no
+    /// second pass opens another, and the owner is told which run to look at.
+    #[tokio::test]
+    async fn open_corrections_opens_one_run_per_fix_branch_and_records_it() {
+        let f = correction_fixture().await;
+
+        let opened = open_corrections(&f.state).await;
+        assert_eq!(opened.len(), 1, "one run for the one fix branch");
+        let run = opened[0];
+
+        let s = verify_postgate::load(&f.state.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.fix_run_id, Some(run));
+
+        let (cwd, prompt): (String, String) =
+            sqlx::query_as("SELECT cwd, prompt FROM runs WHERE id = ?")
+                .bind(run)
+                .fetch_one(&f.state.pool)
+                .await
+                .unwrap();
+        assert!(
+            prompt.contains(&f.fix_branch),
+            "the prompt names the branch"
+        );
+        assert!(
+            Path::new(&cwd).join("fix.txt").exists(),
+            "the run starts on the fix branch's work"
+        );
+
+        let lines = feed_summaries(&f.state.pool).await;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(&format!("correction run {run}")) && l.contains(&f.fix_branch)),
+            "the feed names the run and the branch: {lines:?}"
+        );
+
+        assert!(
+            open_corrections(&f.state).await.is_empty(),
+            "a branch that has its run gets no second one"
+        );
+        assert_eq!(count(&f.state.pool, "runs").await, 1);
+    }
+
+    /// A full project is not a failure: the claim is given back so a later pass tries again, and
+    /// the engaged kill switch stops every pass before it claims anything.
+    #[tokio::test]
+    async fn open_corrections_releases_its_claim_when_busy_and_waits_for_the_kill_switch() {
+        let f = correction_fixture().await;
+        let pool = &f.state.pool;
+
+        // The project's only slot is held by a run parked for approval.
+        sqlx::query("UPDATE autopilot_global SET max_concurrent_slots = 1")
+            .execute(pool)
+            .await
+            .unwrap();
+        let pinned = sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at) \
+             VALUES ('alpha', 'unused', 'pinned', 'awaiting_approval', 'worktree', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        crate::concurrency::claim(pool, "alpha", crate::worktree::Owner::Run(pinned))
+            .await
+            .expect("the parked run holds the slot");
+
+        assert!(open_corrections(&f.state).await.is_empty(), "no room");
+        let s = verify_postgate::load(pool, "alpha").await.unwrap().unwrap();
+        assert_eq!(s.fix_run_id, None, "the claim was released, not kept at 0");
+        assert_eq!(count(pool, "runs").await, 1, "only the parked run exists");
+
+        // Room again, but the kill switch is engaged: nothing is claimed or opened.
+        sqlx::query("UPDATE autopilot_global SET max_concurrent_slots = 8")
+            .execute(pool)
+            .await
+            .unwrap();
+        crate::autopilot::set_kill_switch(pool, true).await.unwrap();
+        assert!(open_corrections(&f.state).await.is_empty());
+        let s = verify_postgate::load(pool, "alpha").await.unwrap().unwrap();
+        assert_eq!(
+            s.fix_run_id, None,
+            "nothing was claimed under the kill switch"
+        );
+        assert_eq!(count(pool, "runs").await, 1);
+
+        // Released: the same branch gets its run on the next pass.
+        crate::autopilot::set_kill_switch(pool, false)
+            .await
+            .unwrap();
+        let opened = open_corrections(&f.state).await;
+        assert_eq!(opened.len(), 1);
+        let s = verify_postgate::load(pool, "alpha").await.unwrap().unwrap();
+        assert_eq!(s.fix_run_id, Some(opened[0]));
     }
 }

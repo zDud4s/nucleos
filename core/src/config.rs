@@ -2733,6 +2733,13 @@ pub struct AutopilotRules {
     /// on. Turning it on is the owner's decision (F3-8).
     #[serde(default)]
     pub gate_after_land: bool,
+    /// Whether the daemon reverts a merge the post-merge gate bisected to a confirmed culprit
+    /// (spec 2026-10-05 §6.2, D4). Off by default — a project that says nothing behaves exactly as
+    /// before this key existed. The post-merge worker reads it only when `gate_after_land` is on as
+    /// well, since without that gate there is no culprit. Turning it on is the owner's decision
+    /// (F3-8); nothing in the daemon sets it.
+    #[serde(default)]
+    pub revert_on_red: bool,
     /// Whether a job asks if the owner is at the keyboard before it starts its next node.
     ///
     /// `Option`, and the absent case is the brake ON. That is deliberately not the same as
@@ -4966,6 +4973,22 @@ resolve_effort: \"  \"
     #[test]
     fn gate_after_land_parses_when_set() {
         let rules = parse_schedule_rules("gate_command: x\ngate_after_land: true\n").unwrap();
+        assert!(rules.gate_after_land);
+        assert_eq!(rules.gate_command.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn revert_on_red_is_off_by_default_and_parses_when_set() {
+        assert!(!AutopilotRules::default().revert_on_red);
+
+        // Files written before the switch existed parse unchanged, with it off.
+        let rules = parse_schedule_rules("gate_command: x\ngate_after_land: true\n").unwrap();
+        assert!(!rules.revert_on_red, "an existing file must not turn it on");
+
+        let rules =
+            parse_schedule_rules("gate_command: x\ngate_after_land: true\nrevert_on_red: true\n")
+                .unwrap();
+        assert!(rules.revert_on_red);
         assert!(rules.gate_after_land);
         assert_eq!(rules.gate_command.as_deref(), Some("x"));
     }

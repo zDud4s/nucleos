@@ -570,6 +570,77 @@ fn lands_on_the_integration_branch(
         .is_none_or(|branch| branch.as_str() == target.as_str())
 }
 
+/// Computes the revert of `merge_sha` on top of `target`, on a detached HEAD in the integration
+/// worktree (spec 2026-10-05 §6.2, D4).
+///
+/// `-m 1`: the queue's merges are always `--no-ff`, so the first parent is the line the merge
+/// landed on. A commit that is not a merge makes git refuse, and that refusal is the outcome. The
+/// result is a new commit whose first parent is the old tip of `target`, so `publish` treats it
+/// exactly like a merge. A commit that is not on `target` is refused before anything is touched,
+/// and a conflicting revert is aborted and reported as a failure — never escalated, because the
+/// resolver only knows how to resolve merges.
+pub async fn compute_revert(
+    project_root: &Path,
+    merge_sha: &str,
+    target: &str,
+    deadline: std::time::Instant,
+) -> Result<Computed, Outcome> {
+    let integration = prepare_integration_worktree(project_root, deadline).await?;
+
+    let checkout = git(&integration, &["checkout", "--detach", target], deadline).await?;
+    if !checkout.succeeded() {
+        return Err(failed(
+            format!("could not check out {target} to revert on"),
+            &checkout,
+        ));
+    }
+
+    let old = revision(&integration, "HEAD", deadline).await?;
+
+    let on_target = git(
+        &integration,
+        &["merge-base", "--is-ancestor", merge_sha, "HEAD"],
+        deadline,
+    )
+    .await?;
+    if !on_target.succeeded() {
+        return Err(failed(
+            format!("{merge_sha} is not on {target}, nothing was reverted"),
+            &on_target,
+        ));
+    }
+
+    let revert = git(
+        &integration,
+        &[
+            "revert",
+            "-m",
+            "1",
+            "--no-edit",
+            "--end-of-options",
+            merge_sha,
+        ],
+        deadline,
+    )
+    .await?;
+    if !revert.succeeded() {
+        // Best-effort: the next operation resets this worktree anyway, and the abort must not
+        // replace git's own refusal, which is what the row records.
+        let _ = git(&integration, &["revert", "--abort"], deadline).await;
+        return Err(failed(
+            format!("reverting {merge_sha} on {target} failed, nothing was reverted"),
+            &revert,
+        ));
+    }
+
+    let new = revision(&integration, "HEAD", deadline).await?;
+    Ok(Computed {
+        old,
+        new,
+        output_tail: revert.output_tail,
+    })
+}
+
 /// Computes `source` into `target` on a detached HEAD in the daemon's integration worktree.
 ///
 /// `Err` is the outcome to record, not an error to propagate: a conflict is the answer to the
@@ -1517,6 +1588,94 @@ pub(crate) async fn prepare_postgate_worktree(
         ));
     }
     Ok(path)
+}
+
+/// A failed queue-style git step as the one-line reason `prepare_fix_branch` returns.
+fn outcome_reason(outcome: Outcome) -> String {
+    match outcome {
+        Outcome::Failed {
+            reason,
+            output_tail,
+            ..
+        } => format!("{reason}: {output_tail}"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Creates the correction branch `branch` (`fix/...`) for a published revert: its tip is a revert
+/// of `revert_sha`, so its first commit puts the reverted work back on top of the target and the
+/// run that follows starts from the culprit's own tree (spec 2026-10-05 §6.2, D4).
+///
+/// The branch is only ever CREATED, and never through the queue: `update-ref` is given the zero id
+/// as the old value, which makes git refuse when the ref exists, so a name that is taken is never
+/// moved. A second call adopts the branch it made itself, recognised by its tip's first parent being
+/// `revert_sha`, and returns that tip; any other branch under the name is an error and is left
+/// exactly as it was. The work is done in the daemon's `postgate-` worktree, which is idle while no
+/// gate runs; the integration worktree belongs to the queue.
+pub(crate) async fn prepare_fix_branch(
+    project_root: &Path,
+    revert_sha: &str,
+    branch: &str,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
+    let full = format!("refs/heads/{branch}");
+    let spec = format!("{full}^{{commit}}");
+    let existing = git(
+        project_root,
+        &["rev-parse", "--verify", "--quiet", &spec],
+        deadline,
+    )
+    .await
+    .map_err(outcome_reason)?;
+    if existing.succeeded() {
+        let tip = existing.stdout.trim().to_owned();
+        let parent_spec = format!("{tip}^1");
+        let parent = git(
+            project_root,
+            &["rev-parse", "--verify", "--quiet", &parent_spec],
+            deadline,
+        )
+        .await
+        .map_err(outcome_reason)?;
+        if parent.succeeded() && parent.stdout.trim() == revert_sha {
+            return Ok(tip);
+        }
+        return Err(format!(
+            "{branch} already exists and is not the correction branch of {revert_sha}; \
+             it was left untouched"
+        ));
+    }
+
+    let tree = prepare_postgate_worktree(project_root, revert_sha, deadline).await?;
+    let reverted = git(
+        &tree,
+        &["revert", "--no-edit", "--end-of-options", revert_sha],
+        deadline,
+    )
+    .await
+    .map_err(outcome_reason)?;
+    if !reverted.succeeded() {
+        // Best-effort, like the revert in `compute_revert`: the next use resets this tree anyway.
+        let _ = git(&tree, &["revert", "--abort"], deadline).await;
+        return Err(format!(
+            "could not revert {revert_sha} to build {branch}: {}",
+            reverted.output_tail.trim()
+        ));
+    }
+    let tip = revision(&tree, "HEAD", deadline)
+        .await
+        .map_err(outcome_reason)?;
+    let zero = "0".repeat(tip.len());
+    let created = git(project_root, &["update-ref", &full, &tip, &zero], deadline)
+        .await
+        .map_err(outcome_reason)?;
+    if !created.succeeded() {
+        return Err(format!(
+            "could not create {branch}: {}",
+            created.output_tail.trim()
+        ));
+    }
+    Ok(tip)
 }
 
 /// The shared body of the daemon-owned detached trees: create `path` when it is absent, otherwise
@@ -2474,6 +2633,18 @@ impl crate::vcs::VcsExecutor for GitExecutor {
             }
             crate::vcs::Op::Rebase { branch, onto } => {
                 rebase(project_root, branch.as_str(), onto.as_str(), deadline).await
+            }
+            // No gate here: a revert returns a tree that has been green before, and the post-merge
+            // gate measures the new tip like any other.
+            crate::vcs::Op::Revert { merge_sha, target } => {
+                match compute_revert(project_root, merge_sha.as_str(), target.as_str(), deadline)
+                    .await
+                {
+                    Ok(computed) => {
+                        publish(project_root, target.as_str(), computed, deadline).await
+                    }
+                    Err(outcome) => outcome,
+                }
             }
         }
     }
@@ -4689,6 +4860,156 @@ gate_command: git --version
         assert_eq!(
             computed.new, before,
             "nothing to merge means nothing to publish"
+        );
+    }
+
+    /// Runs a plain git command in `repo` and requires it to succeed. Test setup only.
+    fn git_must(repo: &Path, args: &[&str]) {
+        let os_args: Vec<&OsStr> = args.iter().map(|a| OsStr::new(*a)).collect();
+        assert!(git_ok(repo, &os_args), "git {args:?} failed in {repo:?}");
+    }
+
+    /// Queues a `Revert` of `merge_sha` on `master` through the real executor.
+    async fn revert_through_the_queue(repo: &Path, merge_sha: &str) -> Outcome {
+        use crate::vcs::VcsExecutor;
+        GitExecutor::default()
+            .execute(&crate::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::vcs::Op::Revert {
+                    merge_sha: merge_sha.into(),
+                    target: "master".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
+                run_id: None,
+                approved_map_blob: None,
+                integration_branch: None,
+            })
+            .await
+    }
+
+    /// D4: a revert is computed in the integration worktree and published by the same
+    /// compare-and-swap as a merge. The new commit sits on the old tip, and it puts the tree back
+    /// to what the merge's first parent had.
+    #[tokio::test]
+    async fn a_revert_publishes_a_revert_of_the_merge_by_compare_and_swap() {
+        let _lock = crate::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-revert-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        let landed = match land_ordinarily(&repo, container.path()).await {
+            Outcome::Succeeded { sha, .. } => sha.expect("a merge names what it published"),
+            other => panic!("the merge to revert must land first, got {other:?}"),
+        };
+        assert_eq!(sha_of(&repo, "master"), landed);
+        assert!(repo.join("feature.txt").exists());
+
+        let reverted = match revert_through_the_queue(&repo, &landed).await {
+            Outcome::Succeeded { sha, .. } => sha.expect("a revert names what it published"),
+            other => panic!("a revert of a merge on the target must publish, got {other:?}"),
+        };
+
+        assert_ne!(reverted, landed);
+        assert_eq!(
+            sha_of(&repo, "master"),
+            reverted,
+            "the target now points at the revert"
+        );
+        assert_eq!(
+            sha_of(&repo, &format!("{reverted}^1")),
+            landed,
+            "the revert sits on the old tip, so the swap was against the tip it computed on"
+        );
+        assert_eq!(
+            sha_of(&repo, &format!("{reverted}^{{tree}}")),
+            sha_of(&repo, &format!("{landed}^1^{{tree}}")),
+            "reverting the merge restores the tree its first parent had"
+        );
+        assert!(
+            !repo.join("feature.txt").exists(),
+            "the checkout that stands on the target moves with it"
+        );
+    }
+
+    /// A commit that is not on the target is refused up front and nothing moves: a revert is only
+    /// ever of something that landed.
+    #[tokio::test]
+    async fn a_revert_of_a_commit_not_on_the_target_is_refused_and_nothing_moves() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-revert-off-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let before = sha_of(&repo, "master");
+        // `feat/x` was never merged, so its tip is not an ancestor of master.
+        let stranger = sha_of(&repo, "feat/x");
+
+        match revert_through_the_queue(&repo, &stranger).await {
+            Outcome::Failed { reason, .. } => assert!(
+                reason.contains("nothing was reverted"),
+                "the refusal says nothing moved: {reason}"
+            ),
+            other => panic!("a commit off the target must be refused, got {other:?}"),
+        }
+
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
+        assert!(
+            !repo.join("feature.txt").exists(),
+            "the working copy was touched"
+        );
+    }
+
+    /// The correction branch is only ever CREATED: a second call adopts the branch it made itself,
+    /// and a branch somebody else made under that name is refused and left exactly as it was.
+    #[tokio::test]
+    async fn the_fix_branch_is_created_once_and_never_overwritten() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-fixbranch-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+
+        // A merge, then its revert, both made by hand on master: the sha under test is the revert.
+        let seed = sha_of(&repo, "master");
+        git_must(&repo, &["merge", "--no-ff", "-m", "merge feat/x", "feat/x"]);
+        let merge = sha_of(&repo, "master");
+        git_must(&repo, &["revert", "-m", "1", "--no-edit", "HEAD"]);
+        let revert = sha_of(&repo, "master");
+
+        let branch = "fix/feat-x-1a2b3c4";
+        let tip = prepare_fix_branch(&repo, &revert, branch, deadline())
+            .await
+            .expect("the first call creates the branch");
+
+        assert_eq!(sha_of(&repo, &format!("refs/heads/{branch}")), tip);
+        assert_eq!(
+            sha_of(&repo, &format!("{tip}^1")),
+            revert,
+            "the branch's first commit is built on the revert"
+        );
+        assert_eq!(
+            sha_of(&repo, &format!("{tip}^{{tree}}")),
+            sha_of(&repo, &format!("{merge}^{{tree}}")),
+            "the revert of the revert puts the merge's tree back"
+        );
+        assert_ne!(seed, tip);
+
+        let again = prepare_fix_branch(&repo, &revert, branch, deadline())
+            .await
+            .expect("a second call adopts the branch it made");
+        assert_eq!(again, tip, "adopted, not recreated");
+
+        // A branch of somebody else's under the same name is never moved.
+        let foreign = "fix/feat-x-aaaaaaa";
+        git_must(&repo, &["branch", foreign, &seed]);
+        let error = prepare_fix_branch(&repo, &revert, foreign, deadline())
+            .await
+            .expect_err("a branch that is not ours must be refused");
+        assert!(!error.is_empty());
+        assert_eq!(
+            sha_of(&repo, &format!("refs/heads/{foreign}")),
+            seed,
+            "the foreign branch was moved"
         );
     }
 
