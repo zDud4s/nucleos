@@ -128,7 +128,7 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	var err error
 	switch action.Kind {
 	case browser.ActionClick:
-		refusal, err = d.click(ctx, on, objectID)
+		refusal, err = d.click(ctx, entry, on, objectID)
 	case browser.ActionScroll:
 		if objectID == "" {
 			refusal, err = d.scrollPage(ctx, on, action.Text)

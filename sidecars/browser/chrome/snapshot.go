@@ -43,6 +43,10 @@ func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser
 		return browser.Snapshot{}, err
 	}
 
+	// The panel is the person's. Its host and everything under it leave the reading before the walk,
+	// so no ref is ever minted for a panel node. Visible sessions only.
+	d.withoutPanel(ctx, entry, root)
+
 	// Before the walk, because a link's address is shortened against the page's own origin and the
 	// walk is where the elements are built.
 	facts := d.locate(ctx, entry.cdp)
@@ -831,4 +835,93 @@ func (d *Driver) locate(ctx context.Context, cdpSession cdp.SessionID) pageFacts
 		return pageFacts{}
 	}
 	return facts
+}
+
+// panelHost is the node name of the panel's host element, as the DOM reports it.
+const panelHost = "NUCLEOS-PANEL"
+
+// withoutPanel drops the panel host's node and its whole subtree from the main document's reading.
+// A session without a panel is left alone and no call is made. Best effort: when the host cannot be
+// found the reading is unchanged, which is what a page without a panel yet looks like.
+func (d *Driver) withoutPanel(ctx context.Context, entry *session, root *tree) {
+	d.mu.Lock()
+	visible := d.visible
+	d.mu.Unlock()
+	if !visible || entry.panel == nil || root == nil {
+		return
+	}
+	// Depth 2: the html element's children are what holds the host, and depth 1 stops short of them.
+	raw, err := d.conn.Call(ctx, entry.cdp, "DOM.getDocument", map[string]any{"depth": 2})
+	if err != nil {
+		return
+	}
+	var doc struct {
+		Root dnode `json:"root"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return
+	}
+	hosts := map[int64]bool{}
+	var find func(n dnode, depth int)
+	find = func(n dnode, depth int) {
+		if depth > 3 {
+			return
+		}
+		if strings.EqualFold(n.NodeName, panelHost) && n.BackendNodeID != 0 {
+			hosts[n.BackendNodeID] = true
+		}
+		for _, child := range n.Children {
+			find(child, depth+1)
+		}
+	}
+	find(doc.Root, 0)
+	if len(hosts) == 0 {
+		return
+	}
+
+	byID := make(map[string]axNode, len(root.nodes))
+	for _, node := range root.nodes {
+		byID[node.NodeID] = node
+	}
+	drop := map[string]bool{}
+	var mark func(id string)
+	mark = func(id string) {
+		if drop[id] {
+			return
+		}
+		drop[id] = true
+		for _, child := range byID[id].ChildIDs {
+			mark(child)
+		}
+	}
+	for _, node := range root.nodes {
+		if hosts[node.BackendDOMNodeID] {
+			mark(node.NodeID)
+		}
+	}
+	if len(drop) == 0 {
+		return
+	}
+	kept := make([]axNode, 0, len(root.nodes))
+	for _, node := range root.nodes {
+		if drop[node.NodeID] {
+			continue
+		}
+		var children []string
+		for _, child := range node.ChildIDs {
+			if !drop[child] {
+				children = append(children, child)
+			}
+		}
+		node.ChildIDs = children
+		kept = append(kept, node)
+	}
+	root.nodes = kept
+}
+
+// dnode is the part of a DOM node that finding the panel host reads.
+type dnode struct {
+	NodeName      string  `json:"nodeName"`
+	BackendNodeID int64   `json:"backendNodeId"`
+	Children      []dnode `json:"children"`
 }

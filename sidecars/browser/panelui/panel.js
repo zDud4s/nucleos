@@ -16,4 +16,9 @@
   if (document.documentElement) mount();
   else document.addEventListener('DOMContentLoaded', mount, { once: true });
   globalThis.__nucleosPush = () => {};
+  // Hides or shows the host element, so a capture taken for the agent does not carry the panel.
+  globalThis.__nucleosHide = (hidden) => {
+    const host = document.querySelector('nucleos-panel');
+    if (host) host.style.visibility = hidden ? 'hidden' : '';
+  };
 })();

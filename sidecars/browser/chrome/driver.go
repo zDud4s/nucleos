@@ -702,6 +702,7 @@ func (d *Driver) Screenshot(ctx context.Context, id browser.SessionID) ([]byte, 
 	if d.personHolds(id) {
 		return nil, browser.ErrPersonIsDriving
 	}
+	defer d.hidePanel(ctx, entry)()
 	result, err := d.conn.Call(ctx, entry.cdp, "Page.captureScreenshot", map[string]any{"format": "png"})
 	if err != nil {
 		return nil, err

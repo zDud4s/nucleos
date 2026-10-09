@@ -90,7 +90,7 @@ const aimQuestion = `function() {
 }`
 
 // click presses the mouse where the element actually is.
-func (d *Driver) click(ctx context.Context, on cdp.SessionID, objectID string) (*browser.Refusal, error) {
+func (d *Driver) click(ctx context.Context, entry *session, on cdp.SessionID, objectID string) (*browser.Refusal, error) {
 	answer, err := d.callOnValue(ctx, on, objectID, aimQuestion, "")
 	if err != nil {
 		return nil, err
@@ -107,6 +107,13 @@ func (d *Driver) click(ctx context.Context, on cdp.SessionID, objectID string) (
 				" hidden or collapsed, and something has to open it first",
 		}, nil
 	}
+	// The panel covers the right edge of a visible window, and a click there would land on it and not
+	// on the page. Checked before anything is sent, and before the generic "on top" refusal, so
+	// the detail names the panel.
+	if refusal := d.panelStrip(ctx, entry, where.X); refusal != nil {
+		return refusal, nil
+	}
+
 	if !where.Reached {
 		return &browser.Refusal{
 			Consequence: browser.ConsequenceNotApplicable,
@@ -128,4 +135,49 @@ func (d *Driver) click(ctx context.Context, on cdp.SessionID, objectID string) (
 		}
 	}
 	return nil, nil
+}
+
+// Widths of the panel's strip in css pixels: open, and collapsed to its handle.
+const (
+	panelStripOpen      = 360
+	panelStripCollapsed = 28
+)
+
+// panelStrip refuses a click that falls inside the panel's strip. Only a visible session has one, and
+// when the viewport cannot be read the click goes on: the strip is a courtesy to the agent and the
+// panel's own hit test is the real guard.
+func (d *Driver) panelStrip(ctx context.Context, entry *session, x float64) *browser.Refusal {
+	d.mu.Lock()
+	visible := d.visible
+	panel := entry.panel
+	d.mu.Unlock()
+	if !visible || panel == nil {
+		return nil
+	}
+	raw, err := d.conn.Call(ctx, entry.cdp, "Page.getLayoutMetrics", map[string]any{})
+	if err != nil {
+		return nil
+	}
+	var metrics struct {
+		Viewport struct {
+			ClientWidth float64 `json:"clientWidth"`
+		} `json:"cssVisualViewport"`
+	}
+	if json.Unmarshal(raw, &metrics) != nil || metrics.Viewport.ClientWidth <= 0 {
+		return nil
+	}
+	panel.mu.Lock()
+	strip := float64(panelStripOpen)
+	if panel.collapsed {
+		strip = panelStripCollapsed
+	}
+	panel.mu.Unlock()
+	if x < metrics.Viewport.ClientWidth-strip {
+		return nil
+	}
+	return &browser.Refusal{
+		Consequence: browser.ConsequenceNotApplicable,
+		Detail: "the browser panel covers that point, so a click there would hit the panel and not the" +
+			" page; scroll the element away from the right edge first",
+	}
 }

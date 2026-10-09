@@ -178,6 +178,7 @@ func (d *Driver) Look(ctx context.Context, id browser.SessionID) (browser.LookRe
 		budget -= len(drawn)
 	}
 
+	defer d.hidePanel(ctx, entry)()
 	result, err := d.capture(ctx, top)
 	if err != nil {
 		return browser.LookResult{}, err
@@ -344,4 +345,34 @@ func jpegSize(data []byte) (int, int) {
 		i += 2 + int(data[i+2])<<8 + int(data[i+3])
 	}
 	return 0, 0
+}
+
+// hidePanel tells each of a visible session's panel worlds to hide before a capture, and returns the
+// call that shows them again. The picture is the agent's and the panel is the person's. Best effort,
+// and a no-op (no CDP call at all) for a session without a panel.
+func (d *Driver) hidePanel(ctx context.Context, entry *session) func() {
+	d.mu.Lock()
+	visible := d.visible
+	var ids []int64
+	if visible && entry.panel != nil {
+		for key, c := range d.contexts {
+			if key.session == entry.cdp && c.name == panelWorld {
+				ids = append(ids, key.id)
+			}
+		}
+	}
+	d.mu.Unlock()
+	if len(ids) == 0 {
+		return func() {}
+	}
+	say := func(hidden bool) {
+		for _, id := range ids {
+			_, _ = d.conn.Call(ctx, entry.cdp, "Runtime.evaluate", map[string]any{
+				"expression": fmt.Sprintf("globalThis.__nucleosHide?.(%t)", hidden),
+				"contextId":  id,
+			})
+		}
+	}
+	say(true)
+	return func() { say(false) }
 }

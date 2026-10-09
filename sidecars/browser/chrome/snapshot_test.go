@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"nucleosbrowser/browser"
+	"nucleosbrowser/cdp/cdptest"
 )
 
 // snapshotFrom runs the two halves the driver runs: read the tree, then name what it found. The
@@ -635,5 +636,68 @@ func TestARowSaysWhatIsInItsUnnamedBox(t *testing.T) {
 	if row != "Cabo HDMI | 7 | x" {
 		t.Fatalf("row = %q, want the box's contents where the box is; a row that reads "+
 			"\"Cabo HDMI |  | x\" hides the field it is about", row)
+	}
+}
+
+// TestSnapshotLeavesOutThePanel. The panel is the person's, and the agent never reads it: its host
+// element and everything under it are dropped from the walk by backend node id, so no ref is ever
+// minted for a panel node and nothing the panel says can reach the agent as page content. The page's
+// own controls are the control, so the omission is shown to be about the panel and not about an
+// empty reading.
+func TestSnapshotLeavesOutThePanel(t *testing.T) {
+	fake, driver, _ := visiblePersonDriver(t)
+	id := opened(t, driver).ID
+
+	const hostBackend, insideBackend = 9900, 9901
+	node := func(nodeID, role, name string, backend int64, children ...string) map[string]any {
+		return map[string]any{
+			"nodeId":           nodeID,
+			"ignored":          false,
+			"role":             map[string]any{"type": "role", "value": role},
+			"name":             map[string]any{"type": "computedString", "value": name},
+			"childIds":         children,
+			"backendDOMNodeId": backend,
+		}
+	}
+	fake.Handle("Accessibility.getFullAXTree", func(cdptest.Call) (any, error) {
+		return map[string]any{"nodes": []any{
+			node("n1", "RootWebArea", "Page", 1, "n2", "n3", "n5"),
+			node("n2", "button", "Page button", 11),
+			node("n3", "generic", "Panel host", hostBackend, "n4"),
+			node("n4", "button", "Panel button", insideBackend),
+			node("n5", "link", "Page link", 12),
+		}}, nil
+	})
+	fake.Handle("DOM.getDocument", func(cdptest.Call) (any, error) {
+		return map[string]any{"root": map[string]any{
+			"nodeId": 1, "backendNodeId": 1, "nodeName": "#document",
+			"children": []any{map[string]any{
+				"nodeId": 2, "backendNodeId": 2, "nodeName": "HTML",
+				"children": []any{
+					map[string]any{"nodeId": 3, "backendNodeId": 3, "nodeName": "BODY"},
+					map[string]any{"nodeId": 4, "backendNodeId": hostBackend, "nodeName": "NUCLEOS-PANEL"},
+				},
+			}},
+		}}, nil
+	})
+
+	snapshot := snapshotOf(t, driver, id)
+
+	names := map[string]bool{}
+	for _, element := range snapshot.Elements {
+		names[element.Name] = true
+		if strings.Contains(element.Name, "Panel") {
+			t.Errorf("the panel was read into the snapshot: %+v", element)
+		}
+	}
+	if !names["Page button"] || !names["Page link"] {
+		t.Fatalf("the page's own controls are missing, so the omission proves nothing: %+v", snapshot.Elements)
+	}
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	for ref, key := range driver.sessions[id].refs {
+		if key.backend == hostBackend || key.backend == insideBackend {
+			t.Errorf("ref %s was minted for panel node %d", ref, key.backend)
+		}
 	}
 }
