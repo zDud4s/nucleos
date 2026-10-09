@@ -3843,6 +3843,54 @@ Merging `{job_branch}` — the branch this job is building — into your work   
     }
 }
 
+/// What a node's briefing needs to know about WHO is working: the team the job belongs to, the
+/// agent an item was given to, and the files that item declares.
+///
+/// Every read is best-effort. A node with no team, no item, or a row that cannot be read is briefed
+/// with the links it does have, because refusing to start the node over the advice about the node
+/// would fail the work for the sake of the advice.
+async fn node_loadout(
+    pool: &SqlitePool,
+    job: &JobRow,
+    item: Option<ItemClaim>,
+) -> (Option<String>, Option<String>, Vec<String>) {
+    let team_read =
+        sqlx::query_scalar::<_, Option<String>>("SELECT team_id FROM jobs WHERE id = ?")
+            .bind(job.id)
+            .fetch_optional(pool)
+            .await;
+    let team = match team_read {
+        Ok(team) => team.flatten(),
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not read a job's team; its node is briefed without it");
+            None
+        }
+    };
+    let Some(ItemClaim { ordinal, .. }) = item else {
+        return (team, None, Vec::new());
+    };
+    let row = match sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT agent_id, files FROM job_items WHERE job_id = ? AND ordinal = ?",
+    )
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(job_id = job.id, ordinal, %error, "could not read an item's agent; its node is briefed without it");
+            None
+        }
+    };
+    let (agent, files) = row.unwrap_or((None, None));
+    // A hint that will not parse is no hint, as `start_item` treats it.
+    let files: Vec<String> = files
+        .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+        .unwrap_or_default();
+    (team, agent, files)
+}
+
 async fn spawn_node(
     state: &AppState,
     job: &JobRow,
@@ -3926,43 +3974,31 @@ async fn spawn_node(
         prompt.push_str(&block);
     }
 
-    // What earlier work on this project learned, appended at the same seam and for the same reason:
-    // this is the one place every node kind passes through, and a lesson that only reached implement
-    // nodes would be a lesson the planner keeps rediscovering. After the notes deliberately — a note
-    // is what the owner is saying NOW about this job, and it should be the last thing read.
+    // What earlier work learned, appended at the same seam and for the same reason: this is the
+    // one place every node kind passes through, and a lesson that only reached implement nodes
+    // would be a lesson the planner keeps rediscovering. After the notes deliberately — a note is
+    // what the owner is saying NOW about this job, and it should be the last thing read.
     //
-    // Best-effort, like the notes above: a layer that cannot be read is a reason to say so, never a
-    // reason to refuse to start the node. The fetch now follows the context's most specific scope
-    // (the job's), a superset of the project read it replaces.
-    let pid = job.project_id.clone();
-    let context = crate::knowledge::Context {
-        chain: vec![
-            crate::knowledge::Scope::Machine,
-            crate::knowledge::Scope::Project(pid.clone()),
-            crate::knowledge::Scope::Job {
-                id: job.id,
-                project: Some(pid.clone()),
-            },
-        ],
-        files: Vec::new(),
-        communities: Vec::new(),
-        node: None,
-        gate: None,
-        query_embedded: false,
-    };
-    let briefing = match crate::brief::of(pool, &context, &task_text).await {
-        Ok(briefing) => Some(briefing),
-        Err(error) => {
-            tracing::warn!(job_id = job.id, %error, "could not read project knowledge");
-            None
-        }
-    };
-    if let Some(block) = briefing
-        .as_ref()
-        .and_then(|briefing| briefing.block.as_ref())
-    {
-        prompt.push_str(block);
-    }
+    // Resolved through the loadout, so the chain is machine -> project -> team -> agent -> job: a
+    // team's item reads its own agent's memory and its team's besides the job's, and no other
+    // agent's. Best-effort, like the notes above: a layer that cannot be read is a reason to say
+    // so, never a reason to refuse to start the node.
+    let (team, agent, files) = node_loadout(pool, job, item).await;
+    let loadout = crate::loadout::resolve(
+        pool,
+        &crate::loadout::LoadoutInput {
+            agent: agent.as_deref(),
+            team: team.as_deref(),
+            project: Some(&job.project_id),
+            job: Some(job.id),
+            task_text: &task_text,
+            node: crate::loadout::node_kind(stage),
+            files: &files,
+        },
+    )
+    .await;
+    prompt.push_str(&loadout.block);
+    let briefing = loadout.brief;
 
     // An item of a job a team directs gets a checkout of its own; everything else — every node of
     // every job without a team, and this job's own plan, replan and review nodes — works in the
@@ -13575,6 +13611,145 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(trees, 2, "each item is writing in a checkout of its own");
+    }
+
+    /// An item's node reads its agent's memory and its team's, and no other agent's or team's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_team_items_node_is_briefed_with_its_agents_and_its_teams_memory() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-loadout-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
+
+        seed_agent(&pool, "ana", "migrations", "careful").await;
+        seed_crew(&pool, "crew", "ana", &[]).await;
+        // The foreign owners have rows too, so the isolation below is proven by scope filtering
+        // and not by the owner check dropping a link whose row is missing.
+        seed_agent(&pool, "bob", "frontend", "bold").await;
+        seed_crew(&pool, "other-crew", "bob", &[]).await;
+
+        let job_id = seed_job_in(
+            &pool,
+            "project-a",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(&repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::worktree::record(
+            &pool,
+            owner,
+            "project-a",
+            &repo.to_string_lossy(),
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job's worktree");
+
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, files, depends_on,
+                                    agent_id)
+             VALUES (?, 0, 'zanzibar quokka item', 'pending', '[\"src/a.rs\"]', '[]', 'ana')",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // "zanzibar" is in every row, so FTS gives it no weight: each in-scope note also needs a term of its own that the task text carries ("ana" for the agent, "quokka" for the team).
+        // The foreign rows carry the task's terms too ("zanzibar quokka ana"), so ranking alone
+        // could not keep them out: only the scope chain can.
+        let mut knowledge_ids = Vec::new();
+        for (scope_kind, scope_id, title) in [
+            ("agent", "ana", "zanzibar ana-note"),
+            ("team", "crew", "zanzibar quokka crew-note"),
+            ("agent", "bob", "zanzibar quokka ana bob-note"),
+            ("team", "other-crew", "zanzibar quokka other-crew-note"),
+        ] {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES ('semantic', ?, ?, 'owner', 'memory', ?, 'body', 'active',
+                         '2026-08-19T00:00:00+00:00')
+                 RETURNING id",
+            )
+            .bind(scope_kind)
+            .bind(scope_id)
+            .bind(title)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            knowledge_ids.push(id);
+        }
+        let (ana_id, crew_id, bob_id, other_id) = (
+            knowledge_ids[0],
+            knowledge_ids[1],
+            knowledge_ids[2],
+            knowledge_ids[3],
+        );
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+
+        let run_id: Option<i64> =
+            sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = ? AND ordinal = 0")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let run_id = run_id.expect("the item's node started, so it has a run to read");
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // The foreign rows first: `crew-note` is a substring of `other-crew-note`, so the positive
+        // check below only means something once the other team's row is known to be absent.
+        assert!(!prompt.contains("bob-note"), "{prompt}");
+        assert!(!prompt.contains("other-crew-note"), "{prompt}");
+        assert!(prompt.contains("ana-note"), "{prompt}");
+        assert!(prompt.contains("crew-note"), "{prompt}");
+
+        // The trace says the same thing as the prompt: nothing of the foreign rows was even a
+        // candidate for this run, shown or not.
+        let foreign: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_knowledge WHERE run_id = ? AND knowledge_id IN (?, ?)",
+        )
+        .bind(run_id)
+        .bind(bob_id)
+        .bind(other_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            foreign, 0,
+            "another agent's or team's row reached the trace"
+        );
+        for (mine, name) in [(ana_id, "ana's"), (crew_id, "the team's")] {
+            let traced: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM run_knowledge WHERE run_id = ? AND knowledge_id = ?",
+            )
+            .bind(run_id)
+            .bind(mine)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(traced, 1, "{name} row {mine} is missing from the trace");
+        }
     }
 
     /// A real repository and a real worktree, because a node that cannot be provisioned would leave
