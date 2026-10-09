@@ -33,6 +33,14 @@ tests:
         - scripts/refresh-models.py
         - scripts/test-refresh-models.py
       command: bash scripts/gates.sh hooks
+    broker:
+      # The machine-wide build broker, its classifier and hook, and their tests.
+      paths:
+        - scripts/heavy.py
+        - scripts/heavy_classify.py
+        - scripts/heavy_guard.py
+        - scripts/heavy_tests/
+      command: bash scripts/gates.sh broker
   gate_entrypoints: [scripts/gates.sh, scripts/gate-diff.sh]
   tools:
     cargo: { allow: [fmt, metadata, tree, add, remove, update, search] }
@@ -48,7 +56,6 @@ tests:
   full_sweep: [scripts/gates.sh, scripts/gate-diff.sh, .github/workflows/]
   no_test:
     # Its tests live in the local workflow (.ai/), which is not versioned.
-    - scripts/heavy.py
     - scripts/heavy_watch.py
     - scripts/stage-bundle-bins.sh
     - scripts/css-contract.mjs
