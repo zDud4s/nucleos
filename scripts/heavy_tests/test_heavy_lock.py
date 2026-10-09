@@ -485,6 +485,52 @@ class LockTests(unittest.TestCase):
         # One holder line, the same shape everywhere: who, which agent, what, for how long.
         self.assertRegex(err, rf"pid {hw.pid}, agent \S+, `[^`]+`, running \d+s")
 
+    def waiter_dirs(self) -> list[Path]:
+        wt = self.state / "wt"
+        return sorted(wt.glob("*.waiters")) if wt.exists() else []
+
+    def test_last_waiter_leaving_removes_the_waiters_dir(self) -> None:
+        # The broker used to leave an empty `wt/<hash>.waiters` behind when its last waiter
+        # went: the dir has to follow the waiter out, not outlive the contention.
+        a1 = self.broker("a1", self.repo_a)
+        self.assert_started("a1")
+        a2 = self.broker("a2", self.repo_a)
+        self.waiters(1)
+        self.stop("a1")
+        self.assert_started("a2")
+        self.stop("a2")
+        self.assertEqual(self.finish(a1)[0], 0)
+        self.assertEqual(self.finish(a2)[0], 0)
+        self.assertTrue(
+            wait_for(lambda: self.waiter_dirs() == [], timeout=10), "waiters dir left behind"
+        )
+
+    def test_an_uncontended_lock_leaves_no_waiters_dir(self) -> None:
+        # Nobody ever waits, and the dir used to be made on every poll all the same.
+        a1 = self.broker("a1", self.repo_a)
+        self.assert_started("a1")
+        self.stop("a1")
+        self.assertEqual(self.finish(a1)[0], 0)
+        self.assertEqual(self.waiter_dirs(), [])
+
+    def test_entries_of_a_vanished_dir_is_empty(self) -> None:
+        # The broker removes empty `.waiters` dirs; a reader outside the Mutex can see
+        # `is_dir()` pass and then lose the dir before `iterdir()`.
+        import importlib.util
+        import pathlib
+        from unittest import mock
+
+        spec = importlib.util.spec_from_file_location("heavy_entries_under_test", HEAVY)
+        heavy = importlib.util.module_from_spec(spec)
+        sys.modules["heavy_entries_under_test"] = heavy
+        self.addCleanup(sys.modules.pop, "heavy_entries_under_test", None)
+        spec.loader.exec_module(heavy)
+
+        gone = self.tmp / "gone.waiters"
+        self.assertEqual(heavy._entries(gone), [])
+        with mock.patch.object(pathlib.Path, "is_dir", return_value=True):
+            self.assertEqual(heavy._entries(gone), [])
+
 
 if __name__ == "__main__":
     unittest.main()

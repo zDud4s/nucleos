@@ -417,9 +417,13 @@ def _entries(directory: Path, reap: bool = True) -> list[tuple[Path, dict]]:
     """Records in a state subdirectory. A dead owner (pid gone, or reused: other creation
     time) is removed when `reap`, and never returned."""
     out = []
-    if not directory.is_dir():
+    try:
+        files = list(directory.iterdir())
+    except OSError:
+        # Missing, or removed between a caller's look and this one: the broker deletes
+        # empty `.waiters` dirs, and readers outside the Mutex race with that.
         return out
-    for f in directory.iterdir():
+    for f in files:
         try:
             rec = json.loads(f.read_text(encoding="utf-8"))
             pid = rec["pid"]
@@ -572,6 +576,19 @@ def _lock_paths(directory: Path, h: str) -> tuple[Path, Path]:
     return wt / f"{h}.lock", wt / f"{h}.waiters"
 
 
+def _leave_waiters(wfile: Path, wdir: Path) -> None:
+    """Drop our waiter file and the waiters dir if now empty. Call under the Mutex: a
+    peer's mkdir+write happens under it too."""
+    try:
+        wfile.unlink()
+    except OSError:
+        pass
+    try:
+        wdir.rmdir()
+    except OSError:
+        pass
+
+
 def _read_lock(lock: Path) -> dict | None:
     """The live holder's record, or None (a dead holder's file is removed)."""
     try:
@@ -634,6 +651,8 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                     # Handed over by the previous holder on its release.
                     lock.write_text(json.dumps(dict(rec, acquired=time.time())),
                                     encoding="utf-8")
+                    _leave_waiters(wfile, wdir)
+                    queued = False
                     return True, time.time() - t0, arrival
                 if holder is not None:
                     last_holder = holder
@@ -643,6 +662,8 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                         f"({_holder_line(holder, est_for(holder))}); nothing was compiled. A gate keeps its "
                         "worktree until it ends - wait for it to finish rather than retrying, "
                         "and run nothing heavy here meanwhile.\n")
+                    _leave_waiters(wfile, wdir)
+                    queued = False
                     return False, time.time() - t0, arrival
                 remaining = wait_cap - (time.time() - t0)
                 if (fail_on_hold and holder is not None
@@ -654,6 +675,8 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                         f"heavy: this worktree is held by {_holder_line(holder, est_for(holder))}; it will "
                         f"not be free within this call's {int(remaining)}s wait - nothing was "
                         "compiled. Wait for it to finish rather than retrying.\n")
+                    _leave_waiters(wfile, wdir)
+                    queued = False
                     return False, time.time() - t0, arrival
                 if holder is None:
                     ahead = [f for f, _ in _entries(wdir)
@@ -661,6 +684,8 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                     if not ahead:
                         lock.write_text(json.dumps(dict(rec, acquired=time.time())),
                                         encoding="utf-8")
+                        _leave_waiters(wfile, wdir)
+                        queued = False
                         return True, time.time() - t0, arrival
                 if not queued or not wfile.exists():
                     wfile.write_text(json.dumps(rec), encoding="utf-8")
@@ -673,6 +698,12 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                     + (f" (held by {_holder_line(last_holder, est_for(last_holder))})"
                        if last_holder else "")
                     + "\n")
+                try:
+                    with Mutex(directory):
+                        _leave_waiters(wfile, wdir)
+                    queued = False
+                except Exception:
+                    pass
                 return False, now - t0, arrival
             if now - last_report >= 30:
                 last_report = now
@@ -681,9 +712,13 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
     finally:
         if queued:
             try:
-                wfile.unlink()
-            except OSError:
-                pass
+                with Mutex(directory):
+                    _leave_waiters(wfile, wdir)
+            except Exception:
+                try:
+                    wfile.unlink()
+                except OSError:
+                    pass
 
 
 def release_lock(directory: Path, h: str):
