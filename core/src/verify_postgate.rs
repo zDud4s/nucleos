@@ -1212,6 +1212,11 @@ mod tests {
             culprit_sha: None,
             candidates: Vec::new(),
             also_suspect: Vec::new(),
+            revert_merge_sha: None,
+            revert_request_id: None,
+            revert_sha: None,
+            fix_branch: None,
+            fix_run_id: None,
         };
         assert_eq!(
             state.already_failing("core").as_deref(),
