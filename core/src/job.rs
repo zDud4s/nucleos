@@ -4352,12 +4352,19 @@ enum ItemGate {
     Scope,
 }
 
-/// `Scope` only for an intermediate item, with a map the measured work cannot have rewritten, and
-/// an executor to run it on. The last item is always `Full`: it is the one measurement a partial
-/// can be trusted on, so a test map never narrows it. Every other case keeps today's behaviour,
-/// because nothing may measure less than it does now without a map worth trusting.
-fn item_gate(last: bool, map_trusted: bool, executor_running: bool) -> ItemGate {
-    if !last && map_trusted && executor_running {
+/// `Scope` only with a map the measured work cannot have rewritten, and an executor to run it on.
+/// The last item is `Full` unless `scoped_final` (the switch AND `gate_after_land`, so a
+/// post-merge gate measures the whole target afterwards): without it the last item is the one
+/// measurement a partial can be trusted on, so a test map never narrows it. Every other case keeps
+/// today's behaviour, because nothing may measure less than it does now without a map worth
+/// trusting.
+fn item_gate(
+    last: bool,
+    map_trusted: bool,
+    executor_running: bool,
+    scoped_final: bool,
+) -> ItemGate {
+    if (!last || scoped_final) && map_trusted && executor_running {
         ItemGate::Scope
     } else {
         ItemGate::Full
@@ -4369,7 +4376,7 @@ fn item_gate(last: bool, map_trusted: bool, executor_running: bool) -> ItemGate 
 /// Same reason as `tampered_gate_script`: a verdict must not depend on a file the work being
 /// measured may have rewritten. An agent that narrowed `nucleos.tests.yaml` would otherwise pick
 /// which tests judge it. Blocking: reads files from disk.
-fn map_is_trusted(worktree: &Path, project_root: &Path) -> bool {
+pub(crate) fn map_is_trusted(worktree: &Path, project_root: &Path) -> bool {
     if !matches!(
         crate::tests_map::load(worktree),
         crate::tests_map::MapState::Valid(_)
@@ -4429,11 +4436,14 @@ async fn gate_item_with(
             .await;
     }
 
-    let command = match crate::config::load_schedule_rules(
+    let (command, scoped_final) = match crate::config::load_schedule_rules(
         state.machine_config_root.as_deref(),
         &job.project_id,
     ) {
-        Ok(rules) => rules.gate_command,
+        Ok(rules) => {
+            let scoped_final = rules.scoped_final();
+            (rules.gate_command, scoped_final)
+        }
         // Unreadable is not the same as absent, and this is the distinction §7 of the design says
         // is the easiest to get wrong: a configuration nobody can read means the measurement did
         // not happen, which is not the same as a project that has no gate.
@@ -4465,8 +4475,12 @@ async fn gate_item_with(
     };
 
     // An intermediate item with a trusted test map is measured by the daemon's verify executor
-    // over the job's own diff; everything else falls through to the full gate below, untouched.
-    let executor = if last { None } else { installed };
+    // over the job's own diff, and so is the last one when `scoped_final` is on; everything else falls through to the full gate below, untouched.
+    let executor = if last && !scoped_final {
+        None
+    } else {
+        installed
+    };
     let trusted = if executor.is_some() {
         let tree = worktree.clone();
         let root = PathBuf::from(&job.project_root);
@@ -4476,7 +4490,7 @@ async fn gate_item_with(
     } else {
         false
     };
-    if item_gate(last, trusted, executor.is_some()) == ItemGate::Scope
+    if item_gate(last, trusted, executor.is_some(), scoped_final) == ItemGate::Scope
         && let Some(executor) = executor
     {
         if matches!(set_live_status(pool, job.id, "gating").await, Ok(false)) {
@@ -4500,6 +4514,20 @@ async fn gate_item_with(
                 "job ended while its gate ran; the outcome is not recorded"
             );
             return Step::Stopped;
+        }
+        // The last item's gate is the one the owner reads as "the job passed", so the feed says
+        // which gate measured it, whatever the verdict (an unavailable scope says the full gate did).
+        if last {
+            say(
+                pool,
+                job,
+                "job_gate_scoped",
+                &crate::verify::scoped_final_note(
+                    &format!("job {} at item {}", job.id, ordinal + 1),
+                    &verdict,
+                ),
+            )
+            .await;
         }
         match verdict {
             crate::verify::ScopeVerdict::Measured(outcome) => {
@@ -14197,24 +14225,36 @@ mod tests {
     /// narrows it: the decision is `Full` whatever the map and the executor say.
     #[test]
     fn the_last_item_keeps_the_full_gate_even_with_a_test_map() {
-        assert_eq!(item_gate(true, true, true), ItemGate::Full);
-        assert_eq!(item_gate(true, true, false), ItemGate::Full);
-        assert_eq!(item_gate(true, false, true), ItemGate::Full);
-        assert_eq!(item_gate(true, false, false), ItemGate::Full);
+        assert_eq!(item_gate(true, true, true, false), ItemGate::Full);
+        assert_eq!(item_gate(true, true, false, false), ItemGate::Full);
+        assert_eq!(item_gate(true, false, true, false), ItemGate::Full);
+        assert_eq!(item_gate(true, false, false, false), ItemGate::Full);
+    }
+
+    /// With the scoped-final switch (and the post-merge gate behind it) the last item takes the
+    /// same decision as an intermediate one: scope only with a trusted map and an executor.
+    #[test]
+    fn the_last_item_gates_by_scope_only_with_scoped_final() {
+        assert_eq!(item_gate(true, true, true, true), ItemGate::Scope);
+        assert_eq!(item_gate(true, false, true, true), ItemGate::Full);
+        assert_eq!(item_gate(true, true, false, true), ItemGate::Full);
+        assert_eq!(item_gate(true, false, false, true), ItemGate::Full);
+        // Off: the same inputs give the full gate.
+        assert_eq!(item_gate(true, true, true, false), ItemGate::Full);
     }
 
     #[test]
     fn an_intermediate_item_with_a_trusted_map_gates_by_scope() {
-        assert_eq!(item_gate(false, true, true), ItemGate::Scope);
+        assert_eq!(item_gate(false, true, true, false), ItemGate::Scope);
     }
 
     /// Never measure less than today without a map the work being measured cannot have rewritten,
     /// and a running executor to measure it with.
     #[test]
     fn an_intermediate_item_falls_back_to_the_full_gate_without_map_or_executor() {
-        assert_eq!(item_gate(false, false, true), ItemGate::Full);
-        assert_eq!(item_gate(false, true, false), ItemGate::Full);
-        assert_eq!(item_gate(false, false, false), ItemGate::Full);
+        assert_eq!(item_gate(false, false, true, false), ItemGate::Full);
+        assert_eq!(item_gate(false, true, false, false), ItemGate::Full);
+        assert_eq!(item_gate(false, false, false, false), ItemGate::Full);
     }
 
     #[test]
@@ -15232,6 +15272,11 @@ tests:
     /// `rostered` is whether the repository is a known project's root; without it `submit` refuses
     /// the scope request (`project_for_worktree` finds no project) before anything is queued.
     async fn scope_job(rostered: bool) -> ScopeJob {
+        scope_job_with(rostered, "gate_command: git --version\n").await
+    }
+
+    /// `scope_job` with the machine's `autopilot.yaml` text chosen by the test.
+    async fn scope_job_with(rostered: bool, rules: &str) -> ScopeJob {
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path();
         std::fs::create_dir_all(root.join("core")).unwrap();
@@ -15277,7 +15322,7 @@ tests:
             machine.path(),
             "project-a",
             crate::project_state::AUTOPILOT_FILE,
-            "gate_command: git --version\n",
+            rules,
         );
         let pool = test_pool().await;
         let state = AppState {
@@ -15384,5 +15429,66 @@ tests:
         assert_eq!(scope_requests(&f.pool).await, Vec::<String>::new());
         assert_eq!(full_gate_rows(&f.pool).await, 1);
         assert_eq!(item_statuses(&f.pool, f.job.id).await[0], "passed");
+    }
+
+    const SCOPED_FINAL_RULES: &str =
+        "gate_command: git --version\ngate_after_land: true\nscoped_final_gate: true\n";
+
+    async fn scoped_feed(pool: &sqlx::SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT summary FROM feed WHERE kind = 'job_gate_scoped' ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// With `scoped_final_gate` and `gate_after_land` both on, the last item is measured by
+    /// `scope` in the job's name, the full gate does not run, and the feed says which gate ran.
+    #[tokio::test]
+    async fn gate_item_sends_the_last_item_through_scope_with_scoped_final_and_gate_after_land() {
+        let f = scope_job_with(true, SCOPED_FINAL_RULES).await;
+
+        gate_item_with(&f.state, &f.job, 1, 2, Some(f.executor.clone())).await;
+
+        assert_eq!(
+            scope_requests(&f.pool).await,
+            vec![format!("job:{}", f.job.id)]
+        );
+        assert_eq!(full_gate_rows(&f.pool).await, 0);
+        let said = scoped_feed(&f.pool).await;
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("verify scope"), "{}", said[0]);
+    }
+
+    /// The switch alone is not enough: without `gate_after_land` there is no net behind a partial
+    /// measurement, so the last item keeps the full gate and says nothing new.
+    #[tokio::test]
+    async fn gate_item_keeps_the_full_gate_on_the_last_item_without_gate_after_land() {
+        let f = scope_job_with(
+            true,
+            "gate_command: git --version\nscoped_final_gate: true\n",
+        )
+        .await;
+
+        gate_item_with(&f.state, &f.job, 1, 2, Some(f.executor.clone())).await;
+
+        assert_eq!(scope_requests(&f.pool).await, Vec::<String>::new());
+        assert_eq!(full_gate_rows(&f.pool).await, 1);
+        assert!(scoped_feed(&f.pool).await.is_empty());
+    }
+
+    /// A scope request that cannot be submitted measured nothing: the last item takes the full
+    /// gate, and the feed says that the full gate is what measured it.
+    #[tokio::test]
+    async fn gate_item_falls_back_to_the_full_gate_on_the_last_item_when_scope_cannot_be_submitted()
+    {
+        let f = scope_job_with(false, SCOPED_FINAL_RULES).await;
+
+        gate_item_with(&f.state, &f.job, 1, 2, Some(f.executor.clone())).await;
+
+        assert_eq!(scope_requests(&f.pool).await, Vec::<String>::new());
+        assert_eq!(full_gate_rows(&f.pool).await, 1);
+        let said = scoped_feed(&f.pool).await;
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("full gate"), "{}", said[0]);
     }
 }
