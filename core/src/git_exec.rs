@@ -2787,7 +2787,7 @@ async fn gate_the_merge(
                     tracing::warn!(
                         vcs_request_id = request_id,
                         %reason,
-                        "the merge's scope verification reached no verdict; measuring with the                          full gate instead"
+                        "the merge's scope verification reached no verdict; measuring with the full gate instead"
                     );
                 }
                 crate::verify::ScopeVerdict::Unavailable => {}
