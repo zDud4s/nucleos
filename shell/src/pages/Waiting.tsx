@@ -1,7 +1,15 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type FocusEvent,
+  type ReactNode,
+} from "react";
 import { Link, useSearch } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
-import type { AgentRequest } from "../data/agents";
+import type { AgentEngine, AgentRequest, AgentToolPolicy } from "../data/agents";
 import type { Proposal } from "../data/system";
 import {
   parseActionPayload,
@@ -15,26 +23,21 @@ import {
   countWaitingDecisions,
   useActionApprovals,
   useApproveProposal,
-  useAwaitingRuns,
   useContactMerges,
   useDecideContactMerge,
-  useDismissProposal,
   useApproveVcsRequest,
   useDismissVcsRequest,
   useRefuseVcsRequest,
   useExclusionRequests,
   useOpenTeamActions,
   useRecruitProposals,
-  useRefusedActions,
   useDeclineAction,
   useRejectProposal,
-  useSkippedItems,
   useTeamActionProposals,
   useVcsRequests,
   useVcsWaiting,
   useWheelRequests,
   type ApprovalOutcome,
-  type AwaitingRun,
   type MergeSide,
   type MergeSuggestion,
   type VcsRequestSummary,
@@ -156,11 +159,8 @@ export function Waiting() {
   const openActions = useOpenTeamActions();
   const merges = onlyProject(reading(useContactMerges()), project);
   const exclusions = onlyProject(reading(useExclusionRequests()), project);
-  const skipped = onlyProject(reading(useSkippedItems()), project);
-  const refused = onlyProject(reading(useRefusedActions()), project);
   const vcs = onlyProject(reading(useVcsRequests()), project);
   const vcsWaiting = onlyProject(reading(useVcsWaiting()), project);
-  const parked = onlyProject(reading(useAwaitingRuns()), project);
 
   const decisions = countWaitingDecisions({
     wheel: wheel.rows,
@@ -171,34 +171,44 @@ export function Waiting() {
     exclusions: exclusions.rows,
     git: vcsWaiting.rows,
   });
-  const records = countOf(skipped.rows, refused.rows);
 
   /**
    * The design's §6.4 order, with the sections that have something in them first.
    *
-   * The order below is that order and is kept exactly — *within* each of the two
-   * groups. What moves is emptiness. A queue whose first four headings are
-   * one-line absences makes somebody scroll past them to reach the one decision
-   * that is actually waiting, which is the opposite of what this page is for; and
-   * on a quiet morning nothing moves at all, because the whole list is one group.
-   * `sort` is stable, so nothing is reordered relative to its own neighbours.
+   * The order below is that order and is kept exactly. What moves is emptiness: a
+   * queue whose first four headings are absences makes somebody scroll past them to
+   * reach the one decision that is actually waiting, which is the opposite of what
+   * this page is for. `sort` is stable, so nothing is reordered relative to its own
+   * neighbours.
    *
-   * The split is `decisions` and `records` above: a decision is work stopped
-   * mid-stride, a record is something the night already settled. Neither is
-   * promoted over the other — the design's order already puts the six decisions
-   * before the two records, and being stable is what preserves that.
+   * **Every section here asks for a decision.** Skipped items and refused actions are
+   * records of what the night and the barrier already settled, and they live on the
+   * Autopilot page now; a parked run is the run side of an approval that is already
+   * on this page; and the calendar absence only ever said that a route does not
+   * exist. A queue that mixes things to decide with things to read is a queue whose
+   * count nobody trusts.
+   *
+   * `rows` is what decides whether a section is *empty* — answered, and nothing in it
+   * — as opposed to not answered yet, which is neither filled nor quiet.
    */
-  const sections: { filled: boolean; node: ReactNode }[] = [
+  const sections: {
+    queue: QueueText;
+    rows: unknown[] | undefined;
+    node: ReactNode;
+  }[] = [
     {
-      filled: has(wheel.rows),
+      queue: QUEUES.wheel,
+      rows: wheel.rows,
       node: <WheelRequestSection key="wheel" view={wheel} />,
     },
     {
-      filled: has(approvals.rows),
+      queue: QUEUES.approvals,
+      rows: approvals.rows,
       node: <ActionApprovalSection key="approvals" view={approvals} />,
     },
     {
-      filled: has(teamActions.rows),
+      queue: QUEUES.teamActions,
+      rows: teamActions.rows,
       node: (
         <TeamActionSection
           key="team-actions"
@@ -208,41 +218,33 @@ export function Waiting() {
       ),
     },
     {
-      filled: has(recruits.rows),
+      queue: QUEUES.recruits,
+      rows: recruits.rows,
       node: <RecruitmentSection key="recruits" view={recruits} />,
     },
     {
-      filled: has(merges.rows),
+      queue: QUEUES.merges,
+      rows: merges.rows,
       node: <ContactMergeSection key="merges" view={merges} />,
     },
-    // Never filled: it is a statement about a route the núcleo does not mount,
-    // and it says the same thing on every morning there has ever been.
-    { filled: false, node: <CalendarEventAbsence key="calendar" /> },
     {
-      filled: has(exclusions.rows),
+      queue: QUEUES.exclusions,
+      rows: exclusions.rows,
       node: <ExclusionRequestSection key="exclusions" view={exclusions} />,
     },
     {
-      filled: has(skipped.rows),
-      node: <SkippedItemsPanel key="skipped" view={skipped} />,
-    },
-    {
-      filled: has(refused.rows),
-      node: <RefusedActionsPanel key="refused" view={refused} />,
-    },
-    {
-      filled: has(vcs.rows) || has(vcsWaiting.rows),
-      node: <GitQueuePanel key="vcs" view={vcs} waiting={vcsWaiting} />,
-    },
-    {
-      filled: has(parked.rows),
-      node: <ParkedRunsPanel key="parked" view={parked} />,
+      queue: QUEUES.git,
+      rows: vcsWaiting.rows,
+      node: <GitQueuePanel key="vcs" history={vcs} waiting={vcsWaiting} />,
     },
   ];
+  const quiet = sections
+    .filter((section) => section.rows !== undefined && section.rows.length === 0)
+    .map((section) => section.queue);
 
   return (
     <>
-      <PageHeader title="Waiting" headline={headlineFor(decisions, records)} />
+      <PageHeader title="Waiting" headline={headlineFor(decisions)} />
 
       {project !== undefined ? (
         <p className="waiting-narrowed" role="status">
@@ -252,10 +254,49 @@ export function Waiting() {
 
       <div className="waiting-sections">
         {[...sections]
-          .sort((a, b) => Number(b.filled) - Number(a.filled))
+          .sort((a, b) => Number(has(b.rows)) - Number(has(a.rows)))
           .map((section) => section.node)}
+        <NothingWaiting queues={quiet} />
       </div>
     </>
+  );
+}
+
+/**
+ * The sections with nothing in them, as one line.
+ *
+ * An empty queue is the *normal* state of this page, and a heading plus a sentence for each of
+ * six absences made the page longest on the morning nothing was wrong. What an absence
+ * needs is to be a fact and not a gap — "nothing has asked for browser access" alone reads as a
+ * list that failed to load — so the names are one sentence. The reasoning behind each rides on
+ * its name: shown on hover, and read out as the name's description. It was a disclosure under
+ * the line, dropped at the owner's call (2026-10-09).
+ */
+function NothingWaiting({ queues }: { queues: QueueText[] }) {
+  const base = useId();
+  if (queues.length === 0) return null;
+  return (
+    <p className="waiting-quiet-line">
+      Nothing waiting in:{" "}
+      {queues.map((queue, index) => (
+        <span key={queue.title}>
+          {index > 0 && ", "}
+          {/* A drawn tip, not `title`: the native one waits a second and a half, does not
+              open on focus at all, and in this webview often never shows — a dotted word that
+              did nothing. The tip is the name's description, so it is also read out. */}
+          <span
+            className="waiting-quiet-name"
+            tabIndex={0}
+            aria-describedby={`${base}-${index}`}
+          >
+            {queue.title}
+            <span className="waiting-quiet-tip" role="tooltip" id={`${base}-${index}`}>
+              {queue.why}
+            </span>
+          </span>
+        </span>
+      ))}
+    </p>
   );
 }
 
@@ -264,31 +305,18 @@ function has(rows: unknown[] | undefined): boolean {
   return (rows?.length ?? 0) > 0;
 }
 
-/** How many rows across several lists, or `undefined` while none of them has answered. */
-function countOf(...lists: (unknown[] | undefined)[]): number | undefined {
-  if (lists.every((list) => list === undefined)) return undefined;
-  return lists.reduce<number>((total, list) => total + (list?.length ?? 0), 0);
-}
-
 /**
  * One derived sentence about the queue.
  *
- * The two counts are kept apart because they ask different things of a person:
- * a decision is work stopped mid-stride, a record is something the night already
- * settled and left a note about. Merging them would make a quiet morning with
- * nine skipped items look like nine things blocking.
+ * Only decisions are counted, and only decisions are said. Records the night settled used to
+ * ride along as "N to read and put away", which made a quiet morning with nine skipped items
+ * read as a page with something on it; they are on the Autopilot page now.
  */
-function headlineFor(
-  decisions: number | undefined,
-  records: number | undefined,
-): string | undefined {
+function headlineFor(decisions: number | undefined): string | undefined {
   if (decisions === undefined) return undefined;
-  const first =
-    decisions === 0
-      ? "nothing is waiting on a decision"
-      : `${decisions} waiting on a decision`;
-  if (records === undefined || records === 0) return first;
-  return `${first}; ${records} to read and put away`;
+  return decisions === 0
+    ? "nothing is waiting on a decision"
+    : `${decisions} waiting on a decision`;
 }
 
 /* ------------------------------------------------------- the ordering freeze -- */
@@ -305,7 +333,7 @@ function headlineFor(
  * Nothing here is a render-phase side effect: the snapshot is state, written
  * from an event handler, so the component stays a pure function of its props.
  */
-function useOrderFreeze<T>(rows: T[], idOf: (row: T) => number) {
+export function useOrderFreeze<T>(rows: T[], idOf: (row: T) => number) {
   const [snapshot, setSnapshot] = useState<number[] | null>(null);
   const armedCount = useRef(0);
 
@@ -348,36 +376,201 @@ function dense(count: number): boolean {
   return count > 3;
 }
 
+/**
+ * Why the agent says it wants this, with a way out of the clamp.
+ *
+ * A dense list clamps the reasoning to three lines (`waiting.css`), and a clamp with no
+ * way past it hides the one thing the person is deciding on: model text that was cut at
+ * the sentence that said what the action would actually touch. So the clamp is
+ * honest — a "Show all" appears when, and only when, the text is really longer than what is
+ * showing, measured on the element rather than guessed from a character count (the width
+ * decides how many lines a sentence takes, and the width is not known until layout).
+ *
+ * `overflows` is **kept while expanded**: once the clamp is lifted the text no longer
+ * overflows, and a button that vanished on the click that opened it could not close it
+ * again. The measure is taken in a layout effect so the first paint already has the button
+ * where it belongs, and it re-runs when the text changes under a poll.
+ */
+function Reasoning({ children }: { children: string }) {
+  const ref = useRef<HTMLParagraphElement>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [overflows, setOverflows] = useState(false);
+  const id = useId();
+
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (element === null || expanded) return;
+    setOverflows(element.scrollHeight > element.clientHeight + 1);
+  }, [children, expanded]);
+
+  return (
+    <div className="waiting-reasoning-block">
+      <p
+        ref={ref}
+        id={id}
+        className="waiting-reasoning"
+        data-expanded={expanded ? "true" : undefined}
+      >
+        {children}
+      </p>
+      {overflows && (
+        <button
+          type="button"
+          className="waiting-more"
+          aria-expanded={expanded}
+          aria-controls={id}
+          onClick={() => setExpanded((current) => !current)}
+        >
+          {expanded ? "Show less" : "Show all"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 
 /* ------------------------------------------------------------- shared parts -- */
 
 /**
- * One section of the queue, in the shape its data allows. There are three.
+ * What a decision section is called, and what it is for.
+ *
+ * Kept in one table and not inside each section, because the page needs the title and the
+ * reasoning of the sections that are **empty** — and an empty section renders nothing, so
+ * the text cannot live in the component that did not render. The sentences are the ones the
+ * one-line absences used to carry behind "why?", moved rather than cut: "nothing has
+ * asked for browser access" alone reads as a list that failed to load, and the sentence
+ * behind it is what makes the silence a fact instead of a gap.
+ */
+interface QueueText {
+  title: string;
+  /** The absence, in the fewest words that are still true. */
+  says: string;
+  /** What this section is for. */
+  why: ReactNode;
+}
+
+const QUEUES = {
+  wheel: {
+    title: "Browser access requests",
+    says: "nothing has asked for browser access",
+    why: (
+      <>
+        An agent has met a wall it may not climb and is asking for the window.
+        A session the shell can drive may be approved to be driven here, in the
+        shell, or opened as a real browser window on this machine; one it
+        cannot is only offered the window. Either way it runs in the profile
+        named on the card. Declining closes the session, and the run carries
+        on without that page.
+      </>
+    ),
+  },
+  approvals: {
+    title: "Action approvals",
+    says: "nothing is waiting to be let through",
+    why: (
+      <>
+        A run that reaches for something outside its permission stops where it
+        is and files one of these. An empty queue means either that nothing
+        has asked, or that the autopilot is off — it is not a sign that
+        anything is stuck.
+      </>
+    ),
+  },
+  teamActions: {
+    title: "Team actions",
+    says: "no team is waiting on an action",
+    why: (
+      <>
+        An action a team asked the daemon to carry out under a propose grant.
+        Approving does not do the thing — it lets the daemon do it on its next
+        tick, about ten seconds later.
+      </>
+    ),
+  },
+  recruits: {
+    title: "Recruitment",
+    says: "no team has asked for a specialist",
+    why: (
+      <>
+        A director asked for a specialist by name. The request is editable
+        here before it is granted; declining leaves nothing behind — the
+        team may ask again.
+      </>
+    ),
+  },
+  merges: {
+    title: "Contact merges",
+    says: "no two contacts look like the same person",
+    why: (
+      <>
+        Two records that look like one person. Merging is a pointer move and
+        is undoable one address at a time; saying they are different people is
+        recorded too, which is what stops the same suggestion coming back on
+        every sweep.
+      </>
+    ),
+  },
+  exclusions: {
+    title: "Keep jobs apart?",
+    says: "no job has asked to be kept apart from another",
+    why: (
+      <>
+        A request that two jobs of one project never run at the same time.
+        Drawing the edge changed nothing; approving it writes the rule, and
+        the higher-numbered job is the one that waits.
+      </>
+    ),
+  },
+  git: {
+    title: "Git queue",
+    says: "nothing in the git queue needs your approval",
+    why: (
+      <>
+        Every push, merge and rebase the daemon has been asked to make. One
+        state wants your approval: a merge that changes the test map, held
+        until you decide. Escalated requests (somebody owns a conflict now) and
+        blocked ones (the queue will not retry) want a person to read them, and
+        none is a failure; they, and the recent history, are behind the
+        disclosure at the bottom of the panel. A request stops waiting once it
+        is settled: a later identical request succeeded, a resolution took it,
+        its branch is already in the target or gone, or you put it away.
+      </>
+    ),
+  },
+} satisfies Record<string, QueueText>;
+
+/**
+ * One section of the queue, in the shape its data allows. There are three, and one of them
+ * is nothing.
  *
  * **With rows in it**, a `Panel` with the count in its corner — a bordered block,
  * because there is something in it to work through.
  *
- * **Empty**, one line under its own heading, with the paragraph that used to sit
- * above the list kept behind "why?". This is the shape that matters: an empty
- * queue is the *normal* state of this page, and eleven panels each explaining an
- * absence made the page longest on the morning nothing was wrong. The reasoning
- * is kept rather than cut — "nothing has asked for the wheel" alone reads as a
- * list that failed to load, and the sentence behind it is what makes the silence
- * a fact instead of a gap.
+ * **Empty**, nothing at all: the page lists the empty sections' titles in one line
+ * (`NothingWaiting`) and keeps their reasoning behind a disclosure there. The exception is a
+ * section that was full a moment ago in this same visit — the last card was just decided.
+ * That one keeps its heading and one line, because it carries the receipt of the decision
+ * ("run 44 is going again"), which outlives the row it was made on, and because it is where
+ * focus goes when the last card leaves.
  *
- * **Not answered yet, or not at all**, the same one line, saying which. A failure
+ * **Not answered yet, or not at all**, one line under its own heading, saying which. A failure
  * gets the daemon's own refusal rather than a sentence of ours.
  *
+ * **Focus.** A decision removes the card it was made on, and with it the button that had
+ * focus, so focus falls to `<body>` and a keyboard user starts again from the top of the
+ * page. Here it is moved to the heading of the card that took the removed one's place, or to
+ * the section's own title when none is left. Only when focus really was inside this section
+ * and really did fall: a poll that drops a row while somebody is typing elsewhere must not
+ * take their cursor.
+ *
  * `Section` and `Panel` both render an `h2` carrying the title, so the page's
- * outline — and the eleven headings a composition test counts — is the same
- * whichever shape a section is in.
+ * outline is the same whichever shape a section is in.
  */
 function Queue({
   title,
   view,
   what,
   says,
-  why,
   count,
   aside,
   notes,
@@ -387,10 +580,8 @@ function Queue({
   view: Reading<unknown>;
   /** What is being read, for the sentence a wait or a failure puts on screen. */
   what: string;
-  /** The absence, in the fewest words that are still true. */
+  /** The absence, for the moment a section has just been emptied. */
   says: string;
-  /** What this section is for — the paragraph the one line replaced. */
-  why?: ReactNode;
   /** How many rows there are. Zero is the empty shape. */
   count: number;
   /** The heading's corner, when the count in it is not `count`. */
@@ -399,8 +590,58 @@ function Queue({
   notes?: ReactNode;
   children: ReactNode;
 }) {
+  const root = useRef<HTMLDivElement>(null);
+  const [hadRows, setHadRows] = useState(false);
+  if (count > 0 && !hadRows) setHadRows(true);
+
+  const focusHeld = useRef(false);
+  const focusedAt = useRef<number | null>(null);
+  const previous = useRef(count);
+
+  function headings(): HTMLElement[] {
+    return Array.from(
+      root.current?.querySelectorAll<HTMLElement>("[data-waiting-heading]") ?? [],
+    );
+  }
+
+  function noteFocus(event: FocusEvent<HTMLDivElement>) {
+    focusHeld.current = true;
+    const card = (event.target as HTMLElement).closest("li");
+    const heading = card?.querySelector<HTMLElement>("[data-waiting-heading]");
+    const at = heading === null || heading === undefined ? -1 : headings().indexOf(heading);
+    focusedAt.current = at === -1 ? null : at;
+  }
+
+  function noteBlur(event: FocusEvent<HTMLDivElement>) {
+    // Focus going to another element is the person moving on. Focus going to nothing is also
+    // what a removed or disabled button looks like, and that is exactly the case to catch.
+    if (event.relatedTarget !== null && !root.current?.contains(event.relatedTarget as Node))
+      focusHeld.current = false;
+  }
+
+  // `[count]` alone, on purpose: the effect is about the list *shrinking*, `headings` is
+  // redefined on every render, and listing it would re-run this on renders that removed nothing.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useLayoutEffect(() => {
+    const before = previous.current;
+    previous.current = count;
+    if (count >= before || !focusHeld.current || root.current === null) return;
+    const active = document.activeElement;
+    if (active !== null && active !== document.body && root.current.contains(active)) return;
+    focusHeld.current = false;
+    const cards = headings();
+    const target =
+      cards.length > 0
+        ? cards[Math.min(focusedAt.current ?? 0, cards.length - 1)]
+        : root.current.querySelector<HTMLElement>("h2");
+    if (target === null || target === undefined) return;
+    if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
+    target.focus();
+  }, [count]);
+
+  let body: ReactNode = null;
   if (view.rows === undefined) {
-    return (
+    body = (
       <Section label={title}>
         {view.error === null ? (
           <Quiet says={`reading ${what}…`} />
@@ -409,24 +650,33 @@ function Queue({
         )}
       </Section>
     );
-  }
-
-  if (count === 0) {
-    return (
+  } else if (count === 0) {
+    body = hadRows ? (
       <Section label={title}>
-        <Quiet says={says}>{why}</Quiet>
+        <Quiet says={says} />
         {view.stale && <StaleNote dataUpdatedAt={view.dataUpdatedAt} />}
         {notes}
       </Section>
+    ) : null;
+  } else {
+    body = (
+      <Panel title={title} aside={aside ?? <Count n={count} />}>
+        {view.stale && <StaleNote dataUpdatedAt={view.dataUpdatedAt} />}
+        {children}
+        {notes}
+      </Panel>
     );
   }
 
   return (
-    <Panel title={title} aside={aside ?? <Count n={count} />}>
-      {view.stale && <StaleNote dataUpdatedAt={view.dataUpdatedAt} />}
-      {children}
-      {notes}
-    </Panel>
+    <div
+      className="waiting-queue"
+      ref={root}
+      onFocusCapture={noteFocus}
+      onBlurCapture={noteBlur}
+    >
+      {body}
+    </div>
   );
 }
 
@@ -435,7 +685,7 @@ function ListError({ error, what }: { error: unknown; what: string }) {
     return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
     <ErrorNote>
-      the núcleo did not answer — nothing is known about {what}
+      the daemon did not answer — nothing is known about {what}
     </ErrorNote>
   );
 }
@@ -454,9 +704,9 @@ const DECISION_SENTENCES: Record<string, string> = {
     "this one was already answered — the list clears it on the next read, and nothing further is needed",
   not_found: "that proposal is gone; there is nothing left to decide",
   unprocessable:
-    "the núcleo accepted the request and found nothing usable inside the proposal to act on",
+    "the daemon accepted the request and found nothing usable inside the proposal to act on",
   internal:
-    "the núcleo failed while carrying the decision out — nothing was changed",
+    "the daemon failed while carrying the decision out — nothing was changed",
 };
 
 /**
@@ -475,7 +725,7 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
   return { [refusal.code]: detail };
 }
 
-function DecisionRefusal({
+export function DecisionRefusal({
   error,
   trustProse,
 }: {
@@ -484,7 +734,7 @@ function DecisionRefusal({
 }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>the núcleo did not answer — nothing was decided</ErrorNote>
+      <ErrorNote>the daemon did not answer — nothing was decided</ErrorNote>
     );
   }
   const sentences = trustProse
@@ -515,7 +765,7 @@ function outcomeSentence(outcome: ApprovalOutcome): string {
   if (outcome.merged === true) return "the two are one contact now";
   if (typeof outcome.event_id === "number")
     return `event ${outcome.event_id} is in the calendar`;
-  return "the núcleo recorded the decision";
+  return "the daemon recorded the decision";
 }
 
 function DecisionNotes({
@@ -548,7 +798,7 @@ function DecisionNotes({
 
 /* ---------------------------------------------------------------- tool input -- */
 
-interface InputField {
+export interface InputField {
   name: string;
   value: string;
 }
@@ -562,7 +812,7 @@ interface InputField {
  * whether an action may happen, and every character that is punctuation rather
  * than content is a character between them and that decision.
  */
-function readToolInput(raw: string): InputField[] | null {
+export function readToolInput(raw: string): InputField[] | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -592,7 +842,7 @@ function plainValue(value: unknown): string {
   return String(value);
 }
 
-function ToolInput({ raw }: { raw: string | null }) {
+export function ToolInput({ raw }: { raw: string | null }) {
   if (raw === null || raw.trim() === "") return null;
   const fields = readToolInput(raw);
   // An object with no fields in it is an action that carried no arguments, and
@@ -611,68 +861,6 @@ function ToolInput({ raw }: { raw: string | null }) {
   );
 }
 
-/** One thing a turn read before it reached for an action. */
-interface ReadEntry {
-  tool?: unknown;
-  arguments?: unknown;
-}
-
-/**
- * Where the idea came from, under the record of what it was.
- *
- * `ToolInput` above answers what was going to happen; this answers who put it in
- * the turn's head, and only the second one decides. "Email accounts and ask them
- * to change the bank details" reads identically whether the owner asked for it
- * or a page did, so a card carrying only the first question gets answered by
- * guessing.
- *
- * **Absent renders as nothing, never as "read nothing".** `null` covers two
- * cases the row cannot tell apart — a refusal that fired on whose work it is
- * rather than on what was read, and a recording that failed — and a card that
- * printed "this turn read nothing" would be wrong in the second one, in the
- * direction that makes a contaminated action look clean.
- */
-function ReadFrom({ raw }: { raw: string | null }) {
-  if (raw === null || raw.trim() === "") return null;
-  let entries: ReadEntry[];
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed) || parsed.length === 0) return null;
-    entries = parsed as ReadEntry[];
-  } catch {
-    return null;
-  }
-  return (
-    <div className="waiting-provenance">
-      <p className="waiting-provenance-head">this turn had read</p>
-      <ul className="waiting-provenance-list">
-        {entries.map((entry, index) => {
-          const tool =
-            typeof entry.tool === "string" ? entry.tool : "something unnamed";
-          // The arguments are stored as the daemon received them, so the url that
-          // decides the question is in there and nowhere else. Flattened through
-          // the same reader the action's own input uses, for the same reason:
-          // braces are characters between a person and a decision.
-          const detail =
-            typeof entry.arguments === "string"
-              ? (readToolInput(entry.arguments) ?? [])
-                  .map((field) => field.value)
-                  .join(", ")
-              : "";
-          return (
-            <li className="waiting-provenance-line" key={`${tool}-${index}`}>
-              <span className="waiting-provenance-tool">{tool}</span>
-              {detail !== "" && (
-                <span className="waiting-provenance-detail">{detail}</span>
-              )}
-            </li>
-          );
-        })}
-      </ul>
-    </div>
-  );
-}
-
 /* ------------------------------------------------------- 1. wheel requests -- */
 
 function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
@@ -686,39 +874,33 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
 
   return (
     <Queue
-      title="Wheel requests"
+      title={QUEUES.wheel.title}
       view={view}
       what="the open browser sessions"
       count={items.length}
-      says="nothing has asked for the wheel"
-      why={
+      says={QUEUES.wheel.says}
+      // The receipt rides in the notes and not in the children: approving the last card
+      // empties the list, and the link to the session is the one thing the person needs next.
+      notes={
         <>
-          An agent has met a wall it may not climb and is asking for the window.
-          A session the shell can drive may be approved to be driven here, in the
-          shell, or opened as a real browser window on this machine; one it
-          cannot is only offered the window. Either way it runs in the profile
-          named on the card. Refusing closes the session, and the run carries
-          on without that page.
+          {approve.isSuccess && approve.variables?.seat === "shell" && (
+            <p className="waiting-outcome" role="status">
+              the shell has the wheel — <Link to="/web">drive it on Web</Link>
+            </p>
+          )}
+          <DecisionNotes
+            outcome={undefined}
+            approveError={approve.isError ? approve.error : null}
+            refuseError={reject.isError ? reject.error : null}
+          />
         </>
       }
-      notes={
-        <DecisionNotes
-          outcome={undefined}
-          approveError={approve.isError ? approve.error : null}
-          refuseError={reject.isError ? reject.error : null}
-        />
-      }
     >
-      {approve.isSuccess && approve.variables?.seat === "shell" && (
-        <p className="waiting-outcome" role="status">
-          the shell has the wheel — <Link to="/web">drive it on Web</Link>
-        </p>
-      )}
-      <Rows label="Wheel requests" className={dense(items.length) ? "waiting-dense" : undefined}>
+      <Rows label={QUEUES.wheel.title} className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((session) => (
           <Row className="waiting-card" dense={dense(items.length)} key={session.id}>
             <div className="waiting-card-head">
-              <span className="waiting-card-id">
+              <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>
                 wheel #{session.proposal_id}
               </span>
               <span className="waiting-meta">
@@ -750,13 +932,13 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
               </div>
             </dl>
             {session.refusal !== null && (
-              <p className="waiting-reasoning">{session.refusal}</p>
+              <Reasoning>{session.refusal}</Reasoning>
             )}
             <div className="waiting-actions">
               {session.shell_eligible && (
                 <ConfirmButton
                   label={`Approve wheel #${session.proposal_id}`}
-                  confirmLabel="Drive it here in the shell"
+                  confirmLabel="Approve and drive it here in the shell"
                   variant="approve"
                   disabled={approve.isPending}
                   onArmedChange={onArmedChange}
@@ -789,8 +971,8 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
                 />
               )}
               <ConfirmButton
-                label={`Refuse wheel #${session.proposal_id}`}
-                confirmLabel="Refuse and close the session"
+                label={`Decline wheel #${session.proposal_id}`}
+                confirmLabel="Decline and close the session"
                 subject={`#${session.proposal_id}`}
                 variant="ghost"
                 disabled={reject.isPending}
@@ -808,24 +990,6 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
 /* ----------------------------------------------------- 2. action approvals -- */
 
 /* --------------------------------------------- the batch on the approvals -- */
-
-/**
- * Which rows a batch decision names.
- *
- * Every identifier up to five, and above five the first three and a count. Five is the page
- * this was written for — `DESIGN.md`'s five byte-identical `git status` cards — and naming
- * them is the whole point: an interlock that says "Let these happen" and nothing else names
- * the action and not the rows, which is the defect the single `subject` was added to fix.
- * Twenty is where listing stops helping. The armed label becomes a paragraph, the
- * announcement a thirty-word sentence that `armWindowFor` then holds the control open for,
- * and neither is how somebody checks a selection — the bar's own line says all twenty, every
- * time the selection changes, which is before anybody arms anything.
- */
-function subjectFor(ids: number[]): string {
-  const named = ids.map((id) => `#${id}`);
-  if (named.length <= 5) return named.join(", ");
-  return `${named.slice(0, 3).join(", ")} and ${named.length - 3} more`;
-}
 
 function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
   const approve = useApproveProposal();
@@ -899,19 +1063,11 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
 
   return (
     <Queue
-      title="Action approvals"
+      title={QUEUES.approvals.title}
       view={view}
       what="the approval queue"
       count={items.length}
-      says="nothing is waiting to be let through"
-      why={
-        <>
-          A run that reaches for something outside its permission stops where it
-          is and files one of these. An empty queue means either that nothing
-          has asked, or that the autopilot is off — it is not a sign that
-          anything is stuck.
-        </>
-      }
+      says={QUEUES.approvals.says}
       notes={
         <DecisionNotes
           // A decline continues the run too, so its outcome is the note the owner reads;
@@ -927,122 +1083,125 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
       }
     >
       <>
-        {items.length > 0 && (
+        {/* The bar is drawn whole whenever there is more than one row to pick from, and
+            nothing in it changes size as boxes are ticked: the buttons carry no count and no
+            subject (both would resize them, and the Decline a slip lands on with them), the
+            selection line is one truncating line, and an empty selection disables rather than
+            removes. Approve opens the bar and Decline closes it, so the two never sit side by
+            side. */}
+        {items.length > 1 && (
           <div className="waiting-bulk">
-            <Button
-              variant="quiet"
-              disabled={busy || chosen.length === items.length}
-              onClick={() =>
-                setSelected(new Set(items.map((proposal) => proposal.id)))
-              }
-            >
-              Select all {items.length}
-            </Button>
-            {chosen.length > 0 && (
-              <>
-                <p className="waiting-bulk-said" role="status">
-                  {chosen.length} selected —{" "}
-                  {chosen.map((proposal) => `#${proposal.id}`).join(", ")}
-                </p>
-                <ConfirmButton
-                  label={`Approve ${chosen.length}`}
-                  confirmLabel="Let these happen"
-                  subject={subjectFor(chosen.map((proposal) => proposal.id))}
-                  variant="approve"
-                  disabled={busy}
-                  onArmedChange={onArmedChange}
-                  onConfirm={() => void decide(batchApprove)}
-                />
-                <ConfirmButton
-                  label={`Reject ${chosen.length}`}
-                  confirmLabel="Refuse and end them"
-                  subject={subjectFor(chosen.map((proposal) => proposal.id))}
-                  variant="ghost"
-                  disabled={busy}
-                  onArmedChange={onArmedChange}
-                  onConfirm={() => void decide(batchReject)}
-                />
-                <Button
-                  variant="ghost"
-                  disabled={busy}
-                  onClick={() => setSelected(new Set())}
-                >
-                  Clear selection
-                </Button>
-              </>
-            )}
+            <div className="waiting-bulk-head">
+              {/* A count and nothing else. The identifiers are already on screen, as the
+                  ticked boxes on the cards below; listing them here grew the line with every
+                  tick and ran out of room past a handful. */}
+              <p className="waiting-bulk-said" role="status">
+                {chosen.length} of {items.length} selected
+              </p>
+              <Button
+                variant="quiet"
+                disabled={busy || chosen.length === items.length}
+                onClick={() =>
+                  setSelected(new Set(items.map((proposal) => proposal.id)))
+                }
+              >
+                Select all
+              </Button>
+              <Button
+                variant="quiet"
+                disabled={busy || chosen.length === 0}
+                onClick={() => setSelected(new Set())}
+              >
+                Clear
+              </Button>
+            </div>
+            <div className="waiting-actions-split">
+              <ConfirmButton
+                label="Approve"
+                confirmLabel="Approve the selected"
+                variant="approve"
+                disabled={busy || chosen.length === 0}
+                onArmedChange={onArmedChange}
+                onConfirm={() => void decide(batchApprove)}
+              />
+              <ConfirmButton
+                label="Decline"
+                confirmLabel="Decline and end their runs"
+                variant="ghost"
+                disabled={busy || chosen.length === 0}
+                onArmedChange={onArmedChange}
+                onConfirm={() => void decide(batchReject)}
+              />
+            </div>
           </div>
         )}
-        <Rows label="Action approvals" className={dense(items.length) ? "waiting-dense" : undefined}>
+        <Rows label={QUEUES.approvals.title} className={dense(items.length) ? "waiting-dense" : undefined}>
           {items.map((proposal) => (
             <Row className="waiting-card" dense={dense(items.length)} key={proposal.id}>
               <div className="waiting-card-head">
-                <input
-                  className="waiting-select"
-                  type="checkbox"
-                  aria-label={`Select approval #${proposal.id}`}
-                  checked={selected.has(proposal.id)}
-                  disabled={busy}
-                  onChange={(event) =>
-                    toggle(proposal.id, event.target.checked)
-                  }
-                />
-                <span className="waiting-card-id">approval #{proposal.id}</span>
+                {/* The box is the smallest target on the card and the one used most when a
+                    queue is worked through, so the label around it is what is clickable:
+                    28 by 28 CSS pixels, with the box centred in it (`waiting.css`). */}
+                <label className="waiting-select-hit">
+                  <input
+                    className="waiting-select"
+                    type="checkbox"
+                    aria-label={`Select approval #${proposal.id}`}
+                    checked={selected.has(proposal.id)}
+                    disabled={busy}
+                    onChange={(event) =>
+                      toggle(proposal.id, event.target.checked)
+                    }
+                  />
+                </label>
+                <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>approval #{proposal.id}</span>
                 <span className="waiting-card-title">
                   {proposal.tool_name ?? "an action that names no tool"}
                 </span>
+                {/* Where it came from is two short facts, so they sit in the head as plain
+                    text: a labelled grid ("RUN", "PROJECT") spent a row on words that say
+                    what their values already say. */}
+                {proposal.run_id === null ? (
+                  <span className="waiting-meta">no run</span>
+                ) : (
+                  <Link
+                    className="waiting-row-link"
+                    to={`/runs/${proposal.run_id}`}
+                  >
+                    run {proposal.run_id}
+                  </Link>
+                )}
+                <span className="waiting-meta">
+                  {proposal.project_id ?? "no project"}
+                </span>
                 <RelativeTime at={proposal.created_at} />
               </div>
-              <dl className="waiting-facts">
-                <div className="waiting-fact">
-                  <dt>run</dt>
-                  <dd>
-                    {proposal.run_id === null ? (
-                      "no run"
-                    ) : (
-                      <Link
-                        className="waiting-row-link"
-                        to={`/runs/${proposal.run_id}`}
-                      >
-                        run {proposal.run_id}
-                      </Link>
-                    )}
-                  </dd>
-                </div>
-                <div className="waiting-fact">
-                  <dt>project</dt>
-                  <dd>{proposal.project_id ?? "no project"}</dd>
-                </div>
-              </dl>
-              <p className="waiting-reasoning">
+              <Reasoning>
                 {proposal.reasoning.trim() === ""
                   ? "nothing was recorded about why this was asked for"
                   : proposal.reasoning}
-              </p>
+              </Reasoning>
               <ToolInput raw={proposal.tool_input} />
-              <div className="waiting-actions">
+              <div className="waiting-actions-split">
                 <ConfirmButton
-                  label={`Approve #${proposal.id}`}
-                  confirmLabel="Let this action happen"
-                  subject={`#${proposal.id}`}
+                  label="Approve"
+                  confirmLabel="Approve and let this action happen"
                   variant="approve"
                   disabled={deciding}
                   onArmedChange={onArmedChange}
                   onConfirm={() => approve.mutate(proposal.id)}
                 />
                 <ConfirmButton
-                  label={`Decline only the action #${proposal.id}`}
-                  confirmLabel="Refuse this action, keep the run going"
-                  subject={`#${proposal.id}`}
+                  label="Decline action"
+                  confirmLabel="Decline action and keep the run going"
                   variant="ghost"
                   disabled={deciding}
                   onArmedChange={onArmedChange}
                   onConfirm={() => decline.mutate(proposal.id)}
                 />
                 <ConfirmButton
-                  label={`Reject #${proposal.id}`}
-                  confirmLabel="Refuse and end the run"
-                  subject={`#${proposal.id}`}
+                  label="Decline and stop run"
+                  confirmLabel="Decline and end the run"
                   variant="ghost"
                   disabled={deciding}
                   onArmedChange={onArmedChange}
@@ -1085,20 +1244,13 @@ function TeamActionSection({
 
   return (
     <Queue
-      title="Team actions"
+      title={QUEUES.teamActions.title}
       view={view}
       what="the team's action requests"
       count={items.length}
-      says="no team is waiting on an action"
-      why={
-        <>
-          An action a team asked the núcleo to carry out under a propose grant.
-          Approving does not do the thing — it lets the núcleo do it on its next
-          tick, about ten seconds later.
-        </>
-      }
+      says={QUEUES.teamActions.says}
     >
-      <Rows label="Team actions" className={dense(items.length) ? "waiting-dense" : undefined}>
+      <Rows label={QUEUES.teamActions.title} className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((proposal) => (
           <TeamActionCard
             key={proposal.id}
@@ -1200,17 +1352,16 @@ function TeamActionCard({
   return (
     <Row className="waiting-card" dense={dense(count)}>
       <div className="waiting-card-head">
-        <span className="waiting-card-id">team action #{proposal.id}</span>
+        <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>team action #{proposal.id}</span>
         <span className="waiting-card-title">
           {proposal.tool_name ?? "an action that names no tool"}
+        </span>
+        <span className="waiting-meta">
+          {proposal.project_id ?? "no project"}
         </span>
         <RelativeTime at={proposal.created_at} />
       </div>
       <dl className="waiting-facts">
-        <div className="waiting-fact">
-          <dt>project</dt>
-          <dd>{proposal.project_id ?? "no project"}</dd>
-        </div>
         <div className="waiting-fact">
           <dt>execution</dt>
           <dd>
@@ -1227,26 +1378,24 @@ function TeamActionCard({
           </dd>
         </div>
       </dl>
-      <p className="waiting-reasoning">
+      <Reasoning>
         {proposal.reasoning.trim() === ""
           ? "nothing was recorded about why"
           : proposal.reasoning}
-      </p>
+      </Reasoning>
       <TeamActionPayload kind={proposal.tool_name} raw={proposal.tool_input} />
-      <div className="waiting-actions">
+      <div className="waiting-actions-split">
         <ConfirmButton
-          label={`Approve #${proposal.id}`}
-          confirmLabel="Let this action happen"
-          subject={`#${proposal.id}`}
+          label="Approve"
+          confirmLabel="Approve and let this action happen"
           variant="approve"
           disabled={approve.isPending}
           onArmedChange={onArmedChange}
           onConfirm={() => approve.mutate(proposal.id)}
         />
         <ConfirmButton
-          label={`Reject #${proposal.id}`}
-          confirmLabel="Refuse and close the action"
-          subject={`#${proposal.id}`}
+          label="Decline"
+          confirmLabel="Decline and close the action"
           variant="ghost"
           disabled={reject.isPending}
           onArmedChange={onArmedChange}
@@ -1280,20 +1429,13 @@ function RecruitmentSection({ view }: { view: Reading<Proposal> }) {
 
   return (
     <Queue
-      title="Recruitment"
+      title={QUEUES.recruits.title}
       view={view}
       what="the recruitment requests"
       count={items.length}
-      says="no team has asked for a specialist"
-      why={
-        <>
-          A director asked for a specialist by name. The request is editable
-          here before it is granted; saying not now leaves nothing behind — the
-          team may ask again.
-        </>
-      }
+      says={QUEUES.recruits.says}
     >
-      <Rows label="Recruitment" className={dense(items.length) ? "waiting-dense" : undefined}>
+      <Rows label={QUEUES.recruits.title} className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((proposal) => (
           <RecruitmentCard
             key={proposal.id}
@@ -1304,6 +1446,34 @@ function RecruitmentSection({ view }: { view: Reading<Proposal> }) {
         ))}
       </Rows>
     </Queue>
+  );
+}
+
+/** What the catalogue accepts for `engine` and `tool_policy` — the same lists `Agents.tsx` offers. */
+const RECRUIT_ENGINES: AgentEngine[] = ["claude", "codex", "local"];
+const RECRUIT_TOOL_POLICIES: AgentToolPolicy[] = ["mcp_only", "none"];
+
+/**
+ * A select's options, keeping whatever the director proposed even when it is not one of them.
+ *
+ * A director can propose a value the daemon refuses (`read_only` is the usual one). Dropping it
+ * would show the first option as if it had been proposed; keeping it, marked, shows what was
+ * asked for and lets the hire's refusal say why.
+ */
+function OptionsWith({ current, known }: { current: string; known: string[] }) {
+  return (
+    <>
+      {!known.includes(current) && (
+        <option value={current}>
+          {current === "" ? "none proposed" : `${current} (not accepted)`}
+        </option>
+      )}
+      {known.map((value) => (
+        <option key={value} value={value}>
+          {value}
+        </option>
+      ))}
+    </>
   );
 }
 
@@ -1351,18 +1521,24 @@ function RecruitmentCard({
   }
 
   const idFor = (name: string) => `recruit-${proposal.id}-${name}`;
+  // The caution about engine and tool policy used to be a paragraph between the fields, on
+  // every card, all the time. It is help for two fields, so it belongs to those two fields:
+  // read out when either takes focus, and on hover for anybody with a pointer.
+  const carefulId = idFor("careful");
+  const careful =
+    "Engine and tool policy are the two fields a director gets wrong most often — they are also what costs money per turn and what widens what this agent can reach.";
 
   return (
     <Row className="waiting-card" dense={dense(count)}>
       <div className="waiting-card-head">
-        <span className="waiting-card-id">recruit #{proposal.id}</span>
+        <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>recruit #{proposal.id}</span>
         <RelativeTime at={proposal.created_at} />
       </div>
-      <p className="waiting-reasoning">
+      <Reasoning>
         {proposal.reasoning.trim() === ""
           ? "nothing was recorded about why"
           : proposal.reasoning}
-      </p>
+      </Reasoning>
       {form === null ? (
         <p className="waiting-payload-raw">
           {proposal.tool_input ?? "nothing was proposed"}
@@ -1371,95 +1547,100 @@ function RecruitmentCard({
         // The one card in this queue that is a form. The inset is what says the
         // fields are a thing standing on the row rather than more of the row.
         <Inset>
-          <div className="waiting-recruit-field">
-            <label className="waiting-recruit-label" htmlFor={idFor("name")}>
-              name
-            </label>
-            <input
-              className="waiting-recruit-input"
-              id={idFor("name")}
-              value={form.name}
-              onChange={(event) => field("name", event.target.value)}
-            />
-          </div>
-          <div className="waiting-recruit-field">
-            <label
-              className="waiting-recruit-label"
-              htmlFor={idFor("speciality")}
-            >
-              speciality
-            </label>
-            <input
-              className="waiting-recruit-input"
-              id={idFor("speciality")}
-              value={form.speciality}
-              onChange={(event) => field("speciality", event.target.value)}
-            />
-          </div>
-          <div className="waiting-recruit-field">
-            <label className="waiting-recruit-label" htmlFor={idFor("prompt")}>
-              prompt
-            </label>
-            <textarea
-              className="waiting-recruit-textarea"
-              id={idFor("prompt")}
-              value={form.prompt}
-              onChange={(event) => field("prompt", event.target.value)}
-            />
-          </div>
-          <p className="waiting-recruit-hint">
-            Engine and tool policy are the two fields a director gets wrong most
-            often — they are also what costs money per turn and what widens what
-            this agent can reach.
-          </p>
-          <div className="waiting-recruit-field">
-            <label className="waiting-recruit-label" htmlFor={idFor("engine")}>
-              engine
-            </label>
-            <input
-              className="waiting-recruit-input"
-              id={idFor("engine")}
-              value={form.engine}
-              onChange={(event) => field("engine", event.target.value)}
-            />
-          </div>
-          <div className="waiting-recruit-field">
-            <label className="waiting-recruit-label" htmlFor={idFor("model")}>
-              model
-            </label>
-            <input
-              className="waiting-recruit-input"
-              id={idFor("model")}
-              value={form.model ?? ""}
-              onChange={(event) =>
-                field(
-                  "model",
-                  event.target.value === "" ? null : event.target.value,
-                )
-              }
-            />
-          </div>
-          <div className="waiting-recruit-field">
-            <label
-              className="waiting-recruit-label"
-              htmlFor={idFor("tool_policy")}
-            >
-              tool policy
-            </label>
-            <input
-              className="waiting-recruit-input"
-              id={idFor("tool_policy")}
-              value={form.tool_policy}
-              onChange={(event) => field("tool_policy", event.target.value)}
-            />
+          <div className="waiting-recruit">
+            <div className="waiting-recruit-form">
+              <div className="waiting-recruit-field">
+                <label className="waiting-recruit-label" htmlFor={idFor("name")}>
+                  Name
+                </label>
+                <input
+                  className="waiting-recruit-input"
+                  id={idFor("name")}
+                  value={form.name}
+                  onChange={(event) => field("name", event.target.value)}
+                />
+              </div>
+              <div className="waiting-recruit-field waiting-recruit-span-2">
+                <label className="waiting-recruit-label" htmlFor={idFor("speciality")}>
+                  Speciality
+                </label>
+                <input
+                  className="waiting-recruit-input"
+                  id={idFor("speciality")}
+                  value={form.speciality}
+                  onChange={(event) => field("speciality", event.target.value)}
+                />
+              </div>
+              <div className="waiting-recruit-field waiting-recruit-span-all">
+                <label className="waiting-recruit-label" htmlFor={idFor("prompt")}>
+                  Prompt
+                </label>
+                <textarea
+                  className="waiting-recruit-textarea"
+                  id={idFor("prompt")}
+                  rows={4}
+                  value={form.prompt}
+                  onChange={(event) => field("prompt", event.target.value)}
+                />
+              </div>
+              <span className="sr-only" id={carefulId}>
+                {careful}
+              </span>
+              <div className="waiting-recruit-field">
+                <label className="waiting-recruit-label" htmlFor={idFor("engine")}>
+                  Engine
+                </label>
+                <select
+                  className="waiting-recruit-input waiting-recruit-input-careful"
+                  id={idFor("engine")}
+                  aria-describedby={carefulId}
+                  title={careful}
+                  value={form.engine}
+                  onChange={(event) => field("engine", event.target.value)}
+                >
+                  <OptionsWith current={form.engine} known={RECRUIT_ENGINES} />
+                </select>
+              </div>
+              <div className="waiting-recruit-field">
+                <label className="waiting-recruit-label" htmlFor={idFor("model")}>
+                  Model
+                </label>
+                <input
+                  className="waiting-recruit-input"
+                  id={idFor("model")}
+                  placeholder="engine default"
+                  value={form.model ?? ""}
+                  onChange={(event) =>
+                    field(
+                      "model",
+                      event.target.value === "" ? null : event.target.value,
+                    )
+                  }
+                />
+              </div>
+              <div className="waiting-recruit-field">
+                <label className="waiting-recruit-label" htmlFor={idFor("tool_policy")}>
+                  Tool policy
+                </label>
+                <select
+                  className="waiting-recruit-input waiting-recruit-input-careful"
+                  id={idFor("tool_policy")}
+                  aria-describedby={carefulId}
+                  title={careful}
+                  value={form.tool_policy}
+                  onChange={(event) => field("tool_policy", event.target.value)}
+                >
+                  <OptionsWith current={form.tool_policy} known={RECRUIT_TOOL_POLICIES} />
+                </select>
+              </div>
+            </div>
           </div>
         </Inset>
       )}
-      <div className="waiting-actions">
+      <div className="waiting-actions-split">
         <ConfirmButton
-          label={`Hire #${proposal.id}`}
-          confirmLabel="Write the agent and add them to the roster"
-          subject={`#${proposal.id}`}
+          label="Hire"
+          confirmLabel="Hire and add them to the roster"
           variant="approve"
           disabled={hire.isPending || form === null}
           onArmedChange={onArmedChange}
@@ -1468,12 +1649,14 @@ function RecruitmentCard({
               hire.mutate({ proposalId: proposal.id, hire: form });
           }}
         />
-        <Button
+        <ConfirmButton
+          label="Decline"
+          confirmLabel="Decline — the team may ask again"
+          variant="ghost"
           disabled={reject.isPending}
-          onClick={() => reject.mutate(proposal.id)}
-        >
-          Not now
-        </Button>
+          onArmedChange={onArmedChange}
+          onConfirm={() => reject.mutate(proposal.id)}
+        />
       </div>
       {hire.isSuccess && hire.data !== undefined && (
         <p className="waiting-outcome" role="status">
@@ -1539,19 +1722,11 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
 
   return (
     <Queue
-      title="Contact merges"
+      title={QUEUES.merges.title}
       view={view}
       what="the suggested merges"
       count={items.length}
-      says="no two contacts look like the same person"
-      why={
-        <>
-          Two records that look like one person. Merging is a pointer move and
-          is undoable one address at a time; saying they are different people is
-          recorded too, which is what stops the same suggestion coming back on
-          every sweep.
-        </>
-      }
+      says={QUEUES.merges.says}
       /* One mutation for both verdicts, so the refusal is shown once — and its
          prose is trusted, because the 409 here is the refusal that names the two
          decisions that disagree. */
@@ -1563,16 +1738,16 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
         />
       }
     >
-      <Rows label="Contact merges" className={dense(items.length) ? "waiting-dense" : undefined}>
+      <Rows label={QUEUES.merges.title} className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((suggestion) => (
           <Row className="waiting-card" dense={dense(items.length)} key={suggestion.proposal_id}>
             <div className="waiting-card-head">
-              <span className="waiting-card-id">
+              <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>
                 merge #{suggestion.proposal_id}
               </span>
               <RelativeTime at={suggestion.created_at} />
             </div>
-            <p className="waiting-reasoning">{suggestion.reasoning}</p>
+            <Reasoning>{suggestion.reasoning}</Reasoning>
             <div className="waiting-merge">
               <MergeSideView side={suggestion.keep} role="kept" />
               <MergeSideView side={suggestion.absorb} role="absorbed" />
@@ -1582,7 +1757,7 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
                 contradict, and the remedy is to settle one of them first. */}
             {verdictsConflict(suggestion) && (
               <ConflictNote>
-                These two carry standing decisions that disagree, so the núcleo
+                These two carry standing decisions that disagree, so the daemon
                 will refuse the merge — settle one of them and decide this
                 again.
               </ConflictNote>
@@ -1590,7 +1765,7 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
             <div className="waiting-actions">
               <ConfirmButton
                 label={`Merge #${suggestion.proposal_id}`}
-                confirmLabel="They are one person"
+                confirmLabel="Merge — they are one person"
                 subject={`#${suggestion.proposal_id}`}
                 variant="approve"
                 disabled={decide.isPending}
@@ -1603,8 +1778,8 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
                 }
               />
               <ConfirmButton
-                label={`Keep #${suggestion.proposal_id} apart`}
-                confirmLabel="They are different people"
+                label={`Decline merge #${suggestion.proposal_id}`}
+                confirmLabel="Decline — they are different people"
                 subject={`#${suggestion.proposal_id}`}
                 variant="quiet"
                 disabled={decide.isPending}
@@ -1621,41 +1796,6 @@ function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }) {
         ))}
       </Rows>
     </Queue>
-  );
-}
-
-/* ------------------------------------------------------- 6. calendar events -- */
-
-/**
- * The one section that cannot be built, stated instead of faked.
- *
- * The núcleo files `calendar-event` proposals and decides them through the same
- * approve and reject doors as everything else on this page — `http.rs` dispatches
- * that kind by hand in both. What it does not mount is any route that *lists*
- * them, so this queue has nothing to read. Pointing a hook at a plausible path
- * would turn a missing feature into an unexplainable 404, which is strictly
- * worse than a sentence.
- *
- * It wears the same shape as every other absence on this page — one `Quiet` line
- * under its own heading, the paragraph behind "why?". It was the last panel among
- * ten one-line absences, and a panel is how this page says "there is something
- * here": the odd one out read as a section that had failed rather than as the one
- * section that cannot exist.
- */
-function CalendarEventAbsence() {
-  return (
-    <Section label="Calendar events">
-      <Quiet says="the núcleo mounts no route that lists them">
-        <p>
-          The núcleo can propose a calendar event and can decide one, but it
-          mounts no route that lists the pending ones — so this queue cannot
-          show them. Nothing is being hidden: what is missing is the door, not
-          the record, and opening it is a change to the núcleo rather than to
-          this page. Nothing here is in the count above: with no route that
-          lists them, there is nothing to count.
-        </p>
-      </Quiet>
-    </Section>
   );
 }
 
@@ -1700,18 +1840,11 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
 
   return (
     <Queue
-      title="Exclusion requests"
+      title={QUEUES.exclusions.title}
       view={view}
       what="the exclusion requests"
       count={items.length}
-      says="no job has asked to be kept apart from another"
-      why={
-        <>
-          A request that two jobs of one project never run at the same time.
-          Drawing the edge changed nothing; approving it writes the rule, and
-          the higher-numbered job is the one that waits.
-        </>
-      }
+      says={QUEUES.exclusions.says}
       notes={
         <DecisionNotes
           outcome={approve.data}
@@ -1720,13 +1853,13 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
         />
       }
     >
-      <Rows label="Exclusion requests" className={dense(items.length) ? "waiting-dense" : undefined}>
+      <Rows label={QUEUES.exclusions.title} className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((proposal) => {
           const pair = readExclusionPair(proposal.tool_input);
           return (
             <Row className="waiting-card" dense={dense(items.length)} key={proposal.id}>
               <div className="waiting-card-head">
-                <span className="waiting-card-id">request #{proposal.id}</span>
+                <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>request #{proposal.id}</span>
                 <span className="waiting-card-title">
                   {pair.low === null || pair.high === null
                     ? "a pair this request does not name"
@@ -1737,11 +1870,11 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                 </span>
                 <RelativeTime at={proposal.created_at} />
               </div>
-              <p className="waiting-reasoning">
+              <Reasoning>
                 {proposal.reasoning.trim() === ""
                   ? "nothing was recorded about why"
                   : proposal.reasoning}
-              </p>
+              </Reasoning>
               {pair.paths.length > 0 && (
                 <ul className="waiting-paths">
                   {pair.paths.map((path) => (
@@ -1752,7 +1885,7 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
               <div className="waiting-actions">
                 <ConfirmButton
                   label={`Approve request #${proposal.id}`}
-                  confirmLabel="Keep these two apart"
+                  confirmLabel="Approve — keep these two apart"
                   subject={`#${proposal.id}`}
                   variant="approve"
                   disabled={approve.isPending}
@@ -1760,8 +1893,8 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                   onConfirm={() => approve.mutate(proposal.id)}
                 />
                 <ConfirmButton
-                  label={`Reject request #${proposal.id}`}
-                  confirmLabel="Let them run together"
+                  label={`Decline request #${proposal.id}`}
+                  confirmLabel="Decline — let them run together"
                   subject={`#${proposal.id}`}
                   variant="ghost"
                   disabled={reject.isPending}
@@ -1777,217 +1910,54 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
   );
 }
 
-/* ---------------------------------------------------------- 8. skipped items -- */
-
-function lostWorkOf(proposal: Proposal): { title: string; detail: string | null } {
-  if (proposal.job_id == null) {
-    return { title: "a job this record can no longer trace", detail: null };
-  }
-
-  const job = "job " + proposal.job_id + " \u00B7 ";
-  if (typeof proposal.item_ordinal === "number") {
-    // The column is 0-based; every surface renders item ordinals one-based.
-    return {
-      title: job + "item " + (proposal.item_ordinal + 1),
-      detail: proposal.item_description ?? null,
-    };
-  }
-  if (proposal.run_stage === "review") return { title: job + "the job's review", detail: null };
-  if (proposal.run_stage === "plan") return { title: job + "the job's plan", detail: null };
-  return { title: job + "an item it no longer names", detail: null };
-}
-
-function SkippedItemsPanel({ view }: { view: Reading<Proposal> }) {
-  const dismiss = useDismissProposal();
-  const rows = view.rows ?? [];
-  const { items, onArmedChange } = useOrderFreeze(
-    rows,
-    (proposal) => proposal.id,
-  );
-
-  return (
-    <Queue
-      title="Skipped items"
-      view={view}
-      what="the skipped items"
-      count={items.length}
-      says="no job put anything down"
-      why={
-        <>
-          Work a job put down overnight because it needed a decision, and
-          carried on without. Nothing resumes from here — the tree moved on
-          hours ago — so the only thing left is to read it and put it away.
-          Which is why none of it is in the count above: this is a record of a
-          decision the night already took, not one held for you.
-        </>
-      }
-      notes={
-        <DecisionNotes
-          outcome={undefined}
-          approveError={null}
-          refuseError={dismiss.isError ? dismiss.error : null}
-        />
-      }
-    >
-      <Rows label="Skipped items" className={dense(items.length) ? "waiting-dense" : undefined}>
-        {items.map((proposal) => {
-          const work = lostWorkOf(proposal);
-          return (
-            <Row className="waiting-card" dense={dense(items.length)} key={proposal.id}>
-              <div className="waiting-card-head">
-                <span className="waiting-card-id">item #{proposal.id}</span>
-                <span className="waiting-card-title">{work.title}</span>
-                {proposal.run_id !== null && (
-                  <Link className="waiting-row-link" to={`/runs/${proposal.run_id}`}>
-                    run {proposal.run_id}
-                  </Link>
-                )}
-                <span className="waiting-meta">{proposal.project_id ?? "no project"}</span>
-                <RelativeTime at={proposal.created_at} />
-              </div>
-              {work.detail !== null && <p className="waiting-reasoning">{work.detail}</p>}
-              <p className="waiting-meta">
-                <span>{proposal.tool_name ?? "an action that names no tool"}</span>{" — "}
-                <span>
-                  {proposal.reasoning.trim() === ""
-                    ? "nothing was recorded about why"
-                    : proposal.reasoning}
-                </span>
-              </p>
-              <ToolInput raw={proposal.tool_input} />
-              <div className="waiting-actions">
-                {/* `/dismiss`, never `/reject`: rejecting guards on
-                    `action-approval` and would answer 409 for every one of these. */}
-                <ConfirmButton
-                  label={`Put item #${proposal.id} away`}
-                  confirmLabel="I have read it"
-                  subject={`#${proposal.id}`}
-                  variant="quiet"
-                  disabled={dismiss.isPending}
-                  onArmedChange={onArmedChange}
-                  onConfirm={() => dismiss.mutate(proposal.id)}
-                />
-              </div>
-            </Row>
-          );
-        })}
-      </Rows>
-    </Queue>
-  );
-}
-
-/* --------------------------------------------------------- 9. refused actions -- */
+/* --------------------------------------------------------------- 7. git queue -- */
 
 /**
- * What the injection barrier refused — a record, and deliberately buttonless.
+ * The git queue: one status asks for a decision, and the rest is for reading.
  *
- * The núcleo would accept a dismiss for these, and the design still asks for no
- * controls, which is the right call: the turn that reached for this ended long
- * ago, so there is nothing to allow and nothing to release. The only useful
- * response is to go and do the thing yourself, or to decide the agent was wrong
- * to try — and neither of those is a button on this page. A dismiss button here
- * would read as "handled" for something nobody handled.
- */
-function RefusedActionsPanel({ view }: { view: Reading<Proposal> }) {
-  const rows = view.rows ?? [];
-
-  return (
-    <Queue
-      title="Refused actions"
-      view={view}
-      what="the refused actions"
-      count={rows.length}
-      says="the barrier has refused nothing"
-      why={
-        <>
-          The barrier stopped these before they happened, in turns that have
-          since ended. There is nothing here to allow: what they were going to
-          do is written out so you can decide whether to do it yourself, and
-          under it what the turn had read when it decided to — which is usually
-          the half that answers whether the idea was the agent&apos;s or a
-          stranger&apos;s. None of it is in the count above: the barrier already
-          answered these, and what is left is a record to read.
-        </>
-      }
-    >
-      <Rows label="Refused actions" className={dense(rows.length) ? "waiting-dense" : undefined}>
-        {rows.map((proposal) => (
-          <Row className="waiting-card" dense={dense(rows.length)} key={proposal.id}>
-            <div className="waiting-card-head">
-              <span className="waiting-card-id">refusal #{proposal.id}</span>
-              <span className="waiting-card-title">
-                {proposal.tool_name ?? "an action that names no tool"}
-              </span>
-              <RelativeTime at={proposal.created_at} />
-            </div>
-            <p className="waiting-reasoning">
-              {proposal.reasoning.trim() === ""
-                ? "nothing was recorded about why"
-                : proposal.reasoning}
-            </p>
-            <ToolInput raw={proposal.tool_input} />
-            <ReadFrom raw={proposal.read_from} />
-          </Row>
-        ))}
-      </Rows>
-    </Queue>
-  );
-}
-
-/* --------------------------------------------------------------- 10. git queue -- */
-
-/**
- * The two statuses that want a person.
- *
- * `escalated` is a *normal outcome* — somebody owns the conflict now, which is
- * the queue working rather than breaking — and `blocked` is terminal without
- * being a failure: the queue will not retry it, and the answer is to fix the
- * tree and submit again. Both need a person; neither is red. `ui/state-map.ts`
- * holds the tones.
+ * `awaiting_owner` is the only row this panel can be *decided* on — a merge that changes the
+ * test map, held until somebody approves or declines it. `escalated` is a *normal outcome*
+ * (somebody owns the conflict now, which is the queue working rather than breaking) and
+ * `blocked` is terminal without being a failure (the queue will not retry it; the answer is to
+ * fix the tree and submit again). Both still want a person, in that they are counted in the
+ * headline, but all anyone can do is read them and put them away — so they sit behind the
+ * disclosure at the bottom with the history, and not between the decision and the person
+ * making it. `ui/state-map.ts` holds the tones.
  */
 /** How much history to show behind the rows that want a person. */
 const VCS_RECENT = 5;
 
 function GitQueuePanel({
-  view,
+  history,
   waiting,
 }: {
-  view: Reading<VcsRequestSummary>;
+  history: Reading<VcsRequestSummary>;
   waiting: Reading<VcsRequestSummary>;
 }) {
   const dismiss = useDismissVcsRequest();
   const approve = useApproveVcsRequest();
   const refuse = useRefuseVcsRequest();
-  const rows = view.rows ?? [];
   // What wants a person comes from `/waiting/git`, never from filtering the history: that listing
   // is capped at 200 and keeps every escalation that has since been settled.
   const wanted = waiting.rows ?? [];
+  // One order for both groups: arming any control pins the sequence, so a poll that reorders
+  // the list cannot move another request under the finger that is about to confirm.
+  const { items, onArmedChange } = useOrderFreeze(wanted, (row) => row.id);
+  const owed = items.filter((row) => row.status === "awaiting_owner");
+  const toRead = items.filter((row) => row.status !== "awaiting_owner");
+  const rows = history.rows ?? [];
   const rest = rows.filter((row) => !wanted.some((open) => open.id === row.id));
   const recent = rest.slice(0, VCS_RECENT);
+  const behind = toRead.length + recent.length;
 
   return (
     <Queue
-      title="Git queue"
-      view={view}
+      title={QUEUES.git.title}
+      view={waiting}
       what="the git queue"
-      // The queue is empty when it holds nothing at all. A queue that has been
-      // through five pushes cleanly is not empty — nothing is waiting on a
-      // person, and the corner says so with a zero while the history stays.
-      count={Math.max(rows.length, wanted.length)}
+      says={QUEUES.git.says}
+      count={wanted.length}
       aside={<Count n={wanted.length} />}
-      says="nothing has been through the git queue"
-      why={
-        <>
-          Every push, merge and rebase the núcleo has been asked to make. Three
-          of the states want a person — escalated, which means somebody owns a
-          conflict now, blocked, which the queue will not retry, and held for
-          your approval, a merge that changes the test map — and none is a
-          failure. One stops waiting once it is settled: a later
-          identical request succeeded, a resolution took it, its branch is
-          already in the target or gone, or you put it away. It stays in the
-          history either way.
-        </>
-      }
       notes={
         <DecisionNotes
           outcome={undefined}
@@ -2004,75 +1974,92 @@ function GitQueuePanel({
         />
       }
     >
-      {wanted.length === 0 ? (
-        <Quiet says="nothing in the git queue is waiting on you." />
+      {owed.length === 0 ? (
+        <Quiet says="nothing in the git queue needs your approval." />
       ) : (
-        <Rows label="Git requests waiting on you" className={dense(wanted.length) ? "waiting-dense" : undefined}>
-          {wanted.map((row) => (
-            <VcsRow key={row.id} row={row} count={wanted.length}>
-              <div className="waiting-actions">
-                {row.status === "awaiting_owner" ? (
-                  <>
-                    <ConfirmButton
-                      label={`Approve ${row.op} #${row.id}`}
-                      confirmLabel="Approve the map change"
-                      subject={`#${row.id}`}
-                      variant="approve"
-                      disabled={approve.isPending || refuse.isPending}
-                      onConfirm={() => {
-                        refuse.reset();
-                        dismiss.reset();
-                        approve.mutate(row.id);
-                      }}
-                    />
-                    <ConfirmButton
-                      label={`Refuse ${row.op} #${row.id}`}
-                      confirmLabel="Refuse the map change"
-                      subject={`#${row.id}`}
-                      variant="ghost"
-                      disabled={approve.isPending || refuse.isPending}
-                      onConfirm={() => {
-                        approve.reset();
-                        dismiss.reset();
-                        refuse.mutate(row.id);
-                      }}
-                    />
-                  </>
-                ) : (
-                  <ConfirmButton
-                    label={`Put ${row.op} #${row.id} away`}
-                    confirmLabel="Nobody needs to act"
-                    subject={`#${row.id}`}
-                    variant="quiet"
-                    disabled={dismiss.isPending}
-                    onConfirm={() => dismiss.mutate(row.id)}
-                  />
-                )}
+        <Rows label="Git requests waiting on you" className={dense(owed.length) ? "waiting-dense" : undefined}>
+          {owed.map((row) => (
+            <VcsRow key={row.id} row={row} count={owed.length} decision>
+              <div className="waiting-actions-split">
+                <ConfirmButton
+                  label="Approve"
+                  confirmLabel="Approve the map change"
+                  variant="approve"
+                  disabled={approve.isPending || refuse.isPending}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() => {
+                    refuse.reset();
+                    dismiss.reset();
+                    approve.mutate(row.id);
+                  }}
+                />
+                <ConfirmButton
+                  label="Decline"
+                  confirmLabel="Decline the map change"
+                  variant="ghost"
+                  disabled={approve.isPending || refuse.isPending}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() => {
+                    approve.reset();
+                    dismiss.reset();
+                    refuse.mutate(row.id);
+                  }}
+                />
               </div>
             </VcsRow>
           ))}
         </Rows>
       )}
-      {recent.length > 0 && (
-        <div className="waiting-recent">
-          <Section label="recently through the queue" level={3}>
-            <Rows label="Recent git requests">
-              {recent.map((row) => (
-                <VcsRow key={row.id} row={row} count={recent.length} />
-              ))}
-            </Rows>
-          </Section>
-        </div>
-      )}
-      {/* Nothing prunes `vcs_requests`, so this listing is the whole history and
-          not a backlog. Arriving at the cap says the daemon has been running a
-          while — it is not a finding and is not drawn as one. */}
-      {rows.length >= VCS_LIST_LIMIT && (
-        <p className="waiting-ceiling">
-          the listing stops at {VCS_LIST_LIMIT} rows — this is the queue&apos;s
-          whole history, kept rather than pruned, so a full listing only means
-          the daemon has been running a while
-        </p>
+      {/* Everything that is read rather than decided, below what is, under its own headings.
+          It sat behind a disclosure until the owner dropped it (2026-10-09); the list is
+          short by construction — the escalations plus at most `VCS_RECENT` rows. */}
+      {(behind > 0 || rows.length >= VCS_LIST_LIMIT) && (
+        <>
+          {toRead.length > 0 && (
+            <div className="waiting-recent">
+              <Section label="escalated or blocked" level={3}>
+                <Rows label="Git requests to put away">
+                  {toRead.map((row) => (
+                    <VcsRow key={row.id} row={row} count={toRead.length}>
+                      <div className="waiting-actions">
+                        <ConfirmButton
+                          label={`Put ${row.op} #${row.id} away`}
+                          confirmLabel="Nobody needs to act"
+                          subject={`#${row.id}`}
+                          variant="quiet"
+                          disabled={dismiss.isPending}
+                          onArmedChange={onArmedChange}
+                          onConfirm={() => dismiss.mutate(row.id)}
+                        />
+                      </div>
+                    </VcsRow>
+                  ))}
+                </Rows>
+              </Section>
+            </div>
+          )}
+          {recent.length > 0 && (
+            <div className="waiting-recent">
+              <Section label="recently through the queue" level={3}>
+                <Rows label="Recent git requests">
+                  {recent.map((row) => (
+                    <VcsRow key={row.id} row={row} count={recent.length} />
+                  ))}
+                </Rows>
+              </Section>
+            </div>
+          )}
+          {/* Nothing prunes `vcs_requests`, so this listing is the whole history and
+              not a backlog. Arriving at the cap says the daemon has been running a
+              while — it is not a finding and is not drawn as one. */}
+          {rows.length >= VCS_LIST_LIMIT && (
+            <p className="waiting-ceiling">
+              the listing stops at {VCS_LIST_LIMIT} rows — this is the queue&apos;s
+              whole history, kept rather than pruned, so a full listing only means
+              the daemon has been running a while
+            </p>
+          )}
+        </>
       )}
     </Queue>
   );
@@ -2081,16 +2068,23 @@ function GitQueuePanel({
 function VcsRow({
   row,
   count,
+  decision,
   children,
 }: {
   row: VcsRequestSummary;
   count: number;
+  /** A request somebody is being asked to decide: a card, with a heading focus can land on. */
+  decision?: boolean;
   children?: ReactNode;
 }) {
   return (
-    <Row dense={dense(count)}>
+    <Row className={decision === true ? "waiting-card" : undefined} dense={dense(count)}>
       <div className="waiting-card-head">
-        <span className="waiting-card-id">
+        <span
+          className="waiting-card-id"
+          tabIndex={decision === true ? -1 : undefined}
+          data-waiting-heading={decision === true ? "" : undefined}
+        >
           {row.op} #{row.id}
         </span>
         <StateBadge domain="vcs" state={row.status} />
@@ -2110,49 +2104,5 @@ function VcsRow({
       ) : null}
       {children}
     </Row>
-  );
-}
-
-/* -------------------------------------------------------------- 11. parked runs -- */
-
-function ParkedRunsPanel({ view }: { view: Reading<AwaitingRun> }) {
-  const rows = view.rows ?? [];
-
-  return (
-    <Queue
-      title="Parked runs"
-      view={view}
-      what="the parked runs"
-      count={rows.length}
-      says="no run is parked"
-      why={
-        <>
-          Worktree runs holding a tree while they wait. The decision that frees
-          one is its approval above; giving the tree back without deciding is on
-          the run&apos;s own page. A parked run is not in the count above either
-          — the approval that frees it is, and counting both would count one
-          decision twice.
-        </>
-      }
-    >
-      <Rows label="Parked runs" className={dense(rows.length) ? "waiting-dense" : undefined}>
-        {rows.map((run) => (
-          <Row dense={dense(rows.length)} key={run.id}>
-            <div className="waiting-card-head">
-              <Link className="waiting-row-link" to={`/runs/${run.id}`}>
-                run {run.id}
-              </Link>
-              <StateBadge domain="run" state="awaiting_approval" />
-              <span className="waiting-meta">
-                {run.project_id ?? "no project"}
-              </span>
-              <RelativeTime at={run.created_at} />
-            </div>
-            <p className="waiting-excerpt">{run.prompt}</p>
-            {run.cwd !== null && <p className="waiting-meta">{run.cwd}</p>}
-          </Row>
-        ))}
-      </Rows>
-    </Queue>
   );
 }

@@ -855,11 +855,11 @@ describe("Fleet — columns", () => {
 
 describe("Fleet — the slot rack", () => {
   /**
-   * The rack beside busy columns lists only the idle projects ("Idle projects"); over the canvas
-   * it lists every project ("Slots by project"), because the canvas has no column heads.
+   * The rack stands above the columns and lists only the idle projects ("Idle projects"). It is
+   * drawn in the Columns view only: the Canvas view shows the canvas and nothing else.
    */
-  async function findRack(name: "Idle projects" | "Slots by project" = "Idle projects"): Promise<HTMLElement> {
-    return await screen.findByRole("region", { name });
+  async function findRack(): Promise<HTMLElement> {
+    return await screen.findByRole("region", { name: "Idle projects" });
   }
 
   /**
@@ -912,7 +912,7 @@ describe("Fleet — the slot rack", () => {
     });
   }
 
-  it("lists every project, busy or idle, in one order that does not follow the columns", async () => {
+  it("lists only the idle projects, in an order that does not follow the columns", async () => {
     daemon.apiFetch.mockImplementation(fleetFetch(mixedFleet()));
 
     await renderWithRouter(<Fleet />);
@@ -925,16 +925,8 @@ describe("Fleet — the slot rack", () => {
     ).toEqual(["quiet column", "busy column", "calm column"]);
     // Beside the columns the rack keeps only the project that has no column head to carry it.
     expect(within(idle).getAllByRole("link").map((link) => link.textContent)).toEqual(["delta"]);
-    // Over the canvas it lists every project, by id — the order `/concurrency` sends them in — so
-    // a project is always where it was, whatever just went wrong in it.
-    fireEvent.click(screen.getByRole("radio", { name: "Canvas" }));
-    const rack = await findRack("Slots by project");
-    expect(within(rack).getAllByRole("link").map((link) => link.textContent)).toEqual([
-      "busy",
-      "calm",
-      "delta",
-      "quiet",
-    ]);
+    // No second rack, and no "every project" list: a busy project is its column's head.
+    expect(screen.queryByRole("region", { name: "Slots by project" })).toBeNull();
   });
 
   it("lights a pip per held slot in the tone its card wears, and leaves a free one hollow", async () => {
@@ -1226,18 +1218,19 @@ describe("Fleet — the slot rack", () => {
     expect(screen.getAllByRole("heading", { name: /^Idle/ })).toHaveLength(1);
   });
 
-  it("stands above the canvas too, with the same lamps", async () => {
+  it("is not drawn over the canvas, which shows the canvas and nothing else", async () => {
     daemon.apiFetch.mockImplementation(fleetFetch(mixedFleet()));
 
     await renderWithRouter(<Fleet />);
     await screen.findByRole("region", { name: "quiet column" });
+    expect(screen.getByRole("region", { name: "Idle projects" })).toBeDefined();
     fireEvent.click(screen.getByRole("radio", { name: "Canvas" }));
 
     await waitFor(() => expect(document.querySelector(".fleet-canvas")).not.toBeNull());
     expect(screen.queryByRole("region", { name: "quiet column" })).toBeNull();
-    const rack = screen.getByRole("region", { name: "Slots by project" });
-    expect(pipsOf(entryOf(rack, "quiet"))).toEqual(["danger", "free"]);
-    expect(within(rack).getByRole("button", { name: "New job in delta" })).toBeDefined();
+    // Owner's call, 2026-10-09: no rack of either kind above the canvas.
+    expect(screen.queryByRole("region", { name: "Idle projects" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Slots by project" })).toBeNull();
   });
 });
 

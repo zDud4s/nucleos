@@ -265,9 +265,9 @@ describe("a matrix too small to be read whole", () => {
 
     // The new half: it names the reading that is gone, in the pixels that decided it,
     // and points at the ways out.
-    expect(screen.getByText(/At this size only the shape reads/)).toBeTruthy();
+    expect(screen.getByText(/Numbers hidden at this size/)).toBeTruthy();
     expect(screen.getByText(/8px/)).toBeTruthy();
-    expect(screen.getByText(/Point at a mark to read it, or stand closer/)).toBeTruthy();
+    expect(screen.getByText(/Point at a mark to read it, or zoom in/)).toBeTruthy();
 
     // And it does what it says: the marks are drawn without the digits nobody could read, and
     // the name of whatever is under the pointer is said above the window at a size that reads.
@@ -286,7 +286,7 @@ describe("a matrix too small to be read whole", () => {
   it("stays quiet about a matrix that fits at a size its numbers can be read at", () => {
     // Two communities open at 100%, where nothing is lost and a warning would be noise.
     draw(twoGroups.modules, twoGroups.imports);
-    expect(screen.queryByText(/At this size only the shape reads/)).toBeNull();
+    expect(screen.queryByText(/Numbers hidden at this size/)).toBeNull();
     // And the numbers are drawn, because here they can be read.
     const marked = [...document.querySelectorAll("td")].filter((cell) => cell.title !== "");
     expect(marked.some((cell) => cell.textContent === "1")).toBe(true);

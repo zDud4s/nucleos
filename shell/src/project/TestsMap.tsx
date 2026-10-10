@@ -33,7 +33,7 @@ export function TestsMap({ projectId }: TestsMapProps) {
       : "no build file recognised";
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-2">
       {state === "valid" && (
         <p className="text-sm">
           <code>nucleos.tests.yaml</code> — {groups.length} {groups.length === 1 ? "group" : "groups"}
@@ -58,20 +58,26 @@ export function TestsMap({ projectId }: TestsMapProps) {
         </p>
       )}
 
+      {/*
+        The proposal, its provenance and where it goes, all inside the disclosure they belong to.
+        The landing note sat under the closed disclosure too, a third line about a map nobody had
+        opened. The listing is a sunken well with its copy control in the corner, as code blocks are.
+      */}
       <details open={state === "absent"}>
-        <summary className="cursor-pointer text-sm">Proposed map</summary>
+        <summary className="cursor-pointer text-sm text-text-muted">Proposed map</summary>
         <div className="mt-2 flex flex-col gap-2">
-          <p className="text-xs text-text-faint">{from}</p>
-          <pre className="overflow-x-auto text-xs">{proposal.yaml}</pre>
-          <div>
-            <CopyButton value={proposal.yaml} label="the proposed map" />
+          <div className="relative rounded-md bg-surface-sunken px-3 py-2">
+            <pre className="overflow-x-auto pr-16 text-xs leading-relaxed">{proposal.yaml}</pre>
+            <div className="absolute top-1 right-1">
+              <CopyButton value={proposal.yaml} label="the proposed map" />
+            </div>
           </div>
+          <p className="text-xs text-text-faint">
+            {from.charAt(0).toUpperCase() + from.slice(1)}. Commit it at the repository root; it
+            lands through the queue like any change.
+          </p>
         </div>
       </details>
-
-      <p className="text-xs text-text-faint">
-        Commit it at the repository root; it lands through the queue like any change.
-      </p>
     </div>
   );
 }

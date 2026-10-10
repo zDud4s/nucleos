@@ -179,7 +179,12 @@ describe("leaving the roster, from inside the project", () => {
     const leaving = await screen.findByRole("region", { name: "Leaving" });
 
     await openRemove("one");
-    const toggle = within(leaving).getByRole("button", { name: "remove from NucleOS…", expanded: true });
+    // The panel is a modal now, so the page under it, toggle included, is hidden from the a11y tree.
+    const toggle = within(leaving).getByRole("button", {
+      name: "remove from NucleOS…",
+      expanded: true,
+      hidden: true,
+    });
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
     const panel = screen.getByRole("group", { name: "Remove one from NucleOS" });
     expect(toggle.getAttribute("aria-controls")).toBe(panel.id);

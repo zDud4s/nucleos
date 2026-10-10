@@ -1,0 +1,1373 @@
+/**
+ * The project workspace (`project/Workspace.tsx` and the modes it hosts), `ws-` throughout — as
+ * `pj-` is for the inspector and `waiting-` for the queue.
+ *
+ * **Why a sheet of its own.** The owner's verdict on the workspace was "doi de ver", and the four
+ * causes named were too much prose, no hierarchy, boxes inside boxes and the type. Each mode had
+ * grown its own answer out of loose utilities — a dashed box here, an uppercase tracked label
+ * there, 11px explanations under everything — so there was no one place where "a group of facts"
+ * looked one way. This is that place: a grouped list (one raised surface, no border, rules inset
+ * from the leading edge), a group title in sentence case, a row that is a label and a value, and
+ * the explanations behind an ⓘ instead of under every line.
+ *
+ * It is the platform's grouped list — `lists-and-tables.md` in the HIG — translated, and not a
+ * look invented here. The rule it lives under is the inspector's: no `ws-` class is used that this
+ * file does not define, and none is defined that nothing uses (`node scripts/css-contract.mjs
+ * workspace`).
+ */
+
+/* The page's one column. A grouped list wider than this reads as a table with too much air. */
+.ws-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+/* Several groups under one title, or one group and its footnote. */
+.ws-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/**
+ * A group title: what the facts below are about.
+ *
+ * Sentence case, the body face, no tracking. The uppercase tracked eyebrow this replaces was on
+ * every section of every mode, which made it the loudest repeated thing on the page while saying
+ * the least. Indented to the rows' own padding so the title sits over the first word, not over
+ * the group's edge.
+ */
+.ws-title {
+  margin: 0;
+  padding: 0 var(--space-4);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-muted);
+}
+
+/**
+ * The grouped surface. One rung up from the page, no border and no shadow: the rung is the
+ * boundary in dark, and in light the page is `--bg` under a white group, which is the same
+ * contrast the platform's own grouped lists use.
+ */
+.ws-group {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-radius: 0.75rem;
+  background: var(--surface-raised);
+}
+
+/*
+  No \`overflow: hidden\` on a group: an ⓘ tip has to float out of it. The rows round their own
+  outer corners instead, so a hover fill still meets the group's curve.
+*/
+.ws-group > :first-child {
+  border-start-start-radius: inherit;
+  border-start-end-radius: inherit;
+}
+
+.ws-group > :last-child {
+  border-end-start-radius: inherit;
+  border-end-end-radius: inherit;
+}
+
+/* The mark that says a row goes somewhere. */
+.ws-chevron {
+  flex: none;
+  margin-inline-start: auto;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-top: 1.5px solid var(--text-faint);
+  border-right: 1.5px solid var(--text-faint);
+  transform: rotate(45deg);
+}
+
+/* The line under a group: provenance, never instructions. */
+.ws-foot {
+  margin: 0;
+  padding: 0 var(--space-4);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/**
+ * The four readings, as one group split four ways instead of four cards.
+ *
+ * Four bordered, shadowed cards side by side were four boxes saying one thing: how the last month
+ * went. One surface with hairlines between the figures keeps them comparable and takes three
+ * frames away.
+ */
+.ws-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  border-radius: 0.75rem;
+  background: var(--surface-raised);
+  overflow: hidden;
+}
+
+/* An identifier — a branch, a path — in the mono face, and only that. */
+.ws-mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+/**
+ * The worktree slots, as one meter: a cell per slot, the taken ones filled and named, the free ones
+ * recessed. It was a row of 160px boxes, the free ones dashed — four frames to say "one of four".
+ */
+.ws-slots {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow: hidden;
+  border-radius: 0.75rem;
+}
+
+.ws-slot {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-height: 2.75rem;
+  padding: var(--space-2) var(--space-4);
+  align-content: center;
+  flex-wrap: wrap;
+  background: var(--surface-raised);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.ws-slot-free {
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-sunken);
+  color: var(--text-faint);
+}
+
+.ws-slot-door {
+  padding: 0;
+}
+
+.ws-slot-link {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  color: inherit;
+  text-decoration: none;
+}
+
+.ws-slot-link:hover {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.ws-slot-kind {
+  color: var(--text-muted);
+  text-transform: capitalize;
+}
+
+/* --------------------------------------------------------- the primitives, in this page -- */
+
+/**
+ * The shared primitives, redrawn inside the workspace only.
+ *
+ * `Section`, `Rows`, `StatCard`, `Inset` and `Quiet` are every page's, and changing their recipe
+ * in `ui.css` would restyle forty screens to answer a complaint about one. So the workspace scopes
+ * them: same components, same roles and names (which is what every test reads), drawn as the
+ * grouped list above. If the owner likes it here, the next step is moving these into `ui.css`.
+ */
+.ws-page .ui-section {
+  gap: var(--space-2);
+}
+
+.ws-page .ui-section-title {
+  margin: 0;
+  padding: 0 var(--space-4);
+  font-family: var(--font-body);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-muted);
+}
+
+.ws-page .ui-rows {
+  gap: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0.75rem;
+  background: var(--surface-raised);
+}
+
+.ws-page .ui-rows > :first-child {
+  border-start-start-radius: inherit;
+  border-start-end-radius: inherit;
+}
+
+.ws-page .ui-rows > :last-child {
+  border-end-start-radius: inherit;
+  border-end-end-radius: inherit;
+}
+
+.ws-page .ui-rows-row {
+  position: relative;
+  justify-content: center;
+  min-height: 2.75rem;
+  background: none;
+}
+
+.ws-page .ui-rows-row + .ui-rows-row::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: var(--space-4);
+  right: 0;
+  height: 1px;
+  background: var(--border);
+}
+
+.ws-page .ui-rows-row-line {
+  align-items: center;
+}
+
+.ws-page .ui-panel-inset {
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 0;
+  border-radius: 0.75rem;
+}
+
+/* The readings' cards lose their frames and become the four cells of `.ws-metrics`. */
+.ws-metrics .ui-stat {
+  padding: var(--space-4);
+  border: 0;
+  border-radius: 0;
+  box-shadow: inset 1px 0 0 var(--border);
+  margin-left: -1px;
+  background: none;
+}
+
+.ws-metrics .ui-stat-value {
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-semibold);
+}
+
+/**
+ * `why?` as an ⓘ. The button keeps its text — its accessible name is still "why?", described by
+ * the line it explains — and the text is hidden by size while the mark is drawn in its place. A
+ * word in every row asking a question was the most repeated prose on the page.
+ */
+.ws-page .ui-quiet-ask {
+  display: inline-grid;
+  place-items: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  overflow: hidden;
+  border: 1.5px solid var(--text-faint);
+  border-radius: var(--radius-pill);
+  font-size: 0;
+  text-decoration: none;
+  color: var(--text-faint);
+  vertical-align: middle;
+}
+
+.ws-page .ui-quiet-ask::before {
+  content: "i";
+  font-family: var(--font-display);
+  font-size: 0.6875rem;
+  font-weight: var(--weight-bold);
+  line-height: 1;
+}
+
+.ws-page .ui-quiet-ask:hover,
+.ws-page .ui-quiet-ask[aria-expanded="true"] {
+  border-color: var(--text-muted);
+  color: var(--text-muted);
+}
+
+.ws-page .ui-quiet {
+  font-size: var(--text-sm);
+}
+
+/**
+ * The Setup group: four sections, each one row. The section's own title becomes the row's label —
+ * full ink, the body size — and what it says sits on the trailing side.
+ */
+.ws-setup > .ui-section {
+  position: relative;
+  flex-flow: row wrap;
+  align-items: baseline;
+  column-gap: var(--space-3);
+  min-height: 2.75rem;
+  padding: var(--space-3) var(--space-4);
+}
+
+.ws-setup > .ui-section + .ui-section::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: var(--space-4);
+  right: 0;
+  height: 1px;
+  background: var(--border);
+}
+
+.ws-setup > .ui-section > .ui-section-title {
+  min-width: 10rem;
+  padding: 0;
+  font-size: var(--text-base);
+  font-weight: var(--weight-regular);
+  color: var(--text);
+}
+
+/* A row's one action sits at its trailing edge, where every grouped list keeps its control. */
+.ws-setup .ui-quiet-action {
+  margin-inline-start: auto;
+}
+
+.ws-setup > .ui-section > :not(.ui-section-title) {
+  flex: 1 1 18rem;
+  min-width: 0;
+}
+
+/**
+ * The leading concern: one sentence, not a band.
+ *
+ * A dot in the concern's tone and the sentence in the display face is the whole treatment. The
+ * tinted block it replaced was the page's loudest surface and the owner hated it; position (first)
+ * and size already say this is what matters.
+ */
+.ws-lead {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.ws-lead-line {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+.ws-lead-line::before {
+  content: "";
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: var(--radius-pill);
+  background: var(--ws-lead-tone, var(--text-muted));
+}
+
+a.ws-lead-door {
+  align-self: flex-start;
+  text-decoration: none;
+}
+
+a.ws-lead-door:hover {
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 3px;
+}
+
+/* The chevron trails the words here; it is not pushed to the far edge of an empty line. */
+.ws-lead-door .ws-chevron {
+  margin-inline-start: 0;
+}
+
+.ws-lead .ws-foot {
+  padding: 0 0 0 calc(0.5rem + var(--space-3));
+}
+
+/**
+ * The exits, as two rows of one group: the reversible one, then the permanent one. They were bare
+ * words under a title, the sentence between them at a different indent from either button.
+ */
+.ws-leaving > * {
+  position: relative;
+  padding: var(--space-3) var(--space-4);
+}
+
+.ws-leaving > * + *::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: var(--space-4);
+  right: 0;
+  height: 1px;
+  background: var(--border);
+}
+
+/* ------------------------------------------------------------------ authority -- */
+
+/**
+ * The Authority mode: four tables of grants, each a grouped list.
+ *
+ * It was the page the owner called unreadable — every group a bordered box opened by an uppercase
+ * eyebrow and a grey paragraph, rows indented by the browser's list padding, and the controls
+ * floating at whatever x their words ended on. Here a group is one surface with its title as the
+ * first row, the caption behind an ⓘ, rows split by inset hairlines, and the controls in one
+ * trailing column.
+ */
+.ws-authority .ui-panel-inset {
+  gap: 0;
+  padding: 0;
+}
+
+.ws-authority .ui-panel-inset > :not(.ws-items) {
+  padding: var(--space-3) var(--space-4);
+}
+
+.ws-authority .ui-panel-inset > :not(.ws-items) + :not(.ws-items) {
+  padding-top: 0;
+}
+
+/* A group's title, as its first line: the body face in sentence case, one step under the page's. */
+.ws-subhead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ws-subtitle {
+  margin: 0;
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-muted);
+}
+
+.ws-items {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/**
+ * One grant or rule: what it is on the leading side, its state and controls on the trailing.
+ * The hairline above each starts at the text, as everywhere in the workspace.
+ */
+.ws-item {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-1) var(--space-4);
+  min-height: 2.75rem;
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--text-base);
+  color: var(--text);
+}
+
+.ws-items > .ws-item::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: var(--space-4);
+  right: 0;
+  height: 1px;
+  background: var(--border);
+}
+
+/* The first row of a group that has no title has no rule above it. */
+.ws-items:first-child > .ws-item:first-child::before {
+  display: none;
+}
+
+/* Metadata on a row reads at 13px, the platform's floor for running text, not 12. */
+.ws-item .text-xs {
+  font-size: var(--text-sm);
+}
+
+/* Anything after the two columns (a failure sentence) takes the full width under them. */
+.ws-item > :nth-child(n + 3) {
+  grid-column: 1 / -1;
+}
+
+/* The leading column: the name, and one line of small facts under it. */
+.ws-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  min-width: 0;
+}
+
+.ws-item-name {
+  font-size: var(--text-base);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.ws-item-sub {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* Facts on one line, separated by a middle dot rather than by whatever gap their lengths leave. */
+.ws-item-sub > * + *::before {
+  content: "·";
+  margin-inline-end: var(--space-2);
+  color: var(--text-faint);
+}
+
+/* The one state that widens what runs may do is the one drawn in full ink. */
+.ws-item-state-on {
+  color: var(--text);
+  font-weight: var(--weight-medium);
+}
+
+/* The controls, in one trailing column, each one a button that looks like one. */
+.ws-trail {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.ws-trail .ui-button-quiet {
+  min-height: 1.875rem;
+  padding: 0 var(--space-3);
+  border-color: var(--border-strong);
+  border-radius: var(--radius-md);
+  text-decoration: none;
+  font-size: var(--text-sm);
+}
+
+.ws-trail .ui-button-quiet:hover:not(:disabled) {
+  border-color: var(--text-faint);
+  background: var(--surface);
+}
+
+/*
+  A \`ConfirmButton\` reserves its armed label's width inside the button, which drew "grant" as a
+  box sized for "grant without asking". Here the box fits the word it shows; arming grows it toward
+  the start, and the trailing edge every row shares does not move.
+*/
+.ws-trail .ui-confirm-stack > [aria-hidden="true"] {
+  display: none;
+}
+
+/*
+  The sentences that sit between the groups — a section's lead, the status line, the remote's
+  header — start where the text inside the groups starts, not at the groups' edge.
+*/
+.ws-authority > [aria-label="Standing"],
+.ws-authority .ui-section > div > .ui-quiet,
+.ws-authority .ui-section > div > p {
+  padding-inline: var(--space-4);
+}
+
+/* A failed CI run, said as a sentence in the wrong colour rather than a red box on a grey box. */
+.ws-alert {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--tone-danger-fg);
+}
+
+/* Field labels in this page are sentence case, like every title above them. */
+.ws-page .ui-field-label {
+  font-size: var(--text-sm);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/**
+ * The ⓘ beside a group title, and its tip. Pure CSS: the sentence is always in the document (a
+ * screen reader reaches it through `aria-describedby`) and is shown on hover or keyboard focus,
+ * floating, so reading it moves nothing on the page.
+ */
+.ws-tip {
+  position: relative;
+  display: inline-flex;
+}
+
+.ws-tip-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 1.125rem;
+  height: 1.125rem;
+  padding: 0;
+  border: 1.5px solid var(--text-faint);
+  border-radius: var(--radius-pill);
+  background: none;
+  font-family: var(--font-display);
+  font-size: 0.625rem;
+  font-weight: var(--weight-bold);
+  line-height: 1;
+  color: var(--text-faint);
+  cursor: help;
+}
+
+.ws-tip:hover .ws-tip-mark,
+.ws-tip-mark:focus-visible {
+  border-color: var(--text-muted);
+  color: var(--text-muted);
+}
+
+.ws-tip-box {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  left: 50%;
+  z-index: 30;
+  width: max-content;
+  max-width: min(22rem, 80vw);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-lg);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  visibility: hidden;
+  opacity: 0;
+  transform: translateX(-50%);
+  transition: opacity 120ms ease;
+  pointer-events: none;
+}
+
+/* The gap between mark and tip, bridged so the pointer can travel onto the tip. */
+.ws-tip-box::before {
+  content: "";
+  position: absolute;
+  inset: calc(-1 * var(--space-2) - 1px) 0 auto;
+  height: var(--space-2);
+}
+
+.ws-tip:hover .ws-tip-box,
+.ws-tip:focus-within .ws-tip-box {
+  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ws-tip-box {
+    transition: none;
+  }
+}
+
+/* The leading line's reserved height was sized for the old band; a sentence needs only its own. */
+.ws-page > section[aria-label="Leading"] {
+  min-height: 2rem;
+}
+
+/* ------------------------------------------------------------------- controls -- */
+
+/* The mode tabs share the row between them, as a segmented control does, instead of huddling left. */
+.ws-tabs > .ui-tab {
+  flex: 1 1 0;
+  justify-content: center;
+}
+
+/*
+  The mode switch spans its card here. \`ui.css\` keeps it at its own width on purpose, for the two
+  pages that offer it in a flex row; in this card it is the card's whole subject, and three segments
+  huddled left of an empty track read as unfinished.
+*/
+.ws-page .ui-switch {
+  display: flex;
+  align-self: stretch;
+}
+
+.ws-page .ui-switch > * {
+  flex: 1 1 0;
+  justify-content: center;
+}
+
+.ws-page .ui-switch-seg-wrap > .ui-confirm,
+.ws-page .ui-switch-seg-wrap > .ui-confirm > .ui-button {
+  flex: 1 1 auto;
+  width: 100%;
+}
+
+/* ---------------------------------------------------------------- the exits' dialogs -- */
+
+/*
+  The leaving dialogs are portalled out of `.ws-page`, so these are standalone classes. A choice
+  that changes what is lost is a card of its own — a line saying what ticking does, the numbers
+  under it — not a checkbox lost in a paragraph.
+*/
+.ws-dialog-option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.ws-dialog-option:has(input:checked) {
+  border-color: var(--tone-danger-border);
+  background: var(--tone-danger-bg);
+}
+
+.ws-dialog-option > input {
+  margin-top: 0.2rem;
+}
+
+/* Work in flight: a calm tinted note, not orange text floating between two controls. */
+.ws-dialog-note {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--tone-paused-bg);
+  color: var(--tone-paused-fg);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+/* The answer row, drawn as the modal's own foot: full-bleed rule, right-aligned, the act last. */
+.ws-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin: var(--space-2) calc(-1 * var(--space-5)) 0;
+  padding: var(--space-4) var(--space-5) 0;
+  border-top: 1px solid var(--border);
+}
+
+/* The armed label's reserved width made "remove and forget" a box the width of the dialog. */
+.ws-dialog-actions .ui-confirm-stack > [aria-hidden="true"] {
+  display: none;
+}
+
+/* ------------------------------------------------------------------------------------ map -- */
+
+/* The map's lead is a door to the stamps when something is on the desk: a button, drawn as the line. */
+button.ws-lead-door {
+  align-self: flex-start;
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: start;
+  cursor: pointer;
+}
+
+button.ws-lead-door:hover {
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 3px;
+}
+
+/* An empty block that says what it would take, with the way to start at its trailing edge. */
+.ws-empty {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3) var(--space-4);
+  padding: var(--space-4);
+}
+
+/* Only "as I wanted" is green and only "part-way" amber (§5.2); every other figure keeps the ink. */
+.ws-verdict-settled {
+  color: var(--tone-active-fg);
+}
+
+.ws-verdict-partial {
+  color: var(--tone-paused-fg);
+}
+
+/* A row that opens its proof: a chevron that turns, not the browser's triangle. */
+.ws-disclosure > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  list-style: none;
+  cursor: pointer;
+}
+
+.ws-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.ws-disclosure > summary::after {
+  content: "";
+  flex: none;
+  width: 0.4rem;
+  height: 0.4rem;
+  margin-inline-start: auto;
+  border-right: 1.5px solid var(--text-faint);
+  border-bottom: 1.5px solid var(--text-faint);
+  transform: rotate(-45deg);
+  transition: transform 120ms ease;
+}
+
+.ws-disclosure[open] > summary::after {
+  transform: rotate(45deg);
+}
+
+/* The unit after a figure, at the size of the words around it. */
+.ws-unit {
+  margin-inline-start: 0.35em;
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-normal);
+  letter-spacing: 0;
+  color: var(--text-muted);
+}
+
+/* ------------------------------------------------------------ the atlas -- */
+
+/*
+  The map's architecture drawing: one graph per side, the seam between the two largest, and the
+  folders of a side layered so each row leans on the rows below. Each box is the size of its
+  drawing, so the Tauri host's eight files get a small box and not a column of empty space.
+*/
+.ws-atlas {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.ws-atlas-rest {
+  flex: 0 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.ws-atlas-col {
+  flex: 0 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: var(--space-3);
+  border-radius: 0.75rem;
+  background: var(--surface-raised);
+}
+
+.ws-atlas-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: 0 var(--space-1) var(--space-1);
+  font-size: var(--text-sm);
+}
+
+/*
+  Drawn at the size it was laid out at. Scaled to its column, fifteen folders came out with 8px
+  labels; a box that scrolls sideways on a narrow window is the lesser loss.
+*/
+.ws-atlas-graph {
+  display: block;
+  flex: none;
+  margin-inline: auto;
+  overflow: visible;
+}
+
+.ws-atlas-edge {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-linecap: round;
+  opacity: 0.28;
+  transition:
+    opacity 120ms ease,
+    stroke 120ms ease;
+}
+
+/* Against the grain: the lighter half of a two-way pair, or a cycle the rows had to cut. */
+.ws-atlas-edge[data-up="true"] {
+  stroke-dasharray: 4 4;
+}
+
+.ws-atlas-edge[data-state="uses"] {
+  stroke: var(--tone-info-fg);
+  opacity: 1;
+}
+
+.ws-atlas-edge[data-state="used-by"] {
+  stroke: var(--text-muted);
+  opacity: 1;
+}
+
+.ws-atlas-edge[data-state="far"] {
+  opacity: 0.08;
+}
+
+.ws-atlas-node {
+  cursor: pointer;
+  outline: none;
+  transition: opacity 120ms ease;
+}
+
+.ws-atlas-node > rect {
+  fill: var(--surface);
+  stroke: var(--border);
+  stroke-width: 1;
+  transition:
+    fill 120ms ease,
+    stroke 120ms ease;
+}
+
+.ws-atlas-node:hover > rect {
+  stroke: var(--border-strong);
+}
+
+.ws-atlas-node:focus-visible > rect {
+  stroke: var(--focus-ring);
+  stroke-width: 2;
+}
+
+.ws-atlas-node[data-state="chosen"] > rect {
+  fill: var(--surface-sunken);
+  stroke: var(--text);
+  stroke-width: 1.5;
+}
+
+.ws-atlas-node[data-state="uses"] > rect {
+  stroke: var(--tone-info-fg);
+}
+
+/* What leans on the chosen folder: told apart from what it uses by hue and a dashed edge. */
+.ws-atlas-node[data-state="used-by"] > rect {
+  stroke: var(--text-muted);
+  stroke-dasharray: 4 3;
+}
+
+.ws-atlas-node[data-state="far"] {
+  opacity: 0.35;
+}
+
+.ws-atlas-node-name {
+  fill: var(--text);
+  font-size: 13px;
+  font-weight: var(--weight-medium);
+}
+
+.ws-atlas-node-meta {
+  fill: var(--text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The tested share, as a hairline along the bottom of the node. */
+.ws-atlas-node-bar {
+  fill: var(--tone-active-fg);
+}
+
+.ws-atlas-seam {
+  flex: 0 0 auto;
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.125rem;
+  min-width: 5.5rem;
+  padding: var(--space-3) var(--space-2);
+  border: 1px dashed var(--border-strong);
+  border-radius: 0.75rem;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.ws-atlas-seam:hover,
+.ws-atlas-seam[aria-pressed="true"] {
+  border-color: var(--text-muted);
+  color: var(--text);
+}
+
+.ws-atlas-seam-kind {
+  font-family: var(--font-mono);
+  color: var(--text-faint);
+  letter-spacing: 0.04em;
+}
+
+.ws-atlas-seam-figure {
+  margin-top: var(--space-2);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.ws-atlas-broken {
+  margin-top: var(--space-2);
+  color: var(--tone-danger-fg);
+  font-weight: var(--weight-medium);
+}
+
+.ws-atlas-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-4);
+}
+
+.ws-atlas-links {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: var(--space-4);
+}
+
+.ws-atlas-link {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-1) 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: start;
+  cursor: pointer;
+}
+
+.ws-atlas-link:hover > :first-child {
+  text-decoration: underline;
+}
+
+.ws-atlas-find {
+  width: 100%;
+  max-width: 20rem;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+}
+
+.ws-atlas-files {
+  display: flex;
+  flex-direction: column;
+  max-height: 22rem;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.ws-atlas-files > li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-xs);
+}
+
+.ws-atlas-files > li + li {
+  border-top: 1px solid var(--border);
+}
+
+.ws-atlas-tested,
+.ws-atlas-untested {
+  flex: none;
+  margin-inline-start: auto;
+}
+
+.ws-atlas-tested {
+  color: var(--tone-active-fg);
+}
+
+.ws-atlas-untested {
+  color: var(--text-faint);
+}
+
+.ws-atlas-unread {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ws-atlas-unread > li {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+/*
+  The map keeps one left edge for the whole page: its section titles and footnotes sit on the
+  same line as the drawing and the rows under them, not a card's padding further in.
+*/
+.ws-map .ui-section-title,
+.ws-map .ws-foot {
+  padding-inline: 0;
+}
+
+/* The read-a-spec row: label, the spec, the brain and the act side by side. */
+.ws-read {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+.ws-read-label {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+.ws-read-pick {
+  flex: 1 1 18rem;
+  min-width: 0;
+  max-width: 28rem;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-field);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* Lines waiting on the owner: one container, a hairline between rows, the spec as a heading. */
+.ws-waiting {
+  display: flex;
+  flex-direction: column;
+  border-radius: 0.75rem;
+  background: var(--surface-raised);
+}
+
+.ws-waiting-group + .ws-waiting-group {
+  border-top: 1px solid var(--border);
+}
+
+.ws-waiting-spec {
+  margin: 0;
+  padding: var(--space-3) var(--space-4) var(--space-1);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.ws-waiting-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-2) var(--space-4);
+}
+
+.ws-waiting-row + .ws-waiting-row {
+  border-top: 1px solid var(--border);
+}
+
+.ws-waiting-kind {
+  padding: 0 var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.ws-waiting-more {
+  align-self: flex-start;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.ws-waiting-more:hover {
+  color: var(--text);
+}
+
+/* The map's header: the lead and when it was read, one tight block over the tabs. */
+.ws-map {
+  gap: var(--space-4);
+}
+
+.ws-map-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* Tabs at their own width: the page-wide stretch above is for the mode card, not a tab row. */
+.ws-map .ws-map-tabs {
+  display: inline-flex;
+  align-self: flex-start;
+}
+
+.ws-map .ws-map-tabs > * {
+  flex: none;
+}
+
+/**
+ * The architecture canvas: down to the bottom of the window, a dotted ground that moves with the
+ * drawing, and the drawing as a world that pans and zooms inside it.
+ */
+.ws-canvas {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background-color: var(--surface-sunken);
+  background-image: radial-gradient(circle, var(--border) 1px, transparent 1.2px);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.ws-canvas:active {
+  cursor: grabbing;
+}
+
+.ws-canvas-world {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: max-content;
+  transform-origin: 0 0;
+}
+
+.ws-canvas .ws-atlas {
+  flex-wrap: nowrap;
+}
+
+.ws-canvas .ws-atlas-col {
+  max-width: none;
+  overflow: visible;
+  border: 1px solid var(--border);
+}
+
+.ws-canvas-hint {
+  position: absolute;
+  left: var(--space-3);
+  bottom: var(--space-3);
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  pointer-events: none;
+}
+
+.ws-canvas-tools {
+  position: absolute;
+  top: var(--space-3);
+  left: var(--space-3);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  cursor: default;
+}
+
+.ws-canvas-tools > button {
+  min-width: 1.75rem;
+  height: 1.75rem;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.ws-canvas-tools > button:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.ws-canvas-tools > button:focus-visible,
+.ws-canvas-close:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.ws-canvas-zoom {
+  min-width: 3rem;
+  text-align: center;
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+
+/* The chosen folder, over the canvas on the right, scrolling on its own. */
+.ws-canvas-panel {
+  position: absolute;
+  top: var(--space-3);
+  right: var(--space-3);
+  bottom: var(--space-3);
+  width: min(26rem, calc(100% - 2 * var(--space-3)));
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--surface);
+  cursor: auto;
+  user-select: text;
+}
+
+.ws-canvas-panel > .ws-atlas-detail {
+  padding-right: var(--space-6);
+  background: none;
+}
+
+.ws-canvas-close {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  width: 1.75rem;
+  height: 1.75rem;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-muted);
+  font-size: var(--text-lg);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.ws-canvas-close:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+}

@@ -1477,7 +1477,7 @@ describe("Chats - choosing a model", () => {
     expect(screen.queryByRole("menuitem", { name: "On the agent CLI" })).toBeNull();
   });
 
-  it("shows a Codex model that needs a project with the hook wired as disabled, and says why", async () => {
+  it("offers a Codex model as a pickable row in a chat with no project", async () => {
     const base = chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
     daemon.apiFetch.mockImplementation(async (path, init) => {
       if (String(path).startsWith("/assistant/models/groups")) {
@@ -1496,6 +1496,8 @@ describe("Chats - choosing a model", () => {
           source: "fallback",
           catalogue_version: "2026-10-02",
           fetched_at: null,
+          // A daemon built before Codex chats ran over the MCP-only path still sends this key. The
+          // shell no longer reads it, so the row must stay pickable either way.
           needs_root: ["gpt-5.5"],
         };
       }
@@ -1506,15 +1508,14 @@ describe("Chats - choosing a model", () => {
     await openModelMenu();
     const gptMenu = await openModelSubmenu("GPT");
 
-    // Listed and closed rather than left out, and the reason is on the row itself.
-    const closed = await within(gptMenu).findByRole("menuitemradio", { name: /^GPT-5\.5/ });
-    expect(
-      closed.getAttribute("aria-disabled") === "true" || closed.getAttribute("data-disabled") !== null,
-    ).toBe(true);
-    expect(within(closed).getByText("needs a project with the hook wired")).toBeDefined();
-    // A sibling the daemon did not list under `needs_root` stays pickable.
-    const open = within(gptMenu).getByRole("menuitemradio", { name: /^GPT-5\.4/ });
-    expect(open.getAttribute("aria-disabled")).toBeNull();
+    // A Codex row is an ordinary row now: no project is needed to pick it, and no reason is on it.
+    const codex = await within(gptMenu).findByRole("menuitemradio", { name: /^GPT-5\.5/ });
+    expect(codex.getAttribute("aria-disabled")).toBeNull();
+    expect(codex.getAttribute("data-disabled")).toBeNull();
+    expect(screen.queryByText("needs a project with the hook wired")).toBeNull();
+    // Its sibling is pickable as before.
+    const sibling = within(gptMenu).getByRole("menuitemradio", { name: /^GPT-5\.4/ });
+    expect(sibling.getAttribute("aria-disabled")).toBeNull();
   });
 
   it("keeps the model and the effort as two controls, not one inside the other", async () => {

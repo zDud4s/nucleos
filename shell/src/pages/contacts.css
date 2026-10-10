@@ -39,9 +39,12 @@
   font-style: italic;
 }
 
+/* Body type, not mono: this line is counts and relative times, prose with numbers in
+   it. Tabular figures keep the digits from jittering as the times tick over. */
 .contacts-meta {
   margin: 0;
-  font-family: var(--font-mono);
+  font-family: var(--font-body);
+  font-variant-numeric: tabular-nums;
   font-size: var(--text-xs);
   color: var(--text-faint);
   overflow-wrap: anywhere;
@@ -100,19 +103,17 @@
 }
 
 /**
- * Which question this is — "question #21".
+ * Who the question is about — "Ana Silva ↔ Ana S.", else the first addresses.
  *
- * Mono because the number is the daemon's, and a neutral rung because it is an
- * identifier. It was `--accent`, which is the one colour in this system that
- * means nothing: the wordmark, links and the focus ring, and nothing else. An
- * id painted in it reads as a link that does not navigate — the same correction
- * `.waiting-card-id` already carries, on the same number from the same table.
+ * It was "question #21", the daemon's number, which told nobody anything: the
+ * pair is the question. Body type in the primary rung, since it names people and
+ * is not an identifier.
  */
-.contacts-question-id {
-  font-family: var(--font-mono);
+.contacts-question-who {
   font-size: var(--text-sm);
-  color: var(--text-muted);
-  white-space: nowrap;
+  font-weight: var(--weight-medium);
+  color: var(--text);
+  overflow-wrap: anywhere;
 }
 
 .contacts-merge {
@@ -166,13 +167,6 @@
   overflow-wrap: anywhere;
 }
 
-/* Said before either button, not discovered after: refusing is permanent. */
-.contacts-permanent {
-  margin: 0;
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
 /* ===================================================================== roster == */
 
 /**
@@ -210,10 +204,9 @@
   min-width: 0;
 }
 
-/* Initials in a cyan disc — the owner's call (2026-10-05), and a deliberate
-   exception to the accent being kept for the wordmark, links and focus: the
-   disc is the contact's mark, not a state. `--accent-ink` is the token made for
-   text on an accent fill, and both are redefined for the light theme. */
+/* Initials in a neutral disc. It was cyan (owner's call, 2026-10-05) and the
+   owner took that back on 2026-10-09: seven identical cyan discs were the
+   loudest thing on the page and said nothing about anyone. */
 .contacts-avatar {
   flex: none;
   display: inline-flex;
@@ -222,8 +215,9 @@
   width: 2.5rem;
   height: 2.5rem;
   border-radius: var(--radius-pill);
-  background: var(--accent);
-  color: var(--accent-ink);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   letter-spacing: 0.02em;
@@ -236,7 +230,13 @@
   min-width: 0;
 }
 
+/* Two lines at most, so one long name cannot make its card taller than the rest of
+   the row (the full name is in the `title`). The address below is never clipped. */
 .contacts-card-name {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);
   color: var(--text);
@@ -254,11 +254,41 @@
 .contacts-card-badges {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: var(--space-1);
 }
 
-/* Two `.contacts-actions` groups; the wider gap says which buttons belong
-   to which, and the rule sets the controls apart from the profile. */
+/* Small and text-weight, so it reads as part of the badge line. The padding is a hit
+   area, not part of the look: the matching negative margin keeps the words themselves
+   on the badge column when the button wraps onto a line of its own. */
+.contacts-unmerge {
+  margin-inline-start: calc(-1 * var(--space-2));
+}
+
+.contacts-unmerge .ui-button {
+  min-height: 1.25rem;
+  padding: 0 var(--space-2);
+  font-size: var(--text-xs);
+}
+
+/* A verdict or unmerge that failed, said once above the grid so no card grows. */
+.contacts-problem {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.contacts-problem > .ui-note {
+  margin: 0;
+}
+
+/* The verdict buttons, pinned to the card's foot; the rule sets the controls
+   apart from the profile. */
 .contacts-card-actions {
   display: flex;
   flex-wrap: wrap;
@@ -267,4 +297,71 @@
   margin-top: auto;
   padding-top: var(--space-3);
   border-top: 1px solid var(--border);
+}
+
+/* ============================================================ quiet line == */
+
+.contacts-quiet-says {
+  position: relative;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: help;
+}
+
+.contacts-quiet-says:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+  color: var(--text);
+}
+
+/* The tip is a transparent bridge: its top padding is the gap, drawn as part of the
+   tip, so the pointer can travel from the text onto the box without the hover being
+   lost. Hidden with `visibility` rather than `display`, so it stays in the
+   accessibility tree as the text's description. The box look is the inner span's. */
+.contacts-quiet-tip {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  width: max-content;
+  max-width: min(24rem, 80vw);
+  padding-top: var(--space-2);
+  cursor: auto;
+  visibility: hidden;
+  opacity: 0;
+}
+
+/* Reset what the tip would inherit from a badge it can sit inside. */
+.contacts-quiet-tip-box {
+  display: block;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-lg);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
+  letter-spacing: normal;
+  line-height: var(--leading-snug);
+  text-align: left;
+  text-transform: none;
+  white-space: normal;
+}
+
+.contacts-quiet-says:hover > .contacts-quiet-tip,
+.contacts-quiet-says:focus-visible > .contacts-quiet-tip {
+  visibility: visible;
+  opacity: 1;
+  transition: opacity 120ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .contacts-quiet-tip,
+  .contacts-quiet-says:hover > .contacts-quiet-tip,
+  .contacts-quiet-says:focus-visible > .contacts-quiet-tip {
+    transition: none;
+  }
 }

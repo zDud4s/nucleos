@@ -1,4 +1,5 @@
 import { Link } from "@tanstack/react-router";
+import type { CSSProperties } from "react";
 import {
   compactTokens,
   efficiencyTrend,
@@ -81,7 +82,7 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
   const leading = leadingConcern(concerns);
 
   return (
-    <div className="flex flex-col gap-8">
+    <div className="ws-page">
       <Leading
         concern={leading}
         project={projectId}
@@ -101,31 +102,40 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
         <Branches projectId={projectId} />
       </Section>
 
-      <Section label="Workflow">
-        <WorkflowSummary projectId={projectId} />
-      </Section>
-
-      <Section label="Commands">
-        <Commands projectId={projectId} />
-      </Section>
-
       {/*
-        The two halves of the write boundary, at the bottom and in this order: what the app authors
-        in the database, then what it authors on disk. Last because the sections above answer *how
-        is this now* and these two answer *what can I do to it* — and the top of this page is
-        state-dependent by design, so the settled things belong furthest from it.
+        The one live control on the page, straight after what is happening: whether this project
+        acts on its own. It used to sit below Workflow and Commands, two lines that are nearly
+        always "none", so the switch that matters most was the seventh thing down.
       */}
       <Section label="Settings">
         <Settings projectId={projectId} />
       </Section>
 
-      <Section label="Files the app owns">
-        <OwnedFiles projectId={projectId} />
-      </Section>
+      {/*
+        Four facts about how the project is set up, and one group for all of them. Each was its own
+        uppercase-titled section with its own "why?" — four headings for four lines that mostly say
+        "none". As rows of one grouped list they read as what they are: a checklist.
+      */}
+      <div className="ws-stack">
+        <h2 className="ws-title">Setup</h2>
+        <div className="ws-group ws-setup">
+          <Section label="Workflow">
+            <WorkflowSummary projectId={projectId} />
+          </Section>
 
-      <Section label="Test map">
-        <TestsMap projectId={projectId} />
-      </Section>
+          <Section label="Commands">
+            <Commands projectId={projectId} />
+          </Section>
+
+          <Section label="Files the app owns">
+            <OwnedFiles projectId={projectId} />
+          </Section>
+
+          <Section label="Test map">
+            <TestsMap projectId={projectId} />
+          </Section>
+        </div>
+      </div>
 
       {/*
         Last, and below everything, because it holds the only thing on this page that cannot be
@@ -139,10 +149,12 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
           stale read would act on a project nobody can say is still there, and the panel needs the
           recorded root to say where the folder stays. Gone rather than disabled, as the roster did.
         */}
-        {project !== undefined && !(projects.isError && projects.data !== undefined) && (
-          <LeaveRoster projectId={projectId} projectRoot={project.project_root} />
-        )}
-        <DeleteFolder projectId={projectId} />
+        <div className="ws-group ws-leaving">
+          {project !== undefined && !(projects.isError && projects.data !== undefined) && (
+            <LeaveRoster projectId={projectId} projectRoot={project.project_root} />
+          )}
+          <DeleteFolder projectId={projectId} />
+        </div>
       </Section>
     </div>
   );
@@ -213,10 +225,15 @@ function Leading({
           {stale}
         </>
       ) : (
+        /*
+          One line, not a band. The tinted block this replaced was the loudest thing on the page and
+          the owner hated it: the concern is a sentence with a dot in its tone, and a count is a
+          link to the queue — weight by position and type, not by a filled surface.
+        */
         <div
           role="status"
-          className="rounded-lg border bg-surface-raised p-5"
-          style={{ borderColor: `var(--tone-${tone}-border)` }}
+          className="ws-lead"
+          style={{ "--ws-lead-tone": `var(--tone-${tone}-fg)` } as CSSProperties}
         >
           {/*
             A count is the one concern with somewhere to go: those proposals are rows in the
@@ -225,20 +242,15 @@ function Leading({
             paragraph — a link that led nowhere would be a promise the page cannot keep.
           */}
           {concern.count === null ? (
-            <p className="font-display text-xl font-medium leading-snug text-text">
-              {CONCERN_TEXT[concern.kind]}
-            </p>
+            <p className="ws-lead-line">{CONCERN_TEXT[concern.kind]}</p>
           ) : (
-            <Link
-              to="/waiting"
-              search={{ project }}
-              className="font-display text-xl font-medium leading-snug"
-            >
+            <Link to="/waiting" search={{ project }} className="ws-lead-line ws-lead-door">
               {concern.count} {concern.count === 1 ? "decision" : "decisions"} waiting on you.
+              <span aria-hidden="true" className="ws-chevron" />
             </Link>
           )}
           {concern.kind === "budget-paused" && budgetReason !== null ? (
-            <p className="mt-2 text-sm text-text-muted">{budgetReason}</p>
+            <p className="ws-foot">{budgetReason}</p>
           ) : null}
           {stale}
         </div>
@@ -276,7 +288,7 @@ function Readings({ projectId }: { projectId: string }) {
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="ws-metrics">
         <GateReading data={data} />
         <DeliveredReading data={data} />
         <CostReading data={data} />

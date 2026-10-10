@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
+import { routeTriple, useRouteReport, type RoutePair } from "../data/route";
 import {
   scopeEngaged,
   useScopedKills,
@@ -231,6 +232,7 @@ function HealthView({
   return (
     <>
       <HealthReadoutPanel health={health} />
+      <RouterReportPanel />
       <SidecarCardsPanel sidecars={sidecars} />
       {/* Side by side when there is room: neither needs the page's full width,
           and stacked they made the health view three screens long. */}
@@ -268,6 +270,82 @@ function HealthReadoutPanel({
             <SubsystemRow key={row.name} row={row} />
           ))}
         </ul>
+      )}
+    </Panel>
+  );
+}
+
+/** One side of a pair as `runner · model · effort`, skipping what is unknown. */
+function pairLabel(runner: string | null, model: string | null, effort: string | null): string {
+  return routeTriple([runner, model, effort]) ?? "unknown";
+}
+
+/**
+ * The llm-router over the last thirty days: how much it saw, how often its
+ * advice matched what ran, and the pairings that account for the difference.
+ *
+ * It lives here and not on Runs because it answers a different question. It
+ * reports on every routed run of the window, ignores the Runs page's filters,
+ * and serves a config decision: is `shadow` ready to become `apply`, per
+ * surface, in `router.yaml` (`core/src/route_report.rs`)? That sits beside the
+ * subsystems readout and its `llm_router` row, not above a list of runs.
+ *
+ * The words are the router's own and are spelt out because the Runs page has a
+ * run *mode* called "shadow" too (plan mode, no relation): here shadow is "advice
+ * only" and apply is "advice applied", with the raw word kept in parentheses so
+ * it still matches the file being edited.
+ *
+ * Nothing at all while loading, on any failure (a 404 from an older daemon is
+ * one) or when no run was routed: an empty panel would claim a router that has
+ * not spoken.
+ */
+function RouterReportPanel() {
+  const report = useRouteReport();
+  const data = report.data;
+  if (report.isError || data === undefined || data.runs <= 0) return null;
+  // Among shadow runs with advice only: an apply run launched its advice and cannot disagree.
+  const shadowAdvised = data.shadow_advised;
+  const rate = shadowAdvised > 0 ? `${Math.round((data.matched / shadowAdvised) * 100)}%` : "n/a";
+  const pairs: RoutePair[] = data.pairs.slice(0, 5);
+  const totals: readonly { label: string; value: string }[] = [
+    { label: "Routed runs", value: String(data.runs) },
+    { label: "Advice only (shadow)", value: String(data.shadow) },
+    { label: "Advice applied (apply)", value: String(data.apply) },
+    { label: "With advice", value: String(data.advised) },
+    { label: "Match rate", value: rate },
+  ];
+  return (
+    <Panel title={`Router (last ${String(data.days)} days)`}>
+      <dl className="sy-router-totals">
+        {totals.map((total) => (
+          <div key={total.label} className="sy-router-total">
+            <dt>{total.label}</dt>
+            <dd>{total.value}</dd>
+          </div>
+        ))}
+      </dl>
+      {pairs.length > 0 && (
+        <table className="sy-router-pairs">
+          <caption className="sy-router-caption">Ran → advised</caption>
+          <thead>
+            <tr>
+              <th scope="col">Pair</th>
+              <th scope="col">Runs</th>
+              <th scope="col">Passed</th>
+              <th scope="col">Failed</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pairs.map((pair, index) => (
+              <tr key={index}>
+                <td>{`${pairLabel(pair.runner, pair.model, pair.effort)} → ${pairLabel(pair.advised_runner, pair.advised_model, pair.advised_effort)}`}</td>
+                <td>{pair.runs}</td>
+                <td>{pair.passed}</td>
+                <td>{pair.failed}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       )}
     </Panel>
   );

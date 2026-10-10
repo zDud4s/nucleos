@@ -1,8 +1,8 @@
 // §spec mapa-do-projeto
-import { useState } from "react";
+import { useId, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useExtractSpec, useProjectSpecs, type Brain } from "../data/project-map";
-import { ErrorNote, Section } from "../ui";
+import { Button, ErrorNote } from "../ui";
 
 /**
  * Choosing what gets read, and by whom.
@@ -38,25 +38,20 @@ export interface ExtractSpecProps {
  * teaches somebody the feature is broken when what happened is that a promise was kept.
  *
  * It costs money, and that is why the choice is never silent: the pressed button says which brain
- * is chosen, the sentence under the pair says what that brain does with the document, and the
+ * is chosen, the line under the row says the cloud read is billed whenever cloud is chosen, and the
  * button that starts the read names the brain in its own label. Nothing about it is discovered
  * afterwards.
  */
 const BRAINS: Brain[] = ["cloud", "local"];
 
-const BRAIN_MEANING: Record<Brain, string> = {
-  cloud: "The cloud brain reads it through the CLI installed on this machine. The document leaves the machine, and the read is billed.",
-  // Deliberately not the words the 503 uses. The refusal's sentence has to be the ONLY place those
-  // words can come from, or a test asserting on them would pass against a surface that never said
-  // it — which is how the one property this feature exists to show would ship unguarded.
-  local: "The local brain reads it through the model on this machine. Nothing leaves and nothing is billed — and where no such model is set up, the núcleo refuses rather than quietly reading it in the cloud instead.",
-};
+const CLOUD_COST = "Cloud: the document leaves this machine, and the read is billed.";
 
 export function ExtractSpec({ projectId }: ExtractSpecProps) {
   const specs = useProjectSpecs(projectId);
   const extract = useExtractSpec(projectId);
   const [chosen, setChosen] = useState<string | null>(null);
   const [brain, setBrain] = useState<Brain>("cloud");
+  const pickId = useId();
 
   if (specs.isError) {
     return (
@@ -93,101 +88,71 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
   }
 
   return (
-    <Section label="Read a spec">
-      <p className="max-w-prose text-sm text-text-muted">
-        One model reads one document and proposes the decisions it fixes. Nothing it proposes enters
-        the map: the list lands below and waits for you to answer it, line by line.
-      </p>
-
+    <section aria-label="Read a spec" className="flex flex-col gap-2">
       {/*
-        By name, and never a box to type one into. Nobody is expected to remember
+        One row: what is read, by whom, and the act. It was a scrolling list of every spec, a brain
+        switch under it and the button alone at the far edge — three rows for one decision.
+        Still by name, and never a box to type one into: nobody is expected to remember
         `2026-08-24-mapa-do-projeto-design`, and a typed slug that matches nothing is a 404 that
         looks exactly like a document that is not there.
       */}
-      <div
-        role="group"
-        aria-label="Specs"
-        className="flex max-h-64 flex-col gap-1 overflow-y-auto rounded-md border border-border bg-surface-sunken p-2"
-      >
-        {specs.data.map((slug) => (
-          <button
-            key={slug}
-            type="button"
-            aria-pressed={slug === chosen}
-            disabled={extract.isPending}
-            onClick={() => setChosen(slug)}
-            /*
-              `shrink-0`, and without it this list is blank.
-
-              The box is a flex column with `max-h-64` and `overflow-y-auto`, and
-              a flex item shrinks before its parent scrolls. Fourteen rows in
-              240px of room came out 13px tall each — under one line of 15px
-              text — and `truncate` brought `overflow: hidden` with it, so every
-              row clipped its own name away and the picker rendered as fourteen
-              empty slabs that could not be scrolled either. Measured in the
-              browser: it is why nothing here could be chosen.
-
-              Not a `max-h` to fight over: the height is the design, the rows
-              are what must keep theirs and let the box scroll.
-            */
-            /*
-              Chosen is `.ui-current` — a 2px rule on the leading edge — and nothing else.
-
-              It was an accent border over a raised fill, which is the Reserved Cyan Rule broken for
-              a selection and, worse, a mark that only worked in one theme: `--surface` and
-              `--surface-raised` are both `#ffffff` in light, so the fill said nothing there. The
-              border also made the chosen row a pixel wider than its siblings, which is a list that
-              twitches as you arrow down it.
-            */
-            className={
-              slug === chosen
-                ? "ui-current shrink-0 truncate rounded-sm px-2 py-1 text-left font-mono text-xs text-text"
-                : "shrink-0 truncate rounded-sm px-2 py-1 text-left font-mono text-xs text-text-muted enabled:hover:text-text disabled:opacity-40"
-            }
-          >
-            {slug}
-          </button>
-        ))}
-      </div>
-
-      <div role="group" aria-label="Which brain reads it" className="flex flex-wrap gap-2">
-        {BRAINS.map((candidate) => (
-          <button
-            key={candidate}
-            type="button"
-            aria-pressed={candidate === brain}
-            disabled={extract.isPending}
-            onClick={() => setBrain(candidate)}
-            className={
-              candidate === brain
-                ? "ui-current rounded-md border border-border px-3 py-1.5 text-sm text-text"
-                : "rounded-md border border-border px-3 py-1.5 text-sm text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
-            }
-          >
-            {candidate}
-          </button>
-        ))}
-      </div>
-      <p className="max-w-prose text-xs text-text-faint">{BRAIN_MEANING[brain]}</p>
-
-      <div className="flex flex-wrap items-center gap-3">
+      <div className="ws-read">
+        <label className="ws-read-label" htmlFor={pickId}>
+          Read a spec
+        </label>
+        <select
+          id={pickId}
+          className="ws-read-pick"
+          value={chosen ?? ""}
+          disabled={extract.isPending}
+          onChange={(event) => setChosen(event.target.value === "" ? null : event.target.value)}
+        >
+          <option value="">Choose one of {specs.data.length}…</option>
+          {specs.data.map((slug) => (
+            <option key={slug} value={slug}>
+              {slug}
+            </option>
+          ))}
+        </select>
+        <div role="group" aria-label="Which brain reads it" className="ui-switch">
+          {BRAINS.map((candidate) => (
+            <button
+              key={candidate}
+              type="button"
+              aria-pressed={candidate === brain}
+              disabled={extract.isPending}
+              onClick={() => setBrain(candidate)}
+              className={
+                candidate === brain
+                  ? "ui-switch-seg bg-surface-raised! text-text!"
+                  : "ui-switch-seg"
+              }
+            >
+              {candidate}
+            </button>
+          ))}
+        </div>
         {/*
-          The label names both halves of what is about to happen. A button reading "extract" would
-          leave the brain — the expensive half, and the half the owner asked to control — visible
-          only in a pressed state three lines above it.
+          The label names the brain, the expensive half and the half the owner asked to control —
+          a button reading "extract" would leave it visible only in a pressed state beside it. Its
+          accessible name carries the document too, which the select beside it shows only by eye.
         */}
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          aria-label={`read ${chosen ?? "the chosen spec"} with the ${brain} brain`}
           disabled={chosen === null || extract.isPending}
           onClick={() => {
             if (chosen === null) return;
             extract.mutate({ specSlug: chosen, brain });
           }}
-          className="rounded-md border border-border px-3 py-1.5 text-sm text-text enabled:hover:border-border-strong disabled:opacity-40"
         >
-          read {chosen ?? "the chosen spec"} with the {brain} brain
-        </button>
+          read with the {brain} brain
+        </Button>
       </div>
+      {/* Only the brain that costs something says so; the local one has nothing to warn about. */}
+      {brain === "cloud" ? (
+        <p className="m-0 max-w-prose text-xs text-text-faint">{CLOUD_COST}</p>
+      ) : null}
 
       {/*
         The wait, said out loud. `POST /map/extract` is synchronous on purpose — the owner pressed a
@@ -216,7 +181,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
             : `Read. ${extract.data.length} ${extract.data.length === 1 ? "line is" : "lines are"} waiting below, this document's among them, and not one of them is in the map until you answer it.`}
         </p>
       ) : null}
-    </Section>
+    </section>
   );
 }
 
@@ -234,7 +199,11 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
  */
 function Failed({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>The núcleo did not answer, so nothing was read and nothing was recorded.</ErrorNote>;
+    return (
+      <ErrorNote>
+        The núcleo did not answer, so nothing was read and nothing was recorded.
+      </ErrorNote>
+    );
   }
 
   const sentence =

@@ -2,7 +2,7 @@
 import { useMemo, type ReactNode } from "react";
 import type { ForeignFile, MapImport, MapModule, Seam } from "../data/project-map";
 import { buildSides, isBlindSpot, type Sides, type Unread } from "./map-sides";
-import { Button, Quiet, Row, Rows } from "../ui";
+import { Button, Quiet, Row, Rows, StatCard } from "../ui";
 
 /**
  * What this reading found, and what it could not see — above every view of the map.
@@ -104,19 +104,29 @@ export function Boundary({
   const wrong = findings.filter((finding) => finding.weight === "wrong").length;
   const limits = findings.filter((finding) => finding.weight === "limit").length;
 
+  /*
+    What is in here first — one card per side, the size of each — and then the verdict over it with
+    one row per exception. The verdict used to open the page at display size, so the first thing the
+    map said about a project was "1 finding", before it had said what the project is.
+  */
   return (
-    <section aria-label="What this reading found" className="flex flex-col gap-3">
-      <div className="flex flex-col gap-1">
+    <section aria-label="What this reading found" className="flex flex-col gap-4">
+      {meta}
+      <SidesLine sides={sides} seam={seam} />
+
+      <div className="flex flex-col gap-2">
         {/*
           The verdict. It counts tripwires only — a number that must be zero and is not — and says
           "checks" rather than "is fine": this reading measures a handful of things, and a line
           claiming the project is healthy would be a green nobody earned.
         */}
-        <p className="m-0 font-display text-lg font-semibold text-text">
+        <p className="m-0 text-base font-medium text-text">
+          {/* Only the count wears the tone. The rows below already say each fault in red. */}
           {wrong > 0 ? (
-            <span className="ui-wrong">
-              {wrong} {plural(wrong, "finding", "findings")} on this reading
-            </span>
+            <>
+              <span className="ui-wrong">{wrong}</span> {plural(wrong, "finding", "findings")} on
+              this reading
+            </>
           ) : (
             "Nothing this reading checks came back wrong"
           )}
@@ -127,30 +137,27 @@ export function Boundary({
             </span>
           ) : null}
         </p>
-        {meta}
+
+        {findings.length === 0 ? null : (
+          <Rows label="Exceptions on this reading">
+            {findings.map((finding) => (
+              <Row key={finding.key} layout="line" dense>
+                {finding.detail === undefined ? (
+                  <span className="min-w-0 flex-1 text-sm">{finding.line}</span>
+                ) : (
+                  <details className="ws-disclosure min-w-0 flex-1 text-sm">
+                    <summary>{finding.line}</summary>
+                    <div className="mt-2 flex max-w-prose flex-col gap-2 text-xs text-text-muted">
+                      {finding.detail}
+                    </div>
+                  </details>
+                )}
+                {finding.action}
+              </Row>
+            ))}
+          </Rows>
+        )}
       </div>
-
-      {findings.length === 0 ? null : (
-        <Rows label="Exceptions on this reading">
-          {findings.map((finding) => (
-            <Row key={finding.key} layout="line" dense>
-              {finding.detail === undefined ? (
-                <span className="min-w-0 flex-1 text-sm">{finding.line}</span>
-              ) : (
-                <details className="min-w-0 flex-1 text-sm">
-                  <summary className="cursor-pointer">{finding.line}</summary>
-                  <div className="mt-2 flex max-w-prose flex-col gap-2 text-xs text-text-muted">
-                    {finding.detail}
-                  </div>
-                </details>
-              )}
-              {finding.action}
-            </Row>
-          ))}
-        </Rows>
-      )}
-
-      <SidesLine sides={sides} seam={seam} />
     </section>
   );
 }
@@ -176,9 +183,9 @@ function collect(
       detail: (
         <>
           <p className="m-0">
-            Nothing should be able to: a Rust file cannot import a TypeScript module, and the
-            núcleo resolves an import only inside the file&apos;s own folder. So the map&apos;s rule
-            for what a side is is wrong for these files, not your code — report it with this list.
+            Nothing should be able to: a Rust file cannot import a TypeScript module, and the núcleo
+            resolves an import only inside the file&apos;s own folder. So the map&apos;s rule for
+            what a side is is wrong for these files, not your code — report it with this list.
           </p>
           <ImportList lines={sides.crossings} label="Imports that cross between sides" />
         </>
@@ -199,8 +206,8 @@ function collect(
       detail: (
         <>
           <p className="m-0">
-            The núcleo only sends imports between files it listed, so this says its two halves
-            have drifted. Report it with this list.
+            The núcleo only sends imports between files it listed, so this says its two halves have
+            drifted. Report it with this list.
           </p>
           <ImportList lines={sides.strays} label="Imports with an end on no listed file" />
         </>
@@ -221,8 +228,8 @@ function collect(
       detail: (
         <>
           <p className="m-0">
-            A screen asking for a route nobody serves compiles, ships, and fails in front of
-            whoever opens it. Each line is the path it asks for and where it asks.
+            A screen asking for a route nobody serves compiles, ships, and fails in front of whoever
+            opens it. Each line is the path it asks for and where it asks.
           </p>
           <ul
             aria-label="Calls to a route nobody serves"
@@ -295,8 +302,7 @@ function collect(
       weight: "limit",
       line: (
         <span className="text-text-muted">
-          This daemon does not report the boundary, so what runs between these sides is unread
-          here.
+          This daemon does not report the boundary, so what runs between these sides is unread here.
         </span>
       ),
     });
@@ -385,26 +391,39 @@ function SidesLine({ sides, seam }: { sides: Sides; seam: Seam | undefined }) {
     .filter((part) => part !== null)
     .join(" ");
 
+  /*
+    One card per side, in the strip the State page's readings use: the folder is the label, its
+    files the figure, the rest one line under it. A wrapping line of prose was where the two halves
+    of the product were introduced, at the size of a footnote.
+  */
   return (
-    <div className="flex flex-col gap-1">
-      <ul
-        aria-label="The sides of this project"
-        className="m-0 flex list-none flex-wrap gap-x-6 gap-y-1 p-0 text-xs text-text-muted"
-      >
+    <div className="flex flex-col gap-2">
+      <div role="list" aria-label="The sides of this project" className="ws-metrics">
         {sides.sides.map((side) => (
-          <li key={side.key}>
-            <span className="font-display text-sm text-text">{side.folder}</span>{" "}
-            <span className="text-text-faint">{side.reader}</span> · {side.files}{" "}
-            {plural(side.files, "file", "files")} · {side.imports}{" "}
-            {plural(side.imports, "import", "imports")} inside · {side.tested} tested ·{" "}
-            <span title="Of the files naming a section, the ones whose header says which document it belongs to.">
-              {side.citing === 0
-                ? "nothing here cites a section"
-                : `${side.declared} of ${side.citing} say which document`}
-            </span>
-          </li>
+          <div role="listitem" key={side.key} className="contents">
+            <StatCard
+              label={side.folder}
+              value={
+                <>
+                  {side.files}
+                  <span className="ws-unit">{plural(side.files, "file", "files")}</span>
+                </>
+              }
+              detail={
+                <>
+                  <span>{side.reader}</span> · {side.tested} tested · {side.imports}{" "}
+                  {plural(side.imports, "import", "imports")} inside ·{" "}
+                  <span title="Of the files naming a section, the ones whose header says which document it belongs to.">
+                    {side.citing === 0
+                      ? "nothing here cites a section"
+                      : `${side.declared} of ${side.citing} say which document`}
+                  </span>
+                </>
+              }
+            />
+          </div>
         ))}
-      </ul>
+      </div>
       {says === "" ? null : (
         <Quiet says={says}>
           <SeamWhy sides={sides} seam={served} />
@@ -434,9 +453,9 @@ function SeamWhy({ sides, seam }: { sides: Sides; seam: Seam | null }) {
       {seam === null ? null : (
         <>
           <p className="m-0">
-            Matching is a measurement and not a property: it is checked every time this is read,
-            and the day somebody renames a route without renaming its caller it stops being true
-            here first.
+            Matching is a measurement and not a property: it is checked every time this is read, and
+            the day somebody renames a route without renaming its caller it stops being true here
+            first.
           </p>
           {seam.computed.length > 0 ? (
             <SiteList

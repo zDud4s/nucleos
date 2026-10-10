@@ -13053,9 +13053,6 @@ async fn post_project_judge(
                     "nothing on this daemon's model menu is called `{model}`"
                 )));
             }
-            Err(BrainRefusal::NeedsRoot) => {
-                return Err(unusable_judge(CODEX_NEEDS_A_ROOT.to_string()));
-            }
             // `can_serve`'s own words, carried through rather than summarised — it is the layer that
             // knows WHY, and the two cases that reach here are the ordinary ones: a local model
             // this machine has not pulled, and a hosted model named with no key stored.
@@ -13266,7 +13263,7 @@ async fn create_chat(
     // precedence `patch_chat` applies, for the same reason: a row saying `local` while naming a
     // cloud model would be sent to Ollama under a name it has never heard.
     let brain = match body.model.as_deref() {
-        Some(id) => chosen_brain(&state, id, Asking::Chat { rooted: false }).await?,
+        Some(id) => chosen_brain(&state, id, Asking::Chat).await?,
         None => crate::chats::Brain::from_wire(body.brain.as_deref().unwrap_or("cloud")),
     };
     // Checked before the row exists, so a bad level leaves no conversation behind to explain. The
@@ -13770,7 +13767,7 @@ async fn menu(
     };
     let choices = match asking {
         Asking::Daemon => config.catalogue_with_installed(&installed),
-        Asking::Chat { rooted } => config.catalogue_for_chat(&installed, rooted),
+        Asking::Chat => config.catalogue_for_chat(&installed),
     };
     (config, choices)
 }
@@ -13779,8 +13776,6 @@ async fn menu(
 enum BrainRefusal {
     /// No catalogue entry — the current `menu()`, installed models included — names this id.
     UnknownModel,
-    /// A Codex model needs a rooted conversation with its classifier hook wired.
-    NeedsRoot,
     /// The id names a real choice, but this machine cannot serve what it names —
     /// `Assistants::can_serve`'s own reason, carried verbatim into the refusal body of both
     /// doors that ask — opening a conversation and re-pointing one — so somebody who picked a
@@ -13788,24 +13783,21 @@ enum BrainRefusal {
     CannotServe(String),
 }
 
-/// The reason Codex cannot answer an unrooted conversation.
-const CODEX_NEEDS_A_ROOT: &str =
-    "A Codex model answers only a conversation rooted in a project whose classifier hook is wired.";
-
 /// The caller whose available models are being selected.
 #[derive(Clone, Copy, Debug)]
 enum Asking {
     /// The daemon's project-independent model menu.
     Daemon,
-    /// A chat menu constrained by whether the conversation is rooted.
-    Chat { rooted: bool },
+    /// A chat menu: any chat, rooted or not, may use either CLI.
+    Chat,
 }
 
-/// Whether the asker is a rooted chat: `None` for the daemon's own menu.
+/// Whether the asker may use either CLI: `None` for the daemon's own menu, which follows the
+/// active runner.
 fn rooted_of(asking: Asking) -> Option<bool> {
     match asking {
         Asking::Daemon => None,
-        Asking::Chat { rooted } => Some(rooted),
+        Asking::Chat => Some(true),
     }
 }
 
@@ -13850,18 +13842,9 @@ async fn chosen_brain_in(
     id: &str,
     asking: Asking,
 ) -> Result<crate::chats::Brain, BrainRefusal> {
-    if matches!(asking, Asking::Chat { rooted: false })
-        && config
-            .runner_of(id)
-            .or_else(|| crate::models::model_catalog::runner_by_id(id))
-            == Some("codex")
-    {
-        return Err(BrainRefusal::NeedsRoot);
-    }
-
     let cheap_choices = match asking {
         Asking::Daemon => config.catalogue(),
-        Asking::Chat { rooted } => config.catalogue_for_chat(&[], rooted),
+        Asking::Chat => config.catalogue_for_chat(&[]),
     };
     let brain = if let Some(choice) = cheap_choices.into_iter().find(|choice| choice.id == id) {
         crate::chats::Brain::from_wire(&choice.brain)
@@ -13921,15 +13904,7 @@ async fn get_assistant_models(
     Query(query): Query<ModelsQuery>,
 ) -> Json<serde_json::Value> {
     let asking = match query.chat {
-        Some(chat_id) => Asking::Chat {
-            rooted: crate::assistant::may_answer_on_codex(
-                crate::chats::cwd_of(&state.pool, &chat_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .as_deref(),
-            ),
-        },
+        Some(_) => Asking::Chat,
         None => Asking::Daemon,
     };
     let (config, choices) = menu(asking).await;
@@ -13996,22 +13971,10 @@ async fn get_latest_models(
 /// The config's cloud choices come first and win; the discovered models (live vendor lists, or the
 /// built-in catalogue when there is no key or the vendor does not answer) are appended when the
 /// runner may answer them. Never carries a key.
-async fn get_model_groups(
-    State(state): State<AppState>,
-    Query(query): Query<ModelsQuery>,
-) -> Json<serde_json::Value> {
-    let asking = match query.chat {
-        Some(chat_id) => Asking::Chat {
-            rooted: crate::assistant::may_answer_on_codex(
-                crate::chats::cwd_of(&state.pool, &chat_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .as_deref(),
-            ),
-        },
-        None => Asking::Daemon,
-    };
+async fn get_model_groups() -> Json<serde_json::Value> {
+    // Only the chat picker calls this, and a chat of any kind may use either CLI. A request with no
+    // `chat` is a new conversation, which `create_chat` validates as a chat.
+    let asking = Asking::Chat;
     let (config, choices) = menu(asking).await;
     let mut cloud: Vec<crate::config::AssistantChoice> = choices
         .into_iter()
@@ -14025,9 +13988,6 @@ async fn get_model_groups(
         .collect();
     let snapshot = crate::models::model_catalog::current().await;
     let mut created = std::collections::HashMap::new();
-    // Codex models this caller may not pick are still listed, and named here, so the picker shows
-    // the whole vendor list and says why a row is closed instead of leaving the vendor out.
-    let mut needs_root: Vec<String> = Vec::new();
     for found in &snapshot.models {
         if let Some(at) = found.created {
             created.insert(found.id.clone(), at);
@@ -14041,20 +14001,10 @@ async fn get_model_groups(
             found.runner,
         ) {
             cloud.push(crate::models::model_catalog::as_choice(found));
-        } else if found.runner == "codex"
-            && crate::models::model_catalog::admits(
-                config.active_runner(),
-                Some(true),
-                found.runner,
-            )
-        {
-            needs_root.push(found.id.clone());
-            cloud.push(crate::models::model_catalog::as_choice(found));
         }
     }
     Json(serde_json::json!({
         "groups": crate::models::model_catalog::group(cloud, &created),
-        "needs_root": needs_root,
         "source": snapshot.source,
         "sources": snapshot.sources,
         "catalogue_version": crate::models::model_catalog::CATALOGUE_VERSION,
@@ -14320,9 +14270,6 @@ impl From<BrainRefusal> for ChatRefusal {
     fn from(refusal: BrainRefusal) -> Self {
         match refusal {
             BrainRefusal::UnknownModel => ChatRefusal::Status(StatusCode::BAD_REQUEST),
-            BrainRefusal::NeedsRoot => {
-                ChatRefusal::WithDetail(StatusCode::BAD_REQUEST, CODEX_NEEDS_A_ROOT.to_string())
-            }
             // Not a 500, for the same reason `BrainRefusal`'s own `From<StatusCode>` impl gives:
             // nothing broke, this machine simply cannot run what was asked for.
             BrainRefusal::CannotServe(reason) => {
@@ -14435,16 +14382,7 @@ async fn patch_chat(
     // name it has never heard.
     if let Some(model) = &body.model {
         let brain = match model {
-            Some(id) => {
-                let cwd = crate::chats::cwd_of(&state.pool, &chat_id)
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(%error, "reading a conversation's project failed");
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-                let rooted = crate::assistant::may_answer_on_codex(cwd.as_deref());
-                Some(chosen_brain(&state, id, Asking::Chat { rooted }).await?)
-            }
+            Some(id) => Some(chosen_brain(&state, id, Asking::Chat).await?),
             // Unpinning says nothing about the route. The conversation goes back to following the
             // configured model, and `brain` keeps whatever it already had — changing it here would
             // be this route inventing a decision nobody expressed.
@@ -30725,7 +30663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_door_takes_a_codex_pick_only_for_a_rooted_conversation() {
+    async fn the_door_takes_a_codex_pick_for_any_conversation() {
         let state = test_state().await;
         let config = crate::config::ModelsConfig {
             primary_runner: None,
@@ -30770,29 +30708,16 @@ mod tests {
             ..Default::default()
         };
 
+        // Any conversation takes a Codex pick: a chat with no project answers it under `McpOnly`,
+        // so there is no longer a rooted/unrooted split to refuse on.
         assert!(matches!(
-            chosen_brain_in(&state, &config, "gpt-5.5", Asking::Chat { rooted: false }).await,
-            Err(BrainRefusal::NeedsRoot)
-        ));
-        assert!(matches!(
-            chosen_brain_in(&state, &config, "gpt-5.5", Asking::Chat { rooted: true }).await,
+            chosen_brain_in(&state, &config, "gpt-5.5", Asking::Chat).await,
             Ok(crate::chats::Brain::Cloud)
         ));
         assert!(matches!(
             chosen_brain_in(&state, &config, "gpt-5.5", Asking::Daemon).await,
             Err(BrainRefusal::UnknownModel)
         ));
-    }
-
-    #[tokio::test]
-    async fn a_codex_refusal_reaches_the_window_as_a_sentence() {
-        let response = ChatRefusal::from(BrainRefusal::NeedsRoot).into_response();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
-            .await
-            .unwrap();
-        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-        assert_eq!(body["detail"].as_str(), Some(CODEX_NEEDS_A_ROOT));
     }
 
     #[tokio::test]
@@ -30903,17 +30828,10 @@ mod tests {
             .collect();
         let ids: Vec<&str> = all.iter().filter_map(|m| m["id"].as_str()).collect();
         assert!(ids.contains(&"claude-sonnet-5-5"), "{ids:?}");
-        // A Codex model is listed, but named as needing a rooted conversation: the daemon's own
-        // menu cannot open one on Codex.
+        // A Codex model is listed and open: a chat with no project answers on Codex too, so no row
+        // is closed and the answer carries no `needs_root` key at all.
         assert!(ids.contains(&"gpt-5.5"), "{ids:?}");
-        let needs_root: Vec<&str> = body["needs_root"]
-            .as_array()
-            .expect("needs_root is a list")
-            .iter()
-            .filter_map(|id| id.as_str())
-            .collect();
-        assert!(needs_root.contains(&"gpt-5.5"), "{needs_root:?}");
-        assert!(!needs_root.contains(&"claude-sonnet-5-5"), "{needs_root:?}");
+        assert!(body.get("needs_root").is_none(), "{body}");
         let sonnet = all.iter().find(|m| m["id"] == "claude-sonnet-5-5").unwrap();
         assert_eq!(sonnet["label"], "Sonnet 5.5");
     }

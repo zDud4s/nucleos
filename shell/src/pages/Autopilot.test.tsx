@@ -98,6 +98,9 @@ interface CockpitWorld {
   scoreboard: ClassTally[];
   jobs: Job[];
   feed: FeedEntry[];
+  /** The overnight records: what jobs put down, and what the injection barrier refused. */
+  skipped: Proposal[];
+  refused: Proposal[];
   /** What `POST /autopilot/state` refuses with, when it refuses. */
   refuseMode: ApiRefusal | null;
 }
@@ -111,6 +114,8 @@ function cockpitWorld(overrides: Partial<CockpitWorld> = {}): CockpitWorld {
     scoreboard: [],
     jobs: [],
     feed: [],
+    skipped: [],
+    refused: [],
     refuseMode: null,
     ...overrides,
   };
@@ -159,6 +164,8 @@ function cockpitFetch(world: CockpitWorld): (path: string, init?: RequestInit) =
     if (path === "/autopilot/budget") return shared.budget;
     if (path === "/projects") return world.projects;
     if (path === "/proposals") return world.proposals;
+    if (path === "/proposals/skipped-items") return world.skipped;
+    if (path === "/proposals/refused-actions") return world.refused;
     if (path === "/autopilot/kill/scoped") return world.scopedKills;
     if (path.startsWith("/scoreboard")) return world.scoreboard;
     if (path.startsWith("/shadow-decisions")) return world.decisions;
@@ -987,6 +994,195 @@ describe("Autopilot - the ask form", () => {
     // positive as `chats-zoom`/`fleet-exclusion`, one abbreviated attribute
     // reference away from being masked out).
     expect(field.outerHTML).toContain('id="ap-job-prompt"');
+  });
+});
+
+/* ------------------------------------------- the records that moved here -- */
+
+/**
+ * Skipped items and refused actions used to be sections of the Waiting page. They ask for no
+ * decision — the night and the barrier already settled them — so they are read here, with the
+ * rest of what governance reports back.
+ */
+describe("Autopilot - the overnight and barrier records", () => {
+  it("shows the records as panels once there are rows, and one line while there are none", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+
+    await renderCockpit();
+
+    // Empty: one quiet line each, with the reasoning behind "why?".
+    const skipped = await screen.findByRole("region", { name: "Skipped items" });
+    expect(within(skipped).getByText("no job put anything down")).toBeDefined();
+    const refused = screen.getByRole("region", { name: "Refused actions" });
+    expect(within(refused).getByText("the barrier has refused nothing")).toBeDefined();
+  });
+
+  it("posts a skipped item to /dismiss and never to /reject", async () => {
+    const world = cockpitWorld({ skipped: [proposal({ id: 41, kind: "skipped-item" })] });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Put item #41 away" }));
+
+    // Clicks inside the 300 ms dwell are swallowed by design and leave the control armed, so
+    // retrying the click until the control disarms is safe — and it is cheaper than either
+    // sleeping for the dwell or bringing fake timers into a suite that waits on react-query.
+    await waitFor(() => {
+      const armed = screen.queryByRole("button", { name: "I have read it · #41" });
+      if (armed !== null) fireEvent.click(armed);
+      expect(screen.queryByRole("button", { name: "I have read it · #41" })).toBeNull();
+    });
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/proposals/41/dismiss", { method: "POST" });
+    });
+
+    // `reject_proposal` guards on `kind = 'action-approval'` and answers 409 for anything else.
+    const asked = daemon.apiFetch.mock.calls.map(([path]) => String(path));
+    expect(asked.some((path) => path.endsWith("/reject"))).toBe(false);
+  });
+
+  it("heads a skipped item with the job and item and links the run", async () => {
+    const world = cockpitWorld({
+      skipped: [
+        proposal({
+          id: 41,
+          kind: "skipped-item",
+          run_id: 7,
+          tool_name: "Bash",
+          reasoning: "asked",
+          job_id: 27,
+          run_stage: "implement",
+          item_ordinal: 3,
+          item_description: "tidy the imports",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+    const list = await screen.findByRole("list", { name: "Skipped items" });
+
+    expect(within(list).getByText("job 27 \u00B7 item 4")).toBeDefined();
+    expect(within(list).getByText("tidy the imports")).toBeDefined();
+    expect(within(list).getByRole("link", { name: "run 7" }).getAttribute("href")).toContain("/runs/7");
+    expect(within(list).getByText("Bash")).toBeDefined();
+    expect(within(list).getByRole("button", { name: "Put item #41 away" })).toBeDefined();
+  });
+
+  it("names a review node as the job's review", async () => {
+    const world = cockpitWorld({
+      skipped: [
+        proposal({
+          id: 41,
+          kind: "skipped-item",
+          run_id: 7,
+          tool_name: "Bash",
+          reasoning: "asked",
+          job_id: 27,
+          run_stage: "review",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+    const list = await screen.findByRole("list", { name: "Skipped items" });
+
+    expect(within(list).getByText("job 27 \u00B7 the job's review")).toBeDefined();
+  });
+
+  it("falls back without going blank when the run no longer resolves", async () => {
+    const world = cockpitWorld({
+      skipped: [
+        proposal({ id: 41, kind: "skipped-item", run_id: 7, tool_name: "Bash", reasoning: "asked" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+    const list = await screen.findByRole("list", { name: "Skipped items" });
+
+    expect(within(list).getByText("a job this record can no longer trace")).toBeDefined();
+    expect(within(list).getByText("Bash")).toBeDefined();
+  });
+
+  it("gives the refused actions no buttons at all", async () => {
+    const world = cockpitWorld({
+      refused: [
+        proposal({
+          id: 51,
+          kind: "refused-action",
+          tool_name: "send_email",
+          reasoning: "the message asked for it, and the message is not the operator",
+          tool_input: JSON.stringify({ to: "billing@example.com", subject: "March" }),
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const list = await screen.findByRole("list", { name: "Refused actions" });
+    const panel = list.closest("section");
+    expect(panel).not.toBeNull();
+
+    // Nothing to allow: the turn that reached for this ended long ago, so a control here would
+    // read as "handled" for something nobody handled.
+    expect(within(panel as HTMLElement).queryAllByRole("button")).toEqual([]);
+
+    // It is still a record worth reading — the verb, and what it was going to do, as fields
+    // rather than as a JSON dump.
+    expect(within(list).getByText("send_email")).toBeDefined();
+    expect(within(list).getByText("billing@example.com")).toBeDefined();
+    expect(within(list).queryByText(/[{}]/)).toBeNull();
+  });
+
+  it("says which stranger the turn had read", async () => {
+    const world = cockpitWorld({
+      refused: [
+        proposal({
+          id: 52,
+          kind: "refused-action",
+          tool_name: "send_email",
+          tool_input: JSON.stringify({ to: "billing@example.com" }),
+          read_from: JSON.stringify([
+            {
+              tool: "browser_open",
+              arguments: JSON.stringify({ url: "https://fornecedor.example/fatura" }),
+              at: "2026-08-21T09:00:00Z",
+            },
+          ]),
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+    const list = await screen.findByRole("list", { name: "Refused actions" });
+
+    // The tool that brought the words in, and the url — the half that decides whether this was
+    // the owner's idea or the page's.
+    expect(within(list).getByText("browser_open")).toBeDefined();
+    expect(within(list).getByText("https://fornecedor.example/fatura")).toBeDefined();
+  });
+
+  it("says nothing at all when nothing was recorded", async () => {
+    // `null` covers a refusal that fired on whose work it is rather than on what was read, AND a
+    // recording that failed — indistinguishable from here. Filling the silence with "this turn
+    // read nothing" would be wrong in the second case, in the direction that makes a
+    // contaminated action look clean.
+    const world = cockpitWorld({
+      refused: [proposal({ id: 53, kind: "refused-action", tool_name: "create_run", read_from: null })],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+    const list = await screen.findByRole("list", { name: "Refused actions" });
+
+    expect(within(list).getByText("create_run")).toBeDefined();
+    expect(within(list).queryByText(/read nothing|nothing was read/i)).toBeNull();
+    expect(within(list).queryByText("this turn had read")).toBeNull();
   });
 });
 

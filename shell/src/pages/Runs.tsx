@@ -19,7 +19,7 @@ import {
   useRunPreset,
   type Preset,
 } from "../data/presets";
-import { routeTriple, useRouteReport, type RoutePair } from "../data/route";
+import { routeTriple } from "../data/route";
 import { useKillSwitch, useProjects, type ProjectSummary } from "../data/system";
 import {
   Button,
@@ -173,8 +173,6 @@ export function Runs() {
         projects={projects.data}
         onChange={applyFilters}
       />
-
-      <RouterPanel />
 
       {stale && <StaleNote dataUpdatedAt={runs.dataUpdatedAt} />}
       {runs.isError && rows === undefined && <ListError error={runs.error} />}
@@ -434,6 +432,10 @@ function RunList({
 
 /** One run as a row: the old list's row, now also what a conversation's turns are drawn with. */
 function RunRow({ row }: { row: RunSearchResult }) {
+  // What ran is a column of the metadata line, not a line of its own: it is a
+  // fact every routed row has, and a third line under every row made the whole
+  // list a third taller to say it.
+  const ran = routeTriple([row.model, row.effort]);
   return (
     <Row className="runs-row">
       <span className="runs-row-state">
@@ -449,9 +451,10 @@ function RunRow({ row }: { row: RunSearchResult }) {
           {row.project_id ?? "no project"}
         </span>
         <RelativeTime at={row.created_at} />
+        {ran !== null && <span className="runs-row-ran">{ran}</span>}
         <span className="runs-row-cost">{costOf(row)}</span>
       </p>
-      <RouteNote row={row} />
+      <RouteAdvice row={row} />
     </Row>
   );
 }
@@ -539,18 +542,24 @@ function ConversationTurns({
 }
 
 /**
- * What ran, and where a shadow router disagreed.
+ * Where a shadow router disagreed with what ran.
  *
- * Nothing for a run that carries no trail. The advice is only drawn when it
- * differs: a matching one is the normal case and would be a line on every row.
+ * What ran is already a column of the metadata line (`RunRow`), so this is only
+ * the extra line, and only when the advice differs: a matching one is the normal
+ * case and would be a line on every row. The "→" prefix and the italic (see
+ * `.runs-row-route-advice`) are what set it apart from the facts above it now
+ * that it is no longer a quieter *colour* — faint text failed the contrast floor.
+ *
+ * The router's report across all runs lives on System → Health, not here: it
+ * ignores this page's filters and serves a config decision (shadow to apply, per
+ * surface, in `router.yaml`) rather than reading the list.
  */
-function RouteNote({ row }: { row: RunSearchResult }) {
-  const ran = routeTriple([row.model, row.effort]);
+function RouteAdvice({ row }: { row: RunSearchResult }) {
   const differs =
     row.route_mode === "shadow" &&
     routeTriple([row.advised_runner, row.advised_model, row.advised_effort]) !== null &&
     (row.advised_runner !== row.runner || row.advised_model !== row.model || row.advised_effort !== row.effort);
-  if (ran === null && !differs) return null;
+  if (!differs) return null;
   const advised = routeTriple([
     row.advised_runner !== row.runner ? row.advised_runner : null,
     row.advised_model,
@@ -558,66 +567,8 @@ function RouteNote({ row }: { row: RunSearchResult }) {
   ]);
   return (
     <p className="runs-row-route">
-      {ran !== null && <span>{ran}</span>}
-      {differs && <span className="runs-row-route-advice">{`router: ${advised}`}</span>}
+      <span className="runs-row-route-advice">{`→ router: ${advised}`}</span>
     </p>
-  );
-}
-
-/** One side of a pair as `runner · model · effort`, skipping what is unknown. */
-function pairLabel(runner: string | null, model: string | null, effort: string | null): string {
-  return routeTriple([runner, model, effort]) ?? "unknown";
-}
-
-/**
- * The router over the last thirty days: how much it saw, how often a shadow
- * advice matched what ran, and the pairings that account for the difference.
- *
- * Nothing at all while loading, on any failure (a 404 from an older daemon is
- * one) or when no run was routed: an empty panel would claim a router that has
- * not spoken.
- */
-function RouterPanel() {
-  const report = useRouteReport();
-  const data = report.data;
-  if (report.isError || data === undefined || data.runs <= 0) return null;
-  // Among shadow runs with advice only: an apply run launched its advice and cannot disagree.
-  const shadowAdvised = data.shadow_advised;
-  const rate = shadowAdvised > 0 ? `${Math.round((data.matched / shadowAdvised) * 100)}%` : "n/a";
-  const pairs: RoutePair[] = data.pairs.slice(0, 5);
-  return (
-    <Panel title={`Router (last ${data.days} days)`}>
-      <p className="runs-router-totals">
-        <span>{`${data.runs} routed runs`}</span>
-        <span>{`${data.shadow} shadow`}</span>
-        <span>{`${data.apply} apply`}</span>
-        <span>{`${data.advised} advised`}</span>
-        <span>{`match rate ${rate}`}</span>
-      </p>
-      {pairs.length > 0 && (
-        <table className="runs-router-pairs">
-          <caption className="runs-router-caption">Ran → advised</caption>
-          <thead>
-            <tr>
-              <th scope="col">Pair</th>
-              <th scope="col">Runs</th>
-              <th scope="col">Passed</th>
-              <th scope="col">Failed</th>
-            </tr>
-          </thead>
-          <tbody>
-            {pairs.map((pair, index) => (
-              <tr key={index}>
-                <td>{`${pairLabel(pair.runner, pair.model, pair.effort)} → ${pairLabel(pair.advised_runner, pair.advised_model, pair.advised_effort)}`}</td>
-                <td>{pair.runs}</td>
-                <td>{pair.passed}</td>
-                <td>{pair.failed}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </Panel>
   );
 }
 
