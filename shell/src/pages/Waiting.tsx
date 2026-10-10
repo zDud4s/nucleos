@@ -973,6 +973,15 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
               <span className="waiting-meta">
                 {session.profile_kind} {session.profile_id}
               </span>
+              {session.run_id !== null && (
+                <Link
+                  className="waiting-row-link"
+                  to="/runs/$runId"
+                  params={{ runId: String(session.run_id) }}
+                >
+                  run {session.run_id}
+                </Link>
+              )}
               <RelativeTime at={session.opened_at} />
             </div>
             <dl className="waiting-facts">
@@ -1493,6 +1502,46 @@ function TeamActionPayload({
   );
 }
 
+/**
+ * Which department asked, who in it, and what it was working on.
+ *
+ * A team action or a recruit names what would happen and why the asker wants it, but not who the
+ * asker is or what job it is doing — and "send this email" is a different decision coming from
+ * the director of a reconciliation than from a specialist halfway through one item of it.
+ */
+function DepartmentContext({ proposal }: { proposal: Proposal }) {
+  const team = proposal.team_name ?? null;
+  const runId = proposal.team_run_id ?? null;
+  const task = taskLine(proposal.team_request);
+  if (team === null && runId === null) return null;
+  return (
+    <>
+      <p className="waiting-meta">
+        asked by {proposal.asked_by ?? "an agent the daemon no longer names"}
+        {proposal.asked_for ? (
+          <>
+            , working on <q>{proposal.asked_for}</q>
+          </>
+        ) : null}
+        {" — "}
+        {runId !== null ? (
+          <Link className="waiting-row-link" to="/team-runs/$runId" params={{ runId }}>
+            {team ?? "a department"}
+          </Link>
+        ) : (
+          team
+        )}
+      </p>
+      {task !== null && (
+        <div className="waiting-provenance">
+          <p className="waiting-provenance-head">the department was asked to</p>
+          <Reasoning>{task}</Reasoning>
+        </div>
+      )}
+    </>
+  );
+}
+
 function TeamActionCard({
   proposal,
   count,
@@ -1523,6 +1572,7 @@ function TeamActionCard({
         </span>
         <RelativeTime at={proposal.created_at} />
       </div>
+      <DepartmentContext proposal={proposal} />
       <dl className="waiting-facts">
         <div className="waiting-fact">
           <dt>execution</dt>
@@ -1696,6 +1746,7 @@ function RecruitmentCard({
         <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>recruit #{proposal.id}</span>
         <RelativeTime at={proposal.created_at} />
       </div>
+      <DepartmentContext proposal={proposal} />
       <Reasoning>
         {proposal.reasoning.trim() === ""
           ? "nothing was recorded about why"
@@ -2037,6 +2088,21 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                   ? "nothing was recorded about why"
                   : proposal.reasoning}
               </Reasoning>
+              {(proposal.job_low_task || proposal.job_high_task) && (
+                <dl className="waiting-input" aria-label={`Jobs in request #${proposal.id}`}>
+                  {[
+                    [pair.low, proposal.job_low_task],
+                    [pair.high, proposal.job_high_task],
+                  ].map(([job, task]) => (
+                    <div className="waiting-input-line" key={String(job)}>
+                      <dt className="waiting-input-name">job {job ?? "?"}</dt>
+                      <dd className="waiting-input-value">
+                        {taskLine(task as string | null) ?? "the daemon no longer has this job"}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
+              )}
               {pair.paths.length > 0 && (
                 <ul className="waiting-paths">
                   {pair.paths.map((path) => (
@@ -2254,7 +2320,10 @@ function VcsRow({
         >
           {row.op} #{row.id}
         </span>
-        <StateBadge domain="vcs" state={row.status} />
+        <StateBadge
+          domain="vcs"
+          state={row.status === "escalated" && next !== null && !next.yours ? "resolving" : row.status}
+        />
         <span className="waiting-meta">{row.project_id}</span>
         <RelativeTime at={row.created_at} />
       </div>

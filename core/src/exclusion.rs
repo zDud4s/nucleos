@@ -254,12 +254,18 @@ pub async fn live(pool: &SqlitePool, project_id: Option<&str>) -> sqlx::Result<V
 /// front to back, and the request that has been waiting longest is the one holding somebody up.
 pub async fn pending_requests(pool: &SqlitePool) -> sqlx::Result<Vec<crate::proposals::Proposal>> {
     sqlx::query_as::<_, crate::proposals::Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
-                tool_input, read_from, created_at, decided_at,
-                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
-         FROM proposals
-         WHERE status = 'pending' AND kind = 'fleet-exclusion'
-         ORDER BY id ASC",
+        // "Jobs 18 and 19" is not something a person can decide on, so each job's task rides
+        // along: the opening of its prompt, or the rule that started it.
+        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.tool_name,
+                p.reasoning, p.tool_input, p.read_from, p.created_at, p.decided_at,
+                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description,
+                COALESCE(substr(lo.prompt, 1, 300), lo.rule_name) AS job_low_task,
+                COALESCE(substr(hi.prompt, 1, 300), hi.rule_name) AS job_high_task
+         FROM proposals p
+         LEFT JOIN jobs lo ON lo.id = json_extract(p.tool_input, '$.job_low')
+         LEFT JOIN jobs hi ON hi.id = json_extract(p.tool_input, '$.job_high')
+         WHERE p.status = 'pending' AND p.kind = 'fleet-exclusion'
+         ORDER BY p.id ASC",
     )
     .fetch_all(pool)
     .await
@@ -752,6 +758,29 @@ mod tests {
 
         reject(&pool, proposal_id).await.unwrap();
         assert!(pending_requests(&pool).await.unwrap().is_empty());
+    }
+
+    /// A request names each job by what it is doing, so "jobs 4 and 9" can be decided on.
+    #[tokio::test]
+    async fn a_request_says_what_each_job_is_doing() {
+        let pool = test_pool().await;
+        let low = add_job(&pool, "alpha").await;
+        let high = add_job(&pool, "alpha").await;
+        sqlx::query("UPDATE jobs SET prompt = 'Rewrite the docs' WHERE id = ?")
+            .bind(low)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET rule_name = 'nightly-deps' WHERE id = ?")
+            .bind(high)
+            .execute(&pool)
+            .await
+            .unwrap();
+        propose(&pool, low, high, &[]).await.unwrap();
+
+        let waiting = pending_requests(&pool).await.unwrap();
+        assert_eq!(waiting[0].job_low_task.as_deref(), Some("Rewrite the docs"));
+        assert_eq!(waiting[0].job_high_task.as_deref(), Some("nightly-deps"));
     }
 
     /// The two decisions refuse anything that is not a pending exclusion, by kind and by status.

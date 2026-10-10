@@ -44,6 +44,26 @@ pub struct Proposal {
     /// A JSON array of `{name, detail}`, oldest first, at most three long.
     #[sqlx(default)]
     pub run_recent: Option<String>,
+    /// The department behind a team action or a recruitment, as their two listings join it: the
+    /// team run that asked, the team's name, what that run was asked to do (cut at 600
+    /// characters), who in it asked — the director or a specialist, by agent name — and, for a
+    /// specialist, the item it was working on. `None` from every other query.
+    #[sqlx(default)]
+    pub team_run_id: Option<String>,
+    #[sqlx(default)]
+    pub team_name: Option<String>,
+    #[sqlx(default)]
+    pub team_request: Option<String>,
+    #[sqlx(default)]
+    pub asked_by: Option<String>,
+    #[sqlx(default)]
+    pub asked_for: Option<String>,
+    /// What each of the two jobs in a fleet-exclusion request is doing — its prompt's opening, or
+    /// the rule that started it — as `exclusion::pending_requests` joins them. `None` elsewhere.
+    #[sqlx(default)]
+    pub job_low_task: Option<String>,
+    #[sqlx(default)]
+    pub job_high_task: Option<String>,
 }
 
 #[derive(Debug)]
@@ -609,12 +629,20 @@ pub async fn list_pending_recruits(
     team_run_id: Option<&str>,
 ) -> sqlx::Result<Vec<Proposal>> {
     let rows = sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
-                tool_input, read_from, created_at, decided_at,
-                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
-         FROM proposals
-         WHERE status = 'pending' AND kind = 'agent-recruit'
-         ORDER BY id ASC",
+        // The team run is named inside the payload, so the join reads it out of the JSON. The
+        // director is who asks for a recruit; a pruned run or team leaves the context NULL.
+        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.tool_name,
+                p.reasoning, p.tool_input, p.read_from, p.created_at, p.decided_at,
+                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description,
+                tr.id AS team_run_id, t.name AS team_name,
+                substr(tr.request, 1, 600) AS team_request,
+                COALESCE(d.name, t.director_agent_id) AS asked_by, NULL AS asked_for
+         FROM proposals p
+         LEFT JOIN team_runs tr ON tr.id = json_extract(p.tool_input, '$.team_run_id')
+         LEFT JOIN teams t ON t.id = tr.team_id
+         LEFT JOIN agents d ON d.id = t.director_agent_id
+         WHERE p.status = 'pending' AND p.kind = 'agent-recruit'
+         ORDER BY p.id ASC",
     )
     .fetch_all(pool)
     .await?;
@@ -650,12 +678,25 @@ pub async fn list_pending_recruits(
 /// and the run that asked has usually finished by then.
 pub async fn list_pending_team_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
-                tool_input, read_from, created_at, decided_at,
-                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
-         FROM proposals
-         WHERE status = 'pending' AND kind = 'team-action'
-         ORDER BY id ASC",
+        // Who asked lives on `team_actions`, not on the proposal: a NULL ordinal is the director,
+        // anything else is the specialist working that item.
+        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.tool_name,
+                p.reasoning, p.tool_input, p.read_from, p.created_at, p.decided_at,
+                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description,
+                tr.id AS team_run_id, t.name AS team_name,
+                substr(tr.request, 1, 600) AS team_request,
+                CASE WHEN a.ordinal IS NULL THEN COALESCE(d.name, t.director_agent_id)
+                     ELSE COALESCE(g.name, i.agent_id) END AS asked_by,
+                i.description AS asked_for
+         FROM proposals p
+         LEFT JOIN team_actions a ON a.proposal_id = p.id
+         LEFT JOIN team_runs tr ON tr.id = a.team_run_id
+         LEFT JOIN teams t ON t.id = tr.team_id
+         LEFT JOIN agents d ON d.id = t.director_agent_id
+         LEFT JOIN team_items i ON i.team_run_id = a.team_run_id AND i.ordinal = a.ordinal
+         LEFT JOIN agents g ON g.id = i.agent_id
+         WHERE p.status = 'pending' AND p.kind = 'team-action'
+         ORDER BY p.id ASC",
     )
     .fetch_all(pool)
     .await
@@ -1594,6 +1635,111 @@ mod tests {
         assert_eq!(details, vec!["step 3", "step 4", "step 5"]);
         assert_eq!(pending[1].run_status, None);
         assert_eq!(pending[1].run_recent, None);
+    }
+
+    async fn seed_department(pool: &sqlx::SqlitePool) {
+        for (id, name) in [("dir", "Ana"), ("spec", "Rui")] {
+            sqlx::query(
+                "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                                     created_at, updated_at)
+                 VALUES (?, ?, 's', 'p', 'claude', 'none', '2026-10-10T00:00:00Z',
+                         '2026-10-10T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO teams (id, name, mission, director_agent_id, max_rounds, max_parallel,
+                                created_at, updated_at)
+             VALUES ('fin', 'Finance', 'm', 'dir', 3, 3, '2026-10-10T00:00:00Z',
+                     '2026-10-10T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO team_runs (id, team_id, request, workspace, token, state,
+                                    created_at, updated_at)
+             VALUES ('tr-1', 'fin', 'Reconcile October', 'w', 't', 'running',
+                     '2026-10-10T00:00:00Z', '2026-10-10T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state)
+             VALUES ('tr-1', 4, 1, 'spec', 'match the statement', 'running')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn team_action(pool: &sqlx::SqlitePool, ordinal: Option<i64>) -> i64 {
+        let now = "2026-10-10T00:00:00Z";
+        let mut transaction = pool.begin().await.unwrap();
+        let id =
+            create_team_action_in_transaction(&mut transaction, "send_email", "why", "{}", now)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO team_actions
+               (team_run_id, ordinal, kind, payload, why, proposal_id, state, created_at)
+             VALUES ('tr-1', ?, 'send_email', '{}', 'why', ?, 'pending', ?)",
+        )
+        .bind(ordinal)
+        .bind(id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        id
+    }
+
+    /// A department's request is decided on who asked and what for, so both listings carry the
+    /// team, the run's request and the asker — the director, or the specialist working the item.
+    #[tokio::test]
+    async fn department_requests_say_which_team_and_who_asked() {
+        let pool = test_pool().await;
+        seed_department(&pool).await;
+        let from_director = team_action(&pool, None).await;
+        let from_specialist = team_action(&pool, Some(4)).await;
+
+        let actions = list_pending_team_actions(&pool).await.unwrap();
+        assert_eq!(
+            actions.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![from_director, from_specialist]
+        );
+        assert_eq!(actions[0].team_name.as_deref(), Some("Finance"));
+        assert_eq!(actions[0].team_run_id.as_deref(), Some("tr-1"));
+        assert_eq!(
+            actions[0].team_request.as_deref(),
+            Some("Reconcile October")
+        );
+        assert_eq!(actions[0].asked_by.as_deref(), Some("Ana"));
+        assert_eq!(actions[0].asked_for, None);
+        assert_eq!(actions[1].asked_by.as_deref(), Some("Rui"));
+        assert_eq!(actions[1].asked_for.as_deref(), Some("match the statement"));
+
+        sqlx::query(
+            "INSERT INTO proposals (kind, status, tool_name, reasoning, tool_input, created_at)
+             VALUES ('agent-recruit', 'pending', 'tax', 'need VAT', ?, '2026-10-10T00:00:00Z')",
+        )
+        .bind(r#"{"team_run_id":"tr-1","name":"tax analyst"}"#)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let recruits = list_pending_recruits(&pool, None).await.unwrap();
+        assert_eq!(recruits[0].team_name.as_deref(), Some("Finance"));
+        assert_eq!(recruits[0].asked_by.as_deref(), Some("Ana"));
+        assert_eq!(
+            recruits[0].team_request.as_deref(),
+            Some("Reconcile October")
+        );
     }
 
     /// The two listings must not leak into each other. `list_pending` is a queue somebody works

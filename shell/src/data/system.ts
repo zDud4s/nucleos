@@ -127,6 +127,19 @@ export interface Proposal {
   run_cwd?: string | null;
   run_prompt?: string | null;
   run_recent?: string | null;
+  /**
+   * The department behind a team action or a recruitment, joined in only by their two listings:
+   * the team run that asked, the team's name, what that run was asked to do (cut at 600
+   * characters), the agent who asked, and — when a specialist asked — the item it was working on.
+   */
+  team_run_id?: string | null;
+  team_name?: string | null;
+  team_request?: string | null;
+  asked_by?: string | null;
+  asked_for?: string | null;
+  /** What each job in a fleet-exclusion request is doing: its prompt's opening, or its rule. */
+  job_low_task?: string | null;
+  job_high_task?: string | null;
 }
 
 /**

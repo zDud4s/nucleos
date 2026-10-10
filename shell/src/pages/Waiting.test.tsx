@@ -508,6 +508,9 @@ describe("Waiting - git requests", () => {
     expect(within(files).getByText("shell/src/preview/daemon.ts")).toBeDefined();
     expect(within(card).getByRole("link", { name: "run #900623" })).toBeDefined();
     expect(within(card).getByText(/is resolving it — nothing to do yet/)).toBeDefined();
+    // The badge agrees with the hint: the next move is the agent's, not the reader's.
+    expect(within(card).getByText("with an agent")).toBeDefined();
+    expect(within(card).queryByText("escalated to you")).toBeNull();
     // The files say it better than the reason written for the agent that asked.
     expect(within(card).queryByText(/nothing was published/)).toBeNull();
     // Git's verbatim prefix is not something a person needs to read.
@@ -1515,6 +1518,85 @@ describe("Waiting - an approval says what the run was doing", () => {
     await renderWaiting();
 
     expect(await screen.findByText(/The run is cancelled, not waiting on this/)).toBeDefined();
+  });
+});
+
+describe("Waiting - a department's request says who asked and what for", () => {
+  const department = {
+    team_run_id: "tr-1",
+    team_name: "Finance",
+    team_request: "Reconcile October." + String.fromCharCode(10, 10) + "Use the ledger.",
+  };
+
+  it("a team action names the asker, the item, and the department's job, with a link", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(
+        waitingWorld({
+          teamActions: [
+            proposal({
+              id: 5,
+              kind: "team-action",
+              tool_name: "send_email",
+              ...department,
+              asked_by: "Rui",
+              asked_for: "match the statement",
+            }),
+          ],
+        }),
+      ),
+    );
+
+    await renderWaiting();
+
+    const link = await screen.findByRole("link", { name: "Finance" });
+    expect(link.getAttribute("href")).toContain("/team-runs/tr-1");
+    expect(link.parentElement?.textContent).toContain("asked by Rui");
+    expect(link.parentElement?.textContent).toContain("match the statement");
+    expect(screen.getByText("Reconcile October.")).toBeDefined();
+    expect(screen.queryByText(/Use the ledger/)).toBeNull();
+  });
+
+  it("a recruit names the director who asked", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(
+        waitingWorld({
+          recruits: [proposal({ id: 6, kind: "agent-recruit", ...department, asked_by: "Ana" })],
+        }),
+      ),
+    );
+
+    await renderWaiting();
+
+    const link = await screen.findByRole("link", { name: "Finance" });
+    expect(link.parentElement?.textContent).toContain("asked by Ana");
+  });
+});
+
+describe("Waiting - an exclusion request says what each job is doing", () => {
+  it("names both jobs by their task", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(
+        waitingWorld({
+          exclusions: [
+            proposal({
+              id: 31,
+              kind: "fleet-exclusion",
+              tool_input: JSON.stringify({ pair: "4:9", job_low: 4, job_high: 9, paths: ["DOGFOOD.md"] }),
+              job_low_task: "Rewrite the docs",
+              job_high_task: "nightly-deps",
+            }),
+          ],
+        }),
+      ),
+    );
+
+    await renderWaiting();
+
+    const jobs = await screen.findByLabelText("Jobs in request #31");
+    expect(jobs.textContent).toContain("job 4");
+    expect(jobs.textContent).toContain("Rewrite the docs");
+    expect(jobs.textContent).toContain("job 9");
+    expect(jobs.textContent).toContain("nightly-deps");
   });
 });
 

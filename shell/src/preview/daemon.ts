@@ -471,6 +471,13 @@ export const ACTIONS: TeamAction[] = [
   },
 ];
 
+/** The department the preview's team actions and recruit come from, as the daemon joins it. */
+const DEPARTMENT = {
+  team_run_id: "run-live-1",
+  team_name: "Finanças",
+  team_request: "Reconcile the October invoices against the bank statement",
+};
+
 export const RECRUITS = [
   {
     id: 21,
@@ -495,6 +502,8 @@ export const RECRUITS = [
     }),
     read_from: null,
     created_at: ago(31 * 60 * 1000),
+    ...DEPARTMENT,
+    asked_by: "Ana",
     decided_at: null,
   },
 ];
@@ -690,6 +699,9 @@ export const TEAM_ACTION_PROPOSALS: Proposal[] = ACTIONS.map((action) => ({
   read_from: null,
   created_at: action.created_at,
   decided_at: action.executed_at,
+  ...DEPARTMENT,
+  asked_by: action.ordinal === null ? "Ana" : "Rui",
+  asked_for: action.ordinal === null ? null : "match the statement against the ledger",
 }));
 
 /* ------------------------------------------------------------- the agents -- */
