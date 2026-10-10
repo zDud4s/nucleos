@@ -1267,6 +1267,23 @@ impl DaemonClient {
         .await
     }
 
+    /// Ask the daemon for a covered verification of a worktree (F3-13): `cover` makes the daemon
+    /// pick the base, so the request carries neither `files` nor `base`. The answer is a ticket, as
+    /// with `verify`.
+    pub async fn verify_cover(&self, worktree: &str) -> Result<Value, String> {
+        self.verify_request(
+            "/verify",
+            &serde_json::json!({
+                "kind": "test",
+                "scope": "scope",
+                "worktree": worktree,
+                "cover": true,
+                "wait": true,
+            }),
+        )
+        .await
+    }
+
     /// One verification ticket's state; `wait` holds the line up to the daemon's ceiling.
     pub async fn verify_status(&self, ticket: i64, wait: bool) -> Result<Value, String> {
         self.verify_request(

@@ -173,6 +173,7 @@ pub mod verify;
 pub mod verify_batch;
 pub mod verify_bisect;
 pub mod verify_box;
+pub mod verify_cli;
 pub mod verify_exec;
 pub mod verify_fingerprint;
 pub mod verify_flaky;
