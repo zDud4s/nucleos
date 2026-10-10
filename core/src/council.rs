@@ -5605,7 +5605,10 @@ mod tests {
 
         let view = view_of(&state, "c1").await;
         assert_eq!(view.ballot_rounds, vec![1, 3]);
-        assert_eq!(view.agreement_by_round.len(), view.leaderboard_by_round.len());
+        assert_eq!(
+            view.agreement_by_round.len(),
+            view.leaderboard_by_round.len()
+        );
         assert_eq!(
             view.agreement_by_round,
             vec![
