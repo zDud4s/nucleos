@@ -837,3 +837,649 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* ================================================================ courtroom == */
+
+/* The page: the room on the left, the dossier beside it, the line of phases
+   under both. Narrow, it is one column — and the room drops the small mono
+   labels it can no longer fit, which the dossier summary repeats. */
+.council-court-page {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(220px, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+.council-court-page > .council-process {
+  grid-column: 1 / -1;
+}
+
+.council-court {
+  position: relative;
+  min-width: 0;
+}
+
+.council-court-dimmed {
+  opacity: 0.55;
+}
+
+.council-court-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* The engraving: fine line, never a 1px hairline (those were refused as unreadable). */
+.council-court-pediment,
+.council-court-pediment *,
+.council-court-scales line,
+.council-court-scales path,
+.council-court-bench {
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* SVG text is sized in viewBox units, so `px` here scales with the room. */
+.council-court-svg text {
+  font-family: var(--font-body);
+  fill: var(--text);
+}
+
+.council-court-svg .council-court-small,
+.council-court-svg .council-court-role,
+.council-court-svg .council-court-rank,
+.council-court-svg .council-court-reveal,
+.council-court-svg .council-court-tick,
+.council-court-svg .council-court-wing-title,
+.council-court-svg .council-court-balance-label {
+  font-family: var(--font-mono);
+}
+
+.council-court-svg .council-court-small {
+  font-size: 8.5px;
+  fill: var(--text-faint);
+  letter-spacing: var(--tracking-wide);
+}
+
+.council-court-svg .council-court-wing-title {
+  font-size: 11px;
+  fill: var(--text);
+  letter-spacing: var(--tracking-wide);
+}
+
+.council-court-svg .council-court-balance-label {
+  font-size: 9.5px;
+  fill: var(--text-muted);
+}
+
+/* The wing is read, not pointed at: its overlay control sits above it. */
+.council-court-wing {
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------- the bench -- */
+
+.council-court-judge,
+.council-court-seat,
+.council-court-lectern-group[role="button"] {
+  cursor: pointer;
+  outline: none;
+}
+
+.council-court-svg .council-court-bench {
+  fill: var(--surface-raised);
+}
+
+.council-court-svg .council-court-judge-label {
+  font-family: var(--font-display);
+  font-size: 11px;
+  fill: var(--text);
+}
+
+.council-court-judge[data-state="verdict"] .council-court-bench {
+  stroke: var(--tone-active-fg);
+  fill: var(--tone-active-bg);
+}
+
+.council-court-svg .council-court-judge[data-state="verdict"] .council-court-judge-label {
+  fill: var(--tone-active-fg);
+  letter-spacing: var(--tracking-wider);
+}
+
+.council-court-judge[data-state="speaking"] .council-court-bench,
+.council-court-judge[aria-pressed="true"] .council-court-bench,
+.council-court-judge:focus-visible .council-court-bench {
+  stroke: var(--accent);
+  stroke-width: 2;
+  filter: drop-shadow(0 0 4px var(--accent));
+}
+
+.council-court-judge[data-state="failed"] .council-court-bench {
+  stroke: var(--tone-danger-fg);
+}
+
+.council-court-svg .council-court-judge[data-state="failed"] .council-court-judge-label {
+  fill: var(--tone-danger-fg);
+}
+
+.council-court-svg .council-court-judge[data-state="cancelled"] .council-court-judge-label {
+  fill: var(--text-faint);
+}
+
+.council-court-judge[data-state="empty"] .council-court-bench {
+  stroke-dasharray: 3 3;
+}
+
+/* --------------------------------------------------------------- the scales -- */
+
+.council-court-svg .council-court-scales-base,
+.council-court-svg .council-court-plate-dish {
+  fill: var(--border-strong);
+  fill-opacity: 0.4;
+}
+
+.council-court-svg .council-court-pivot {
+  fill: var(--border-strong);
+  stroke: none;
+}
+
+/* The beam and its chains tip as one; each plate turns back so it stays level.
+   The overshoot of the curve is the short rocking it settles with. */
+.council-court-beam,
+.council-court-plate {
+  transition: transform 700ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.council-court-scales[data-tone="strong"] line,
+.council-court-scales[data-tone="strong"] path {
+  stroke: var(--tone-active-fg);
+}
+
+.council-court-scales[data-tone="split"] line,
+.council-court-scales[data-tone="split"] path {
+  stroke: var(--tone-paused-fg);
+}
+
+.council-court-scales[data-tone="none"] line,
+.council-court-scales[data-tone="none"] path {
+  stroke: var(--tone-danger-fg);
+}
+
+.council-court-scales[data-tone="insufficient"] line,
+.council-court-scales[data-tone="insufficient"] path,
+.council-court-scales[data-tone="empty"] line,
+.council-court-scales[data-tone="empty"] path {
+  stroke: var(--text-faint);
+  stroke-dasharray: 2 2;
+}
+
+.council-court-svg .council-court-scales[data-tone="strong"] .council-court-balance-label {
+  fill: var(--tone-active-fg);
+}
+
+.council-court-svg .council-court-scales[data-tone="split"] .council-court-balance-label {
+  fill: var(--tone-paused-fg);
+}
+
+.council-court-svg .council-court-scales[data-tone="none"] .council-court-balance-label {
+  fill: var(--tone-danger-fg);
+}
+
+.council-court-svg .council-court-scales[data-tone="insufficient"] .council-court-balance-label,
+.council-court-svg .council-court-scales[data-tone="empty"] .council-court-balance-label {
+  fill: var(--text-faint);
+}
+
+/* --------------------------------------------------------- lectern and links -- */
+
+.council-court-svg .council-court-lectern {
+  fill: var(--surface);
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+}
+
+.council-court-lectern-group[aria-pressed="true"] .council-court-lectern,
+.council-court-lectern-group[data-selected] .council-court-lectern,
+.council-court-lectern-group:focus-visible .council-court-lectern {
+  stroke: var(--accent);
+}
+
+.council-court-svg .council-court-lectern-text {
+  font-family: var(--font-display);
+  font-size: 9px;
+}
+
+.council-court-svg .council-court-link {
+  stroke-width: 1.5;
+  fill: none;
+}
+
+.council-court-svg .council-court-link-top {
+  stroke: var(--tone-active-fg);
+  stroke-opacity: 0.55;
+}
+
+.council-court-svg .council-court-link-dissent {
+  stroke: var(--tone-danger-fg);
+  stroke-dasharray: 4 3;
+  stroke-opacity: 0.8;
+}
+
+/* ------------------------------------------------------------------- ballots -- */
+
+.council-court-svg .council-court-tray rect:first-child {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+}
+
+.council-court-svg .council-court-ballot {
+  fill: var(--tone-shadow-fg);
+  animation: council-court-ballot-in 500ms ease-out both;
+}
+
+.council-court-svg .council-court-ballot-slot {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-dasharray: 2 2;
+}
+
+/* A new ballot mounts and flies from its voter's chair to the tray. */
+@keyframes council-court-ballot-in {
+  from {
+    transform: translate(var(--from-x), var(--from-y));
+    opacity: 0;
+  }
+}
+
+/* ---------------------------------------------------------------- the chairs -- */
+
+.council-court-svg .council-court-seat-disc {
+  fill: var(--surface-raised);
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
+}
+
+.council-court-svg .council-court-seat-name {
+  font-size: 9px;
+  fill: var(--text);
+}
+
+.council-court-svg .council-court-letter {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: var(--weight-semibold);
+  fill: var(--tone-shadow-fg);
+}
+
+/* A masked chair shows its letter, and its name only while it is pointed at. */
+.council-court-svg .council-court-reveal {
+  font-size: 8.5px;
+  display: none;
+}
+
+.council-court-seat[data-masked]:is(:hover, :focus-visible) .council-court-letter {
+  display: none;
+}
+
+.council-court-seat[data-masked]:is(:hover, :focus-visible) .council-court-reveal {
+  display: inline;
+}
+
+.council-court-svg .council-court-role {
+  font-size: 8.5px;
+  fill: var(--tone-shadow-fg);
+}
+
+.council-court-svg .council-court-rank {
+  font-size: 8.5px;
+  fill: var(--text-muted);
+}
+
+.council-court-svg .council-court-dissent {
+  fill: var(--tone-danger-fg);
+}
+
+.council-court-svg .council-court-tick {
+  font-size: 9px;
+  fill: var(--accent);
+}
+
+.council-court-svg .council-court-seat-state {
+  fill: var(--text-faint);
+}
+
+.council-court-seat[data-state="empty"] .council-court-seat-disc {
+  fill: none;
+  stroke-dasharray: 3 3;
+}
+
+.council-court-svg .council-court-seat[data-state="empty"] .council-court-seat-name {
+  fill: var(--text-faint);
+}
+
+.council-court-seat[data-state="ok"] .council-court-seat-disc {
+  stroke: var(--accent);
+}
+
+.council-court-seat[data-state="failed"] .council-court-seat-disc {
+  stroke: var(--tone-danger-fg);
+}
+
+.council-court-seat[data-state="cancelled"] .council-court-seat-disc {
+  stroke: var(--text-faint);
+}
+
+.council-court-seat[data-state="skipped"] {
+  opacity: 0.45;
+}
+
+.council-court-seat[data-state="speaking"] .council-court-seat-disc,
+.council-court-seat[aria-pressed="true"] .council-court-seat-disc,
+.council-court-seat:focus-visible .council-court-seat-disc {
+  stroke: var(--accent);
+  stroke-width: 2;
+  filter: drop-shadow(0 0 4px var(--accent));
+}
+
+.council-court-seat[data-state="speaking"] .council-court-seat-disc {
+  fill: var(--accent-quiet);
+}
+
+/* Opening the session: the chairs settle from where the setup had them. */
+.council-court-settle .council-court-seat {
+  animation: council-court-seat-settle 600ms ease-out both;
+}
+
+@keyframes council-court-seat-settle {
+  from {
+    transform: translate(var(--from-x), var(--from-y));
+    opacity: 0;
+  }
+}
+
+/* ------------------------------------------------- overlays on the room -- */
+
+/* Percentages of the room's own box, which is the viewBox: 200/560 across and
+   139/320 down, so the field stays on the lectern as the room scales. */
+.council-court-question {
+  position: absolute;
+  left: 35.8%;
+  top: 43.4%;
+  width: 28.4%;
+  height: 6.4%;
+  margin: 0;
+  padding: 0 var(--space-1);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: var(--text-xs);
+  line-height: 1.2;
+  text-align: center;
+  resize: none;
+  overflow: hidden;
+}
+
+.council-court-question::placeholder {
+  color: var(--text-faint);
+  opacity: 1;
+}
+
+.council-court-question:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.council-court-wing-action {
+  position: absolute;
+  left: 71.5%;
+  top: 31%;
+  width: 25%;
+  display: flex;
+  justify-content: center;
+}
+
+/* --------------------------------------------------------------- dossier -- */
+
+.council-dossier {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.council-dossier-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.council-dossier-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.council-dossier-who {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.council-dossier-question {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.council-dossier-hint {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.council-dossier-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.council-dossier-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.council-dossier-chip {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.council-dossier-chip:hover {
+  border-color: var(--accent);
+}
+
+.council-dossier-chip:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.council-dossier-chip-role {
+  color: var(--tone-shadow-fg);
+}
+
+.council-dossier-chip[aria-pressed="true"] {
+  border-color: var(--tone-shadow-border);
+  background: var(--tone-shadow-bg);
+  color: var(--tone-shadow-fg);
+}
+
+.council-dossier-ballot {
+  margin: 0;
+  padding-left: var(--space-5);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.council-dossier-review {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.council-dossier-review ul {
+  margin: 0;
+  padding-left: var(--space-4);
+}
+
+.council-dossier-review-on {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* The room's readings in words. Wide, the room says them itself. */
+.council-dossier-summary {
+  display: none;
+  margin: 0;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+  grid-template-columns: auto 1fr;
+  gap: var(--space-1) var(--space-3);
+  font-size: var(--text-xs);
+}
+
+.council-dossier-summary dt {
+  font-family: var(--font-mono);
+  color: var(--text-faint);
+}
+
+.council-dossier-summary dd {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+/* ---------------------------------------------------------- process line -- */
+
+.council-process {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.council-process-phases {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.council-process-phase {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.council-process-phase[data-current] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.council-process-step {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.council-process-step[aria-current="step"] {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.council-process-step:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* A phase that has not happened, or never will: shown so the line reads whole, and not offered. */
+.council-process-phase-unreachable {
+  text-decoration: line-through;
+  color: var(--text-faint);
+}
+
+.council-process-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* ------------------------------------------------------------- responsive -- */
+
+@media (min-width: 901px) {
+  .council-dossier-summary {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .council-court-page {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .council-court-svg .council-court-small {
+    display: none;
+  }
+
+  .council-dossier-summary {
+    display: grid;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .council-court-beam,
+  .council-court-plate {
+    transition: none;
+  }
+
+  .council-court-svg .council-court-ballot,
+  .council-court-settle .council-court-seat {
+    animation: none;
+  }
+}
