@@ -175,8 +175,8 @@ func TestANewPanelWorldIsReplayedTheHistory(t *testing.T) {
 	id := opened(t, driver).ID
 	ctx := context.Background()
 
-	first := json.RawMessage(`{"v":1,"kind":"say","text":"first-message"}`)
-	second := json.RawMessage(`{"v":1,"kind":"say","text":"second-message"}`)
+	first := json.RawMessage(`{"v":1,"kind":"message","text":"first-message"}`)
+	second := json.RawMessage(`{"v":1,"kind":"message","text":"second-message"}`)
 
 	// Said before any panel world exists: it can only reach a world through the replay.
 	if err := driver.PanelPush(ctx, id, first); err != nil {

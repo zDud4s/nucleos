@@ -91,6 +91,10 @@ const aimQuestion = `function() {
 
 // click presses the mouse where the element actually is.
 func (d *Driver) click(ctx context.Context, entry *session, on cdp.SessionID, objectID string) (*browser.Refusal, error) {
+	// The panel's pellicle covers the page in agent mode, so both the aim check and the mouse events
+	// would land on it. Hidden before the first and restored on every path out, on a detached context
+	// so a cancelled act cannot leave the person's panel invisible.
+	defer d.hidePanel(ctx, entry)()
 	answer, err := d.callOnValue(ctx, on, objectID, aimQuestion, "")
 	if err != nil {
 		return nil, err

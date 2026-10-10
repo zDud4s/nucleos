@@ -94,6 +94,14 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		objectID = resolved
 	}
 
+	// The panel is the person's. A key goes wherever focus is and a CDP key is trusted, so the keyboard
+	// verbs are checked against it before anything is sent.
+	if refusal, err := d.panelKeyboardGuard(ctx, entry, action.Kind, pageSession, objectID, key.session); err != nil {
+		return browser.ActResult{}, err
+	} else if refusal != nil {
+		return browser.Refused(refusal.Consequence, refusal.Detail), nil
+	}
+
 	d.mu.Lock()
 	before := entry.reportedUpTo
 	d.mu.Unlock()

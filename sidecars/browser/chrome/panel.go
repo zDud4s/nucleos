@@ -111,9 +111,17 @@ func (d *Driver) evaluateInto(ctx context.Context, key contextKey, msg json.RawM
 	return err
 }
 
-// PanelPush says something to the panel and keeps it for the worlds that open later.
+// PanelPush says something to the panel. Only a "message" is kept for the worlds that open later;
+// the other kinds (an ask, a delivery) are live-only, or a new world would re-ask what was answered.
+// "state" is never taken from the core: it is the driver's own (see stateMessage).
 func (d *Driver) PanelPush(ctx context.Context, id browser.SessionID, msg json.RawMessage) error {
 	if !json.Valid(msg) {
+		return browser.ErrUnsupported
+	}
+	var head struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(msg, &head); err != nil || head.Kind == "state" {
 		return browser.ErrUnsupported
 	}
 	p, err := d.panelOf(id)
@@ -121,13 +129,20 @@ func (d *Driver) PanelPush(ctx context.Context, id browser.SessionID, msg json.R
 		return err
 	}
 	msg = append(json.RawMessage(nil), msg...)
+	// Under the lock only the bookkeeping; the round trips happen after it, or a slow page would hold
+	// panelCalled, which runs on the dispatch goroutine that also answers the fence.
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.history = append(p.history, msg)
-	if over := len(p.history) - panelHistory; over > 0 {
-		p.history = append([]json.RawMessage(nil), p.history[over:]...)
+	if head.Kind == "message" {
+		p.history = append(p.history, msg)
+		if over := len(p.history) - panelHistory; over > 0 {
+			p.history = append([]json.RawMessage(nil), p.history[over:]...)
+		}
 	}
-	for _, key := range d.pruneLive(p) {
+	keys := d.pruneLive(p)
+	p.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	for _, key := range keys {
 		_ = d.evaluateInto(ctx, key, msg)
 	}
 	return nil
@@ -166,9 +181,10 @@ func (d *Driver) pushState(ctx context.Context, id browser.SessionID) {
 		return
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	msg := d.stateMessage(id, p)
-	for _, key := range d.pruneLive(p) {
+	keys := d.pruneLive(p)
+	p.mu.Unlock()
+	for _, key := range keys {
 		_ = d.evaluateInto(ctx, key, msg)
 	}
 }
@@ -187,21 +203,27 @@ func (d *Driver) replayPanel(on cdp.SessionID, contextID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.live[key] {
+		p.mu.Unlock()
 		return
 	}
 	d.mu.Lock()
 	_, there := d.contexts[key]
 	d.mu.Unlock()
 	if !there {
+		p.mu.Unlock()
 		return
 	}
-	for _, msg := range p.history {
+	history := append([]json.RawMessage(nil), p.history...)
+	state := d.stateMessage(owner, p)
+	// Marked before the lock is released, so a concurrent replay of the same world is not doubled and
+	// a push that arrives meanwhile goes straight to it. The round trips run outside the lock.
+	p.live[key] = true
+	p.mu.Unlock()
+	for _, msg := range history {
 		_ = d.evaluateInto(ctx, key, msg)
 	}
-	_ = d.evaluateInto(ctx, key, d.stateMessage(owner, p))
-	p.live[key] = true
+	_ = d.evaluateInto(ctx, key, state)
 }
 
 // adoptPanelWorlds replays into the panel worlds that appeared before the session was registered,

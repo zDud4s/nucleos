@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/cdp"
@@ -365,7 +366,7 @@ func (d *Driver) hidePanel(ctx context.Context, entry *session) func() {
 	if len(ids) == 0 {
 		return func() {}
 	}
-	say := func(hidden bool) {
+	say := func(ctx context.Context, hidden bool) {
 		for _, id := range ids {
 			_, _ = d.conn.Call(ctx, entry.cdp, "Runtime.evaluate", map[string]any{
 				"expression": fmt.Sprintf("globalThis.__nucleosHide?.(%t)", hidden),
@@ -373,6 +374,11 @@ func (d *Driver) hidePanel(ctx context.Context, entry *session) func() {
 			})
 		}
 	}
-	say(true)
-	return func() { say(false) }
+	say(ctx, true)
+	return func() {
+		// Detached: an act that was cancelled must still give the person their panel back.
+		back, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		say(back, false)
+	}
 }
