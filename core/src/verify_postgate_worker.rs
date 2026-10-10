@@ -1501,6 +1501,13 @@ mod tests {
         let repo = space_free_tempdir("nucleos-postgate-");
         let root = repo.path().to_path_buf();
         git_in(&root, &["init", "-q", "-b", "main"]);
+        // The daemon's own git calls (the correction branch's `git revert` in the postgate
+        // worktree) carry no identity of their own and rely on the repository's. A runner with no
+        // global `user.name` (GitHub's ubuntu image) refuses the commit, `prepare_fix_branch`
+        // fails and the worker settles the revert as failed, so the step a test waits for never
+        // comes. Linked worktrees share this repository config.
+        git_in(&root, &["config", "user.name", "t"]);
+        git_in(&root, &["config", "user.email", "t@t"]);
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
         git_in(&root, &["add", "-A"]);
         git_in(&root, &["commit", "-q", "-m", "one"]);

@@ -31,9 +31,11 @@ import os, pathlib, sys, time
 
 d = pathlib.Path(os.environ["SLEEPER_DIR"])
 tag = sys.argv[-1]
-(d / f"{tag}.start").write_text(str(os.getpid()))
+# order.txt first, the .start marker last: tests treat the marker as "started" and then read
+# order.txt, so the marker must not be visible before the line it vouches for.
 with open(d / "order.txt", "a") as f:
     f.write(tag + "\n")
+(d / f"{tag}.start").write_text(str(os.getpid()))
 (d / f"{tag}.token").write_text(os.environ.get("NUCLEOS_HEAVY_TOKEN", ""))
 while not ((d / f"{tag}.stop").exists() or (d / "all.stop").exists()):
     time.sleep(0.05)
