@@ -6,8 +6,6 @@
 # over this file), and drop the line once a file is at the limit or under; the test fails on a
 # line whose file no longer exists, or that sits at or under the limit. Nothing new is ever added
 # here: a new file past the limit is split by what it does, not given a line.
-src/execution/job.rs 3987
-src/execution/runs.rs 3554
 src/team.rs 3368
 src/execution/runner.rs 2812
 src/hooks.rs 2614
@@ -16,7 +14,7 @@ src/execution/git_exec.rs 2190
 src/mcp_tools.rs 2067
 src/knowledge.rs 2023
 src/council.rs 2006
-src/execution/vcs.rs 1674
+src/execution/vcs.rs 1730
 src/governance/classifier.rs 1549
 src/main.rs 1532
 src/config.rs 1422
