@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react";
+import { createContext, useContext, useId, useState, type ReactNode } from "react";
 
 export interface QuietProps {
   /** What is there, in the fewest words that are still true. It sits on the heading's line. */
@@ -22,6 +22,17 @@ export interface QuietProps {
 }
 
 /**
+ * Whether the reasoning opens as a tip beside the ⓘ instead of a paragraph under the line.
+ *
+ * The project workspace asked for this ("os i não podem abrir na própria card"): a paragraph
+ * unfolding inside a grouped row pushed the whole group down to answer a glance. Under this
+ * context the reasoning floats over the page on hover or focus, and a press pins it — the press
+ * is what keyboard, touch and every existing test already use, so it keeps working unchanged.
+ * Off by default: the other screens keep the inline disclosure until somebody decides otherwise.
+ */
+export const QuietTips = createContext(false);
+
+/**
  * A section with nothing to report, in one line, with the reasoning one click away.
  *
  * {@link Teach} is the same instinct at the other end of the app, and the difference is *where*.
@@ -42,27 +53,64 @@ export interface QuietProps {
  */
 export function Quiet({ says, children, action, announce }: QuietProps) {
   const [why, setWhy] = useState(false);
+  const [peek, setPeek] = useState(false);
+  const tips = useContext(QuietTips);
   // Seven `why?` buttons on `03-waiting` whose accessible name was "why?" and nothing else.
   // The line beside it is the only description this component owns, and it is the right one:
   // it is what the section actually says.
   const saidId = useId();
   const whyId = useId();
 
+  const ask =
+    children === undefined ? null : (
+      <button
+        type="button"
+        className="ui-quiet-ask"
+        aria-expanded={why}
+        aria-controls={whyId}
+        aria-describedby={saidId}
+        onClick={() => setWhy(!why)}
+      >
+        {why ? "less" : "why?"}
+      </button>
+    );
+
+  if (tips && children !== undefined) {
+    const shown = why || peek;
+    return (
+      <div className="ui-quiet" role={announce === true ? "status" : undefined}>
+        <p id={saidId}>{says}</p>
+        {/*
+          The tip lives inside the anchor, so moving the pointer from the ⓘ onto the tip is still
+          hovering the anchor and the tip stays up long enough to be read.
+        */}
+        <div
+          className="ui-quiet-anchor"
+          onMouseEnter={() => setPeek(true)}
+          onMouseLeave={() => setPeek(false)}
+          onFocus={() => setPeek(true)}
+          onBlur={() => setPeek(false)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && shown) {
+              setWhy(false);
+              setPeek(false);
+            }
+          }}
+        >
+          {ask}
+          <div className="ui-quiet-tip" id={whyId} role="tooltip" hidden={!shown}>
+            {shown ? <div className="ui-quiet-tip-box">{children}</div> : null}
+          </div>
+        </div>
+        {action === undefined ? null : <div className="ui-quiet-action">{action}</div>}
+      </div>
+    );
+  }
+
   return (
     <div className="ui-quiet" role={announce === true ? "status" : undefined}>
       <p id={saidId}>{says}</p>
-      {children === undefined ? null : (
-        <button
-          type="button"
-          className="ui-quiet-ask"
-          aria-expanded={why}
-          aria-controls={whyId}
-          aria-describedby={saidId}
-          onClick={() => setWhy(!why)}
-        >
-          {why ? "less" : "why?"}
-        </button>
-      )}
+      {ask}
       {action === undefined ? null : <div className="ui-quiet-action">{action}</div>}
       {children === undefined ? null : (
         // The ELEMENT is always here so `aria-controls` resolves; the CHILDREN are not, so

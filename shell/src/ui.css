@@ -1120,6 +1120,50 @@ a.ui-button:not(.ui-button-link):is(:hover, :focus-visible) {
   color: var(--text-faint);
 }
 
+/**
+ * The same reasoning as a tip, under `QuietTips` (the project workspace).
+ *
+ * It floats over the page instead of unfolding inside the row, so reading it moves nothing. The
+ * tip sits inside the anchor with its gap drawn as padding, so the pointer can travel from the
+ * mark onto the text without the anchor losing the hover.
+ */
+.ui-quiet-anchor {
+  position: relative;
+  display: inline-flex;
+  align-self: center;
+}
+
+.ui-quiet-tip {
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  z-index: 30;
+  display: block;
+  padding-top: var(--space-2);
+  transform: translateX(-50%);
+}
+
+.ui-quiet-tip[hidden] {
+  display: none;
+}
+
+.ui-quiet-tip-box {
+  display: block;
+  width: max-content;
+  max-width: min(22rem, 80vw);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-lg);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  text-align: left;
+  white-space: normal;
+}
+
 /* --------------------------------------------------------------- current -- */
 
 /**
