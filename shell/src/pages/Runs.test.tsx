@@ -12,7 +12,6 @@ vi.mock("../data/client", async (original) => ({
 import { Runs } from "./Runs";
 import { ApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
-import type { RouteReport } from "../data/route";
 import type { Preset } from "../data/presets";
 import type { RunDetail, RunSearchResult } from "../data/runs";
 import { money } from "../ui";
@@ -140,8 +139,6 @@ interface RunsWorld {
   details: Record<number, RunDetail>;
   /** What `/autopilot/kill` answers. */
   killEngaged: boolean;
-  /** What `/route/report` answers; `undefined` is an older daemon's 404. */
-  report?: RouteReport;
 }
 
 function world(overrides: Partial<RunsWorld> = {}): RunsWorld {
@@ -167,10 +164,6 @@ function runsFetch(state: RunsWorld): (path: string, init?: RequestInit) => Prom
   return async (path, init) => {
     if (init?.method !== undefined && init.method !== "GET") return await shared(path, init);
     if (path.startsWith("/runs?")) return state.rows;
-    if (path.startsWith("/route/report")) {
-      if (state.report === undefined) throw new ApiRefusal(404, "not_found", "no such route");
-      return state.report;
-    }
     if (path === "/presets") return state.presets;
     const one = /^\/runs\/(\d+)$/.exec(path);
     if (one !== null) return state.details[Number(one[1])];
@@ -852,24 +845,10 @@ describe("Runs - presets", () => {
   });
 
   describe("router trail", () => {
-    const report: RouteReport = {
-      days: 30,
-      runs: 12,
-      shadow: 10,
-      apply: 2,
-      advised: 10,
-      shadow_advised: 8,
-      matched: 6,
-      pairs: [
-        {
-          runner: "claude", model: "sonnet", effort: "high",
-          advised_runner: "claude", advised_model: "haiku", advised_effort: "low",
-          runs: 4, passed: 3, failed: 1,
-        },
-      ],
-    };
-
-    it("shows what ran and, in shadow, the advice that differed", async () => {
+    // The router's report across all runs moved to System -> Health; what stays
+    // here is the per-row trail: what ran, as a column, and the advice only
+    // where it differs.
+    it("shows what ran as a column of the metadata line and, in shadow, the advice that differed", async () => {
       daemon.apiFetch.mockImplementation(
         runsFetch(
           world({
@@ -888,39 +867,34 @@ describe("Runs - presets", () => {
         ),
       );
       await renderRuns();
-      expect(await screen.findByText("sonnet · high")).toBeTruthy();
-      expect(screen.getByText("router: haiku · low")).toBeTruthy();
-      expect(screen.getByText("opus · low")).toBeTruthy();
-      expect(screen.getAllByText(/^router:/)).toHaveLength(1);
+      const ran = await screen.findByText("sonnet · high");
+      // In the metadata line, beside the id and the cost, not on a line of its own.
+      expect(ran.closest(".runs-row-meta")).not.toBeNull();
+      expect(ran.className).toContain("runs-row-ran");
+      expect(screen.getByText("opus · low").closest(".runs-row-meta")).not.toBeNull();
+      const advice = screen.getByText("→ router: haiku · low");
+      expect(advice.closest(".runs-row-meta")).toBeNull();
+      expect(screen.getAllByText(/^→ router:/)).toHaveLength(1);
     });
 
-    it("renders the report's totals and pairs", async () => {
-      daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()], report })));
-      await renderRuns();
-      expect(await screen.findByRole("heading", { name: "Router (last 30 days)" })).toBeTruthy();
-      expect(screen.getByText("12 routed runs")).toBeTruthy();
-      expect(screen.getByText("match rate 75%")).toBeTruthy();
-      expect(screen.getByText("claude · sonnet · high → claude · haiku · low")).toBeTruthy();
-    });
-
-    it("renders nothing when no run was routed or the daemon has no report", async () => {
-      daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()], report: { ...report, runs: 0, pairs: [] } })));
-      const first = await renderRuns();
-      await screen.findByText("tidy the imports");
-      await waitFor(() =>
-        expect(daemon.apiFetch).toHaveBeenCalledWith("/route/report?days=30"),
+    it("draws no line of its own for a row whose advice matched, and no panel on this page", async () => {
+      daemon.apiFetch.mockImplementation(
+        runsFetch(
+          world({
+            rows: [
+              row({
+                id: 2, runner: "claude", model: "opus", effort: "low", route_mode: "shadow",
+                advised_runner: "claude", advised_model: "opus", advised_effort: "low",
+              }),
+            ],
+          }),
+        ),
       );
-      expect(screen.queryByText(/Router \(last/)).toBeNull();
-      first.unmount?.();
-    });
-
-    it("an older daemon's 404 shows no panel and no error", async () => {
-      daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()] })));
       await renderRuns();
-      await screen.findByText("tidy the imports");
-      await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/route/report?days=30"));
+      await screen.findByText("opus · low");
+      expect(document.querySelector(".runs-row-route")).toBeNull();
       expect(screen.queryByText(/Router \(last/)).toBeNull();
-      expect(screen.queryByRole("alert")).toBeNull();
+      expect(daemon.apiFetch).not.toHaveBeenCalledWith(expect.stringContaining("/route/report"));
     });
   });
 });

@@ -412,6 +412,57 @@
   white-space: nowrap;
 }
 
+/* The router report: its totals as label-above-value pairs, then a compact pairs
+   table. The totals follow the Runs page's `.runs-facts` so a count reads the same
+   way on both. */
+.sy-router-totals {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: var(--space-3);
+  margin: 0 0 var(--space-4);
+}
+
+.sy-router-total dt {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.sy-router-total dd {
+  margin: var(--space-1) 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.sy-router-pairs {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.sy-router-caption {
+  text-align: left;
+  color: var(--text-muted);
+  padding-bottom: var(--space-1);
+}
+
+.sy-router-pairs th,
+.sy-router-pairs td {
+  text-align: right;
+  padding: var(--space-1) var(--space-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.sy-router-pairs th:first-child,
+.sy-router-pairs td:first-child {
+  text-align: left;
+  padding-left: 0;
+  font-family: var(--font-mono);
+}
+
 /* Project brakes and the budget share a row when the page is wide enough. */
 .sy-health-pair {
   display: grid;
