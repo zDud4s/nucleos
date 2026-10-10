@@ -3016,6 +3016,63 @@ async fn launch_specialist(
     Ok(())
 }
 
+/// Resolves and records what one team node is given: the knowledge block, the tools and the trace
+/// of what it was shown. Returns the run's tools and the block to append to its prompt.
+///
+/// Spec 2026-10-08 section 6: a department agent reads the machine's knowledge, its team's and its
+/// own, and no project's. The block is appended to the prompt because `state.runner` may be Codex.
+/// Since R3 a team agent leaves a trace of what it was shown (this supersedes D15 for
+/// departments), so a later outcome can credit the rows that were in front of it.
+///
+/// Shared by both engines, and that is the point: the local loop's `LocalToolBox` is derived from
+/// the same `run_loadout` row the Claude path's Team box is served from, so the two cannot disagree
+/// about which loadout tools a node holds.
+async fn resolve_node_loadout(
+    state: &AppState,
+    run: &TeamRun,
+    agent: &crate::agent::Agent,
+    run_id: i64,
+    with_tools: bool,
+    prompt: &str,
+) -> (crate::loadout::RunTools, String) {
+    let loadout = crate::loadout::resolve(
+        &state.pool,
+        &crate::loadout::LoadoutInput {
+            agent: Some(&agent.id),
+            team: Some(&run.team_id),
+            project: None,
+            job: None,
+            task_text: prompt,
+            node: None,
+            files: &[],
+            // The tools and the context come out of the same resolution as the memory. A member
+            // with tools runs in the Team box; one without holds none, and "none" is recorded as
+            // an empty set like any other loadout. There is no working directory, so a folder ref
+            // is listed in the index but never added.
+            equipment: Some(crate::loadout::Equipment {
+                tool_policy: if with_tools { "mcp_only" } else { "none" },
+                base: crate::mcp_tools::TEAM_BASE,
+                extras: crate::mcp_tools::TEAM_EXTRAS,
+                managed_root: state.files_root.as_deref(),
+                has_cwd: false,
+            }),
+        },
+    )
+    .await;
+    if let Some(brief) = loadout.brief.as_ref()
+        && let Err(error) = crate::brief::record(&state.pool, run_id, None, &brief.trace).await
+    {
+        tracing::warn!(team_run = %run.id, run_id, %error, "could not record what the team agent was shown");
+    }
+    // The row is written before the CLI starts: the route and the hook decide an extra from it, and
+    // a run that cannot prove it holds a tool does not hold it.
+    let run_tools = loadout.run.clone().unwrap_or_default();
+    if let Err(error) = crate::loadout::record(&state.pool, run_id, &run_tools).await {
+        tracing::warn!(team_run = %run.id, run_id, %error, "could not record the team agent's loadout");
+    }
+    (run_tools, loadout.block)
+}
+
 /// Spawns one invocation and lets it write its own terminal `runs` row.
 ///
 /// Nothing awaits the task: the tick discovers the answer by reading the row, which is what makes a
@@ -3064,8 +3121,19 @@ async fn spawn_agent(
         };
         // The TEAM's box, never `LocalToolBox::new`: `LOCAL_TOOLS` carries `create_run` and
         // `create_job`, and the local path never passes through `hooks.rs` at all.
+        //
+        // And resolved the way the Claude path resolves it, BEFORE the loop starts: the loadout row
+        // is what the daemon's routes admit `request_tool` and `read_context` by, and the same
+        // tools then decide which of those two this box offers. A member without tools holds none
+        // (`NoTools` below) and its row is recorded empty, like any other loadout. The block is
+        // appended for the reason it is on the Claude path -- it is what lists the context files
+        // `read_context` can open.
+        let (run_tools, block) =
+            resolve_node_loadout(state, run, agent, run_id, with_tools, &prompt).await;
+        let prompt = format!("{prompt}{block}");
         let tools =
-            crate::mcp_tools::LocalToolBox::for_team(daemon_url(), token, pool.clone(), run_id);
+            crate::mcp_tools::LocalToolBox::for_team(daemon_url(), token, pool.clone(), run_id)
+                .with_loadout(&run_tools.tools);
         let timeout = state.run_timeout;
         crate::runs::spawn_registered(state, run_id, async move {
             let taint = std::sync::atomic::AtomicBool::new(false);
@@ -3131,46 +3199,11 @@ async fn spawn_agent(
         crate::speed::Capacity::solo()
     });
 
-    // Spec 2026-10-08 section 6: a department agent reads the machine's knowledge, its team's and
-    // its own, and no project's. Append it to the prompt because state.runner may be Codex. Since
-    // R3 a team agent leaves a trace of what it was shown (this supersedes D15 for departments),
-    // so a later outcome can credit the rows that were in front of it.
-    let loadout = crate::loadout::resolve(
-        &state.pool,
-        &crate::loadout::LoadoutInput {
-            agent: Some(&agent.id),
-            team: Some(&run.team_id),
-            project: None,
-            job: None,
-            task_text: &prompt,
-            node: None,
-            files: &[],
-            // The tools and the context come out of the same resolution as the memory. A member
-            // with tools runs in the Team box; one without holds none, and "none" is recorded as
-            // an empty set like any other loadout. There is no working directory, so a folder ref
-            // is listed in the index but never added.
-            equipment: Some(crate::loadout::Equipment {
-                tool_policy: if with_tools { "mcp_only" } else { "none" },
-                base: crate::mcp_tools::TEAM_BASE,
-                extras: crate::mcp_tools::TEAM_EXTRAS,
-                managed_root: state.files_root.as_deref(),
-                has_cwd: false,
-            }),
-        },
-    )
-    .await;
-    if let Some(brief) = loadout.brief.as_ref()
-        && let Err(error) = crate::brief::record(&state.pool, run_id, None, &brief.trace).await
-    {
-        tracing::warn!(team_run = %run.id, run_id, %error, "could not record what the team agent was shown");
-    }
-    // The row is written before the CLI starts: the route and the hook decide an extra from it, and
-    // a run that cannot prove it holds a tool does not hold it.
-    let run_tools = loadout.run.clone().unwrap_or_default();
-    if let Err(error) = crate::loadout::record(&state.pool, run_id, &run_tools).await {
-        tracing::warn!(team_run = %run.id, run_id, %error, "could not record the team agent's loadout");
-    }
-    let prompt = format!("{prompt}{}", loadout.block);
+    // Spec 2026-10-08 section 6: see `resolve_node_loadout`. Resolved here for the Claude engine and
+    // before the local loop starts for the local one, so both engines hold the same tools.
+    let (run_tools, block) =
+        resolve_node_loadout(state, run, agent, run_id, with_tools, &prompt).await;
+    let prompt = format!("{prompt}{block}");
 
     let request = crate::runner::RunRequest {
         prompt,
@@ -8091,6 +8124,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mode, None);
+    }
+
+    /// A local member records the loadout the Claude path records, before its loop starts: the
+    /// daemon admits `request_tool` and `read_context` by that row, and the local box offers them
+    /// by the same tools. A member without tools records an empty one.
+    #[tokio::test]
+    async fn a_local_team_member_records_its_loadout_like_a_cloud_one() {
+        let base_url = stub_openai_compatible_member("done").await;
+        let (mut state, _root) = state_with_root().await;
+        state.assistants = std::sync::Arc::new(MemberAssistants {
+            base_url,
+            asked_for: std::sync::Mutex::new(Vec::new()),
+        });
+        let run = team_run_for_member(&state, "tr-local-loadout").await;
+
+        for (policy, expected) in [
+            ("mcp_only", loadout_team_base()),
+            ("unrestricted", Vec::new()),
+        ] {
+            let agent = crate::agent::Agent {
+                tool_policy: policy.to_owned(),
+                ..local_member("a-frontier-moe")
+            };
+            let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+
+            spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+
+            assert_eq!(settled_run(&state, run_id).await.0, "completed");
+            let (_, _, tools) = loadout_row_of(&state, run_id).await;
+            assert_eq!(tools, expected, "tool_policy {policy}");
+        }
     }
 
     /// A cloud member under `team: apply` launches on the advice, and the row says so.
