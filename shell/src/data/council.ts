@@ -212,6 +212,18 @@ export interface CouncilView {
   leaderboard: BordaRow[];
   /** Every critique round's leaderboard, in round order. */
   leaderboard_by_round: BordaRow[][];
+  /** How far each critique round's ballots agree, aligned with `leaderboard_by_round`. */
+  agreement_by_round: Agreement[];
+  /**
+   * The round each `*_by_round` index stands for. Dense: a round with no
+   * readable ballot has no entry, so index i is round `ballot_rounds[i]`.
+   */
+  ballot_rounds: number[];
+  /**
+   * The run of the chairman's synthesis step, set as soon as that step opens,
+   * so the verdict can be tailed while it is being written. Null until then.
+   */
+  synthesis_run_id: number | null;
   /** The synthesis as markdown, once the chairman has produced one. Never HTML. */
   synthesis: string | null;
   synthesis_structured: Synthesis | null;

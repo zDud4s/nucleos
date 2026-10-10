@@ -252,6 +252,44 @@ pub fn call_ceiling(members: usize, rounds: u32) -> usize {
     members + rounds * members + rounds.saturating_sub(1) * members + 2
 }
 
+/// Every critique round's tally, in round order. Dense: a round with no readable ballot has no
+/// entry, so index i is round `ballot_rounds[i]`. `leaderboard` and `agreement` are the last
+/// round's — THE leaderboard and THE agreement.
+pub struct ByRound {
+    pub leaderboard_by_round: Vec<Vec<BordaRow>>,
+    pub agreement_by_round: Vec<Agreement>,
+    pub ballot_rounds: Vec<u32>,
+    pub leaderboard: Vec<BordaRow>,
+    pub agreement: Option<Agreement>,
+}
+
+/// Tallies `round -> voter seat -> ranking labels` into [`ByRound`].
+pub fn by_round(
+    ballots_by_round: &BTreeMap<i64, BTreeMap<usize, Vec<String>>>,
+    anon_map: &BTreeMap<String, usize>,
+) -> ByRound {
+    let leaderboard_by_round: Vec<Vec<BordaRow>> = ballots_by_round
+        .values()
+        .map(|ballots| borda(ballots, anon_map))
+        .collect();
+    let agreement_by_round: Vec<Agreement> = ballots_by_round
+        .values()
+        .map(|ballots| agreement(ballots, anon_map))
+        .collect();
+    // A negative round is not one this daemon writes; read as 0, as `step_view` does.
+    let ballot_rounds = ballots_by_round
+        .keys()
+        .map(|round| u32::try_from(*round).unwrap_or_default())
+        .collect();
+    ByRound {
+        leaderboard: leaderboard_by_round.last().cloned().unwrap_or_default(),
+        agreement: agreement_by_round.last().cloned(),
+        leaderboard_by_round,
+        agreement_by_round,
+        ballot_rounds,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

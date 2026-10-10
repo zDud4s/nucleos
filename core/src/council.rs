@@ -2510,7 +2510,8 @@ pub struct CouncilView {
     pub chairman_ref: String,
     pub chairman_agent_id: Option<String>,
     pub chairman_agent_name: Option<String>,
-    /// How far the LAST critique round's ballots agree. `None` when no critique round exists.
+    /// How far the LAST critique round's ballots agree. `None` when no critique round exists. The
+    /// last entry of `agreement_by_round`.
     pub agreement: Option<tally::Agreement>,
     /// The last critique round's Borda leaderboard — THE leaderboard. Computed from the stored
     /// ballots on every read, never read off the legacy `leaderboard` column, so it cannot drift
@@ -2518,6 +2519,16 @@ pub struct CouncilView {
     pub leaderboard: Vec<tally::BordaRow>,
     /// Every critique round's leaderboard, in round order, so a client can show how standings moved.
     pub leaderboard_by_round: Vec<Vec<tally::BordaRow>>,
+    /// How far each critique round's ballots agree, in the same order as `leaderboard_by_round`
+    /// and only for the rounds that have a readable ballot. The last entry is `agreement`.
+    pub agreement_by_round: Vec<tally::Agreement>,
+    /// The round each `*_by_round` index stands for. Dense like them: a round with no readable
+    /// ballot has no entry, so index i is round `ballot_rounds[i]`, not round i + 1.
+    pub ballot_rounds: Vec<u32>,
+    /// The run of the chairman's synthesis step, set as soon as that step opens (before it
+    /// finishes), so a client can tail the verdict while it is being written. `None` until the
+    /// council reaches phase 3, and for a council whose chairman never got a run.
+    pub synthesis_run_id: Option<i64>,
     /// The synthesis as markdown, once the chairman has produced one. See [`synthesis_text`].
     pub synthesis: Option<String>,
     /// The same synthesis as its structure, when the chairman wrote a structured one.
@@ -2675,15 +2686,7 @@ pub async fn get_council(
         steps_by_seat.entry(seat_idx).or_default().push(view);
     }
 
-    let leaderboard_by_round: Vec<Vec<tally::BordaRow>> = ballots_by_round
-        .values()
-        .map(|ballots| tally::borda(ballots, &anon_map))
-        .collect();
-    let leaderboard = leaderboard_by_round.last().cloned().unwrap_or_default();
-    let agreement = ballots_by_round
-        .values()
-        .last()
-        .map(|ballots| tally::agreement(ballots, &anon_map));
+    let tallies = tally::by_round(&ballots_by_round, &anon_map);
 
     let (synthesis, synthesis_structured) = synthesis_text(pool, &row).await;
 
@@ -2704,9 +2707,12 @@ pub async fn get_council(
             })
             .collect(),
         anon_map,
-        agreement,
-        leaderboard,
-        leaderboard_by_round,
+        agreement: tallies.agreement,
+        leaderboard: tallies.leaderboard,
+        leaderboard_by_round: tallies.leaderboard_by_round,
+        agreement_by_round: tallies.agreement_by_round,
+        ballot_rounds: tallies.ballot_rounds,
+        synthesis_run_id: row.chairman_run_id,
         synthesis,
         synthesis_structured,
         synthesis_status: row.synthesis_status,
@@ -5532,6 +5538,94 @@ mod tests {
         );
         assert_eq!(view.agreement.as_ref().unwrap().ballots, 3);
         assert_eq!(view.anon_map, abc());
+    }
+
+    /// `agreement_by_round` and `ballot_rounds` walk the same rounds as `leaderboard_by_round`: one
+    /// entry per critique round that cast a readable ballot, in round order, the last being
+    /// `agreement`. A round whose critiques all failed to read has no entry, and `ballot_rounds`
+    /// skips its number — that is how a client knows which round index i stands for.
+    #[tokio::test]
+    async fn view_reports_agreement_per_ballot_round() {
+        let state = council_state(std::sync::Arc::new(ScriptedRunner::default()), None).await;
+        let pool = &state.pool;
+        bare_council(pool, "c1", 3, 3).await;
+        set_anon_map(pool, "c1", &abc()).await.unwrap();
+
+        let round_one: &[(usize, &[&str])] =
+            &[(0, &["C", "B"]), (1, &["C", "A"]), (2, &["A", "B"])];
+        let round_three: &[(usize, &[&str])] =
+            &[(0, &["B", "C"]), (1, &["A", "C"]), (2, &["A", "B"])];
+        for (round, votes) in [(1i64, round_one), (3i64, round_three)] {
+            for (voter, labels) in votes {
+                store::upsert_step(
+                    pool,
+                    "c1",
+                    round,
+                    *voter as i64,
+                    store::PHASE_CRITIQUE,
+                    None,
+                    SEAT_OK,
+                    None,
+                    Some(&critique_json(labels)),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        // Round 2: every seat critiqued and none of it reads. No ballot, so no entry.
+        for voter in 0..3i64 {
+            store::upsert_step(
+                pool,
+                "c1",
+                2,
+                voter,
+                store::PHASE_CRITIQUE,
+                None,
+                store::STEP_INVALID,
+                Some("unreadable"),
+                Some("not a ballot"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let view = view_of(&state, "c1").await;
+        assert_eq!(view.ballot_rounds, vec![1, 3]);
+        assert_eq!(
+            view.agreement_by_round.len(),
+            view.leaderboard_by_round.len()
+        );
+        assert_eq!(
+            view.agreement_by_round,
+            vec![
+                tally::agreement(&ballots(round_one), &abc()),
+                tally::agreement(&ballots(round_three), &abc()),
+            ]
+        );
+        assert_eq!(view.agreement_by_round.last(), view.agreement.as_ref());
+
+        // The wire names the shell reads.
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["ballot_rounds"], serde_json::json!([1, 3]));
+        assert_eq!(json["agreement_by_round"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// `synthesis_run_id` is the chairman's run, visible as soon as that run is attached — before
+    /// it has written anything — so a client can tail the verdict live. Nothing attached, nothing
+    /// served.
+    #[tokio::test]
+    async fn view_exposes_the_chairman_run_as_synthesis_run_id() {
+        let state = council_state(std::sync::Arc::new(ScriptedRunner::default()), None).await;
+        let pool = &state.pool;
+        bare_council(pool, "c1", 3, 1).await;
+        assert_eq!(view_of(&state, "c1").await.synthesis_run_id, None);
+
+        let run = run_with_stdout(pool, "the verdict so far").await;
+        set_chairman_run(pool, "c1", run).await.unwrap();
+        let view = view_of(&state, "c1").await;
+        assert_eq!(view.synthesis_run_id, Some(run));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["synthesis_run_id"], serde_json::json!(run));
     }
 
     /// A council recorded before rounds existed is read in the shape `0155` copied it into: answers

@@ -67,6 +67,11 @@
   padding-right: 0;
 }
 
+/* A heading with nothing under it has no rule to close. */
+.ui-panel-head:last-child {
+  border-bottom: none;
+}
+
 .ui-panel-title {
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);
