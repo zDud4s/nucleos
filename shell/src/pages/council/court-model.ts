@@ -240,3 +240,60 @@ export function rankIn(board: BordaRow[], seatIdx: number): number | null {
   if (row === undefined) return null;
   return 1 + board.filter((other) => other.score > row.score + 1e-9).length;
 }
+
+/* ------------------------------------------------------------ verdict lines -- */
+
+export interface CourtLink { kind: "top" | "dissent"; from: string; to: string; title: string }
+
+export const seatKey = (seatIdx: number) => `seat-${seatIdx}`;
+
+/**
+ * Judge → the seat(s) with the highest Borda. Read as "most voted", never as
+ * "the seat the verdict followed": `consensus` and `answer` carry no seat
+ * references (`formats.rs:124-135`), so that line would be invented.
+ */
+export function topLinks(board: BordaRow[] | null): CourtLink[] {
+  if (board === null || board.length === 0) return [];
+  const best = Math.max(...board.map((row) => row.score));
+  return board
+    .filter((row) => row.score >= best - 1e-9)
+    .map((row) => row.seat_idx)
+    .sort((a, b) => a - b)
+    .map((seatIdx) => ({ kind: "top" as const, from: "judge", to: seatKey(seatIdx), title: "most voted" }));
+}
+
+/** Every pair of seats on different positions of one disagreement (`formats.rs:106-115`), once each. */
+export function dissentLinks(synthesis: Synthesis | null): CourtLink[] {
+  if (synthesis === null) return [];
+  const seen = new Set<string>();
+  const out: CourtLink[] = [];
+  for (const d of synthesis.disagreements) {
+    d.positions.forEach((p, i) => {
+      for (const q of d.positions.slice(i + 1)) {
+        for (const a of p.seats) for (const b of q.seats) {
+          if (a === b) continue;
+          const [lo, hi] = a < b ? [a, b] : [b, a];
+          const key = `${d.topic}|${lo}|${hi}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({ kind: "dissent", from: seatKey(lo), to: seatKey(hi), title: d.topic });
+        }
+      }
+    });
+  }
+  return out;
+}
+
+/** Seats marked dissent: only with a `minority`, only the position with STRICTLY fewer seats. */
+export function dissenters(synthesis: Synthesis | null): Set<number> {
+  const out = new Set<number>();
+  if (synthesis === null || synthesis.minority === null) return out;
+  for (const d of synthesis.disagreements) {
+    if (d.positions.length < 2) continue;
+    const sizes = d.positions.map((p) => p.seats.length);
+    const least = Math.min(...sizes);
+    if (sizes.filter((size) => size === least).length !== 1) continue;
+    d.positions[sizes.indexOf(least)].seats.forEach((s) => out.add(s));
+  }
+  return out;
+}

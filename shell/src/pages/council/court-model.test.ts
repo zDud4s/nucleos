@@ -240,3 +240,33 @@ describe("a chair's size", () => {
     expect([0, 1, 2].map((s) => court.rankIn(board, s))).toEqual([1, 1, 3]);
   });
 });
+
+const synthesis = (overrides: Partial<Synthesis> = {}): Synthesis => ({
+  answer: "ship", consensus: [], disagreements: [], minority: null,
+  confidence: { level: "high", why: "w" }, open_questions: [], ...overrides,
+});
+
+describe("the verdict's lines", () => {
+  const board = [{ seat_idx: 0, score: 1, n: 2 }, { seat_idx: 2, score: 1, n: 2 }, { seat_idx: 1, score: 0.3, n: 2 }];
+  it("links the judge to every seat tied at the top Borda", () => {
+    expect(court.topLinks(board)).toEqual([
+      { kind: "top", from: "judge", to: "seat-0", title: "most voted" },
+      { kind: "top", from: "judge", to: "seat-2", title: "most voted" },
+    ]);
+  });
+  it("draws one dissent line per pair of seats on different positions, titled by the topic", () => {
+    const s = synthesis({ disagreements: [{ topic: "cost", positions: [{ seats: [0, 1], view: "a" }, { seats: [2], view: "b" }] }] });
+    expect(court.dissentLinks(s)).toEqual([
+      { kind: "dissent", from: "seat-0", to: "seat-2", title: "cost" },
+      { kind: "dissent", from: "seat-1", to: "seat-2", title: "cost" },
+    ]);
+  });
+  it("marks dissent only with a minority, and only the strictly smaller position", () => {
+    const d = { topic: "t", positions: [{ seats: [0, 1], view: "a" }, { seats: [2], view: "b" }] };
+    expect(court.dissenters(synthesis({ disagreements: [d] }))).toEqual(new Set());
+    expect(court.dissenters(synthesis({ minority: "m", disagreements: [d] }))).toEqual(new Set([2]));
+    const tie = { topic: "t", positions: [{ seats: [0], view: "a" }, { seats: [1], view: "b" }] };
+    expect(court.dissenters(synthesis({ minority: "m", disagreements: [tie] }))).toEqual(new Set());
+    expect(court.dissenters(synthesis({ minority: "m" }))).toEqual(new Set());
+  });
+});
