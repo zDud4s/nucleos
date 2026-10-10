@@ -30,7 +30,7 @@
 //! have and the reason they are testable at all. `main.rs` calls the pure functions; it never
 //! reimplements what they decide.
 
-use crate::runner;
+use crate::execution::runner;
 
 /// What a role needs from a model before it may run at full capability.
 ///
@@ -1067,9 +1067,9 @@ impl DiscoveryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local_agent;
-    use crate::triage;
-    use crate::voice;
+    use crate::governance::triage;
+    use crate::integrations::voice;
+    use crate::models::local_agent;
 
     fn satisfied_requirement() -> Requirement {
         Requirement {
@@ -2240,7 +2240,8 @@ mod tests {
     #[ignore = "needs a running Ollama at runner::OLLAMA_BASE_URL with at least one model pulled"]
     async fn a_real_ollama_streams_a_pull_it_already_has() {
         let client = reqwest::Client::new();
-        let installed = installed_local_models(&client, crate::runner::OLLAMA_BASE_URL).await;
+        let installed =
+            installed_local_models(&client, crate::execution::runner::OLLAMA_BASE_URL).await;
         let model = installed
             .first()
             .expect("this test needs a machine with at least one model already pulled")
@@ -2249,7 +2250,7 @@ mod tests {
 
         let outcome = pull_local_model(
             &client,
-            crate::runner::OLLAMA_BASE_URL,
+            crate::execution::runner::OLLAMA_BASE_URL,
             &model,
             |progress| {
                 seen.push(progress.status);
@@ -2580,7 +2581,7 @@ mod tests {
     async fn the_real_openrouter_catalogue_is_readable_over_tls() {
         let declared = discover_openai_compatible(
             &reqwest::Client::new(),
-            crate::openai_compatible::OPENROUTER_BASE_URL,
+            crate::models::openai_compatible::OPENROUTER_BASE_URL,
             "anthropic/claude-sonnet-4.5",
             8_000,
             None,

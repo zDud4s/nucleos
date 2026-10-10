@@ -3,7 +3,7 @@
  *
  * # Why this exists
  *
- * `core/src/runner.rs`'s `BUILTIN_TOOLS` is a BLOCKLIST: `denied_tools()` denies exactly these
+ * `core/src/execution/runner.rs`'s `BUILTIN_TOOLS` is a BLOCKLIST: `denied_tools()` denies exactly these
  * names under `ToolPolicy::McpOnly`, so any tool the CLI advertises that is absent from the list
  * is ALLOWED to an assistant turn — the surface that reads summaries of mail written by strangers.
  * The failure mode measured 2026-09 was `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate` appearing
@@ -16,7 +16,7 @@
  *
  * `core/src/http.rs`'s `get_deniable_tools` serves the same list to the UI, but reaching it needs a
  * running, authenticated daemon. The whole point of this script is to be run standalone right after
- * a CLI upgrade, so it parses `BUILTIN_TOOLS` out of `core/src/runner.rs` directly — the source is
+ * a CLI upgrade, so it parses `BUILTIN_TOOLS` out of `core/src/execution/runner.rs` directly — the source is
  * equally the one list, and a script that needs nothing but a checkout is a script that actually
  * gets run.
  *
@@ -47,7 +47,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const RUNNER_RS = join(REPO, "core", "src", "runner.rs");
+const RUNNER_RS = join(REPO, "core", "src", "execution", "runner.rs");
 
 /** How long the trivial probe turn gets before it counts as hung rather than merely slow. */
 const PROBE_TIMEOUT_MS = 30_000;
@@ -186,7 +186,7 @@ async function main() {
     console.error(
       `${missing.length} tool(s) advertised by the CLI are NOT in BUILTIN_TOOLS and are therefore ` +
         `ALLOWED under ToolPolicy::McpOnly:\n  ${missing.join("\n  ")}\n` +
-        `Add them to core/src/runner.rs's BUILTIN_TOOLS before this reaches a real conversation.`,
+        `Add them to core/src/execution/runner.rs's BUILTIN_TOOLS before this reaches a real conversation.`,
     );
     process.exit(1);
   }

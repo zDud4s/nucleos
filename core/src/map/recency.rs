@@ -28,7 +28,7 @@
 //! and here it splits cleanly in two: [`walk`] is the only thing in this file that spawns anything,
 //! and [`parse`], [`Walk::age`] and [`order`] are exercisable with no repository within reach.
 
-use crate::git_exec::run_git;
+use crate::execution::git_exec::run_git;
 use crate::map::join::Anchored;
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -909,12 +909,12 @@ mod tests {
         // Read before and after rather than against zero: this fixture builds its repository with
         // `std::process::Command`, which the counter does not see, and nothing says a later helper
         // will not go through `run_git` instead.
-        let before = crate::git_exec::spawns::against(root);
+        let before = crate::execution::git_exec::spawns::against(root);
         let walked = walk_within(root, 50).await;
         let recency = order(&mut decisions, &walked);
 
         assert_eq!(
-            crate::git_exec::spawns::against(root) - before,
+            crate::execution::git_exec::spawns::against(root) - before,
             1,
             "twenty-five decisions over twenty anchor files must cost ONE git process, and the \
              ordering itself must cost none"

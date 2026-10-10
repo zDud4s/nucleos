@@ -36,13 +36,13 @@ use sqlx::SqlitePool;
 
 use crate::auth::{ApiTokenLevel, Scope};
 use crate::config;
-use crate::git_exec::{self, CommandResult, OPERATION_TIMEOUT};
+use crate::execution::git_exec::{self, CommandResult, OPERATION_TIMEOUT};
+use crate::execution::land;
+use crate::execution::vcs;
 use crate::inspect;
-use crate::land;
 use crate::state::AppState;
 use crate::test_select;
 use crate::tests_map::{self, Group, MapState};
-use crate::vcs;
 use crate::verify::exec::Executor;
 use crate::verify::fingerprint as verify_fingerprint;
 use crate::verify::plan::{self as verify_plan, Kind, PlanError, ScopeArg, Ticket};
@@ -678,9 +678,11 @@ async fn map_trusted_now(pool: &SqlitePool, project_id: &str, worktree: &Path) -
         _ => return false,
     };
     let worktree = worktree.to_path_buf();
-    tokio::task::spawn_blocking(move || crate::job::map_is_trusted(&worktree, &project_root))
-        .await
-        .unwrap_or(false)
+    tokio::task::spawn_blocking(move || {
+        crate::execution::job::map_is_trusted(&worktree, &project_root)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// `submit` that also says whether the plan was made from a map the daemon could vouch for at
@@ -1120,9 +1122,11 @@ pub(crate) async fn confirm_measured_tree(
     };
     let trusted = {
         let worktree = worktree.clone();
-        tokio::task::spawn_blocking(move || crate::job::map_is_trusted(&worktree, &project_root))
-            .await
-            .unwrap_or(false)
+        tokio::task::spawn_blocking(move || {
+            crate::execution::job::map_is_trusted(&worktree, &project_root)
+        })
+        .await
+        .unwrap_or(false)
     };
     if !trusted {
         tracing::info!(

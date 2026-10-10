@@ -89,7 +89,7 @@ const RESERVED: &[&str] = &[
 pub fn reserved(rel: &str) -> bool {
     // Derived from the hook's own path rather than written out a second time, so moving the hook
     // cannot leave a bundle able to overwrite it.
-    let hook_dir = crate::autopilot::HOOK_SCRIPT
+    let hook_dir = crate::governance::autopilot::HOOK_SCRIPT
         .rsplit_once('/')
         .map_or("", |(dir, _)| dir);
     RESERVED.iter().any(|entry| match entry.strip_suffix('/') {
@@ -1135,7 +1135,7 @@ pub async fn into_worktree(
     // reasons: the daemon resets it itself and the gate must measure the commit as it is.
     if worktree.file_name().is_some_and(|name| {
         let name = name.to_string_lossy();
-        name.starts_with(crate::git_exec::INTEGRATION_PREFIX)
+        name.starts_with(crate::execution::git_exec::INTEGRATION_PREFIX)
             || name.starts_with(crate::verify::postgate::POSTGATE_PREFIX)
     }) {
         return;
@@ -1525,9 +1525,10 @@ mod tests {
     async fn an_integration_tree_is_never_synced() {
         let pool = crate::testdb::fresh_pool().await;
         let temp = tempfile::tempdir().unwrap();
-        let tree = temp
-            .path()
-            .join(format!("{}project", crate::git_exec::INTEGRATION_PREFIX));
+        let tree = temp.path().join(format!(
+            "{}project",
+            crate::execution::git_exec::INTEGRATION_PREFIX
+        ));
         std::fs::create_dir_all(&tree).unwrap();
         crate::project::state::write_for_test(
             temp.path(),

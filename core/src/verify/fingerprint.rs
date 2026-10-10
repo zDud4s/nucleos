@@ -140,7 +140,7 @@ async fn list(
     args.push("--".into());
     args.extend(pathspecs.iter().map(OsString::from));
     let refs: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
-    let result = crate::git_exec::run_git(worktree, &refs, LIST_TIMEOUT).await?;
+    let result = crate::execution::git_exec::run_git(worktree, &refs, LIST_TIMEOUT).await?;
     if !result.succeeded() {
         return Err(format!(
             "git ls-files failed ({:?}): {}",

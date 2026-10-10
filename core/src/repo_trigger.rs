@@ -128,7 +128,7 @@ async fn governance_permits_repo_trigger(
     project_id: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), GateRefusal> {
-    if crate::autopilot::kill_switch_engaged(&state.pool)
+    if crate::governance::autopilot::kill_switch_engaged(&state.pool)
         .await
         .unwrap_or(true)
     {
@@ -137,7 +137,7 @@ async fn governance_permits_repo_trigger(
             stop_tick: true,
         });
     }
-    if crate::autopilot::scoped_kill_engaged(&state.pool, "trigger", "repo")
+    if crate::governance::autopilot::scoped_kill_engaged(&state.pool, "trigger", "repo")
         .await
         .unwrap_or(true)
     {
@@ -146,7 +146,7 @@ async fn governance_permits_repo_trigger(
             stop_tick: true,
         });
     }
-    if crate::autopilot::scoped_kill_engaged(&state.pool, "project", project_id)
+    if crate::governance::autopilot::scoped_kill_engaged(&state.pool, "project", project_id)
         .await
         .unwrap_or(true)
     {
@@ -155,7 +155,7 @@ async fn governance_permits_repo_trigger(
             stop_tick: false,
         });
     }
-    if let crate::budget::BudgetDecision::Pause { reason, .. } =
+    if let crate::governance::budget::BudgetDecision::Pause { reason, .. } =
         crate::quota::permits_new_run(state, now).await
     {
         return Err(GateRefusal {
@@ -194,7 +194,7 @@ pub async fn fire_configured_trigger(
     now: chrono::DateTime<chrono::Utc>,
     project_id: &str,
     project_root: &str,
-    project_mode: crate::autopilot::Mode,
+    project_mode: crate::governance::autopilot::Mode,
     trigger: &RepoTrigger,
     current_sha: &str,
 ) -> TriggerFireOutcome {
@@ -206,9 +206,9 @@ pub async fn fire_configured_trigger(
     }
 
     let run_mode = match project_mode {
-        crate::autopilot::Mode::Shadow => "shadow",
-        crate::autopilot::Mode::Active => "worktree",
-        crate::autopilot::Mode::Off => {
+        crate::governance::autopilot::Mode::Shadow => "shadow",
+        crate::governance::autopilot::Mode::Active => "worktree",
+        crate::governance::autopilot::Mode::Off => {
             return TriggerFireOutcome::Deferred {
                 reason: "project autopilot is off".to_string(),
                 stop_tick: false,
@@ -218,7 +218,7 @@ pub async fn fire_configured_trigger(
 
     // Re-read the emergency stop immediately before committing because the preceding checks take
     // time and a switch thrown during them must stop this queued trigger.
-    if crate::autopilot::kill_switch_engaged(&state.pool)
+    if crate::governance::autopilot::kill_switch_engaged(&state.pool)
         .await
         .unwrap_or(true)
     {
@@ -228,7 +228,7 @@ pub async fn fire_configured_trigger(
         };
     }
 
-    match crate::runs::create_run_inner(
+    match crate::execution::runs::create_run_inner(
         state,
         trigger.prompt.clone(),
         Some(project_id.to_string()),
@@ -252,15 +252,17 @@ pub async fn fire_configured_trigger(
             }
             TriggerFireOutcome::Fired(run_id)
         }
-        Err(crate::runs::CreateRunError::Busy) => TriggerFireOutcome::Busy,
+        Err(crate::execution::runs::CreateRunError::Busy) => TriggerFireOutcome::Busy,
         // Deferred and not `Busy`: both outcomes leave the SHA unrecorded and carry on with the
         // tick, but `Busy` is read out as "project busy" and "work in progress", which is the wrong
         // thing to go looking for. Only an item is ever refused for disk today, so this arm is for
         // the day a trigger's run is asked the same question.
-        Err(crate::runs::CreateRunError::NoRoomOnDisk(refusal)) => TriggerFireOutcome::Deferred {
-            reason: refusal,
-            stop_tick: false,
-        },
+        Err(crate::execution::runs::CreateRunError::NoRoomOnDisk(refusal)) => {
+            TriggerFireOutcome::Deferred {
+                reason: refusal,
+                stop_tick: false,
+            }
+        }
         Err(error) => TriggerFireOutcome::Failed(error.to_string()),
     }
 }
@@ -278,7 +280,7 @@ pub async fn run_repo_poller(state: crate::state::AppState) {
 /// arm first-seen triggers without firing, and fire a run for any trigger whose branch SHA changed —
 /// gated by the same global/scoped kill switches and budget as the scheduler.
 pub async fn poll_tick(state: &crate::state::AppState, now: chrono::DateTime<chrono::Utc>) {
-    let projects = match crate::autopilot::autopilot_projects(&state.pool).await {
+    let projects = match crate::governance::autopilot::autopilot_projects(&state.pool).await {
         Ok(projects) => projects,
         Err(error) => {
             tracing::warn!(%error, "failed to load autopilot projects for repo poll tick");
@@ -571,7 +573,7 @@ mod tests {
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,
-            runner: Arc::new(crate::runner::FakeCommandRunner::default()),
+            runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
@@ -584,13 +586,13 @@ mod tests {
             machine_config_root: Some(home.path().to_path_buf()),
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
-            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
-            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
-            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
             judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
-            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,

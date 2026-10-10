@@ -440,7 +440,7 @@ pub struct Answering {
     pub extra_dirs: Vec<String>,
     pub turn_budget_usd: Option<f64>,
     /// The helpers this conversation may hand work to, beyond the ones the CLI finds on disk.
-    pub agents: Vec<crate::runner::Subagent>,
+    pub agents: Vec<crate::execution::runner::Subagent>,
     /// Standing instructions appended to the CLI's own system prompt, or `None`.
     pub system_prompt: Option<String>,
     /// Built-in tools this conversation may not reach for, on top of what its policy already denies.
@@ -503,7 +503,7 @@ pub async fn model_of(
 /// Unreadable JSON reads as no helpers. The alternative is a turn refused because a preference
 /// could not be parsed, and this preference only ever ADDS helpers — falling back to none leaves
 /// the conversation exactly as capable as one that never defined any.
-fn subagents_from(raw: Option<String>) -> Vec<crate::runner::Subagent> {
+fn subagents_from(raw: Option<String>) -> Vec<crate::execution::runner::Subagent> {
     let Some(parsed) = raw.and_then(|text| {
         serde_json::from_str::<std::collections::BTreeMap<String, serde_json::Value>>(&text).ok()
     }) else {
@@ -512,7 +512,8 @@ fn subagents_from(raw: Option<String>) -> Vec<crate::runner::Subagent> {
     parsed
         .into_iter()
         .filter_map(|(name, body)| {
-            let mut agent: crate::runner::Subagent = serde_json::from_value(body).ok()?;
+            let mut agent: crate::execution::runner::Subagent =
+                serde_json::from_value(body).ok()?;
             // The name lives in the key, and `Subagent` skips it on the way out — so what comes
             // back from the value is whatever `Default` gave it, which is the empty string. Put the
             // key back or every helper is anonymous.
@@ -768,9 +769,9 @@ pub async fn set_denied_tools(
 pub async fn set_agents(
     pool: &SqlitePool,
     chat_id: &str,
-    agents: &[crate::runner::Subagent],
+    agents: &[crate::execution::runner::Subagent],
 ) -> sqlx::Result<()> {
-    let encoded = crate::runner::agents_json(agents);
+    let encoded = crate::execution::runner::agents_json(agents);
     sqlx::query("UPDATE chats SET agents = ? WHERE chat_id = ?")
         .bind((!agents.is_empty()).then_some(encoded))
         .bind(chat_id)

@@ -37,9 +37,9 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::git_exec;
-use crate::land;
-use crate::vcs::{self, Branch, CommitSha, Op, Origin};
+use crate::execution::git_exec;
+use crate::execution::land;
+use crate::execution::vcs::{self, Branch, CommitSha, Op, Origin};
 use crate::verify::batch::{self as verify_batch, Commit, Decision, TargetState};
 use crate::verify::bisect::{Bisection, Candidate, Next, Probe, Verdict};
 use crate::verify::exec::Executor;
@@ -915,7 +915,7 @@ async fn queue_revert(
         Ok(None) => {}
         Err(error) => return Step::Failed(format!("cannot look for a queued revert: {error}")),
     }
-    if crate::autopilot::kill_switch_engaged(pool)
+    if crate::governance::autopilot::kill_switch_engaged(pool)
         .await
         .unwrap_or(true)
     {
@@ -1241,7 +1241,7 @@ fn correction_outcome(retry: bool, released: bool) -> String {
 /// it like any other run the daemon starts on its own; a switch that cannot be read stops it too.
 pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
     let pool = &state.pool;
-    if crate::autopilot::kill_switch_engaged(pool)
+    if crate::governance::autopilot::kill_switch_engaged(pool)
         .await
         .unwrap_or(true)
     {
@@ -1267,7 +1267,7 @@ pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
     if rows.is_empty() {
         return Vec::new();
     }
-    if let crate::budget::BudgetDecision::Pause { reason, .. } =
+    if let crate::governance::budget::BudgetDecision::Pause { reason, .. } =
         crate::quota::permits_new_run(state, chrono::Utc::now()).await
     {
         tracing::info!(%reason, "budget exhausted; no correction run opened this tick");
@@ -1301,12 +1301,12 @@ pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
                 continue;
             }
         }
-        let started = crate::runs::create_correction_run(
+        let started = crate::execution::runs::create_correction_run(
             state,
             correction_prompt(&row),
             row.project_id.clone(),
             row.project_root.clone(),
-            crate::runs::Correction {
+            crate::execution::runs::Correction {
                 base: row.fix_branch.clone(),
             },
         )
@@ -1333,7 +1333,8 @@ pub async fn open_corrections(state: &crate::state::AppState) -> Vec<i64> {
             }
             // Nothing was spent: give the claim back and ask again on a later pass.
             Err(
-                crate::runs::CreateRunError::Busy | crate::runs::CreateRunError::NoRoomOnDisk(_),
+                crate::execution::runs::CreateRunError::Busy
+                | crate::execution::runs::CreateRunError::NoRoomOnDisk(_),
             ) => {
                 if let Err(error) = set_fix_run(pool, &row, None).await {
                     tracing::warn!(
@@ -1445,7 +1446,7 @@ mod tests {
 
     use super::*;
     use crate::config::VerifyConfig;
-    use crate::git_exec::tests::{WorktreeRootEnv, space_free_tempdir};
+    use crate::execution::git_exec::tests::{WorktreeRootEnv, space_free_tempdir};
     use crate::verify::exec::{self as verify_exec, Executor};
     use crate::verify::postgate as verify_postgate;
     use crate::verify::runs::PRIORITY_POSTGATE;
@@ -1497,7 +1498,7 @@ mod tests {
     /// A repository with two commits on `main`, rostered as project `alpha`, whose
     /// `autopilot.yaml` holds `rules` when given. The executor loop is NOT running.
     async fn fixture(rules: Option<&str>) -> Fixture {
-        let lock = crate::worktree::test_env_lock();
+        let lock = crate::execution::worktree::test_env_lock();
         let repo = space_free_tempdir("nucleos-postgate-");
         let root = repo.path().to_path_buf();
         git_in(&root, &["init", "-q", "-b", "main"]);
@@ -2155,7 +2156,7 @@ mod tests {
         let f = fixture(Some(REVERT_ON)).await;
         let (c3, _c4) = confirmed_culprit(&f).await;
 
-        crate::autopilot::set_kill_switch(&f.pool, true)
+        crate::governance::autopilot::set_kill_switch(&f.pool, true)
             .await
             .unwrap();
         for _ in 0..3 {
@@ -2172,7 +2173,7 @@ mod tests {
         assert_eq!(s.revert_merge_sha.as_deref(), Some(c3.as_str()));
         assert_eq!(s.revert_request_id, None);
 
-        crate::autopilot::set_kill_switch(&f.pool, false)
+        crate::governance::autopilot::set_kill_switch(&f.pool, false)
             .await
             .unwrap();
         tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
@@ -2447,10 +2448,10 @@ mod tests {
     }
 
     async fn correction_fixture() -> CorrectionFixture {
-        let lock = crate::worktree::test_env_lock();
+        let lock = crate::execution::worktree::test_env_lock();
         let container = space_free_tempdir("nucleos-correction-");
         let root = container.path().join("repo");
-        crate::git_exec::testkit::initialize_repo(&root);
+        crate::execution::git_exec::testkit::initialize_repo(&root);
         let roots = space_free_tempdir("nucleos-correction-wt-");
         let env = WorktreeRootEnv::set(roots.path());
         let floor = DiskFloorOff::new();
@@ -2463,7 +2464,7 @@ mod tests {
         git_in(&root, &["commit", "-q", "-m", "revert the revert"]);
         git_in(&root, &["checkout", "-q", "-"]);
 
-        let (state, _runner) = crate::runs::testkit::test_state_with_runner(
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
             Some(Duration::from_secs(30)),
             Duration::from_secs(120),
         )
@@ -2571,9 +2572,13 @@ mod tests {
         .await
         .unwrap()
         .last_insert_rowid();
-        crate::concurrency::claim(pool, "alpha", crate::worktree::Owner::Run(pinned))
-            .await
-            .expect("the parked run holds the slot");
+        crate::execution::concurrency::claim(
+            pool,
+            "alpha",
+            crate::execution::worktree::Owner::Run(pinned),
+        )
+        .await
+        .expect("the parked run holds the slot");
 
         assert!(open_corrections(&f.state).await.is_empty(), "no room");
         let s = verify_postgate::load(pool, "alpha").await.unwrap().unwrap();
@@ -2585,7 +2590,9 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        crate::autopilot::set_kill_switch(pool, true).await.unwrap();
+        crate::governance::autopilot::set_kill_switch(pool, true)
+            .await
+            .unwrap();
         assert!(open_corrections(&f.state).await.is_empty());
         let s = verify_postgate::load(pool, "alpha").await.unwrap().unwrap();
         assert_eq!(
@@ -2595,7 +2602,7 @@ mod tests {
         assert_eq!(count(pool, "runs").await, 1);
 
         // Released: the same branch gets its run on the next pass.
-        crate::autopilot::set_kill_switch(pool, false)
+        crate::governance::autopilot::set_kill_switch(pool, false)
             .await
             .unwrap();
         let opened = open_corrections(&f.state).await;

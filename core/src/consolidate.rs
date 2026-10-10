@@ -238,7 +238,7 @@ fn record(report: &mut PassReport, outcome: Outcome) {
 }
 
 async fn project_is_busy(pool: &SqlitePool, project: &str) -> sqlx::Result<bool> {
-    let placeholders = std::iter::repeat_n("?", crate::job::LIVE_STATUSES.len())
+    let placeholders = std::iter::repeat_n("?", crate::execution::job::LIVE_STATUSES.len())
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
@@ -248,7 +248,7 @@ async fn project_is_busy(pool: &SqlitePool, project: &str) -> sqlx::Result<bool>
     // `AssertSqlSafe`, audited: only one `?` per member of the constant status list is
     // interpolated. Project and status values are bound below.
     let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql)).bind(project);
-    for status in crate::job::LIVE_STATUSES {
+    for status in crate::execution::job::LIVE_STATUSES {
         query = query.bind(status);
     }
     Ok(query.bind(project).fetch_one(pool).await? != 0)

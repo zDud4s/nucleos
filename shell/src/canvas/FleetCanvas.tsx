@@ -291,7 +291,7 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
             <span className="fleet-card-of">id {slot.owner_id}</span>
           </p>
           {/* Where the conflict is dealt with. Nobody is asked: `batch_of` in
-              `core/src/job.rs` takes a conflicted item as work and starts a
+              `core/src/execution/job.rs` takes a conflicted item as work and starts a
               resolution run in its own tree, and that run is listed in Runs
               under this project. So the door goes there, and the sentence says
               the núcleo is on it rather than implying a person must be. */}

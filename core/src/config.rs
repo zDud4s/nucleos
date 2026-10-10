@@ -543,7 +543,7 @@ impl ModelsConfig {
             (Some(written), _) => written.clone(),
             // Read from the runner's own constant, so the default address and the address the
             // runner posts to cannot drift apart without a test failing.
-            (None, LocalEngine::Ollama) => crate::runner::OLLAMA_BASE_URL.to_string(),
+            (None, LocalEngine::Ollama) => crate::execution::runner::OLLAMA_BASE_URL.to_string(),
             (None, LocalEngine::OpenAiCompatible) => return Err(LocalEngineRefusal::NoBaseUrl),
         };
         if !is_loopback_url(&base_url) {
@@ -5351,7 +5351,7 @@ resolve_effort: \"  \"
         );
         assert_eq!(
             resolved.base_url,
-            crate::runner::OLLAMA_BASE_URL,
+            crate::execution::runner::OLLAMA_BASE_URL,
             "absent means the address the runner already uses, read from the constant itself"
         );
         assert_eq!(

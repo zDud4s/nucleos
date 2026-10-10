@@ -30,7 +30,8 @@ pub fn postgate_worktree(project_root: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unnamed".to_owned());
-    crate::worktree::worktree_root(project_root).join(format!("{POSTGATE_PREFIX}{project}"))
+    crate::execution::worktree::worktree_root(project_root)
+        .join(format!("{POSTGATE_PREFIX}{project}"))
 }
 
 /// The feed kind of the owner-facing report of a confirmed red (spec 2026-10-05 §6.2 step 4).

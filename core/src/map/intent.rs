@@ -298,8 +298,8 @@ fn extraction_format() -> serde_json::Value {
 /// under a rule nobody wrote down.
 ///
 /// **Not `1`, and the reason is that the ceiling counts something other than what "ask once" means.**
-/// [`crate::runner::over_turn_ceiling`] is `turns >= ceiling` and
-/// [`crate::runner::TurnCounter`] counts every new `assistant` message AND every `turn.completed`
+/// [`crate::execution::runner::over_turn_ceiling`] is `turns >= ceiling` and
+/// [`crate::execution::runner::TurnCounter`] counts every new `assistant` message AND every `turn.completed`
 /// event, so `Some(1)` breaks the stream ON the first assistant message — before the `result` event
 /// carrying the answer has been read. The cloud arm would then return a truncated transcript and
 /// `TURN_CEILING_EXIT_CODE` for every run that had in fact succeeded, which the exit-code check
@@ -307,7 +307,7 @@ fn extraction_format() -> serde_json::Value {
 /// halves of that against the runner's own pure functions.
 ///
 /// **A margin rather than a budget, and it brakes nothing that could run away.** The ceiling exists
-/// to stop a tool loop, and [`crate::runner::ToolPolicy::None`] leaves no tool to loop on: the model
+/// to stop a tool loop, and [`crate::execution::runner::ToolPolicy::None`] leaves no tool to loop on: the model
 /// is handed a document, answers, and the process ends. What this has to survive is one answer
 /// arriving as more than one event — a `turn.completed` beside the `assistant` is already two — not
 /// a run that will not converge. Four is that margin and nothing more; it is not a number this is
@@ -317,14 +317,14 @@ const MAX_ANSWER_TURNS: i64 = 4;
 /// Who is being asked, which is the whole of the owner's choice.
 ///
 /// **Two arms and not one, and the reason is behavioural rather than typed.** Both `OllamaRunner`
-/// and `ClaudeCliRunner` implement [`crate::runner::CommandRunner`], so a single call through the
+/// and `ClaudeCliRunner` implement [`crate::execution::runner::CommandRunner`], so a single call through the
 /// trait looks like it would serve both — and it does not. `OllamaRunner` is the TRIAGE runner
 /// wearing the trait: it imposes a `{id, class, summary}` grammar on every prompt it is given,
 /// validates the answer as a triage verdict, and pins the context to `triage::LOCAL_NUM_CTX`. An
 /// extraction sent through it comes back a triage array, is judged unusable, and parses to nothing.
 ///
 /// So the local brain is asked at the loopback endpoint directly, which is what
-/// [`crate::runner::ollama_chat`] is `pub` for — `web.rs`, `voice.rs` and `pii_shadow.rs` all reach
+/// [`crate::execution::runner::ollama_chat`] is `pub` for — `web.rs`, `voice.rs` and `pii_shadow.rs` all reach
 /// it that way, and this is the fourth. The cost is one `match` in one function; the alternative
 /// was making the grammar per-request in the runner, which would rewrite shipped mail triage to
 /// serve a feature that had not shipped yet.
@@ -334,7 +334,7 @@ const MAX_ANSWER_TURNS: i64 = 4;
 #[derive(Clone, Copy)]
 pub enum Extractor<'a> {
     /// The agent CLI, through the trait every runner implements.
-    Cli(&'a dyn crate::runner::CommandRunner),
+    Cli(&'a dyn crate::execution::runner::CommandRunner),
     /// The model on this machine, asked where it lives.
     Loopback {
         client: &'a reqwest::Client,
@@ -379,7 +379,7 @@ pub async fn extract(
             // Straight to the same parse the other arm ends at, with no `extract_reply` on the way:
             // there is no stream to unwrap here, because `ollama_chat` returns `message.content`,
             // which is the model's words and nothing else.
-            crate::runner::ollama_chat(
+            crate::execution::runner::ollama_chat(
                 client,
                 base_url,
                 model,
@@ -438,7 +438,7 @@ pub async fn extract(
 /// model is told on every turn, and adding one to a shipped feature while wiring up a different
 /// one would be two changes reported as one.
 pub async fn ask_once(
-    runner: &dyn crate::runner::CommandRunner,
+    runner: &dyn crate::execution::runner::CommandRunner,
     prompt: String,
     what: &str,
     standing: Option<&str>,
@@ -447,13 +447,13 @@ pub async fn ask_once(
     // comment says why: a flag added later must not silently inherit a value nobody chose. Copied
     // from `council.rs`'s cloud seat, which is the closest neighbour (one question, no tools, no
     // resume), and changed only where this call differs.
-    let request = crate::runner::RunRequest {
+    let request = crate::execution::runner::RunRequest {
         prompt,
         // Nothing to reach, so nothing to carry. A run with no tools cannot spend a token, and one
         // handed a key it has no door for is a key that leaked for no reason.
         env: Vec::new(),
         cwd: None,
-        permission: crate::runner::Permission::Default,
+        permission: crate::execution::runner::Permission::Default,
         resume_session_id: None,
         mcp_config: None,
         mcp_job: None,
@@ -464,7 +464,7 @@ pub async fn ask_once(
         // The argument is `local_agent::verdict`'s: a reader that could edit the repository is not
         // reading it. It is also the only policy `OllamaRunner` accepts at all — it refuses
         // anything else outright — so the local half of the owner's choice depends on this value.
-        tool_policy: crate::runner::ToolPolicy::None,
+        tool_policy: crate::execution::runner::ToolPolicy::None,
         progress_timeout: None,
         // Asks once and reads the answer — but the ceiling counts events, not questions, so the
         // number that expresses "once" is not `1`. See [`MAX_ANSWER_TURNS`].
@@ -539,7 +539,7 @@ pub async fn ask_once(
     // rest of this daemon uses for exactly that (`team.rs`, `voice.rs`, `assistant.rs`), and it
     // returns `None` for an answer that is not a stream, so a runner answering in plain text passes
     // through it untouched.
-    Ok(crate::runner::extract_reply(&outcome.stdout).unwrap_or(outcome.stdout))
+    Ok(crate::execution::runner::extract_reply(&outcome.stdout).unwrap_or(outcome.stdout))
 }
 
 use std::path::Path;
@@ -840,9 +840,9 @@ mod tests {
     /// The canned outcome is spelled out rather than defaulted, because `FakeCommandRunner` with
     /// `canned: None` answers a `result` EVENT — `{"type":"result",...,"result":"fake output"}` —
     /// and a test of what this module makes of an answer must decide what the answer was.
-    fn fake_answering(stdout: &str) -> crate::runner::FakeCommandRunner {
-        crate::runner::FakeCommandRunner {
-            canned: std::sync::Mutex::new(Some(crate::runner::RunOutcome {
+    fn fake_answering(stdout: &str) -> crate::execution::runner::FakeCommandRunner {
+        crate::execution::runner::FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(crate::execution::runner::RunOutcome {
                 exit_code: 0,
                 stdout: stdout.to_owned(),
                 stderr: String::new(),
@@ -864,8 +864,8 @@ mod tests {
     /// `fail_times` is a countdown the fake decrements, so `1` fails the first call and would let a
     /// second through. One call is all this makes, and a larger number would be a retry budget this
     /// function does not have.
-    fn fake_failing() -> crate::runner::FakeCommandRunner {
-        crate::runner::FakeCommandRunner {
+    fn fake_failing() -> crate::execution::runner::FakeCommandRunner {
+        crate::execution::runner::FakeCommandRunner {
             fail_times: std::sync::Mutex::new(1),
             ..Default::default()
         }
@@ -930,7 +930,7 @@ mod tests {
         assert!(prompt.contains("the-slug"));
         assert_eq!(
             *runner.last_tool_policy.lock().unwrap(),
-            Some(crate::runner::ToolPolicy::None)
+            Some(crate::execution::runner::ToolPolicy::None)
         );
     }
 
@@ -967,7 +967,7 @@ mod tests {
         // mid-transcript. Every one means nobody finished reading the spec, and each would parse to
         // an empty list: the same collapse as above, through the door that does not look like one.
         let runner = fake_answering("");
-        *runner.canned.lock().unwrap() = Some(crate::runner::RunOutcome {
+        *runner.canned.lock().unwrap() = Some(crate::execution::runner::RunOutcome {
             exit_code: 1,
             stdout: String::new(),
             stderr: "nucleos: stream failed after launch".to_string(),
@@ -1003,17 +1003,17 @@ mod tests {
         // would come back truncated and non-zero.
         let assistant =
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#;
-        let mut turns = crate::runner::TurnCounter::default();
+        let mut turns = crate::execution::runner::TurnCounter::default();
         turns.line(assistant);
         let after_one_answer = turns.count();
         assert_eq!(after_one_answer, 1);
 
         assert!(
-            crate::runner::over_turn_ceiling(after_one_answer, Some(1)),
+            crate::execution::runner::over_turn_ceiling(after_one_answer, Some(1)),
             "Some(1) stops the stream on the first answer, before the result event"
         );
         assert!(
-            !crate::runner::over_turn_ceiling(after_one_answer, Some(MAX_ANSWER_TURNS)),
+            !crate::execution::runner::over_turn_ceiling(after_one_answer, Some(MAX_ANSWER_TURNS)),
             "the ceiling this asks for lets one answer finish"
         );
         // A `turn.completed` beside the `assistant` is already two events for one answer, which is
@@ -1021,7 +1021,7 @@ mod tests {
         turns.line(r#"{"type":"turn.completed"}"#);
         let after_completion = turns.count();
         assert_eq!(after_completion, 2);
-        assert!(!crate::runner::over_turn_ceiling(
+        assert!(!crate::execution::runner::over_turn_ceiling(
             after_completion,
             Some(MAX_ANSWER_TURNS)
         ));

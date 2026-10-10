@@ -184,7 +184,7 @@ async fn head_sha(worktree: &Path) -> Option<String> {
         std::ffi::OsStr::new("rev-parse"),
         std::ffi::OsStr::new("HEAD"),
     ];
-    let result = crate::git_exec::run_git(worktree, &args, SHA_TIMEOUT)
+    let result = crate::execution::git_exec::run_git(worktree, &args, SHA_TIMEOUT)
         .await
         .ok()?;
     if result.exit_code != Some(0) {

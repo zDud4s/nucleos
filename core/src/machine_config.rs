@@ -153,7 +153,7 @@ fn validate_council(contents: &str) -> Result<(), String> {
 /// The llm-router adviser's file. `parse_config` is the grammar and also the loopback fence, so the
 /// door refuses a router URL off this machine exactly as the daemon would at startup.
 fn validate_router(contents: &str) -> Result<(), String> {
-    crate::route_advice::parse_config(contents).map(|_| ())
+    crate::models::route_advice::parse_config(contents).map(|_| ())
 }
 
 /// Parses, and then asks the one question parsing cannot: whether the local route this file

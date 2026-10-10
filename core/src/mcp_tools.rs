@@ -1522,7 +1522,7 @@ impl NucleosTools {
     ) -> String {
         json_result(
             self.client
-                .github_act(crate::github::ActRequest {
+                .github_act(crate::integrations::github::ActRequest {
                     operation,
                     repo,
                     id,
@@ -1916,7 +1916,7 @@ fn redact_rendered(text: &str) -> String {
         }
         // Not everything crossing here is JSON — a transport-level error string is not — and for
         // those the flat pass is the right one: they have no escaping to undo.
-        Err(_) => crate::redact::redact_secrets(text),
+        Err(_) => crate::governance::redact::redact_secrets(text),
     }
 }
 
@@ -1935,7 +1935,7 @@ fn redact_rendered(text: &str) -> String {
 fn redact_json_strings(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => {
-            *text = crate::redact::redact_secrets(text);
+            *text = crate::governance::redact::redact_secrets(text);
         }
         serde_json::Value::Array(items) => items.iter_mut().for_each(redact_json_strings),
         serde_json::Value::Object(fields) => {
@@ -2698,9 +2698,9 @@ impl LocalToolBox {
     /// decision to change — one that would affect the desktop app, where somebody is watching.
     async fn spend_is_permitted(&self) -> Result<(), String> {
         let now = chrono::Utc::now();
-        match crate::budget::budget_permits_new_run(&self.pool, now).await {
-            crate::budget::BudgetDecision::Pause { reason, .. } => Err(reason),
-            crate::budget::BudgetDecision::Allow => {
+        match crate::governance::budget::budget_permits_new_run(&self.pool, now).await {
+            crate::governance::budget::BudgetDecision::Pause { reason, .. } => Err(reason),
+            crate::governance::budget::BudgetDecision::Allow => {
                 // LocalToolBox has no runtime, so this reads stored quota and never warns.
                 match crate::quota::quota_permits_new_run(
                     &self.pool,
@@ -2780,7 +2780,7 @@ impl LocalToolBox {
 }
 
 #[async_trait::async_trait]
-impl crate::local_agent::ToolBox for LocalToolBox {
+impl crate::models::local_agent::ToolBox for LocalToolBox {
     /// Derived from the router's own list, so a tool's description and schema reach a local model
     /// exactly as they reach a cloud one. Writing them out by hand here is how the two would come
     /// to disagree about what `create_job` is for.
@@ -2802,7 +2802,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             .collect()
     }
 
-    fn for_run(&self, run_id: i64) -> Option<Box<dyn crate::local_agent::ToolBox>> {
+    fn for_run(&self, run_id: i64) -> Option<Box<dyn crate::models::local_agent::ToolBox>> {
         Some(Box::new(LocalToolBox {
             tools: NucleosTools::for_box(self.tools.client.for_run(run_id), McpBox::All),
             pool: self.pool.clone(),
@@ -2821,12 +2821,12 @@ impl crate::local_agent::ToolBox for LocalToolBox {
         &self,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> crate::local_agent::ToolAnswer {
+    ) -> crate::models::local_agent::ToolAnswer {
         // A name outside the offered set is refused here rather than dispatched, because the model
         // is the only thing that chose it: `self.offers` is what was advertised, and anything else
         // is a hallucinated name or a tool this turn was deliberately not given.
         if !self.offers(name) {
-            return crate::local_agent::ToolAnswer::own(error_json(format!(
+            return crate::models::local_agent::ToolAnswer::own(error_json(format!(
                 "{name} is not a tool this conversation can use"
             )));
         }
@@ -2842,7 +2842,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
                 match serde_json::from_value::<$type>(arguments.clone()) {
                     Ok(value) => value,
                     Err(error) => {
-                        return crate::local_agent::ToolAnswer {
+                        return crate::models::local_agent::ToolAnswer {
                             text: error_json(format!("bad arguments for {name}: {error}")),
                             untrusted: effect == ToolEffect::ReadsUntrusted,
                         };
@@ -2953,7 +2953,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
                 if let Err(reason) = self.spend_is_permitted().await {
                     // Answered as a tool result rather than as a failure, so the model can tell the
                     // person WHY nothing started instead of falling silent or trying again.
-                    return crate::local_agent::ToolAnswer::own(error_json(format!(
+                    return crate::models::local_agent::ToolAnswer::own(error_json(format!(
                         "no work can start right now: {reason}"
                     )));
                 }
@@ -2990,7 +2990,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             text
         };
 
-        crate::local_agent::ToolAnswer { text, untrusted }
+        crate::models::local_agent::ToolAnswer { text, untrusted }
     }
 }
 
@@ -3074,7 +3074,7 @@ fn github_read_effect(arguments: &serde_json::Value) -> ToolEffect {
     arguments
         .get("operation")
         .and_then(serde_json::Value::as_str)
-        .and_then(crate::github::ReadOp::effect_of_kind)
+        .and_then(crate::integrations::github::ReadOp::effect_of_kind)
         .unwrap_or(ToolEffect::ReadsUntrusted)
 }
 
@@ -3088,7 +3088,9 @@ async fn run_read_effect(pool: &sqlx::SqlitePool, arguments: &serde_json::Value)
         .fetch_optional(pool)
         .await
     {
-        Ok(Some(mode)) if mode == crate::email::TRIAGE_MODE => ToolEffect::ReadsUntrusted,
+        Ok(Some(mode)) if mode == crate::integrations::email::TRIAGE_MODE => {
+            ToolEffect::ReadsUntrusted
+        }
         // `Ok(None)` is the one gap left, and it is left knowingly. A run that does not exist when
         // this asks, but exists as a triage run by the time the tool reads it, is classified own.
         // Closing it means holding a transaction across the loopback call, which trades a race the
@@ -4007,7 +4009,7 @@ mod tests {
         }
 
         fn kinds_graded(effect: ToolEffect) -> Vec<String> {
-            let mut kinds: Vec<String> = crate::github::ReadOp::all()
+            let mut kinds: Vec<String> = crate::integrations::github::ReadOp::all()
                 .iter()
                 .filter(|operation| operation.effect() == effect)
                 .map(|operation| operation.kind().to_owned())
@@ -4495,7 +4497,7 @@ mod tests {
     /// would look like the model choosing badly.
     #[tokio::test]
     async fn every_offered_tool_can_be_dispatched() {
-        use crate::local_agent::ToolBox;
+        use crate::models::local_agent::ToolBox;
 
         let pool = { crate::testdb::fresh_shared_pool().await };
 
@@ -4521,7 +4523,7 @@ mod tests {
 
     /// The names a local box advertises, read from its schemas the way a model reads them.
     fn offered_names(toolbox: &LocalToolBox) -> Vec<String> {
-        use crate::local_agent::ToolBox;
+        use crate::models::local_agent::ToolBox;
 
         toolbox
             .schemas()
@@ -4572,7 +4574,7 @@ mod tests {
     /// neither advertised nor dispatched.
     #[tokio::test]
     async fn a_local_team_box_without_the_loadout_doors_does_not_offer_them() {
-        use crate::local_agent::ToolBox;
+        use crate::models::local_agent::ToolBox;
 
         for loadout in [&[][..], &["web_read", "get_email"][..]] {
             let toolbox = team_box_with(loadout).await;
@@ -4617,7 +4619,7 @@ mod tests {
     /// connect, which is different from both refusals this test rules out.
     #[tokio::test]
     async fn a_granted_door_is_dispatched_alone_and_read_context_is_untrusted() {
-        use crate::local_agent::ToolBox;
+        use crate::models::local_agent::ToolBox;
 
         let only_read = team_box_with(&["read_context"]).await;
         let answer = only_read
@@ -4725,7 +4727,7 @@ mod tests {
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,
-            runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
+            runner: std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
@@ -4742,13 +4744,13 @@ mod tests {
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
-            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
-            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
-            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
             judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
-            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -5092,7 +5094,7 @@ mod tests {
         .await;
         assert_eq!(status, axum::http::StatusCode::CONFLICT);
 
-        for status in crate::job::TERMINAL_STATUSES {
+        for status in crate::execution::job::TERMINAL_STATUSES {
             let (_, run_id) = seed_job_run(&pool, status).await;
             let (answer, _) =
                 finding_at_door(&pool, crate::auth::Scope::Run(run_id), body.clone()).await;
@@ -5466,7 +5468,7 @@ mod tests {
     /// consults rather than of the table underneath it.
     #[tokio::test]
     async fn reading_mail_taints_a_turn_and_shuts_the_acting_tools() {
-        use crate::local_agent::ToolBox;
+        use crate::models::local_agent::ToolBox;
 
         let pool = crate::testdb::fresh_shared_pool().await;
         sqlx::query(
@@ -5474,7 +5476,7 @@ mod tests {
              VALUES (1, 'triage', 'completed', ?, '2026-08-11T00:00:00Z'),
                     (2, 'ordinary', 'completed', 'assistant', '2026-08-11T00:00:00Z')",
         )
-        .bind(crate::email::TRIAGE_MODE)
+        .bind(crate::integrations::email::TRIAGE_MODE)
         .execute(&pool)
         .await
         .unwrap();
@@ -5550,7 +5552,7 @@ mod tests {
     /// what stops the repair from being "fence every local answer".
     #[tokio::test]
     async fn the_local_path_fences_by_what_the_call_reads_and_not_by_the_name() {
-        use crate::local_agent::ToolBox;
+        use crate::models::local_agent::ToolBox;
 
         let pool = crate::testdb::fresh_shared_pool().await;
         sqlx::query(
@@ -5558,7 +5560,7 @@ mod tests {
              VALUES (1, 'triage', 'completed', ?, '2026-08-11T00:00:00Z'),
                     (2, 'ordinary', 'completed', 'assistant', '2026-08-11T00:00:00Z')",
         )
-        .bind(crate::email::TRIAGE_MODE)
+        .bind(crate::integrations::email::TRIAGE_MODE)
         .execute(&pool)
         .await
         .unwrap();
@@ -6124,7 +6126,7 @@ mod tests {
     /// arguments could have saved a single tool.
     #[tokio::test]
     async fn a_marked_turn_may_read_github_and_may_not_act_on_it() {
-        use crate::local_agent::ToolBox;
+        use crate::models::local_agent::ToolBox;
 
         let pool = test_pool().await;
         let toolbox =
@@ -6556,7 +6558,7 @@ mod tests {
     /// it.
     #[tokio::test]
     async fn the_hosted_tool_box_offers_exactly_the_six_allowed_names() {
-        use crate::local_agent::ToolBox;
+        use crate::models::local_agent::ToolBox;
 
         let toolbox = LocalToolBox::for_hosted(
             "http://127.0.0.1:1".to_string(),

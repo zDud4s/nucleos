@@ -1099,8 +1099,8 @@ pub async fn start_with(
     }
 
     match crate::quota::permits_new_run(state, chrono::Utc::now()).await {
-        crate::budget::BudgetDecision::Allow => {}
-        crate::budget::BudgetDecision::Pause { reason, source, .. } => {
+        crate::governance::budget::BudgetDecision::Allow => {}
+        crate::governance::budget::BudgetDecision::Pause { reason, source, .. } => {
             return Err(if source == crate::quota::PAUSE_SOURCE {
                 StartError::QuotaExhausted(reason)
             } else {
@@ -1743,7 +1743,7 @@ fn validate_payload(kind: &str, payload: &serde_json::Value) -> Result<String, S
             // break, so a `\n` in `to` or `subject` does not corrupt a message — it ends that header
             // and starts one nobody approved. Asking `mailsend` means a department and the owner's
             // own send button cannot come to disagree about what an address is.
-            crate::mailsend::validate(&to, &subject).map_err(str::to_owned)?;
+            crate::integrations::mailsend::validate(&to, &subject).map_err(str::to_owned)?;
             serde_json::json!({ "to": to, "subject": subject, "body": body })
         }
         "file_document" => {
@@ -1769,13 +1769,16 @@ fn validate_payload(kind: &str, payload: &serde_json::Value) -> Result<String, S
                 .ok_or("a `calendar_event` needs a `duration_minutes` above zero")?;
             // Both parsed HERE and stored as strings, so an unparseable date is the agent's problem
             // and not a `failed` row a human approved in good faith.
-            chrono::NaiveDateTime::parse_from_str(&starts_at_local, crate::calendar::LOCAL_FORMAT)
-                .map_err(|_| {
-                    format!(
-                        "`starts_at_local` is written {}, e.g. 2026-08-17T09:30:00",
-                        crate::calendar::LOCAL_FORMAT
-                    )
-                })?;
+            chrono::NaiveDateTime::parse_from_str(
+                &starts_at_local,
+                crate::integrations::calendar::LOCAL_FORMAT,
+            )
+            .map_err(|_| {
+                format!(
+                    "`starts_at_local` is written {}, e.g. 2026-08-17T09:30:00",
+                    crate::integrations::calendar::LOCAL_FORMAT
+                )
+            })?;
             tz.parse::<chrono_tz::Tz>()
                 .map_err(|_| format!("`{tz}` is not a timezone name, e.g. Europe/Lisbon"))?;
             serde_json::json!({
@@ -2024,7 +2027,7 @@ pub async fn suggest_model(
     if calling_node(&state.pool, team_run_id, headers).await != Caller::Director {
         return Err(RecruitError::NotTheDirector);
     }
-    Ok(crate::seat_advice::suggest_model(
+    Ok(crate::models::seat_advice::suggest_model(
         state.runner.router(),
         &request.speciality,
         &request.why,
@@ -2134,7 +2137,7 @@ pub async fn propose_teammate(
     // request is otherwise fileable, so a refused one sends its text nowhere; and an advised model
     // that `validate_request` would refuse is dropped for the director's.
     if request.model.is_none()
-        && let Some(advised) = crate::seat_advice::recruit_default(
+        && let Some(advised) = crate::models::seat_advice::recruit_default(
             state.runner.router(),
             &proposed.engine,
             &request.speciality,
@@ -2429,9 +2432,9 @@ async fn perform(state: &AppState, action: &TeamAction) -> Result<(), String> {
     };
 
     match action.kind.as_str() {
-        "send_email" => crate::mailsend::send(
+        "send_email" => crate::integrations::mailsend::send(
             state,
-            &crate::mailsend::SendRequest {
+            &crate::integrations::mailsend::SendRequest {
                 to: text("to"),
                 subject: text("subject"),
                 body: text("body"),
@@ -2462,7 +2465,7 @@ async fn perform(state: &AppState, action: &TeamAction) -> Result<(), String> {
             // event somebody's week is arranged around.
             let starts_at_local = chrono::NaiveDateTime::parse_from_str(
                 &text("starts_at_local"),
-                crate::calendar::LOCAL_FORMAT,
+                crate::integrations::calendar::LOCAL_FORMAT,
             )
             .map_err(|_| "the stored start time is not a date and time".to_owned())?;
             let tz: chrono_tz::Tz = text("tz")
@@ -2472,7 +2475,7 @@ async fn perform(state: &AppState, action: &TeamAction) -> Result<(), String> {
                 .get("duration_minutes")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            crate::calendar::insert_event(
+            crate::integrations::calendar::insert_event(
                 &state.pool,
                 &text("title"),
                 starts_at_local,
@@ -2607,8 +2610,8 @@ async fn ceiling_reached(
         ));
     }
 
-    if let crate::budget::BudgetDecision::Pause { reason, .. } =
-        crate::budget::budget_permits_new_run(&state.pool, now).await
+    if let crate::governance::budget::BudgetDecision::Pause { reason, .. } =
+        crate::governance::budget::budget_permits_new_run(&state.pool, now).await
     {
         return Some(("stopped", reason));
     }
@@ -3137,20 +3140,20 @@ async fn spawn_agent(
             crate::mcp_tools::LocalToolBox::for_team(daemon_url(), token, pool.clone(), run_id)
                 .with_loadout(&run_tools.tools);
         let timeout = state.run_timeout;
-        crate::runs::spawn_registered(state, run_id, async move {
+        crate::execution::runs::spawn_registered(state, run_id, async move {
             let taint = std::sync::atomic::AtomicBool::new(false);
-            let empty = crate::local_agent::NoTools;
-            let tool_box: &dyn crate::local_agent::ToolBox =
+            let empty = crate::models::local_agent::NoTools;
+            let tool_box: &dyn crate::models::local_agent::ToolBox =
                 if with_tools { &tools } else { &empty };
             let turn = tokio::time::timeout(
                 timeout,
-                crate::local_agent::run_turn(
+                crate::models::local_agent::run_turn(
                     // `as_ref`, because what the factory hands back is a `Box<dyn LocalChat>`
                     // and the loop takes the trait object itself -- the box is the seam, not
                     // the value.
                     chat.as_ref(),
                     tool_box,
-                    crate::local_agent::SYSTEM_PROMPT,
+                    crate::models::local_agent::SYSTEM_PROMPT,
                     &[],
                     &prompt,
                     &taint,
@@ -3158,7 +3161,7 @@ async fn spawn_agent(
             )
             .await;
             if taint.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = crate::runs::mark_untrusted_context(&pool, run_id).await;
+                let _ = crate::execution::runs::mark_untrusted_context(&pool, run_id).await;
             }
             let completed_at = chrono::Utc::now().to_rfc3339();
             match turn {
@@ -3207,14 +3210,14 @@ async fn spawn_agent(
         resolve_node_loadout(state, run, agent, run_id, with_tools, &prompt).await;
     let prompt = format!("{prompt}{block}");
 
-    let request = crate::runner::RunRequest {
+    let request = crate::execution::runner::RunRequest {
         prompt,
         // The RUN's own key, never `state.token`. `auth::TEAM_ROUTES` is what it reaches.
-        env: crate::runs::run_env(&token, run_id, None, capacity),
+        env: crate::execution::runs::run_env(&token, run_id, None, capacity),
         // No working directory, exactly as a council seat has none — which is also why the
         // `PreToolUse` hook may never fire and why the route table has to hold alone.
         cwd: None,
-        permission: crate::runner::Permission::Default,
+        permission: crate::execution::runner::Permission::Default,
         resume_session_id: None,
         mcp_config,
         mcp_job: None,
@@ -3224,12 +3227,12 @@ async fn spawn_agent(
         // only what its loadout row lists plus the box's base. `allowed_mcp_tools` below is that
         // same set handed to the CLI as `--allowedTools`.
         tool_policy: if with_tools {
-            crate::runner::ToolPolicy::McpOnly
+            crate::execution::runner::ToolPolicy::McpOnly
         } else {
-            crate::runner::ToolPolicy::None
+            crate::execution::runner::ToolPolicy::None
         },
         progress_timeout: None,
-        max_turns: Some(crate::runner::DEFAULT_MAX_TURNS),
+        max_turns: Some(crate::execution::runner::DEFAULT_MAX_TURNS),
         session_id: Some(session_id),
         fork_session: false,
         include_partial_messages: false,
@@ -3260,7 +3263,7 @@ async fn spawn_agent(
 
     let runner = state.runner.clone();
     let timeout = state.run_timeout;
-    crate::runs::spawn_registered(state, run_id, async move {
+    crate::execution::runs::spawn_registered(state, run_id, async move {
         // Moved in so the node's config file is removed when the task ends — normally, by timeout,
         // or aborted by a cancel (which drops the future and with it the guard).
         let _mcp_guard = mcp_guard;
@@ -3269,8 +3272,13 @@ async fn spawn_agent(
         // Its outcome is reported by `ingest_landed_items`, against the `route_decision_id` this
         // writes on the run's row, once the item lands.
         let mut request = request;
-        let _decision =
-            crate::seat_advice::route_team_seat(&pool, runner.router(), run_id, &mut request).await;
+        let _decision = crate::models::seat_advice::route_team_seat(
+            &pool,
+            runner.router(),
+            run_id,
+            &mut request,
+        )
+        .await;
         let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         // How much window this agent is holding, mirrored into the row while it runs.
@@ -3282,8 +3290,11 @@ async fn spawn_agent(
         // and writes only a status, so an in-memory number would be dropped with the run most
         // worth inspecting.
         let context_fill = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let _live_context_fill =
-            crate::runs::mirror_context_fill(&pool, run_id, std::sync::Arc::clone(&context_fill));
+        let _live_context_fill = crate::execution::runs::mirror_context_fill(
+            &pool,
+            run_id,
+            std::sync::Arc::clone(&context_fill),
+        );
         let outcome = tokio::time::timeout(
             timeout,
             runner.run_prompt_with_context_fill(
@@ -3307,9 +3318,12 @@ async fn spawn_agent(
                      WHERE id = ? AND status = 'running'",
                 )
                 .bind(&partial)
-                .bind(crate::runs::observed_context_fill(&context_fill, &partial))
-                .bind(crate::runs::peak_of(&partial))
-                .bind(crate::runs::tools_of(&partial))
+                .bind(crate::execution::runs::observed_context_fill(
+                    &context_fill,
+                    &partial,
+                ))
+                .bind(crate::execution::runs::peak_of(&partial))
+                .bind(crate::execution::runs::tools_of(&partial))
                 .bind(&completed_at)
                 .bind(run_id)
                 .execute(&pool)
@@ -3329,13 +3343,13 @@ async fn spawn_agent(
                 .bind(outcome.output_tokens)
                 .bind(outcome.cache_read_tokens)
                 .bind(outcome.num_turns)
-                .bind(crate::runs::observed_context_fill(
+                .bind(crate::execution::runs::observed_context_fill(
                     &context_fill,
                     &outcome.stdout,
                 ))
-                .bind(crate::runs::peak_of(&outcome.stdout))
+                .bind(crate::execution::runs::peak_of(&outcome.stdout))
                 .bind(outcome.compacted)
-                .bind(crate::runs::tools_of(&outcome.stdout))
+                .bind(crate::execution::runs::tools_of(&outcome.stdout))
                 .bind(&completed_at)
                 .bind(run_id)
                 .execute(&pool)
@@ -3356,13 +3370,13 @@ async fn spawn_agent(
                 .bind(&outcome.stderr)
                 .bind(outcome.cost_usd)
                 .bind(outcome.num_turns)
-                .bind(crate::runs::observed_context_fill(
+                .bind(crate::execution::runs::observed_context_fill(
                     &context_fill,
                     &outcome.stdout,
                 ))
-                .bind(crate::runs::peak_of(&outcome.stdout))
+                .bind(crate::execution::runs::peak_of(&outcome.stdout))
                 .bind(outcome.compacted)
-                .bind(crate::runs::tools_of(&outcome.stdout))
+                .bind(crate::execution::runs::tools_of(&outcome.stdout))
                 .bind(&completed_at)
                 .bind(run_id)
                 .execute(&pool)
@@ -3398,7 +3412,7 @@ async fn spawn_agent(
 async fn record_local_turn(
     pool: &sqlx::SqlitePool,
     run_id: i64,
-    turn: &crate::local_agent::Turn,
+    turn: &crate::models::local_agent::Turn,
     completed_at: &str,
 ) {
     let _ = sqlx::query(
@@ -3476,7 +3490,12 @@ async fn ingest_landed_items(state: &AppState, run: &TeamRun) -> Result<(), sqlx
             .bind(ordinal)
             .execute(&state.pool)
             .await?;
-            crate::seat_advice::report_team_item(&state.pool, state.runner.router(), run_id).await;
+            crate::models::seat_advice::report_team_item(
+                &state.pool,
+                state.runner.router(),
+                run_id,
+            )
+            .await;
             continue;
         }
 
@@ -3485,7 +3504,7 @@ async fn ingest_landed_items(state: &AppState, run: &TeamRun) -> Result<(), sqlx
             .fetch_optional(&state.pool)
             .await?
             .flatten();
-        let answer = crate::runner::extract_reply(answer.as_deref().unwrap_or_default())
+        let answer = crate::execution::runner::extract_reply(answer.as_deref().unwrap_or_default())
             .unwrap_or_else(|| answer.unwrap_or_default());
 
         // The core names the file, which is what removes collisions by construction: the ordinal is
@@ -3519,7 +3538,8 @@ async fn ingest_landed_items(state: &AppState, run: &TeamRun) -> Result<(), sqlx
         // pass that could not write it retries next tick and reports once, not twice. A completed
         // run whose answer could not be filed is still `pass`: the model did the work, the daemon
         // is what failed to keep it.
-        crate::seat_advice::report_team_item(&state.pool, state.runner.router(), run_id).await;
+        crate::models::seat_advice::report_team_item(&state.pool, state.runner.router(), run_id)
+            .await;
     }
     Ok(())
 }
@@ -3577,7 +3597,7 @@ async fn ingest_director(state: &AppState, run: TeamRun) -> Result<(), sqlx::Err
     }
 
     let answer = stdout.unwrap_or_default();
-    let answer = crate::runner::extract_reply(&answer).unwrap_or(answer);
+    let answer = crate::execution::runner::extract_reply(&answer).unwrap_or(answer);
 
     if node == "delivering" {
         write_into_workspace(state, &run, DELIVERY_FILE, &answer)
@@ -4031,7 +4051,7 @@ pub async fn cancel(state: &AppState, id: &str) -> Result<(), TeamError> {
         // `finalize_termination` rather than the `/runs/{id}/cancel` handler beside it: that one is
         // an axum extractor signature, and reaching it would mean a loopback HTTP call to a
         // function already in scope. This is the same body that handler runs.
-        crate::runs::finalize_termination(state, run_id, "cancelled").await;
+        crate::execution::runs::finalize_termination(state, run_id, "cancelled").await;
     }
 
     // And then the sweep, which is not belt-and-braces but a second case: `finalize_termination`
@@ -5047,7 +5067,7 @@ mod tests {
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,
-            runner: Arc::new(crate::runner::FakeCommandRunner::default()),
+            runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
@@ -5060,15 +5080,15 @@ mod tests {
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: Arc::new(crate::state::EmailRuntime::default()),
-            voice: Arc::new(crate::voice::VoiceRuntime::default()),
+            voice: Arc::new(crate::integrations::voice::VoiceRuntime::default()),
             // Off, like `web` beside it: no test in this module drives a browser, and a department
             // reaches one — if it ever does — through the daemon client like any other agent.
             browser: Arc::new(crate::browser::BrowserRuntime::disabled()),
-            github: Arc::new(crate::github::GithubRuntime::default()),
-            web: Arc::new(crate::web::WebRuntime::disabled()),
+            github: Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: Arc::new(crate::integrations::web::WebRuntime::disabled()),
             quota: Arc::new(crate::quota::QuotaRuntime::disabled()),
             judge: Arc::new(crate::judge::JudgeRuntime::disabled()),
-            calendar: Arc::new(crate::calendar::CalendarRuntime::default()),
+            calendar: Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
             council: Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -6762,7 +6782,7 @@ mod tests {
     /// named in `surfaces` at its mode. Returns what the stub was asked.
     async fn advised_runner(
         state: &mut AppState,
-        surfaces: &[(&'static str, crate::route_advice::Mode)],
+        surfaces: &[(&'static str, crate::models::route_advice::Mode)],
     ) -> tokio::sync::mpsc::UnboundedReceiver<serde_json::Value> {
         let (url, sent) = crate::router_client::test_support::stub_router(
             200,
@@ -6772,24 +6792,25 @@ mod tests {
             }),
         )
         .await;
-        let config = crate::route_advice::RouterConfig {
-            mode: crate::route_advice::Mode::Off,
+        let config = crate::models::route_advice::RouterConfig {
+            mode: crate::models::route_advice::Mode::Off,
             url,
             surfaces: surfaces.iter().copied().collect(),
-            ..crate::route_advice::RouterConfig::off()
+            ..crate::models::route_advice::RouterConfig::off()
         };
         let inner = state.runner.clone();
-        let router = std::sync::Arc::new(crate::route_advice::Router::new(
+        let router = std::sync::Arc::new(crate::models::route_advice::Router::new(
             config,
-            crate::route_advice::Available {
-                kind: crate::route_advice::RunnerKind::Claude,
+            crate::models::route_advice::Available {
+                kind: crate::models::route_advice::RunnerKind::Claude,
                 runner: inner.clone(),
                 default_model: "claude-sonnet-5".into(),
                 models: vec!["claude-*".into()],
             },
             Vec::new(),
         ));
-        state.runner = std::sync::Arc::new(crate::route_advice::RoutedRunner { inner, router });
+        state.runner =
+            std::sync::Arc::new(crate::models::route_advice::RoutedRunner { inner, router });
         sent
     }
 
@@ -6800,7 +6821,7 @@ mod tests {
         let (mut state, _root) = state_with_root().await;
         let mut sent = advised_runner(
             &mut state,
-            &[("recruit", crate::route_advice::Mode::Shadow)],
+            &[("recruit", crate::models::route_advice::Mode::Shadow)],
         )
         .await;
         marketing(&state).await;
@@ -6839,8 +6860,11 @@ mod tests {
     #[tokio::test]
     async fn a_recruit_with_no_model_takes_the_advice_under_apply() {
         let (mut state, _root) = state_with_root().await;
-        let mut sent =
-            advised_runner(&mut state, &[("recruit", crate::route_advice::Mode::Apply)]).await;
+        let mut sent = advised_runner(
+            &mut state,
+            &[("recruit", crate::models::route_advice::Mode::Apply)],
+        )
+        .await;
         marketing(&state).await;
         let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
@@ -6886,8 +6910,11 @@ mod tests {
     #[tokio::test]
     async fn a_recruit_refused_on_its_own_terms_never_reaches_the_adviser() {
         let (mut state, _root) = state_with_root().await;
-        let mut sent =
-            advised_runner(&mut state, &[("recruit", crate::route_advice::Mode::Apply)]).await;
+        let mut sent = advised_runner(
+            &mut state,
+            &[("recruit", crate::models::route_advice::Mode::Apply)],
+        )
+        .await;
         marketing(&state).await;
         let run_id = start(&state, "marketing", "prepare the launch", None)
             .await
@@ -7597,8 +7624,8 @@ mod tests {
     async fn a_specialists_run_records_the_window_it_cost_and_whether_it_compacted() {
         let (mut state, _root) = state_with_root().await;
         // Climbs to 190k, compacts, ends at 40k -- two tool calls along the way.
-        state.runner = std::sync::Arc::new(crate::runner::FakeCommandRunner {
-            canned: std::sync::Mutex::new(Some(crate::runner::RunOutcome {
+        state.runner = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(crate::execution::runner::RunOutcome {
                 exit_code: 0,
                 stdout: [
                     r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":189000},"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
@@ -7693,7 +7720,8 @@ mod tests {
     async fn a_departments_session_is_told_its_speed_and_ceiling() {
         for (speed, expected_ceiling) in [("normal", "2"), ("fast", "4"), ("thorough", "2")] {
             let (mut state, _root) = state_with_root().await;
-            let runner = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+            let runner =
+                std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
             state.runner = runner.clone();
             marketing(&state).await;
             let id = format!("tr-speed-{speed}");
@@ -7760,7 +7788,7 @@ mod tests {
     #[tokio::test]
     async fn a_department_agent_is_told_what_the_house_knows_and_leaves_a_trace() {
         let (mut state, _root) = state_with_root().await;
-        let runner = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        let runner = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
         state.runner = runner.clone();
         marketing(&state).await;
         sqlx::query(
@@ -7851,9 +7879,9 @@ mod tests {
         record_local_turn(
             &state.pool,
             run_id,
-            &crate::local_agent::Turn {
+            &crate::models::local_agent::Turn {
                 answer: "done".to_owned(),
-                ending: crate::local_agent::Ending::Answered,
+                ending: crate::models::local_agent::Ending::Answered,
                 tool_calls: 7,
             },
             "2026-08-26T01:00:00Z",
@@ -7910,13 +7938,14 @@ mod tests {
         fn local_chat(
             &self,
             model: &str,
-        ) -> Result<Box<dyn crate::local_agent::LocalChat>, crate::assistants::Refusal> {
+        ) -> Result<Box<dyn crate::models::local_agent::LocalChat>, crate::assistants::Refusal>
+        {
             self.asked_for
                 .lock()
                 .expect("the double's recorder is never held across an await")
                 .push(model.to_string());
             Ok(Box::new(
-                crate::openai_compatible::OpenAiCompatibleChat::with_client(
+                crate::models::openai_compatible::OpenAiCompatibleChat::with_client(
                     reqwest::Client::new(),
                     self.base_url.clone(),
                     model.to_string(),
@@ -7931,8 +7960,10 @@ mod tests {
             &self,
             _brain: crate::chats::Brain,
             _model: Option<&str>,
-        ) -> Result<std::sync::Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal>
-        {
+        ) -> Result<
+            std::sync::Arc<crate::models::local_agent::LocalAssistant>,
+            crate::assistants::Refusal,
+        > {
             Err(crate::assistants::Refusal::NotServedByThisFactory)
         }
 
@@ -7968,7 +7999,8 @@ mod tests {
         fn local_chat(
             &self,
             _model: &str,
-        ) -> Result<Box<dyn crate::local_agent::LocalChat>, crate::assistants::Refusal> {
+        ) -> Result<Box<dyn crate::models::local_agent::LocalChat>, crate::assistants::Refusal>
+        {
             Err(crate::assistants::Refusal::RouteNotConfigured)
         }
 
@@ -7976,8 +8008,10 @@ mod tests {
             &self,
             _brain: crate::chats::Brain,
             _model: Option<&str>,
-        ) -> Result<std::sync::Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal>
-        {
+        ) -> Result<
+            std::sync::Arc<crate::models::local_agent::LocalAssistant>,
+            crate::assistants::Refusal,
+        > {
             Err(crate::assistants::Refusal::RouteNotConfigured)
         }
 
@@ -8108,8 +8142,11 @@ mod tests {
         const ANSWER: &str = "a local answer";
         let base_url = stub_openai_compatible_member(ANSWER).await;
         let (mut state, _root) = state_with_root().await;
-        let mut sent =
-            advised_runner(&mut state, &[("team", crate::route_advice::Mode::Apply)]).await;
+        let mut sent = advised_runner(
+            &mut state,
+            &[("team", crate::models::route_advice::Mode::Apply)],
+        )
+        .await;
         state.assistants = std::sync::Arc::new(MemberAssistants {
             base_url,
             asked_for: std::sync::Mutex::new(Vec::new()),
@@ -8165,10 +8202,13 @@ mod tests {
     #[tokio::test]
     async fn a_cloud_team_member_under_apply_launches_the_advice() {
         let (mut state, _root) = state_with_root().await;
-        let fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        let fake = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
         state.runner = fake.clone();
-        let mut sent =
-            advised_runner(&mut state, &[("team", crate::route_advice::Mode::Apply)]).await;
+        let mut sent = advised_runner(
+            &mut state,
+            &[("team", crate::models::route_advice::Mode::Apply)],
+        )
+        .await;
         let run = team_run_for_member(&state, "tr-cloud-routed").await;
         let agent = crate::agent::Agent {
             engine: "claude".to_owned(),
@@ -8204,7 +8244,7 @@ mod tests {
     #[tokio::test]
     async fn a_team_member_is_briefed_with_its_own_and_its_teams_memory_and_leaves_a_trace() {
         let (mut state, _root) = state_with_root().await;
-        let fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        let fake = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
         state.runner = fake.clone();
         let run = team_run_for_member(&state, "tr-loadout").await;
         let agent = crate::agent::Agent {
@@ -8335,7 +8375,7 @@ mod tests {
     #[tokio::test]
     async fn loadout_a_team_member_launches_with_its_loadout_and_box() {
         let (mut state, _root) = state_with_root().await;
-        let fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        let fake = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
         state.runner = fake.clone();
         let run = team_run_for_member(&state, "tr-loadout-box").await;
         let agent = loadout_member("mcp_only");
@@ -8387,7 +8427,7 @@ mod tests {
     #[tokio::test]
     async fn loadout_a_team_member_never_receives_another_agents_tools_or_refs() {
         let (mut state, _root) = state_with_root().await;
-        let fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        let fake = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
         state.runner = fake.clone();
         let run = team_run_for_member(&state, "tr-loadout-iso").await;
         let agent = loadout_member("mcp_only");
@@ -8434,7 +8474,7 @@ mod tests {
     #[tokio::test]
     async fn loadout_a_member_without_tools_records_an_empty_set() {
         let (mut state, _root) = state_with_root().await;
-        let fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
+        let fake = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
         state.runner = fake.clone();
         let run = team_run_for_member(&state, "tr-loadout-none").await;
         let agent = loadout_member("none");
@@ -8571,21 +8611,22 @@ mod tests {
         let (mut state, _root) = state_with_root().await;
         let (url, mut received) = crate::router_client::test_support::outcome_router(200).await;
         let inner = state.runner.clone();
-        let router = std::sync::Arc::new(crate::route_advice::Router::new(
-            crate::route_advice::RouterConfig {
-                mode: crate::route_advice::Mode::Shadow,
+        let router = std::sync::Arc::new(crate::models::route_advice::Router::new(
+            crate::models::route_advice::RouterConfig {
+                mode: crate::models::route_advice::Mode::Shadow,
                 url,
-                ..crate::route_advice::RouterConfig::off()
+                ..crate::models::route_advice::RouterConfig::off()
             },
-            crate::route_advice::Available {
-                kind: crate::route_advice::RunnerKind::Claude,
+            crate::models::route_advice::Available {
+                kind: crate::models::route_advice::RunnerKind::Claude,
                 runner: inner.clone(),
                 default_model: "claude-sonnet-5".into(),
                 models: vec!["claude-*".into()],
             },
             Vec::new(),
         ));
-        state.runner = std::sync::Arc::new(crate::route_advice::RoutedRunner { inner, router });
+        state.runner =
+            std::sync::Arc::new(crate::models::route_advice::RoutedRunner { inner, router });
         marketing(&state).await;
         let id = start(&state, "marketing", "write the launch post", None)
             .await

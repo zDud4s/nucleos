@@ -247,7 +247,7 @@ pub async fn readings(
 
     /* ------------------------------------------------------------------ cost -- */
 
-    let cost = crate::budget::project_spend(pool, project_id, since, now).await?;
+    let cost = crate::governance::budget::project_spend(pool, project_id, since, now).await?;
 
     /* ------------------------------------------------------------- delivered -- */
 

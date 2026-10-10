@@ -2,7 +2,7 @@
 """Cover the filter and the outcome reporter in `core/hooks/ask_daemon.py`.
 
 **This is the most load-bearing Python in the repository and it had no test at all.** The script is
-`include_str!`'d into the daemon by `core/src/autopilot.rs`'s `HOOK_SOURCE` — `include_str!("../hooks/
+`include_str!`'d into the daemon by `core/src/governance/autopilot.rs`'s `HOOK_SOURCE` — `include_str!("../hooks/
 ask_daemon.py")`, i.e. `core/hooks/ask_daemon.py` — so it ships inside the binary, and its interactive
 branch is what decides whether a git operation a person types is refused and sent to the queue. It was
 written, reviewed, committed, and shipped with a hole you could walk through with a `cd`: the filter
@@ -601,7 +601,7 @@ def pending_expiry_cases():
         cases.append(("settled_notice: a token passed in is used, not re-read", failure))
 
     # The Python list is the Rust one.
-    with open(os.path.join(ROOT, "core", "src", "vcs.rs"), encoding="utf-8") as handle:
+    with open(os.path.join(ROOT, "core", "src", "execution", "vcs.rs"), encoding="utf-8") as handle:
         source = handle.read()
     found = re.search(r"TERMINAL_STATUSES:\s*\[&str;\s*\d+\]\s*=\s*\[(.*?)\]", source, re.S)
     rust = set(re.findall(r'"([a-z_]+)"', found.group(1))) if found else None

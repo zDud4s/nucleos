@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::Scope;
 use crate::state::AppState;
 use crate::verify::{Caller, VerifyError, resolve_worktree};
-use crate::{autopilot, git_exec};
+use crate::{execution::git_exec, governance::autopilot};
 
 /// How often a live box beats.
 pub const BEAT_EVERY: Duration = Duration::from_secs(30);
@@ -315,7 +315,7 @@ mod tests {
     }
 
     async fn key_of(repo: &Path) -> String {
-        crate::git_exec::canonical(repo).await.unwrap()
+        crate::execution::git_exec::canonical(repo).await.unwrap()
     }
 
     #[test]
@@ -409,7 +409,7 @@ mod tests {
                 "{} is outside every project and must be refused",
                 path.display()
             );
-            let key = crate::git_exec::canonical(path).await.unwrap();
+            let key = crate::execution::git_exec::canonical(path).await.unwrap();
             assert!(!registry.lock().unwrap().is_live(&key, now));
         }
         let key = key_of(rostered.path()).await;

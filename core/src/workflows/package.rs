@@ -192,7 +192,7 @@ pub async fn package(
 /// Run git in `dir` through the daemon's own runner (`worktree::git`, which disables the
 /// repository-named command strings a hostile config could smuggle in).
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = crate::worktree::git()
+    let output = crate::execution::worktree::git()
         .arg("-C")
         .arg(dir)
         .args(args)

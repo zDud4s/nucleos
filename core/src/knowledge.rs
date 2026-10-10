@@ -1284,7 +1284,7 @@ pub async fn close_working_for_job(pool: &SqlitePool, job_id: i64) -> sqlx::Resu
 pub async fn close_orphaned_working(pool: &SqlitePool) -> sqlx::Result<u64> {
     let mut tx = pool.begin().await?;
     let at = chrono::Utc::now().to_rfc3339();
-    let placeholders = vec!["?"; crate::job::TERMINAL_STATUSES.len()].join(", ");
+    let placeholders = vec!["?"; crate::execution::job::TERMINAL_STATUSES.len()].join(", ");
     let predicate = format!(
         "layer = 'working' AND scope_kind = 'job' AND status = 'live'
          AND NOT EXISTS (
@@ -1301,7 +1301,7 @@ pub async fn close_orphaned_working(pool: &SqlitePool) -> sqlx::Result<u64> {
          SELECT id, 'live', 'closed', 'the job ended', ? FROM knowledge WHERE {predicate}"
     )))
     .bind(&at);
-    for status in crate::job::TERMINAL_STATUSES {
+    for status in crate::execution::job::TERMINAL_STATUSES {
         events = events.bind(status);
     }
     events.execute(&mut *tx).await?;
@@ -1311,7 +1311,7 @@ pub async fn close_orphaned_working(pool: &SqlitePool) -> sqlx::Result<u64> {
         "UPDATE knowledge SET status = 'closed', ended_at = ? WHERE {predicate}"
     )))
     .bind(&at);
-    for status in crate::job::TERMINAL_STATUSES {
+    for status in crate::execution::job::TERMINAL_STATUSES {
         update = update.bind(status);
     }
     let closed = update.execute(&mut *tx).await?.rows_affected();
@@ -2569,7 +2569,7 @@ pub async fn note_finding(
     else {
         return Err(FindingError::JobEnded);
     };
-    if crate::job::TERMINAL_STATUSES.contains(&job_status.as_str()) {
+    if crate::execution::job::TERMINAL_STATUSES.contains(&job_status.as_str()) {
         return Err(FindingError::JobEnded);
     }
 
@@ -2765,13 +2765,13 @@ mod tests {
     #[tokio::test]
     async fn a_finding_closes_with_its_job_through_the_one_place_that_ends_a_job() {
         assert_eq!(
-            crate::job::TERMINAL_STATUSES.len(),
+            crate::execution::job::TERMINAL_STATUSES.len(),
             8,
             "a ninth ending needs a deliberate finding-lifetime decision"
         );
         let pool = test_pool().await;
 
-        for (index, terminal) in crate::job::TERMINAL_STATUSES.iter().enumerate() {
+        for (index, terminal) in crate::execution::job::TERMINAL_STATUSES.iter().enumerate() {
             let job_id = insert_job(&pool, &format!("retired-{index}"), "running").await;
             let other_job_id = insert_job(&pool, &format!("running-{index}"), "running").await;
             let finding = insert_job_knowledge(
@@ -2799,7 +2799,9 @@ mod tests {
             )
             .await;
 
-            crate::job::retire(&pool, job_id, terminal).await.unwrap();
+            crate::execution::job::retire(&pool, job_id, terminal)
+                .await
+                .unwrap();
 
             let (status, ended_at): (String, Option<String>) =
                 sqlx::query_as("SELECT status, ended_at FROM knowledge WHERE id = ?")

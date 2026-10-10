@@ -133,7 +133,7 @@ fn toolbox_for(
     base_url: String,
     token: String,
     pool: sqlx::SqlitePool,
-) -> Box<dyn crate::local_agent::ToolBox> {
+) -> Box<dyn crate::models::local_agent::ToolBox> {
     match brain {
         crate::chats::Brain::Local => {
             Box::new(crate::mcp_tools::LocalToolBox::new(base_url, token, pool))
@@ -170,7 +170,7 @@ pub trait Assistants: Send + Sync {
         &self,
         brain: crate::chats::Brain,
         model: Option<&str>,
-    ) -> Result<std::sync::Arc<crate::local_agent::LocalAssistant>, Refusal>;
+    ) -> Result<std::sync::Arc<crate::models::local_agent::LocalAssistant>, Refusal>;
 
     /// Whether this route can answer at all, without building anything to find out.
     fn serves(&self, brain: crate::chats::Brain) -> Result<(), Refusal>;
@@ -222,7 +222,10 @@ pub trait Assistants: Send + Sync {
     /// write an arm about a route their own test says nothing about. Refusing
     /// `NotServedByThisFactory` is the honest answer for such a double — wrong door, not
     /// misconfiguration — and a factory that does serve the local route says so by overriding.
-    fn local_chat(&self, _model: &str) -> Result<Box<dyn crate::local_agent::LocalChat>, Refusal> {
+    fn local_chat(
+        &self,
+        _model: &str,
+    ) -> Result<Box<dyn crate::models::local_agent::LocalChat>, Refusal> {
         Err(Refusal::NotServedByThisFactory)
     }
 
@@ -231,7 +234,7 @@ pub trait Assistants: Send + Sync {
         &self,
         _cli: &str,
         _model: Option<&str>,
-    ) -> Option<std::sync::Arc<dyn crate::runner::CommandRunner>> {
+    ) -> Option<std::sync::Arc<dyn crate::execution::runner::CommandRunner>> {
         None
     }
 }
@@ -326,7 +329,7 @@ pub struct ConfiguredAssistants {
     /// 2-second `OLLAMA_TAGS_TIMEOUT` rather than reusing a generation client: a wedged Ollama (or
     /// a slow OpenRouter catalogue read) must cost the menu a brief pause, never a two-minute hang.
     introspection_client: reqwest::Client,
-    claude_cli: Option<std::sync::Arc<dyn crate::runner::CommandRunner>>,
+    claude_cli: Option<std::sync::Arc<dyn crate::execution::runner::CommandRunner>>,
     codex_model: Option<String>,
 }
 
@@ -354,11 +357,11 @@ impl ConfiguredAssistants {
             // than pretending to recover. (This reasoning lived on `runner::OllamaChat::new` until
             // that constructor lost its last caller; this is the builder every local chat now uses.)
             local_client: reqwest::Client::builder()
-                .timeout(crate::runner::OLLAMA_EXCHANGE_TIMEOUT)
+                .timeout(crate::execution::runner::OLLAMA_EXCHANGE_TIMEOUT)
                 .build()
                 .expect("HTTP client for the local model (check TLS and proxy environment)"),
             hosted_client: reqwest::Client::builder()
-                .timeout(crate::openai_compatible::OPENROUTER_EXCHANGE_TIMEOUT)
+                .timeout(crate::models::openai_compatible::OPENROUTER_EXCHANGE_TIMEOUT)
                 .build()
                 .expect("HTTP client for the hosted model (check TLS and proxy environment)"),
             local_model,
@@ -373,7 +376,7 @@ impl ConfiguredAssistants {
             // install that has never named an engine must keep the one this daemon always used.
             local_engine: crate::config::LocalEngine::Ollama,
             local_declared_context_tokens: None,
-            hosted_base_url: crate::openai_compatible::OPENROUTER_BASE_URL.to_string(),
+            hosted_base_url: crate::models::openai_compatible::OPENROUTER_BASE_URL.to_string(),
             discovery_cache: crate::capabilities::DiscoveryCache::new(),
             introspection_client: reqwest::Client::builder()
                 .timeout(CAPABILITY_PROBE_TIMEOUT)
@@ -387,7 +390,7 @@ impl ConfiguredAssistants {
     /// Adds the agent CLI runners configured at daemon startup.
     pub fn with_agent_clis(
         mut self,
-        claude: std::sync::Arc<dyn crate::runner::CommandRunner>,
+        claude: std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
         codex_model: String,
     ) -> Self {
         self.claude_cli = Some(claude);
@@ -443,12 +446,12 @@ impl Assistants for ConfiguredAssistants {
         &self,
         cli: &str,
         pinned: Option<&str>,
-    ) -> Option<std::sync::Arc<dyn crate::runner::CommandRunner>> {
+    ) -> Option<std::sync::Arc<dyn crate::execution::runner::CommandRunner>> {
         match cli {
             "codex" => self.codex_model.as_ref().map(|configured| {
-                std::sync::Arc::new(crate::runner::CodexCliRunner::for_chat(
+                std::sync::Arc::new(crate::execution::runner::CodexCliRunner::for_chat(
                     pinned.unwrap_or(configured).to_string(),
-                )) as std::sync::Arc<dyn crate::runner::CommandRunner>
+                )) as std::sync::Arc<dyn crate::execution::runner::CommandRunner>
             }),
             "claude" => self.claude_cli.clone(),
             _ => None,
@@ -468,7 +471,10 @@ impl Assistants for ConfiguredAssistants {
     /// what turns the local route on, and a caller naming a model of its own does not get to turn
     /// it on by naming one. Harmless to repeat when `assistant_for` has just asked the same
     /// question, for the reason its own comment gives below.
-    fn local_chat(&self, model: &str) -> Result<Box<dyn crate::local_agent::LocalChat>, Refusal> {
+    fn local_chat(
+        &self,
+        model: &str,
+    ) -> Result<Box<dyn crate::models::local_agent::LocalChat>, Refusal> {
         self.serves(crate::chats::Brain::Local)?;
         // `self.local_base_url` on BOTH engines, where this read the CONSTANT
         // `runner::OLLAMA_BASE_URL` directly until the engine field arrived. That constant is why
@@ -477,25 +483,29 @@ impl Assistants for ConfiguredAssistants {
         // turns go to Ollama anyway. Production behaviour is unchanged by the switch, because
         // `main.rs` passes the resolved address as the seventh argument and for an install that
         // named no engine that address IS this same constant.
-        let chat: Box<dyn crate::local_agent::LocalChat> = match self.local_engine {
-            crate::config::LocalEngine::Ollama => Box::new(crate::runner::OllamaChat::with_client(
-                self.local_client.clone(),
-                self.local_base_url.clone(),
-                model.to_string(),
-            )),
-            crate::config::LocalEngine::OpenAiCompatible => {
-                Box::new(crate::openai_compatible::OpenAiCompatibleChat::with_client(
+        let chat: Box<dyn crate::models::local_agent::LocalChat> = match self.local_engine {
+            crate::config::LocalEngine::Ollama => {
+                Box::new(crate::execution::runner::OllamaChat::with_client(
                     self.local_client.clone(),
                     self.local_base_url.clone(),
                     model.to_string(),
-                    // `None`, always, on this route - the other half of the choice that made
-                    // `with_client`'s key an `Option`, whose `Some(key)` case is the hosted arm of
-                    // `assistant_for`. `config::ModelsConfig::local_engine` has already refused any
-                    // address that is not this machine's, so what is dialled here is a loopback
-                    // server, and a loopback server is sent no `Authorization` header at all rather
-                    // than an empty or invented one.
-                    None,
                 ))
+            }
+            crate::config::LocalEngine::OpenAiCompatible => {
+                Box::new(
+                    crate::models::openai_compatible::OpenAiCompatibleChat::with_client(
+                        self.local_client.clone(),
+                        self.local_base_url.clone(),
+                        model.to_string(),
+                        // `None`, always, on this route - the other half of the choice that made
+                        // `with_client`'s key an `Option`, whose `Some(key)` case is the hosted arm of
+                        // `assistant_for`. `config::ModelsConfig::local_engine` has already refused any
+                        // address that is not this machine's, so what is dialled here is a loopback
+                        // server, and a loopback server is sent no `Authorization` header at all rather
+                        // than an empty or invented one.
+                        None,
+                    ),
+                )
             }
         };
         Ok(chat)
@@ -505,7 +515,7 @@ impl Assistants for ConfiguredAssistants {
         &self,
         brain: crate::chats::Brain,
         model: Option<&str>,
-    ) -> Result<std::sync::Arc<crate::local_agent::LocalAssistant>, Refusal> {
+    ) -> Result<std::sync::Arc<crate::models::local_agent::LocalAssistant>, Refusal> {
         // `serves` carries the availability rule now — calling it first means a refusal here and a
         // refusal from `serves` are the same check, not two copies of it. Harmless to repeat below:
         // `resolve_model`'s and the key's own checks only ever fail for the same reason `serves`
@@ -532,7 +542,7 @@ impl Assistants for ConfiguredAssistants {
                     // Already boxed by `local_chat`, where the engine chose which of the two
                     // `LocalChat` implementations this is - one `Box::new` per arm instead of one
                     // here.
-                    crate::local_agent::LocalAssistant::new(chat, toolbox),
+                    crate::models::local_agent::LocalAssistant::new(chat, toolbox),
                 ))
             }
             crate::chats::Brain::OpenRouter => {
@@ -545,7 +555,7 @@ impl Assistants for ConfiguredAssistants {
                     .hosted_key
                     .clone()
                     .ok_or(Refusal::HostedModelNamedButNoKey)?;
-                let chat = crate::openai_compatible::OpenAiCompatibleChat::with_client(
+                let chat = crate::models::openai_compatible::OpenAiCompatibleChat::with_client(
                     self.hosted_client.clone(),
                     // The FIELD, not `openai_compatible::OPENROUTER_BASE_URL` directly. Behaviour-neutral
                     // in production — the field is initialised to that same constant and only
@@ -569,7 +579,7 @@ impl Assistants for ConfiguredAssistants {
                     self.pool.clone(),
                 );
                 Ok(std::sync::Arc::new(
-                    crate::local_agent::LocalAssistant::new(Box::new(chat), toolbox),
+                    crate::models::local_agent::LocalAssistant::new(Box::new(chat), toolbox),
                 ))
             }
         }
@@ -627,7 +637,7 @@ impl Assistants for ConfiguredAssistants {
         // network route serves it), so they share its one declared requirement — there is no
         // route-specific REQUIREMENT to choose between. What differs between them is where to ask,
         // which `declared_one` below is the one place that decides.
-        let requirement = crate::local_agent::CAPABILITY_REQUIREMENT;
+        let requirement = crate::models::local_agent::CAPABILITY_REQUIREMENT;
         let declared = self.declared_one(brain, model).await;
 
         let missing = crate::capabilities::missing_capabilities(&requirement, &declared);
@@ -690,7 +700,7 @@ impl ConfiguredAssistants {
         brain: crate::chats::Brain,
         model: &str,
     ) -> crate::capabilities::Declared {
-        let required_tokens = crate::local_agent::CAPABILITY_REQUIREMENT.context_tokens;
+        let required_tokens = crate::models::local_agent::CAPABILITY_REQUIREMENT.context_tokens;
         let key = format!("{}:{model}", brain.as_str());
 
         match brain {
@@ -774,7 +784,7 @@ impl ConfiguredAssistants {
 /// answered, and none of them cares which route or model the turn asked for — that is
 /// `RecordingAssistants`'s job below, not this one's.
 #[cfg(any(test, feature = "testkit"))]
-pub struct FixedAssistants(pub std::sync::Arc<crate::local_agent::LocalAssistant>);
+pub struct FixedAssistants(pub std::sync::Arc<crate::models::local_agent::LocalAssistant>);
 
 #[cfg(any(test, feature = "testkit"))]
 #[async_trait::async_trait]
@@ -783,7 +793,7 @@ impl Assistants for FixedAssistants {
         &self,
         _brain: crate::chats::Brain,
         _model: Option<&str>,
-    ) -> Result<std::sync::Arc<crate::local_agent::LocalAssistant>, Refusal> {
+    ) -> Result<std::sync::Arc<crate::models::local_agent::LocalAssistant>, Refusal> {
         Ok(self.0.clone())
     }
 
@@ -819,13 +829,13 @@ impl Assistants for FixedAssistants {
 /// self` to record into.
 #[cfg(any(test, feature = "testkit"))]
 pub struct RecordingAssistants {
-    assistant: std::sync::Arc<crate::local_agent::LocalAssistant>,
+    assistant: std::sync::Arc<crate::models::local_agent::LocalAssistant>,
     pub calls: std::sync::Mutex<Vec<(crate::chats::Brain, Option<String>)>>,
 }
 
 #[cfg(any(test, feature = "testkit"))]
 impl RecordingAssistants {
-    pub fn new(assistant: std::sync::Arc<crate::local_agent::LocalAssistant>) -> Self {
+    pub fn new(assistant: std::sync::Arc<crate::models::local_agent::LocalAssistant>) -> Self {
         Self {
             assistant,
             calls: std::sync::Mutex::new(Vec::new()),
@@ -840,7 +850,7 @@ impl Assistants for RecordingAssistants {
         &self,
         brain: crate::chats::Brain,
         model: Option<&str>,
-    ) -> Result<std::sync::Arc<crate::local_agent::LocalAssistant>, Refusal> {
+    ) -> Result<std::sync::Arc<crate::models::local_agent::LocalAssistant>, Refusal> {
         self.calls
             .lock()
             .expect("recording assistants mutex poisoned")
@@ -882,7 +892,7 @@ impl Assistants for NoAssistants {
         &self,
         _brain: crate::chats::Brain,
         _model: Option<&str>,
-    ) -> Result<std::sync::Arc<crate::local_agent::LocalAssistant>, Refusal> {
+    ) -> Result<std::sync::Arc<crate::models::local_agent::LocalAssistant>, Refusal> {
         Err(Refusal::RouteNotConfigured)
     }
 
@@ -920,8 +930,10 @@ mod tests {
 
     #[tokio::test]
     async fn configured_assistants_hand_each_cli_its_own_runner() {
-        let claude_fake = std::sync::Arc::new(crate::runner::FakeCommandRunner::default());
-        let expected: std::sync::Arc<dyn crate::runner::CommandRunner> = claude_fake.clone();
+        let claude_fake =
+            std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
+        let expected: std::sync::Arc<dyn crate::execution::runner::CommandRunner> =
+            claude_fake.clone();
         let configured = ConfiguredAssistants::new(
             None,
             None,
@@ -929,7 +941,7 @@ mod tests {
             "http://127.0.0.1:8791".to_string(),
             "token".to_string(),
             test_pool().await,
-            crate::runner::OLLAMA_BASE_URL.to_string(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
         )
         .with_agent_clis(claude_fake, "gpt-5.6-terra".to_string());
 
@@ -947,7 +959,7 @@ mod tests {
             "http://127.0.0.1:8791".to_string(),
             "token".to_string(),
             test_pool().await,
-            crate::runner::OLLAMA_BASE_URL.to_string(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
         );
         assert!(unconfigured.cli_runner("claude", None).is_none());
         assert!(unconfigured.cli_runner("codex", None).is_none());
@@ -1099,7 +1111,7 @@ mod tests {
             "http://127.0.0.1:8791".to_string(),
             "token".to_string(),
             test_pool().await,
-            crate::runner::OLLAMA_BASE_URL.to_string(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
         );
 
         assert!(factory.assistant_for(Brain::Local, None).is_ok());
@@ -1114,7 +1126,7 @@ mod tests {
             "http://127.0.0.1:8791".to_string(),
             "token".to_string(),
             test_pool().await,
-            crate::runner::OLLAMA_BASE_URL.to_string(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
         );
 
         assert!(
@@ -1136,7 +1148,7 @@ mod tests {
             "http://127.0.0.1:8791".to_string(),
             "token".to_string(),
             test_pool().await,
-            crate::runner::OLLAMA_BASE_URL.to_string(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
         );
 
         let result = factory.assistant_for(Brain::OpenRouter, None);
@@ -1157,7 +1169,7 @@ mod tests {
             "http://127.0.0.1:8791".to_string(),
             "token".to_string(),
             test_pool().await,
-            crate::runner::OLLAMA_BASE_URL.to_string(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
         );
 
         assert!(
@@ -1262,7 +1274,7 @@ mod tests {
                 );
                 assert!(
                     reason.contains(
-                        &crate::local_agent::CAPABILITY_REQUIREMENT
+                        &crate::models::local_agent::CAPABILITY_REQUIREMENT
                             .context_tokens
                             .to_string()
                     ),
@@ -1480,7 +1492,7 @@ mod tests {
             "http://127.0.0.1:8791".to_string(),
             "token".to_string(),
             test_pool().await,
-            crate::runner::OLLAMA_BASE_URL.to_string(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
         )
         .with_hosted_base_url(hosted_base_url);
 
@@ -1766,7 +1778,7 @@ mod tests {
             "http://127.0.0.1:8791".to_string(),
             "token".to_string(),
             test_pool().await,
-            crate::runner::OLLAMA_BASE_URL.to_string(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
         );
 
         assert_eq!(

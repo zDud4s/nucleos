@@ -77,7 +77,7 @@ impl Verdict {
 /// passing `declare_shell_rule` at all — an out-of-band write, or a migration older than this rule —
 /// and such a row must not be able to smuggle in a dead refusal.
 fn fold_prefix(prefix: &str) -> String {
-    crate::classifier::normalize_command(prefix)
+    crate::governance::classifier::normalize_command(prefix)
 }
 
 /// The fold a declared PATH prefix gets, and it is deliberately not `fold_prefix`.
@@ -169,7 +169,7 @@ impl ShellRules {
     /// generic: two functions here is how the two lists would drift.
     fn matches(command: &str, prefixes: &[String]) -> bool {
         prefixes.iter().any(|prefix| {
-            crate::classifier::matches_command_prefix(command, &[fold_prefix(prefix)])
+            crate::governance::classifier::matches_command_prefix(command, &[fold_prefix(prefix)])
         })
     }
 }

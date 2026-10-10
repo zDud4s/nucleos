@@ -11,7 +11,7 @@ import {
 } from "./job-progress";
 
 /**
- * Every variant of `ItemState` in `core/src/job.rs`, by the string `job_items.status` stores.
+ * Every variant of `ItemState` in `core/src/execution/job.rs`, by the string `job_items.status` stores.
  *
  * `GateRetriable` is absent ON PURPOSE and is not an oversight: that state is never stored, and
  * the row says `gate_failed` for it. Held here so a new variant in the núcleo cannot quietly
@@ -92,7 +92,7 @@ describe("job-progress — the status table", () => {
   });
 
   it("draws a conflicted item as work the queue still owes, not as a question for a person", () => {
-    // `core/src/job.rs`: `Conflicted` leaves for `Running`, the resolution node, and `next_step`
+    // `core/src/execution/job.rs`: `Conflicted` leaves for `Running`, the resolution node, and `next_step`
     // finds it as work. Filing it under "waiting on a person" sent the reader to a queue that
     // holds nothing for them.
     expect(lifecycleOf("conflicted")).toBe("running");

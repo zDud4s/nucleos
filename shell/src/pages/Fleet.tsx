@@ -459,7 +459,7 @@ function ProjectAction({
  * list of idle rows after the columns — because both treated idle as a kind of project. It is not;
  * it is how full a project is, and every project has a fullness. So every project is here, busy or
  * not — all but one whose autopilot is off and that holds nothing (`isSwitchedOff`) — one line each, **in one order that never changes**: by project id, the order `/concurrency`
- * sends them in (`core/src/concurrency.rs`, `readout`: `ids.sort()`), so a project is always where
+ * sends them in (`core/src/execution/concurrency.rs`, `readout`: `ids.sort()`), so a project is always where
  * it was, whatever just went wrong in it. The columns below keep their exceptions-first order and do
  * the ranking; the rack is where a project is found.
  *
@@ -752,7 +752,7 @@ export interface ProjectChoice {
 /**
  * Why `POST /jobs` would refuse a job in this project, or `null` when it would take one.
  *
- * The reasons are the route's own, read out of `core/src/job.rs` and asked before the press
+ * The reasons are the route's own, read out of `core/src/execution/job.rs` and asked before the press
  * rather than after it: `resolve_start` refuses a project whose autopilot is not `active` —
  * `shadow` included, because shadow is plan-only and a job writes to a worktree — and one with no
  * root recorded, and `concurrency::room_for` refuses a full one.
@@ -802,7 +802,7 @@ export interface NoJob {
  *
  * Off is not part of the fleet: `POST /jobs` and `POST /runs` both refuse it, so it has no room to
  * show and nothing to offer. Only a known `off` counts — before `/projects` answers nothing is
- * hidden on a guess. Its slots are another matter: `readout` in `core/src/concurrency.rs` keeps
+ * hidden on a guess. Its slots are another matter: `readout` in `core/src/execution/concurrency.rs` keeps
  * listing an off project, and work started before the switch still holds what it claimed, so a
  * caller hides an off project only while it holds nothing.
  */
@@ -1154,7 +1154,7 @@ function counted(count: number, one: string, many: string): string {
  * A ladder in the order of what it asks of the reader, the way Home's is. Faults lead — a slot
  * held by nothing, two trees measured writing the same file — and they are set in the wrong-fact
  * colour, as Home sets its own. Then an item that did not merge, in plain words and not in that
- * colour: `core/src/job.rs` puts a conflicted item down rather than failing it ("a conflict is a
+ * colour: `core/src/execution/job.rs` puts a conflicted item down rather than failing it ("a conflict is a
  * question about two pieces of work, not a verdict on either") and the queue starts the
  * resolution run itself, so it is work that stopped, not a fault. Then what is waiting on a
  * decision, which is a door to Waiting; then what a rule is holding back; then the kill switch,

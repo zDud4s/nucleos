@@ -255,7 +255,9 @@ mod tests {
         let turn = a_running_run(&pool, "assistant", Some("c-1")).await;
         let other = a_running_run(&pool, "worktree", None).await;
 
-        crate::runs::reconcile_orphaned_runs(&pool).await.unwrap();
+        crate::execution::runs::reconcile_orphaned_runs(&pool)
+            .await
+            .unwrap();
 
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
             .bind(turn)
@@ -288,10 +290,10 @@ mod tests {
         crate::chats::set_cwd(&pool, "c-1", "C:/x").await.unwrap();
         let turn = a_running_run(&pool, "assistant", Some("c-1")).await;
 
-        crate::runs::mark_untrusted_context(&pool, turn)
+        crate::execution::runs::mark_untrusted_context(&pool, turn)
             .await
             .unwrap();
-        crate::runs::mark_untrusted_context(&pool, turn)
+        crate::execution::runs::mark_untrusted_context(&pool, turn)
             .await
             .unwrap();
 
@@ -309,7 +311,7 @@ mod tests {
         a_chat(&pool, "c-1").await;
         let turn = a_running_run(&pool, "assistant", Some("c-1")).await;
 
-        crate::runs::mark_untrusted_context(&pool, turn)
+        crate::execution::runs::mark_untrusted_context(&pool, turn)
             .await
             .unwrap();
 

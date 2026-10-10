@@ -95,7 +95,7 @@ pub async fn post_embedding_config(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     crate::embed::install(Arc::new(crate::embed::OllamaEmbedder::new(
-        crate::runner::OLLAMA_BASE_URL.to_string(),
+        crate::execution::runner::OLLAMA_BASE_URL.to_string(),
         model.clone(),
     )));
     crate::embed::nudge();

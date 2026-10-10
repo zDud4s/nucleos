@@ -7,10 +7,10 @@ import { readState, statesOf } from "./state-map";
 
 const moduleUrl = import.meta.url.startsWith("file:") ? import.meta.url : `file://${import.meta.url}`;
 const repoRoot = fileURLToPath(new URL("../../../", moduleUrl));
-const jobRs = readFileSync(`${repoRoot}core/src/job.rs`, "utf8");
+const jobRs = readFileSync(`${repoRoot}core/src/execution/job.rs`, "utf8");
 const teamRs = readFileSync(`${repoRoot}core/src/team.rs`, "utf8");
-const concurrencyRs = readFileSync(`${repoRoot}core/src/concurrency.rs`, "utf8");
-const runsRs = readFileSync(`${repoRoot}core/src/runs.rs`, "utf8");
+const concurrencyRs = readFileSync(`${repoRoot}core/src/execution/concurrency.rs`, "utf8");
+const runsRs = readFileSync(`${repoRoot}core/src/execution/runs.rs`, "utf8");
 const quotaRs = readFileSync(`${repoRoot}core/src/quota.rs`, "utf8");
 
 /**
@@ -64,17 +64,17 @@ const WRITERS: { name: string; position: number }[] = [
   { name: "append", position: 3 },
   { name: "append_on", position: 3 },
   { name: "say", position: 3 },
-  // `job.rs::say_once` forwards to `say` only when the same line is not already written.
+  // `execution/job.rs::say_once` forwards to `say` only when the same line is not already written.
   { name: "say_once", position: 3 },
   { name: "deliver_or_defer", position: 2 },
 ];
 
 const FORWARDED: Record<string, Record<string, string[]>> = {
   "feed.rs": { kind: [] },
-  "job.rs": { kind: [] },
-  "notify.rs": { kind: [] },
-  "runs.rs": { kind: ["shadow_run_completed", "worktree_run_completed"] },
-  "triage.rs": { 'format!("email_{}",verdict.class)': [] },
+  "execution/job.rs": { kind: [] },
+  "integrations/notify.rs": { kind: [] },
+  "execution/runs.rs": { kind: ["shadow_run_completed", "worktree_run_completed"] },
+  "governance/triage.rs": { 'format!("email_{}",verdict.class)': [] },
 };
 
 const EMAIL_CLASS_KINDS = ["email_urgent"];
@@ -197,7 +197,7 @@ describe("state-map completeness", () => {
     expect(jobRs).toMatch(/_ => ItemState::Pending/);
 
     expect(new Set(statesOf("job_item"))).toEqual(new Set([...arms, "pending"]));
-    // Put down rather than failed (`core/src/job.rs`, `ItemState::Conflicted`), so held and not
+    // Put down rather than failed (`core/src/execution/job.rs`, `ItemState::Conflicted`), so held and not
     // wrong; and not a summons either, because the queue starts the resolution run itself.
     expect(readState("job_item", "conflicted")?.tone).toBe("paused");
     expect(readState("job_item", "conflicted")?.tone).toBe(readState("feed", "job_item_conflicted")?.tone);

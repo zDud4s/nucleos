@@ -8,7 +8,7 @@ import { POLL, pollWhile } from "./poll";
  * Runs, as hooks: the index, one run in full, its live tail, and the five
  * writes a person can make to one.
  *
- * Every shape below was read off `core/src/runs.rs` and the routes
+ * Every shape below was read off `core/src/execution/runs.rs` and the routes
  * `core/src/http.rs` mounts, field for field. Two of them differ from what the
  * old shell declared, and both differences are load-bearing — `successor_run_id`
  * exists and was never rendered, and the refusal codes are not the ones the old

@@ -233,7 +233,7 @@ fn written(project: &str, job_id: i64, deadline: &str, facts: &[Fact]) -> String
         job_id,
         until: &until,
     };
-    crate::redact::redact_secrets(&render(&header, facts))
+    crate::governance::redact::redact_secrets(&render(&header, facts))
 }
 
 fn facts_json(facts: &[Fact]) -> String {
@@ -280,7 +280,8 @@ pub async fn open_due(
             None => {
                 let deadline = stamp(now + Duration::minutes(wait_minutes));
                 // Redacted at the source: the fact is stored in `causes` too, not only in the question.
-                let fact = crate::redact::redact_secrets(&fact_for(&mut *conn, &row).await?);
+                let fact =
+                    crate::governance::redact::redact_secrets(&fact_for(&mut *conn, &row).await?);
                 let facts = vec![Fact {
                     row: row.id,
                     cause: row.cause.clone(),
@@ -322,7 +323,8 @@ pub async fn open_due(
                     continue;
                 }
                 // Redacted at the source: the fact is stored in `causes` too, not only in the question.
-                let fact = crate::redact::redact_secrets(&fact_for(&mut *conn, &row).await?);
+                let fact =
+                    crate::governance::redact::redact_secrets(&fact_for(&mut *conn, &row).await?);
                 facts.push(Fact {
                     row: row.id,
                     cause: row.cause.clone(),

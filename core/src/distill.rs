@@ -650,7 +650,7 @@ fn clip_tail(s: &str, width: usize) -> String {
 
 /// A stored transcript as prose: the model's reply when it has one, the raw text otherwise.
 fn reply_of(stdout: String) -> String {
-    crate::runner::extract_reply(&stdout).unwrap_or(stdout)
+    crate::execution::runner::extract_reply(&stdout).unwrap_or(stdout)
 }
 
 /// A gate output as the failure it describes, or its tail when it has no signature.
@@ -796,7 +796,7 @@ async fn ask(asked: Extractor<'_>, prompt: String) -> std::io::Result<String> {
             base_url,
             model,
         } => {
-            crate::runner::ollama_chat(
+            crate::execution::runner::ollama_chat(
                 client,
                 base_url,
                 model,
@@ -919,8 +919,10 @@ async fn write_items(
         // A learning that quotes the owner's text reaches no prompt without the owner's yes
         // (spec `2026-10-07-fronteira-prompts-design.md` §4): an episode is proposed, not recorded.
         let (kind, by_layer) = door(item.layer);
-        let quoted =
-            crate::quote_guard::quotes(&format!("{}\n{}", item.title, item.body), &sources);
+        let quoted = crate::governance::quote_guard::quotes(
+            &format!("{}\n{}", item.title, item.body),
+            &sources,
+        );
         let demoted = quoted && by_layer == Door::Record;
         let how = if quoted { Door::Propose } else { by_layer };
         let declaration = crate::knowledge::Declaration {
@@ -1816,9 +1818,9 @@ mod tests {
     use super::{claim_next, items_format, process_one, recover_running};
     use crate::map::intent::Extractor;
 
-    fn fake_answering(stdout: &str) -> crate::runner::FakeCommandRunner {
-        crate::runner::FakeCommandRunner {
-            canned: std::sync::Mutex::new(Some(crate::runner::RunOutcome {
+    fn fake_answering(stdout: &str) -> crate::execution::runner::FakeCommandRunner {
+        crate::execution::runner::FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(crate::execution::runner::RunOutcome {
                 exit_code: 0,
                 stdout: stdout.to_owned(),
                 stderr: String::new(),
@@ -1836,8 +1838,8 @@ mod tests {
     }
 
     /// A runner whose launch fails once; each call site builds a fresh one per attempt.
-    fn fake_failing() -> crate::runner::FakeCommandRunner {
-        crate::runner::FakeCommandRunner {
+    fn fake_failing() -> crate::execution::runner::FakeCommandRunner {
+        crate::execution::runner::FakeCommandRunner {
             fail_times: std::sync::Mutex::new(1),
             ..Default::default()
         }

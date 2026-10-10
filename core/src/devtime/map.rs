@@ -133,14 +133,14 @@ async fn decide(
 
     // 4. Git: the checkout this cwd stands in, and whose repository it belongs to.
     let deadline = Instant::now() + GIT_DEADLINE;
-    if let Ok(toplevel) = crate::git_exec::toplevel(Path::new(cwd), deadline).await {
+    if let Ok(toplevel) = crate::execution::git_exec::toplevel(Path::new(cwd), deadline).await {
         let toplevel_s = toplevel.to_string_lossy().into_owned();
-        if let Ok(key) = crate::git_exec::repo_key(&toplevel, deadline).await {
+        if let Ok(key) = crate::execution::git_exec::repo_key(&toplevel, deadline).await {
             for (project, root) in roster {
                 let root_key = match root_keys.get(root) {
                     Some(cached) => cached.clone(),
                     None => {
-                        let found = crate::git_exec::repo_key(Path::new(root), deadline)
+                        let found = crate::execution::git_exec::repo_key(Path::new(root), deadline)
                             .await
                             .ok();
                         root_keys.insert(root.clone(), found.clone());

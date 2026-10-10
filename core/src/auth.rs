@@ -1040,7 +1040,7 @@ pub async fn require_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::FakeCommandRunner;
+    use crate::execution::runner::FakeCommandRunner;
     use axum::Router;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
@@ -1091,13 +1091,13 @@ mod tests {
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
-            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
-            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
-            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
             judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
-            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -3730,7 +3730,7 @@ mod tests {
         }
 
         for key in [&run, &api, &team, &service, &chat, &control] {
-            let redacted = crate::redact::redact_secrets(&format!("leaked {key} here"));
+            let redacted = crate::governance::redact::redact_secrets(&format!("leaked {key} here"));
             assert!(
                 redacted.contains("[SECRET:nucleos-token]"),
                 "{key} was not redacted: {redacted}"

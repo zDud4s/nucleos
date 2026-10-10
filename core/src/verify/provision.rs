@@ -31,10 +31,10 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 
 use crate::auth::Scope;
-use crate::git_exec::{self, OPERATION_TIMEOUT};
+use crate::execution::git_exec::{self, OPERATION_TIMEOUT};
 use crate::state::AppState;
 use crate::verify::Caller;
-use crate::{autopilot, inspect};
+use crate::{governance::autopilot, inspect};
 
 const MCP_FILE: &str = ".mcp.json";
 const CLAUDE_DIR: &str = ".claude";
@@ -745,7 +745,7 @@ mod tests {
     }
 
     async fn switch_is(pool: &SqlitePool) -> bool {
-        crate::autopilot::ide_verify_enabled(pool, "alpha")
+        crate::governance::autopilot::ide_verify_enabled(pool, "alpha")
             .await
             .unwrap()
     }
@@ -784,8 +784,10 @@ mod tests {
     }
 
     async fn same_dir(a: &str, b: &Path) -> bool {
-        crate::git_exec::canonical(Path::new(a)).await.unwrap()
-            == crate::git_exec::canonical(b).await.unwrap()
+        crate::execution::git_exec::canonical(Path::new(a))
+            .await
+            .unwrap()
+            == crate::execution::git_exec::canonical(b).await.unwrap()
     }
 
     /// The report whose path names `dir`.

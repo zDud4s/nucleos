@@ -756,16 +756,17 @@ pub async fn ingest_cycle(
     projects_dir: &Path,
 ) -> CycleStats {
     let mut stats = CycleStats::default();
-    let roster: Vec<(String, String)> = match crate::autopilot::project_roster(pool).await {
-        Ok(rows) => rows
-            .into_iter()
-            .filter_map(|row| row.project_root.map(|root| (row.project_id, root)))
-            .collect(),
-        Err(error) => {
-            tracing::warn!(%error, "devtime: could not read the project roster");
-            Vec::new()
-        }
-    };
+    let roster: Vec<(String, String)> =
+        match crate::governance::autopilot::project_roster(pool).await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|row| row.project_root.map(|root| (row.project_id, root)))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "devtime: could not read the project roster");
+                Vec::new()
+            }
+        };
 
     let dir = projects_dir.to_path_buf();
     let found = tokio::task::spawn_blocking(move || walk(&dir))

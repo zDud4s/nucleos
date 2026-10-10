@@ -7,7 +7,7 @@ import { POLL } from "./poll";
  * The voice pillar: the pillar's own configuration, the two capture lists it
  * keeps, one delete, and the raw POST that turns recorded bytes into text.
  *
- * Every shape and route below was read off `core/src/voice.rs`, not inferred
+ * Every shape and route below was read off `core/src/integrations/voice.rs`, not inferred
  * from a name. Three facts are load-bearing and easy to get wrong by analogy
  * with the rest of the shell:
  *
@@ -246,7 +246,7 @@ export function postConversation(
   });
 }
 
-/** The wire spelling of the fourth kind — a contract with `core/src/voice.rs`'s `Kind`. */
+/** The wire spelling of the fourth kind — a contract with `core/src/integrations/voice.rs`'s `Kind`. */
 const SEGMENT_KIND = "segment";
 
 export interface SegmentTranscribed {
@@ -283,7 +283,7 @@ export async function postSegment(
   return heard ?? { text: "", verdict: "continues" };
 }
 
-/** The wire spelling of the fifth kind — a contract with `core/src/voice.rs`'s `Kind`. */
+/** The wire spelling of the fifth kind — a contract with `core/src/integrations/voice.rs`'s `Kind`. */
 const DRAFT_KIND = "draft";
 
 /**
@@ -326,7 +326,7 @@ export async function postDraft(
 /**
  * The wire spelling of the third kind.
  *
- * A constant because it is a contract with `core/src/voice.rs`'s `Kind`, which
+ * A constant because it is a contract with `core/src/integrations/voice.rs`'s `Kind`, which
  * serialises `rename_all = "lowercase"`, and the value travels as a query
  * string — so a mismatch is a runtime refusal and nothing at compile time. The
  * other two spellings are pinned by a test in `shell/src-tauri/src/dictation.rs`

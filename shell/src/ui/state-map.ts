@@ -78,7 +78,7 @@ export interface StateReading {
  */
 const READINGS: Record<StateDomain, Record<string, StateReading>> = {
   /**
-   * What a project does without being asked (`AutopilotMode`, `core/src/autopilot.rs`).
+   * What a project does without being asked (`AutopilotMode`, `core/src/governance/autopilot.rs`).
    *
    * The three are not a severity scale and must not read as one. `off` is a
    * decision — nothing runs here, and that is fine; `shadow` is the project
@@ -336,7 +336,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * fact, while Acting Green is work happening now.
    */
   job: {
-    // The six live statuses (`core/src/job.rs`, `LIVE_STATUSES`). A job that is running is not
+    // The six live statuses (`core/src/execution/job.rs`, `LIVE_STATUSES`). A job that is running is not
     // an unknown word — firing the unmapped badge on the one job actually working teaches the
     // reader to ignore the device that exists to admit ignorance.
     planning: { tone: "active", label: "planning" },
@@ -361,13 +361,13 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
 
   /**
    * One item of a job's queue — every `job_items.status` the núcleo stores, read out of
-   * `item_state_from` in `core/src/job.rs`, plus `pending`, which that function reaches through
+   * `item_state_from` in `core/src/execution/job.rs`, plus `pending`, which that function reaches through
    * its `_ =>` arm because it is the column's default. `GateRetriable` is absent on purpose: it is
    * never stored, only derived from `gate_failed` and an attempt count, so the wire cannot say it.
    * `state-map-completeness.test.ts` holds this row to that function.
    *
    * **`conflicted` is Held Ember — not Wrong Red, and not Awaiting-You Amber.** The daemon says
-   * which in the variant's own doc (`core/src/job.rs`, `ItemState::Conflicted`): "The item is put
+   * which in the variant's own doc (`core/src/execution/job.rs`, `ItemState::Conflicted`): "The item is put
    * down rather than failed: a conflict is a question about two pieces of work, not a verdict on
    * either", and it "Leaves for `Running` — the resolution node, in that same tree". Red would be
    * the verdict the daemon declines to give. Amber would be a summons, and nobody is being waited
@@ -406,7 +406,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * Which of the collision warning's two sources is speaking.
    *
    * The keys are the núcleo's own field names on `Collisions` (`declared`, `observed` —
-   * `data/fleet.ts`, read off `core/src/collision.rs`); the words and the tones are the shell's,
+   * `data/fleet.ts`, read off `core/src/execution/collision.rs`); the words and the tones are the shell's,
    * and this docstring is the permission the header asks for. §7 asks for two badges because
    * *this collided* is a measurement and *this will collide* is a prediction, so the source is
    * worded apart AND toned apart: the measurement in Wrong Red, the prediction in Held Ember.
@@ -435,7 +435,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    *
    * Two spellings for the same third state, and both are real: `job_items.status`
    * records `gate_errored` while `job_items.gate_status` records plain `errored`
-   * (`core/src/job.rs`, `step_after_gate`). Whichever column a caller happens to
+   * (`core/src/execution/job.rs`, `step_after_gate`). Whichever column a caller happens to
    * hold, it must not read as a failure.
    */
   gate: {
@@ -452,7 +452,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    *
    * `excluded` is the third, and it is neither: the job is not short of money
    * and not short of a slot. A rule somebody approved says it may not run while
-   * its partner does (`core/src/job.rs`, `Brake::Park { reason: "excluded" }`),
+   * its partner does (`core/src/execution/job.rs`, `Brake::Park { reason: "excluded" }`),
    * and the only thing that changes it is lifting the rule or letting the
    * partner finish. Reading it as slot contention would send somebody looking
    * for capacity that is already there.
@@ -630,7 +630,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
   },
 
   /**
-   * A message's triage class — `core/src/triage.rs:253` `VALID_CLASSES`, plus
+   * A message's triage class — `core/src/governance/triage.rs:253` `VALID_CLASSES`, plus
    * the terminal fifth one at `triage.rs:839,886`.
    *
    * `failed` is deliberately kept off `noise`'s tone: it is triage giving up
@@ -648,7 +648,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
   },
 
   /**
-   * Whether a voice memo's transcript was cleaned up — `core/src/voice.rs:92-116`.
+   * Whether a voice memo's transcript was cleaned up — `core/src/integrations/voice.rs:92-116`.
    *
    * `raw` and `shrunk` both leave the raw transcript on screen and must not
    * collapse into one reading: `raw` is nothing having been attempted (no
@@ -664,7 +664,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
 
   /**
    * Whether a fetched page's text reaches an agent as written or only as a
-   * summary — `core/src/web.rs`, `trust.rs:31-34`. The default is quarantine;
+   * summary — `core/src/integrations/web.rs`, `trust.rs:31-34`. The default is quarantine;
    * `raw` is the narrower, earned case (spec §5.2's conjunction), not the
    * common one.
    */
@@ -774,7 +774,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
 const ABSENT: Partial<Record<StateDomain, StateReading>> = {
   gate: { tone: "off", label: "no gate configured" },
   /**
-   * A NULL `triage_class` (`core/src/email.rs:791`) is a message triage has
+   * A NULL `triage_class` (`core/src/integrations/email.rs:791`) is a message triage has
    * not reached yet, not a message that was read and found to be nothing —
    * that second fact is `noise`, a real class, and the two must not share a
    * badge.

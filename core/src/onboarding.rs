@@ -232,7 +232,7 @@ pub fn onboard(
         .map(|harness| harness.path)
         .collect();
 
-    crate::autopilot::wire_classifier_hook(project_root).map_err(OnboardError::Hook)?;
+    crate::governance::autopilot::wire_classifier_hook(project_root).map_err(OnboardError::Hook)?;
 
     if let Some(text) = rules {
         crate::project::state::write_atomically(&rules_path, &text).map_err(OnboardError::Io)?;
@@ -412,7 +412,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(crate::autopilot::classifier_hook_is_wired(project.path()));
+        assert!(crate::governance::autopilot::classifier_hook_is_wired(
+            project.path()
+        ));
         assert_eq!(marker.harnesses, vec![".claude".to_string()]);
         assert!(marker.hook_installed && !marker.migrated);
         assert_eq!(read_marker(Some(home.path()), "alpha"), Some(marker));

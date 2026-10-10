@@ -175,10 +175,10 @@ fn validate(request: &TriggerRequest) -> Result<(), TriggerError> {
         }
         "email_triaged" => {
             let class = request.email_class.as_deref().unwrap_or("");
-            if !crate::triage::VALID_CLASSES.contains(&class) {
+            if !crate::governance::triage::VALID_CLASSES.contains(&class) {
                 return Err(TriggerError::Invalid(format!(
                     "a triage class is one of {}",
-                    crate::triage::VALID_CLASSES.join(", ")
+                    crate::governance::triage::VALID_CLASSES.join(", ")
                 )));
             }
             if request.cron.is_some() || request.from_team.is_some() {
@@ -404,7 +404,7 @@ pub fn next_at(trigger: &TeamTrigger, since: DateTime<Utc>) -> Result<DateTime<U
     if trigger.source != "cron" {
         return Err("this rule does not fire on a clock".to_owned());
     }
-    crate::scheduler::next_fire(&as_rule(trigger), since)
+    crate::execution::scheduler::next_fire(&as_rule(trigger), since)
 }
 
 fn as_rule(trigger: &TeamTrigger) -> crate::config::ScheduleRule {
@@ -453,7 +453,7 @@ pub async fn run_team_trigger_loop(state: AppState) {
 /// is a column per rule, `respects_attention`, defaulting to false; a switch is not worth adding
 /// before there is a case for it.
 pub async fn team_trigger_tick(state: &AppState, now: DateTime<Utc>) {
-    if crate::autopilot::kill_switch_engaged(&state.pool)
+    if crate::governance::autopilot::kill_switch_engaged(&state.pool)
         .await
         .unwrap_or(true)
     {
@@ -463,13 +463,13 @@ pub async fn team_trigger_tick(state: &AppState, now: DateTime<Utc>) {
     // not touch a department already running: a switch that killed work in flight would be a
     // different thing, and the owner reaching for this one wants the alarm clock off, not the
     // meeting stopped.
-    if crate::autopilot::scoped_kill_engaged(&state.pool, "trigger", "team")
+    if crate::governance::autopilot::scoped_kill_engaged(&state.pool, "trigger", "team")
         .await
         .unwrap_or(true)
     {
         return;
     }
-    if let crate::budget::BudgetDecision::Pause { reason, .. } =
+    if let crate::governance::budget::BudgetDecision::Pause { reason, .. } =
         crate::quota::permits_new_run(state, now).await
     {
         tracing::info!(reason = %reason, "budget exhausted; team triggers paused this tick");

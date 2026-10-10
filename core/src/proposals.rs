@@ -922,7 +922,7 @@ pub async fn reject_proposal(pool: &SqlitePool, id: i64) -> Result<(), RejectErr
         return Err(RejectError::NotPending);
     }
     if let Some(run_id) = proposal.run_id {
-        crate::worktree::release(pool, run_id).await?;
+        crate::execution::worktree::release(pool, run_id).await?;
     }
     Ok(())
 }
@@ -1253,7 +1253,9 @@ mod tests {
         let pool = test_pool().await;
         let (run_id, proposal_id) = parked_run(&pool, "awaiting_approval").await;
 
-        crate::worktree::release(&pool, run_id).await.unwrap();
+        crate::execution::worktree::release(&pool, run_id)
+            .await
+            .unwrap();
 
         let proposal = get(&pool, proposal_id).await.unwrap().unwrap();
         assert_eq!(proposal.status, "expired");

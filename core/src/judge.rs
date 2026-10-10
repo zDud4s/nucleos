@@ -16,8 +16,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
-use crate::classifier;
 use crate::command_reader::Shell;
+use crate::governance::classifier;
 
 /// One question put to the judge: the name its answer comes back under, and its wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,7 +442,7 @@ pub fn redact_for_judge(text: &str) -> String {
 
 /// `redact_for_judge` with the home directory handed in, so a test does not depend on the machine.
 fn redact_for_judge_with_home(text: &str, home: Option<&Path>) -> String {
-    let text = crate::redact::redact_secrets(text);
+    let text = crate::governance::redact::redact_secrets(text);
     let text = match home {
         Some(home) => redact_home(&text, home),
         None => text,

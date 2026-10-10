@@ -3,7 +3,7 @@
  *
  * The decisions are elsewhere and on purpose. `lib/conversation.ts` owns what each event means,
  * `lib/vad.ts` owns when somebody started and stopped talking, `data/listening.ts` owns the open
- * microphone that applies it, and `core/src/voice.rs` owns what a turn IS. What is left here is the
+ * microphone that applies it, and `core/src/integrations/voice.rs` owns what a turn IS. What is left here is the
  * half that makes it a CONVERSATION rather than a transcript: the turn being assembled, the message
  * sent to the agent, and the answer played back.
  *

@@ -20,7 +20,7 @@
 //! the row exists; and `git_exec.rs` is transport that knows nothing about rows or decisions, which
 //! is precisely why it is the wrong home for something that knows what an anchor is.
 
-use crate::git_exec::run_git;
+use crate::execution::git_exec::run_git;
 use crate::map::store::Stamp;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -718,7 +718,7 @@ fn moved(stamped: &str, current: &str) -> Option<Lapse> {
 
 /// How long one `git ls-files` is given before the answer becomes *I could not look*.
 ///
-/// **Its own constant rather than [`crate::git_exec::OPERATION_TIMEOUT`], and nearly two orders of
+/// **Its own constant rather than [`crate::execution::git_exec::OPERATION_TIMEOUT`], and nearly two orders of
 /// magnitude smaller.** That 300s is the budget for a whole queued VCS operation — a worktree add, a
 /// merge, a push across a network — and it is the right size for one. This is a single read of an
 /// index git has already built, on a route the window calls every time the map opens, with a person
@@ -926,7 +926,7 @@ fn ls_files_entry(record: &str) -> Option<(u8, &str, &str)> {
 /// spelled exactly as they went in — which the route depends on to slice one call's answer per
 /// decision.
 ///
-/// This is the seventh caller of [`crate::git_exec::run_git`], whose doc names six sanctioned entries
+/// This is the seventh caller of [`crate::execution::git_exec::run_git`], whose doc names six sanctioned entries
 /// and warns that a further one "takes its `Duration` from somewhere else and quietly loses that
 /// gate". The gate in question is the VCS queue's per-operation budget, and this is not part of an
 /// operation — no worktree is claimed, nothing is written, there is no budget to spend down. It is a

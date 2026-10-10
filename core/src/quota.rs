@@ -384,22 +384,24 @@ pub async fn quota_permits_new_run(
 pub async fn permits_new_run(
     state: &crate::state::AppState,
     now: DateTime<Utc>,
-) -> crate::budget::BudgetDecision {
-    let budget = crate::budget::budget_permits_new_run(&state.pool, now).await;
-    if !matches!(budget, crate::budget::BudgetDecision::Allow) {
+) -> crate::governance::budget::BudgetDecision {
+    let budget = crate::governance::budget::budget_permits_new_run(&state.pool, now).await;
+    if !matches!(budget, crate::governance::budget::BudgetDecision::Allow) {
         return budget;
     }
     match quota_permits_new_run(&state.pool, Some(&state.quota), &state.quota.provider, now).await {
-        QuotaDecision::Allow => crate::budget::BudgetDecision::Allow,
-        QuotaDecision::Pause { reason, resets_at } => crate::budget::BudgetDecision::Pause {
-            reason,
-            kind: if resets_at.is_some() {
-                crate::budget::PauseKind::Transient
-            } else {
-                crate::budget::PauseKind::Window
-            },
-            source: PAUSE_SOURCE,
-        },
+        QuotaDecision::Allow => crate::governance::budget::BudgetDecision::Allow,
+        QuotaDecision::Pause { reason, resets_at } => {
+            crate::governance::budget::BudgetDecision::Pause {
+                reason,
+                kind: if resets_at.is_some() {
+                    crate::governance::budget::PauseKind::Transient
+                } else {
+                    crate::governance::budget::PauseKind::Window
+                },
+                source: PAUSE_SOURCE,
+            }
+        }
     }
 }
 
@@ -1172,7 +1174,7 @@ mod tests {
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,
-            runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
+            runner: std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
@@ -1189,13 +1191,13 @@ mod tests {
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
-            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
-            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
-            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(quota),
             judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
-            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
@@ -2305,7 +2307,7 @@ mod tests {
         )
         .await;
         let pause = permits_new_run(&state, now).await;
-        let crate::budget::BudgetDecision::Pause { reason, source, .. } = pause else {
+        let crate::governance::budget::BudgetDecision::Pause { reason, source, .. } = pause else {
             panic!("quota pause must be a pause")
         };
         assert_eq!(source, PAUSE_SOURCE);

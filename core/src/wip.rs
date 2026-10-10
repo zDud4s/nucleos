@@ -45,7 +45,7 @@ pub async fn global_wip_limit(pool: &SqlitePool) -> sqlx::Result<Option<i64>> {
 /// project. `?1` for a bound read; `state.project_id` for a correlated one inside the roster.
 ///
 /// **Macros and not `&str` constants, because the roster cannot bind a parameter.**
-/// [`crate::autopilot::project_roster`] reads every project in one pass, so its copy of this
+/// [`crate::governance::autopilot::project_roster`] reads every project in one pass, so its copy of this
 /// arithmetic has to correlate against the outer row rather than bind `?1` — and that single
 /// difference is the whole reason two hand-written copies existed at all. They drifted twice.
 /// The first time, the shadow term lost its `runs.mode` scope in one copy; the second, the
@@ -165,7 +165,7 @@ pub struct OpenReviewItems {
     /// Pending proposals, excluding the kinds that are notes rather than queue --
     /// see [`open_proposals_term`], which is where that exclusion is argued.
     pub proposals: i64,
-    /// Unreviewed decisions from `shadow`-mode runs -- what `crate::shadow::list_unreviewed`
+    /// Unreviewed decisions from `shadow`-mode runs -- what `crate::governance::shadow::list_unreviewed`
     /// serves, scoped identically, which `autopilot.rs` holds with a cross-module test.
     pub shadow_decisions: i64,
 }

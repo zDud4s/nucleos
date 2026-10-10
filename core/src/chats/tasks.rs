@@ -53,7 +53,7 @@ fn cut(text: &str) -> String {
 }
 
 /// PURE: the task a call launched, or `None` for a call that launches none (or carries no id).
-fn launched(call: &crate::runner::ToolCall) -> Option<Launch> {
+fn launched(call: &crate::execution::runner::ToolCall) -> Option<Launch> {
     let tool_use_id = call.id.clone()?;
     let spawns = matches!(call.name.as_str(), "Task" | "Agent");
     if !spawns && !call.background {
@@ -171,7 +171,7 @@ fn task_update(line: &str) -> Option<TaskUpdate> {
 /// failed write is logged and never fails the turn.
 pub async fn record_turn(pool: &SqlitePool, chat_id: &str, run_id: i64, stdout: &str) {
     let now = chrono::Utc::now().to_rfc3339();
-    let calls = crate::runner::live_from_stream(stdout).did;
+    let calls = crate::execution::runner::live_from_stream(stdout).did;
     for launch in calls.iter().filter_map(launched) {
         // A row already closed keeps its end: the upsert only rewrites a `running` row.
         let written = sqlx::query(

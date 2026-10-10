@@ -44,7 +44,7 @@
 //! never **implements**. This hands over a fact and a hash; the owner judges, as §5 requires of
 //! everything else here.
 
-use crate::git_exec::run_git;
+use crate::execution::git_exec::run_git;
 use crate::map::join::{Citation, Evidence, citations, evidence};
 use crate::map::scanned;
 use serde::Serialize;

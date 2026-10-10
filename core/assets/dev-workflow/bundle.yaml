@@ -45,8 +45,8 @@
 #   - `.ai/local/`                — gitignored runtime output (ledgers, job files, pipeline runs,
 #                                   agent-run records). Generated, never authored, never owned.
 #   - `.claude/hooks/ask_daemon.py` — has ONE source, `core/hooks/ask_daemon.py`, compiled into the
-#                                   daemon via `include_str!` (`core/src/autopilot.rs`,
-#                                   `core/src/triage.rs`); the copy under `.claude/hooks/` is held
+#                                   daemon via `include_str!` (`core/src/governance/autopilot.rs`,
+#                                   `core/src/governance/triage.rs`); the copy under `.claude/hooks/` is held
 #                                   byte-equal by `scripts/test-hook-filter.py`, not authored by a
 #                                   packaged workflow.
 #   - `.claude/settings.json`     — this project's own hook wiring (which commands run on

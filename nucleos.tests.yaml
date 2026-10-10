@@ -55,6 +55,8 @@ tests:
     GOCACHE: { dir: 'shared:gocache' }
   full_sweep: [scripts/gates.sh, scripts/gate-diff.sh, .github/workflows/]
   no_test:
+    # A measuring tool run by hand before and after a refactor; no gate calls it.
+    - scripts/code_metrics.py
     # Its tests live in the local workflow (.ai/), which is not versioned.
     - scripts/heavy_watch.py
     - scripts/stage-bundle-bins.sh

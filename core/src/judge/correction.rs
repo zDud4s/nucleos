@@ -143,7 +143,7 @@ pub async fn refusal_before_the_transaction(
     // owner may have moved it to observe or off meanwhile. Anything but enforce corrects nothing
     // and writes no owner line, as the observe path does (spec D11).
     if !matches!(
-        crate::autopilot::autopilot_judge_resolve_mode(pool, project_id).await,
+        crate::governance::autopilot::autopilot_judge_resolve_mode(pool, project_id).await,
         Ok(JudgeMode::Enforce)
     ) {
         return Some(Refusal::Silent);
@@ -151,13 +151,13 @@ pub async fn refusal_before_the_transaction(
     // 5: Active NOW. The E4 may fire hours after the launch, and launching work on a project the
     // owner took out of Active would be less cautious than today.
     if !matches!(
-        crate::autopilot::project_mode(pool, project_id).await,
-        Ok(crate::autopilot::Mode::Active)
+        crate::governance::autopilot::project_mode(pool, project_id).await,
+        Ok(crate::governance::autopilot::Mode::Active)
     ) {
         return Some(Refusal::Owner("the project is not in Active".to_owned()));
     }
     // 5: the scheduler's own door, budget then quota. A correction is a launch.
-    if let crate::budget::BudgetDecision::Pause { reason, .. } =
+    if let crate::governance::budget::BudgetDecision::Pause { reason, .. } =
         crate::quota::permits_new_run(state, chrono::Utc::now()).await
     {
         return Some(Refusal::Owner(format!(
@@ -165,13 +165,13 @@ pub async fn refusal_before_the_transaction(
         )));
     }
     // 6 (B1): both switches, and an unreadable one counts as engaged, as the scheduler reads them.
-    if crate::autopilot::kill_switch_engaged(pool)
+    if crate::governance::autopilot::kill_switch_engaged(pool)
         .await
         .unwrap_or(true)
     {
         return Some(Refusal::Owner("the kill switch is engaged".to_owned()));
     }
-    if crate::autopilot::scoped_kill_engaged(pool, "project", project_id)
+    if crate::governance::autopilot::scoped_kill_engaged(pool, "project", project_id)
         .await
         .unwrap_or(true)
     {
@@ -249,7 +249,7 @@ pub async fn after_gate_failed(state: AppState, run_id: i64, exit_code: i32) {
     // The resolver's setting NOW, not the launch snapshot (S7): the snapshot exists so a run's
     // rules do not change halfway through; here the run is over, and a correction is a new launch
     // that may come hours later. An unreadable setting is `off`.
-    let now = crate::autopilot::autopilot_judge_resolve_mode(pool, &project_id)
+    let now = crate::governance::autopilot::autopilot_judge_resolve_mode(pool, &project_id)
         .await
         .unwrap_or(JudgeMode::Off);
     if now == JudgeMode::Off {
@@ -341,7 +341,7 @@ pub async fn after_gate_failed(state: AppState, run_id: i64, exit_code: i32) {
         }
     }
     // 4. The transaction, whose first write is the correction row.
-    match crate::runs::resume_for_correction(&state, run_id, exit_code).await {
+    match crate::execution::runs::resume_for_correction(&state, run_id, exit_code).await {
         Ok(correction) => {
             let phrase = resolve::phrase(Outcome::Correction, row.p);
             let mut settled = row.settled(Outcome::Correction, true);

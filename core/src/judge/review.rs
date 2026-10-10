@@ -75,7 +75,7 @@ pub async fn set_verdict(
     id: i64,
     verdict: &str,
 ) -> sqlx::Result<bool> {
-    if !crate::shadow::VALID_VERDICTS.contains(&verdict) {
+    if !crate::governance::shadow::VALID_VERDICTS.contains(&verdict) {
         return Ok(false);
     }
     let result = sqlx::query(
@@ -178,7 +178,7 @@ pub async fn readiness_on(
         reviewed,
         agree,
         // The shadow bar's own arithmetic and constants (`READINESS_MIN_*`), reused as D11 says.
-        ready: crate::shadow::class_ready(reviewed, agree),
+        ready: crate::governance::shadow::class_ready(reviewed, agree),
         by_class,
     })
 }

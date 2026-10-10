@@ -981,7 +981,7 @@ pub async fn ask(
             base_url,
             model,
         } => {
-            crate::runner::ollama_chat(
+            crate::execution::runner::ollama_chat(
                 client,
                 base_url,
                 model,
@@ -992,7 +992,7 @@ pub async fn ask(
                 // function's doc for what the other arm does instead, and for the three runs that
                 // measured the difference rather than assuming it away.
                 serde_json::json!({
-                    "num_ctx": crate::triage::LOCAL_NUM_CTX,
+                    "num_ctx": crate::governance::triage::LOCAL_NUM_CTX,
                     "temperature": 0
                 }),
                 Some(anchor_format()),
@@ -2789,9 +2789,9 @@ mod tests {
     }
 
     /// A runner with one canned answer, `map_intent`'s own fixture spelled the same way.
-    fn fake_answering(stdout: &str) -> crate::runner::FakeCommandRunner {
-        crate::runner::FakeCommandRunner {
-            canned: std::sync::Mutex::new(Some(crate::runner::RunOutcome {
+    fn fake_answering(stdout: &str) -> crate::execution::runner::FakeCommandRunner {
+        crate::execution::runner::FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(crate::execution::runner::RunOutcome {
                 exit_code: 0,
                 stdout: stdout.to_owned(),
                 stderr: String::new(),
@@ -2817,7 +2817,7 @@ mod tests {
         // abstention, because a report saying *the model looked at 40 files and declined* about 40
         // files nobody ever read is the false confidence with better pixels.
         let file = asked("core/src/gate.rs", "// the gate, and §7 governs it.\n");
-        let failing = crate::runner::FakeCommandRunner {
+        let failing = crate::execution::runner::FakeCommandRunner {
             fail_times: std::sync::Mutex::new(1),
             ..Default::default()
         };
@@ -2859,7 +2859,7 @@ mod tests {
         );
         assert_eq!(
             *runner.last_tool_policy.lock().unwrap(),
-            Some(crate::runner::ToolPolicy::None)
+            Some(crate::execution::runner::ToolPolicy::None)
         );
     }
 
@@ -3145,7 +3145,7 @@ mod tests {
         let files = ["core/src/asked.rs".to_owned()];
         let specs = catalogue(&root);
         // `fail_times` is a countdown, and one call is all this sweep makes.
-        let runner = crate::runner::FakeCommandRunner {
+        let runner = crate::execution::runner::FakeCommandRunner {
             fail_times: std::sync::Mutex::new(1),
             ..Default::default()
         };
@@ -3205,7 +3205,10 @@ mod tests {
     /// [`the_ground_truth_names_only_pairs_this_project_can_be_asked_about`] is that check, made
     /// executable, for free, before any money is spent.
     const GROUND_TRUTH: &[(&str, &str)] = &[
-        ("core/src/email.rs", "2026-07-28-email-pillar-design"),
+        (
+            "core/src/integrations/email.rs",
+            "2026-07-28-email-pillar-design",
+        ),
         ("core/src/browser.rs", "2026-08-15-pilar-de-browser-design"),
         (
             "core/src/browser_policy.rs",
@@ -3215,12 +3218,24 @@ mod tests {
             "core/src/browser/wheel.rs",
             "2026-08-15-pilar-de-browser-design",
         ),
-        ("core/src/web.rs", "2026-08-01-pilar-de-web-design"),
+        (
+            "core/src/integrations/web.rs",
+            "2026-08-01-pilar-de-web-design",
+        ),
         ("core/src/web_client.rs", "2026-08-01-pilar-de-web-design"),
-        ("core/src/vcs.rs", "2026-08-02-fila-vcs-design"),
-        ("core/src/git_exec.rs", "2026-08-02-fila-vcs-design"),
-        ("core/src/github.rs", "2026-08-19-modulo-de-github-design"),
-        ("core/src/job.rs", "2026-07-29-autopilot-job-graph-design"),
+        ("core/src/execution/vcs.rs", "2026-08-02-fila-vcs-design"),
+        (
+            "core/src/execution/git_exec.rs",
+            "2026-08-02-fila-vcs-design",
+        ),
+        (
+            "core/src/integrations/github.rs",
+            "2026-08-19-modulo-de-github-design",
+        ),
+        (
+            "core/src/execution/job.rs",
+            "2026-07-29-autopilot-job-graph-design",
+        ),
         (
             "core/src/map/intent.rs",
             "2026-08-24-mapa-do-projeto-design",
@@ -3308,7 +3323,7 @@ mod tests {
         // `.ai/` is gitignored by the owner's standing decision, so a git worktree and a fresh
         // clone both start with an empty `.ai/specs/` -- and then every pair below fails on a slug
         // the checkout cannot possibly hold. The first one reported wins, so the suite says "the
-        // ground truth scores core/src/email.rs against 2026-07-28-email-pillar-design, which this
+        // ground truth scores core/src/integrations/email.rs against 2026-07-28-email-pillar-design, which this
         // project does not have", which reads as a regression in a table nobody touched. It stopped
         // a `gates.sh all` in a worktree on 2026-08-31 and cost a bisection of 3,229 tests to
         // recognise. This repository keeps worktrees for autonomous jobs, so it will happen again.
@@ -3386,8 +3401,8 @@ mod tests {
     ///
     /// One runner per lane rather than one shared: the struct is three strings, and a lane whose
     /// future owns everything it borrows is a lane that can be spawned.
-    fn brain() -> crate::runner::ClaudeCliRunner {
-        crate::runner::ClaudeCliRunner {
+    fn brain() -> crate::execution::runner::ClaudeCliRunner {
+        crate::execution::runner::ClaudeCliRunner {
             model: std::env::var("NUCLEOS_ANCHOR_MODEL").unwrap_or_else(|_| "sonnet".to_owned()),
             plan_model: None,
             review_model: None,

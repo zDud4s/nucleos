@@ -8,8 +8,8 @@
 //! Observe-only and pure: no disk, no database, no process. It decides nothing — the caller
 //! records what it finds.
 
-use crate::classifier::{program_name, shell_words};
 use crate::command_reader::{self, Shell};
+use crate::governance::classifier::{program_name, shell_words};
 use crate::tests_map::{self, TestsMap};
 
 /// How many layers of wrapping are peeled before the line is given up on. A real line is one or

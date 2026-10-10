@@ -459,7 +459,7 @@ fn triage_format() -> serde_json::Value {
 /// that word carries — the machine and the bill — at once. The type is `map_intent`'s own rather
 /// than a second copy of it, because a second enum is a second place to add a brain, and the reason
 /// it has two arms is behavioural and holds here unchanged: `OllamaRunner` wears the
-/// [`crate::runner::CommandRunner`] trait while imposing the mail-triage `{id, class, summary}`
+/// [`crate::execution::runner::CommandRunner`] trait while imposing the mail-triage `{id, class, summary}`
 /// grammar on every prompt it is handed, so a judgement sent through it comes back as a triage
 /// array and parses to nothing.
 ///
@@ -483,13 +483,13 @@ pub async fn ask(
             base_url,
             model,
         } => {
-            crate::runner::ollama_chat(
+            crate::execution::runner::ollama_chat(
                 client,
                 base_url,
                 model,
                 &prompt,
                 serde_json::json!({
-                    "num_ctx": crate::triage::LOCAL_NUM_CTX,
+                    "num_ctx": crate::governance::triage::LOCAL_NUM_CTX,
                     // Zero, because the question has one right answer about one decision and a
                     // sampled one would make a re-run disagree with itself over evidence that had
                     // not moved — and `inputs_digest` is built on the premise that unchanged inputs

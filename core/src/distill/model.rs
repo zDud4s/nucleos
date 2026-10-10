@@ -2,9 +2,9 @@
 
 use crate::assistants::Refusal;
 use crate::chats::Brain;
-use crate::local_agent::LocalAssistant;
+use crate::execution::runner::{CommandRunner, RunOutcome, RunRequest};
 use crate::map::intent::Extractor;
-use crate::runner::{CommandRunner, RunOutcome, RunRequest};
+use crate::models::local_agent::LocalAssistant;
 use crate::state::AppState;
 use axum::Json;
 use axum::extract::State;
@@ -172,7 +172,7 @@ impl Route {
             Route::Cli => Extractor::Cli(runner),
             Route::Loopback { model } => Extractor::Loopback {
                 client: http,
-                base_url: crate::runner::OLLAMA_BASE_URL,
+                base_url: crate::execution::runner::OLLAMA_BASE_URL,
                 model: model.as_str(),
             },
             Route::Hosted(hosted) => Extractor::Cli(hosted),
@@ -241,9 +241,9 @@ mod tests {
     use super::*;
     use crate::assistants::Refusal;
     use crate::chats::Brain;
-    use crate::local_agent::{LocalAssistant, LocalChat, ToolAnswer, ToolBox};
+    use crate::execution::runner::{CommandRunner, RunOutcome, RunRequest};
     use crate::map::intent::Extractor;
-    use crate::runner::{CommandRunner, RunOutcome, RunRequest};
+    use crate::models::local_agent::{LocalAssistant, LocalChat, ToolAnswer, ToolBox};
     use serde_json::{Value, json};
     use sqlx::SqlitePool;
 
@@ -432,7 +432,7 @@ mod tests {
             Extractor::Loopback {
                 base_url, model, ..
             } => {
-                assert_eq!(base_url, crate::runner::OLLAMA_BASE_URL);
+                assert_eq!(base_url, crate::execution::runner::OLLAMA_BASE_URL);
                 assert_eq!(model, "qwen3");
             }
             _ => panic!("the local route asks the model on this machine"),

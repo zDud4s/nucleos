@@ -47,7 +47,7 @@ export interface ToolCall {
    *
    * Absent means three different things and the page can act on none of them apart: nothing came
    * back, the turn predates the column, or — the ordinary case — this call arrived on the
-   * TRANSCRIPT, which deliberately strips them. See `ToolCall::result` in `core/src/runner.rs`:
+   * TRANSCRIPT, which deliberately strips them. See `ToolCall::result` in `core/src/execution/runner.rs`:
    * the transcript is polled once a second while a turn is live, and a hundred turns of tool
    * output on that poll is a cost paid forever for something almost nobody has open. They are
    * fetched per turn, by `useTurnTools`, when somebody opens one.

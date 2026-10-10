@@ -145,7 +145,7 @@ export function tokenCount(count: number | null): string {
 
 /**
  * The window a handoff is measured against — `HANDOFF_CONTEXT_LIMIT_FLOOR` in
- * `core/src/runs.rs`. Duplicated rather than asked for, because the daemon
+ * `core/src/execution/runs.rs`. Duplicated rather than asked for, because the daemon
  * exposes no route that reports it; a drift here only mis-scales a bar.
  */
 export const CONTEXT_WINDOW_TOKENS = 200_000;

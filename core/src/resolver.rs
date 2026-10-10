@@ -11,8 +11,8 @@
 //! It landed first, deliberately: building the launcher before the check would have meant a window
 //! in which an agent can publish a resolution nothing verified.
 
+use crate::execution::vcs;
 use crate::state::AppState;
-use crate::vcs;
 
 /// How often the daemon looks for a conflict nobody has attempted.
 ///
@@ -252,7 +252,7 @@ async fn cancel_settled(state: &AppState) {
     };
 
     for row in settled {
-        if !crate::runs::finalize_termination(state, row.run_id, "cancelled").await {
+        if !crate::execution::runs::finalize_termination(state, row.run_id, "cancelled").await {
             continue;
         }
         tracing::info!(
@@ -290,7 +290,7 @@ async fn cancel_settled(state: &AppState) {
 async fn launch_once(state: &AppState) -> Option<i64> {
     // The emergency stop, and it has no exemptions — `runs::create_run` makes the same argument at
     // its own door. Fails closed: a switch that cannot be read stops runs rather than starting them.
-    if crate::autopilot::kill_switch_engaged(&state.pool)
+    if crate::governance::autopilot::kill_switch_engaged(&state.pool)
         .await
         .unwrap_or(true)
     {
@@ -305,7 +305,7 @@ async fn launch_once(state: &AppState) -> Option<i64> {
     // whose merge was asked for, and which is stuck until somebody clears the conflict. Deferring it
     // for a busy project would leave that work stranded precisely when the project is busy enough
     // for the conflict to matter.
-    if let crate::budget::BudgetDecision::Pause { reason, .. } =
+    if let crate::governance::budget::BudgetDecision::Pause { reason, .. } =
         crate::quota::permits_new_run(state, chrono::Utc::now()).await
     {
         tracing::info!(%reason, "budget exhausted; no conflict resolution started this tick");
@@ -325,37 +325,38 @@ async fn launch_once(state: &AppState) -> Option<i64> {
     // the ones it refuses are already resolutions. Those are excluded by `from_resolution = 0`
     // above; what is left here is a row whose operation will not parse, which the queue itself
     // treats as terminal and unexecutable rather than as work.
-    let (source, target) = match crate::vcs::Op::from_stored(&candidate.op, &candidate.args) {
-        Ok(crate::vcs::Op::Merge { source, target }) => (source, target),
-        Ok(other) => {
-            tracing::warn!(
-                vcs_request_id = candidate.id,
-                op = other.kind(),
-                "resolver: a row selected as a merge parsed as something else"
-            );
-            return None;
-        }
-        Err(error) => {
-            tracing::warn!(
-                vcs_request_id = candidate.id,
-                %error,
-                "resolver: an escalated merge's stored operation could not be parsed"
-            );
-            return None;
-        }
-    };
+    let (source, target) =
+        match crate::execution::vcs::Op::from_stored(&candidate.op, &candidate.args) {
+            Ok(crate::execution::vcs::Op::Merge { source, target }) => (source, target),
+            Ok(other) => {
+                tracing::warn!(
+                    vcs_request_id = candidate.id,
+                    op = other.kind(),
+                    "resolver: a row selected as a merge parsed as something else"
+                );
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    vcs_request_id = candidate.id,
+                    %error,
+                    "resolver: an escalated merge's stored operation could not be parsed"
+                );
+                return None;
+            }
+        };
 
     let prompt = resolution_prompt(
         source.as_str(),
         target.as_str(),
         candidate.output_tail.as_deref(),
     );
-    let started = crate::runs::create_resolution_run(
+    let started = crate::execution::runs::create_resolution_run(
         state,
         prompt,
         candidate.project_id.clone(),
         candidate.project_root.clone(),
-        crate::runs::Resolution {
+        crate::execution::runs::Resolution {
             request_id: candidate.id,
             source: source.as_str().to_owned(),
             target: target.as_str().to_owned(),
@@ -393,7 +394,7 @@ async fn launch_once(state: &AppState) -> Option<i64> {
         // Nothing was claimed: `Busy` is refused before the run row exists, so the conflict keeps its
         // attempt and the next tick asks again. Not a warning — a busy project deferring its own
         // resolution is the documented consequence of charging a resolution a slot.
-        Err(crate::runs::CreateRunError::Busy) => {
+        Err(crate::execution::runs::CreateRunError::Busy) => {
             tracing::info!(
                 vcs_request_id = candidate.id,
                 project_id = %candidate.project_id,
@@ -405,7 +406,7 @@ async fn launch_once(state: &AppState) -> Option<i64> {
         // as the disk rather than as a full project, because the two are cleared by different hands.
         // Only items are asked about the disk today; this is here so the day a resolution is, the
         // log does not send somebody looking for a slot.
-        Err(crate::runs::CreateRunError::NoRoomOnDisk(refusal)) => {
+        Err(crate::execution::runs::CreateRunError::NoRoomOnDisk(refusal)) => {
             tracing::info!(
                 vcs_request_id = candidate.id,
                 project_id = %candidate.project_id,
@@ -496,14 +497,16 @@ async fn settle_moot(pool: &sqlx::SqlitePool) {
             continue;
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let reason = match crate::git_exec::branch_exists(root, source, deadline).await {
+        let reason = match crate::execution::git_exec::branch_exists(root, source, deadline).await {
             Ok(false) => "source-gone",
             Ok(true) => {
-                match crate::git_exec::branch_exists(root, target, deadline).await {
+                match crate::execution::git_exec::branch_exists(root, target, deadline).await {
                     Ok(true) => {}
                     _ => continue,
                 }
-                match crate::git_exec::is_ancestor(root, ancestor, descendant, deadline).await {
+                match crate::execution::git_exec::is_ancestor(root, ancestor, descendant, deadline)
+                    .await
+                {
                     Ok(true) => "merged",
                     _ => continue,
                 }
@@ -560,8 +563,8 @@ async fn record_discards(pool: &sqlx::SqlitePool) {
         return;
     };
 
-    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
-    let record = match crate::git_exec::discarded_by_resolution(
+    let deadline = std::time::Instant::now() + crate::execution::git_exec::OPERATION_TIMEOUT;
+    let record = match crate::execution::git_exec::discarded_by_resolution(
         std::path::Path::new(&published.project_root),
         &published.result_sha,
         deadline,
@@ -700,7 +703,7 @@ pub async fn landing_is_a_resolution(
 ) -> bool {
     // A branch this daemon did not open cannot be a resolution's output, and every resolution's is
     // one it opened.
-    let Some(run) = crate::worktree::run_behind_branch(branch) else {
+    let Some(run) = crate::execution::worktree::run_behind_branch(branch) else {
         return false;
     };
     let found: sqlx::Result<bool> = sqlx::query_scalar(
@@ -750,7 +753,7 @@ pub async fn escalated_request_id(
     project_id: &str,
     branch: &str,
 ) -> Option<i64> {
-    let run = crate::worktree::run_behind_branch(branch)?;
+    let run = crate::execution::worktree::run_behind_branch(branch)?;
     let found: sqlx::Result<Option<i64>> = sqlx::query_scalar(
         "SELECT id FROM vcs_requests
           WHERE project_id = ? AND (resolution_run_id = ? OR resolution_run_id IN (
@@ -809,8 +812,8 @@ pub async fn escalated_target(
             return None;
         }
     };
-    match crate::vcs::Op::from_stored(&op, &args) {
-        Ok(crate::vcs::Op::Merge { target, .. }) => Some(target.as_str().to_owned()),
+    match crate::execution::vcs::Op::from_stored(&op, &args) {
+        Ok(crate::execution::vcs::Op::Merge { target, .. }) => Some(target.as_str().to_owned()),
         _ => None,
     }
 }
@@ -856,7 +859,7 @@ async fn land_finished(
     pool: &sqlx::SqlitePool,
     refused: &mut std::collections::HashSet<(i64, String)>,
 ) {
-    if crate::autopilot::kill_switch_engaged(pool)
+    if crate::governance::autopilot::kill_switch_engaged(pool)
         .await
         .unwrap_or(true)
     {
@@ -922,9 +925,9 @@ async fn land_finished(
                     "{}'s conflict resolution on {} was not handed to the queue: {why};                      it needs a person",
                     row.project_id, row.branch
                 );
-                if let Err(error) = crate::notify::deliver_or_defer(
+                if let Err(error) = crate::integrations::notify::deliver_or_defer(
                     pool,
-                    crate::land::RESOLUTION_FAILED_KIND,
+                    crate::execution::land::RESOLUTION_FAILED_KIND,
                     &summary,
                 )
                 .await
@@ -940,8 +943,8 @@ async fn land_finished(
         if refused.contains(&(row.id, head.clone())) {
             continue;
         }
-        let target = match crate::vcs::Op::from_stored(&row.op, &row.args) {
-            Ok(crate::vcs::Op::Merge { target, .. }) => target,
+        let target = match crate::execution::vcs::Op::from_stored(&row.op, &row.args) {
+            Ok(crate::execution::vcs::Op::Merge { target, .. }) => target,
             _ => continue,
         };
         // The `resolved_by` link is written best-effort by `land::submit`; if it was lost, the
@@ -969,9 +972,9 @@ async fn land_finished(
                      it was not handed to the queue and needs a person",
                     row.project_id, row.branch
                 );
-                if let Err(error) = crate::notify::deliver_or_defer(
+                if let Err(error) = crate::integrations::notify::deliver_or_defer(
                     pool,
-                    crate::land::RESOLUTION_FAILED_KIND,
+                    crate::execution::land::RESOLUTION_FAILED_KIND,
                     &summary,
                 )
                 .await
@@ -984,7 +987,7 @@ async fn land_finished(
                 continue;
             }
         }
-        let repo = match crate::vcs::resolve_repo(pool, &row.project_id).await {
+        let repo = match crate::execution::vcs::resolve_repo(pool, &row.project_id).await {
             Ok(repo) => repo,
             Err(error) => {
                 tracing::warn!(
@@ -995,9 +998,9 @@ async fn land_finished(
                 continue;
             }
         };
-        let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+        let deadline = std::time::Instant::now() + crate::execution::git_exec::OPERATION_TIMEOUT;
         let project_root = std::path::PathBuf::from(repo.root());
-        let outcome = crate::land::submit(
+        let outcome = crate::execution::land::submit(
             pool,
             &repo,
             &project_root,
@@ -1015,16 +1018,16 @@ async fn land_finished(
             Err(refusal) => {
                 refused.insert((row.id, head));
                 // `NotAdmitted` was already announced by `land::submit` itself.
-                if !matches!(refusal, crate::land::LandRefusal::NotAdmitted(_)) {
+                if !matches!(refusal, crate::execution::land::LandRefusal::NotAdmitted(_)) {
                     let summary = format!(
                         "{}'s conflict resolution on {} was not handed to the queue: {}",
                         row.project_id,
                         row.branch,
                         refusal.message()
                     );
-                    if let Err(error) = crate::notify::deliver_or_defer(
+                    if let Err(error) = crate::integrations::notify::deliver_or_defer(
                         pool,
-                        crate::land::RESOLUTION_FAILED_KIND,
+                        crate::execution::land::RESOLUTION_FAILED_KIND,
                         &summary,
                     )
                     .await
@@ -1055,8 +1058,8 @@ async fn branch_already_queued(
     .await?;
     Ok(stored.iter().any(|args| {
         matches!(
-            crate::vcs::Op::from_stored("merge", args),
-            Ok(crate::vcs::Op::Merge { source, .. }) if source.as_str() == branch
+            crate::execution::vcs::Op::from_stored("merge", args),
+            Ok(crate::execution::vcs::Op::Merge { source, .. }) if source.as_str() == branch
         )
     }))
 }
@@ -1065,7 +1068,7 @@ async fn branch_already_queued(
 /// the base the tree was opened on. `None` for anything else, including a git that would not run.
 async fn finished_merge_head(path: &std::path::Path, base_sha: Option<&str>) -> Option<String> {
     async fn rev_parse(path: &std::path::Path, revision: &str) -> Option<String> {
-        let output = crate::worktree::git()
+        let output = crate::execution::worktree::git()
             .arg("-C")
             .arg(path)
             .args(["rev-parse", "-q", "--verify", revision])
@@ -1136,15 +1139,22 @@ mod tests {
         target: &str,
         from_resolution: bool,
     ) -> i64 {
-        let repo = crate::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj");
-        let op = crate::vcs::Op::Merge {
+        let repo = crate::execution::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj");
+        let op = crate::execution::vcs::Op::Merge {
             source: source.into(),
             target: target.into(),
         };
         let id = if from_resolution {
-            crate::vcs::submit_resolution(pool, &repo, &op, crate::vcs::Origin::Shell).await
+            crate::execution::vcs::submit_resolution(
+                pool,
+                &repo,
+                &op,
+                crate::execution::vcs::Origin::Shell,
+            )
+            .await
         } else {
-            crate::vcs::submit(pool, &repo, &op, crate::vcs::Origin::Shell).await
+            crate::execution::vcs::submit(pool, &repo, &op, crate::execution::vcs::Origin::Shell)
+                .await
         }
         .expect("admit the merge");
         sqlx::query("UPDATE vcs_requests SET status = 'escalated' WHERE id = ?")
@@ -1201,14 +1211,14 @@ mod tests {
         // another landing that can conflict, one agent per turn, for ever. It goes to a person.
         let looped = escalated_merge_of(&pool, "feat/looped", true).await;
         // Escalated, but not a merge: nothing an agent in a worktree can do about a push.
-        let other = crate::vcs::submit(
+        let other = crate::execution::vcs::submit(
             &pool,
-            &crate::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj"),
-            &crate::vcs::Op::Push {
+            &crate::execution::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj"),
+            &crate::execution::vcs::Op::Push {
                 remote: "origin".into(),
                 branch: "master".into(),
             },
-            crate::vcs::Origin::Shell,
+            crate::execution::vcs::Origin::Shell,
         )
         .await
         .unwrap();
@@ -1298,14 +1308,14 @@ mod tests {
 
         // A different merge in the same project is untouched by the deduplication: it is a different
         // conflict, and nobody has looked at it.
-        let elsewhere = crate::vcs::submit(
+        let elsewhere = crate::execution::vcs::submit(
             &pool,
-            &crate::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj"),
-            &crate::vcs::Op::Merge {
+            &crate::execution::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj"),
+            &crate::execution::vcs::Op::Merge {
                 source: "feat/other".into(),
                 target: "master".into(),
             },
-            crate::vcs::Origin::Shell,
+            crate::execution::vcs::Origin::Shell,
         )
         .await
         .unwrap();
@@ -1483,9 +1493,9 @@ mod tests {
 
         // The resume: the worktree is handed to run 9, which is what a resumed approval does. The
         // branch keeps naming 7, and that is what has to carry the answer.
-        crate::worktree::record(
+        crate::execution::worktree::record(
             &pool,
-            crate::worktree::Owner::Run(9),
+            crate::execution::worktree::Owner::Run(9),
             "proj",
             "C:/repo",
             "C:/wt/run-7",
@@ -1514,10 +1524,15 @@ mod tests {
     /// this daemon opens must be one it can recognise later.
     #[test]
     fn the_branch_a_worktree_gets_names_the_run_it_was_opened_for() {
-        let branch = crate::worktree::Owner::Run(4242).branch_name();
-        assert_eq!(crate::worktree::run_behind_branch(&branch), Some(4242));
+        let branch = crate::execution::worktree::Owner::Run(4242).branch_name();
         assert_eq!(
-            crate::worktree::run_behind_branch(&crate::worktree::Owner::Job(4242).branch_name()),
+            crate::execution::worktree::run_behind_branch(&branch),
+            Some(4242)
+        );
+        assert_eq!(
+            crate::execution::worktree::run_behind_branch(
+                &crate::execution::worktree::Owner::Job(4242).branch_name()
+            ),
             None,
             "a job's tree is not a run's, and reading one as the other would attribute a resolution \
              to a run id that belongs to a different sequence"
@@ -1643,9 +1658,9 @@ mod tests {
         progress: Progress,
         target: &str,
     ) -> Scenario {
-        let container = crate::git_exec::testkit::space_free_tempdir(prefix);
+        let container = crate::execution::git_exec::testkit::space_free_tempdir(prefix);
         let repo = container.path().join("repo");
-        crate::git_exec::testkit::initialize_repo(&repo);
+        crate::execution::git_exec::testkit::initialize_repo(&repo);
         assert!(git_at(&repo, &["branch", "-M", "master"]));
         assert!(git_at(&repo, &["checkout", "-q", "-b", "feat/x"]));
         std::fs::write(repo.join("seed.txt"), "theirs\n").unwrap();
@@ -1656,9 +1671,9 @@ mod tests {
         if target != "master" {
             assert!(git_at(&repo, &["branch", target, "master"]));
         }
-        let base = crate::git_exec::tests::sha_of(&repo, target);
+        let base = crate::execution::git_exec::tests::sha_of(&repo, target);
 
-        let branch = crate::worktree::Owner::Run(7).branch_name();
+        let branch = crate::execution::worktree::Owner::Run(7).branch_name();
         let tree = container.path().join("run-7");
         assert!(git_at(
             &repo,
@@ -1706,9 +1721,9 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        crate::worktree::record(
+        crate::execution::worktree::record(
             pool,
-            crate::worktree::Owner::Run(7),
+            crate::execution::worktree::Owner::Run(7),
             "proj",
             &repo.to_string_lossy(),
             &tree.to_string_lossy(),
@@ -1926,7 +1941,7 @@ mod tests {
             assert_eq!(linked, None);
             let summaries: Vec<String> =
                 sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?")
-                    .bind(crate::land::RESOLUTION_FAILED_KIND)
+                    .bind(crate::execution::land::RESOLUTION_FAILED_KIND)
                     .fetch_all(&pool)
                     .await
                     .unwrap();
@@ -1960,7 +1975,7 @@ mod tests {
             );
             let summaries: Vec<String> =
                 sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?")
-                    .bind(crate::land::RESOLUTION_FAILED_KIND)
+                    .bind(crate::execution::land::RESOLUTION_FAILED_KIND)
                     .fetch_all(&pool)
                     .await
                     .unwrap();
@@ -2022,19 +2037,24 @@ mod tests {
         .await;
         gate(&pool, "passed").await;
 
-        let repo = crate::vcs::resolve_repo(&pool, "proj").await.unwrap();
+        let repo = crate::execution::vcs::resolve_repo(&pool, "proj")
+            .await
+            .unwrap();
         let root = std::path::PathBuf::from(repo.root());
-        let elsewhere = crate::land::submit(
+        let elsewhere = crate::execution::land::submit(
             &pool,
             &repo,
             &root,
             &scenario.branch,
             Some("feat/x"),
-            std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT,
+            std::time::Instant::now() + crate::execution::git_exec::OPERATION_TIMEOUT,
         )
         .await;
         assert!(
-            matches!(elsewhere, Err(crate::land::LandRefusal::Refused(_))),
+            matches!(
+                elsewhere,
+                Err(crate::execution::land::LandRefusal::Refused(_))
+            ),
             "a resolution may name its escalation's target and no other unlisted branch"
         );
 
@@ -2050,8 +2070,8 @@ mod tests {
             .unwrap();
         assert!(
             matches!(
-                crate::vcs::Op::from_stored("merge", &args),
-                Ok(crate::vcs::Op::Merge { target, .. }) if target.as_str() == "feat/wave"
+                crate::execution::vcs::Op::from_stored("merge", &args),
+                Ok(crate::execution::vcs::Op::Merge { target, .. }) if target.as_str() == "feat/wave"
             ),
             "it lands on the branch the escalated merge named: {args}"
         );
@@ -2073,9 +2093,9 @@ mod tests {
         let pool = test_pool().await;
         let request = escalated_merge(&pool, false).await;
         resolving(&pool, request, 9).await;
-        crate::worktree::record(
+        crate::execution::worktree::record(
             &pool,
-            crate::worktree::Owner::Run(9),
+            crate::execution::worktree::Owner::Run(9),
             "proj",
             "C:/repo",
             "C:/wt/run-7",
@@ -2172,9 +2192,9 @@ mod tests {
 
     /// A real repository on `master`, and the directory that keeps it alive.
     fn moot_repo(prefix: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let container = crate::git_exec::testkit::space_free_tempdir(prefix);
+        let container = crate::execution::git_exec::testkit::space_free_tempdir(prefix);
         let repo = container.path().join("repo");
-        crate::git_exec::testkit::initialize_repo(&repo);
+        crate::execution::git_exec::testkit::initialize_repo(&repo);
         assert!(git_at(&repo, &["branch", "-M", "master"]));
         (container, repo)
     }
@@ -2196,14 +2216,15 @@ mod tests {
 
     /// An escalated rebase, admitted through the real INSERT like `escalated_merge_of`.
     async fn escalated_rebase_of(pool: &sqlx::SqlitePool, branch: &str, onto: &str) -> i64 {
-        let repo = crate::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj");
-        let op = crate::vcs::Op::Rebase {
+        let repo = crate::execution::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj");
+        let op = crate::execution::vcs::Op::Rebase {
             branch: branch.into(),
             onto: onto.into(),
         };
-        let id = crate::vcs::submit(pool, &repo, &op, crate::vcs::Origin::Shell)
-            .await
-            .expect("admit the rebase");
+        let id =
+            crate::execution::vcs::submit(pool, &repo, &op, crate::execution::vcs::Origin::Shell)
+                .await
+                .expect("admit the rebase");
         sqlx::query("UPDATE vcs_requests SET status = 'escalated' WHERE id = ?")
             .bind(id)
             .execute(pool)
@@ -2343,7 +2364,9 @@ mod tests {
         let dismissed = escalated_merge_of(&pool, "feat/put-away", false).await;
         let open = escalated_merge_of(&pool, "feat/still-open", false).await;
 
-        crate::vcs::dismiss(&pool, dismissed).await.unwrap();
+        crate::execution::vcs::dismiss(&pool, dismissed)
+            .await
+            .unwrap();
 
         // "Nobody needs to act" is a person's answer; the loop must not act on it either. The row
         // beside it, never put away, is still the one launched.
