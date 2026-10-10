@@ -2199,6 +2199,7 @@ fn spawn_run(
                 resume_session_id: resume_session_id.clone(),
                 mcp_config: job_mcp.as_ref().map(|mcp| mcp.path.clone()),
                 mcp_job: job_mcp.as_ref().map(|mcp| mcp.job_id),
+                mcp_team_run: None,
                 tool_policy,
                 progress_timeout: Some(progress_timeout),
                 // The brake that was missing. These are the runs nobody is watching, and the
@@ -16277,6 +16278,7 @@ tests:
             resume_session_id: None,
             mcp_config: None,
             mcp_job: None,
+            mcp_team_run: None,
             tool_policy: crate::runner::ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,

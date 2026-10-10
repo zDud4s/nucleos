@@ -3183,6 +3183,8 @@ async fn spawn_agent(
         resume_session_id: None,
         mcp_config,
         mcp_job: None,
+        // The node's own run id, the one `TeamNodeMcp::write` put on `--run`; priced as the Team box.
+        mcp_team_run: mcp_guard.as_ref().map(|_| run_id),
         // A member with tools is offered the Team box (`--box team --run <node>`), which serves
         // only what its loadout row lists plus the box's base. `allowed_mcp_tools` below is that
         // same set handed to the CLI as `--allowedTools`.
