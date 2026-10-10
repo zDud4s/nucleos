@@ -263,6 +263,9 @@ describe("the verdict's lines", () => {
       { kind: "top", from: "judge", to: "seat-2", title: "most voted" },
     ]);
   });
+  it("draws no judge line when every Borda score is 0", () => {
+    expect(court.topLinks([{ seat_idx: 0, score: 0, n: 2 }, { seat_idx: 1, score: 0, n: 2 }])).toEqual([]);
+  });
   it("draws one dissent line per pair of seats on different positions, titled by the topic", () => {
     const s = synthesis({ disagreements: [{ topic: "cost", positions: [{ seats: [0, 1], view: "a" }, { seats: [2], view: "b" }] }] });
     expect(court.dissentLinks(s)).toEqual([
@@ -304,7 +307,7 @@ describe("the session court", () => {
 
   it("counts the ballots of the round's critique", () => {
     expect(court.buildSessionCourt(running, "live").ballots).toMatchObject({ got: 1, total: 2 });
-    expect(court.buildSessionCourt(running, "live").ballots?.from).toHaveLength(1);
+    expect(court.buildSessionCourt(running, "live").ballots?.cast).toHaveLength(1);
     expect(court.buildSessionCourt(running, { round: 0, phase: "answer" }).ballots).toBeNull();
   });
 
@@ -336,6 +339,29 @@ describe("the session court", () => {
     expect(c.judge.state).toBe("failed");
   });
 
+  it("carries who cast each ballot, so a ballot keeps its own chair as its origin", () => {
+    // Seat 1 finished its critique BEFORE seat 0: the tray holds one ballot, and it is seat 1's.
+    const crit = (status: string) => step({ round: 1, phase: "critique", status, critique: status === "ok" ? ({ reviews: [], ranking: ["A"] } as never) : null });
+    const late = view({ ...running, seats: [
+      seat({ seat_idx: 0, ref: "gpt-5", steps: [step(), crit("pending")] }),
+      seat({ seat_idx: 1, ref: "opus", steps: [step(), crit("ok")] }),
+    ] });
+    const b = court.buildSessionCourt(late, "live").ballots!;
+    expect(b.cast.map((c) => c.seat)).toEqual([1]);
+    const chair1 = court.buildSessionCourt(late, "live").seats[1];
+    expect(b.cast[0].from).toEqual({ x: chair1.x, y: chair1.y });
+    const both = view({ ...late, seats: [
+      seat({ seat_idx: 0, ref: "gpt-5", steps: [step(), crit("ok")] }),
+      seat({ seat_idx: 1, ref: "opus", steps: [step(), crit("ok")] }),
+    ] });
+    expect(court.buildSessionCourt(both, "live").ballots!.cast.map((c) => c.seat)).toEqual([0, 1]);
+  });
+
+  it("says COUNCIL FAILED on the right wing of an error council, even at the synthesis", () => {
+    const failed = view({ ...running, status: "error", error: "boom", current_phase: "synthesis" });
+    expect(court.buildSessionCourt(failed, "live").wing).toEqual({ title: "COUNCIL FAILED", sub: null });
+  });
+
   it("dims a cancelled council", () => {
     expect(court.buildSessionCourt(view({ status: "cancelled" }), "live").dimmed).toBe(true);
   });
@@ -365,7 +391,7 @@ describe("the setup court", () => {
   });
   it("says on the left wing that fewer than three seats cannot measure agreement", () => {
     const two = release(draftFromConfig(cfg), 2);
-    expect(court.buildSetupCourt(cfg, two, "", 2).balance).toMatchObject({ tone: "insufficient", label: "fewer than 3 seats: no agreement measure" });
+    expect(court.buildSetupCourt(cfg, two, "", 2).balance).toMatchObject({ tone: "insufficient", label: "no agreement measure", sub: "fewer than 3 seats" });
     expect(court.buildSetupCourt(cfg, draftFromConfig(cfg), "", 2).balance.tone).toBe("empty");
   });
   it("shows rounds and the call ceiling on the right wing", () => {

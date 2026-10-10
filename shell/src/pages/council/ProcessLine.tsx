@@ -19,6 +19,11 @@ export type ProcessLineProps =
   | {
       mode: "session";
       phases: ProcessPhase[];
+      /**
+       * The key of the live moment (`momentKey(liveMoment(view))`). An ended council has no `current`
+       * phase, yet it still stopped somewhere: that phase is the way back to live.
+       */
+      liveKey: string;
       /** A `momentKey`, or `"live"`. */
       viewing: string;
       onView: (key: string | "live") => void;
@@ -85,10 +90,8 @@ function SetupLine({
   );
 }
 
-function SessionLine({ phases, viewing, onView }: Extract<ProcessLineProps, { mode: "session" }>) {
-  // The live moment: the running phase, or — once the council has ended — its verdict.
-  const live = phases.find((p) => p.current) ?? phases[phases.length - 1];
-  const viewed = viewing === "live" ? live?.key : viewing;
+function SessionLine({ phases, liveKey, viewing, onView }: Extract<ProcessLineProps, { mode: "session" }>) {
+  const viewed = viewing === "live" ? liveKey : viewing;
   return (
     <div className="council-process">
       <ol className="council-process-phases" aria-label="Process">
@@ -101,7 +104,7 @@ function SessionLine({ phases, viewing, onView }: Extract<ProcessLineProps, { mo
                   type="button"
                   className="council-process-step"
                   aria-current={p.key === viewed ? "step" : undefined}
-                  onClick={() => onView(p.key === live?.key ? "live" : p.key)}
+                  onClick={() => onView(p.key === liveKey ? "live" : p.key)}
                 >
                   {label}
                 </button>

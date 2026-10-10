@@ -257,6 +257,8 @@ export const seatKey = (seatIdx: number) => `seat-${seatIdx}`;
 export function topLinks(board: BordaRow[] | null): CourtLink[] {
   if (board === null || board.length === 0) return [];
   const best = Math.max(...board.map((row) => row.score));
+  // Everyone at 0 is nobody ahead: a line to every seat would name a winner that is not there.
+  if (best <= 1e-9) return [];
   return board
     .filter((row) => row.score >= best - 1e-9)
     .map((row) => row.seat_idx)
@@ -333,8 +335,12 @@ export interface Court {
   balance: Balance;
   wing: { title: string; sub: string | null };
   lectern: { text: string; full: string };
-  /** `from`: one voter-chair position per ballot, in `seat_idx` order, for the fly-in animation. */
-  ballots: { got: number; total: number; from: { x: number; y: number }[] } | null;
+  /**
+   * `cast`: one entry per ballot in `seat_idx` order, carrying WHO cast it (`seat`) and that
+   * voter's chair position (`from`) for the fly-in. The identity is the React key, so a ballot
+   * already in the tray keeps its origin when an earlier seat's ballot lands after it.
+   */
+  ballots: { got: number; total: number; cast: { seat: number; from: { x: number; y: number } }[] } | null;
   links: CourtLink[];
   dimmed: boolean;
 }
@@ -397,7 +403,7 @@ export function buildSessionCourt(view: CouncilView, at: Moment | "live"): Court
   const ballots = m.phase === "answer" ? null : {
     got: voters.length,
     total: n,
-    from: voters.map((v) => ({ x: v.x, y: v.y })),
+    cast: voters.map((v) => ({ seat: v.index, from: { x: v.x, y: v.y } })),
   };
 
   return {
@@ -428,6 +434,7 @@ function judgeOf(view: CouncilView, m: Moment): CourtJudge {
 
 function wingOf(view: CouncilView, m: Moment, live: boolean, seats: CourtSeat[]): Court["wing"] {
   if (view.status === "cancelled") return { title: "COUNCIL CANCELLED", sub: null };
+  if (view.status === "error") return { title: "COUNCIL FAILED", sub: null };
   if (view.status === "done" && m.phase === "synthesis") {
     const parts = [`${view.rounds_run} ${view.rounds_run === 1 ? "ROUND" : "ROUNDS"}`];
     if (view.agreement !== null) parts.push(AGREEMENT_WORDS[view.agreement.level] ?? view.agreement.level);
@@ -467,7 +474,7 @@ export function buildSetupCourt(
     };
   });
   const balance: Balance = occupiedCount(d) < MIN_BALLOTS
-    ? { angle: 0, tone: "insufficient", label: "fewer than 3 seats: no agreement measure", sub: null }
+    ? { angle: 0, tone: "insufficient", label: "no agreement measure", sub: `fewer than ${MIN_BALLOTS} seats` }
     : balanceOf(null);
   const wing = rounds === undefined
     ? { title: "ROUNDS", sub: null }

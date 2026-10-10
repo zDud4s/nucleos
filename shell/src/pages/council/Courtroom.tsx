@@ -370,7 +370,7 @@ function Lectern({
           {Array.from({ length: ballots.total }, (_, i) =>
             i < ballots.got ? (
               <rect
-                key={i}
+                key={`cast-${ballots.cast[i]?.seat ?? i}`}
                 className="council-court-ballot"
                 x={slot(i)}
                 y={TRAY.y + 2}
@@ -379,14 +379,14 @@ function Lectern({
                 rx={1}
                 style={
                   {
-                    "--from-x": `${(ballots.from[i]?.x ?? slot(i)) - slot(i)}px`,
-                    "--from-y": `${(ballots.from[i]?.y ?? TRAY.y) - (TRAY.y + 2)}px`,
+                    "--from-x": `${(ballots.cast[i]?.from.x ?? slot(i)) - slot(i)}px`,
+                    "--from-y": `${(ballots.cast[i]?.from.y ?? TRAY.y) - (TRAY.y + 2)}px`,
                   } as CSSProperties
                 }
               />
             ) : (
               <rect
-                key={i}
+                key={`slot-${i}`}
                 className="council-court-ballot-slot"
                 x={slot(i)}
                 y={TRAY.y + 2}

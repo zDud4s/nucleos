@@ -30,7 +30,7 @@ import {
   roundsOf,
   type CourtDraft,
 } from "./council/court-draft";
-import { buildSessionCourt, buildSetupCourt, liveMoment, processLine } from "./council/court-model";
+import { buildSessionCourt, buildSetupCourt, liveMoment, momentKey, processLine } from "./council/court-model";
 import {
   Button,
   ConfirmButton,
@@ -447,7 +447,7 @@ function CouncilSession({ id, detail }: { id: string; detail: CouncilView }) {
             setViewing("live");
           }}
         />
-        <ProcessLine mode="session" phases={phases} viewing={viewing} onView={setViewing} />
+        <ProcessLine mode="session" phases={phases} liveKey={momentKey(liveMoment(detail))} viewing={viewing} onView={setViewing} />
       </section>
 
       {cancel.isError && <CancelRefusal error={cancel.error} />}

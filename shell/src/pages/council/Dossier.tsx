@@ -6,7 +6,6 @@ import {
   seatName,
   type CouncilConfig,
   type CouncilView,
-  type SeatView,
   type StepView,
 } from "../../data/council";
 import { Button, ErrorNote } from "../../ui";
@@ -259,11 +258,14 @@ function ConveneChips({ onPick }: { onPick: (who: Occupant) => void }) {
   // is a refusal waiting to happen. Offering it would be offering a 400.
   const seatable = (agents.data ?? []).filter(canTakeASeat);
   const choices = models.data?.choices ?? [];
-  const waiting = agents.data === undefined && models.data === undefined;
+  const waiting = agents.data === undefined && models.data === undefined && !agents.isError && !models.isError;
+  // One catalogue down still leaves the other's chips; both down would leave an empty panel that reads as "nobody".
+  const unreadable = agents.isError && models.isError;
 
   return (
     <>
       {waiting && <p className="council-dossier-hint">Reading who can sit…</p>}
+      {unreadable && <p className="council-dossier-hint">Couldn't load who can sit.</p>}
       {seatable.length > 0 && (
         <div className="council-dossier-chips" role="group" aria-label="Agents">
           {seatable.map((agent) => (
@@ -308,6 +310,8 @@ function SessionDossier({
 }: Extract<DossierProps, { mode: "session" }>) {
   const chosen = selection?.kind === "seat" ? court.seats.find((s) => s.index === selection.index) : undefined;
   let body: ReactNode;
+  // The Verdict section renders the error itself; anywhere else an `error` council still owes it.
+  let verdictShown = false;
   if (chosen !== undefined) {
     body = <SeatNotes view={view} seat={chosen} />;
   } else if (selection?.kind === "lectern") {
@@ -318,6 +322,7 @@ function SessionDossier({
       </section>
     );
   } else if (selection?.kind === "judge" || moment.phase === "synthesis") {
+    verdictShown = true;
     body = <Verdict view={view} />;
   } else {
     body = (
@@ -337,6 +342,7 @@ function SessionDossier({
           </Button>
         </div>
       )}
+      {view.status === "error" && !verdictShown && <ErrorNote>{view.error ?? "the council failed"}</ErrorNote>}
       {body}
       <Summary court={court} />
     </aside>
@@ -390,6 +396,8 @@ function SeatNotes({ view, seat }: { view: CouncilView; seat: CourtSeat }) {
   const record = view.seats.find((s) => s.seat_idx === seat.index);
   const name = record === undefined ? seat.name : seatName(record);
   const title = seat.masked ? seat.label : seat.name;
+  // A masked seat is its letter everywhere, the accessible names included.
+  const voter = seat.masked ? seat.label : name;
   const state = seat.state === "failed" ? `failed: ${seat.reason ?? "failed"}` : (STATE_LINE[seat.state] ?? seat.state);
   return (
     <section className="council-dossier-section" aria-labelledby="council-dossier-title">
@@ -398,18 +406,18 @@ function SeatNotes({ view, seat }: { view: CouncilView; seat: CourtSeat }) {
       </h2>
       <p className="council-dossier-who">{[`Seat ${seat.index + 1}`, seat.sublabel, state].filter(Boolean).join(" · ")}</p>
       {seat.state === "speaking" && seat.runId !== null ? (
-        <StepTail key={seat.runId} runId={seat.runId} name={seat.masked ? seat.label : name} />
+        <StepTail key={seat.runId} runId={seat.runId} name={voter} />
       ) : seat.state === "failed" ? (
         <ErrorNote>{seat.reason ?? "failed"}</ErrorNote>
       ) : (
-        seat.step !== undefined && <StepText view={view} step={seat.step} record={record} />
+        seat.step !== undefined && <StepText view={view} step={seat.step} voter={voter} />
       )}
     </section>
   );
 }
 
 /** What a settled step said: an answer, a ballot, or a revision. */
-function StepText({ view, step, record }: { view: CouncilView; step: StepView; record: SeatView | undefined }) {
+function StepText({ view, step, voter }: { view: CouncilView; step: StepView; voter: string }) {
   if (step.status !== "ok") return null;
   const nameOf = (seatIdx: number | null): string => {
     const found = seatIdx === null ? undefined : view.seats.find((s) => s.seat_idx === seatIdx);
@@ -421,7 +429,7 @@ function StepText({ view, step, record }: { view: CouncilView; step: StepView; r
     if (critique.ranking.length === 0) return <p className="council-dossier-hint">abstained</p>;
     return (
       <>
-        <ol className="council-dossier-ballot" aria-label={`Ballot of ${record === undefined ? "this seat" : seatName(record)}`}>
+        <ol className="council-dossier-ballot" aria-label={`Ballot of ${voter}`}>
           {deanonymise(critique.ranking, view.anon_map).map((idx, at) => (
             <li key={at}>{nameOf(idx)}</li>
           ))}

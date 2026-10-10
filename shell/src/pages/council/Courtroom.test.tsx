@@ -6,7 +6,7 @@ import type { Agreement, CouncilConfig, CouncilView, SeatView, StepView, Synthes
 import { Courtroom, type CourtSelection } from "./Courtroom";
 import { Dossier } from "./Dossier";
 import { ProcessLine } from "./ProcessLine";
-import { buildSessionCourt, buildSetupCourt, liveMoment, processLine } from "./court-model";
+import { buildSessionCourt, buildSetupCourt, liveMoment, momentKey, processLine } from "./court-model";
 import { draftFromConfig, type CourtDraft } from "./court-draft";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -353,7 +353,7 @@ describe("ProcessLine", () => {
     });
 
     it("keeps phases that did not happen out of reach and the viewed one current", () => {
-      render(<ProcessLine mode="session" phases={processLine(live)} viewing="live" onView={noop} />);
+      render(<ProcessLine mode="session" phases={processLine(live)} liveKey={momentKey(liveMoment(live))} viewing="live" onView={noop} />);
       const rebuttal = screen.getByText("Rebuttal I");
       expect(rebuttal.tagName).toBe("SPAN");
       expect(rebuttal.className).toContain("council-process-phase-unreachable");
@@ -364,7 +364,7 @@ describe("ProcessLine", () => {
 
     it("goes back to a phase by its key and returns to live by the current one", () => {
       const onView = vi.fn();
-      render(<ProcessLine mode="session" phases={processLine(live)} viewing="live" onView={onView} />);
+      render(<ProcessLine mode="session" phases={processLine(live)} liveKey={momentKey(liveMoment(live))} viewing="live" onView={onView} />);
       fireEvent.click(screen.getByRole("button", { name: "Opening" }));
       expect(onView).toHaveBeenLastCalledWith("0:answer");
       fireEvent.click(screen.getByRole("button", { name: "Deliberation I" }));
@@ -372,9 +372,20 @@ describe("ProcessLine", () => {
     });
 
     it("marks the viewed phase when the reader has stepped back", () => {
-      render(<ProcessLine mode="session" phases={processLine(live)} viewing="0:answer" onView={noop} />);
+      render(<ProcessLine mode="session" phases={processLine(live)} liveKey={momentKey(liveMoment(live))} viewing="0:answer" onView={noop} />);
       expect(screen.getByRole("button", { name: "Opening" }).getAttribute("aria-current")).toBe("step");
       expect(screen.getByRole("button", { name: "Deliberation I" }).getAttribute("aria-current")).toBeNull();
+    });
+
+    it("treats the phase an ended council stopped in as its live one", () => {
+      // An error mid-deliberation: nothing is `current`, yet round 1's deliberation is where it stopped.
+      const failed = view({ ...live, status: "error", error: "boom" });
+      const onView = vi.fn();
+      render(<ProcessLine mode="session" phases={processLine(failed)} liveKey={momentKey(liveMoment(failed))} viewing="live" onView={onView} />);
+      expect(screen.getByRole("button", { name: "Deliberation I" }).getAttribute("aria-current")).toBe("step");
+      expect(screen.getByRole("button", { name: "Opening" }).getAttribute("aria-current")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Deliberation I" }));
+      expect(onView).toHaveBeenLastCalledWith("live");
     });
 
     it("says where a council stopped early", () => {
@@ -387,7 +398,7 @@ describe("ProcessLine", () => {
         current_phase: "synthesis",
         seats: [seat({ steps: [step(), step({ round: 1, phase: "critique", answer: null })] })],
       });
-      render(<ProcessLine mode="session" phases={processLine(stopped)} viewing="live" onView={noop} />);
+      render(<ProcessLine mode="session" phases={processLine(stopped)} liveKey={momentKey(liveMoment(stopped))} viewing="live" onView={noop} />);
       expect(screen.getByRole("button", { name: "Deliberation I · stopped early" })).toBeDefined();
       // A finished council is at its verdict, and that is the live view.
       expect(screen.getByRole("button", { name: "Verdict" }).getAttribute("aria-current")).toBe("step");
@@ -455,6 +466,13 @@ describe("Dossier", () => {
       />,
     );
   }
+
+  it("says so when neither catalogue could be read", async () => {
+    daemon.apiFetch.mockReset();
+    daemon.apiFetch.mockRejectedValue(new Error("down"));
+    setupDossier({ selection: { kind: "seat", index: 3 } });
+    expect(await screen.findByText("Couldn't load who can sit.")).toBeDefined();
+  });
 
   it("asks for neither catalogue while nothing is chosen", () => {
     setupDossier();
@@ -542,10 +560,24 @@ describe("Dossier", () => {
       ],
     });
     sessionDossier(v, { kind: "seat", index: 0 });
-    const ballot = screen.getByRole("list", { name: "Ballot of a" });
+    const ballot = screen.getByRole("list", { name: "Ballot of A" });
     expect(within(ballot).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["b", "a"]);
-    // The masked chair is titled by its letter in the dossier too.
+    // The masked chair is titled by its letter in the dossier too, and its ballot is named by it:
+    // the real name never reaches the accessible tree while the round is masked.
+    expect(screen.queryByRole("list", { name: "Ballot of a" })).toBeNull();
     expect(screen.getByRole("heading", { name: "A" })).toBeDefined();
+  });
+
+  it("shows the error of a council that failed mid-round at the top of the dossier", () => {
+    const failed = view({ rounds: 2, current_round: 1, current_phase: "critique", status: "error", error: "the panel lost its connection" });
+    sessionDossier(failed, null);
+    expect(screen.getByText("the panel lost its connection")).toBeDefined();
+  });
+
+  it("shows the error of a failed council once, where the verdict already renders it", () => {
+    const failed = view({ rounds: 1, current_round: 1, current_phase: "synthesis", status: "error", error: "the chair failed" });
+    sessionDossier(failed, { kind: "judge" });
+    expect(screen.getAllByText("the chair failed")).toHaveLength(1);
   });
 
   it("tails the chairman while the verdict is written, once its run is known", async () => {
