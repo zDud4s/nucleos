@@ -132,3 +132,41 @@ describe("the scales", () => {
     expect(court.balanceOf(null)).toEqual({ angle: 0, tone: "empty", label: "no votes yet", sub: null });
   });
 });
+
+describe("the process line", () => {
+  it("is Opening, then Deliberation/Rebuttal per round with no rebuttal after the last, then Verdict", () => {
+    expect(court.processPhases(3).map(court.phaseLabel)).toEqual([
+      "Opening", "Deliberation I", "Rebuttal I", "Deliberation II", "Rebuttal II", "Deliberation III", "Verdict",
+    ]);
+    expect(court.processPhases(1).map(court.phaseLabel)).toEqual(["Opening", "Deliberation I", "Verdict"]);
+  });
+
+  it("makes a phase reachable only when the council has steps for it", () => {
+    // Stopped early in round 1: critique ran, no revise.
+    const v = view({
+      rounds: 2, rounds_run: 1, stopped_early: true, status: "done", current_round: 1, current_phase: "synthesis",
+      synthesis: "done", seats: [seat({ steps: [step(), step({ round: 1, phase: "critique" })] })],
+    });
+    const line = court.processLine(v);
+    expect(line.map((p) => [p.label, p.reachable])).toEqual([
+      ["Opening", true], ["Deliberation I", true], ["Rebuttal I", false],
+      ["Deliberation II", false], ["Verdict", true],
+    ]);
+    expect(line.find((p) => p.stoppedHere)?.label).toBe("Deliberation I");
+  });
+
+  it("leaves the verdict unreachable on a council that failed before the synthesis", () => {
+    const v = view({ status: "error", error: "boom", current_round: 1, current_phase: "critique" });
+    expect(court.processLine(v).at(-1)).toMatchObject({ label: "Verdict", reachable: false });
+  });
+
+  it("marks the live moment as current", () => {
+    const v = view({ current_round: 1, current_phase: "critique", seats: [seat({ steps: [step(), step({ round: 1, phase: "critique", status: "pending" })] })] });
+    expect(court.processLine(v).filter((p) => p.current).map((p) => p.label)).toEqual(["Deliberation I"]);
+  });
+
+  it("keeps the live phase reachable before any of its steps exists", () => {
+    const v = view({ current_round: 1, current_phase: "critique", seats: [seat({ steps: [step()] })] });
+    expect(court.processLine(v).find((p) => p.current)).toMatchObject({ label: "Deliberation I", reachable: true });
+  });
+});

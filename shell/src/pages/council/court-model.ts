@@ -86,3 +86,82 @@ export function balanceOf(agreement: Agreement | null): Balance {
   const words = AGREEMENT_WORDS[agreement.level] ?? agreement.level;
   return { angle: balanceAngle(agreement.tau), tone, label: `${words} · τ ${agreement.tau!.toFixed(2)}`, sub: null };
 }
+
+/* ------------------------------------------------------------ process line -- */
+
+export type PhaseName = "answer" | "critique" | "revise" | "synthesis";
+export interface Moment { round: number; phase: PhaseName }
+
+export interface ProcessPhase extends Moment {
+  key: string;
+  label: string;
+  /** The council has steps for it (or, for the verdict, a synthesis or a synthesis under way). */
+  reachable: boolean;
+  /** The live moment. */
+  current: boolean;
+  /** `stopped_early`: the last phase that ran. */
+  stoppedHere: boolean;
+}
+
+const ROMAN = ["I", "II", "III", "IV", "V"];
+export const roman = (n: number) => ROMAN[n - 1] ?? String(n);
+
+/** Opening, Deliberation 1, Rebuttal 1, …, Deliberation R, Verdict — no rebuttal after the last round (`store.rs:12-14`). */
+export function processPhases(rounds: number): Moment[] {
+  const out: Moment[] = [{ round: 0, phase: "answer" }];
+  for (let r = 1; r <= rounds; r += 1) {
+    out.push({ round: r, phase: "critique" });
+    if (r < rounds) out.push({ round: r, phase: "revise" });
+  }
+  out.push({ round: rounds, phase: "synthesis" });
+  return out;
+}
+
+export function phaseLabel(m: Moment): string {
+  switch (m.phase) {
+    case "answer": return "Opening";
+    case "critique": return `Deliberation ${roman(m.round)}`;
+    case "revise": return `Rebuttal ${roman(m.round)}`;
+    case "synthesis": return "Verdict";
+  }
+}
+
+export const momentKey = (m: Moment) => (m.phase === "synthesis" ? "synthesis" : `${m.round}:${m.phase}`);
+
+export function sameMoment(a: Moment, b: Moment): boolean {
+  return momentKey(a) === momentKey(b);
+}
+
+/** Where the council is now. A finished council is at its verdict. */
+export function liveMoment(view: CouncilView): Moment {
+  if (view.status === "done" || view.current_phase === "synthesis") {
+    return { round: view.rounds, phase: "synthesis" };
+  }
+  return { round: view.current_round, phase: view.current_phase as PhaseName };
+}
+
+function hasSteps(view: CouncilView, m: Moment): boolean {
+  if (m.phase === "synthesis") {
+    return view.synthesis !== null || view.synthesis_structured !== null || view.status === "done"
+      || (view.status === "running" && view.current_phase === "synthesis");
+  }
+  return view.seats.some((s) => s.steps.some((st) => st.round === m.round && st.phase === m.phase));
+}
+
+export function processLine(view: CouncilView): ProcessPhase[] {
+  const live = liveMoment(view);
+  const phases = processPhases(view.rounds).map((m) => ({
+    ...m,
+    key: momentKey(m),
+    label: phaseLabel(m),
+    // The live phase stays clickable even before its first step row lands: it is the way back to live.
+    reachable: hasSteps(view, m) || (view.status === "running" && sameMoment(m, live)),
+    current: view.status === "running" && sameMoment(m, live),
+    stoppedHere: false,
+  }));
+  if (view.stopped_early) {
+    const lastRun = [...phases].reverse().find((p) => p.reachable && p.phase !== "synthesis");
+    if (lastRun !== undefined) lastRun.stoppedHere = true;
+  }
+  return phases;
+}
