@@ -125,14 +125,25 @@ function councilView(overrides: Partial<CouncilView> = {}): CouncilView {
   };
 }
 
-/** `GET /council/config` — a configured roster, two rounds by default. */
+/**
+ * `GET /council/config` — a configured roster of three, two rounds by default.
+ * The room opens on that roster, so a test that convenes untouched needs it; a
+ * test that wants an empty room passes `default_roster: null`.
+ */
 function councilConfig(overrides: Partial<CouncilConfig> = {}): CouncilConfig {
   return {
     configured: true,
     default_rounds: 2,
     max_rounds: 3,
     roles: ["skeptic", "pragmatist"],
-    default_roster: null,
+    default_roster: {
+      chairman: { kind: "cloud", ref: "claude-opus-4" },
+      members: [
+        { kind: "cloud", ref: "claude-opus-4" },
+        { kind: "cloud", ref: "claude-opus-5" },
+        { kind: "local", ref: "qwen3.5:4b" },
+      ],
+    },
     ...overrides,
   };
 }
@@ -229,6 +240,26 @@ async function panelFor(headingText: string): Promise<HTMLElement> {
   return panel as HTMLElement;
 }
 
+/** The Case record panel is shut by default; the deliberation's columns live inside it. */
+async function openTheRecord() {
+  const panel = await panelFor("Case record");
+  fireEvent.click(within(panel).getByRole("button", { name: "Show" }));
+}
+
+/** Click a chair by its accessible name prefix ("Seat 4"). */
+async function chooseChair(n: number) {
+  const chair = await screen.findByRole("button", { name: new RegExp(`^Seat ${n},`) });
+  fireEvent.click(chair);
+  return chair;
+}
+
+async function chooseJudge() {
+  fireEvent.click(await screen.findByRole("button", { name: /^Chairman,/ }));
+}
+
+/** The dossier aside. */
+const dossier = () => screen.getByRole("complementary", { name: "Dossier" });
+
 /** Convene waits for the config now: click it once it has lost `disabled`. */
 async function conveneWhenReady() {
   const convene = await screen.findByRole("button", { name: "Convene" });
@@ -280,6 +311,7 @@ describe("Council - a seat that abstained", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     const abstained = await screen.findByText("abstained");
     const seatCard = abstained.closest("li");
@@ -300,6 +332,7 @@ describe("Council - an expired answer", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     expect(await screen.findByText("answered — the text has expired")).toBeDefined();
   });
@@ -319,6 +352,7 @@ describe("Council - a seat's answer", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     const seats = await panelFor("Deliberation");
     // The emphasis is an element, and the asterisks are gone with it.
@@ -359,6 +393,7 @@ describe("Council - a seat's answer", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     // The ranking was cast over the FIRST answers, so a card that dropped the
     // round-0 answer for a later one would be showing a leaderboard of text it
@@ -393,6 +428,7 @@ describe("Council - a seat's answer", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     const seats = await panelFor("Deliberation");
     expect(within(seats).getByText("the seat timed out")).toBeDefined();
@@ -430,6 +466,7 @@ describe("Council - a step the daemon could not read", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     const seats = await panelFor("Deliberation");
     expect(within(seats).getByText("invalid")).toBeDefined();
@@ -447,6 +484,7 @@ describe("Council - a seat an agent filled", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     const seats = await panelFor("Deliberation");
     // Both facts on the card, not one. The name answers who, and the model is
@@ -465,6 +503,7 @@ describe("Council - a seat an agent filled", () => {
     );
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     // The non-regression half: agents are an addition to this page, not a
     // migration of it, and a roster written the old way renders as it did.
@@ -482,6 +521,7 @@ describe("Council - a seat whose agent was deleted", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     // `agent_name` is read from the catalogue as the view is built, so this
     // pair — an id with no name — is the deleted agent, and the daemon is not
@@ -508,10 +548,9 @@ describe("Council - who chaired", () => {
 
     await renderCouncil("/council/c-1");
 
-    // Scoped to the detail panel: the synthesis is one seat's writing, and
-    // until now this page never said whose.
-    const panel = await panelFor("This council");
-    expect(within(panel).getByText("chaired by the arbiter on gpt-5")).toBeDefined();
+    // The facts line: the synthesis is one seat's writing, and until now this
+    // page never said whose.
+    expect(await screen.findByText("chaired by the arbiter on gpt-5")).toBeDefined();
   });
 
   it("names the model alone when no agent chaired", async () => {
@@ -523,8 +562,7 @@ describe("Council - who chaired", () => {
 
     // `chairman_ref` is printed either way. It is the fact that survives the
     // agent being renamed or deleted, which is why the row copies it.
-    const panel = await panelFor("This council");
-    expect(within(panel).getByText("chaired by claude-opus-4")).toBeDefined();
+    expect(await screen.findByText("chaired by claude-opus-4")).toBeDefined();
   });
 
   it("falls back to the id when the chairman's agent was deleted", async () => {
@@ -541,8 +579,7 @@ describe("Council - who chaired", () => {
     // read from the catalogue as the view is built, so a null beside a set id
     // is a deletion, not a gap. The line does not collapse to "chaired by
     // gpt-5" — that would say a model chaired when an agent did.
-    const panel = await panelFor("This council");
-    expect(within(panel).getByText("chaired by ag-1 on gpt-5")).toBeDefined();
+    expect(await screen.findByText("chaired by ag-1 on gpt-5")).toBeDefined();
   });
 });
 
@@ -579,7 +616,7 @@ describe("Council - refusals convening meets", () => {
 
     await renderCouncil("/council");
 
-    // The convene form's own copy, not the daemon's. It is a second place the path is written,
+    // The case file's own copy, not the daemon's. It is a second place the path is written,
     // and the two saying different things is worse than either being wrong alone.
     const note = await screen.findByText(/Roster from ~\/\.nucleos\/council\.yaml/);
     expect(note.textContent).toContain("~/.nucleos/council.yaml");
@@ -633,10 +670,9 @@ describe("Council - the detail's cadence", () => {
     daemon.apiFetch.mockImplementation(councilFetch(summaries, views));
 
     const { queryClient } = await renderCouncil("/council/c-1");
-    // Scoped to the detail panel: the list row for this same council can read
-    // a different status than the one under test, and a bare `findByText`
-    // would not know which badge it found.
-    expect(within(await panelFor("This council")).getByText("deliberating")).toBeDefined();
+    // The facts line's badge, found by its exact word: the page headline says
+    // "deliberating" inside a longer sentence and does not match.
+    expect(await screen.findByText("deliberating")).toBeDefined();
 
     function computedInterval(): number | false {
       const query = queryClient
@@ -662,7 +698,7 @@ describe("Council - the detail's cadence", () => {
     await act(async () => {
       await queryClient.refetchQueries({ queryKey: [...keys.council.all, "detail", "c-1"] });
     });
-    expect(within(await panelFor("This council")).getByText("settled")).toBeDefined();
+    expect(await screen.findByText("settled")).toBeDefined();
 
     expect(computedInterval()).toBe(false);
   });
@@ -671,7 +707,7 @@ describe("Council - the detail's cadence", () => {
 /* --------------------------------------------------- A14: chairman failed -- */
 
 describe("Council - a chairman that failed", () => {
-  it("still renders the seats and the leaderboard when synthesis is null and error is set", async () => {
+  it("still draws every seat, and the dossier carries the failure, when synthesis is null and error is set", async () => {
     const view = councilView({
       status: "error",
       current_phase: "synthesis",
@@ -687,10 +723,15 @@ describe("Council - a chairman that failed", () => {
 
     await renderCouncil("/council/c-1");
 
+    // The seats are read in the room, by their chairs; the chairman's failure is
+    // the error note in the dossier, opened on the bench.
+    expect(await screen.findByRole("button", { name: /^Seat 1,/ })).toBeDefined();
+    expect(screen.getByRole("button", { name: /^Seat 2,/ })).toBeDefined();
+    expect(screen.getByRole("button", { name: /^Chairman,/ }).getAttribute("data-state")).toBe("failed");
+    expect(await within(dossier()).findByText(/ended in timeout/)).toBeDefined();
+    // The seats' own answers are still on the record.
+    await openTheRecord();
     expect(await screen.findByRole("list", { name: "Seats" })).toBeDefined();
-    expect(await screen.findByRole("list", { name: "Leaderboard" })).toBeDefined();
-    expect(await screen.findByText(/chairman failed to write a synthesis/i)).toBeDefined();
-    expect(screen.getByText(/ended in timeout/)).toBeDefined();
   });
 });
 
@@ -721,7 +762,7 @@ describe("Council - the route and the list", () => {
   });
 });
 
-/* ------------------------------------------------------- the roster control -- */
+/* ------------------------------------------------------- the courtroom setup -- */
 
 /** One catalogue agent. `model: null` is the one that cannot take a seat. */
 function agentRow(overrides: Record<string, unknown> = {}) {
@@ -744,23 +785,20 @@ function modelRow(overrides: Record<string, unknown> = {}) {
   return { id: "claude-opus-5", label: "Opus 5", brain: "cloud", efforts: [], ...overrides };
 }
 
-/**
- * Tick the box that opens the control, and wait for the catalogues it then reads.
- *
- * The wait is the point. `RosterPicker` mounts with both queries in flight, so
- * for a tick every seat picker holds nothing but its own placeholder — and a
- * `fireEvent.change` naming an option that has not arrived is silently a
- * no-op, which reads in the failure output as the form ignoring a choice
- * somebody made.
- */
-async function openTheRoster() {
-  fireEvent.click(await screen.findByRole("button", { name: /^Chair:/ }));
-  const chairman = await screen.findByLabelText("Chairman");
-  await waitFor(() => expect(chairman.querySelectorAll("option").length).toBeGreaterThan(1));
-  return chairman;
-}
+/** The Convene button. */
+const convene = () => screen.getByRole("button", { name: "Convene" });
 
-describe("Council - convening with the roster shut", () => {
+/** The sentence a disabled Convene points at with `aria-describedby`. */
+const reasonOf = (button: HTMLElement) =>
+  document.getElementById(button.getAttribute("aria-describedby") ?? "")?.textContent;
+
+/** The phases drawn on the process line, as text. */
+const processPhaseLabels = () =>
+  within(screen.getByRole("list", { name: "Process" }))
+    .getAllByRole("listitem")
+    .map((item) => item.textContent);
+
+describe("Council - convening from the untouched room", () => {
   it("sends the question and nothing else", async () => {
     let sent: unknown = "nothing was posted";
     daemon.apiFetch.mockImplementation(
@@ -776,7 +814,7 @@ describe("Council - convening with the roster shut", () => {
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
     await conveneWhenReady();
 
-    // The property this whole packet is built around. `roster` is
+    // The property this whole page is built around. `roster` is
     // `Option<RosterOverride>`, which reads an absent key and a `null` the
     // same way — so nothing on the daemon's side would ever have complained
     // if the key had started travelling as `null`, and the request this page
@@ -786,17 +824,35 @@ describe("Council - convening with the roster shut", () => {
     expect(Object.keys(sent as object)).toEqual(["question"]);
   });
 
-  it("asks for neither catalogue while it is shut", async () => {
-    daemon.apiFetch.mockImplementation(councilFetch([], {}));
+  it("asks for neither catalogue until a chair is chosen", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}, { agents: [agentRow()], models: [modelRow()] }));
 
     await renderCouncil("/council");
     await screen.findByLabelText("Question");
+    await screen.findByRole("button", { name: /^Seat 1,/ });
 
-    // The picker is not mounted, so its two queries never run. A control most
-    // visits do not use must not add two requests to every visit.
-    const asked = daemon.apiFetch.mock.calls.map((call) => call[0]);
-    expect(asked).not.toContain("/agents");
-    expect(asked).not.toContain("/assistant/models");
+    // A room most visits do not touch must not add two requests to every visit.
+    const asked = () => daemon.apiFetch.mock.calls.map((call) => call[0]);
+    expect(asked()).not.toContain("/agents");
+    expect(asked()).not.toContain("/assistant/models");
+
+    // Calling somebody to an empty chair is what reads them.
+    await chooseChair(4);
+    await waitFor(() => expect(asked()).toContain("/agents"));
+    expect(asked()).toContain("/assistant/models");
+  });
+
+  it("seats the configured roster, on the chairs and the bench", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}));
+
+    await renderCouncil("/council");
+
+    expect(await screen.findByRole("button", { name: "Seat 1, claude-opus-4" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Seat 2, claude-opus-5" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Seat 3, qwen3.5:4b" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Seat 4, empty" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Chairman, claude-opus-4" })).toBeDefined();
+    await waitFor(() => expect(processPhaseLabels()).toHaveLength(5));
   });
 });
 
@@ -805,6 +861,7 @@ describe("Council - convening with a chosen panel", () => {
     let sent: unknown = "nothing was posted";
     daemon.apiFetch.mockImplementation(
       councilFetch([], {}, {
+        config: councilConfig({ default_roster: null }),
         agents: [agentRow()],
         models: [modelRow(), modelRow({ id: "qwen3.5:4b", label: "Qwen 4b", brain: "local" })],
         onCreate: (body) => {
@@ -816,15 +873,15 @@ describe("Council - convening with a chosen panel", () => {
 
     await renderCouncil("/council");
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
-    await openTheRoster();
 
-    // Half-chosen is not a panel: there is no `SeatSpec` meaning "nobody", so
-    // convening now would either refuse or silently seat one fewer than the
-    // rows on screen. The button waits instead.
-    expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(true);
+    // An empty room is not a panel: with nobody on the bench or in a chair the
+    // button waits, and says why.
+    await waitFor(() => expect(convene().hasAttribute("disabled")).toBe(true));
 
-    fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
-    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:qwen3.5:4b" } });
+    await chooseJudge();
+    fireEvent.click(await within(dossier()).findByRole("button", { name: "the sceptic" }));
+    await chooseChair(1);
+    fireEvent.click(await within(dossier()).findByRole("button", { name: "Qwen 4b" }));
     await conveneWhenReady();
 
     // An agent seat carries only `agent`, and a model seat only `kind`/`ref`:
@@ -846,61 +903,40 @@ describe("Council - convening with a chosen panel", () => {
   it("never offers an agent that names no model", async () => {
     daemon.apiFetch.mockImplementation(
       councilFetch([], {}, {
+        config: councilConfig({ default_roster: null }),
         agents: [agentRow(), agentRow({ id: "ag-2", name: "the mute", model: null })],
         models: [modelRow()],
       }),
     );
 
     await renderCouncil("/council");
-    const chairman = await openTheRoster();
+    await chooseChair(1);
+    const agents = await within(dossier()).findByRole("group", { name: "Agents" });
 
     // `council::start` refuses an agent that names no model, because a seat's
     // row records the model that answered and the column is NOT NULL. Offering
     // it here would be offering a 400 — so `canTakeASeat` filters it out, and
     // it is the shell's reading of that same refusal rather than a second rule.
-    expect(within(chairman).getByRole("option", { name: "the sceptic" })).toBeDefined();
-    expect(within(chairman).queryByRole("option", { name: "the mute" })).toBeNull();
+    expect(within(agents).getByRole("button", { name: "the sceptic" })).toBeDefined();
+    expect(within(agents).queryByRole("button", { name: "the mute" })).toBeNull();
   });
 
-  it("stops offering seats at the eighth", async () => {
+  it("has exactly eight chairs and no way to add a ninth", async () => {
     daemon.apiFetch.mockImplementation(
       councilFetch([], {}, { agents: [agentRow()], models: [modelRow()] }),
     );
 
     await renderCouncil("/council");
-    await openTheRoster();
-
-    const add = screen.getByRole("button", { name: "Add a seat" });
-    // One row exists already, so seven more reach the ceiling.
-    for (let seat = 1; seat < 8; seat += 1) fireEvent.click(add);
+    await screen.findByRole("button", { name: /^Seat 1,/ });
 
     // `MAX_COUNCIL_SEATS` counts members alone — the chairman is resolved apart
     // from them — so eight plus a chairman is a roster the daemon accepts and a
-    // ninth member is a 400. The button goes out rather than letting somebody
-    // assemble a panel that cannot be convened and learn it on submit.
-    expect(within(await screen.findByRole("list", { name: "Panel" })).getAllByRole("listitem")).toHaveLength(8);
-    expect(add.hasAttribute("disabled")).toBe(true);
+    // ninth member is a 400. The room has eight chairs and nothing to add one.
+    expect(screen.getAllByRole("button", { name: /^Seat \d,/ })).toHaveLength(8);
+    expect(screen.queryByRole("button", { name: "Add a seat" })).toBeNull();
   });
-});
 
-/* ------------------------------------------------- rounds, roles, estimate -- */
-
-/** A configured roster of three, so the estimate has a member count before anyone opens the picker. */
-function threeSeatConfig(): CouncilConfig {
-  return councilConfig({
-    default_roster: {
-      chairman: { kind: "cloud", ref: "claude-opus-4" },
-      members: [
-        { kind: "cloud", ref: "claude-opus-4" },
-        { kind: "cloud", ref: "claude-opus-5" },
-        { kind: "local", ref: "qwen3.5:4b" },
-      ],
-    },
-  });
-}
-
-describe("Council - convening with rounds, roles and an estimate", () => {
-  it("offers rounds 1 to max, defaulting to the config's, and sends none when untouched", async () => {
+  it("a released chair leaves the roster, re-keys the roles and lowers the estimate", async () => {
     let sent: unknown = "nothing was posted";
     daemon.apiFetch.mockImplementation(
       councilFetch([], {}, {
@@ -912,16 +948,58 @@ describe("Council - convening with rounds, roles and an estimate", () => {
     );
 
     await renderCouncil("/council");
-    const rounds = await screen.findByRole("group", { name: "Rounds" });
-    // The config answers after the form mounts: the default is read, not assumed.
+    fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
+    await chooseChair(1);
+    fireEvent.click(await within(dossier()).findByRole("button", { name: "Release" }));
+    // N=2, R=2: 2 answers + 4 critiques + 2 revisions + 2 chairman = 10.
+    expect(await screen.findByText("≤ 10 calls")).toBeDefined();
+
+    // Seat 3 is now the second member, so a role given there is keyed "1".
+    await chooseChair(3);
+    fireEvent.click(await within(dossier()).findByRole("button", { name: "skeptic" }));
+    await conveneWhenReady();
+
     await waitFor(() =>
-      expect(within(rounds).getByRole("button", { name: "2" }).getAttribute("aria-pressed")).toBe("true"),
+      expect(sent).toEqual({
+        question: "well?",
+        roster: {
+          chairman: { kind: "cloud", ref: "claude-opus-4" },
+          members: [
+            { kind: "cloud", ref: "claude-opus-5" },
+            { kind: "local", ref: "qwen3.5:4b" },
+          ],
+        },
+        roles: { "1": "skeptic" },
+      }),
     );
-    expect(within(rounds).getAllByRole("button").map((button) => button.textContent)).toEqual([
-      "1",
-      "2",
-      "3",
-    ]);
+  });
+});
+
+/* ------------------------------------------------- rounds, roles, estimate -- */
+
+describe("Council - convening with rounds, roles and an estimate", () => {
+  it("draws the phases for the config's default rounds and sends none when untouched", async () => {
+    let sent: unknown = "nothing was posted";
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        onCreate: (body) => {
+          sent = body;
+          return { id: "new-1" };
+        },
+      }),
+    );
+
+    await renderCouncil("/council");
+    // The config answers after the page mounts: the default is read, not assumed.
+    await waitFor(() =>
+      expect(processPhaseLabels()).toEqual([
+        "Opening",
+        "Deliberation I",
+        "Rebuttal I",
+        "Deliberation II",
+        "Verdict",
+      ]),
+    );
 
     fireEvent.change(screen.getByLabelText("Question"), { target: { value: "well?" } });
     await conveneWhenReady();
@@ -929,6 +1007,24 @@ describe("Council - convening with rounds, roles and an estimate", () => {
     // Choosing nothing is not choosing the default: the key stays off the request.
     await waitFor(() => expect(sent).toEqual({ question: "well?" }));
     expect(Object.keys(sent as object)).toEqual(["question"]);
+  });
+
+  it("adds a round up to the maximum and removes one down to one", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}));
+
+    await renderCouncil("/council");
+    await waitFor(() => expect(processPhaseLabels()).toHaveLength(5));
+
+    const add = screen.getByRole("button", { name: "Add a round" });
+    const remove = screen.getByRole("button", { name: "Remove the last round" });
+    fireEvent.click(add);
+    expect(processPhaseLabels()).toHaveLength(7);
+    expect(add.hasAttribute("disabled")).toBe(true);
+
+    fireEvent.click(remove);
+    fireEvent.click(remove);
+    expect(processPhaseLabels()).toEqual(["Opening", "Deliberation I", "Verdict"]);
+    expect(remove.hasAttribute("disabled")).toBe(true);
   });
 
   it("sends rounds only when it differs from the default", async () => {
@@ -943,24 +1039,19 @@ describe("Council - convening with rounds, roles and an estimate", () => {
     );
 
     await renderCouncil("/council");
-    const rounds = await screen.findByRole("group", { name: "Rounds" });
-    await waitFor(() =>
-      expect(within(rounds).getByRole("button", { name: "2" }).getAttribute("aria-pressed")).toBe("true"),
-    );
+    await waitFor(() => expect(processPhaseLabels()).toHaveLength(5));
 
-    fireEvent.click(within(rounds).getByRole("button", { name: "3" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add a round" }));
     fireEvent.change(screen.getByLabelText("Question"), { target: { value: "well?" } });
     await conveneWhenReady();
 
     await waitFor(() => expect(sent).toEqual({ question: "well?", rounds: 3 }));
   });
 
-  it("sends the roles chosen per seat, keyed by the seat's index", async () => {
+  it("sends the roles chosen per chair, keyed by the member's index, without a roster", async () => {
     let sent: unknown = "nothing was posted";
     daemon.apiFetch.mockImplementation(
       councilFetch([], {}, {
-        agents: [agentRow()],
-        models: [modelRow(), modelRow({ id: "qwen3.5:4b", label: "Qwen 4b", brain: "local" })],
         onCreate: (body) => {
           sent = body;
           return { id: "new-1" };
@@ -970,46 +1061,26 @@ describe("Council - convening with rounds, roles and an estimate", () => {
 
     await renderCouncil("/council");
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
-    await openTheRoster();
-    fireEvent.click(screen.getByRole("button", { name: "Add a seat" }));
+    await chooseChair(2);
 
-    // "no role" first, then the config's roles in the daemon's declared order.
-    const second = (await screen.findByLabelText("Role for seat 2")) as HTMLSelectElement;
-    expect(within(second).getAllByRole("option").map((option) => option.textContent)).toEqual([
-      "no role",
+    // The config's roles in the daemon's declared order, then "no role".
+    const roles = await within(dossier()).findByRole("group", { name: "Roles" });
+    expect(within(roles).getAllByRole("button").map((button) => button.textContent)).toEqual([
       "skeptic",
       "pragmatist",
+      "no role",
     ]);
-    expect(second.value).toBe("");
-
-    fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
-    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:claude-opus-5" } });
-    fireEvent.change(screen.getByLabelText("Seat 2"), { target: { value: "model:qwen3.5:4b" } });
-    // Only seat 1 is given a role; seat 0 keeps "no role" and must not appear.
-    fireEvent.change(second, { target: { value: "skeptic" } });
+    fireEvent.click(within(roles).getByRole("button", { name: "skeptic" }));
     await conveneWhenReady();
 
-    await waitFor(() =>
-      expect(sent).toEqual({
-        question: "well?",
-        roster: {
-          chairman: { agent: "ag-1" },
-          members: [
-            { kind: "cloud", ref: "claude-opus-5" },
-            { kind: "local", ref: "qwen3.5:4b" },
-          ],
-        },
-        roles: { "1": "skeptic" },
-      }),
-    );
+    // A role alone does not touch the roster: `roles` travels against the file's.
+    await waitFor(() => expect(sent).toEqual({ question: "well?", roles: { "1": "skeptic" } }));
   });
 
-  it("sends no roles key when no seat was given a role", async () => {
+  it("sends no roles key when no chair was given a role", async () => {
     let sent: unknown = "nothing was posted";
     daemon.apiFetch.mockImplementation(
       councilFetch([], {}, {
-        agents: [agentRow()],
-        models: [modelRow()],
         onCreate: (body) => {
           sent = body;
           return { id: "new-1" };
@@ -1019,67 +1090,45 @@ describe("Council - convening with rounds, roles and an estimate", () => {
 
     await renderCouncil("/council");
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
-    await openTheRoster();
-    fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
-    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:claude-opus-5" } });
+    await chooseChair(2);
+    await within(dossier()).findByRole("group", { name: "Roles" });
     await conveneWhenReady();
 
     await waitFor(() => expect(sent).not.toBe("nothing was posted"));
-    expect(Object.keys(sent as object)).toEqual(["question", "roster"]);
+    expect(Object.keys(sent as object)).toEqual(["question"]);
   });
 
-  it("shows up to X calls for the configured roster at the default rounds, and follows the rounds control", async () => {
-    daemon.apiFetch.mockImplementation(councilFetch([], {}, { config: threeSeatConfig() }));
+  it("shows up to X calls for the configured roster at the default rounds, and follows the rounds", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}));
 
     await renderCouncil("/council");
     // N=3, R=2: 3 answers + 6 critiques + 3 revisions + 2 chairman = 14.
-    expect(await screen.findByText("≤ 14 calls · 5 steps in sequence")).toBeDefined();
+    expect(await screen.findByText("≤ 14 calls")).toBeDefined();
+    expect(screen.getByText("5 steps in sequence")).toBeDefined();
 
     // N=3, R=3: 3 + 9 + 6 + 2 = 20.
-    fireEvent.click(within(screen.getByRole("group", { name: "Rounds" })).getByRole("button", { name: "3" }));
-    expect(await screen.findByText("≤ 20 calls · 7 steps in sequence")).toBeDefined();
-  });
-
-  it("counts the chosen members, not the configured roster, once a panel is chosen", async () => {
-    daemon.apiFetch.mockImplementation(
-      councilFetch([], {}, {
-        config: threeSeatConfig(),
-        agents: [agentRow()],
-        models: [modelRow()],
-      }),
-    );
-
-    await renderCouncil("/council");
-    expect(await screen.findByText("≤ 14 calls · 5 steps in sequence")).toBeDefined();
-
-    await openTheRoster();
-    fireEvent.click(screen.getByRole("button", { name: "Add a seat" }));
-    fireEvent.change(screen.getByLabelText("Chairman"), { target: { value: "agent:ag-1" } });
-    fireEvent.change(screen.getByLabelText("Seat 1"), { target: { value: "model:claude-opus-5" } });
-    fireEvent.change(screen.getByLabelText("Seat 2"), { target: { value: "model:claude-opus-5" } });
-
-    // N=2, R=2: 2 + 4 + 2 + 2 = 10.
-    expect(await screen.findByText("≤ 10 calls · 5 steps in sequence")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Add a round" }));
+    expect(await screen.findByText("≤ 20 calls")).toBeDefined();
+    expect(screen.getByText("7 steps in sequence")).toBeDefined();
   });
 });
 
-/* ------------------------------------------------------------ the composer -- */
+/* ------------------------------------------------------------ the lectern -- */
 
-describe("Council - the composer", () => {
-  it("collapses the question to one line and grows it on focus", async () => {
+describe("Council - the lectern", () => {
+  it("shows the whole question in the dossier while the lectern is focused", async () => {
     daemon.apiFetch.mockImplementation(councilFetch([], {}));
 
     await renderCouncil("/council");
     const question = (await screen.findByLabelText("Question")) as HTMLTextAreaElement;
-
     expect(question.getAttribute("placeholder")).toBe("Ask the council…");
-    expect(question.getAttribute("rows")).toBe("1");
+
+    const long = "should we ship the frontend rewrite before the migration is rehearsed twice over?";
     fireEvent.focus(question);
-    expect(question.getAttribute("rows")).toBe("4");
-    fireEvent.blur(question);
-    expect(question.getAttribute("rows")).toBe("1");
-    fireEvent.change(question, { target: { value: "well?" } });
-    expect(question.getAttribute("rows")).toBe("4");
+    fireEvent.change(question, { target: { value: long } });
+
+    // The lectern holds a line; the dossier is where the question is read whole.
+    expect(within(dossier()).getByText(long)).toBeDefined();
   });
 
   it("convenes on ctrl+enter", async () => {
@@ -1096,48 +1145,13 @@ describe("Council - the composer", () => {
     await renderCouncil("/council");
     const question = await screen.findByLabelText("Question");
     fireEvent.change(question, { target: { value: "well?" } });
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(false),
-    );
+    await waitFor(() => expect(convene().hasAttribute("disabled")).toBe(false));
     fireEvent.keyDown(question, { key: "Enter", ctrlKey: true });
 
     await waitFor(() => expect(sent).toEqual({ question: "well?" }));
   });
 
-  it("shows the configured roster as chips with the rounds and the call ceiling", async () => {
-    daemon.apiFetch.mockImplementation(councilFetch([], {}, { config: threeSeatConfig() }));
-
-    await renderCouncil("/council");
-
-    const chips = await screen.findByRole("button", { name: /^Chair:/ });
-    expect(chips.textContent).toBe("Chair: claude-opus-4 · Seats: claude-opus-4, claude-opus-5, qwen3.5:4b");
-    expect(chips.getAttribute("aria-expanded")).toBe("false");
-    const rounds = screen.getByRole("group", { name: "Rounds" });
-    await waitFor(() =>
-      expect(within(rounds).getByRole("button", { name: "2" }).getAttribute("aria-pressed")).toBe("true"),
-    );
-    expect(within(rounds).getByRole("button", { name: "1" }).getAttribute("aria-pressed")).toBe("false");
-    expect(await screen.findByText("≤ 14 calls · 5 steps in sequence")).toBeDefined();
-  });
-
-  it("opens the panel editor from the roster chips and offers no checkbox", async () => {
-    daemon.apiFetch.mockImplementation(
-      councilFetch([], {}, { agents: [agentRow()], models: [modelRow()] }),
-    );
-
-    await renderCouncil("/council");
-    expect(await screen.findByRole("button", { name: /^Chair:/ })).toBeDefined();
-    expect(screen.queryByRole("checkbox")).toBeNull();
-    expect(screen.queryByLabelText("Chairman")).toBeNull();
-
-    await openTheRoster();
-
-    expect(screen.getByRole("button", { name: /^Chosen panel/ }).getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByLabelText("Chairman")).toBeDefined();
-    expect(screen.queryByRole("checkbox")).toBeNull();
-  });
-
-  it("disables convene with the reason when no roster is configured", async () => {
+  it("disables convene and gives the reason as the button's description when no roster is configured", async () => {
     daemon.apiFetch.mockImplementation(
       councilFetch([], {}, { config: councilConfig({ configured: false }) }),
     );
@@ -1145,13 +1159,14 @@ describe("Council - the composer", () => {
     await renderCouncil("/council");
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
 
-    const reason = await screen.findByText(
-      "No roster in ~/.nucleos/council.yaml — add one and restart the núcleo.",
-    );
-    const convene = screen.getByRole("button", { name: "Convene" });
-    expect(convene.hasAttribute("disabled")).toBe(true);
-    expect(reason.id).not.toBe("");
-    expect(convene.getAttribute("aria-describedby")).toBe(reason.id);
+    const button = await screen.findByRole("button", { name: "Convene" });
+    const reason = "No roster in ~/.nucleos/council.yaml — add one and restart the núcleo.";
+    // The id is stable, so the description is read once it holds the reason.
+    const describedBy = () => document.getElementById(button.getAttribute("aria-describedby") ?? "")?.textContent;
+    await waitFor(() => expect(describedBy()).toBe(reason));
+    expect(button.hasAttribute("disabled")).toBe(true);
+    // And the case file says it in plain sight too.
+    expect(within(dossier()).getByText(reason)).toBeDefined();
   });
 
   it("disables convene and draws no bounds sentence when the config is malformed", async () => {
@@ -1162,14 +1177,13 @@ describe("Council - the composer", () => {
     const { container } = await renderCouncil("/council");
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
 
-    const reason = await screen.findByText("The council config could not be read.");
-    expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(true);
-    expect(reason).toBeDefined();
+    expect((await screen.findAllByText("The council config could not be read.")).length).toBeGreaterThan(0);
+    expect(convene().hasAttribute("disabled")).toBe(true);
     expect(container.textContent).not.toContain("at most");
     expect(container.textContent).not.toContain("undefined");
   });
 
-  it("hides the composer while a council is open", async () => {
+  it("hides the courtroom setup while a council is open", async () => {
     const views: Record<string, CouncilView> = { "c-1": councilView({ id: "c-1" }) };
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], views));
 
@@ -1181,30 +1195,38 @@ describe("Council - the composer", () => {
     expect(screen.queryByRole("button", { name: "Convene" })).toBeNull();
   });
 
-  it("labels panel seats from 1", async () => {
-    daemon.apiFetch.mockImplementation(
-      councilFetch([], {}, { agents: [agentRow()], models: [modelRow()] }),
-    );
+  it("names chairs from 1", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}));
 
     await renderCouncil("/council");
-    await openTheRoster();
-    fireEvent.click(screen.getByRole("button", { name: "Add a seat" }));
 
-    expect(screen.getByLabelText("Seat 1")).toBeDefined();
-    expect(screen.getByLabelText("Seat 2")).toBeDefined();
-    expect(screen.getByRole("button", { name: "Remove seat 1" })).toBeDefined();
-    expect(screen.getByLabelText("Role for seat 1")).toBeDefined();
-    expect(screen.queryByLabelText("Seat 0")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Remove seat 0" })).toBeNull();
+    expect(await screen.findByRole("button", { name: /^Seat 1,/ })).toBeDefined();
+    expect(screen.getByRole("button", { name: /^Seat 8,/ })).toBeDefined();
+    expect(screen.queryByRole("button", { name: /^Seat 0,/ })).toBeNull();
+  });
+
+  it("keyboard: an arrow moves between chairs and Enter opens the chair in the dossier", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([], {}));
+
+    await renderCouncil("/council");
+    const first = await screen.findByRole("button", { name: /^Seat 1,/ });
+    first.focus();
+    fireEvent.keyDown(first, { key: "ArrowRight" });
+
+    const second = screen.getByRole("button", { name: /^Seat 2,/ });
+    expect(document.activeElement).toBe(second);
+    fireEvent.keyDown(second, { key: "Enter" });
+    expect(within(dossier()).getByRole("heading", { level: 2, name: "Seat 2" })).toBeDefined();
   });
 });
 
-/* -------------------------------------------------------------- leaderboard -- */
+/* ------------------------------------------------------------- the verdict -- */
 
-describe("Council - the leaderboard", () => {
-  it("names the seats rather than numbering them, with the score and n beside each", async () => {
+describe("Council - the verdict in the room", () => {
+  it("sizes the chairs by Borda and ranks them at the verdict", async () => {
     const view = councilView({
       status: "done",
+      current_phase: "synthesis",
       seats: [
         seatView({ seat_idx: 0, ref: "gpt-5" }),
         seatView({ seat_idx: 1, agent_id: "ag-7", agent_name: "the sceptic" }),
@@ -1218,18 +1240,13 @@ describe("Council - the leaderboard", () => {
 
     await renderCouncil("/council/c-1");
 
-    const board = await screen.findByRole("list", { name: "Leaderboard" });
-    const rows = within(board).getAllByRole("listitem");
-    expect(rows).toHaveLength(2);
-    // `seatName`: the agent's name, else the model that answered. "seat 1" is a
-    // number the reader then has to carry up to the seat grid to decode.
-    expect(rows[0].textContent).toContain("the sceptic");
-    expect(rows[1].textContent).toContain("gpt-5");
-    expect(within(board).queryByText(/^seat \d+$/)).toBeNull();
-    // The Borda score, and n beside it always: one ballot and four are not the same claim.
-    expect(rows[0].textContent).toContain("1.00");
-    expect(rows[0].textContent).toContain("1 ballot");
-    expect(board.textContent).not.toMatch(/avg rank/);
+    // The names come from the chairs' accessible names, not from a table.
+    const first = await screen.findByRole("button", { name: /^Seat 2, the sceptic/ });
+    const last = screen.getByRole("button", { name: /^Seat 1, gpt-5/ });
+    expect(first.querySelector("circle")?.getAttribute("r")).toBe("24");
+    expect(last.querySelector("circle")?.getAttribute("r")).toBe("14");
+    expect(first.textContent).toContain("1st");
+    expect(last.textContent).toContain("2nd");
   });
 });
 
@@ -1452,6 +1469,7 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     expect(await screen.findByRole("heading", { level: 2, name: "Deliberation" })).toBeDefined();
     const tabs = within(await screen.findByRole("tablist", { name: "Rounds" })).getAllByRole("tab");
@@ -1469,6 +1487,7 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     const panel = await panelFor("Deliberation");
     expect(screen.queryByRole("heading", { level: 2, name: "Seats" })).toBeNull();
@@ -1481,6 +1500,7 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     const tab = await screen.findByRole("tab", { name: "Round 2" });
     expect(tab.getAttribute("aria-selected")).toBe("true");
@@ -1491,6 +1511,7 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
     await openRound("Answers");
 
     expect(screen.getAllByText("beta says ship")).toHaveLength(1);
@@ -1500,6 +1521,7 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
     await openRound("Answers");
 
     const more = await screen.findByRole("button", { name: "more of alpha's answer" });
@@ -1513,6 +1535,7 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
 
     const panel = await panelFor("Deliberation");
     expect(within(panel).getByText("Seat 1")).toBeDefined();
@@ -1536,6 +1559,7 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
     const panel = await openRound("Round 1");
 
     // alpha ranked ["C", "B"]: gamma first, beta second.
@@ -1552,6 +1576,7 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
     const panel = await openRound("Round 1");
 
     const given = within(panel).getByRole("group", { name: "Critiques by alpha" });
@@ -1570,6 +1595,7 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
     const panel = await openRound("Round 1");
 
     const revision = within(panel).getByRole("group", { name: "Revision by alpha" });
@@ -1607,6 +1633,7 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": one }));
 
     const first = await renderCouncil("/council/c-1");
+    await openTheRecord();
     await screen.findByRole("tablist", { name: "Rounds" });
     expect(screen.queryByRole("table", { name: "Rank evolution" })).toBeNull();
     first.unmount();
@@ -1627,6 +1654,7 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": two }));
 
     await renderCouncil("/council/c-1");
+    await openTheRecord();
     const table = await screen.findByRole("table", { name: "Rank evolution" });
     expect(within(table).getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
       "",
@@ -1651,11 +1679,13 @@ describe("Council - round by round", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": stopped }));
 
     const first = await renderCouncil("/council/c-1");
+    await openTheRecord();
     expect(await screen.findByText(/Stopped early at round 1/)).toBeDefined();
     first.unmount();
 
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": roundsView() }));
     await renderCouncil("/council/c-1");
+    await openTheRecord();
     await screen.findByRole("tablist", { name: "Rounds" });
     expect(screen.queryByText(/Stopped early at round/)).toBeNull();
   });
@@ -1909,7 +1939,9 @@ describe("Council - the live tail of a running step", () => {
     });
 
     await waitFor(() => expect(screen.queryByRole("log", { name: "Live tail of alpha" })).toBeNull());
-    expect(await screen.findByText("the settled answer")).toBeDefined();
+    // Nobody speaks any more, so nothing is followed: the seat is read by choosing it.
+    fireEvent.click(await screen.findByRole("button", { name: /^Seat 1,/ }));
+    expect(await within(dossier()).findByText("the settled answer")).toBeDefined();
     const before = tailAsks().length;
     await act(async () => {
       await queryClient.refetchQueries({ queryKey: keys.runs.tail(7) });
@@ -1922,7 +1954,7 @@ describe("Council - the live tail of a running step", () => {
     const settled = councilView({ status: "running", seats: [seatNamed("alpha", 0, [stepView()])] });
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": settled }, { tail }));
     const first = await renderCouncil("/council/c-1");
-    await panelFor("This council");
+    await screen.findByRole("complementary", { name: "Dossier" });
     expect(screen.queryByRole("log")).toBeNull();
     first.unmount();
 
@@ -1931,21 +1963,88 @@ describe("Council - the live tail of a running step", () => {
       councilFetch([councilSummary({ status: "error" })], { "c-1": ended }, { tail }),
     );
     await renderCouncil("/council/c-1");
-    await panelFor("This council");
+    await screen.findByRole("complementary", { name: "Dossier" });
     expect(screen.queryByRole("log")).toBeNull();
     expect(tailAsks()).toHaveLength(0);
+  });
+
+  it("keeps the deliberation columns' own tail working with the record open", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": pendingView() }, { tail: () => ({ text: "weighing", next: 8, live: true }) }),
+    );
+
+    await renderCouncil("/council/c-1");
+    // The dossier follows the speaking seat; the opened record tails it a second time.
+    await openTheRecord();
+    await waitFor(() => expect(screen.getAllByRole("log", { name: "Live tail of alpha" })).toHaveLength(2));
+  });
+
+  it("follows the speaking seat and a click pins another, with Follow live to return", async () => {
+    const view = pendingView({
+      seats: [
+        seatNamed("alpha", 0, [stepView({ status: "pending", run_id: 7, answer: null })]),
+        seatNamed("beta", 1, [stepView({ run_id: 8, answer: "beta's opening answer" })]),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": view }, { tail: () => ({ text: "weighing", next: 8, live: true }) }),
+    );
+
+    await renderCouncil("/council/c-1");
+    // Nobody pinned anything: the dossier is already on whoever speaks.
+    await screen.findByRole("log", { name: "Live tail of alpha" });
+    expect(screen.queryByRole("button", { name: "Follow live" })).toBeNull();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Seat 2,/ }));
+    expect(await within(dossier()).findByText("beta's opening answer")).toBeDefined();
+    expect(screen.queryByRole("log", { name: "Live tail of alpha" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Follow live" }));
+    expect(await screen.findByRole("log", { name: "Live tail of alpha" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Follow live" })).toBeNull();
+  });
+
+  it("gives every chair its state in its accessible name", async () => {
+    const view = pendingView({
+      seats: [
+        seatNamed("alpha", 0, [stepView({ status: "pending", run_id: null, answer: null })]),
+        seatNamed("beta", 1, [stepView({ status: "pending", run_id: 7, answer: null })]),
+        seatNamed("gamma", 2, [stepView({ run_id: 8 })]),
+        seatNamed("delta", 3, [stepView({ run_id: 9, status: "invalid", answer: null })]),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+
+    expect(await screen.findByRole("button", { name: "Seat 1, alpha, thinking" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Seat 2, beta, speaking" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Seat 3, gamma, done" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Seat 4, delta, failed: unreadable answer" })).toBeDefined();
   });
 });
 
 describe("Council - the detail, redesigned", () => {
-  it("orders the detail as question, synthesis, leaderboard", async () => {
+  it("draws the court, the dossier and the process line, and the record shut", async () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": synthesisView() }));
 
     await renderCouncil("/council/c-1");
     await panelFor("Synthesis");
 
-    const headings = screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent);
-    expect(headings.slice(0, 3)).toEqual(["This council", "Synthesis", "Leaderboard"]);
+    expect(screen.getByRole("group", { name: "Courtroom" })).toBeDefined();
+    expect(within(dossier()).getByRole("heading", { level: 2, name: "Synthesis" })).toBeDefined();
+    expect(within(screen.getByRole("list", { name: "Process" })).getAllByRole("listitem")).toHaveLength(5);
+    // The record is the last thing on the page and starts shut.
+    const record = await panelFor("Case record");
+    const toggle = within(record).getByRole("button", { name: "Show" });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("heading", { level: 2, name: "Deliberation" })).toBeNull();
+    // The leaderboard panel is gone: the room's chairs carry the ranking.
+    expect(screen.queryByRole("heading", { level: 2, name: "Leaderboard" })).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(await screen.findByRole("heading", { level: 2, name: "Deliberation" })).toBeDefined();
+    expect(within(record).getByRole("button", { name: "Hide" }).getAttribute("aria-expanded")).toBe("true");
   });
 
   it("replaces the list and composer with a way back while a council is open", async () => {
@@ -1973,37 +2072,7 @@ describe("Council - the detail, redesigned", () => {
     expect(panel.querySelector("[title]")).toBeNull();
   });
 
-  it("draws each leaderboard score as a bar against the maximum possible", async () => {
-    const view = councilView({
-      status: "done",
-      seats: [
-        seatView({ seat_idx: 0, ref: "gpt-5" }),
-        seatView({ seat_idx: 1, agent_id: "ag-7", agent_name: "the sceptic" }),
-      ],
-      leaderboard: [
-        { seat_idx: 1, score: 1, n: 1 },
-        { seat_idx: 0, score: 0.5, n: 1 },
-      ],
-    });
-    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
-
-    const first = await renderCouncil("/council/c-1");
-    expect(await screen.findByRole("img", { name: "the sceptic: 1.00 of 1.00" })).toBeDefined();
-    expect(screen.getByRole("img", { name: "gpt-5: 0.50 of 1.00" })).toBeDefined();
-    first.unmount();
-
-    // An older council scored above 1: the bar's ceiling is its top score.
-    const legacy = councilView({
-      status: "done",
-      seats: [seatView({ seat_idx: 1, agent_id: "ag-7", agent_name: "the sceptic" })],
-      leaderboard: [{ seat_idx: 1, score: 1.5, n: 1 }],
-    });
-    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": legacy }));
-    await renderCouncil("/council/c-1");
-    expect(await screen.findByRole("img", { name: "the sceptic: 1.50 of 1.50" })).toBeDefined();
-  });
-
-  it("offers ask again on a settled council and prefills the composer with its question, panel and rounds", async () => {
+  it("offers ask again on a settled council and fills the room with its question, panel and rounds", async () => {
     let sent: unknown = "nothing was posted";
     const view = councilView({
       status: "done",
@@ -2036,6 +2105,12 @@ describe("Council - the detail, redesigned", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/council"));
     const question = (await screen.findByLabelText("Question")) as HTMLTextAreaElement;
     expect(question.value).toBe("is the migration safe?");
+    // The room holds the old panel: chairs by their names, the chair presiding,
+    // the role a chair played, and the rounds on the process line.
+    expect(await screen.findByRole("button", { name: "Seat 1, qwen3.5:4b, skeptic" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Seat 2, ag-1" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Chairman, ag-1" })).toBeDefined();
+    await waitFor(() => expect(processPhaseLabels()).toHaveLength(7));
     await conveneWhenReady();
 
     await waitFor(() =>
@@ -2060,12 +2135,12 @@ describe("Council - the detail, redesigned", () => {
     );
 
     await renderCouncil("/council/c-1");
-    await screen.findByRole("heading", { level: 2, name: "This council" });
+    await screen.findByRole("button", { name: "Cancel" });
 
     expect(screen.queryByRole("button", { name: "Ask again" })).toBeNull();
   });
 
-  it("ask again leaves a deleted agent's seat unchosen", async () => {
+  it("ask again leaves a deleted agent's seat as an empty chair", async () => {
     const view = councilView({
       status: "done",
       seats: [
@@ -2084,18 +2159,71 @@ describe("Council - the detail, redesigned", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Ask again" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/council"));
 
-    const seat = (await screen.findByLabelText("Seat 1")) as HTMLSelectElement;
-    expect(seat.value).toBe("");
-    expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(true);
+    expect(await screen.findByRole("button", { name: "Seat 1, empty" })).toBeDefined();
+    // Nobody else sits, and the minimum is one.
+    const button = screen.getByRole("button", { name: "Convene" });
+    await waitFor(() => expect(reasonOf(button)).toBe("Seat at least one member."));
+    expect(button.hasAttribute("disabled")).toBe(true);
   });
 
-  it("says an empty leaderboard in one short line", async () => {
-    const view = councilView({ status: "done", leaderboard: [] });
+  it("draws even chairs when nobody could be ranked", async () => {
+    const view = councilView({ status: "done", current_phase: "synthesis", leaderboard: [] });
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
 
-    expect(await screen.findByText("No ranking — fewer than two answers to rank.")).toBeDefined();
+    const chair = await screen.findByRole("button", { name: /^Seat 1,/ });
+    expect(chair.querySelector("circle")?.getAttribute("r")).toBe("18");
+    expect(chair.textContent).not.toMatch(/\d(st|nd|rd|th)/);
+  });
+
+  it("going back: a phase shows that round's masks and its scales, and the live phase returns to live", async () => {
+    const view = synthesisView({
+      ballot_rounds: [1, 2],
+      leaderboard_by_round: [
+        [
+          { seat_idx: 0, score: 1, n: 3 },
+          { seat_idx: 1, score: 0.5, n: 3 },
+        ],
+        [
+          { seat_idx: 1, score: 1, n: 3 },
+          { seat_idx: 0, score: 0.5, n: 3 },
+        ],
+      ],
+      agreement_by_round: [
+        { tau: 0.3, level: "split", ballots: 3, comparisons: 3 },
+        { tau: 0.8, level: "strong", ballots: 3, comparisons: 3 },
+      ],
+    });
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
+
+    await renderCouncil("/council/c-1");
+    const room = await screen.findByRole("group", { name: "Courtroom" });
+    const process = screen.getByRole("list", { name: "Process" });
+    // Live: the verdict, with the real names and the final scales.
+    expect(within(room).getByText("strong consensus · τ 0.90")).toBeDefined();
+    expect(screen.getByRole("button", { name: /^Seat 1, alpha/ })).toBeDefined();
+    expect(within(process).getByRole("button", { name: "Verdict" }).getAttribute("aria-current")).toBe("step");
+
+    fireEvent.click(within(process).getByRole("button", { name: "Deliberation I" }));
+
+    // Round 1: the critique masks the seats and the scales are that round's own.
+    expect(await screen.findByRole("button", { name: /^Seat 1, A/ })).toBeDefined();
+    expect(within(room).getByText("split · τ 0.30")).toBeDefined();
+    expect(within(process).getByRole("button", { name: "Deliberation I" }).getAttribute("aria-current")).toBe("step");
+
+    fireEvent.click(within(process).getByRole("button", { name: "Verdict" }));
+    expect(await screen.findByRole("button", { name: /^Seat 1, alpha/ })).toBeDefined();
+    expect(within(room).getByText("strong consensus · τ 0.90")).toBeDefined();
+  });
+
+  it("the verdict opens the structured synthesis in the dossier", async () => {
+    daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": synthesisView() }));
+
+    await renderCouncil("/council/c-1");
+
+    expect(await within(await screen.findByRole("complementary", { name: "Dossier" })).findByRole("heading", { level: 2, name: "Synthesis" })).toBeDefined();
+    expect(within(dossier()).getByText("Ship it behind a flag.")).toBeDefined();
   });
 });
 
@@ -2110,7 +2238,7 @@ describe("Council - review rework", () => {
     daemon.apiFetch.mockImplementation(councilFetch(summaries, views));
 
     const { queryClient } = await renderCouncil("/council/c-1");
-    await panelFor("This council");
+    await screen.findByRole("complementary", { name: "Dossier" });
 
     fireEvent.click(screen.getByRole("link", { name: "Councils" }));
     const link = await screen.findByRole("link", { name: /should we ship the frontend rewrite\?/ });
@@ -2133,6 +2261,7 @@ describe("Council - review rework", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], views));
 
     const { queryClient } = await renderCouncil("/council/c-1");
+    await openTheRecord();
     const first = await screen.findByRole("tab", { name: "Answers" });
     expect(first.getAttribute("aria-selected")).toBe("true");
 
@@ -2154,7 +2283,8 @@ describe("Council - review rework", () => {
     await waitFor(() =>
       expect(screen.getByRole("tab", { name: "Round 1" }).getAttribute("aria-selected")).toBe("true"),
     );
-    expect(await screen.findByRole("log", { name: "Live tail of alpha" })).toBeDefined();
+    // The dossier tails the speaking seat and so does the opened column.
+    expect((await screen.findAllByRole("log", { name: "Live tail of alpha" })).length).toBeGreaterThan(0);
   });
 
   it("F2: a tab the reader picked while the council runs is kept when the round advances", async () => {
@@ -2173,6 +2303,7 @@ describe("Council - review rework", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], views));
 
     const { queryClient } = await renderCouncil("/council/c-1");
+    await openTheRecord();
     expect((await screen.findByRole("tab", { name: "Round 1" })).getAttribute("aria-selected")).toBe("true");
     await openRound("Answers");
     expect(screen.getByRole("tab", { name: "Answers" }).getAttribute("aria-selected")).toBe("true");
@@ -2198,17 +2329,17 @@ describe("Council - review rework", () => {
     expect(screen.getByRole("tab", { name: "Round 2" }).getAttribute("aria-selected")).toBe("false");
   });
 
-  it("F3: with no roster configured the chips never claim a default", async () => {
+  it("F3: with no roster configured the room is empty and never claims a default", async () => {
     daemon.apiFetch.mockImplementation(
       councilFetch([], {}, { config: councilConfig({ configured: false }) }),
     );
 
-    const { container } = await renderCouncil("/council");
-    await screen.findByText("No roster in ~/.nucleos/council.yaml — add one and restart the núcleo.");
+    await renderCouncil("/council");
+    await screen.findAllByText("No roster in ~/.nucleos/council.yaml — add one and restart the núcleo.");
 
-    const chips = container.querySelector(".council-ask-bar button");
-    expect(chips).not.toBeNull();
-    expect((chips as HTMLElement).textContent ?? "").not.toMatch(/default/i);
+    expect(screen.getAllByRole("button", { name: /^Seat \d, empty$/ })).toHaveLength(8);
+    expect(screen.getByRole("button", { name: "Chairman, empty" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: /default/i })).toBeNull();
   });
 
   it("F4: a failed background refetch of the config leaves Convene enabled", async () => {
@@ -2236,11 +2367,14 @@ describe("Council - review rework", () => {
     expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(false);
   });
 
-  it("F5: ask again with a seat no longer offered leaves it unchosen and Convene waits", async () => {
+  it("F5: ask again with a seat no longer offered leaves that chair empty and Convene does not wait", async () => {
     const view = councilView({
       status: "done",
       chairman_ref: "claude-opus-5",
-      seats: [seatView({ seat_idx: 0, kind: "cloud", ref: "model-that-left" })],
+      seats: [
+        seatView({ seat_idx: 0, kind: "cloud", ref: "model-that-left" }),
+        seatView({ seat_idx: 1, kind: "cloud", ref: "claude-opus-5" }),
+      ],
     });
     daemon.apiFetch.mockImplementation(
       councilFetch([councilSummary()], { "c-1": view }, {
@@ -2253,16 +2387,35 @@ describe("Council - review rework", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Ask again" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/council"));
 
-    const seat = (await screen.findByLabelText("Seat 1")) as HTMLSelectElement;
-    await waitFor(() => expect(seat.querySelectorAll("option").length).toBeGreaterThan(1));
-    // The config must have answered too, or Convene is disabled for the wrong reason.
-    await within(await screen.findByRole("group", { name: "Rounds" })).findByRole("button", { name: "1" });
+    // Both catalogues have to answer before a seat is judged gone.
+    expect(await screen.findByRole("button", { name: "Seat 1, empty" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Seat 2, claude-opus-5" })).toBeDefined();
+    fireEvent.change(screen.getByLabelText("Question"), { target: { value: "well?" } });
+    await waitFor(() => expect(convene().hasAttribute("disabled")).toBe(false));
+  });
 
-    expect(seat.value).toBe("");
-    await waitFor(() =>
-      expect(screen.getByText("Choose every seat, or close the panel.")).toBeDefined(),
+  it("F5: ask again with the chairman no longer offered waits for a chairman", async () => {
+    const view = councilView({
+      status: "done",
+      chairman_ref: "model-that-left",
+      seats: [seatView({ seat_idx: 0, kind: "cloud", ref: "claude-opus-5" })],
+    });
+    daemon.apiFetch.mockImplementation(
+      councilFetch([councilSummary()], { "c-1": view }, {
+        agents: [agentRow()],
+        models: [modelRow()],
+      }),
     );
-    expect(screen.getByRole("button", { name: "Convene" }).hasAttribute("disabled")).toBe(true);
+
+    const { router } = await renderCouncil("/council/c-1");
+    fireEvent.click(await screen.findByRole("button", { name: "Ask again" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/council"));
+
+    expect(await screen.findByRole("button", { name: "Chairman, empty" })).toBeDefined();
+    fireEvent.change(screen.getByLabelText("Question"), { target: { value: "well?" } });
+    const button = screen.getByRole("button", { name: "Convene" });
+    await waitFor(() => expect(reasonOf(button)).toBe("Choose a chairman."));
+    expect(button.hasAttribute("disabled")).toBe(true);
   });
 
   it("F5: ask again clamps draft rounds above the config's maximum", async () => {
@@ -2275,11 +2428,8 @@ describe("Council - review rework", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Ask again" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/council"));
 
-    const rounds = await screen.findByRole("group", { name: "Rounds" });
-    const pressed = within(rounds)
-      .getAllByRole("button")
-      .filter((button) => button.getAttribute("aria-pressed") === "true");
-    expect(pressed.map((button) => button.textContent)).toEqual(["3"]);
+    // Three rounds on the process line, not five.
+    await waitFor(() => expect(processPhaseLabels()).toHaveLength(7));
   });
 
   it("F7: ctrl+enter while an IME is composing does not convene", async () => {
