@@ -1,8 +1,49 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type PointerEvent,
+  type ReactNode,
+} from "react";
 import { Button, type ButtonIntent, type ButtonVariant } from "./Button";
 
 /**
- * How long an armed control stays armed, at least.
+ * How long a press has to be held before it counts, in milliseconds.
+ *
+ * The interlock is a press-and-hold: the pointer or the key goes down, a fill sweeps across the
+ * button, and only when it completes does `onConfirm` run. Letting go early is a "no" and fires
+ * nothing. A second is long enough that a reflex click or a double-click cannot complete it, and
+ * short enough that a person who means it is not made to wait.
+ */
+const HOLD_MS = 1000;
+
+/**
+ * The longer hold for the actions that stop something or destroy data.
+ *
+ * `intent="stop"` and the two danger variants. The component already distinguishes them (a
+ * danger button swaps to `danger-solid` when armed), so the distinction costs nothing here: half
+ * a second more is the price of an irreversible action, and it is paid only by those.
+ */
+const HOLD_DESTRUCTIVE_MS = 1500;
+
+/**
+ * How long a pointer or key event vouches for the `click` that follows it, in milliseconds.
+ *
+ * The browser dispatches a press's `click` in the same task as the release that causes it, so
+ * this only has to outlast that. It is a window and not a flag on purpose: a flag waits for its
+ * click to clear it, and a press released OUTSIDE the button (no click ever follows) would leave
+ * it set and swallow a later screen-reader activation.
+ */
+const GUARD_MS = 150;
+
+/**
+ * How long an armed control stays armed, at least — the screen-reader FALLBACK path only.
+ *
+ * Since the control became a press-and-hold, the pointer and the keyboard no longer arm
+ * anything and nothing times out on them: a hold is its own clock. The two-step arm below
+ * survives for one reason, a click that never had a hold in front of it (see `handleClick`).
  *
  * Long enough to read the second label and mean it; short enough that a control
  * you armed and walked away from is not still live when you come back. An
@@ -81,7 +122,8 @@ interface ConfirmButtonBase {
   label: ReactNode;
   onConfirm: () => void;
   /**
-   * Told whenever the armed state changes.
+   * Told whenever the engaged state changes: `true` while a press is being held (or, on the
+   * screen-reader fallback, while the control is armed), `false` on release, completion or expiry.
    *
    * Not decoration: the approval queue freezes its sort order while any card is
    * armed, so that a list re-ordering under a poll tick cannot move a different
@@ -164,13 +206,42 @@ type ConfirmSpeech =
 
 export type ConfirmButtonProps = ConfirmButtonBase & ConfirmSpeech;
 
+/** What is holding the control down: a pointer (by id, so a second finger is not the first) or a key. */
+type HoldSource = { kind: "pointer"; id: number } | { kind: "key" };
+
+/** The keys that press a button. Space and Enter are what a native button answers to. */
+function isActivationKey(key: string): boolean {
+  return key === "Enter" || key === " " || key === "Spacebar";
+}
+
 /**
- * A two-click interlock for the actions that cannot be undone.
+ * A press-and-hold interlock for the actions that cannot be undone.
  *
- * Arm, then confirm. There is no dialog: a modal that asks "are you sure?"
- * trains people to click through it, and it moves the decision away from the
- * control that caused it. Here the button itself changes what it says, in
- * place, and goes back to what it was if you do nothing.
+ * Press and keep pressing: a fill sweeps across the button, and when it completes `onConfirm`
+ * runs. Letting go before that, or sliding off the button, cancels with nothing fired. There
+ * is no dialog: a modal that asks "are you sure?" trains people to click through it, and it
+ * moves the decision away from the control that caused it. Here the cost of the decision is
+ * time, and it is paid on the control itself, in the place the finger already is.
+ *
+ * This replaced a two-click arm-then-confirm. The public props are unchanged on purpose, so
+ * none of the call sites had to learn about it; `confirmLabel` is now what the button says WHILE
+ * it is held, and `onArmedChange` is told `true` for as long as the hold lasts.
+ *
+ * Three ways in, one rule each:
+ * - Pointer: `pointerdown` starts the hold with pointer capture; `pointerup`, `pointercancel`,
+ *   or sliding off the button before the fill completes cancel it.
+ * - Keyboard: holding Space or Enter is the same hold. Auto-repeat is ignored (it is the same
+ *   press, not a new one), and releasing the key, Escape, or losing focus cancels.
+ * - Assistive technology: see `handleClick`. A screen reader's synthetic activation has no hold
+ *   in it, and gets the old two-step instead of a dead control.
+ *
+ * The resting label is `label` alone, and not a label built from `confirmLabel` ("Hold to ...").
+ * The `confirmLabel` strings are written to be read AFTER arming ("Really release — work
+ * resumes", "Let this action happen"), so putting "Hold to" in front of them is either
+ * ungrammatical or an essay at rest. A visible "hold" hint was tried and dropped at the owner's
+ * call (2026-10-09): the fill that starts on press is the instruction. The accessible name
+ * stays `label`, and `aria-roledescription="hold button"` tells a screen reader how to operate it
+ * (a description id would have changed `aria-describedby`, which callers own and tests read).
  */
 export function ConfirmButton({
   label,
@@ -186,7 +257,19 @@ export function ConfirmButton({
   title,
   describedBy,
 }: ConfirmButtonProps) {
+  // The two-step state below belongs to the screen-reader fallback ONLY.
   const [armed, setArmed] = useState(false);
+  // The hold. State for the render (the fill, the label), and the refs beside it for the timers
+  // and handlers, which have to see what is true now and not what the render that made them saw.
+  const [holding, setHolding] = useState(false);
+  const holdSource = useRef<HoldSource | null>(null);
+  const holdTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // When the last pointer / key event on this button landed. The browser dispatches the `click`
+  // that follows a press in the same task as the release, so "within `GUARD_MS`" means "this
+  // click is the tail of a press I have already handled" and anything older is not. A flag
+  // that waited for its click to clear it would be left behind by a press released elsewhere.
+  const lastPointerAt = useRef(Number.NEGATIVE_INFINITY);
+  const lastKeyAt = useRef(Number.NEGATIVE_INFINITY);
   // A ref rather than state: the dwell must not cause a render, and the click
   // handler has to see the *current* value rather than the one captured by the
   // render it belongs to.
@@ -198,27 +281,34 @@ export function ConfirmButton({
   // written inside the effect that schedules the clock, and a render is exactly what it must
   // not cause.
   const windows = useRef(0);
-  // What the unmount cleanup below reads. Its dependency list is empty — it is the unmount
-  // handler and nothing else — so the closure it captured belongs to the FIRST render, where
-  // `armed` is false and `onArmedChange` may be an inline arrow several renders out of date.
-  // Refs are the only way for a cleanup that runs once to see what is true when it runs.
-  const armedNow = useRef(false);
-  const reportArmed = useRef(onArmedChange);
+  // What `onArmedChange` was last told, so the pair stays a pair however the two paths
+  // interleave: a hold that starts over an open fallback arming is one continuous "armed", not
+  // `true, true, false`, which would leave the queue's freeze counter stuck at one.
+  const reported = useRef(false);
+  // The latest callbacks, for the code that outlives a render: the hold timer and the unmount
+  // cleanup. The timer is set in one render and fires in a later one, and `onConfirm` is an
+  // inline arrow at most call sites; confirming through the stale one would act on the
+  // selection of a second ago.
+  const latest = useRef({ onConfirm, onArmedChange });
   useEffect(() => {
-    armedNow.current = armed;
-    reportArmed.current = onArmedChange;
+    latest.current = { onConfirm, onArmedChange };
   });
 
+  const holdMs =
+    intent === "stop" || variant === "danger" || variant === "danger-solid"
+      ? HOLD_DESTRUCTIVE_MS
+      : HOLD_MS;
+
   // What a screen reader is told, and the only channel that carries it: the label swap is
-  // silent to anyone not looking at the button, and the 4 s window used to expire without a
-  // word. Prefixed rather than bare so it is not a second copy of the label on the page —
-  // `getByText` matches on the whole string, and two exact matches would be ambiguous.
+  // silent to anyone not looking at the button. Prefixed rather than bare so it is not a second
+  // copy of the label on the page; `getByText` matches on the whole string, and two exact
+  // matches would be ambiguous.
   //
-  // `sayAs` first, because the consequence is what somebody needs before they press again;
-  // the label is the fallback and is only ever the whole story where the two are the same
-  // sentence. The objectless third branch is unreachable from TypeScript — the props union
-  // requires `sayAs` for a non-string label — and is kept because unreachable is a claim
-  // about the type checker, and this is the announcement on a control that cannot be undone.
+  // `sayAs` first, because the consequence is what somebody needs before they commit; the label
+  // is the fallback and is only ever the whole story where the two are the same sentence. The
+  // objectless branch is unreachable from TypeScript (the props union requires `sayAs` for a
+  // non-string label) and is kept because unreachable is a claim about the type checker, and
+  // this is the announcement on a control that cannot be undone.
   //
   // The subject comes FIRST in what is said and LAST in what is drawn, and the asymmetry is
   // the point. The ear needs to know which row before it is told what will happen to it,
@@ -227,14 +317,12 @@ export function ConfirmButton({
   // keeping it at the end holds the anchor still while the verb changes under it.
   //
   // The separator is `·` and not a dash: the label already contains an em dash at several
-  // sites, and it is for the eye only — the announcement spells the same two facts with the
+  // sites, and it is for the eye only. The announcement spells the same two facts with the
   // dashes it has always used, so nothing depends on a screen reader pronouncing a middle dot.
   const [said, setSaid] = useState("");
   const spoken = sayAs ?? (typeof confirmLabel === "string" ? confirmLabel : null);
-  // The `typeof` guard is unreachable from TypeScript — the props union puts `subject` on the
-  // string arm only — and is kept for the same reason the objectless branch below is:
-  // unreachable is a claim about the type checker, and this is the label on a control that
-  // cannot be undone.
+  // The `typeof` guard is unreachable from TypeScript (the props union puts `subject` on the
+  // string arm only) and is kept for the same reason the objectless branch is.
   const armedLabel =
     subject === undefined || typeof confirmLabel !== "string"
       ? confirmLabel
@@ -245,6 +333,21 @@ export function ConfirmButton({
       : subject === undefined
         ? `armed: ${spoken} — press again to confirm`
         : `armed: ${subject} — ${spoken} — press again to confirm`;
+  // The hold's own announcement. It says "hold" so that somebody who pressed and heard nothing
+  // else knows the gesture is a duration, and it names the consequence for the same reason the
+  // armed one does.
+  const holdSaid =
+    spoken === null
+      ? "hold to confirm"
+      : subject === undefined
+        ? `hold to confirm: ${spoken}`
+        : `hold to confirm: ${subject} — ${spoken}`;
+
+  function report(next: boolean) {
+    if (reported.current === next) return;
+    reported.current = next;
+    latest.current.onArmedChange?.(next);
+  }
 
   function clearTimers() {
     if (dwellTimer.current !== null) {
@@ -262,41 +365,44 @@ export function ConfirmButton({
     dwelling.current = false;
   }
 
-  // An armed control that unmounts — the row it belonged to was approved
-  // elsewhere, the page navigated — must not leave a timer that calls setState
-  // on a component that is gone.
+  // A control that unmounts mid-hold or armed (the row it belonged to was approved elsewhere,
+  // the page navigated) must not leave a timer that calls setState on a component that is
+  // gone, and above all must not let the hold timer COMPLETE and confirm something nobody can
+  // see any more.
   //
-  // And it has to say it disarmed on the way out. `onArmedChange` is a PAIR — the queue
-  // holds its sort order for as long as the count is above zero — so a control that
-  // vanishes armed leaves that count stuck at one for the life of the page, and the list
+  // And it has to say it disarmed on the way out. `onArmedChange` is a PAIR: the queue
+  // holds its sort order for as long as the count is above zero, so a control that
+  // vanishes engaged leaves that count stuck at one for the life of the page, and the list
   // never unfreezes again. Waiting's batch interlock is exactly that shape: it unmounts the
   // moment the selection empties under it, which `Clear selection` and unticking the last box
-  // both do while it is armed.
+  // both do while it is engaged.
   useEffect(() => {
     return () => {
       if (dwellTimer.current !== null) clearTimeout(dwellTimer.current);
       if (closingTimer.current !== null) clearTimeout(closingTimer.current);
       if (disarmTimer.current !== null) clearTimeout(disarmTimer.current);
-      if (armedNow.current) reportArmed.current?.(false);
+      if (holdTimer.current !== null) clearTimeout(holdTimer.current);
+      if (reported.current) latest.current.onArmedChange?.(false);
     };
   }, []);
 
   function disarm() {
     clearTimers();
     setArmed(false);
-    onArmedChange?.(false);
+    report(false);
     setSaid("disarmed — nothing changed");
   }
 
   /*
-    The window is a function of what has to be said, and it restarts when that changes.
+    The fallback's window is a function of what has to be said, and it restarts when that changes.
+
+    This clock belongs to the screen-reader fallback only; a hold has no timeout beyond the hold.
 
     One effect and not two places: arming and re-announcing are the same event as far as the
-    clock is concerned, and the flat 4 s this replaces was set in `handleClick`, where it could
-    only ever be a constant. `sayAs` is a PROP, so it can be rewritten under an armed control —
-    a roster tick can change the consequence while a finger is over the button — and
+    clock is concerned. `sayAs` is a PROP, so it can be rewritten under an armed control, since
+    a roster tick can change the consequence while a finger is over the button, and
     re-announcing without restarting the clock would hand a new sentence the remainder of the
-    old sentence's window, which is this whole defect in miniature.
+    old sentence's window.
 
     `armed` and `armedSaid` are the whole dependency list on purpose. `disarm` is redefined on
     every render, so listing it would restart the window on every render and the control would
@@ -304,7 +410,7 @@ export function ConfirmButton({
     the same result. The house carries this exemption in three other files.
 
     The restart has a ceiling of `MAX_ARM_WINDOWS`, and a rewrite past it is still announced and
-    simply buys no more time — a consequence fed by a three-second poll would otherwise keep an
+    simply buys no more time; a consequence fed by a three-second poll would otherwise keep an
     armed control live for ever. The counter resets the moment `armed` goes false, which is one
     place for three events: a confirm, an expiry and an Escape all come back through here.
   */
@@ -330,29 +436,147 @@ export function ConfirmButton({
     disarmTimer.current = setTimeout(disarm, span);
   }, [armed, armedSaid]);
 
+  /**
+   * Ends a hold that did not complete: nothing is fired, and it says so.
+   *
+   * Idempotent, because three events can land for one release (`pointerup`, then
+   * `lostpointercapture`, then a `blur`) and only the first has anything to cancel.
+   */
+  function cancelHold() {
+    if (holdSource.current === null) return;
+    holdSource.current = null;
+    if (holdTimer.current !== null) {
+      clearTimeout(holdTimer.current);
+      holdTimer.current = null;
+    }
+    setHolding(false);
+    report(false);
+    setSaid("released — nothing changed");
+  }
+
+  /** The fill completed with the press still down: this is the decision. */
+  function completeHold() {
+    holdTimer.current = null;
+    holdSource.current = null;
+    setHolding(false);
+    report(false);
+    // Completion is announced, which the old confirm path (a silent clearing) did not do: the
+    // fill is a visual event, and somebody on a screen reader needs to hear that it landed.
+    setSaid("confirmed");
+    latest.current.onConfirm();
+  }
+
+  function startHold(source: HoldSource) {
+    // Unavailable swallows every press: it never starts a hold, and so can never confirm.
+    if (unavailable === true || disabled === true || holdSource.current !== null) return;
+    // A fallback arming still open is superseded, not stacked: the hold is the better evidence
+    // of intent. `reported` stays true across the swap, so the pair is not broken.
+    if (armed) {
+      clearTimers();
+      setArmed(false);
+    }
+    holdSource.current = source;
+    setHolding(true);
+    report(true);
+    setSaid(holdSaid);
+    holdTimer.current = setTimeout(completeHold, holdMs);
+  }
+
   /*
-    Becoming unavailable while armed is a disarm, said out loud.
+    Becoming unavailable or disabled while engaged stands the control down, said out loud.
 
-    A poll can take the permission away with a finger over the button. Staying armed would keep a
-    live confirm on something that can no longer be done, and standing down silently would be the
-    expiry nobody hears — so it goes through `disarm`, which says "disarmed — nothing changed" and
-    reports the pair's closing half to `onArmedChange`.
+    A poll can take the permission away with a finger over the button. Staying engaged would keep
+    a live confirm on something that can no longer be done, and a hold timer that completes on a
+    disabled button would fire an action the page had just refused. So it goes through the same
+    exits as everything else, and the pair's closing half reaches `onArmedChange`.
 
-    `[unavailable]` alone, for the reason the effect above gives: `disarm` is redefined on every
-    render, and listing it (or `armed`) would re-run this on renders that changed nothing.
+    `[unavailable, disabled]` alone, for the reason the effect above gives: the handlers are
+    redefined on every render, and listing them would re-run this on renders that changed nothing.
   */
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
-    if (unavailable === true && armed) disarm();
-  }, [unavailable]);
+    if (unavailable !== true && disabled !== true) return;
+    if (armed) disarm();
+    cancelHold();
+  }, [unavailable, disabled]);
 
-  function handleClick() {
-    // Unavailable swallows every press: it does not arm, and it cannot confirm either, because
-    // it can never be armed — the effect above stands it down the moment it turns unavailable.
+  function fresh(at: number): boolean {
+    return Date.now() - at < GUARD_MS;
+  }
+
+  function handlePointerDown(event: PointerEvent<HTMLButtonElement>) {
+    lastPointerAt.current = Date.now();
+    // Primary button only; a right-click or a second finger is not a decision.
+    if (event.button !== 0 || event.isPrimary === false) return;
+    // Capture, so the release reaches this button even when the pointer has left it, and the
+    // browser does not hand the gesture to something else mid-hold. Optional-called because the
+    // test DOM does not implement it, and a missing capture only costs the slide-off cancel
+    // below, which `onPointerLeave` then covers.
+    try {
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+    } catch {
+      // A pointer that is already gone cannot be captured; the hold simply cancels on release.
+    }
+    startHold({ kind: "pointer", id: event.pointerId });
+  }
+
+  function ownsPointer(event: PointerEvent<HTMLButtonElement>): boolean {
+    const source = holdSource.current;
+    return source !== null && source.kind === "pointer" && source.id === event.pointerId;
+  }
+
+  function handlePointerEnd(event: PointerEvent<HTMLButtonElement>) {
+    lastPointerAt.current = Date.now();
+    if (ownsPointer(event)) cancelHold();
+  }
+
+  /*
+    Sliding off the button cancels, and capture is why this has to be measured by hand.
+
+    A captured pointer keeps its events on the button wherever it goes, and the browser then
+    reports no `pointerleave` at all, so the cancel the gesture promises ("slide off to call it
+    off") would silently not happen and the hold would complete under a finger that is no longer
+    on the control. `onPointerLeave` still covers the case where capture was refused.
+  */
+  function handlePointerMove(event: PointerEvent<HTMLButtonElement>) {
+    lastPointerAt.current = Date.now();
+    if (!ownsPointer(event)) return;
+    const box = event.currentTarget.getBoundingClientRect();
+    // A zero-size box is a layout-less environment (the test DOM), not a pointer that left.
+    if (box.width === 0 && box.height === 0) return;
+    const outside =
+      event.clientX < box.left ||
+      event.clientX > box.right ||
+      event.clientY < box.top ||
+      event.clientY > box.bottom;
+    if (outside) cancelHold();
+  }
+
+  /*
+    The one entry for anything that is not a pointer or a key.
+
+    A screen reader's "activate" does not press and hold: it dispatches a bare `click`, where
+    `detail` is 0 or no pointer or key event came before it. If the hold were the only way in,
+    that would be a dead control for exactly the people who cannot see the fill, and a button
+    that does nothing when activated is worse than one with a weaker interlock. So this path
+    keeps the old two-step, for that click alone: the first activation arms and says
+    `confirmLabel` (and the live region reads the consequence), the second confirms, and the old
+    window disarms it if nobody comes back.
+
+    A click that IS the tail of a hold is recognised and ignored: a pointer one by `detail > 0`
+    with a pointer event just before it, a keyboard one by a key event just before it. That
+    covers the click the browser dispatches after every release, whether the hold completed
+    (already confirmed) or was cancelled (nothing to do).
+  */
+  function handleClick(event: { detail: number }) {
+    if (fresh(lastKeyAt.current)) return;
+    if (event.detail > 0 && fresh(lastPointerAt.current)) return;
+    // Unavailable swallows the activation: it does not arm, and it cannot confirm either, because
+    // it can never be armed; the effect above stands it down the moment it turns unavailable.
     if (unavailable === true) return;
     if (!armed) {
       setArmed(true);
-      onArmedChange?.(true);
+      report(true);
       dwelling.current = true;
       dwellTimer.current = setTimeout(() => {
         dwellTimer.current = null;
@@ -361,61 +585,90 @@ export function ConfirmButton({
       return;
     }
 
-    // Inside the dwell this click is the tail of a double-click, not a decision.
+    // Inside the dwell this click is the tail of a double-activation, not a decision.
     // Swallow it and stay armed.
     if (dwelling.current) return;
 
     clearTimers();
     setArmed(false);
-    onArmedChange?.(false);
-    // A confirm is not an expiry: the action is about to happen, so there is nothing to
-    // report about it not happening. Clearing rather than announcing keeps the region for
-    // the two events that are otherwise silent.
+    report(false);
+    // The fallback keeps the old silent clearing: a confirm is not an expiry, the action is about
+    // to happen, and the region is kept for the events that are otherwise silent. (The hold's
+    // completion IS announced, in `completeHold`: a sweep is a visual event with no click to
+    // hear.)
     setSaid("");
-    onConfirm();
+    latest.current.onConfirm();
   }
 
   /*
-    Escape disarms, and blur does not.
+    Holding Space or Enter is the same hold as the pointer's.
 
-    A control that is live for four seconds and cannot be called off is an interlock that only
-    runs one way: the mouse can arm it and only the clock can stand it down. Escape is the key
-    every person in this app already presses to mean "no", and it costs nothing to honour.
+    `preventDefault` on every keydown of those two, repeats included: the native button would
+    otherwise click on Enter's keydown (and on every auto-repeat of it) and on Space's keyup, and
+    each of those clicks is exactly the single-press confirm this control no longer has. The
+    repeat itself is ignored, since a held key is one press and not a stream of new ones.
 
-    On the button and not on the wrapper: the wrapper is not focusable, so a keydown only
-    reaches it when focus is already here. Not on the document either — there are 53 interlocks
-    in this app, and an Escape aimed at a dialog would stand down every armed control behind it.
+    Escape calls it off, and so does leaving. It is on the button and not on the wrapper: the
+    wrapper is not focusable, so a keydown only reaches it when focus is already here. Not on
+    the document either; an Escape aimed at a dialog would stand down every control behind it.
 
     The event is not stopped. Inside a sheet, Escape should still close the sheet; closing it
-    unmounts this control, which disarms it anyway, so both things happen and neither has to
-    know about the other.
+    unmounts this control, which stands it down anyway.
 
-    And there is no blur handler, deliberately. Somebody who cannot see the label reads the
-    consequence by moving to it — the `aria-describedby` element, the live region — and
-    disarming on blur would take the control away at the exact moment they went to find out
-    what confirming would do. The window already expires on its own; that is what it is for.
+    Escape also disarms the fallback arming, as it always did.
   */
   function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
-    if (event.key !== "Escape" || !armed) return;
-    disarm();
+    if (event.key === "Escape") {
+      if (armed) disarm();
+      cancelHold();
+      return;
+    }
+    if (!isActivationKey(event.key) || event.ctrlKey || event.metaKey || event.altKey) return;
+    lastKeyAt.current = Date.now();
+    event.preventDefault();
+    if (event.repeat) return;
+    startHold({ kind: "key" });
   }
 
+  function handleKeyUp(event: KeyboardEvent<HTMLButtonElement>) {
+    if (!isActivationKey(event.key)) return;
+    lastKeyAt.current = Date.now();
+    event.preventDefault();
+    if (holdSource.current?.kind === "key") cancelHold();
+  }
+
+  /*
+    Blur cancels a KEY hold, and only that.
+
+    The keyup that would end it goes to whatever has focus by then, so a hold that outlived its
+    focus could never be released and would complete on its own. This is not the blur-disarms
+    rule the fallback refuses: that one took the control away from somebody reading the
+    consequence, and a hold has no reading to protect; it is a gesture in progress.
+  */
+  function handleBlur() {
+    if (holdSource.current?.kind === "key") cancelHold();
+  }
+
+  const engaged = armed || holding;
+  const classes = ["ui-confirm"];
+  if (armed) classes.push("ui-confirm-armed");
+  if (holding) classes.push("ui-confirm-holding");
+
   return (
-    <span className={armed ? "ui-confirm ui-confirm-armed" : "ui-confirm"}>
+    <span
+      className={classes.join(" ")}
+      style={{ "--ui-confirm-hold": `${holdMs}ms` } as CSSProperties}
+    >
       {/*
-        No `aria-pressed`. Armed is a label swap plus `.ui-confirm-armed`, not a toggle.
+        No `aria-pressed`. Holding and armed are a fill and a label swap, not a toggle.
 
         This button used to carry `aria-pressed={armed}`, and inside `ModeSwitch`'s
         `role="group"` that is a lie at the worst possible moment: the two setting segments
-        beside it use `aria-pressed` to mean "this IS the setting now", so an armed interlock
-        announcing "pressed" tells a screen reader the project is acting — at the one moment
+        beside it use `aria-pressed` to mean "this IS the setting now", so an engaged interlock
+        announcing "pressed" tells a screen reader the project is acting, at the one moment
         nothing has happened yet and the whole point is that it still has to be confirmed.
-        Everywhere else the attribute was equally wrong for the same reason: an interlock
-        halfway through is not a state anything is in.
-
-        The interlock itself is untouched — arm, 300 ms dwell, a window of at least 4 s,
-        `onArmedChange`.
-        What is armed is said by the label, which is where a caller can also read it.
+        What is happening is said by the label and the live region, which is where a caller can
+        also read it.
       */}
       <Button
         variant={armed && variant === "danger" ? "danger-solid" : variant}
@@ -424,36 +677,59 @@ export function ConfirmButton({
         aria-disabled={unavailable === true ? "true" : undefined}
         title={title}
         aria-describedby={describedBy}
+        aria-roledescription="hold button"
         onClick={handleClick}
         onKeyDown={handleKeyDown}
+        onKeyUp={handleKeyUp}
+        onBlur={handleBlur}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerEnd}
+        onPointerCancel={handlePointerEnd}
+        onPointerLeave={handlePointerEnd}
+        onLostPointerCapture={handlePointerEnd}
+        onContextMenu={(event) => {
+          // A long press on touch opens the context menu, which would cancel the hold it is
+          // part of.
+          if (holdSource.current !== null) event.preventDefault();
+        }}
       >
         {/*
-          Both labels, always, stacked in one cell — and only one of them showing.
+          The labels, always, stacked in one cell, and only one of them showing.
 
-          The armed label says what will happen instead of what the control is, so it is longer
+          The held label says what will happen instead of what the control is, so it is longer
           at 48 of 53 sites: `Approve #101` becomes `Let this action happen · #101` and the button
           grew about 198 device px under the finger that had just pressed it, taking most of the
-          box that said `Reject #101` a moment earlier — a click aimed at Reject landed on a live
-          confirm. Nothing in this app reserved that width; `ModeSwitch` only survives it by
+          box that said `Reject #101` a moment earlier, so a click aimed at Reject landed on a
+          live confirm. Nothing in this app reserved that width; `ModeSwitch` only survives it by
           keeping its label short by contract and clipping what does not fit.
 
-          So the width is spent once, at first paint, on the wider of the two, and arming becomes
+          So the width is spent once, at first paint, on the widest of them, and the hold becomes
           a swap inside a box that does not move. `visibility: hidden` rather than `display: none`
-          because the hidden one still has to occupy the cell — that IS the mechanism — and
+          because the hidden one still has to occupy the cell (that IS the mechanism), and
           `aria-hidden` beside it because a label nobody can see must not be read out either: the
           pair is what keeps every `getByRole("button", { name })` in the suite naming the label
           that is showing.
+
+          The third cell, "Keep holding…", is only ever seen under `prefers-reduced-motion`, where
+          the fill does not sweep and the label has to carry the "this is in progress" that the
+          sweep otherwise would. It is always `aria-hidden`: the live region already says it.
         */}
         <span className="ui-confirm-stack">
-          <span aria-hidden={armed ? "true" : undefined}>{label}</span>
-          <span aria-hidden={armed ? undefined : "true"}>{armedLabel}</span>
+          <span className="ui-confirm-rest" aria-hidden={engaged ? "true" : undefined}>
+            {label}
+          </span>
+          <span aria-hidden={engaged ? undefined : "true"}>{armedLabel}</span>
+          <span className="ui-confirm-keep" aria-hidden="true">
+            Keep holding…
+          </span>
         </span>
       </Button>
       {/*
         Said, not shown. `base.css`'s `.sr-only` rather than a `.ui-*` twin: `ui.css` already
         carries one copy of those ten lines (`.ui-field-said`, owned by `Field`) and a third
         would be the duplication this app keeps paying for. `role="status"` is the house idiom
-        for a polite region — 58 sites use it — and it is absolutely positioned, so it cannot
+        for a polite region (58 sites use it), and it is absolutely positioned, so it cannot
         move the button it belongs to.
       */}
       <span className="sr-only" role="status">
