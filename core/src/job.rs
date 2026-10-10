@@ -4595,6 +4595,25 @@ async fn gate_item_with(
             crate::verify::ScopeVerdict::Measured(outcome) => {
                 return record_gate(state, job, ordinal, outcome).await;
             }
+            // On the LAST item a trusted map's "no group covers this diff" is a verdict: the map
+            // was re-checked after the ticket came back, so the same bytes that answered are still
+            // the root's, and the item takes a footing like a green one. Anywhere else, and on a
+            // map that stopped being trusted meanwhile, nothing is minted.
+            crate::verify::ScopeVerdict::NothingRan if last => {
+                let tree = worktree.clone();
+                let root = PathBuf::from(&job.project_root);
+                let still_trusted =
+                    tokio::task::spawn_blocking(move || map_is_trusted(&tree, &root))
+                        .await
+                        .unwrap_or(false);
+                if !still_trusted {
+                    return pass_without_measuring(
+                        "the test map selects no group for the job's diff",
+                    )
+                    .await;
+                }
+                return pass_unmeasured_with_checkpoint(pool, job, ordinal, &worktree).await;
+            }
             crate::verify::ScopeVerdict::NothingRan => {
                 return pass_without_measuring("the test map selects no group for the job's diff")
                     .await;
@@ -4840,6 +4859,48 @@ async fn queue_the_verdict(conn: &mut sqlx::SqliteConnection, job_id: i64, ordin
     if let Err(error) = crate::distill::enqueue_item_verdict_in(conn, job_id, ordinal).await {
         tracing::warn!(job_id, ordinal, %error, "distill: could not queue an item verdict");
     }
+}
+
+/// Pass the last item whose scoped gate ran nothing over a trusted map, taking a checkpoint.
+///
+/// Unlike `gate_after_each_item` off, where no gate was even asked, here a trusted test map
+/// answered "no test covers this diff" for the whole job, and that answer is a verdict: the work
+/// is on the branch and nothing the map vouches for disagrees with it, so the tree is committed
+/// the way a green item's is and `checkpoint_sha` records it.
+///
+/// Deliberately not `record_gate(Passed)`: nothing was measured, so `gate_status` stays NULL and
+/// `route_advice` is not told a pass. The status and the checkpoint are ONE statement, for the
+/// reason `record_gate` gives (an item that reads `passed` with no checkpoint, for a moment, can
+/// revert past work that was agreed with). A checkpoint that cannot be taken warns and writes
+/// NULL; it never fails the item.
+async fn pass_unmeasured_with_checkpoint(
+    pool: &SqlitePool,
+    job: &JobRow,
+    ordinal: usize,
+    worktree: &Path,
+) -> Step {
+    let checkpoint_sha = match crate::worktree::checkpoint(worktree).await {
+        Ok(sha) => Some(sha),
+        Err(error) => {
+            tracing::warn!(job_id = job.id, ordinal, %error, "could not checkpoint an unmeasured last item");
+            None
+        }
+    };
+    let _ = sqlx::query(
+        "UPDATE job_items SET status = 'passed', checkpoint_sha = ? WHERE job_id = ? AND ordinal = ?",
+    )
+    .bind(checkpoint_sha)
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .execute(pool)
+    .await;
+    credit_the_briefing(pool, job, ordinal).await;
+    tracing::debug!(
+        job_id = job.id,
+        ordinal,
+        "last item not measured; checkpointed"
+    );
+    Step::Continued
 }
 
 async fn record_gate(
@@ -16031,5 +16092,53 @@ tests:
         let said = scoped_feed(&f.pool).await;
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("full gate"), "{}", said[0]);
+    }
+
+    /// The last item's scope ran nothing over a map the project root still vouches for: "no test
+    /// covers this diff" is a verdict there, so the item is committed like a green one (status
+    /// `passed` and `checkpoint_sha` set in one write) while `gate_status` stays empty and no full
+    /// gate runs. The recorded base is moved to HEAD so the cumulative diff is empty.
+    #[tokio::test]
+    async fn gate_item_records_a_checkpoint_when_the_last_item_scope_ran_nothing() {
+        let f = scope_job_with(true, SCOPED_FINAL_RULES).await;
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&f.job.project_root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        sqlx::query("UPDATE worktrees SET base_sha = ? WHERE owner_kind = 'job' AND owner_id = ?")
+            .bind(&head)
+            .bind(f.job.id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        gate_item_with(&f.state, &f.job, 1, 2, Some(f.executor.clone())).await;
+
+        assert_eq!(
+            scope_requests(&f.pool).await,
+            vec![format!("job:{}", f.job.id)]
+        );
+        assert_eq!(full_gate_rows(&f.pool).await, 0);
+        assert_eq!(item_statuses(&f.pool, f.job.id).await[1], "passed");
+        let checkpoint: Option<String> = sqlx::query_scalar(
+            "SELECT checkpoint_sha FROM job_items WHERE job_id = ? AND ordinal = 1",
+        )
+        .bind(f.job.id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            checkpoint,
+            Some(head),
+            "a trusted nothing-ran last item checkpoints the tree"
+        );
     }
 }
