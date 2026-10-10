@@ -118,6 +118,15 @@ export interface Proposal {
   run_stage?: string | null;
   item_ordinal?: number | null;
   item_description?: string | null;
+  /**
+   * The run behind an action approval, joined in only by `GET /proposals`: its state, where it
+   * works, how its prompt opens (cut at 600 characters), and its last three steps as a JSON array
+   * of `{name, detail}`, oldest first. Null when the run was pruned or never recorded them.
+   */
+  run_status?: string | null;
+  run_cwd?: string | null;
+  run_prompt?: string | null;
+  run_recent?: string | null;
 }
 
 /**

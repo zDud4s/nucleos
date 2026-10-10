@@ -22,8 +22,8 @@ import {
 } from "../ui";
 import {
   DecisionRefusal,
+  ReadFrom,
   ToolInput,
-  readToolInput,
   useOrderFreeze,
 } from "./Waiting";
 // The records wear the Waiting cards: the same head, the same facts, the same well for a payload.
@@ -261,66 +261,3 @@ export function RefusedActionsPanel() {
   );
 }
 
-/* ---------------------------------------------------------------- the provenance -- */
-
-/** One thing a turn read before it reached for an action. */
-interface ReadEntry {
-  tool?: unknown;
-  arguments?: unknown;
-}
-
-/**
- * Where the idea came from, under the record of what it was.
- *
- * `ToolInput` answers what was going to happen; this answers who put it in
- * the turn's head, and only the second one decides. "Email accounts and ask them
- * to change the bank details" reads identically whether the owner asked for it
- * or a page did, so a card carrying only the first question gets answered by
- * guessing.
- *
- * **Absent renders as nothing, never as "read nothing".** `null` covers two
- * cases the row cannot tell apart — a refusal that fired on whose work it is
- * rather than on what was read, and a recording that failed — and a card that
- * printed "this turn read nothing" would be wrong in the second one, in the
- * direction that makes a contaminated action look clean.
- */
-function ReadFrom({ raw }: { raw: string | null }) {
-  if (raw === null || raw.trim() === "") return null;
-  let entries: ReadEntry[];
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed) || parsed.length === 0) return null;
-    entries = parsed as ReadEntry[];
-  } catch {
-    return null;
-  }
-  return (
-    <div className="waiting-provenance">
-      <p className="waiting-provenance-head">this turn had read</p>
-      <ul className="waiting-provenance-list">
-        {entries.map((entry, index) => {
-          const tool =
-            typeof entry.tool === "string" ? entry.tool : "something unnamed";
-          // The arguments are stored as the daemon received them, so the url that
-          // decides the question is in there and nowhere else. Flattened through
-          // the same reader the action's own input uses, for the same reason:
-          // braces are characters between a person and a decision.
-          const detail =
-            typeof entry.arguments === "string"
-              ? (readToolInput(entry.arguments) ?? [])
-                  .map((field) => field.value)
-                  .join(", ")
-              : "";
-          return (
-            <li className="waiting-provenance-line" key={`${tool}-${index}`}>
-              <span className="waiting-provenance-tool">{tool}</span>
-              {detail !== "" && (
-                <span className="waiting-provenance-detail">{detail}</span>
-              )}
-            </li>
-          );
-        })}
-      </ul>
-    </div>
-  );
-}

@@ -9,7 +9,7 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
-import { Waiting } from "./Waiting";
+import { Waiting, conflictedFiles, gitNextStep } from "./Waiting";
 import { ApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
 import { seatNonce } from "../data/seat";
@@ -372,7 +372,7 @@ describe("Waiting - git requests", () => {
     // `--text-faint` at 11px, third clause in an em-dash chain — which is the quietest rank on
     // the card, for the one sentence on it that is asking somebody to do something.
     expect(within(row).getByText(/alpha:main/).textContent).not.toContain("submit it again");
-    expect(within(row).getByText("submit it again").className).toBe("waiting-hint");
+    expect(within(row).getByText("submit it again").classList.contains("waiting-hint")).toBe(true);
   });
 
   it("the git section waits on /waiting/git, not on the history's escalations", async () => {
@@ -476,6 +476,42 @@ describe("Waiting - git requests", () => {
     expect(within(away).getByText("push #65")).toBeDefined();
     const recent = screen.getByRole("list", { name: "Recent git requests" });
     expect(within(recent).getByText("push #66")).toBeDefined();
+  });
+
+  it("an escalated merge says which branches, which files, and who is resolving it", async () => {
+    const world = waitingWorld({
+      vcsWaiting: [
+        vcsRow({
+          id: 573,
+          op: "merge",
+          repo_key: "\\\\?\\C:\\Projects\\nucleos\\.git",
+          origin: "shell",
+          source: "master",
+          target: "feat/agent-loadout-preview",
+          output_tail:
+            "Auto-merging shell/src/preview/daemon.ts\nCONFLICT (content): Merge conflict in shell/src/preview/daemon.ts\n",
+          failure_reason: "merging master into feat/agent-loadout-preview conflicts, so nothing was published",
+          resolution_run_id: 900623,
+          resolution_status: "running",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    await screen.findByText("merge #573");
+    const card = cardOf("merge #573");
+    expect(within(card).getByText("master")).toBeDefined();
+    expect(within(card).getByText("feat/agent-loadout-preview")).toBeDefined();
+    const files = within(card).getByRole("list", { name: "Conflicts in merge #573" });
+    expect(within(files).getByText("shell/src/preview/daemon.ts")).toBeDefined();
+    expect(within(card).getByRole("link", { name: "run #900623" })).toBeDefined();
+    expect(within(card).getByText(/is resolving it — nothing to do yet/)).toBeDefined();
+    // The files say it better than the reason written for the agent that asked.
+    expect(within(card).queryByText(/nothing was published/)).toBeNull();
+    // Git's verbatim prefix is not something a person needs to read.
+    expect(within(card).getByText(/^C:\\Projects\\nucleos\\\.git — asked from shell$/)).toBeDefined();
   });
 
   it("arming a git control holds the order of the requests still", async () => {
@@ -1433,5 +1469,95 @@ describe("Waiting - focus after a decision", () => {
     // The section stays for the visit, with its one line and the receipt of what was decided.
     expect(screen.getByText("nothing is waiting to be let through")).toBeDefined();
     expect(screen.getByText("run 5 is going again")).toBeDefined();
+  });
+});
+
+describe("Waiting - an approval says what the run was doing", () => {
+  it("shows why it was held, where it runs, what the run is for and what it did just before", async () => {
+    const world = waitingWorld({
+      approvals: [
+        proposal({
+          id: 7,
+          run_id: 70,
+          tool_name: "Bash",
+          reasoning: "unrecognized shell commands require approval",
+          tool_input: JSON.stringify({ command: "wc -l /tmp/ours.rs" }),
+          run_status: "awaiting_approval",
+          run_cwd: "C:/w/run-70",
+          run_prompt: "Resolve the conflict in main.rs." + String.fromCharCode(10, 10) + "Rules follow.",
+          run_recent: JSON.stringify([
+            { name: "Bash", detail: "git status" },
+            { name: "Bash", detail: "git show :2:main.rs" },
+          ]),
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    expect(await screen.findByText("unrecognized shell commands require approval")).toBeDefined();
+    expect(screen.getByText("C:/w/run-70")).toBeDefined();
+    expect(screen.getByText("Resolve the conflict in main.rs.")).toBeDefined();
+    expect(screen.queryByText(/Rules follow/)).toBeNull();
+    const steps = screen.getByRole("list", { name: "Steps before approval #7" });
+    expect(steps.textContent).toContain("git status");
+    expect(steps.textContent).toContain("git show :2:main.rs");
+    expect(screen.queryByText(/approving resumes nothing/)).toBeNull();
+  });
+
+  it("says so when the run is no longer waiting on it", async () => {
+    const world = waitingWorld({
+      approvals: [proposal({ id: 8, run_id: 80, run_status: "cancelled" })],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    expect(await screen.findByText(/The run is cancelled, not waiting on this/)).toBeDefined();
+  });
+});
+
+describe("what a git request asks of the reader", () => {
+  const merge = (overrides: Partial<VcsRequestSummary>): VcsRequestSummary => ({
+    id: 1,
+    op: "merge",
+    project_id: "alpha",
+    repo_key: "alpha",
+    origin: "shell",
+    status: "escalated",
+    created_at: "2026-10-09T20:55:15Z",
+    ...overrides,
+  });
+
+  it("reads every conflict git named, once, and keeps the shapes it cannot parse whole", () => {
+    expect(
+      conflictedFiles(
+        [
+          "Auto-merging a.rs",
+          "CONFLICT (content): Merge conflict in a.rs",
+          "CONFLICT (content): Merge conflict in a.rs",
+          "CONFLICT (modify/delete): b.rs deleted in HEAD and modified in feat/x.",
+          "",
+        ].join("\n"),
+      ),
+    ).toEqual(["a.rs", "b.rs deleted in HEAD and modified in feat/x."]);
+    expect(conflictedFiles(null)).toEqual([]);
+  });
+
+  it("says who acts next, and asks the reader only when it is theirs", () => {
+    expect(gitNextStep(merge({ resolution_run_id: null }))?.yours).toBe(false);
+    expect(gitNextStep(merge({ resolution_run_id: 7, resolution_status: "running" }))).toMatchObject({
+      run: 7,
+      yours: false,
+    });
+    expect(gitNextStep(merge({ resolution_run_id: 7, resolution_status: "awaiting_approval" }))?.yours).toBe(true);
+    expect(gitNextStep(merge({ resolution_run_id: 7, resolution_status: "failed" }))).toMatchObject({
+      run: 7,
+      yours: true,
+    });
+    expect(gitNextStep(merge({ from_resolution: true }))?.yours).toBe(true);
+    expect(gitNextStep(merge({ status: "blocked" }))?.before).toBe("submit it again");
+    expect(gitNextStep(merge({ op: "push" }))).toBeNull();
   });
 });

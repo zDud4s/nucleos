@@ -246,6 +246,28 @@
   color: var(--text-muted);
 }
 
+/* The line that asks the reader to act, against the ones that say somebody else is acting. */
+.waiting-hint-yours {
+  color: var(--text);
+}
+
+/* A git request's branches and conflicted files: what the decision is about, so above the
+   faint metadata in rank and in the body colour. */
+.waiting-git-branches {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.waiting-git-conflicts ul {
+  margin: var(--space-1) 0 0;
+  padding-left: var(--space-2);
+  list-style: none;
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
 /**
  * Prose the card is read for, at the card's own rank.
  *
@@ -284,7 +306,8 @@
  * They name a value.
  */
 .waiting-fact dt,
-.waiting-provenance-head {
+.waiting-provenance-head,
+.waiting-approval-label {
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
@@ -817,4 +840,12 @@
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
   color: var(--text-faint);
+}
+
+.waiting-approval-label {
+  margin: 0 0 var(--space-1);
+}
+
+.waiting-provenance .waiting-provenance-head ~ .waiting-provenance-head {
+  margin-top: var(--space-2);
 }

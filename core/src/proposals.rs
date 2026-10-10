@@ -31,6 +31,19 @@ pub struct Proposal {
     pub run_stage: Option<String>,
     pub item_ordinal: Option<i64>,
     pub item_description: Option<String>,
+    /// The run this asked from, as `list_pending` joins it: what it is now, where it works, how
+    /// its prompt opens, and the last few things it did. The person deciding needs to know what
+    /// the action is FOR, and the classifier's reason only says why it was held. `None` from every
+    /// other query, and from a pruned run.
+    #[sqlx(default)]
+    pub run_status: Option<String>,
+    #[sqlx(default)]
+    pub run_cwd: Option<String>,
+    #[sqlx(default)]
+    pub run_prompt: Option<String>,
+    /// A JSON array of `{name, detail}`, oldest first, at most three long.
+    #[sqlx(default)]
+    pub run_recent: Option<String>,
 }
 
 #[derive(Debug)]
@@ -679,12 +692,25 @@ pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
 
 pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
     sqlx::query_as::<_, Proposal>(
-        "SELECT id, kind, status, run_id, session_id, project_id, tool_name, reasoning,
-                tool_input, read_from, created_at, decided_at,
-                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description
-         FROM proposals
-         WHERE status = 'pending' AND kind = 'action-approval'
-         ORDER BY id ASC",
+        // LEFT so a pruned run still lists. The prompt is cut to its opening, which is where a
+        // task says what it is; the steps are the last few, each detail cut to a line or two.
+        "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.tool_name,
+                p.reasoning, p.tool_input, p.read_from, p.created_at, p.decided_at,
+                NULL AS job_id, NULL AS run_stage, NULL AS item_ordinal, NULL AS item_description,
+                r.status AS run_status, r.cwd AS run_cwd, substr(r.prompt, 1, 600) AS run_prompt,
+                CASE WHEN json_valid(r.tools_used) THEN (
+                    SELECT json_group_array(json_object(
+                               'name', json_extract(t.value, '$.name'),
+                               'detail', substr(json_extract(t.value, '$.detail'), 1, 300)))
+                    FROM (SELECT key, value FROM (
+                              SELECT key, value FROM json_each(r.tools_used)
+                              ORDER BY key DESC LIMIT 3)
+                          ORDER BY key ASC) AS t
+                ) END AS run_recent
+         FROM proposals p
+         LEFT JOIN runs r ON r.id = p.run_id
+         WHERE p.status = 'pending' AND p.kind = 'action-approval'
+         ORDER BY p.id ASC",
     )
     .fetch_all(pool)
     .await
@@ -1524,6 +1550,50 @@ mod tests {
                 .iter()
                 .all(|proposal| proposal.kind == "action-approval" && proposal.status == "pending")
         );
+    }
+
+    /// An approval is decided on what the action is for, so the queue carries the run behind it:
+    /// its state, its directory, how its prompt opens, and its last three steps in order.
+    #[tokio::test]
+    async fn the_approval_queue_says_what_the_run_was_doing() {
+        let pool = test_pool().await;
+        let steps = (1..=5)
+            .map(|n| format!(r#"{{"name":"Bash","detail":"step {n}","result":"ok"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let run = sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, cwd, tools_used, created_at)
+             VALUES ('p', 'Fix the checkout total', 'awaiting_approval', 'worktree',
+                     'C:/w/run-1', ?, '2026-10-10T00:00:00Z')",
+        )
+        .bind(format!("[{steps}]"))
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        create_action_approval(&pool, run, Some("s"), Some("p"), "Bash", "held", None)
+            .await
+            .unwrap();
+        create_action_approval(&pool, 999_999, None, Some("p"), "Bash", "pruned", None)
+            .await
+            .unwrap();
+
+        let pending = list_pending(&pool).await.unwrap();
+        let asked = &pending[0];
+        assert_eq!(asked.run_status.as_deref(), Some("awaiting_approval"));
+        assert_eq!(asked.run_cwd.as_deref(), Some("C:/w/run-1"));
+        assert_eq!(asked.run_prompt.as_deref(), Some("Fix the checkout total"));
+        let recent: serde_json::Value =
+            serde_json::from_str(asked.run_recent.as_deref().unwrap()).unwrap();
+        let details: Vec<&str> = recent
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["detail"].as_str().unwrap())
+            .collect();
+        assert_eq!(details, vec!["step 3", "step 4", "step 5"]);
+        assert_eq!(pending[1].run_status, None);
+        assert_eq!(pending[1].run_recent, None);
     }
 
     /// The two listings must not leak into each other. `list_pending` is a queue somebody works

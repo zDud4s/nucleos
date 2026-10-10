@@ -2124,6 +2124,32 @@ pub struct RequestSummary {
     pub origin: String,
     pub status: String,
     pub created_at: String,
+    /// What a person needs to decide on a row, filled only by `waiting_on_a_person`.
+    ///
+    /// The history listing (`list`) leaves these at their defaults: it can return 200 rows and
+    /// nobody decides anything from it. A Waiting card that showed only the fields above told the
+    /// owner "merge #573 escalated" and nothing about which branches, which files, or whether an
+    /// agent was already on it — the card asked for a decision it gave no grounds for.
+    ///
+    /// `source`/`target` are the merge's branches (absent for other operations).
+    #[sqlx(default)]
+    pub source: Option<String>,
+    #[sqlx(default)]
+    pub target: Option<String>,
+    /// Git's own output, where a conflict names its files.
+    #[sqlx(default)]
+    pub output_tail: Option<String>,
+    #[sqlx(default)]
+    pub failure_reason: Option<String>,
+    /// The run minted to resolve this conflict, and where that run got to.
+    #[sqlx(default)]
+    pub resolution_run_id: Option<i64>,
+    #[sqlx(default)]
+    pub resolution_status: Option<String>,
+    /// This merge was itself a resolution's landing, so no agent will be minted for it.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub from_resolution: bool,
 }
 
 /// How many rows a listing returns at most.
@@ -2196,10 +2222,17 @@ pub const OWNER_DECISION_SQL: &str = "status = 'awaiting_owner'";
 /// (`OWNER_DECISION_SQL`).
 ///
 /// `list` is capped at `LIST_LIMIT`, so a count taken from it silently stopped at the cap. This is
-/// the uncapped read, and it carries the same columns so the shell draws both the same way.
+/// the uncapped read, and it carries the same columns so the shell draws both the same way, plus
+/// the ones a decision needs. The resolution's status is a subquery, not a join: `runs` has a
+/// `status` column too, and the shared predicates name theirs unqualified.
 pub async fn waiting_on_a_person(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<RequestSummary>> {
     sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT id, op, project_id, repo_key, origin, status, created_at
+        "SELECT id, op, project_id, repo_key, origin, status, created_at,
+                json_extract(args, '$.source') AS source,
+                json_extract(args, '$.target') AS target,
+                output_tail, failure_reason, resolution_run_id, from_resolution,
+                (SELECT r.status FROM runs AS r WHERE r.id = vcs_requests.resolution_run_id)
+                    AS resolution_status
            FROM vcs_requests
           WHERE ({WANTS_A_PERSON_SQL}) OR {OWNER_DECISION_SQL}
           ORDER BY id DESC"
@@ -2264,6 +2297,7 @@ fn settled_words(reason: &str) -> &str {
     match reason {
         "superseded" => "a later request on the same merge succeeded",
         "resolved" => "a conflict resolution landed it under another request",
+        "landed" => "its target has since been merged into its source",
         "merged" => "its source is already in its target",
         "source-gone" => "its source branch is gone",
         "dismissed" => "dismissed",
@@ -2275,7 +2309,16 @@ fn settled_words(reason: &str) -> &str {
 ///
 /// `superseded`: a later request with the same project and arguments succeeded (the wording of
 /// `resolver::next_conflict`'s own subquery). `resolved`: the row was handed to a resolution that
-/// lands under another request. Returns how many rows were settled.
+/// lands under another request — linked by `resolved_by`, or, when somebody merged the resolution's
+/// branch into the same target by hand (a plain merge, so `land` never wrote the link), by a later
+/// success of exactly that merge. `landed`: a later merge of this row's target INTO its source
+/// succeeded, so whatever this merge would have brought over is already where it was going.
+///
+/// The two by-hand cases were measured, not imagined: requests 568 and 573 (master into
+/// `feat/agent-loadout-preview`) each got a resolution, each resolution was merged in from the
+/// shell (572, 576) and the branch then landed on master (577) — and both escalations stayed on the
+/// Waiting page a day later, asking the owner to decide something already done.
+/// Returns how many rows were settled.
 pub async fn settle_by_record(pool: &sqlx::SqlitePool) -> sqlx::Result<u64> {
     let settled_at = chrono::Utc::now().to_rfc3339();
     let superseded: Vec<(i64,)> = sqlx::query_as(
@@ -2294,9 +2337,41 @@ pub async fn settle_by_record(pool: &sqlx::SqlitePool) -> sqlx::Result<u64> {
     .fetch_all(pool)
     .await?;
     let resolved: Vec<(i64,)> = sqlx::query_as(
-        "UPDATE vcs_requests SET settled_at = ?, settled_reason = 'resolved'
-          WHERE status IN ('escalated','blocked') AND settled_at IS NULL
-            AND resolved_by IS NOT NULL
+        "UPDATE vcs_requests AS open SET settled_at = ?, settled_reason = 'resolved'
+          WHERE open.status IN ('escalated','blocked') AND open.settled_at IS NULL
+            AND (
+                open.resolved_by IS NOT NULL
+                OR EXISTS (
+                    SELECT 1 FROM vcs_requests AS landed
+                      JOIN worktrees AS w
+                        ON w.owner_kind = 'run' AND w.owner_id = open.resolution_run_id
+                     WHERE landed.project_id = open.project_id
+                       AND landed.op = 'merge'
+                       AND landed.status = 'succeeded'
+                       AND landed.id > open.id
+                       AND json_extract(landed.args, '$.source') = w.branch
+                       AND json_extract(landed.args, '$.target')
+                           = json_extract(open.args, '$.target')
+                )
+            )
+          RETURNING id",
+    )
+    .bind(&settled_at)
+    .fetch_all(pool)
+    .await?;
+    let landed: Vec<(i64,)> = sqlx::query_as(
+        "UPDATE vcs_requests AS open SET settled_at = ?, settled_reason = 'landed'
+          WHERE open.status IN ('escalated','blocked') AND open.settled_at IS NULL
+            AND open.op = 'merge'
+            AND EXISTS (
+                SELECT 1 FROM vcs_requests AS back
+                 WHERE back.project_id = open.project_id
+                   AND back.op = 'merge'
+                   AND back.status = 'succeeded'
+                   AND back.id > open.id
+                   AND json_extract(back.args, '$.source') = json_extract(open.args, '$.target')
+                   AND json_extract(back.args, '$.target') = json_extract(open.args, '$.source')
+            )
           RETURNING id",
     )
     .bind(&settled_at)
@@ -2308,7 +2383,10 @@ pub async fn settle_by_record(pool: &sqlx::SqlitePool) -> sqlx::Result<u64> {
     for (id,) in &resolved {
         say_settled(pool, *id, "resolved").await;
     }
-    Ok((superseded.len() + resolved.len()) as u64)
+    for (id,) in &landed {
+        say_settled(pool, *id, "landed").await;
+    }
+    Ok((superseded.len() + resolved.len() + landed.len()) as u64)
 }
 
 /// Why `dismiss` did not dismiss.
@@ -7594,6 +7672,129 @@ mod tests {
             settlement_of(&pool, landing).await,
             (None, None),
             "the landing row itself is not escalated or blocked"
+        );
+    }
+
+    /// A merge of `source` into `target`, admitted through the real INSERT and moved to `status`.
+    async fn merge_in_status(
+        pool: &sqlx::SqlitePool,
+        source: &str,
+        target: &str,
+        status: &str,
+    ) -> i64 {
+        let op = Op::Merge {
+            source: source.into(),
+            target: target.into(),
+        };
+        let id = submit(pool, &repo_for("alpha"), &op, Origin::Shell)
+            .await
+            .expect("admit the merge");
+        sqlx::query("UPDATE vcs_requests SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("move it to its status");
+        id
+    }
+
+    /// Hands `escalated` to resolution run `run`, whose worktree is on `branch`.
+    async fn hand_to_resolution(pool: &sqlx::SqlitePool, escalated: i64, run: i64, branch: &str) {
+        sqlx::query("UPDATE vcs_requests SET resolution_run_id = ? WHERE id = ?")
+            .bind(run)
+            .bind(escalated)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch,
+                                    created_at)
+             VALUES ('run', ?, 'alpha', '/repo', '/repo/wt', ?, '2026-10-09T00:00:00Z')",
+        )
+        .bind(run)
+        .bind(branch)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Requests 568/573 in production: the resolution was merged in from the shell, a plain merge,
+    /// so `resolved_by` was never written and the escalation stayed open after the work was done.
+    #[tokio::test]
+    async fn a_resolution_merged_in_by_hand_settles_its_escalation() {
+        let pool = test_pool().await;
+        let escalated = merge_in_status(&pool, "master", "feat/x", "escalated").await;
+        hand_to_resolution(&pool, escalated, 900, "alpha/run-900").await;
+        // The resolution branch into some OTHER target says nothing about this conflict.
+        merge_in_status(&pool, "alpha/run-900", "feat/y", "succeeded").await;
+        settle_by_record(&pool).await.unwrap();
+        assert_eq!(settlement_of(&pool, escalated).await, (None, None));
+
+        merge_in_status(&pool, "alpha/run-900", "feat/x", "succeeded").await;
+        settle_by_record(&pool).await.unwrap();
+        assert_eq!(
+            settlement_of(&pool, escalated).await.1.as_deref(),
+            Some("resolved")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_merged_back_into_its_source_settles_the_conflict_as_landed() {
+        let pool = test_pool().await;
+        // Before the escalation: a different event, the branches moved on afterwards.
+        merge_in_status(&pool, "feat/x", "master", "succeeded").await;
+        let escalated = merge_in_status(&pool, "master", "feat/x", "escalated").await;
+        // Same direction as the escalation is `superseded`'s business, not this rule's.
+        let unrelated = merge_in_status(&pool, "master", "feat/y", "escalated").await;
+        settle_by_record(&pool).await.unwrap();
+        assert_eq!(settlement_of(&pool, escalated).await, (None, None));
+
+        merge_in_status(&pool, "feat/x", "master", "succeeded").await;
+        settle_by_record(&pool).await.unwrap();
+        assert_eq!(
+            settlement_of(&pool, escalated).await.1.as_deref(),
+            Some("landed")
+        );
+        assert_eq!(settlement_of(&pool, unrelated).await, (None, None));
+        assert!(
+            feed_of(&pool, escalated).await.iter().any(|(_, summary)| {
+                summary.ends_with("its target has since been merged into its source")
+            }),
+            "the feed says why in words"
+        );
+    }
+
+    /// The Waiting card's grounds for a decision: which branches, git's output, and the resolution.
+    #[tokio::test]
+    async fn waiting_on_a_person_carries_what_a_decision_needs() {
+        let pool = test_pool().await;
+        let escalated = merge_in_status(&pool, "master", "feat/x", "escalated").await;
+        sqlx::query("UPDATE vcs_requests SET output_tail = ? WHERE id = ?")
+            .bind("CONFLICT (content): Merge conflict in a.rs\n")
+            .bind(escalated)
+            .execute(&pool)
+            .await
+            .unwrap();
+        hand_to_resolution(&pool, escalated, 901, "alpha/run-901").await;
+
+        let waiting = waiting_on_a_person(&pool).await.unwrap();
+        let row = waiting.iter().find(|r| r.id == escalated).expect("listed");
+        assert_eq!(row.source.as_deref(), Some("master"));
+        assert_eq!(row.target.as_deref(), Some("feat/x"));
+        assert!(row.output_tail.as_deref().unwrap().contains("a.rs"));
+        assert_eq!(row.resolution_run_id, Some(901));
+        assert_eq!(
+            row.resolution_status, None,
+            "no such run row: absent, not an error"
+        );
+        assert!(!row.from_resolution);
+
+        let history = list(&pool, None).await.unwrap();
+        assert!(
+            history
+                .iter()
+                .all(|r| r.source.is_none() && r.output_tail.is_none()),
+            "the 200-row history stays light"
         );
     }
 

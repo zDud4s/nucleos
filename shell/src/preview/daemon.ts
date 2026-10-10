@@ -597,21 +597,84 @@ function noteDetail(id: number): NoteDetail | null {
   };
 }
 
+const APPROVAL_BASE = {
+  kind: "action-approval",
+  status: "pending",
+  tool_name: "Bash",
+  read_from: null,
+  decided_at: null,
+  run_status: "awaiting_approval",
+};
+
+const steps = (...details: string[]) =>
+  JSON.stringify(details.map((detail) => ({ name: "Bash", detail })));
+
 export const PROPOSALS: Proposal[] = [
-  ...["alpha", "alpha", "alpha", "bravo", "bravo"].map((project_id, index) => ({
-    id: 101 + index,
-    kind: "action-approval",
-    status: "pending",
+  {
+    ...APPROVAL_BASE,
+    id: 101,
+    run_id: 900621,
+    session_id: "72a4a393",
+    project_id: "alpha",
+    reasoning:
+      "this shell line cannot be read as a sequence of commands: command substitution runs a nested command",
+    tool_input: JSON.stringify({
+      command:
+        ["git commit -m \"$(cat <<'EOF'", "merge feat/checkout into master", "", "Keep both preview routes.", "EOF", ")\""].join("\n"),
+      description: "Commit the conflict resolution",
+    }),
+    run_cwd: "C:/Projects/alpha/.nucleos/worktrees/run-900621",
+    run_prompt:
+      "You are resolving a merge conflict that the version-control queue met and could not carry.\n\nThe conflict is ALREADY STAGED in this worktree.",
+    run_recent: steps("git status", "git diff --name-only --diff-filter=U", "git add src/cart.ts"),
+    created_at: ago(60 * 1000),
+  },
+  {
+    ...APPROVAL_BASE,
+    id: 102,
+    run_id: 900604,
+    session_id: "bd8bdeec",
+    project_id: "alpha",
+    reasoning: "unrecognized shell commands and code execution require approval",
+    tool_input: JSON.stringify({
+      command:
+        "git show :2:core/src/main.rs > /tmp/ours_main.rs; git show :3:core/src/main.rs > /tmp/theirs_main.rs; wc -l /tmp/ours_main.rs /tmp/theirs_main.rs",
+    }),
+    run_cwd: "C:/Projects/alpha/.nucleos/worktrees/run-900604",
+    run_prompt: "Bring master into feat/prompt-boundary and resolve what conflicts.",
+    run_recent: steps("git merge master", "git status"),
+    created_at: ago(2 * 60 * 1000),
+  },
+  {
+    ...APPROVAL_BASE,
+    id: 103,
+    run_id: 900556,
+    session_id: "e131ce90",
+    project_id: "bravo",
+    reasoning: "this shell line cannot be read as a sequence of commands: assigning PATH changes which program runs",
+    tool_input: JSON.stringify({
+      command: 'export PATH="C:/Projects/cargo/bin:$PATH"\ncargo build -p nucleos-core',
+      description: "Build the core",
+    }),
+    run_cwd: "C:/Projects/bravo",
+    run_prompt: "Add a retry to the mail sync when the server drops the connection.",
+    run_recent: steps("cargo build -p nucleos-core", "where cargo"),
+    read_from: JSON.stringify([
+      { tool: "WebFetch", arguments: JSON.stringify({ url: "https://example.com/rust-setup" }) },
+    ]),
+    created_at: ago(3 * 60 * 1000),
+  },
+  {
+    ...APPROVAL_BASE,
+    id: 104,
     run_id: null,
     session_id: null,
-    project_id,
-    tool_name: "Bash",
-    reasoning: "The next action needs an owner's approval.",
+    project_id: "bravo",
+    reasoning: "unrecognized shell commands and code execution require approval",
     tool_input: JSON.stringify({ command: "git status" }),
-    read_from: null,
-    created_at: ago((index + 1) * 60 * 1000),
-    decided_at: null,
-  })),
+    run_status: null,
+    created_at: ago(4 * 60 * 1000),
+  },
 ];
 
 export const TEAM_ACTION_PROPOSALS: Proposal[] = ACTIONS.map((action) => ({
@@ -885,6 +948,12 @@ export const VCS_REQUESTS: VcsRequestSummary[] = [
     origin: "run",
     status: "escalated",
     created_at: ago(40 * 60 * 1000),
+    source: "master",
+    target: "feat/checkout",
+    output_tail:
+      "Auto-merging src/cart.ts\nCONFLICT (content): Merge conflict in src/cart.ts\nAutomatic merge failed; fix conflicts and then commit the result.\n",
+    resolution_run_id: 9021,
+    resolution_status: "running",
   },
   {
     id: 409,
