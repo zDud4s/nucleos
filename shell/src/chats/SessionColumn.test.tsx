@@ -24,7 +24,6 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 import { SessionColumn } from "./SessionColumn";
-import { chatHue } from "./sessions";
 import { createAppQueryClient } from "../app/queryClient";
 import type { ChatGroup, ChatSummary } from "../data/chats";
 
@@ -66,6 +65,16 @@ const ARCHIVED: ChatSummary[] = [
   chat({ chat_id: "c-old", title: "old thing", archived_at: "2026-08-01T00:00:00Z" }),
 ];
 
+const EDITOR = [
+  {
+    session_id: "s-ide",
+    cwd: "C:/Projects/elsewhere",
+    title: "typed in the editor",
+    last_activity: new Date().toISOString(),
+    tools: true,
+  },
+];
+
 const posts: Array<{ path: string; method: string; body: unknown }> = [];
 
 beforeEach(() => {
@@ -84,6 +93,7 @@ beforeEach(() => {
       }
       if (path === "/assistant/chat-groups") return GROUPS;
       if (path.startsWith("/assistant/chats?archived=true")) return ARCHIVED;
+      if (path === "/assistant/ide-sessions") return EDITOR;
       return [];
     },
   );
@@ -133,7 +143,7 @@ describe("SessionColumn", () => {
     const onNew = vi.fn();
     await renderColumn({ onNew });
 
-    // The way in.
+    // The way in, at the head of the column it folds away with.
     fireEvent.click(await screen.findByRole("button", { name: "New session" }));
     expect(onNew).toHaveBeenCalledTimes(1);
     // New group sits beside it, on the same row, and nowhere else.
@@ -144,10 +154,10 @@ describe("SessionColumn", () => {
 
     // The group holds its own row, the rest are ungrouped, and each heading carries a count.
     expect(await screen.findByText("Mail work (1)")).toBeDefined();
-    expect(screen.getByText("Ungrouped (3)")).toBeDefined();
+    expect(await screen.findByText("Ungrouped (4)")).toBeDefined();
     const group = screen.getByText("Mail work (1)").closest("details") as HTMLElement;
     expect(within(group).getByText("needs an answer")).toBeDefined();
-    const ungrouped = screen.getByText("Ungrouped (3)").closest("details") as HTMLElement;
+    const ungrouped = screen.getByText("Ungrouped (4)").closest("details") as HTMLElement;
     expect(within(ungrouped).getByText("busy one")).toBeDefined();
     expect(within(ungrouped).queryByText("needs an answer")).toBeNull();
 
@@ -157,15 +167,8 @@ describe("SessionColumn", () => {
     expect(within(ungrouped).getByLabelText("Unread").className).toContain("chats-dot-unread");
     expect(within(ungrouped).getByLabelText("Seen").className).toContain("chats-dot-seen");
 
-    // Every row carries its conversation's own colour, stable per chat_id — even a row whose state
-    // has nothing to report (a closed tab, idle), which used to show no dot at all.
-    const own = (title: string) =>
-      screen
-        .getByText(title)
-        .closest("a")
-        ?.querySelector<HTMLElement>(".chats-dot-chat")
-        ?.style.getPropertyValue("--chat-hue");
-    for (const row of ROWS) expect(own(row.title as string)).toBe(String(chatHue(row.chat_id)));
+    // The colour is the state's and nobody else's: no row wears a colour of its own.
+    expect(document.querySelector(".chats-dot-chat")).toBeNull();
 
     // The filter menu: counts per status and per tab state.
     openMenu(screen.getByRole("button", { name: "Filter sessions" }));
@@ -216,7 +219,7 @@ describe("SessionColumn", () => {
   it("lists archived sessions only once opened and restores one", async () => {
     await renderColumn();
     // Not asked for while the section is shut.
-    await screen.findByText("Ungrouped (3)");
+    await screen.findByText("Ungrouped (4)");
     expect(
       daemon.apiFetch.mock.calls.some(([path]) => String(path).includes("archived=true")),
     ).toBe(false);
@@ -232,5 +235,28 @@ describe("SessionColumn", () => {
         body: undefined,
       }),
     );
+  });
+
+  it("hides the editor's own sessions from the filter menu, and remembers it", async () => {
+    const { unmount } = await renderColumn();
+    expect(await screen.findByText("typed in the editor")).toBeDefined();
+
+    openMenu(screen.getByRole("button", { name: "Filter sessions" }));
+    const source = await screen.findByRole("menuitemcheckbox", { name: "From the editor (1)" });
+    expect(source.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(source);
+
+    await waitFor(() => expect(screen.queryByText("typed in the editor")).toBeNull());
+    // NucleOS's own conversations stay.
+    expect(screen.getByText("busy one")).toBeDefined();
+    // The menu is still open, which hides the rest of the page from the accessibility tree.
+    expect(
+      screen.getByRole("button", { name: "Filter sessions", hidden: true }).hasAttribute("data-on"),
+    ).toBe(true);
+
+    unmount();
+    await renderColumn();
+    await screen.findByText("busy one");
+    expect(screen.queryByText("typed in the editor")).toBeNull();
   });
 });

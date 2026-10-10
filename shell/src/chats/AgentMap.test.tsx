@@ -1,8 +1,24 @@
-import { describe, expect, it } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { QueryClientProvider } from "@tanstack/react-query";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
+const daemon = vi.hoisted(() => ({
+  apiFetch: vi.fn(),
+  apiText: vi.fn(),
+  apiBlob: vi.fn(),
+  probeHealth: vi.fn(),
+}));
+vi.mock("../data/client", async (original) => ({
+  ...(await original<typeof import("../data/client")>()),
+  ...daemon,
+}));
+
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { AgentMapBody, durationText, groupAgents } from "./AgentMap";
 import type { ToolCall, Turn } from "../lib/turns";
 import type { ChatTask } from "../data/chats";
+import { createAppQueryClient } from "../app/queryClient";
 
 const call = (over: Partial<ToolCall>): ToolCall => ({ name: "Bash", detail: null, todos: [], ...over });
 
@@ -96,14 +112,19 @@ describe("AgentMapBody", () => {
   it("draws the root, the children and the background count, and opens a detail view", () => {
     render(<AgentMapBody turns={turns} chatTitle="My chat" now={Date.parse("2026-10-03T10:23:50Z")} />);
     expect(screen.getByText("My chat")).toBeTruthy();
-    expect(screen.getByText(/12\.3k context/)).toBeTruthy();
+    expect(screen.getByText(/12\.3k tokens/)).toBeTruthy();
     expect(screen.getByText("1 background task")).toBeTruthy();
     expect(screen.getByText(/shell · 23m 50s/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /explore/ }));
-    expect(screen.getByText("needle")).toBeTruthy();
+    // Its calls, and the one it is on now.
+    expect(within(screen.getByRole("list", { name: "Its tool calls" })).getByText("needle")).toBeTruthy();
+    expect(screen.getByText(/^Running/).textContent).toContain("needle");
     expect(screen.getByText(/Explore/)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Back to the map" }));
+    // Over the map, not instead of it: the map is still there underneath.
+    expect(screen.getByRole("dialog", { name: "explore" })).toBeTruthy();
     expect(screen.getByText("1 background task")).toBeTruthy();
+    fireEvent.click(within(screen.getByRole("dialog", { name: "explore" })).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog", { name: "explore" })).toBeNull();
   });
 
   it("shows a settled subagent's final text and tokens from its row", () => {
@@ -121,5 +142,47 @@ describe("AgentMapBody", () => {
     expect(screen.getByText(/4\.2k tokens/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /explore — completed/ }));
     expect(screen.getByText("the callers are in parser.rs")).toBeTruthy();
+  });
+
+  it("opens the whole run over the detail, each call with what went in and came out", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) =>
+      path === "/assistant/turns/1/tools"
+        ? { did: [{ name: "Grep", detail: "needle", todos: [], id: "x", parent: "a", result: "parser.rs:12" }] }
+        : undefined,
+    );
+    render(
+      <QueryClientProvider client={createAppQueryClient()}>
+        <AgentMapBody turns={turns} chatTitle="My chat" chatId="c-9" now={Date.parse("2026-10-03T10:23:50Z")} />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /explore/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Open transcript" }));
+
+    const run = await screen.findByRole("list", { name: "Transcript" });
+    expect(within(run).getByText("Grep")).toBeTruthy();
+    expect(within(run).getByText("needle")).toBeTruthy();
+    await waitFor(() => expect(within(run).getByText("parser.rs:12")).toBeTruthy());
+    // Still working, and it says so at the end.
+    expect(within(run).getByText("Working…")).toBeTruthy();
+  });
+
+  it("stops one working agent by its task id, from beside Open transcript", async () => {
+    daemon.apiFetch.mockResolvedValue({ stopped: "asked" });
+    const live = [
+      turn([call({ id: "a", name: "Task", detail: "explore", task_id: "tk1" })], "running"),
+    ];
+    render(
+      <QueryClientProvider client={createAppQueryClient()}>
+        <AgentMapBody turns={live} chatTitle="My chat" chatId="c-9" now={Date.parse("2026-10-03T10:23:50Z")} />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /explore/ }));
+    const stop = screen.getByRole("button", { name: "Stop agent" });
+    // Beside Open transcript, after it.
+    expect(stop.previousElementSibling?.textContent).toBe("Open transcript");
+    fireEvent.click(stop);
+    await waitFor(() =>
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-9/tasks/tk1/stop", { method: "POST" }),
+    );
   });
 });

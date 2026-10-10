@@ -1714,6 +1714,26 @@ export function useAnswerAsk(chatId: string) {
  * `cancelled`, and the list carries the ordering and the unread count, which
  * both move when a turn stops moving.
  */
+/**
+ * Stop ONE agent of a running conversation — a subagent or a background shell — by the CLI's task
+ * id, leaving the turn and every other agent to carry on. 404 when no turn is running to ask.
+ */
+export function useStopTask(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (taskId: string) =>
+      apiFetch<{ stopped: string }>(
+        `/assistant/chats/${encodeURIComponent(chatId)}/tasks/${encodeURIComponent(taskId)}/stop`,
+        { method: "POST" },
+      ),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.tasks(chatId) });
+    },
+  });
+}
+
 export function useStopTurn(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({

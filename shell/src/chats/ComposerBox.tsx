@@ -4,7 +4,7 @@ import type {
   ReactNode,
   RefObject,
 } from "react";
-import { ArrowUp } from "lucide-react";
+import { ArrowUp, Square } from "lucide-react";
 
 /**
  * One object you type into, with the actions inside it — see `.chats-composer-box`.
@@ -30,6 +30,7 @@ export function ComposerBox({
   sendDisabled,
   placeholder = "Say something…",
   sendLabel = "Send",
+  stop,
 }: {
   text: string;
   /** The new text, and where the caret is in it. */
@@ -48,7 +49,14 @@ export function ComposerBox({
   sendDisabled: boolean;
   placeholder?: string;
   sendLabel?: string;
+  /**
+   * A turn is running: while the box is empty the send button is this one instead, in the same
+   * place — the corner the hand is already on — the way every chat app turns send into stop.
+   * Typing brings send back, because what is typed then is something to say, not a wish to stop.
+   */
+  stop?: { onStop: () => void; pending: boolean };
 }) {
+  const stopping = stop !== undefined && text.trim() === "";
   return (
     <div className="chats-composer-box">
       {/* The control beside the textarea shares its flex line rather than owning a row: the
@@ -80,15 +88,28 @@ export function ComposerBox({
       </div>
       <div className="chats-composer-actions">
         {actions}
-        <button
-          type="button"
-          className="chats-send"
-          aria-label={sendLabel}
-          disabled={sendDisabled}
-          onClick={onSubmit}
-        >
-          <ArrowUp className="chats-send-icon" aria-hidden="true" />
-        </button>
+        {stopping ? (
+          <button
+            type="button"
+            className="chats-send chats-send-stop"
+            aria-label="Stop"
+            title="stop the turn — the conversation stays warm for the next message"
+            disabled={stop.pending}
+            onClick={stop.onStop}
+          >
+            <Square className="chats-send-icon chats-send-stop-icon" aria-hidden="true" />
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="chats-send"
+            aria-label={sendLabel}
+            disabled={sendDisabled}
+            onClick={onSubmit}
+          >
+            <ArrowUp className="chats-send-icon" aria-hidden="true" />
+          </button>
+        )}
       </div>
     </div>
   );
