@@ -76,6 +76,18 @@ export function reduce(state: PanelState, incoming: Incoming): PanelState {
         text: incoming.text,
         ts: incoming.ts,
       };
+      if (incoming.role === "person") {
+        // Core mirrors the person's own words back; adopt the oldest unmatched
+        // local line with the same text instead of showing it twice.
+        const at = state.messages.findIndex(
+          (m) => m.key.startsWith("say:") && m.text === incoming.text,
+        );
+        if (at >= 0) {
+          const messages = state.messages.slice();
+          messages[at] = { ...messages[at], key, ts: incoming.ts };
+          return { ...state, messages };
+        }
+      }
       return { ...state, messages: [...state.messages, message] };
     }
     case "state":

@@ -68,3 +68,38 @@ describe("panel protocol", () => {
     expect(giveBack("log in done")).toEqual({ v: 1, kind: "give_back", note: "log in done" });
   });
 });
+
+describe("panel protocol mirror dedupe", () => {
+  const mirror = (text: string, ts: string): Incoming => ({
+    v: 1,
+    kind: "message",
+    role: "person",
+    text,
+    ts,
+  });
+
+  it("panel protocol replaces a pending say with its mirrored line", () => {
+    let state = pendingSay(initialState(), "c1", "hello", "2026-10-09T10:01:00Z");
+    state = reduce(state, mirror("hello", "2026-10-09T10:01:01Z"));
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0].key).toBe("person|2026-10-09T10:01:01Z|hello");
+    // A replay of the same mirror stays one line.
+    state = reduce(state, mirror("hello", "2026-10-09T10:01:01Z"));
+    expect(state.messages).toHaveLength(1);
+  });
+
+  it("panel protocol keeps two different mirrored texts as two lines", () => {
+    let state = pendingSay(initialState(), "c1", "one", "2026-10-09T10:01:00Z");
+    state = reduce(state, mirror("two", "2026-10-09T10:01:01Z"));
+    expect(state.messages).toHaveLength(2);
+  });
+
+  it("panel protocol matches the same text said twice to two mirrors", () => {
+    let state = pendingSay(initialState(), "c1", "ok", "2026-10-09T10:01:00Z");
+    state = pendingSay(state, "c2", "ok", "2026-10-09T10:02:00Z");
+    state = reduce(state, mirror("ok", "2026-10-09T10:01:01Z"));
+    state = reduce(state, mirror("ok", "2026-10-09T10:02:01Z"));
+    expect(state.messages).toHaveLength(2);
+    expect(state.messages.every((m) => m.key.startsWith("person|"))).toBe(true);
+  });
+});

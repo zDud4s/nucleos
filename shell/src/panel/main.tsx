@@ -4,6 +4,7 @@ import tokensCss from "../tokens.css?inline";
 import chatsCss from "../pages/chats.css?inline";
 import panelCss from "./panel.css?inline";
 import { Panel } from "./Panel";
+import { shouldMount } from "./frame";
 import { dropUntrusted } from "./trust";
 import type { Incoming, Outgoing } from "./protocol";
 
@@ -19,10 +20,14 @@ declare global {
 const listeners = new Set<(m: Incoming) => void>();
 const backlog: Incoming[] = [];
 
-globalThis.__nucleosPush = (message) => {
-  if (listeners.size === 0) backlog.push(message);
-  for (const fn of listeners) fn(message);
-};
+const topFrame = shouldMount(window);
+
+if (topFrame) {
+  globalThis.__nucleosPush = (message) => {
+    if (listeners.size === 0) backlog.push(message);
+    for (const fn of listeners) fn(message);
+  };
+}
 
 function subscribe(fn: (m: Incoming) => void): () => void {
   listeners.add(fn);
@@ -58,7 +63,9 @@ function mount(): HTMLElement {
   return host;
 }
 
-const host = mount();
-new MutationObserver(() => {
-  if (!host.isConnected) document.documentElement.appendChild(host);
-}).observe(document.documentElement, { childList: true });
+if (topFrame) {
+  const host = mount();
+  new MutationObserver(() => {
+    if (!host.isConnected) document.documentElement.appendChild(host);
+  }).observe(document.documentElement, { childList: true });
+}
