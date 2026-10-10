@@ -263,18 +263,16 @@ export function Fleet() {
         </Teach>
       )}
 
-      {/* Above both views: which project has room, and what is in each slot, is a question
-          neither arrangement answers at a glance, and the rack does not change with the view. */}
-      {/* In the columns view a busy project is its column's head, so the rack keeps only the idle
-          ones; the canvas has no column heads, so there it keeps every project. */}
-      {hasProjects && (
+      {/* Columns view only: a busy project is its column's head, so the rack keeps the idle
+          ones. The canvas tab shows the canvas and nothing else (owner's call, 2026-10-09). */}
+      {hasProjects && view === "columns" && (
         <SlotRack
           columns={model.columns}
           projects={projects.data}
           stale={stale}
           panelId={panelId}
           onNewJob={openComposer}
-          only={view === "columns" ? "idle" : "all"}
+          only="idle"
         />
       )}
 
