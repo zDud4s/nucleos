@@ -46,7 +46,30 @@ the contract, not a snapshot.
 | `sidecar.rs` | Generic sidecar supervisor (spawn/wait/restart) — reusable for any future Go sidecar. Owns the process-global registry of what it last saw of each child, which is what `GET /sidecars` lists and what `health.rs` grades a readiness row from. It reports the OS's `ErrorKind` and never a `FailureCategory`: the vocabulary a person reads is `health.rs`'s to choose, and keeping that translation in one place is what stops one spawn failure being described two ways. |
 | `config.rs` | Model pinning (`~/.nucleos/nucleos-models.yaml`) + the typed per-project `autopilot.yaml` reader (`load_schedule_rules(machine_root, project_id)` → `AutopilotRules { schedules, repo_triggers }`, from `~/.nucleos/projects/<id>/`) read by `scheduler.rs`/`repo_trigger.rs`. Both fall back to defaults when the file is absent but error on malformed YAML rather than guessing. |
 | `models/model_catalog.rs` | Model discovery: display names, family/runner from an id, vendor `/v1/models` parsing, grouping newest-first, the versioned fallback catalogue, and the 1-day cache. Keys are handed in by main.rs; never reads the keyring. |
-| `http.rs` | axum router + CORS assembly — the ONLY module that knows the transport is HTTP. |
+| `http.rs` | axum router + CORS assembly — the ONLY module that knows the transport is HTTP. Parent of `http/`: each child owns one route family and exposes `routes()` with full literal paths (no `nest`, so `map::seam` still reads every path); `build_router` merges them and applies `require_token` once. Holds `/health`, `/status`, `/home`, `/daemon/shutdown`, `/webhooks/push`, the shutdown watchdog and the inline `mod tests`. |
+| `http/admin.rs` | API tokens, backups, sidecars and this machine's settings (`/api-tokens`, `/backup*`, `/sidecars`, `/config/*`). |
+| `http/agents.rs` | Agents, loadouts, presets and model routing (`/agents`, `/loadout/*`, `/presets`, `/models`, `/route`). |
+| `http/brains.rs` | Which models and tools a conversation can use (`/assistant/models*`, `/assistant/local-model*`, `/assistant/tools`, `/assistant/ide-sessions*`). |
+| `http/chat_edit.rs` | Creating and editing a conversation and its groups (`POST /assistant/chats`, `PATCH /assistant/chats/{chat_id}`, `/assistant/chat-groups*`). |
+| `http/chat_turns.rs` | Sending a message and following its turn (`/assistant/message`, `/assistant/turns/*`, `/assistant/{turn_id}*`, relay and forward). |
+| `http/chats.rs` | Reading a conversation and the state around it (`/assistant/chats*`). |
+| `http/commands.rs` | A project's commands, rules and limits (`/projects/{id}/commands*`, `/rules`, `/shell-rules`, `/wip-limit`). |
+| `http/common.rs` | Query shapes, resolvers and refusals shared by more than one route family. |
+| `http/email.rs` | Mail, contacts and calendar (`/email/*`, `/contacts/*`, `/calendar/*`). |
+| `http/files.rs` | The shared files area (`/files/*`). |
+| `http/fleet.rs` | Autopilot state, kill switches, quota and fleet capacity (`/autopilot/*`, `/quota`, `/fleet/*`, `/concurrency`). |
+| `http/git_ops.rs` | Declared git and GitHub operations and land targets (`/projects/{id}/git-ops`, `/github-ops`, `/land-targets`, `/github/*`). |
+| `http/hooks.rs` | Claude Code hook decisions (`/hooks/*`). |
+| `http/judging.rs` | Shadow decisions, judge verdicts and the scoreboard (`/shadow-decisions/*`, `/judge-*`, `/scoreboard`, `/verify/*`). |
+| `http/knowledge.rs` | Jobs, knowledge, owner notes and capture requests (`/jobs/*`, `/knowledge/*`, `/owner-notes/*`, `/capture-requests/*`). |
+| `http/map.rs` | The project map (`/projects/{id}/map/*`). |
+| `http/projects.rs` | The roster: adding, reading and removing projects (`/projects*`). |
+| `http/proposals.rs` | Proposals and the waiting queue (`/proposals/*`, `/waiting/*`). |
+| `http/relay.rs` | Notifications, PII, voice, web and browser seats (`/notifications/*`, `/pii`, `/voice/*`, `/web/*`, `/browser/*`). |
+| `http/repo.rs` | Reading and writing a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`, `/write`…). |
+| `http/run_queue.rs` | Runs, the vcs queue, worktrees and the feed (`/runs/*`, `/vcs/*`, `/worktrees`, `/feed`). |
+| `http/team.rs` | Council and teams (`/council/*`, `/teams/*`, `/team-*`). |
+| `http/workflows.rs` | Workflows (`/workflows/*`, `/projects/{id}/workflows/*`). |
 | `lib.rs` | The library crate root: declares every module except `http` and `main` (the bottom ones are re-exported from `nucleos-base`), all `pub`, so the binary (`main.rs` + `http.rs`) compiles separately and an edit to `http.rs` recompiles only the binary. The `testkit` feature exposes test fixtures to the binary's tests; Cargo turns it on for test builds through the self dev-dependency in `Cargo.toml`. |
 | `crates/nucleos-base/src/lib.rs` | Root of `nucleos-base`, the bottom crate: storage (with `MIGRATOR`, which embeds `core/migrations`), the test database, process/gate plumbing and the other modules that name nothing above them. `nucleos-core`'s `lib.rs` re-exports each one (`pub use nucleos_base::storage;`), so `crate::storage::...` is unchanged there. Its `testkit` feature exposes fixtures to the crates above and is enabled by theirs. |
 | `door.rs` | The few pieces of the HTTP door the library itself calls or tests against, moved out of `http.rs` by the lib/bin split: `uncancellable`, `files_root`, `refusal`, `sending_run_id_of`, and the knowledge door (`post_knowledge`, `recall_knowledge`, `post_finding`) that `mcp_tools`' and `assistant`'s tests drive end to end. `http.rs` routes to them; nothing here is new. |

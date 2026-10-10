@@ -1264,6 +1264,10 @@ mod tests {
             if crate::source_scan::is_top_level(&path) && allowed.contains(&name) {
                 continue;
             }
+            // `http.rs`'s children are the same door, split by route family.
+            if crate::source_scan::module_path(&path).starts_with("http/") {
+                continue;
+            }
             let source = std::fs::read_to_string(&path).expect("source file must be readable");
             if crate::source_scan::is_top_level(&path) && name == "distill.rs" {
                 assert!(

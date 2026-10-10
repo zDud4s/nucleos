@@ -31,8 +31,8 @@
 //! - **Test routers are not the boundary.** `auth.rs` registers 66 routes and every one is a
 //!   fixture inside `#[cfg(test)] mod tests`; `hooks.rs` and `runs.rs` have their own. Scanning
 //!   every `.route(` in every file said this daemon serves `/secret`. So a `#[cfg(test)] mod`
-//!   block is skipped whole, and after that every route found is in `http.rs` — 208 of them,
-//!   which is exactly what `http.rs` registers outside its own tests.
+//!   block is skipped whole, and after that every route found is in `http.rs` or its `http/`
+//!   children — 208 of them then, which is exactly what the router registered outside its tests.
 //! - **A comment is not code.** `auth.rs` explains itself with `` `.route("/files", …)` `` inside a
 //!   doc comment, and a text search reported that as a served route. The scan runs over
 //!   [`crate::map::items::mask`], which blanks comments and string *contents* while leaving every
