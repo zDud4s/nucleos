@@ -884,7 +884,7 @@ pub async fn start_with(
         None => resolve_roster(state, &configured.chairman, &configured.members).await?,
     };
 
-    if let crate::budget::BudgetDecision::Pause { reason, source, .. } =
+    if let crate::governance::budget::BudgetDecision::Pause { reason, source, .. } =
         crate::quota::permits_new_run(state, chrono::Utc::now()).await
     {
         return Err(if source == crate::quota::PAUSE_SOURCE {
@@ -1646,7 +1646,8 @@ impl Driver {
         // transcript, and what a peer is shown, a critique is parsed from and the chairman reads is
         // the text the model wrote. A runner that already returns plain text is passed through.
         let outcome = if outcome.status == SEAT_OK {
-            let answer = crate::runner::extract_reply(&outcome.answer).unwrap_or(outcome.answer);
+            let answer =
+                crate::execution::runner::extract_reply(&outcome.answer).unwrap_or(outcome.answer);
             SeatOutcome { answer, ..outcome }
         } else {
             outcome
@@ -1737,12 +1738,17 @@ impl Driver {
             Some(block) => format!("{prompt}{block}"),
             None => prompt,
         };
-        let request = crate::runner::RunRequest {
+        let request = crate::execution::runner::RunRequest {
             prompt,
             // The council's OWN key, never `state.token`. `auth::COUNCIL_ROUTES` is what it reaches.
-            env: crate::runs::run_env(&self.token, run_id, None, crate::speed::Capacity::solo()),
+            env: crate::execution::runs::run_env(
+                &self.token,
+                run_id,
+                None,
+                crate::speed::Capacity::solo(),
+            ),
             cwd: None,
-            permission: crate::runner::Permission::Default,
+            permission: crate::execution::runner::Permission::Default,
             resume_session_id: None,
             mcp_config: with_tools.then(|| mcp_config_path(&self.id)),
             mcp_job: None,
@@ -1751,12 +1757,12 @@ impl Driver {
             // given tools is offered the whole surface and pays for the whole surface, which
             // `runner::authored_prompt` reads off the line above.
             tool_policy: if with_tools {
-                crate::runner::ToolPolicy::McpOnly
+                crate::execution::runner::ToolPolicy::McpOnly
             } else {
-                crate::runner::ToolPolicy::None
+                crate::execution::runner::ToolPolicy::None
             },
             progress_timeout: None,
-            max_turns: Some(crate::runner::DEFAULT_MAX_TURNS),
+            max_turns: Some(crate::execution::runner::DEFAULT_MAX_TURNS),
             session_id: Some(session_id),
             fork_session: false,
             include_partial_messages: false,
@@ -1802,7 +1808,7 @@ impl Driver {
         let pool = self.state.pool.clone();
         let runner = self.state.runner.clone();
         let timeout = self.timeout;
-        crate::runs::spawn_registered(&self.state, run_id, async move {
+        crate::execution::runs::spawn_registered(&self.state, run_id, async move {
             // Captured, so an abort drops it and the awaiting driver learns the seat was
             // cancelled — the same mechanism, and the same reason, as every other guard here.
             let result_tx = result_tx;
@@ -1811,7 +1817,7 @@ impl Driver {
             // this seat's final status: every stage opens its own run, so one decision is one seat
             // turn and is reported once.
             let mut request = request;
-            let decision = crate::seat_advice::route_council_seat(
+            let decision = crate::models::seat_advice::route_council_seat(
                 &pool,
                 runner.router(),
                 run_id,
@@ -1877,7 +1883,7 @@ impl Driver {
                     //
                     // `num_turns` and the token columns travel here too, and did not used to: a
                     // seat that answers once and then dies at its turn ceiling —
-                    // `crate::runner::TURN_CEILING_EXIT_CODE`, a non-zero exit, so it lands in
+                    // `crate::execution::runner::TURN_CEILING_EXIT_CODE`, a non-zero exit, so it lands in
                     // THIS arm — carries the completed turn's own count and usage in `RunOutcome`
                     // exactly as the `completed` arm above does, and this `UPDATE` was the one
                     // place that dropped them on the floor instead of binding them.
@@ -1929,7 +1935,7 @@ impl Driver {
             };
             // A cancel aborts this task before it gets here, which is why a cancelled seat is
             // never reported.
-            crate::seat_advice::report_council_seat(
+            crate::models::seat_advice::report_council_seat(
                 runner.router(),
                 decision,
                 seat_outcome.status,
@@ -2004,14 +2010,14 @@ impl Driver {
             self.token.clone(),
             self.state.pool.clone(),
         );
-        let no_tools = crate::local_agent::NoTools;
+        let no_tools = crate::models::local_agent::NoTools;
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<SeatOutcome>();
         let pool = self.state.pool.clone();
         let timeout = self.timeout;
-        crate::runs::spawn_registered(&self.state, run_id, async move {
+        crate::execution::runs::spawn_registered(&self.state, run_id, async move {
             let result_tx = result_tx;
-            let tool_box: &dyn crate::local_agent::ToolBox =
+            let tool_box: &dyn crate::models::local_agent::ToolBox =
                 if with_tools { &tools } else { &no_tools };
             // Owned out here rather than read off the returned `Turn`, for the reason `run_turn`
             // gives: a wall-clock timeout drops that future and a transport error propagates past
@@ -2019,12 +2025,12 @@ impl Driver {
             let taint = std::sync::atomic::AtomicBool::new(false);
             let turn = tokio::time::timeout(
                 timeout,
-                crate::local_agent::run_turn(
+                crate::models::local_agent::run_turn(
                     // `as_ref`, because what the factory hands back is a `Box<dyn LocalChat>` and
                     // the loop takes the trait object itself - the box is the seam, not the value.
                     chat.as_ref(),
                     tool_box,
-                    crate::local_agent::SYSTEM_PROMPT,
+                    crate::models::local_agent::SYSTEM_PROMPT,
                     &[],
                     &prompt,
                     &taint,
@@ -2036,7 +2042,8 @@ impl Driver {
             // turn — but the row is what the REST of the system reads, and a council seat that read
             // mail must be as legible as any other run that did.
             if taint.load(std::sync::atomic::Ordering::SeqCst)
-                && let Err(error) = crate::runs::mark_untrusted_context(&pool, run_id).await
+                && let Err(error) =
+                    crate::execution::runs::mark_untrusted_context(&pool, run_id).await
             {
                 tracing::warn!(
                     run_id,
@@ -2286,7 +2293,7 @@ pub async fn cancel(state: &crate::state::AppState, id: &str) -> sqlx::Result<bo
         // `finalize_termination` is the atomic-handle arbiter: it is a no-op for a run that has
         // already ended, so calling it for every run this council ever opened is correct as well as
         // simple.
-        crate::runs::finalize_termination(state, run_id, "cancelled").await;
+        crate::execution::runs::finalize_termination(state, run_id, "cancelled").await;
     }
     // After the runs, so a step whose seat future records `cancelled` on its own and one this
     // settles end up the same; a step that already ended keeps how it ended.
@@ -3124,7 +3131,7 @@ mod tests {
         /// The CLI ran and exited non-zero: the model refused, or the tool it wanted was denied.
         Fails(String),
         /// The CLI answered once and then hit its turn ceiling on a later turn: a real, non-zero
-        /// exit — `crate::runner::TURN_CEILING_EXIT_CODE` — carrying the completed turn's own
+        /// exit — `crate::execution::runner::TURN_CEILING_EXIT_CODE` — carrying the completed turn's own
         /// `cost_usd`/`num_turns`/token counts, exactly as `runner.rs`'s own ceiling test proves
         /// `RunOutcome` looks in that case. Distinct from `Fails`, whose fixture leaves every one of
         /// those `None` and so cannot tell a caller that drops them from one that does not.
@@ -3152,7 +3159,7 @@ mod tests {
 
     struct SeenRequest {
         prompt: String,
-        tool_policy: crate::runner::ToolPolicy,
+        tool_policy: crate::execution::runner::ToolPolicy,
         mcp_config: Option<std::path::PathBuf>,
         token: Option<String>,
         /// Whether the prompt travelled on stdin rather than on the command line.
@@ -3193,13 +3200,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::runner::CommandRunner for ScriptedRunner {
+    impl crate::execution::runner::CommandRunner for ScriptedRunner {
         async fn run_prompt(
             &self,
-            request: crate::runner::RunRequest,
+            request: crate::execution::runner::RunRequest,
             _session_tx: tokio::sync::mpsc::UnboundedSender<String>,
             _transcript: std::sync::Arc<std::sync::Mutex<String>>,
-        ) -> std::io::Result<crate::runner::RunOutcome> {
+        ) -> std::io::Result<crate::execution::runner::RunOutcome> {
             let scripted = self.next_for(&request.prompt);
             self.seen.lock().unwrap().push(SeenRequest {
                 prompt: request.prompt.clone(),
@@ -3213,7 +3220,7 @@ mod tests {
                 steerable: request.steerable,
             });
 
-            let blank = crate::runner::RunOutcome {
+            let blank = crate::execution::runner::RunOutcome {
                 exit_code: 0,
                 stdout: String::new(),
                 stderr: String::new(),
@@ -3227,17 +3234,17 @@ mod tests {
                 compacted: false,
             };
             match scripted {
-                Scripted::Answers(text) => Ok(crate::runner::RunOutcome {
+                Scripted::Answers(text) => Ok(crate::execution::runner::RunOutcome {
                     stdout: text,
                     ..blank
                 }),
-                Scripted::Fails(stderr) => Ok(crate::runner::RunOutcome {
+                Scripted::Fails(stderr) => Ok(crate::execution::runner::RunOutcome {
                     exit_code: 1,
                     stderr,
                     ..blank
                 }),
-                Scripted::DiesAtTheCeiling => Ok(crate::runner::RunOutcome {
-                    exit_code: crate::runner::TURN_CEILING_EXIT_CODE,
+                Scripted::DiesAtTheCeiling => Ok(crate::execution::runner::RunOutcome {
+                    exit_code: crate::execution::runner::TURN_CEILING_EXIT_CODE,
                     stderr: "nucleos: stopped after 3 turns; this run's ceiling was 3\n"
                         .to_string(),
                     cost_usd: Some(0.05),
@@ -3288,13 +3295,13 @@ mod tests {
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
-            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
-            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
-            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
             judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
-            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(CouncilRuntime::new(
                 config,
                 Some("council-key".to_string()),
@@ -3380,18 +3387,18 @@ mod tests {
                 ),
             );
         let url = crate::router_client::test_support::serve(app).await;
-        let inner: std::sync::Arc<dyn crate::runner::CommandRunner> = runner.clone();
-        let router = std::sync::Arc::new(crate::route_advice::Router::new(
-            crate::route_advice::RouterConfig {
-                mode: crate::route_advice::Mode::Off,
+        let inner: std::sync::Arc<dyn crate::execution::runner::CommandRunner> = runner.clone();
+        let router = std::sync::Arc::new(crate::models::route_advice::Router::new(
+            crate::models::route_advice::RouterConfig {
+                mode: crate::models::route_advice::Mode::Off,
                 url,
-                surfaces: [("council", crate::route_advice::Mode::Shadow)]
+                surfaces: [("council", crate::models::route_advice::Mode::Shadow)]
                     .into_iter()
                     .collect(),
-                ..crate::route_advice::RouterConfig::off()
+                ..crate::models::route_advice::RouterConfig::off()
             },
-            crate::route_advice::Available {
-                kind: crate::route_advice::RunnerKind::Claude,
+            crate::models::route_advice::Available {
+                kind: crate::models::route_advice::RunnerKind::Claude,
                 runner: inner.clone(),
                 default_model: "claude-sonnet-5".into(),
                 models: vec!["claude-*".into()],
@@ -3399,7 +3406,8 @@ mod tests {
             Vec::new(),
         ));
         let mut state = council_state(runner.clone(), Some(roster(3))).await;
-        state.runner = std::sync::Arc::new(crate::route_advice::RoutedRunner { inner, router });
+        state.runner =
+            std::sync::Arc::new(crate::models::route_advice::RoutedRunner { inner, router });
 
         let id = start(&state, "why?", None).await.unwrap();
         assert_eq!(settled(&state, &id).await.status, STATUS_DONE);
@@ -3547,7 +3555,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(exit_code, Some(crate::runner::TURN_CEILING_EXIT_CODE));
+        assert_eq!(
+            exit_code,
+            Some(crate::execution::runner::TURN_CEILING_EXIT_CODE)
+        );
         assert_eq!(
             cost_usd,
             Some(0.05),
@@ -3870,7 +3881,10 @@ mod tests {
         for request in ranking_or_synthesis {
             // No tools after phase 1. A seat that could go and find targeted evidence AFTER seeing
             // its peers' answers would turn the ranking into a measure of who had time left.
-            assert_eq!(request.tool_policy, crate::runner::ToolPolicy::None);
+            assert_eq!(
+                request.tool_policy,
+                crate::execution::runner::ToolPolicy::None
+            );
             assert_eq!(
                 request.mcp_config, None,
                 "a policy of None beside a config file would advertise a server the CLI may not reach"
@@ -3881,7 +3895,10 @@ mod tests {
             .iter()
             .find(|request| request.prompt == "why?")
             .expect("phase 1 asks the question as written");
-        assert_eq!(answering.tool_policy, crate::runner::ToolPolicy::McpOnly);
+        assert_eq!(
+            answering.tool_policy,
+            crate::execution::runner::ToolPolicy::McpOnly
+        );
         assert!(answering.mcp_config.is_some());
     }
 
@@ -3937,11 +3954,11 @@ mod tests {
     async fn an_exhausted_budget_refuses_before_spending() {
         let runner = std::sync::Arc::new(ScriptedRunner::default());
         let state = council_state(runner.clone(), Some(roster(2))).await;
-        crate::budget::set_budget_config(
+        crate::governance::budget::set_budget_config(
             &state.pool,
-            &crate::budget::BudgetConfig {
+            &crate::governance::budget::BudgetConfig {
                 limit_usd: Some(0.01),
-                period: crate::budget::BudgetPeriod::Monthly,
+                period: crate::governance::budget::BudgetPeriod::Monthly,
                 hourly_limit_usd: None,
                 per_run_reserve_usd: 0.5,
                 time_cost_per_hour_usd: 3.0,
@@ -3981,7 +3998,7 @@ mod tests {
         .await;
         crate::quota::test_support::arm(&state.pool, true, 85, 90).await;
         state.quota = std::sync::Arc::new(crate::quota::QuotaRuntime::new(
-            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            crate::quota::client::QuotaClient::new(&address, "bearer".into()),
             "claude".into(),
         ));
 
@@ -4445,7 +4462,10 @@ mod tests {
 
         let seen = runner.seen.lock().unwrap();
         assert!(
-            matches!(seen[0].tool_policy, crate::runner::ToolPolicy::None),
+            matches!(
+                seen[0].tool_policy,
+                crate::execution::runner::ToolPolicy::None
+            ),
             "phase 1 is the phase that HAS tools, and this agent asked for none"
         );
         assert!(seen[0].mcp_config.is_none());
@@ -4960,13 +4980,14 @@ mod tests {
         fn local_chat(
             &self,
             model: &str,
-        ) -> Result<Box<dyn crate::local_agent::LocalChat>, crate::assistants::Refusal> {
+        ) -> Result<Box<dyn crate::models::local_agent::LocalChat>, crate::assistants::Refusal>
+        {
             self.asked_for
                 .lock()
                 .expect("the double's recorder is never held across an await")
                 .push(model.to_string());
             Ok(Box::new(
-                crate::openai_compatible::OpenAiCompatibleChat::with_client(
+                crate::models::openai_compatible::OpenAiCompatibleChat::with_client(
                     reqwest::Client::new(),
                     self.base_url.clone(),
                     model.to_string(),
@@ -4983,8 +5004,10 @@ mod tests {
             &self,
             _brain: crate::chats::Brain,
             _model: Option<&str>,
-        ) -> Result<std::sync::Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal>
-        {
+        ) -> Result<
+            std::sync::Arc<crate::models::local_agent::LocalAssistant>,
+            crate::assistants::Refusal,
+        > {
             Err(crate::assistants::Refusal::NotServedByThisFactory)
         }
 
@@ -7103,18 +7126,18 @@ mod tests {
                 ),
             );
         let url = crate::router_client::test_support::serve(app).await;
-        let inner: std::sync::Arc<dyn crate::runner::CommandRunner> = runner.clone();
-        let router = std::sync::Arc::new(crate::route_advice::Router::new(
-            crate::route_advice::RouterConfig {
-                mode: crate::route_advice::Mode::Off,
+        let inner: std::sync::Arc<dyn crate::execution::runner::CommandRunner> = runner.clone();
+        let router = std::sync::Arc::new(crate::models::route_advice::Router::new(
+            crate::models::route_advice::RouterConfig {
+                mode: crate::models::route_advice::Mode::Off,
                 url,
-                surfaces: [("council", crate::route_advice::Mode::Shadow)]
+                surfaces: [("council", crate::models::route_advice::Mode::Shadow)]
                     .into_iter()
                     .collect(),
-                ..crate::route_advice::RouterConfig::off()
+                ..crate::models::route_advice::RouterConfig::off()
             },
-            crate::route_advice::Available {
-                kind: crate::route_advice::RunnerKind::Claude,
+            crate::models::route_advice::Available {
+                kind: crate::models::route_advice::RunnerKind::Claude,
                 runner: inner.clone(),
                 default_model: "claude-sonnet-5".into(),
                 models: vec!["claude-*".into()],
@@ -7122,7 +7145,8 @@ mod tests {
             Vec::new(),
         ));
         let mut state = council_state(runner.clone(), Some(roster(3))).await;
-        state.runner = std::sync::Arc::new(crate::route_advice::RoutedRunner { inner, router });
+        state.runner =
+            std::sync::Arc::new(crate::models::route_advice::RoutedRunner { inner, router });
 
         let id = start_with(&state, "why?", None, Some(2), BTreeMap::new())
             .await

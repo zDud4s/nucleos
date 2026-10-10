@@ -179,7 +179,7 @@ export function buildCommunities(modules: MapModule[], imports: MapImport[]): Co
   const titles = new Map<string, string>();
   const taken = new Map<string, number>();
   for (const [where, group] of [...members].sort((a, b) => b[1].length - a[1].length)) {
-    // The file's name and not its path: a matrix row is a label, and `core/src/map_join.rs` sitting
+    // The file's name and not its path: a matrix row is a label, and `core/src/map/join.rs` sitting
     // sideways down a column is not one.
     const named = pull(group);
     const wanted = sided ? `${topFolder(named)}·${moduleName(named)}` : moduleName(named);

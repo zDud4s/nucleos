@@ -3,6 +3,8 @@
 //! Embeddings are always local: no text of a project goes to a hosted service for this. Nothing in
 //! this module logs a title, a body, a query or a vector.
 
+pub mod model;
+
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;

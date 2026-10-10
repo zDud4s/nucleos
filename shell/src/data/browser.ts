@@ -31,7 +31,7 @@ export type { SidecarState, SubsystemReadout } from "./system";
  * /browser/keep` answers "keep these?" over the chain that came back with
  * it — a session already closed by the time that question is asked, so the
  * chain travels in the mutation's own response rather than in a further
- * read of the sessions list (`core/src/browser_wheel.rs:222-275`).
+ * read of the sessions list (`core/src/browser/wheel.rs:222-275`).
  */
 
 /* ----------------------------------------------------------------- shapes -- */

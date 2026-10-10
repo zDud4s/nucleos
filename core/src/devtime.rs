@@ -19,13 +19,24 @@
 //! - A `bg_ref` is looked for by comparing short string values of a tool call's input against the
 //!   background task ids the session already holds. The values are compared, never stored.
 
+pub mod lanes;
+pub mod map;
+pub mod parse;
+pub mod precision;
+pub mod rules;
+pub mod store;
+pub mod unexplained;
+
 use crate::config::DevtimeConfig;
-use crate::devtime_lanes;
-use crate::devtime_map;
-use crate::devtime_parse::{self, Event, EventKind, PARSER_VERSION, ParseVocab, Parsed};
-use crate::devtime_rules::{self, AdapterSources};
-use crate::devtime_store::{
-    self, AttemptResult, AttemptRow, CwdMapping, FileCounters, MarkerRow, MessageRow, SessionRow,
+use crate::devtime::lanes as devtime_lanes;
+use crate::devtime::map as devtime_map;
+use crate::devtime::parse::{
+    self as devtime_parse, Event, EventKind, PARSER_VERSION, ParseVocab, Parsed,
+};
+use crate::devtime::rules::{self as devtime_rules, AdapterSources};
+use crate::devtime::store::{
+    self as devtime_store, AttemptResult, AttemptRow, CwdMapping, FileCounters, MarkerRow,
+    MessageRow, SessionRow,
 };
 use serde_json::{Value, json};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -745,16 +756,17 @@ pub async fn ingest_cycle(
     projects_dir: &Path,
 ) -> CycleStats {
     let mut stats = CycleStats::default();
-    let roster: Vec<(String, String)> = match crate::autopilot::project_roster(pool).await {
-        Ok(rows) => rows
-            .into_iter()
-            .filter_map(|row| row.project_root.map(|root| (row.project_id, root)))
-            .collect(),
-        Err(error) => {
-            tracing::warn!(%error, "devtime: could not read the project roster");
-            Vec::new()
-        }
-    };
+    let roster: Vec<(String, String)> =
+        match crate::governance::autopilot::project_roster(pool).await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|row| row.project_root.map(|root| (row.project_id, root)))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "devtime: could not read the project roster");
+                Vec::new()
+            }
+        };
 
     let dir = projects_dir.to_path_buf();
     let found = tokio::task::spawn_blocking(move || walk(&dir))
@@ -930,7 +942,7 @@ pub async fn run_ingest_loop(pool: SqlitePool, cfg: DevtimeConfig, projects_dir:
 mod tests {
     use super::*;
     use crate::config::DevtimeConfig;
-    use crate::devtime_store;
+    use crate::devtime::store as devtime_store;
     use sha2::{Digest, Sha256};
     use sqlx::SqlitePool;
 

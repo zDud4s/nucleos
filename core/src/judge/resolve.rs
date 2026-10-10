@@ -509,7 +509,7 @@ async fn state_of(pool: &SqlitePool, asked: &Asked) -> Result<String, String> {
                 .await
                 .map_err(|error| format!("state: {error}"))?;
             Ok(render_gate_state(
-                crate::runs::task_to_carry(&task),
+                crate::execution::runs::task_to_carry(&task),
                 *exit_code,
                 output,
             ))
@@ -1216,7 +1216,7 @@ mod tests {
         // The weaker redactor lets the assignment through, so its removal below can only be the
         // judge's. It catches bearer tokens itself since 3a56fe7, so the header is no longer
         // evidence of anything here; it stays in the fixture so the judge is still held to it.
-        let weak = crate::redact::redact_secrets(output);
+        let weak = crate::governance::redact::redact_secrets(output);
         assert!(weak.contains("hunter2horse"), "{weak:?}");
         let state = render_gate_state("Fix the build", 1, output);
         assert!(!state.contains("hunter2horse"));
@@ -1322,9 +1322,9 @@ mod tests {
     }
 
     fn write_rules(root: &std::path::Path, yaml: &str) {
-        let dir = crate::project_state::dir(root, "p").unwrap();
+        let dir = crate::project::state::dir(root, "p").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(crate::project_state::AUTOPILOT_FILE), yaml).unwrap();
+        std::fs::write(dir.join(crate::project::state::AUTOPILOT_FILE), yaml).unwrap();
     }
 
     /// D4/D1: an unreadable `autopilot.yaml` may be looser than what the project wrote down, so

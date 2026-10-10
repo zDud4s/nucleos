@@ -162,7 +162,7 @@ pub async fn label_from_decision(
                     .await?
                     .flatten();
             if let Some(project_id) = project {
-                crate::autopilot::hold_judge_resolve_to_the_bar(&mut tx, &project_id).await?;
+                crate::governance::autopilot::hold_judge_resolve_to_the_bar(&mut tx, &project_id).await?;
             }
         }
         tx.commit().await?;

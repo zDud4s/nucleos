@@ -1,7 +1,7 @@
 //! §spec email-pillar
 
 use crate::auth::Token;
-use crate::runner::CommandRunner;
+use crate::execution::runner::CommandRunner;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -139,8 +139,9 @@ pub type RunHandles = Arc<Mutex<HashMap<i64, AbortHandle>>>;
 ///
 /// `LaterTurn` and not `String`: a turn arriving after the one a run was launched with can carry
 /// pictures too, which is what lets a conversation keep its process when somebody pastes one.
-pub type RunMessages =
-    Arc<Mutex<HashMap<i64, tokio::sync::mpsc::UnboundedSender<crate::runner::LaterTurn>>>>;
+pub type RunMessages = Arc<
+    Mutex<HashMap<i64, tokio::sync::mpsc::UnboundedSender<crate::execution::runner::LaterTurn>>>,
+>;
 
 /// In-flight runs' transcripts as they fill, keyed by `runs.id`.
 ///
@@ -408,10 +409,10 @@ pub struct AppState {
     /// One field rather than three because they are read together and switched on together, and
     /// because `VoiceRuntime::default()` means "off" — which is what keeps every test that does not
     /// care about voice from having to know it exists. Same reasoning as `email` above.
-    pub voice: Arc<crate::voice::VoiceRuntime>,
+    pub voice: Arc<crate::integrations::voice::VoiceRuntime>,
     /// The web pillar: the trust allowlist, retention, and the client for the sidecar that is the
     /// only process here allowed to open a connection off this machine.
-    pub web: Arc<crate::web::WebRuntime>,
+    pub web: Arc<crate::integrations::web::WebRuntime>,
     /// The quota pillar: the client for the sidecar that reads how much of each assistant's usage
     /// limit is gone.
     ///
@@ -420,7 +421,7 @@ pub struct AppState {
     /// fraction, so the one secret on this path is the daemon's bearer for its own sidecar. That
     /// bearer is a smaller secret than the ones `EmailRuntime` and `CouncilRuntime` hold and it is
     /// still a secret, so `QuotaClient` carries a `Debug` guard of the same kind — see
-    /// `quota_client.rs`. What D2 buys is that a leak here opens the sidecar, never the vendor.
+    /// `quota/client.rs`. What D2 buys is that a leak here opens the sidecar, never the vendor.
     pub quota: Arc<crate::quota::QuotaRuntime>,
     /// Spec A: the autopilot's judge, its occupant and its four permits (D10/D11). Built once at
     /// startup; `runs.judge` decides per run whether it is asked at all.
@@ -437,13 +438,13 @@ pub struct AppState {
     /// site lists a few lines up — for the reason `classifier.rs` gives about its fourth argument. A
     /// policy re-read per call is a policy a run could change in the middle of itself, and the hook
     /// and the resume would then answer differently about one command line.
-    pub github: Arc<crate::github::GithubRuntime>,
+    pub github: Arc<crate::integrations::github::GithubRuntime>,
     /// The calendar's settings — the default zone and the window a proposal may land in.
     ///
     /// Same shape and same reasoning as `email` and `voice` above: read together, changed together,
     /// and a `Default` that means "UTC, ordinary office hours" so no test that ignores calendars
     /// has to know this field exists.
-    pub calendar: Arc<crate::calendar::CalendarRuntime>,
+    pub calendar: Arc<crate::integrations::calendar::CalendarRuntime>,
     /// The council: the roster, the per-seat clock, and the scoped key its seats reach the daemon
     /// with. `Default` means there is no council, which is the shipped state.
     pub council: Arc<crate::council::CouncilRuntime>,

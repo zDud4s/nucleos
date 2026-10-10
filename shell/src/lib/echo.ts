@@ -9,7 +9,7 @@
 /**
  * Fold the spelling variations the transcriber commonly introduces before comparing words.
  *
- * This follows `fold_for_hint` in `core/src/voice.rs`: its measured Portuguese failure mode is
+ * This follows `fold_for_hint` in `core/src/integrations/voice.rs`: its measured Portuguese failure mode is
  * dropping an accent, so "amanha" must match "amanhã". Punctuation stays intact here; tokenisation
  * decides separately where words begin and end.
  */

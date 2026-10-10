@@ -22,7 +22,7 @@ import type { Job, JobItem } from "../data/fleet";
  * Seven, and they line up one-to-one with the seven state tones in `tokens.css` — which that file
  * calls "the app's whole colour vocabulary for *state*". That alignment is load-bearing rather
  * than tidy: `ui/state-map.ts` is emphatic that `cancelled` takes the `off` tone and NEVER the
- * failure tone, because it is "withdrawn work, not a verdict", and `core/src/job.rs` says the
+ * failure tone, because it is "withdrawn work, not a verdict", and `core/src/execution/job.rs` says the
  * same thing from its end — `Cancelled` is "you stopped it" against `Failed`'s "the work broke",
  * and `Skipped` is "not a failure and not a cancellation".
  *
@@ -133,7 +133,7 @@ const LIFECYCLE: Record<string, Lifecycle> = {
   passed: "done",
   // Put down rather than failed, and not waiting on anybody: `Conflicted` "leaves for `Running` —
   // the resolution node, in that same tree", and `next_step` finds it by the same search as pending
-  // work because "the item owes a run" (`core/src/job.rs`). The queue is still holding it, as with
+  // work because "the item owes a run" (`core/src/execution/job.rs`). The queue is still holding it, as with
   // `reverted`.
   conflicted: "running",
   // The item asked for a decision and the job moved on. Nothing broke and nobody stopped it.

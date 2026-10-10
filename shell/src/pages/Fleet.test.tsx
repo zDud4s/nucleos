@@ -217,7 +217,7 @@ function exclusion(overrides: Partial<FleetExclusion> = {}): FleetExclusion {
 
 /**
  * A project the núcleo will start a job in: `POST /jobs` refuses one whose autopilot is not
- * `active` or which has no root (`core/src/job.rs`, `resolve_start`), and the harness's own
+ * `active` or which has no root (`core/src/execution/job.rs`, `resolve_start`), and the harness's own
  * default project is `off` with no root — the right default for every other page, and a project
  * this page must offer only as disabled.
  */
@@ -694,7 +694,7 @@ describe("Fleet — columns", () => {
     expect(within(card).getAllByText(/nightly-backlog/).length).toBeGreaterThan(0);
     // The id is still there, second and as a handle.
     expect(within(card).getByText("id 7")).toBeDefined();
-    // Through the map, and in the feed's tone for the same event: `core/src/job.rs` puts a
+    // Through the map, and in the feed's tone for the same event: `core/src/execution/job.rs` puts a
     // conflicted item down rather than failing it, and the queue resolves it itself (`batch_of`),
     // so Held Ember — neither a fault nor a summons.
     const state = within(card).getByText("did not merge");
@@ -1296,7 +1296,7 @@ describe("Fleet — the headline", () => {
     // The one clause somebody can act on is a door to where it is acted on.
     const header = await pageHeader();
     // The faults wear the wrong-fact colour and the item that did not merge does not: it was put
-    // down, not failed (`core/src/job.rs`, `ItemState::Conflicted`).
+    // down, not failed (`core/src/execution/job.rs`, `ItemState::Conflicted`).
     expect([...header.querySelectorAll(".ui-wrong")].map((node) => node.textContent)).toEqual([
       "1 slot held by nothing, awaiting reconciliation",
       "1 observed overlap between trees",

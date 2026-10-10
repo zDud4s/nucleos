@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// once: `module_map-fbe301874ed541e2.exe` with `C:\Projects\nucleos\core` baked in, and
 /// `module_map-71f5cbac06dd4edb.exe` with `C:\Projects\nucleos-conversas\core`. Which one cargo
 /// runs is invisible from the output, so the gate was a coin flip that always looked green — and
-/// `map_stamp.rs` landed with no row in the map while this test said everything was fine.
+/// `map/stamp.rs` landed with no row in the map while this test said everything was fine.
 ///
 /// That is the exact shape of the false confidence the project-map feature exists to cure, sitting
 /// inside this repository's own gate. So the mismatch is an ASSERTION and not a fallback: a test
@@ -61,6 +61,34 @@ fn source_dirs(root: &Path) -> Vec<(String, PathBuf)> {
     dirs
 }
 
+/// Every `.rs` file under `dir`, at any depth, as its path from `dir` with `/` between folders
+/// (`verify/batch.rs`), sorted so a failure lists them in the same order every time.
+///
+/// Recursive on purpose. This used to read one level, which was every module there was until
+/// `council/` and `judge/` became folders: from then on their files were in no check at all, and
+/// the day `core/src` is arranged in folders a one-level read would see almost nothing and still
+/// pass — the quiet green this file exists to refuse.
+fn rust_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
+    let mut pending = vec![(String::new(), dir.to_path_buf())];
+    while let Some((prefix, at)) = pending.pop() {
+        for entry in fs::read_dir(&at).expect("the source directory should be readable") {
+            let entry = entry.expect("source directory entries should be readable");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let kind = entry
+                .file_type()
+                .expect("source file types should be readable");
+            if kind.is_dir() {
+                pending.push((format!("{prefix}{name}/"), entry.path()));
+            } else if kind.is_file() && name.ends_with(".rs") {
+                found.push((format!("{prefix}{name}"), entry.path()));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 #[test]
 fn the_module_map_matches_the_files_on_disk() {
     let manifest_dir = package_root();
@@ -92,19 +120,9 @@ fn the_module_map_matches_the_files_on_disk() {
     let source_files = source_dirs(&manifest_dir)
         .into_iter()
         .flat_map(|(prefix, dir)| {
-            fs::read_dir(dir)
-                .expect("the source directory should be readable")
-                .map(|entry| entry.expect("source directory entries should be readable"))
-                .filter_map(|entry| {
-                    entry
-                        .file_type()
-                        .expect("source file types should be readable")
-                        .is_file()
-                        .then_some(entry.file_name().to_string_lossy().into_owned())
-                })
-                .filter(|file_name| file_name.ends_with(".rs"))
-                .map(move |file_name| format!("{prefix}{file_name}"))
-                .collect::<Vec<_>>()
+            rust_files(&dir)
+                .into_iter()
+                .map(move |(file, _)| format!("{prefix}{file}"))
         })
         .collect::<BTreeSet<_>>();
 
@@ -155,19 +173,14 @@ fn nothing_sets_the_worktree_root_without_restoring_it() {
     // so this test would not have gone red on a binary built elsewhere — it would have read the
     // other checkout's modules and reported on those. Quieter than the map check's failure and the
     // same defect.
-    let entries = source_dirs(&package_root())
+    let files = source_dirs(&package_root())
         .into_iter()
-        .flat_map(|(_, dir)| fs::read_dir(dir).expect("the source directory should be readable"))
+        .flat_map(|(_, dir)| rust_files(&dir))
         .collect::<Vec<_>>();
     let mut offenders = Vec::new();
 
-    for entry in entries {
-        let entry = entry.expect("source directory entries should be readable");
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".rs") {
-            continue;
-        }
-        let text = fs::read_to_string(entry.path()).expect("a source file should be readable");
+    for (name, path) in files {
+        let text = fs::read_to_string(&path).expect("a source file should be readable");
         // BOTH verbs, and counting `remove_var` is not symmetry for its own sake: the guard's
         // `drop` restores by SETTING the old value or by REMOVING it when there was none, so a
         // module that only ever removed the variable would have zero `set_var` and slip past this

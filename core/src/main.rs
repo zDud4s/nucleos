@@ -17,7 +17,7 @@ const WEB_SEARCH_KEY: &str = "web-search-api-key";
 /// OpenRouter's own API key, in Credential Manager for the same reason every secret above is: it
 /// never sits in `~/.nucleos/nucleos-models.yaml`, which only ever names the model
 /// (`hosted_assistant_model`) and is plain text anybody may open.
-/// `openai_compatible::OpenAiCompatibleChat::new` refuses outright when this comes back `None` —
+/// `models::openai_compatible::OpenAiCompatibleChat::new` refuses outright when this comes back `None` —
 /// see its own doc comment for why that refusal happens before any request leaves the machine
 /// rather than after a 401 comes back.
 const OPENROUTER_KEY: &str = "openrouter-api-key";
@@ -108,7 +108,7 @@ async fn migrate_machine_settings(pool: &sqlx::SqlitePool, root: &std::path::Pat
 /// Copies each rostered project's state files from its old `<project root>/.ai/` into
 /// `~/.nucleos/projects/<project_id>/`, and puts a line in that project's feed for each one.
 ///
-/// The copying is [`project_state::migrate_legacy`]'s, and so is every rule about when it does and
+/// The copying is [`project::state::migrate_legacy`]'s, and so is every rule about when it does and
 /// does not happen; this only reads the roster and tells somebody, for the reason
 /// [`migrate_machine_settings`] gives. The roster is every project with a root on record — a
 /// project in `off` has none, and its old files are copied the next time it is given one and the
@@ -135,7 +135,7 @@ async fn migrate_project_state(pool: &sqlx::SqlitePool, root: &std::path::Path) 
         .collect();
     let root = root.to_path_buf();
     let copied =
-        match tokio::task::spawn_blocking(move || project_state::migrate_legacy(&root, &roster))
+        match tokio::task::spawn_blocking(move || project::state::migrate_legacy(&root, &roster))
             .await
         {
             Ok(copied) => copied,
@@ -148,7 +148,7 @@ async fn migrate_project_state(pool: &sqlx::SqlitePool, root: &std::path::Path) 
         let summary = format!(
             "{} copied from .ai/{file} in this project's folder; the old file was left where it \
              was and is no longer read",
-            project_state::display_path(&project_id, file)
+            project::state::display_path(&project_id, file)
         );
         if let Err(error) = feed::append(
             pool,
@@ -206,7 +206,7 @@ async fn migrate_onboarding(pool: &sqlx::SqlitePool, root: &std::path::Path) {
         let summary = format!(
             "marked onboarded in {}, because this project had .ai/workflow/workflow.md, which is \
              what onboarded meant before; that file is no longer read",
-            project_state::display_path(&project_id, onboarding::MARKER_FILE)
+            project::state::display_path(&project_id, onboarding::MARKER_FILE)
         );
         if let Err(error) = feed::append(
             pool,
@@ -351,7 +351,7 @@ fn is_land_flag(arg: &str) -> bool {
 ///
 /// **The two empty forms are answered differently, on purpose.** `--land=` carries no value at
 /// all, so there is nothing to send and it is `None`. `--land ""` carries one, and it goes as it
-/// was typed: `land::resolve_target` reads an empty target as the project's integration branch, so
+/// was typed: `execution::land::resolve_target` reads an empty target as the project's integration branch, so
 /// the ends already agree, and a refusal invented here would be a second opinion nobody asked for.
 /// Both land in the same place.
 ///
@@ -697,7 +697,7 @@ async fn main() {
         match read_secret_from_stdin(
             "paste the GitHub token (a fine-grained PAT or a classic one), then press Enter:",
         ) {
-            Some(value) => match secrets::store_secret(github::TOKEN_KEY, &value) {
+            Some(value) => match secrets::store_secret(integrations::github::TOKEN_KEY, &value) {
                 Ok(()) => {
                     println!("github token stored in the system credential store");
                     // Said here because this is the last moment the person is listening, and the
@@ -880,7 +880,7 @@ async fn main() {
             eprintln!("this machine has no home directory, so it has no workflow library");
             std::process::exit(1);
         };
-        match workflow_package::package(&library, &name, &version, &from, &manifest).await {
+        match workflows::package::package(&library, &name, &version, &from, &manifest).await {
             Ok(packaged) => {
                 println!(
                     "{name}@{version}: {} files into {} ({})",
@@ -971,7 +971,7 @@ async fn main() {
     // has not existed since the last restart would refuse every future click with "already
     // running". Best-effort — a project command left unsettled is a button that will not press, not
     // a daemon that must not start.
-    match project_commands::reconcile_orphaned_commands(&pool).await {
+    match project::commands::reconcile_orphaned_commands(&pool).await {
         Ok(0) => {}
         Ok(settled) => tracing::info!(
             settled,
@@ -980,7 +980,7 @@ async fn main() {
         Err(error) => tracing::warn!(%error, "could not settle project commands left running"),
     }
 
-    let interrupted = runs::reconcile_orphaned_runs(&pool)
+    let interrupted = execution::runs::reconcile_orphaned_runs(&pool)
         .await
         .expect("failed to reconcile orphaned runs on startup");
     if interrupted > 0 {
@@ -991,7 +991,7 @@ async fn main() {
 
     // Spec 2026-10-04 §4.2 item 5: a task caught mid-flight by a restart is `orphaned`, beside the
     // turns marked `interrupted` above. Best effort: a stale task row must not stop the daemon.
-    match chat_tasks::orphan_running(&pool).await {
+    match chats::tasks::orphan_running(&pool).await {
         Ok(0) => {}
         Ok(orphaned) => tracing::warn!(
             orphaned,
@@ -1000,7 +1000,7 @@ async fn main() {
         Err(error) => tracing::warn!(%error, "could not mark chat tasks left running"),
     }
 
-    let stranded = runs::reconcile_stranded_approvals(&pool)
+    let stranded = execution::runs::reconcile_stranded_approvals(&pool)
         .await
         .expect("failed to reconcile stranded approval pauses on startup");
     if stranded > 0 {
@@ -1024,7 +1024,7 @@ async fn main() {
     // `running` as `interrupted`, so by now no job has a live node under it — which means "has no
     // live run" is true of every job, including the ones that died in the gap between two nodes.
     // Those are exactly the recoverable ones, so the pass below discriminates on HEAD instead.
-    match job::reconcile_orphaned_jobs(&pool).await {
+    match execution::job::reconcile_orphaned_jobs(&pool).await {
         Ok(retired) if retired > 0 => {
             tracing::warn!(
                 "retired {retired} job(s) whose repository moved while the daemon was down -> 'interrupted'"
@@ -1037,7 +1037,7 @@ async fn main() {
     // After both owner reconciliations above, and that order is the whole correctness of this pass:
     // it frees a slot by asking whether its owner is still live, and before those two every dead
     // owner still reads live. Run earlier it would free nothing at all.
-    match concurrency::reconcile_orphaned_slots(&pool).await {
+    match execution::concurrency::reconcile_orphaned_slots(&pool).await {
         Ok(freed) if freed > 0 => {
             tracing::warn!("freed {freed} concurrency slot(s) left held by a previous crash");
         }
@@ -1050,8 +1050,8 @@ async fn main() {
     //
     // A verification unit left `running` was cut off by the restart, and the agent holding its ticket
     // is still waiting: put it back in the queue. One that keeps taking the daemon down gives up
-    // after `verify_runs::MAX_INTERRUPTIONS` instead of looping.
-    match verify_runs::requeue_interrupted(&pool).await {
+    // after `verify::runs::MAX_INTERRUPTIONS` instead of looping.
+    match verify::runs::requeue_interrupted(&pool).await {
         Ok((requeued, given_up)) if requeued + given_up > 0 => tracing::warn!(
             "requeued {requeued} verification unit(s) interrupted by the restart; gave up on {given_up}"
         ),
@@ -1064,7 +1064,7 @@ async fn main() {
     // somebody notices. That is a jam, not untidiness, hence `error!`. But it is one pillar's queue:
     // refusing to boot mail, voice, calendar and runs over it would trade a stuck repository for a
     // stuck machine.
-    match vcs::reconcile_interrupted(&pool).await {
+    match execution::vcs::reconcile_interrupted(&pool).await {
         Ok(released) if released > 0 => {
             tracing::warn!(
                 "reconciled {released} vcs request(s) left 'running' by a previous crash -> 'interrupted'"
@@ -1092,10 +1092,10 @@ async fn main() {
     }
 
     // After the run reconciliations above, so nothing from a previous life still counts as live.
-    match worktree::reconcile_orphaned_worktrees(
+    match execution::worktree::reconcile_orphaned_worktrees(
         &pool,
-        worktree::ORPHAN_MIN_AGE,
-        worktree::GC_BACKOFF,
+        execution::worktree::ORPHAN_MIN_AGE,
+        execution::worktree::GC_BACKOFF,
     )
     .await
     {
@@ -1156,29 +1156,33 @@ async fn main() {
     // The owner's saved choice (Settings) wins over the file, which is the default of an untouched
     // install; `embed::install` is called again by the settings door when the choice changes.
     embed::install(Arc::new(embed::OllamaEmbedder::new(
-        runner::OLLAMA_BASE_URL.to_string(),
-        embed_model::effective(&pool, &models_config.embedding_model).await,
+        execution::runner::OLLAMA_BASE_URL.to_string(),
+        embed::model::effective(&pool, &models_config.embedding_model).await,
     )));
     let (triage_runner, local_triage_disabled): (
-        Option<Arc<dyn runner::CommandRunner>>,
+        Option<Arc<dyn execution::runner::CommandRunner>>,
         Option<String>,
     ) = if let Some(model) = models_config.local_triage_model.clone() {
-        let local_runner =
-            runner::OllamaRunner::new(runner::OLLAMA_BASE_URL.to_string(), model.clone());
-        // The requirement's own field, not `triage::LOCAL_NUM_CTX` directly: this is the number
+        let local_runner = execution::runner::OllamaRunner::new(
+            execution::runner::OLLAMA_BASE_URL.to_string(),
+            model.clone(),
+        );
+        // The requirement's own field, not `governance::triage::LOCAL_NUM_CTX` directly: this is the number
         // that gets enforced, and it must come FROM the declaration the role states below, not
         // sit beside it as a second copy that could drift out of step. `CAPABILITY_REQUIREMENT`
         // is itself defined from `LOCAL_NUM_CTX`, which is the link that keeps them together.
         let declared = capabilities::discover_ollama_as(
             &reqwest::Client::new(),
-            runner::OLLAMA_BASE_URL,
+            execution::runner::OLLAMA_BASE_URL,
             &model,
-            triage::CAPABILITY_REQUIREMENT.context_tokens,
+            governance::triage::CAPABILITY_REQUIREMENT.context_tokens,
             "local model",
         )
         .await;
-        let missing =
-            capabilities::missing_capabilities(&triage::CAPABILITY_REQUIREMENT, &declared);
+        let missing = capabilities::missing_capabilities(
+            &governance::triage::CAPABILITY_REQUIREMENT,
+            &declared,
+        );
         match capabilities::triage_posture(&missing) {
             capabilities::Posture::Unaffected => {
                 tracing::info!(%model, "local triage model enabled");
@@ -1223,7 +1227,7 @@ async fn main() {
     // Built whether or not the pillar is enabled: it is two small files, and having it always in a
     // known state means enabling email later is a config edit rather than a fresh directory.
     let triage_sandbox = dirs.data_local_dir().join("triage-sandbox");
-    if let Err(error) = triage::ensure_sandbox(&triage_sandbox) {
+    if let Err(error) = governance::triage::ensure_sandbox(&triage_sandbox) {
         tracing::warn!(%error, "could not build the triage sandbox — the email pillar will stay off");
     }
 
@@ -1329,23 +1333,25 @@ async fn main() {
     // That asymmetry is deliberate. Local triage refuses to run at all when its probe fails, because
     // there the alternative is sending mail bodies off-machine. Here the fallback is a raw transcript
     // that never leaves the laptop, so the same failure should cost the polish and not the dictation —
-    // exactly what `voice::clean_up` does at runtime, decided once here at startup.
+    // exactly what `integrations::voice::clean_up` does at runtime, decided once here at startup.
     let voice_cleanup_model = match models_config.voice_cleanup_model.clone() {
         Some(model) if voice_config.armed() => {
-            // The requirement's own field, not `voice::CLEANUP_NUM_CTX` directly — see the same
+            // The requirement's own field, not `integrations::voice::CLEANUP_NUM_CTX` directly — see the same
             // note on the local-triage probe above; `CAPABILITY_REQUIREMENT` is defined from
             // `CLEANUP_NUM_CTX`, so the two stay linked without a second number to keep in step.
             let declared = capabilities::discover_ollama_as(
                 &reqwest::Client::new(),
-                runner::OLLAMA_BASE_URL,
+                execution::runner::OLLAMA_BASE_URL,
                 &model,
-                voice::CAPABILITY_REQUIREMENT.context_tokens,
+                integrations::voice::CAPABILITY_REQUIREMENT.context_tokens,
                 "voice cleanup",
             )
             .await;
-            let missing =
-                capabilities::missing_capabilities(&voice::CAPABILITY_REQUIREMENT, &declared);
-            // voice_posture reuses runner::local_triage_decision's own wording for a context gap —
+            let missing = capabilities::missing_capabilities(
+                &integrations::voice::CAPABILITY_REQUIREMENT,
+                &declared,
+            );
+            // voice_posture reuses execution::runner::local_triage_decision's own wording for a context gap —
             // a pure mapping from a context-probe result to an operator-readable reason, and every
             // message it produces talks about "the local model" rather than about mail. A second
             // copy would drift from this one.
@@ -1384,7 +1390,7 @@ async fn main() {
     // operator has asked for it by name. An unrecognised name warns rather than fails startup, for
     // the same reason a bad local-model probe does — a typo in one config key must not take down
     // every unrelated daemon service.
-    let claude_runner = || runner::ClaudeCliRunner {
+    let claude_runner = || execution::runner::ClaudeCliRunner {
         model: models_config.claude_model.clone(),
         plan_model: models_config.plan_model.clone(),
         review_model: models_config.review_model.clone(),
@@ -1392,10 +1398,10 @@ async fn main() {
         resolve_effort: models_config.resolve_effort.clone(),
     };
     let configured_runner = models_config.primary_runner.as_deref();
-    let primary_runner: Arc<dyn runner::CommandRunner> = match configured_runner {
+    let primary_runner: Arc<dyn execution::runner::CommandRunner> = match configured_runner {
         Some("codex") => {
             tracing::info!(model = %models_config.codex_model, "codex CLI selected as the run runner");
-            Arc::new(runner::CodexCliRunner {
+            Arc::new(execution::runner::CodexCliRunner {
                 model: models_config.codex_model.clone(),
                 // A run keeps the user's Codex config; only chats pin a sandbox (`for_chat`).
                 sandbox_mode: None,
@@ -1410,12 +1416,12 @@ async fn main() {
     // The llm-router as an adviser. Off unless `~/.nucleos/router.yaml` turns it on, and off hands
     // back the very runner built above. Read from the same root the settings page writes and the
     // health row probes, so the three never disagree about which file is in force.
-    let primary_runner = route_advice::front(
+    let primary_runner = models::route_advice::front(
         primary_runner,
         &models_config,
         machine_file(machine_config::ROUTER_FILE)
-            .map(|path| route_advice::load_config(&path))
-            .unwrap_or_else(route_advice::RouterConfig::off),
+            .map(|path| models::route_advice::load_config(&path))
+            .unwrap_or_else(models::route_advice::RouterConfig::off),
     );
 
     // The email sidecar's own key, minted before `AppState` exists rather than beside the spawn.
@@ -1491,7 +1497,7 @@ async fn main() {
         resolved_local_engine.as_ref(),
     ) {
         (Some(model), Some(resolved)) => {
-            // The requirement's own field, not `local_agent::TURN_NUM_CTX` directly — see the
+            // The requirement's own field, not `models::local_agent::TURN_NUM_CTX` directly — see the
             // same note on the local-triage probe above; `CAPABILITY_REQUIREMENT` is defined
             // from `TURN_NUM_CTX`, so the two stay linked without a second number to keep in
             // step.
@@ -1500,13 +1506,15 @@ async fn main() {
                 resolved.engine,
                 &resolved.base_url,
                 &model,
-                local_agent::CAPABILITY_REQUIREMENT.context_tokens,
+                models::local_agent::CAPABILITY_REQUIREMENT.context_tokens,
                 resolved.declared_context_tokens,
                 "local assistant",
             )
             .await;
-            let missing =
-                capabilities::missing_capabilities(&local_agent::CAPABILITY_REQUIREMENT, &declared);
+            let missing = capabilities::missing_capabilities(
+                &models::local_agent::CAPABILITY_REQUIREMENT,
+                &declared,
+            );
             match capabilities::local_assistant_posture(&missing) {
                 capabilities::Posture::Unaffected => {
                     tracing::info!(%model, "local assistant enabled for chat turns that ask for it");
@@ -1602,7 +1610,7 @@ async fn main() {
                 .or_else(|| std::env::var(env).ok())
                 .filter(|k| !k.trim().is_empty())
         };
-        let keys = model_catalog::Keys {
+        let keys = models::model_catalog::Keys {
             anthropic: key("anthropic-api-key", "ANTHROPIC_API_KEY"),
             openai: key("openai-api-key", "OPENAI_API_KEY"),
         };
@@ -1611,13 +1619,13 @@ async fn main() {
             openai = keys.openai.is_some(),
             "model discovery keys"
         );
-        model_catalog::install_keys(keys);
+        models::model_catalog::install_keys(keys);
         // Without a key a vendor is still discovered: Codex from the CLI's own cache, Anthropic
         // from the public models.dev catalogue. A newly shipped model shows without a code edit.
-        model_catalog::enable_keyless();
+        models::model_catalog::enable_keyless();
         // Warm the snapshot off the request path: the first picker open then finds it ready.
         tokio::spawn(async {
-            model_catalog::current().await;
+            models::model_catalog::current().await;
         });
     }
 
@@ -1673,7 +1681,7 @@ async fn main() {
             // handed, never something it has to infer from a branch it cannot see.
             None => (
                 None,
-                runner::OLLAMA_BASE_URL.to_string(),
+                execution::runner::OLLAMA_BASE_URL.to_string(),
                 config::LocalEngine::Ollama,
                 None,
             ),
@@ -1690,7 +1698,7 @@ async fn main() {
             "http://127.0.0.1:8791".to_string(),
             token_value.clone(),
             pool.clone(),
-            // The RESOLVED address, not `runner::OLLAMA_BASE_URL` directly. Identical for an
+            // The RESOLVED address, not `execution::runner::OLLAMA_BASE_URL` directly. Identical for an
             // install that named no engine — `local_engine()` resolves absence to Ollama on that
             // same constant — and the whole point for one that named another server.
             local_base_url,
@@ -1721,13 +1729,15 @@ async fn main() {
             triage_sandbox,
             email_sidecar_token,
         )),
-        voice: Arc::new(voice::VoiceRuntime::from_config(
+        voice: Arc::new(integrations::voice::VoiceRuntime::from_config(
             &voice_config,
             voice_cleanup_model,
         )),
-        calendar: Arc::new(calendar::CalendarRuntime::from_config(&calendar_config)),
+        calendar: Arc::new(integrations::calendar::CalendarRuntime::from_config(
+            &calendar_config,
+        )),
         council: Arc::new(council::CouncilRuntime::new(council_config, council_token)),
-        github: Arc::new(github::GithubRuntime::from_config(
+        github: Arc::new(integrations::github::GithubRuntime::from_config(
             &github_config,
             github_configured,
             github_binary,
@@ -1741,7 +1751,7 @@ async fn main() {
             modes: Default::default(),
             seats: Default::default(),
         }),
-        web: Arc::new(web::WebRuntime {
+        web: Arc::new(integrations::web::WebRuntime {
             enabled: web_config.enabled,
             trusted_hosts: web_config.trusted_hosts.clone(),
             retain_pages_days: web_config.retain_pages_days,
@@ -1751,11 +1761,11 @@ async fn main() {
             // its absence is the opposite: voice degrades to a raw transcript, and this one
             // REFUSES. A typing aid may fail soft; a barrier may not.
             quarantine_model: models_config.voice_cleanup_model.clone(),
-            ollama_base_url: runner::OLLAMA_BASE_URL.to_string(),
+            ollama_base_url: execution::runner::OLLAMA_BASE_URL.to_string(),
             http: reqwest::Client::new(),
         }),
         quota: Arc::new(quota::QuotaRuntime::new(
-            quota_client::QuotaClient::new(sidecar::QUOTA_ADDR, quota_sidecar_token.clone()),
+            quota::client::QuotaClient::new(sidecar::QUOTA_ADDR, quota_sidecar_token.clone()),
             models_config.active_runner().to_string(),
         )),
         judge: Arc::new(judge::JudgeRuntime::jev()),
@@ -1873,7 +1883,7 @@ async fn main() {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 ticker.tick().await;
-                match web::prune(
+                match integrations::web::prune(
                     &retention_state.pool,
                     retention_state.web.retain_pages_days,
                     chrono::Utc::now(),
@@ -1912,14 +1922,14 @@ async fn main() {
             tracing::warn!("failed to read telegram-token from the system credential store: {e}");
         }
     }
-    tokio::spawn(scheduler::run_scheduler(state.clone()));
+    tokio::spawn(execution::scheduler::run_scheduler(state.clone()));
     // Its own loop, not a step inside the scheduler's: a job pass can sit inside `run_gate` for the
     // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
     // one project's test suite.
-    tokio::spawn(job::run_job_loop(state.clone()));
-    // AFTER `runs::reconcile_orphaned_runs`, which ran near the top of this function and is what
+    tokio::spawn(execution::job::run_job_loop(state.clone()));
+    // AFTER `execution::runs::reconcile_orphaned_runs`, which ran near the top of this function and is what
     // marks the abandoned subprocesses `interrupted` — the ordering this depends on, and the same
-    // one `job::reconcile_orphaned_jobs` respects. Awaited rather than spawned, so the loop below
+    // one `execution::job::reconcile_orphaned_jobs` respects. Awaited rather than spawned, so the loop below
     // never meets a half-reconciled run.
     if let Err(error) = team::reconcile_orphaned_team_runs(&state).await {
         tracing::warn!(%error, "could not reconcile the team runs a previous daemon left behind");
@@ -1934,15 +1944,15 @@ async fn main() {
     // starts is a different question from how it runs — the same separation `scheduler.rs` has from
     // `job.rs` — and it could not have gone in `scheduler_tick` at all: that loop is per project,
     // and a department has no project, no root and no HEAD.
-    tokio::spawn(team_trigger::run_team_trigger_loop(state.clone()));
+    tokio::spawn(team::trigger::run_team_trigger_loop(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
-    tokio::spawn(worktree::run_gc(state.pool.clone()));
+    tokio::spawn(execution::worktree::run_gc(state.pool.clone()));
     // The worktree GC's counterpart inside the database. It collects the directories a finished run
     // leaves on disk; this expires the transcript it leaves in `runs`, the events it leaves in
     // `run_events`, and eventually its line in the feed. Nothing removed any of those, so all three
     // grew for as long as the daemon was ever used — and a transcript is stored twice and indexed a
     // third time, so they grew at three times the obvious rate.
-    tokio::spawn(runs::run_retention_loop(state.clone()));
+    tokio::spawn(execution::runs::run_retention_loop(state.clone()));
     // The distiller: turns closed jobs queued by the job loop and the vcs queue into learnings.
     tokio::spawn(distill::run_distill_loop(state.clone()));
     // Its own loop: the cadence is file I/O over the transcripts directory, independent of runs.
@@ -1959,27 +1969,27 @@ async fn main() {
     // `POST /verify` submits to it, so the handlers need the very instance the worker drains: it is
     // parked in `verify::install` (an `OnceLock`, because `AppState` is built literally in dozens of
     // places) before the worker starts. The restart above hands interrupted units straight back to it.
-    let verify_executor = verify_exec::Executor::new(
+    let verify_executor = verify::exec::Executor::new(
         state.pool.clone(),
         verify_config,
         machine_config_root.clone(),
     );
     verify::install(verify_executor.clone());
     // Off for every project unless its rules set `gate_after_land`.
-    tokio::spawn(verify_postgate_worker::run_postgate_worker(
+    tokio::spawn(verify::postgate_worker::run_postgate_worker(
         verify_executor.clone(),
     ));
     // Opens the correction run of a `fix/` branch the gate worker prepared; with `revert_on_red` off
     // for every project there is never one, and a pass reads an empty query.
-    tokio::spawn(verify_postgate_worker::run_correction_loop(state.clone()));
-    tokio::spawn(verify_exec::run_executor(verify_executor));
-    tokio::spawn(vcs::run_queue_worker(
+    tokio::spawn(verify::postgate_worker::run_correction_loop(state.clone()));
+    tokio::spawn(verify::exec::run_executor(verify_executor));
+    tokio::spawn(execution::vcs::run_queue_worker(
         state.pool.clone(),
-        std::sync::Arc::new(git_exec::GitExecutor {
+        std::sync::Arc::new(execution::git_exec::GitExecutor {
             machine_root: machine_config_root.clone(),
             pool: Some(state.pool.clone()),
             verify: verify::installed(),
-            ..git_exec::GitExecutor::default()
+            ..execution::git_exec::GitExecutor::default()
         }),
     ));
     // Its own loop and not a step inside the queue worker's, for the reason `resolver.rs` opens
@@ -1993,33 +2003,33 @@ async fn main() {
     // reader. Without it the sweep simply never runs, and the observation table stays empty —
     // which is the correct behaviour for a measurement nobody asked for.
     if let Some(model) = models_config.local_triage_model.clone() {
-        tokio::spawn(pii_shadow::run_sweep_loop(
+        tokio::spawn(governance::pii_shadow::run_sweep_loop(
             state.pool.clone(),
-            runner::OLLAMA_BASE_URL.to_string(),
+            execution::runner::OLLAMA_BASE_URL.to_string(),
             model,
         ));
     }
 
     // Spawned whether or not the pillar is enabled: the loop also owns retention, and bodies
     // already stored do not stop needing to expire because polling was switched off.
-    tokio::spawn(triage::run_triage_loop(state.clone()));
+    tokio::spawn(governance::triage::run_triage_loop(state.clone()));
 
     // Unconditional for exactly the reason above, applied to dictations. Gating this on the pillar
     // being armed would FREEZE the transcript history at the moment somebody switched voice off, which
     // is the opposite of what switching it off is for — the recordings of what they said would then
     // outlive the feature that made them.
-    tokio::spawn(voice::run_retention_loop(state.clone()));
+    tokio::spawn(integrations::voice::run_retention_loop(state.clone()));
     // Held notifications are reconciled at startup for the same reason orphaned runs and stranded
     // approvals are: the daemon may have been down when the meeting ended, and a queue that only
     // drains on the tick would sit there until the NEXT meeting ended instead.
-    match notify::flush_due(&state.pool).await {
+    match integrations::notify::flush_due(&state.pool).await {
         Ok(delivered) if delivered > 0 => {
             tracing::warn!("delivered {delivered} notification(s) held over from a previous run")
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "could not flush held notifications on startup"),
     }
-    tokio::spawn(notify::run_flush_loop(state.clone()));
+    tokio::spawn(integrations::notify::run_flush_loop(state.clone()));
 
     // The email pillar starts only after its hook barrier has been PROVEN, and the proof can only
     // be attempted once this listener is serving — the hook reaches the daemon over HTTP, and a
@@ -2029,7 +2039,7 @@ async fn main() {
     if state.email.enabled {
         let state = state.clone();
         tokio::spawn(async move {
-            match triage::verify_hook_barrier(
+            match governance::triage::verify_hook_barrier(
                 &state.pool,
                 &state.email.sandbox,
                 &daemon_client::daemon_url(),

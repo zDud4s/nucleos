@@ -1,0 +1,34 @@
+# Production code ceilings for the core files already past the limit in tests/file_size.rs.
+#
+# One line per file: its path from core/, then the most code lines it may hold. The test fails
+# when a file grows past its line. A ceiling only ever goes down: lower it by hand when a split
+# lands (shrinking does not fail, so parallel branches that each delete a few lines never fight
+# over this file), and drop the line once a file is at the limit or under; the test fails on a
+# line whose file no longer exists, or that sits at or under the limit. Nothing new is ever added
+# here: a new file past the limit is split by what it does, not given a line.
+src/http.rs 11163
+src/execution/job.rs 3987
+src/execution/runs.rs 3554
+src/team.rs 3368
+src/execution/runner.rs 2812
+src/hooks.rs 2614
+src/assistant.rs 2374
+src/execution/git_exec.rs 2190
+src/mcp_tools.rs 2067
+src/knowledge.rs 2023
+src/council.rs 2006
+src/execution/vcs.rs 1674
+src/governance/classifier.rs 1549
+src/main.rs 1532
+src/config.rs 1422
+src/execution/worktree.rs 1396
+src/integrations/github.rs 1330
+src/verify.rs 1309
+src/devtime/store.rs 1231
+src/verify/postgate_worker.rs 1216
+src/devtime/rules.rs 1141
+src/browser.rs 1113
+src/daemon_client.rs 1002
+src/governance/triage.rs 1030
+src/judge.rs 1014
+src/devtime/parse.rs 1008

@@ -17,7 +17,7 @@ import type { Proposal } from "./system";
  * The departments pillar — teams, their runs, the actions they ask for and the rules that start
  * them.
  *
- * Every shape below was read off `core/src/team.rs`, `core/src/team_trigger.rs` and the routes
+ * Every shape below was read off `core/src/team.rs`, `core/src/team/trigger.rs` and the routes
  * `core/src/http.rs:105-160` mounts. Where the design's §6.9 disagrees, the daemon is what this
  * file follows.
  *
@@ -216,7 +216,7 @@ export const GRANTABLE_ACTIONS = ["calendar_event", "file_document", "send_email
 /** `core/src/team.rs:375`. There is no `deny`: a kind with no row is a kind the team may not ask for. */
 export const GRANT_MODES = ["propose", "allow"] as const;
 
-/** `core/src/team_trigger.rs:51`. */
+/** `core/src/team/trigger.rs:51`. */
 export const TRIGGER_SOURCES = ["cron", "team_finished", "email_triaged"] as const;
 
 /** The daemon's own hard cap on `GET /team-runs`, with no way to page past it. */
@@ -331,7 +331,7 @@ function combineRuns(results: Array<UseQueryResult<TeamRunView>>) {
  * in a loop over a list whose length changes, so this is the honest shape rather than a clever one.
  *
  * Bounded by the daemon: `max_live_runs` is validated into `1..=MAX_LIVE_TEAM_RUNS`
- * (`core/src/team.rs:254`, `core/src/team_trigger.rs:48`), so this is at most four requests — the
+ * (`core/src/team.rs:254`, `core/src/team/trigger.rs:48`), so this is at most four requests — the
  * same four the Work tab makes, against the same keys, so nothing is fetched twice.
  */
 export function useLiveTeamRuns(ids: string[]) {

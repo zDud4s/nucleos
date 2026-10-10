@@ -219,7 +219,7 @@ fn keepable_line(raw: &str) -> Option<String> {
     }
     let redacted = trimmed
         .split_whitespace()
-        .map(crate::redact::redact_url)
+        .map(crate::governance::redact::redact_url)
         .collect::<Vec<_>>()
         .join(" ");
     if redacted.len() <= MAX_LINE_BYTES {

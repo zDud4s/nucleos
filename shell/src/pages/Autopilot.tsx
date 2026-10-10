@@ -1463,7 +1463,7 @@ function TallyTable({ label, rows }: { label: string; rows: ClassTally[] }) {
  * `reads` is not decoration and is not a guess: each `true` below is a
  * `scoped_kill_engaged(pool, "trigger", …)` call site in `core/src/`, named in
  * the comment beside it. All four scopes are read now, `team` last —
- * `core/src/team_trigger.rs:461` calls `scoped_kill_engaged(&state.pool,
+ * `core/src/team/trigger.rs:461` calls `scoped_kill_engaged(&state.pool,
  * "trigger", "team")` before any rule is considered, and its test
  * `the_scoped_kill_stops_the_rules_and_not_the_work` is what pins that.
  *
@@ -1504,7 +1504,7 @@ const TRIGGER_SCOPES: {
     id: "team",
     label: "Team triggers",
     what: "the rules that start a team on a clock, on another team ending, or on triaged mail",
-    // `team_trigger.rs`, before any rule is considered.
+    // `team/trigger.rs`, before any rule is considered.
     reads: true,
   },
 ];

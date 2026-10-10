@@ -7,9 +7,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::auth::Scope;
-use crate::classifier;
-use crate::runs::finalize_termination;
-use crate::shadow;
+use crate::execution::runs::finalize_termination;
+use crate::governance::classifier;
+use crate::governance::shadow;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -97,13 +97,13 @@ const SESSION_DECISION_BUDGET: Duration = Duration::from_secs(25);
 const QUEUE_OP_PROBE_BRANCH: &str = "probe";
 
 /// The six parsers, in the order the session gate asks them, for one segment.
-fn queue_op(segment: &str, branch: &str) -> Option<crate::vcs::Op> {
-    crate::vcs::merge_from_command(segment, branch)
-        .or_else(|| crate::vcs::push_from_command(segment, branch))
-        .or_else(|| crate::vcs::tag_from_command(segment, branch))
-        .or_else(|| crate::vcs::fetch_from_command(segment))
-        .or_else(|| crate::vcs::branch_delete_from_command(segment))
-        .or_else(|| crate::vcs::rebase_from_command(segment, branch))
+fn queue_op(segment: &str, branch: &str) -> Option<crate::execution::vcs::Op> {
+    crate::execution::vcs::merge_from_command(segment, branch)
+        .or_else(|| crate::execution::vcs::push_from_command(segment, branch))
+        .or_else(|| crate::execution::vcs::tag_from_command(segment, branch))
+        .or_else(|| crate::execution::vcs::fetch_from_command(segment))
+        .or_else(|| crate::execution::vcs::branch_delete_from_command(segment))
+        .or_else(|| crate::execution::vcs::rebase_from_command(segment, branch))
 }
 
 #[derive(Deserialize)]
@@ -172,7 +172,7 @@ async fn session_git_decision_within(
     // One deadline for the whole decision. A hook runs in front of every tool call, so this path
     // spends git subprocesses on a person's keystrokes — which is why the caller filters first and
     // only asks about commands that could possibly be queueable.
-    let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
+    let deadline = std::time::Instant::now() + crate::execution::git_exec::OPERATION_TIMEOUT;
 
     // Per SEGMENT, not per command. Every parser below matches its whole token list as an exact
     // shape, so a shell operator in front of the git call made the list longer and the match fail —
@@ -186,7 +186,7 @@ async fn session_git_decision_within(
     // `master into master` and reported it performed. The shape is matched first with a stand-in
     // branch (the parsers only copy the branch into the op), and the real one is read afterwards
     // from where the segment actually runs.
-    let segments = crate::vcs::directed_segments(command);
+    let segments = crate::execution::vcs::directed_segments(command);
     let Some((segment, probe)) = segments.iter().find_map(|segment| {
         queue_op(&segment.command, QUEUE_OP_PROBE_BRANCH).map(|probe| (segment, probe))
     }) else {
@@ -194,16 +194,16 @@ async fn session_git_decision_within(
         // as one left `git push --force` passing. A spelling that still writes something other
         // sessions share is refused with NOTHING queued — there is nothing to queue, because the
         // queue cannot perform that spelling either. Per segment, for the reason above.
-        let Some(reason) = crate::vcs::shell_segments(command)
+        let Some(reason) = crate::execution::vcs::shell_segments(command)
             .into_iter()
-            .find_map(crate::vcs::unqueueable_but_shared)
+            .find_map(crate::execution::vcs::unqueueable_but_shared)
         else {
             return no_opinion();
         };
         // Standing outside a working tree, so no git command from here reaches a repository this
         // queue serves. Silence rather than refusal: this hook is registered for one repository and
         // a session that has wandered out of it is not the case being governed.
-        if crate::git_exec::toplevel(Path::new(&payload.cwd), deadline)
+        if crate::execution::git_exec::toplevel(Path::new(&payload.cwd), deadline)
             .await
             .is_err()
         {
@@ -214,11 +214,11 @@ async fn session_git_decision_within(
 
     let kind = probe.kind();
     let cwd = match &segment.dir {
-        crate::vcs::SegmentDir::Session => std::path::PathBuf::from(&payload.cwd),
-        crate::vcs::SegmentDir::Steps(steps) => {
-            crate::vcs::resolve_segment_dir(Path::new(&payload.cwd), steps)
+        crate::execution::vcs::SegmentDir::Session => std::path::PathBuf::from(&payload.cwd),
+        crate::execution::vcs::SegmentDir::Steps(steps) => {
+            crate::execution::vcs::resolve_segment_dir(Path::new(&payload.cwd), steps)
         }
-        crate::vcs::SegmentDir::Unfollowable(how) => {
+        crate::execution::vcs::SegmentDir::Unfollowable(how) => {
             return Json(
                 deny_with(&format!(
                     "{kind} goes through the queue, and the queue has to know which branch it \
@@ -233,8 +233,8 @@ async fn session_git_decision_within(
             );
         }
     };
-    let explicit = segment.dir != crate::vcs::SegmentDir::Session;
-    let root = match crate::git_exec::toplevel(&cwd, deadline).await {
+    let explicit = segment.dir != crate::execution::vcs::SegmentDir::Session;
+    let root = match crate::execution::git_exec::toplevel(&cwd, deadline).await {
         Ok(root) => root,
         // An explicit `cd`/`-C` into something that is not a working tree is a mistake to report,
         // not a session that wandered off; falling silent would let it run by hand.
@@ -243,7 +243,7 @@ async fn session_git_decision_within(
         }
         Err(_) => return no_opinion(),
     };
-    let branch = match crate::git_exec::current_branch(&root, deadline).await {
+    let branch = match crate::execution::git_exec::current_branch(&root, deadline).await {
         Ok(branch) => branch,
         Err(reason) if explicit => {
             return Json(deny_with(&format!("{kind} goes through the queue, and {reason}")).into());
@@ -268,19 +268,20 @@ async fn session_git_decision_within(
     // and the two are right for opposite reasons: there, a person has already approved an action and
     // being unable to queue it must not strand them holding it; here, nobody has approved anything,
     // and falling through would hand back the very bypass this function closes.
-    let project_id = match crate::vcs::project_for_worktree(&state.pool, &root, deadline).await {
-        Ok(project_id) => project_id,
-        Err(reason) => {
-            return Json(
-                deny_with(&format!(
-                    "{} goes through the queue, and {reason}",
-                    op.kind()
-                ))
-                .into(),
-            );
-        }
-    };
-    let repo = match crate::vcs::resolve_repo(&state.pool, &project_id).await {
+    let project_id =
+        match crate::execution::vcs::project_for_worktree(&state.pool, &root, deadline).await {
+            Ok(project_id) => project_id,
+            Err(reason) => {
+                return Json(
+                    deny_with(&format!(
+                        "{} goes through the queue, and {reason}",
+                        op.kind()
+                    ))
+                    .into(),
+                );
+            }
+        };
+    let repo = match crate::execution::vcs::resolve_repo(&state.pool, &project_id).await {
         Ok(repo) => repo,
         Err(error) => {
             tracing::warn!(
@@ -298,14 +299,21 @@ async fn session_git_decision_within(
         }
     };
 
-    match crate::vcs::submit(&state.pool, &repo, &op, crate::vcs::Origin::Shell).await {
+    match crate::execution::vcs::submit(
+        &state.pool,
+        &repo,
+        &op,
+        crate::execution::vcs::Origin::Shell,
+    )
+    .await
+    {
         Ok(id) => {
             let wait = settle_wait.min(SESSION_DECISION_BUDGET.saturating_sub(started.elapsed()));
-            let ticket = match crate::vcs::wait_for(&state.pool, id, wait).await {
+            let ticket = match crate::execution::vcs::wait_for(&state.pool, id, wait).await {
                 Ok(ticket) => ticket,
                 Err(error) => {
                     tracing::warn!(id, ?error, "session-git: could not read the request back");
-                    crate::vcs::Ticket {
+                    crate::execution::vcs::Ticket {
                         id,
                         status: "queued".into(),
                         result_sha: None,
@@ -313,7 +321,8 @@ async fn session_git_decision_within(
                     }
                 }
             };
-            let settled = crate::vcs::TERMINAL_STATUSES.contains(&ticket.status.as_str());
+            let settled =
+                crate::execution::vcs::TERMINAL_STATUSES.contains(&ticket.status.as_str());
             Json(SessionGitDecision {
                 decision: "deny".to_owned(),
                 reason: session_git_reason(id, op.kind(), &ticket, settled),
@@ -337,7 +346,12 @@ async fn session_git_decision_within(
 /// What the session is told about a request it caused, by where the request stands. Pure, so every
 /// outcome can be asserted without a queue. The sentence always opens the same way, and never names
 /// a route the session cannot read: an editor session holds no control token.
-fn session_git_reason(id: i64, kind: &str, ticket: &crate::vcs::Ticket, settled: bool) -> String {
+fn session_git_reason(
+    id: i64,
+    kind: &str,
+    ticket: &crate::execution::vcs::Ticket,
+    settled: bool,
+) -> String {
     let head = format!("queued as vcs request #{id} ({kind}) — ");
     let why = ticket
         .failure_reason
@@ -359,7 +373,7 @@ fn session_git_reason(id: i64, kind: &str, ticket: &crate::vcs::Ticket, settled:
         status @ ("failed" | "interrupted") => {
             format!("it {status}: {why}. Check the repository state before asking again.")
         }
-        "rejected" if ticket.failure_reason.as_deref() == Some(crate::vcs::OWNER_REFUSED_REASON) => {
+        "rejected" if ticket.failure_reason.as_deref() == Some(crate::execution::vcs::OWNER_REFUSED_REASON) => {
             "the owner refused the change it makes to the test map, and nothing was performed.              Do not run it again."
                 .to_owned()
         }
@@ -462,7 +476,7 @@ fn deny_with(reason: &str) -> Decision {
 enum ProjectRules {
     /// What the project declared — and an empty pair when there was no project to ask, or when the
     /// call is one no rule could reach. Both of those are the whole truth rather than a stand-in.
-    Declared(crate::project_policy::ShellRules),
+    Declared(crate::project::policy::ShellRules),
     /// The table would not answer. Carries NO lists, because a state that held both "unreadable"
     /// and a set of rules would be a state nothing can act on — and the struct this replaces could
     /// represent it.
@@ -484,7 +498,7 @@ enum ProjectRules {
 /// It is also why `ShellRules::deny_writes` is a `Vec` of pairs and not a map keyed by tool: a
 /// `HashMap::new()` is not a `const fn`, so a shape chosen for the read side would have taken this
 /// `static` away and the `E0515` above with it.
-static NO_SHELL_RULES: crate::project_policy::ShellRules = crate::project_policy::ShellRules {
+static NO_SHELL_RULES: crate::project::policy::ShellRules = crate::project::policy::ShellRules {
     allow: Vec::new(),
     deny: Vec::new(),
     deny_writes: Vec::new(),
@@ -495,10 +509,10 @@ impl ProjectRules {
     /// rules could not change anyway. Distinct from `Unreadable` in exactly the way that matters —
     /// there is nothing here that needs repairing afterwards.
     fn none() -> Self {
-        Self::Declared(crate::project_policy::ShellRules::default())
+        Self::Declared(crate::project::policy::ShellRules::default())
     }
 
-    fn declared(&self) -> &crate::project_policy::ShellRules {
+    fn declared(&self) -> &crate::project::policy::ShellRules {
         match self {
             Self::Declared(rules) => rules,
             // Classified under an empty pair and repaired afterwards: `downgrade_if_unreadable` is
@@ -582,7 +596,7 @@ async fn shell_rules_of(state: &AppState, project_id: Option<&str>) -> ProjectRu
     let Some(project_id) = project_id else {
         return ProjectRules::none();
     };
-    match crate::project_policy::shell_rules(&state.pool, project_id).await {
+    match crate::project::policy::shell_rules(&state.pool, project_id).await {
         Ok(declared) => ProjectRules::Declared(declared),
         Err(error) => {
             tracing::warn!(
@@ -619,7 +633,7 @@ async fn shell_rules_of(state: &AppState, project_id: Option<&str>) -> ProjectRu
 async fn github_policy_of<'a>(
     state: &'a AppState,
     project_id: Option<&str>,
-) -> std::borrow::Cow<'a, crate::github::Policy> {
+) -> std::borrow::Cow<'a, crate::integrations::github::Policy> {
     match project_id {
         Some(project_id) => std::borrow::Cow::Owned(
             state
@@ -712,7 +726,7 @@ async fn observe_verification(
     }
     let map = match (tree, target) {
         (MapState::Valid(tree), Some(MapState::Valid(target))) => {
-            crate::verify_guard::detection_union(&target, &tree)
+            crate::verify::guard::detection_union(&target, &tree)
         }
         (MapState::Valid(map), _) | (_, Some(MapState::Valid(map))) => map,
         _ => return false,
@@ -729,7 +743,7 @@ async fn observe_verification(
             (None, crate::config::VerifyGuardMode::Observe)
         }
     };
-    let Some(hit) = crate::verify_guard::detect(
+    let Some(hit) = crate::verify::guard::detect(
         command,
         classifier::shell_for(&payload.tool_name),
         &map,
@@ -738,9 +752,9 @@ async fn observe_verification(
         return false;
     };
     let refused = guard == crate::config::VerifyGuardMode::Refuse && decision != "deny";
-    if let Err(error) = crate::verify_observe::record(
+    if let Err(error) = crate::verify::observe::record(
         &state.pool,
-        &crate::verify_observe::Observation {
+        &crate::verify::observe::Observation {
             project_id,
             run_id,
             shadow_decision_id,
@@ -953,7 +967,7 @@ async fn pretooluse_decision_from(
     // a stranger wrote and answer with a verdict, and every tool is a way for that text to act.
     //
     // It returns before the classifier, so it never terminates the run and never mints a proposal.
-    if mode == crate::email::TRIAGE_MODE {
+    if mode == crate::integrations::email::TRIAGE_MODE {
         // Only a run that is actually executing can have reached a tool through barrier 1, and that
         // is the alarming case. The startup verification deliberately probes this branch with a
         // throwaway row that is NOT in flight, so warning on both would fire a false alarm on every
@@ -1030,7 +1044,10 @@ async fn pretooluse_decision_from(
     // the classifier, like the branches above, so it never reaches the judge, never parks and writes
     // no scoreboard row (the scoreboard measures the classifier, and this is not its decision).
     // Anything short of ALL the conditions falls through and is refused as an unrecognised tool.
-    if is_job_node_tool(&payload.tool_name) && is_in_flight && crate::runs::runs_unattended(&mode) {
+    if is_job_node_tool(&payload.tool_name)
+        && is_in_flight
+        && crate::execution::runs::runs_unattended(&mode)
+    {
         match job_id_of(&state.pool, run_id).await {
             Ok(Some(job_id)) => {
                 // A base tool that carries a third party's words (`read_context`) taints the run
@@ -1042,7 +1059,7 @@ async fn pretooluse_decision_from(
                 if crate::mcp_tools::effect_of_call(&state.pool, bare, &payload.tool_input).await
                     == crate::mcp_tools::ToolEffect::ReadsUntrusted
                     && let Err(error) =
-                        crate::runs::mark_untrusted_context(&state.pool, run_id).await
+                        crate::execution::runs::mark_untrusted_context(&state.pool, run_id).await
                 {
                     tracing::warn!(
                         run_id = run_id,
@@ -1086,7 +1103,7 @@ async fn pretooluse_decision_from(
     // base branch; a tool that is not listed is refused with the way to ask for it.
     if let Some(extra) = job_node_extra(&payload.tool_name)
         && is_in_flight
-        && crate::runs::runs_unattended(&mode)
+        && crate::execution::runs::runs_unattended(&mode)
     {
         match job_id_of(&state.pool, run_id).await {
             Ok(Some(job_id)) => {
@@ -1100,7 +1117,8 @@ async fn pretooluse_decision_from(
                         .await;
                         if effect == crate::mcp_tools::ToolEffect::ReadsUntrusted
                             && let Err(error) =
-                                crate::runs::mark_untrusted_context(&state.pool, run_id).await
+                                crate::execution::runs::mark_untrusted_context(&state.pool, run_id)
+                                    .await
                         {
                             tracing::warn!(
                                 run_id = run_id,
@@ -1443,7 +1461,7 @@ async fn pretooluse_decision_from(
             // a person could still approve, and a failed submission leaves no ticket to name.
             let declared_git_decision: Option<Decision> = async {
                 let project_id = project_id.as_deref()?;
-                let declared = crate::project_policy::git_ops(&state.pool, project_id).await;
+                let declared = crate::project::policy::git_ops(&state.pool, project_id).await;
                 if declared.is_empty() {
                     return None;
                 }
@@ -1453,31 +1471,34 @@ async fn pretooluse_decision_from(
                 // The branch is read where the segment RUNS, not where the run stands: `cd x &&`
                 // and `git -C x` move it. A directory change this reader cannot follow is not
                 // auto-queued; it falls to the approval path, where a person sees the line.
-                let segments = crate::vcs::directed_segments(command);
+                let segments = crate::execution::vcs::directed_segments(command);
                 let segment = segments
                     .iter()
                     .find(|segment| queue_op(&segment.command, QUEUE_OP_PROBE_BRANCH).is_some())?;
                 let cwd = match &segment.dir {
-                    crate::vcs::SegmentDir::Session => std::path::PathBuf::from(cwd),
-                    crate::vcs::SegmentDir::Steps(steps) => {
-                        crate::vcs::resolve_segment_dir(Path::new(cwd), steps)
+                    crate::execution::vcs::SegmentDir::Session => std::path::PathBuf::from(cwd),
+                    crate::execution::vcs::SegmentDir::Steps(steps) => {
+                        crate::execution::vcs::resolve_segment_dir(Path::new(cwd), steps)
                     }
-                    crate::vcs::SegmentDir::Unfollowable(_) => return None,
+                    crate::execution::vcs::SegmentDir::Unfollowable(_) => return None,
                 };
-                let deadline = std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT;
-                let root = crate::git_exec::toplevel(&cwd, deadline).await.ok()?;
-                let branch = crate::git_exec::current_branch(&root, deadline)
+                let deadline =
+                    std::time::Instant::now() + crate::execution::git_exec::OPERATION_TIMEOUT;
+                let root = crate::execution::git_exec::toplevel(&cwd, deadline)
+                    .await
+                    .ok()?;
+                let branch = crate::execution::git_exec::current_branch(&root, deadline)
                     .await
                     .ok()?;
 
                 let worktree_project =
-                    crate::vcs::project_for_worktree(&state.pool, &root, deadline)
+                    crate::execution::vcs::project_for_worktree(&state.pool, &root, deadline)
                         .await
                         .ok()?;
                 if worktree_project != project_id {
                     return None;
                 }
-                let repo = crate::vcs::resolve_repo(&state.pool, project_id)
+                let repo = crate::execution::vcs::resolve_repo(&state.pool, project_id)
                     .await
                     .ok()?;
 
@@ -1486,11 +1507,11 @@ async fn pretooluse_decision_from(
                     return None;
                 }
 
-                let request_id = crate::vcs::submit_declared(
+                let request_id = crate::execution::vcs::submit_declared(
                     &state.pool,
                     &repo,
                     &op,
-                    crate::vcs::Origin::Run(run_id),
+                    crate::execution::vcs::Origin::Run(run_id),
                 )
                 .await
                 .ok()?;
@@ -1838,7 +1859,7 @@ async fn pretooluse_decision_from(
     // in ten seconds.
     if classification.decision.decision == "pending_approval"
         && classification.action_class == "unrecognized-tool"
-        && crate::runs::runs_unattended(&mode)
+        && crate::execution::runs::runs_unattended(&mode)
     {
         return Json(Decision {
             decision: "deny".to_owned(),
@@ -2137,9 +2158,9 @@ async fn unrecognized_policy_for(
     pool: &sqlx::SqlitePool,
     run_id: i64,
     mode: &str,
-) -> crate::classifier::Unrecognized {
-    if !crate::runs::runs_unattended(mode) {
-        return crate::classifier::Unrecognized::AsksAPerson;
+) -> crate::governance::classifier::Unrecognized {
+    if !crate::execution::runs::runs_unattended(mode) {
+        return crate::governance::classifier::Unrecognized::AsksAPerson;
     }
     let asked_for: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM runs JOIN jobs ON jobs.id = runs.job_id
@@ -2151,8 +2172,8 @@ async fn unrecognized_policy_for(
     .unwrap_or(None);
 
     match asked_for {
-        Some(_) => crate::classifier::Unrecognized::MayBeConfined,
-        None => crate::classifier::Unrecognized::AsksAPerson,
+        Some(_) => crate::governance::classifier::Unrecognized::MayBeConfined,
+        None => crate::governance::classifier::Unrecognized::AsksAPerson,
     }
 }
 
@@ -2186,7 +2207,7 @@ pub const A_PARK_HERE_WOULD_END_THE_ITEM: &str = "this is unattended work you we
 /// Fails closed everywhere: any error, any missing row, anything not a job node answers `false` and
 /// the run parks exactly as it did before this existed.
 async fn a_park_here_would_only_destroy(pool: &sqlx::SqlitePool, run_id: i64, mode: &str) -> bool {
-    if !crate::runs::runs_unattended(mode) {
+    if !crate::execution::runs::runs_unattended(mode) {
         return false;
     }
     // Read-only, and it mirrors `put_the_item_down`'s WHERE clause plus the `NODES_THAT_GIVE_UP`
@@ -2500,18 +2521,18 @@ fn judge_prompt(
 async fn judge_for(
     state: &AppState,
     project_id: Option<&str>,
-) -> Option<std::sync::Arc<crate::local_agent::LocalAssistant>> {
+) -> Option<std::sync::Arc<crate::models::local_agent::LocalAssistant>> {
     // A turn with no project cannot have a judge NAMED for it, and gets the default rather than
     // nothing: `auto` means the same thing wherever it is switched on. The read itself lives in
     // `project_policy`, with the other three answers to "what may this project do without asking".
     let configured = match project_id {
-        Some(project_id) => crate::project_policy::judge(&state.pool, project_id).await,
-        None => crate::project_policy::Judge::Default,
+        Some(project_id) => crate::project::policy::judge(&state.pool, project_id).await,
+        None => crate::project::policy::Judge::Default,
     };
     let (brain, model) = match configured {
-        crate::project_policy::Judge::Off => return None,
-        crate::project_policy::Judge::Named { brain, model } => (brain, model),
-        crate::project_policy::Judge::Default => (crate::chats::Brain::Local, None),
+        crate::project::policy::Judge::Off => return None,
+        crate::project::policy::Judge::Named { brain, model } => (brain, model),
+        crate::project::policy::Judge::Default => (crate::chats::Brain::Local, None),
     };
     match state.assistants.assistant_for(brain, model.as_deref()) {
         Ok(assistant) => Some(assistant),
@@ -2664,7 +2685,7 @@ fn allowed_at(
 ) -> bool {
     match permission {
         crate::chats::PermissionMode::Manual => {
-            action_class == "read-local" && !crate::classifier::writes_files(tool_name)
+            action_class == "read-local" && !crate::governance::classifier::writes_files(tool_name)
         }
         crate::chats::PermissionMode::AcceptEdits => action_class == "read-local",
         // Everything the classifier was willing to allow. `plan` is here and not one rung down
@@ -2708,17 +2729,17 @@ async fn rooted_decision(
     // Filtered like the sibling call, and for the same reason: an unreadable list parks everything,
     // so a read no tool call could consult is a read whose failure costs more than the read itself.
     // The GitHub policy rides its own gate, as it does there, and for the reason given there.
-    let rules = if crate::classifier::reads_shell_rules(&payload.tool_name) {
+    let rules = if crate::governance::classifier::reads_shell_rules(&payload.tool_name) {
         shell_rules_of(state, project_id).await
     } else {
         ProjectRules::none()
     };
-    let policy = if crate::classifier::reads_github_policy(&payload.tool_name) {
+    let policy = if crate::governance::classifier::reads_github_policy(&payload.tool_name) {
         github_policy_of(state, project_id).await
     } else {
         std::borrow::Cow::Borrowed(&state.github.policy)
     };
-    let mut classification = crate::classifier::classify(
+    let mut classification = crate::governance::classifier::classify(
         &payload.tool_name,
         &payload.tool_input,
         Some(Path::new(root)),
@@ -2731,7 +2752,7 @@ async fn rooted_decision(
         rules.declared(),
         // A rooted turn is a conversation. Somebody asked for it AND is sitting in front of it, so
         // a park costs them ten seconds and buys the strict reading.
-        crate::classifier::Unrecognized::AsksAPerson,
+        crate::governance::classifier::Unrecognized::AsksAPerson,
     );
 
     // **`bypass` moves the VERDICT. It does not move the path.**
@@ -2799,8 +2820,8 @@ async fn rooted_decision(
     // `read_untrusted_since` and not `read_untrusted_context`: a live task's calls arrive under its
     // launcher's id, and the process it runs in was fed by every later turn of the chat too, so
     // those turns count against it.
-    if !crate::classifier::only_reads(&payload.tool_name) {
-        match crate::runs::read_untrusted_since(&state.pool, payload.run_id).await {
+    if !crate::governance::classifier::only_reads(&payload.tool_name) {
+        match crate::execution::runs::read_untrusted_since(&state.pool, payload.run_id).await {
             Ok(false) => {}
             Ok(true) => {
                 tracing::warn!(
@@ -2903,7 +2924,7 @@ async fn rooted_decision(
             &chat_id,
             run_id,
             &payload.tool_name,
-            crate::runner::detail_of(&payload.tool_input),
+            crate::execution::runner::detail_of(&payload.tool_input),
         );
         // **`auto` only.** Not `manual`, where a rung called Manual whose answer comes from a model
         // is a rung that lies; not `accept_edits`, one line above for the same reason; not `bypass`,
@@ -2965,7 +2986,7 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
             // alternative is a turn that has a stranger's words in it and no record of having read
             // them, which is the state every refusal below depends on not existing.
             if let Err(error) =
-                crate::runs::mark_untrusted_context(&state.pool, payload.run_id).await
+                crate::execution::runs::mark_untrusted_context(&state.pool, payload.run_id).await
             {
                 tracing::warn!(
                     run_id = payload.run_id,
@@ -2986,7 +3007,7 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
             // on: the cost is a refusal that has to say "not recorded", which is worse than knowing
             // and better than a browsing session that cannot open a page because a log line would
             // not write.
-            if let Err(error) = crate::runs::record_untrusted_read(
+            if let Err(error) = crate::execution::runs::record_untrusted_read(
                 &state.pool,
                 payload.run_id,
                 tool,
@@ -3007,7 +3028,7 @@ async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Js
             })
         }
         crate::mcp_tools::ToolEffect::Acts => {
-            match crate::runs::read_untrusted_since(&state.pool, payload.run_id).await {
+            match crate::execution::runs::read_untrusted_since(&state.pool, payload.run_id).await {
                 Ok(false) => Json(Decision {
                     decision: "allow".to_owned(),
                     reason: "orchestrator NucleOS tool".to_owned(),
@@ -3090,7 +3111,7 @@ async fn record_refused_action(
     // on their own schedule and this record is meant to outlive the turn. An error is `None` for the
     // same reason the write was best-effort — a person reading "not recorded" still has the action
     // in front of them, where a refusal that failed to be written down at all leaves them nothing.
-    let read_from = crate::runs::untrusted_reads_json(&state.pool, payload.run_id)
+    let read_from = crate::execution::runs::untrusted_reads_json(&state.pool, payload.run_id)
         .await
         .unwrap_or_default();
 
@@ -3280,7 +3301,7 @@ async fn team_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<De
             // holding a stranger's words with no record of having read them, which is the one state
             // every refusal below depends on not existing.
             if let Err(error) =
-                crate::runs::mark_untrusted_context(&state.pool, payload.run_id).await
+                crate::execution::runs::mark_untrusted_context(&state.pool, payload.run_id).await
             {
                 tracing::warn!(
                     run_id = payload.run_id,
@@ -3299,7 +3320,8 @@ async fn team_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<De
             })
         }
         crate::mcp_tools::ToolEffect::Acts => {
-            match crate::runs::read_untrusted_context(&state.pool, payload.run_id).await {
+            match crate::execution::runs::read_untrusted_context(&state.pool, payload.run_id).await
+            {
                 Ok(false) => Json(Decision {
                     decision: "allow".to_owned(),
                     reason: "a department may ask".to_owned(),
@@ -3615,14 +3637,14 @@ async fn resolve_park(
                 // classifier wanted approval (spec B D5), after the fixed sentence.
                 &format!(
                     "{} Needed approval because: {}",
-                    crate::runs::CONTINUING_WITHOUT_IT,
+                    crate::execution::runs::CONTINUING_WITHOUT_IT,
                     classification.reason
                 ),
             )
             .await;
             Some(Decision {
                 decision: "deny".to_owned(),
-                reason: crate::runs::CONTINUING_WITHOUT_IT.to_owned(),
+                reason: crate::execution::runs::CONTINUING_WITHOUT_IT.to_owned(),
             })
         }
         _ => None,
@@ -3996,7 +4018,7 @@ async fn put_the_item_down(pool: &sqlx::SqlitePool, job_id: i64, run_id: i64) ->
     let marked = sqlx::query(
         "UPDATE job_items SET status = ? WHERE job_id = ? AND run_id = ? AND status = 'running'",
     )
-    .bind(crate::job::STATUS_SKIPPED)
+    .bind(crate::execution::job::STATUS_SKIPPED)
     .bind(job_id)
     .bind(run_id)
     .execute(pool)
@@ -4087,9 +4109,9 @@ async fn skip_the_item(state: AppState, item: SkippedItem) {
         // taken from a different one is worse than reverting nothing — and asking for them together
         // is what keeps them from being resolved off different keys, which is how a node working in
         // its item's own tree came to have the job's reverted instead.
-        match crate::job::revert_target(&state.pool, job_id, run_id).await {
+        match crate::execution::job::revert_target(&state.pool, job_id, run_id).await {
             Some((worktree, sha)) => {
-                if let Err(error) = crate::worktree::revert_to(&worktree, &sha).await {
+                if let Err(error) = crate::execution::worktree::revert_to(&worktree, &sha).await {
                     tracing::warn!(run_id, job_id, %error, "pretooluse-decision: could not revert a skipped item");
                 }
             }
@@ -4137,8 +4159,8 @@ async fn skip_the_item(state: AppState, item: SkippedItem) {
 mod tests {
     use super::*;
     use crate::auth::Token;
+    use crate::execution::runner::FakeCommandRunner;
     use crate::proposals;
-    use crate::runner::FakeCommandRunner;
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -4166,13 +4188,13 @@ mod tests {
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
-            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
-            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
-            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
             judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
-            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -4437,7 +4459,7 @@ mod tests {
             count_denial_and_stop_a_prober(&state, run_id, "Bash").await,
             DenialCount::Counted(2)
         );
-        crate::runs::finalize_termination(&state, run_id, "cancelled").await;
+        crate::execution::runs::finalize_termination(&state, run_id, "cancelled").await;
         assert_eq!(
             count_denial_and_stop_a_prober(&state, run_id, "Bash").await,
             DenialCount::Stopped,
@@ -4594,8 +4616,8 @@ mod tests {
             "Bash",
             &serde_json::json!({ "command": PARKED }),
             Some(Path::new("C:\\work\\repo")),
-            &crate::github::Policy::empty(),
-            &crate::project_policy::ShellRules::default(),
+            &crate::integrations::github::Policy::empty(),
+            &crate::project::policy::ShellRules::default(),
             classifier::Unrecognized::AsksAPerson,
         )
         .action_class;
@@ -4898,7 +4920,7 @@ mod tests {
 
         assert_eq!(
             (decision.decision.as_str(), decision.reason.as_str()),
-            ("deny", crate::runs::CONTINUING_WITHOUT_IT)
+            ("deny", crate::execution::runs::CONTINUING_WITHOUT_IT)
         );
         assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
         let (denials, refused): (i64, i64) = sqlx::query_as(
@@ -5107,7 +5129,10 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        assert_eq!(decision.reason, crate::runs::CONTINUING_WITHOUT_IT);
+        assert_eq!(
+            decision.reason,
+            crate::execution::runs::CONTINUING_WITHOUT_IT
+        );
     }
 
     /// Spec B D13: when spec A decides the call, the resolver's answer is moot: recorded, never
@@ -5765,7 +5790,7 @@ mod tests {
         assert_eq!(granted.decision, "allow");
 
         let repo = rostered_repo(&state, "hook-judge-declared-push").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+        crate::project::policy::declare_git_op(&state.pool, "p", "push")
             .await
             .unwrap();
         let declared_run = in_flight_run(
@@ -5963,7 +5988,7 @@ mod tests {
         .await;
         assert_eq!(verdict.decision, "allow");
         assert!(
-            crate::runs::read_untrusted_context(&state.pool, run_id)
+            crate::execution::runs::read_untrusted_context(&state.pool, run_id)
                 .await
                 .unwrap(),
             "web_read must mark the run as having read untrusted text"
@@ -5978,7 +6003,7 @@ mod tests {
         let (_job_id, run_id) = in_flight_job_node(&state).await;
         let app = test_router(state.clone());
         assert!(
-            !crate::runs::read_untrusted_context(&state.pool, run_id)
+            !crate::execution::runs::read_untrusted_context(&state.pool, run_id)
                 .await
                 .unwrap(),
             "a fresh run has read nothing untrusted"
@@ -5995,7 +6020,7 @@ mod tests {
         .await;
         assert_eq!(verdict.decision, "allow", "{}", verdict.reason);
         assert!(
-            crate::runs::read_untrusted_context(&state.pool, run_id)
+            crate::execution::runs::read_untrusted_context(&state.pool, run_id)
                 .await
                 .unwrap(),
             "read_context must mark the run as having read untrusted text"
@@ -6010,7 +6035,7 @@ mod tests {
         let run_id = in_flight_run(&state, crate::team::TEAM_MODE, None, None, None).await;
         let app = test_router(state.clone());
         assert!(
-            !crate::runs::read_untrusted_context(&state.pool, run_id)
+            !crate::execution::runs::read_untrusted_context(&state.pool, run_id)
                 .await
                 .unwrap(),
             "a fresh run has read nothing untrusted"
@@ -6025,7 +6050,7 @@ mod tests {
         .await;
         assert_eq!(verdict.decision, "allow", "{}", verdict.reason);
         assert!(
-            crate::runs::read_untrusted_context(&state.pool, run_id)
+            crate::execution::runs::read_untrusted_context(&state.pool, run_id)
                 .await
                 .unwrap(),
             "read_context must mark the run as having read untrusted text"
@@ -6202,7 +6227,7 @@ mod tests {
     /// that has to come back `AsksAPerson` rather than fall through to it.
     #[tokio::test]
     async fn only_an_unattended_node_of_a_job_the_owner_asked_for_may_be_confined() {
-        use crate::classifier::Unrecognized;
+        use crate::governance::classifier::Unrecognized;
         let state = test_state().await;
 
         // Asked for (`rule_name IS NULL`) and unattended: the case the whole thing exists for.
@@ -6601,7 +6626,7 @@ mod tests {
         // The turn being answered right now, down the same living process, which has read a
         // stranger's text.
         let now = turn_of(&state, "live-chat").await;
-        crate::runs::mark_untrusted_context(&state.pool, now)
+        crate::execution::runs::mark_untrusted_context(&state.pool, now)
             .await
             .unwrap();
 
@@ -6872,7 +6897,14 @@ mod tests {
     #[tokio::test]
     async fn a_triage_run_is_denied_every_tool() {
         let state = test_state().await;
-        let run_id = in_flight_run(&state, crate::email::TRIAGE_MODE, None, None, None).await;
+        let run_id = in_flight_run(
+            &state,
+            crate::integrations::email::TRIAGE_MODE,
+            None,
+            None,
+            None,
+        )
+        .await;
         let app = test_router(state);
 
         for (tool, input) in [
@@ -6912,7 +6944,7 @@ mod tests {
     #[tokio::test]
     async fn a_triage_run_stays_denied_once_it_leaves_the_handle_map() {
         let state = test_state().await;
-        let run_id = out_of_flight_run(&state, crate::email::TRIAGE_MODE).await;
+        let run_id = out_of_flight_run(&state, crate::integrations::email::TRIAGE_MODE).await;
         let app = test_router(state);
 
         let body = serde_json::json!({
@@ -7027,8 +7059,8 @@ mod tests {
             "Bash",
             &tool_input,
             None,
-            &crate::github::Policy::empty(),
-            &crate::project_policy::ShellRules::default(),
+            &crate::integrations::github::Policy::empty(),
+            &crate::project::policy::ShellRules::default(),
             classifier::Unrecognized::AsksAPerson,
         );
         assert_eq!(classification.action_class, "unrecognized");
@@ -7051,12 +7083,12 @@ mod tests {
     #[tokio::test]
     async fn a_prefix_the_project_declared_runs_where_a_run_with_no_project_parks() {
         let state = test_state().await;
-        crate::project_policy::declare_shell_rule(
+        crate::project::policy::declare_shell_rule(
             &state.pool,
             "alpha",
             None,
             "bash scripts/gates.sh",
-            crate::project_policy::Verdict::Allow,
+            crate::project::policy::Verdict::Allow,
             None,
         )
         .await
@@ -7098,7 +7130,7 @@ mod tests {
     #[tokio::test]
     async fn an_operation_the_project_declared_reaches_github_where_a_run_with_no_project_parks() {
         let state = test_state().await;
-        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_list")
+        crate::project::policy::declare_github_op(&state.pool, "alpha", "run_list")
             .await
             .unwrap();
 
@@ -7138,7 +7170,7 @@ mod tests {
     #[tokio::test]
     async fn a_declared_read_that_asks_for_a_strangers_words_parks_anyway() {
         let state = test_state().await;
-        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_status")
+        crate::project::policy::declare_github_op(&state.pool, "alpha", "run_status")
             .await
             .unwrap();
 
@@ -7176,12 +7208,12 @@ mod tests {
     #[tokio::test]
     async fn a_projects_refusal_overrides_a_compiled_permission() {
         let state = test_state().await;
-        crate::project_policy::declare_shell_rule(
+        crate::project::policy::declare_shell_rule(
             &state.pool,
             "alpha",
             None,
             "ls",
-            crate::project_policy::Verdict::Deny,
+            crate::project::policy::Verdict::Deny,
             None,
         )
         .await
@@ -7348,12 +7380,12 @@ mod tests {
     #[tokio::test]
     async fn a_rooted_turn_is_bound_by_its_projects_refusals() {
         let state = test_state().await;
-        crate::project_policy::declare_shell_rule(
+        crate::project::policy::declare_shell_rule(
             &state.pool,
             "alpha",
             None,
             "ls",
-            crate::project_policy::Verdict::Deny,
+            crate::project::policy::Verdict::Deny,
             None,
         )
         .await
@@ -7400,7 +7432,7 @@ mod tests {
     #[tokio::test]
     async fn a_rooted_turn_reaches_github_through_its_projects_declared_operations() {
         let state = test_state().await;
-        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_list")
+        crate::project::policy::declare_github_op(&state.pool, "alpha", "run_list")
             .await
             .unwrap();
 
@@ -7477,14 +7509,14 @@ mod tests {
     async fn a_run_paused_for_approval_keeps_the_merge_it_asked_for() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, "real", None, None, None).await;
-        let request = crate::vcs::submit(
+        let request = crate::execution::vcs::submit(
             &state.pool,
-            &crate::vcs::ResolvedRepo::synthetic("proj-1", "C:/repo", "proj-1"),
-            &crate::vcs::Op::Merge {
+            &crate::execution::vcs::ResolvedRepo::synthetic("proj-1", "C:/repo", "proj-1"),
+            &crate::execution::vcs::Op::Merge {
                 source: "feat/x".into(),
                 target: "master".into(),
             },
-            crate::vcs::Origin::Run(run_id),
+            crate::execution::vcs::Origin::Run(run_id),
         )
         .await
         .unwrap();
@@ -8604,7 +8636,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::local_agent::LocalChat for ScriptedJudge {
+    impl crate::models::local_agent::LocalChat for ScriptedJudge {
         async fn exchange(
             &self,
             _messages: Vec<serde_json::Value>,
@@ -8627,7 +8659,7 @@ mod tests {
 
     struct NoJudgeTools;
     #[async_trait::async_trait]
-    impl crate::local_agent::ToolBox for NoJudgeTools {
+    impl crate::models::local_agent::ToolBox for NoJudgeTools {
         fn schemas(&self) -> Vec<serde_json::Value> {
             Vec::new()
         }
@@ -8635,7 +8667,7 @@ mod tests {
             &self,
             _name: &str,
             _arguments: &serde_json::Value,
-        ) -> crate::local_agent::ToolAnswer {
+        ) -> crate::models::local_agent::ToolAnswer {
             unreachable!("a judge has no tools, which is the whole of what makes it a judge")
         }
     }
@@ -8646,7 +8678,7 @@ mod tests {
         takes: std::time::Duration,
     ) -> (AppState, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let assistant = std::sync::Arc::new(crate::local_agent::LocalAssistant::new(
+        let assistant = std::sync::Arc::new(crate::models::local_agent::LocalAssistant::new(
             Box::new(ScriptedJudge {
                 reply,
                 takes,
@@ -9035,7 +9067,7 @@ mod tests {
             crate::chats::PermissionMode::Auto,
         )
         .await;
-        crate::runs::mark_untrusted_context(&state.pool, run_id)
+        crate::execution::runs::mark_untrusted_context(&state.pool, run_id)
             .await
             .unwrap();
 
@@ -9310,12 +9342,12 @@ mod tests {
     async fn bypass_never_lowers_a_refusal_about_where_a_command_points_or_what_a_project_declared()
     {
         let state = test_state().await;
-        crate::project_policy::declare_shell_rule(
+        crate::project::policy::declare_shell_rule(
             &state.pool,
             "alpha",
             None,
             "npm ci",
-            crate::project_policy::Verdict::Deny,
+            crate::project::policy::Verdict::Deny,
             None,
         )
         .await
@@ -9375,7 +9407,7 @@ mod tests {
             crate::chats::PermissionMode::Bypass,
         )
         .await;
-        crate::runs::mark_untrusted_context(&state.pool, run_id)
+        crate::execution::runs::mark_untrusted_context(&state.pool, run_id)
             .await
             .unwrap();
 
@@ -9817,7 +9849,7 @@ mod tests {
         let state = test_state().await;
         let app = test_router(state.clone());
         let run_id = rooted_turn_run(&state, "C:/Projects/nucleos").await;
-        crate::runs::mark_untrusted_context(&state.pool, run_id)
+        crate::execution::runs::mark_untrusted_context(&state.pool, run_id)
             .await
             .unwrap();
 
@@ -9981,7 +10013,7 @@ mod tests {
     async fn a_team_agent_that_read_a_strangers_words_may_still_read_and_may_no_longer_ask() {
         let state = test_state().await;
         let run_id = in_flight_run(&state, crate::team::TEAM_MODE, None, None, None).await;
-        crate::runs::mark_untrusted_context(&state.pool, run_id)
+        crate::execution::runs::mark_untrusted_context(&state.pool, run_id)
             .await
             .unwrap();
         let app = test_router(state.clone());
@@ -10410,7 +10442,14 @@ mod tests {
     async fn reading_a_triage_run_counts_as_reading_the_mail_it_triaged() {
         let state = test_state().await;
         let turn = in_flight_run(&state, "assistant", None, None, None).await;
-        let triage = in_flight_run(&state, crate::email::TRIAGE_MODE, None, None, None).await;
+        let triage = in_flight_run(
+            &state,
+            crate::integrations::email::TRIAGE_MODE,
+            None,
+            None,
+            None,
+        )
+        .await;
         let worktree = in_flight_run(&state, "worktree", None, None, None).await;
         let app = test_router(state);
 
@@ -10628,7 +10667,14 @@ mod tests {
         // mode read fails must not be handed `Read`, the one tool the pillar exists to keep away
         // from a stranger's text. A gate that cannot be read is not permission.
         let state = test_state().await;
-        let run_id = in_flight_run(&state, crate::email::TRIAGE_MODE, None, None, None).await;
+        let run_id = in_flight_run(
+            &state,
+            crate::integrations::email::TRIAGE_MODE,
+            None,
+            None,
+            None,
+        )
+        .await;
         let app = test_router(state.clone());
 
         // A closed pool makes every query error — the cheapest faithful stand-in for the SQLITE_BUSY
@@ -10897,8 +10943,8 @@ mod tests {
 
     /// A repository on the roster, and the path a session would be standing in.
     async fn rostered_repo(state: &AppState, prefix: &str) -> tempfile::TempDir {
-        let dir = crate::git_exec::testkit::space_free_tempdir(prefix);
-        crate::git_exec::testkit::initialize_repo(dir.path());
+        let dir = crate::execution::git_exec::testkit::space_free_tempdir(prefix);
+        crate::execution::git_exec::testkit::initialize_repo(dir.path());
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
         )
@@ -10958,7 +11004,7 @@ mod tests {
     async fn a_declared_git_op_is_queued_instead_of_stopping_the_run() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-declared-push").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+        crate::project::policy::declare_git_op(&state.pool, "p", "push")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11032,17 +11078,17 @@ mod tests {
     async fn a_denied_prefix_beats_a_declared_git_op() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-denied-push").await;
-        crate::project_policy::declare_shell_rule(
+        crate::project::policy::declare_shell_rule(
             &state.pool,
             "p",
             None,
             "git push",
-            crate::project_policy::Verdict::Deny,
+            crate::project::policy::Verdict::Deny,
             None,
         )
         .await
         .unwrap();
-        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+        crate::project::policy::declare_git_op(&state.pool, "p", "push")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11069,7 +11115,7 @@ mod tests {
     async fn unreadable_rules_stop_a_declared_git_op() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-unreadable-rules").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+        crate::project::policy::declare_git_op(&state.pool, "p", "push")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11098,7 +11144,7 @@ mod tests {
     async fn a_declared_git_op_is_found_per_segment() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-segmented-merge").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "merge")
+        crate::project::policy::declare_git_op(&state.pool, "p", "merge")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11137,7 +11183,7 @@ mod tests {
     async fn a_git_op_spelling_the_queue_cannot_build_still_stops_the_run() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-bare-push").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+        crate::project::policy::declare_git_op(&state.pool, "p", "push")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11168,7 +11214,7 @@ mod tests {
             .await
             .unwrap();
         let another_repo = rostered_repo(&state, "hook-run-another-project").await;
-        crate::project_policy::declare_git_op(&state.pool, "other", "push")
+        crate::project::policy::declare_git_op(&state.pool, "other", "push")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11195,7 +11241,7 @@ mod tests {
     async fn a_declared_git_op_that_blocks_is_still_admitted() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-declared-rebase").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "rebase")
+        crate::project::policy::declare_git_op(&state.pool, "p", "rebase")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11251,14 +11297,14 @@ mod tests {
         );
     }
 
-    async fn queued_ops(state: &AppState) -> Vec<crate::vcs::Op> {
+    async fn queued_ops(state: &AppState) -> Vec<crate::execution::vcs::Op> {
         let rows: Vec<(String, String)> =
             sqlx::query_as("SELECT op, args FROM vcs_requests ORDER BY id")
                 .fetch_all(&state.pool)
                 .await
                 .unwrap();
         rows.iter()
-            .map(|(kind, args)| crate::vcs::Op::from_stored(kind, args).unwrap())
+            .map(|(kind, args)| crate::execution::vcs::Op::from_stored(kind, args).unwrap())
             .collect()
     }
 
@@ -11270,9 +11316,9 @@ mod tests {
     async fn a_merge_behind_cd_or_dash_c_targets_the_branch_of_the_directory_it_names() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-session-cd-main").await;
-        let holder = crate::git_exec::testkit::space_free_tempdir("hook-session-cd-wt");
+        let holder = crate::execution::git_exec::testkit::space_free_tempdir("hook-session-cd-wt");
         let worktree = holder.path().join("wt");
-        assert!(crate::git_exec::testkit::git_ok(
+        assert!(crate::execution::git_exec::testkit::git_ok(
             repo.path(),
             &[
                 std::ffi::OsStr::new("worktree"),
@@ -11298,9 +11344,9 @@ mod tests {
                 decision.reason
             );
         }
-        let expected = crate::vcs::Op::Merge {
-            source: crate::vcs::Branch::new("master").unwrap(),
-            target: crate::vcs::Branch::new("side").unwrap(),
+        let expected = crate::execution::vcs::Op::Merge {
+            source: crate::execution::vcs::Branch::new("master").unwrap(),
+            target: crate::execution::vcs::Branch::new("side").unwrap(),
         };
         assert_eq!(queued_ops(&state).await, vec![expected; 4]);
     }
@@ -11332,8 +11378,12 @@ mod tests {
         assert!(queued_rows(&state).await.is_empty());
     }
 
-    fn ticket(status: &str, sha: Option<&str>, reason: Option<&str>) -> crate::vcs::Ticket {
-        crate::vcs::Ticket {
+    fn ticket(
+        status: &str,
+        sha: Option<&str>,
+        reason: Option<&str>,
+    ) -> crate::execution::vcs::Ticket {
+        crate::execution::vcs::Ticket {
             id: 7,
             status: status.to_owned(),
             result_sha: sha.map(str::to_owned),
@@ -11400,7 +11450,11 @@ mod tests {
         let text = session_git_reason(
             7,
             "merge",
-            &ticket("rejected", None, Some(crate::vcs::OWNER_REFUSED_REASON)),
+            &ticket(
+                "rejected",
+                None,
+                Some(crate::execution::vcs::OWNER_REFUSED_REASON),
+            ),
             true,
         );
 
@@ -11667,8 +11721,8 @@ mod tests {
     #[tokio::test]
     async fn a_repository_no_project_claims_is_refused_rather_than_waved_through() {
         let state = test_state().await;
-        let dir = crate::git_exec::testkit::space_free_tempdir("hook-session-unclaimed");
-        crate::git_exec::testkit::initialize_repo(dir.path());
+        let dir = crate::execution::git_exec::testkit::space_free_tempdir("hook-session-unclaimed");
+        crate::execution::git_exec::testkit::initialize_repo(dir.path());
 
         let decision = session_decision(&state, "git merge feature", dir.path()).await;
 
@@ -11854,7 +11908,7 @@ mod tests {
         );
 
         // (d) The barrier still stands in front of an opted-in tool.
-        crate::runs::mark_untrusted_context(&state.pool, run_id)
+        crate::execution::runs::mark_untrusted_context(&state.pool, run_id)
             .await
             .unwrap();
         let barred = decide(&app, &ambient).await;
@@ -12017,10 +12071,10 @@ mod tests {
         let mut state = test_state().await;
         let root = tempfile::tempdir().unwrap();
         state.machine_config_root = Some(root.path().to_path_buf());
-        let rules = crate::project_state::file(
+        let rules = crate::project::state::file(
             Some(root.path()),
             "p",
-            crate::project_state::AUTOPILOT_FILE,
+            crate::project::state::AUTOPILOT_FILE,
         )
         .unwrap();
         std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
@@ -12058,7 +12112,7 @@ mod tests {
 
     fn write_rules(root: &Path, project: &str, text: &str) {
         let rules =
-            crate::project_state::file(Some(root), project, crate::project_state::AUTOPILOT_FILE)
+            crate::project::state::file(Some(root), project, crate::project::state::AUTOPILOT_FILE)
                 .unwrap();
         std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
         std::fs::write(&rules, text).unwrap();

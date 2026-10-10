@@ -2,7 +2,7 @@
  * The one conversation the Voice page speaks into.
  *
  * **The owner's decision, 2026-09-21: a spoken conversation belongs to a single dedicated chat.** The
- * daemon refuses a turn that names no chat (`core/src/voice.rs`, `CaptureError::NoChat`), so the page
+ * daemon refuses a turn that names no chat (`core/src/integrations/voice.rs`, `CaptureError::NoChat`), so the page
  * has to answer "which one?" before anybody can say a word, and the three possible answers were
  * weighed: the last chat somebody had open, a new conversation each session, or one that is always
  * the same. The last one won because opening the page is then the whole gesture — nothing to pick,

@@ -6,7 +6,7 @@ import { keys } from "./keys";
 /**
  * A workflow's graph, with this project's overlay painted on it.
  *
- * The núcleo resolves the overlay, not the shell — `core/src/workflow_graph.rs`. A client that
+ * The núcleo resolves the overlay, not the shell — `core/src/workflows/graph.rs`. A client that
  * applied it itself would be a second implementation of §6.2's rules, and the two would eventually
  * disagree about which node this project changed, which is the one thing the seal exists to say.
  */

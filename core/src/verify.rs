@@ -7,6 +7,21 @@
 //! ticket. The ticket's live state is always derived from `verify_runs`, never stored, so a
 //! status read can never disagree with what the executor actually did.
 
+pub mod batch;
+pub mod bisect;
+pub mod exec;
+pub mod fingerprint;
+pub mod flaky;
+pub mod guard;
+pub mod ide_box;
+pub mod observe;
+pub mod plan;
+pub mod postgate;
+pub mod postgate_worker;
+pub mod provision;
+pub mod runs;
+pub mod store;
+
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -21,20 +36,22 @@ use sqlx::SqlitePool;
 
 use crate::auth::{ApiTokenLevel, Scope};
 use crate::config;
-use crate::git_exec::{self, CommandResult, OPERATION_TIMEOUT};
+use crate::execution::git_exec::{self, CommandResult, OPERATION_TIMEOUT};
+use crate::execution::land;
+use crate::execution::vcs;
 use crate::inspect;
-use crate::land;
 use crate::state::AppState;
 use crate::test_select;
 use crate::tests_map::{self, Group, MapState};
-use crate::vcs;
-use crate::verify_exec::Executor;
-use crate::verify_fingerprint;
-use crate::verify_plan::{self, Kind, PlanError, ScopeArg, Ticket};
-use crate::verify_postgate;
-use crate::verify_postgate_worker;
-use crate::verify_runs::{self, ORIGIN_VERIFY, PRIORITY_AUTONOMOUS, PRIORITY_INTERACTIVE};
-use crate::verify_store::{self, CacheKey, NewRequest, PlannedUnit};
+use crate::verify::exec::Executor;
+use crate::verify::fingerprint as verify_fingerprint;
+use crate::verify::plan::{self as verify_plan, Kind, PlanError, ScopeArg, Ticket};
+use crate::verify::postgate as verify_postgate;
+use crate::verify::postgate_worker as verify_postgate_worker;
+use crate::verify::runs::{
+    self as verify_runs, ORIGIN_VERIFY, PRIORITY_AUTONOMOUS, PRIORITY_INTERACTIVE,
+};
+use crate::verify::store::{self as verify_store, CacheKey, NewRequest, PlannedUnit};
 
 /// How often `settle` re-reads a unit it is waiting on to cache.
 const SETTLE_POLL: Duration = Duration::from_millis(500);
@@ -661,9 +678,11 @@ async fn map_trusted_now(pool: &SqlitePool, project_id: &str, worktree: &Path) -
         _ => return false,
     };
     let worktree = worktree.to_path_buf();
-    tokio::task::spawn_blocking(move || crate::job::map_is_trusted(&worktree, &project_root))
-        .await
-        .unwrap_or(false)
+    tokio::task::spawn_blocking(move || {
+        crate::execution::job::map_is_trusted(&worktree, &project_root)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// `submit` that also says whether the plan was made from a map the daemon could vouch for at
@@ -1103,9 +1122,11 @@ pub(crate) async fn confirm_measured_tree(
     };
     let trusted = {
         let worktree = worktree.clone();
-        tokio::task::spawn_blocking(move || crate::job::map_is_trusted(&worktree, &project_root))
-            .await
-            .unwrap_or(false)
+        tokio::task::spawn_blocking(move || {
+            crate::execution::job::map_is_trusted(&worktree, &project_root)
+        })
+        .await
+        .unwrap_or(false)
     };
     if !trusted {
         tracing::info!(
@@ -1589,8 +1610,8 @@ pub async fn post_verify_status(
 mod tests {
     use super::*;
     use crate::config::VerifyConfig;
-    use crate::verify_exec;
-    use crate::verify_plan::NO_MAP_OWN_NOTE;
+    use crate::verify::exec as verify_exec;
+    use crate::verify::plan::NO_MAP_OWN_NOTE;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     /// Long enough for a `git --version` unit on a loaded machine, short enough to bound a test.
@@ -1704,7 +1725,7 @@ tests:
             let dir = machine.path().join("projects").join("alpha");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
-                dir.join(crate::project_state::AUTOPILOT_FILE),
+                dir.join(crate::project::state::AUTOPILOT_FILE),
                 format!("gate_command: \"{gate}\"\n"),
             )
             .unwrap();
@@ -1876,7 +1897,7 @@ tests:
     fn the_postgate_caller_runs_at_postgate_priority_and_no_key_can_claim_it() {
         assert_eq!(
             Caller::Postgate.priority(),
-            crate::verify_runs::PRIORITY_POSTGATE
+            crate::verify::runs::PRIORITY_POSTGATE
         );
         assert_eq!(Caller::Postgate.label(), "postgate");
         assert!(may_read(Caller::Postgate, "postgate"));
@@ -1889,7 +1910,7 @@ tests:
         // scope text, so the readers of `requested_by` see no new values.
         assert_eq!(
             Caller::Postgate.requested_by("full"),
-            crate::verify_runs::REQUESTED_BY_POSTGATE
+            crate::verify::runs::REQUESTED_BY_POSTGATE
         );
         assert_eq!(Caller::Postgate.requested_by("full"), "postgate");
         assert_eq!(Caller::Owner.requested_by("full"), "full");
@@ -1912,7 +1933,7 @@ tests:
     #[test]
     fn the_flake_check_and_bisect_callers_run_at_postgate_priority_and_label_their_units() {
         for caller in [Caller::FlakeCheck, Caller::Bisect] {
-            assert_eq!(caller.priority(), crate::verify_runs::PRIORITY_POSTGATE);
+            assert_eq!(caller.priority(), crate::verify::runs::PRIORITY_POSTGATE);
             // The same owner as the gate's own tickets.
             assert_eq!(caller.label(), "postgate");
             assert!(may_read(caller, "postgate"));
@@ -1923,12 +1944,12 @@ tests:
 
         assert_eq!(
             Caller::FlakeCheck.requested_by("full"),
-            crate::verify_runs::REQUESTED_BY_FLAKE_CHECK
+            crate::verify::runs::REQUESTED_BY_FLAKE_CHECK
         );
         assert_eq!(Caller::FlakeCheck.requested_by("full"), "flake-check");
         assert_eq!(
             Caller::Bisect.requested_by("full"),
-            crate::verify_runs::REQUESTED_BY_BISECT
+            crate::verify::runs::REQUESTED_BY_BISECT
         );
         assert_eq!(Caller::Bisect.requested_by("full"), "bisect");
 

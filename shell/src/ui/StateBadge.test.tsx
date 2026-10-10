@@ -139,7 +139,7 @@ describe("StateBadge — wait_reason", () => {
   });
 
   it("keeps an exclusion apart from both, and never calls it a missing slot", () => {
-    // The third literal (`core/src/job.rs`, `Brake::Park { reason: "excluded" }`).
+    // The third literal (`core/src/execution/job.rs`, `Brake::Park { reason: "excluded" }`).
     // A job held by an approved rule is not short of capacity: reading it as
     // slot contention sends somebody looking for room that is already there.
     assertAllDistinct("wait_reason", ["budget", "slot", "excluded"]);
@@ -148,7 +148,7 @@ describe("StateBadge — wait_reason", () => {
   });
 
   it("keeps a full disk apart from all three, and never calls it a missing slot", () => {
-    // The fourth literal (`core/src/job.rs`, `WAIT_DISK`). Until 2026-09-14 the
+    // The fourth literal (`core/src/execution/job.rs`, `WAIT_DISK`). Until 2026-09-14 the
     // daemon parked it as `slot`, and a reader waited for a run to end when
     // nothing would clear until somebody freed space.
     assertAllDistinct("wait_reason", ["budget", "slot", "excluded", "disk"]);

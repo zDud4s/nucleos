@@ -117,7 +117,7 @@ pub fn resolve_within(root: &Path, relative: &str) -> Result<PathBuf, PathError>
             Component::CurDir => {}
             Component::Normal(name) => {
                 let name = name.to_str().ok_or(PathError::Unsafe)?;
-                if name != crate::email::safe_filename(name) {
+                if name != crate::integrations::email::safe_filename(name) {
                     return Err(PathError::Unsafe);
                 }
                 resolved.push(name);
@@ -337,7 +337,7 @@ pub fn write_file(
         return Err(PathError::NotADirectory);
     }
 
-    let safe = crate::email::safe_filename(filename);
+    let safe = crate::integrations::email::safe_filename(filename);
     let name = available_name(&directory, &safe);
     std::fs::write(directory.join(&name), bytes).map_err(|e| PathError::Io(e.to_string()))?;
     Ok(name)

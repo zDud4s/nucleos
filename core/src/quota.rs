@@ -8,7 +8,7 @@
 //! second brake onto the first would have turned each of that function's eleven call sites into a
 //! place asking two questions with two failure directions tangled in one return value.
 //!
-//! This module holds no HTTP: `quota_client.rs` is the transport, exactly as `web_client.rs` is for
+//! This module holds no HTTP: `quota/client.rs` is the transport, exactly as `web_client.rs` is for
 //! `web.rs`. And it holds no provider credential — see design D2, whose whole point is that the
 //! token stays inside the sidecar.
 //!
@@ -17,6 +17,8 @@
 //! quota so the phase-3 warning fires even with the brake off. The brake fails OPEN, fixed: an
 //! absent, stale, or unmeasured reading cannot prove a window spent—the opposite direction from
 //! `budget.rs`, which fails closed.
+
+pub mod client;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -173,12 +175,12 @@ pub struct QuotaReport {
 /// that only changes when the daemon restarts.
 #[derive(Debug, Clone)]
 pub struct QuotaRuntime {
-    pub client: Option<crate::quota_client::QuotaClient>,
+    pub client: Option<crate::quota::client::QuotaClient>,
     pub provider: String,
 }
 
 impl QuotaRuntime {
-    pub fn new(client: crate::quota_client::QuotaClient, provider: String) -> Self {
+    pub fn new(client: crate::quota::client::QuotaClient, provider: String) -> Self {
         Self {
             client: Some(client),
             provider,
@@ -382,22 +384,24 @@ pub async fn quota_permits_new_run(
 pub async fn permits_new_run(
     state: &crate::state::AppState,
     now: DateTime<Utc>,
-) -> crate::budget::BudgetDecision {
-    let budget = crate::budget::budget_permits_new_run(&state.pool, now).await;
-    if !matches!(budget, crate::budget::BudgetDecision::Allow) {
+) -> crate::governance::budget::BudgetDecision {
+    let budget = crate::governance::budget::budget_permits_new_run(&state.pool, now).await;
+    if !matches!(budget, crate::governance::budget::BudgetDecision::Allow) {
         return budget;
     }
     match quota_permits_new_run(&state.pool, Some(&state.quota), &state.quota.provider, now).await {
-        QuotaDecision::Allow => crate::budget::BudgetDecision::Allow,
-        QuotaDecision::Pause { reason, resets_at } => crate::budget::BudgetDecision::Pause {
-            reason,
-            kind: if resets_at.is_some() {
-                crate::budget::PauseKind::Transient
-            } else {
-                crate::budget::PauseKind::Window
-            },
-            source: PAUSE_SOURCE,
-        },
+        QuotaDecision::Allow => crate::governance::budget::BudgetDecision::Allow,
+        QuotaDecision::Pause { reason, resets_at } => {
+            crate::governance::budget::BudgetDecision::Pause {
+                reason,
+                kind: if resets_at.is_some() {
+                    crate::governance::budget::PauseKind::Transient
+                } else {
+                    crate::governance::budget::PauseKind::Window
+                },
+                source: PAUSE_SOURCE,
+            }
+        }
     }
 }
 
@@ -456,7 +460,7 @@ pub async fn report(
 /// test executes — and deleting either call left the suite green.
 async fn live_report(
     pool: &SqlitePool,
-    live: crate::quota_client::QuotaReport,
+    live: crate::quota::client::QuotaReport,
     now: chrono::DateTime<chrono::Utc>,
 ) -> QuotaReport {
     let cached = live.cached;
@@ -643,7 +647,7 @@ fn is_stale(
 /// a cache of up to a minute, and the process that decides the state should judge it against the
 /// clock its caller passed in, not the one the reading was taken under.
 fn from_reading(
-    raw: crate::quota_client::ProviderReading,
+    raw: crate::quota::client::ProviderReading,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Provider {
     let fidelity = Fidelity::parse(&raw.fidelity);
@@ -1170,7 +1174,7 @@ mod tests {
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,
-            runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
+            runner: std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
@@ -1187,13 +1191,13 @@ mod tests {
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
-            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
-            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
-            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(quota),
             judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
-            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
@@ -1394,11 +1398,11 @@ mod tests {
     /// The same clock decides a live reading, because the sidecar answers from a cache of its own.
     #[test]
     fn a_live_window_past_its_reset_is_stale_however_the_sidecar_flagged_it() {
-        let reading = crate::quota_client::ProviderReading {
+        let reading = crate::quota::client::ProviderReading {
             provider: "claude".into(),
             fidelity: "official".into(),
             read_at: at(BEFORE_RESET),
-            windows: vec![crate::quota_client::WindowReading {
+            windows: vec![crate::quota::client::WindowReading {
                 window: "5h".into(),
                 used_fraction: 0.97,
                 resets_at: Some(at(RESET)),
@@ -2017,7 +2021,7 @@ mod tests {
     #[tokio::test]
     async fn a_live_reading_is_both_stored_and_judged() {
         let pool = pool().await;
-        let live: crate::quota_client::QuotaReport = serde_json::from_str(
+        let live: crate::quota::client::QuotaReport = serde_json::from_str(
             r#"{"providers":[{"provider":"claude","fidelity":"official",
                  "read_at":"2026-09-19T12:00:00Z","severity":"normal",
                  "windows":[{"window":"5h","used_fraction":0.82,
@@ -2087,7 +2091,7 @@ mod tests {
         }))
         .await;
         let runtime = QuotaRuntime::new(
-            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            crate::quota::client::QuotaClient::new(&address, "bearer".into()),
             "claude".into(),
         );
 
@@ -2230,7 +2234,7 @@ mod tests {
         let now = chrono::Utc::now();
         let address = stub_sidecar(live_answer("claude", "5h", 1.0, None, now)).await;
         let runtime = QuotaRuntime::new(
-            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            crate::quota::client::QuotaClient::new(&address, "bearer".into()),
             "claude".into(),
         );
         assert!(matches!(
@@ -2253,7 +2257,7 @@ mod tests {
         let now = chrono::Utc::now();
         let address = stub_sidecar(serde_json::json!({"providers": [], "cached": false})).await;
         let runtime = QuotaRuntime::new(
-            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            crate::quota::client::QuotaClient::new(&address, "bearer".into()),
             "claude".into(),
         );
         for _ in 0..2 {
@@ -2278,7 +2282,7 @@ mod tests {
         let now = chrono::Utc::now();
         let address = stub_sidecar(live_answer("claude", "5h", 0.82, None, now)).await;
         let runtime = QuotaRuntime::new(
-            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            crate::quota::client::QuotaClient::new(&address, "bearer".into()),
             "claude".into(),
         );
         assert!(matches!(
@@ -2297,13 +2301,13 @@ mod tests {
         let state = state_with_quota(
             pool,
             QuotaRuntime::new(
-                crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+                crate::quota::client::QuotaClient::new(&address, "bearer".into()),
                 "claude".into(),
             ),
         )
         .await;
         let pause = permits_new_run(&state, now).await;
-        let crate::budget::BudgetDecision::Pause { reason, source, .. } = pause else {
+        let crate::governance::budget::BudgetDecision::Pause { reason, source, .. } = pause else {
             panic!("quota pause must be a pause")
         };
         assert_eq!(source, PAUSE_SOURCE);

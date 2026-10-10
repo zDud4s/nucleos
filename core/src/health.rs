@@ -24,9 +24,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::execution::worktree;
 use crate::sidecar::Liveness;
 use crate::state::AppState;
-use crate::worktree;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const SUBSYSTEM_TIMEOUT: Duration = Duration::from_millis(500);
@@ -103,7 +103,7 @@ pub const BREACH_INTENT_KIND: &str = "health_breach_intent";
 ///
 /// **The feed, and no longer `.ai/local/ledgers/intents.jsonl`.** That ledger is the AI dev
 /// workflow's, in the project's own `.ai/` folder, and the product has no business writing into it
-/// — the same line `project_state.rs` draws for the rules file. The feed is the daemon's own record
+/// — the same line `project/state.rs` draws for the rules file. The feed is the daemon's own record
 /// of what happened to a project, it is where a person already looks, and it needed no new table.
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn record_breach_intent(
@@ -415,7 +415,7 @@ fn router_plan(text: Option<&str>) -> RouterPlan {
     let Some(text) = text else {
         return RouterPlan::Off;
     };
-    match crate::route_advice::parse_config(text) {
+    match crate::models::route_advice::parse_config(text) {
         Err(_) => RouterPlan::Refused,
         Ok(config) if config.is_off() => RouterPlan::Off,
         Ok(config) => RouterPlan::Ask {
@@ -431,7 +431,7 @@ fn router_plan(text: Option<&str>) -> RouterPlan {
 /// `None` means nothing has run yet, which is green: a daemon that has just started has not failed
 /// at anything. Past the failure rate is `degraded` and never `down`, because ingestion only feeds
 /// a reading and stops nothing else.
-fn devtime_row(status: Option<crate::devtime_store::IngestStatus>) -> SubsystemReadout {
+fn devtime_row(status: Option<crate::devtime::store::IngestStatus>) -> SubsystemReadout {
     let Some(status) = status else {
         return SubsystemReadout::ok("devtime_ingest");
     };
@@ -457,7 +457,7 @@ fn devtime_row(status: Option<crate::devtime_store::IngestStatus>) -> SubsystemR
 }
 
 async fn devtime_probe(pool: sqlx::SqlitePool) -> SubsystemReadout {
-    match crate::devtime_store::read_ingest_status(&pool).await {
+    match crate::devtime::store::read_ingest_status(&pool).await {
         Ok(status) => devtime_row(status),
         Err(_) => SubsystemReadout::down("devtime_ingest", FailureCategory::Unknown),
     }
@@ -562,7 +562,7 @@ fn embeddings_row(model: Option<&str>, listed: &[String]) -> SubsystemReadout {
     };
     if listed.is_empty() {
         SubsystemReadout::degraded("embeddings", FailureCategory::Unreachable)
-    } else if !crate::embed_model::is_pulled(model, listed) {
+    } else if !crate::embed::model::is_pulled(model, listed) {
         SubsystemReadout::degraded("embeddings", FailureCategory::Missing)
     } else {
         SubsystemReadout::ok("embeddings")
@@ -579,8 +579,11 @@ async fn embeddings_probe() -> SubsystemReadout {
         .timeout(Duration::from_millis(400))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let listed =
-        crate::capabilities::installed_local_models(&client, crate::runner::OLLAMA_BASE_URL).await;
+    let listed = crate::capabilities::installed_local_models(
+        &client,
+        crate::execution::runner::OLLAMA_BASE_URL,
+    )
+    .await;
     embeddings_row(Some(embedder.model()), &listed)
 }
 
@@ -656,7 +659,9 @@ fn hook_interpreter_row(resolved: Option<PathBuf>, wired_anywhere: bool) -> Subs
 /// always did. Both lookups run on the blocking pool, as `get_projects` does for the same roots.
 async fn hook_interpreter_probe(pool: SqlitePool) -> SubsystemReadout {
     let resolved = match tokio::task::spawn_blocking(|| {
-        resolve_program(std::ffi::OsStr::new(crate::autopilot::HOOK_INTERPRETER))
+        resolve_program(std::ffi::OsStr::new(
+            crate::governance::autopilot::HOOK_INTERPRETER,
+        ))
     })
     .await
     {
@@ -688,7 +693,7 @@ async fn hook_wired_in_any_project(pool: &SqlitePool) -> bool {
     tokio::task::spawn_blocking(move || {
         roots
             .iter()
-            .any(|root| crate::autopilot::classifier_hook_is_wired(Path::new(root)))
+            .any(|root| crate::governance::autopilot::classifier_hook_is_wired(Path::new(root)))
     })
     .await
     .unwrap_or(true)
@@ -823,9 +828,9 @@ async fn github_probe(asked_for: bool, binary: String) -> SubsystemReadout {
                 .map_err(classify_error)?
                 .is_none()
             {
-                Some(crate::github::Failure::MissingCli)
-            } else if crate::github::load_token().await.is_none() {
-                Some(crate::github::Failure::MissingToken)
+                Some(crate::integrations::github::Failure::MissingCli)
+            } else if crate::integrations::github::load_token().await.is_none() {
+                Some(crate::integrations::github::Failure::MissingToken)
             } else {
                 None
             };
@@ -1403,7 +1408,7 @@ url: http://127.0.0.1:{port}
         );
 
         let wired = tempfile::tempdir().unwrap();
-        crate::autopilot::wire_classifier_hook(wired.path()).unwrap();
+        crate::governance::autopilot::wire_classifier_hook(wired.path()).unwrap();
         sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('wired', 'active', ?)")
             .bind(wired.path().to_string_lossy().into_owned())
             .execute(&pool)
@@ -1798,8 +1803,8 @@ url: http://127.0.0.1:{port}
         enabled: bool,
         lines_read: i64,
         lines_failed: i64,
-    ) -> crate::devtime_store::IngestStatus {
-        crate::devtime_store::IngestStatus {
+    ) -> crate::devtime::store::IngestStatus {
+        crate::devtime::store::IngestStatus {
             enabled,
             cycle_at: "2026-10-04T10:00:00.000Z".to_string(),
             lines_read,

@@ -23,6 +23,11 @@
 //! document — nothing ran — and this module reopens the same request in a throwaway. That is spec
 //! §5.4's "the url is handed to an ephemeral session", and it is a downgrade rather than a failure.
 
+pub mod live;
+pub mod panel;
+pub mod seat;
+pub mod wheel;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -41,9 +46,9 @@ pub struct BrowserRuntime {
     pub enabled: bool,
     pub client: BrowserClient,
     /// Where a session's mode changes are announced to whoever is watching its live view.
-    pub modes: crate::browser_live::ModeChannels,
+    pub modes: crate::browser::live::ModeChannels,
     /// Who holds the person's seat in each session, kept in memory only (spec browser-volante §4.3).
-    pub seats: crate::browser_seat::SeatState,
+    pub seats: crate::browser::seat::SeatState,
 }
 
 impl BrowserRuntime {
@@ -786,7 +791,7 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
 /// agent clicking on a page a person had just been handed.
 pub async fn set_mode(
     pool: &SqlitePool,
-    modes: &crate::browser_live::ModeChannels,
+    modes: &crate::browser::live::ModeChannels,
     id: i64,
     from: &str,
     to: &str,
@@ -805,7 +810,7 @@ pub async fn set_mode(
         // that did not happen.
         modes.publish(
             id,
-            crate::browser_live::LiveMode {
+            crate::browser::live::LiveMode {
                 mode: to.to_owned(),
                 seat: None,
             },
@@ -820,7 +825,7 @@ pub async fn set_mode(
 /// writes would leave a window where a `human` row has no seat yet.
 pub async fn set_mode_seat(
     pool: &SqlitePool,
-    modes: &crate::browser_live::ModeChannels,
+    modes: &crate::browser::live::ModeChannels,
     id: i64,
     from: &str,
     to: &str,
@@ -840,7 +845,7 @@ pub async fn set_mode_seat(
         // Published even when the mode string is unchanged: human/shell -> human/window must cut.
         modes.publish(
             id,
-            crate::browser_live::LiveMode {
+            crate::browser::live::LiveMode {
                 mode: to.to_owned(),
                 seat: seat.map(str::to_owned),
             },
@@ -1182,8 +1187,8 @@ pub async fn post_open(
     match open_with(&state.pool, &state.browser, ask, body.visible).await {
         Ok(Opened::Session(row)) => {
             if row.visible {
-                crate::browser_panel::start(state.clone(), row.id);
-                crate::browser_panel::panel_push(
+                crate::browser::panel::start(state.clone(), row.id);
+                crate::browser::panel::panel_push(
                     &state,
                     &row.sidecar_id,
                     serde_json::json!({
@@ -1370,7 +1375,7 @@ pub async fn post_act(
                 } else {
                     body.element_ref.as_str()
                 };
-                crate::browser_panel::panel_push(
+                crate::browser::panel::panel_push(
                     &state,
                     &row.sidecar_id,
                     serde_json::json!({
@@ -1704,7 +1709,7 @@ mod tests {
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,
-            runner: std::sync::Arc::new(crate::runner::FakeCommandRunner::default()),
+            runner: std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
@@ -1721,13 +1726,13 @@ mod tests {
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
-            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(browser),
-            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
-            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
             judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
-            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -2824,7 +2829,7 @@ mod tests {
     async fn volante_set_mode_seat_moves_mode_and_seat_together() {
         let db = TempDb::new().await;
         let id = raw_session(&db.pool, "project", "acme", false).await;
-        let modes = crate::browser_live::ModeChannels::default();
+        let modes = crate::browser::live::ModeChannels::default();
         let mut watcher = modes.subscribe(id);
 
         assert!(

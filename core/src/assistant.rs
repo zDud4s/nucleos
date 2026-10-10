@@ -4,7 +4,7 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
-use crate::runner::extract_reply;
+use crate::execution::runner::extract_reply;
 
 static BUSY_CHATS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -80,7 +80,7 @@ fn is_open(seen: Option<std::time::Instant>, now: std::time::Instant) -> bool {
 /// tool running or a background task alive (spike "verify before building"); the grace period in
 /// [`stop_turn`] covers whatever that turns out to be.
 static STEERING: LazyLock<
-    Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::runner::LaterTurn>>>,
+    Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::execution::runner::LaterTurn>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Keeps a chat's entry in [`STEERING`] for as long as it is held, on every way out (an aborted
@@ -92,7 +92,7 @@ struct SteerGuard {
 impl SteerGuard {
     fn open(
         chat_id: &str,
-        messages: &tokio::sync::mpsc::UnboundedSender<crate::runner::LaterTurn>,
+        messages: &tokio::sync::mpsc::UnboundedSender<crate::execution::runner::LaterTurn>,
     ) -> Self {
         STEERING
             .lock()
@@ -111,7 +111,7 @@ impl Drop for SteerGuard {
 }
 
 /// Writes a line into the process running a chat's turn, if one is. False when nothing is steerable.
-fn steer(chat_id: &str, turn: crate::runner::LaterTurn) -> bool {
+fn steer(chat_id: &str, turn: crate::execution::runner::LaterTurn) -> bool {
     // Cloned out so the lock is not held across the send.
     let sender = STEERING.lock().unwrap().get(chat_id).cloned();
     sender.is_some_and(|sender| sender.send(turn).is_ok())
@@ -165,7 +165,7 @@ async fn stop_turn_within(
         && chat_id.as_deref().is_some_and(|chat| {
             steer(
                 chat,
-                crate::runner::LaterTurn {
+                crate::execution::runner::LaterTurn {
                     interrupt: true,
                     ..Default::default()
                 },
@@ -190,7 +190,7 @@ async fn stop_turn_within(
         }
     }
 
-    if crate::runs::finalize_termination(state, turn_id, "cancelled").await {
+    if crate::execution::runs::finalize_termination(state, turn_id, "cancelled").await {
         Stopped::Killed
     } else {
         Stopped::NotRunning
@@ -278,7 +278,7 @@ pub async fn say_now_from(
         .map_err(|error| error.to_string())?;
         let delivered = steer(
             chat_id,
-            crate::runner::LaterTurn {
+            crate::execution::runner::LaterTurn {
                 text: text.to_owned(),
                 images: Vec::new(),
                 interrupt: false,
@@ -363,9 +363,9 @@ struct LiveChat {
     ///
     /// Dropping this closes the CLI's stdin, which ends the process *after* it finishes whatever
     /// turn it is on — measured; it is not a way to interrupt one. That is what `abort` is for.
-    messages: tokio::sync::mpsc::UnboundedSender<crate::runner::LaterTurn>,
+    messages: tokio::sync::mpsc::UnboundedSender<crate::execution::runner::LaterTurn>,
     /// Everything the process says, already split into turns by `runner::TurnSplitter`.
-    events: tokio::sync::mpsc::UnboundedReceiver<crate::runner::TurnEvent>,
+    events: tokio::sync::mpsc::UnboundedReceiver<crate::execution::runner::TurnEvent>,
     /// The session every turn of this process shares, once its first `init` has said what it is.
     ///
     /// Shared rather than owned because it becomes known DURING the first turn, from a task reading
@@ -395,7 +395,7 @@ struct LiveChat {
     /// The whole rung and not a boolean, since `0129`: a conversation can move between five modes,
     /// and a process spawned on one of them is the wrong process for any of the other four whose
     /// command line differs.
-    permission: crate::runner::Permission,
+    permission: crate::execution::runner::Permission,
     /// Where the process is standing, fixed when it was spawned.
     ///
     /// Kept so it can be COMPARED. A conversation's working directory is resolved per turn, so it can differ from the one this process was started
@@ -410,7 +410,7 @@ struct LiveChat {
     _counted: LiveCount,
     /// Events read between turns and not yet handed to a turn, oldest first. `gather` drains these
     /// before the channel, so nothing read early is lost or reordered.
-    carried: std::collections::VecDeque<crate::runner::TurnEvent>,
+    carried: std::collections::VecDeque<crate::execution::runner::TurnEvent>,
     /// Background tasks seen starting in this process and not yet seen ending. Non-empty pins the
     /// process against the reaper (spec 4.2 item 2, before `chat_tasks` exists).
     background: HashSet<String>,
@@ -451,7 +451,7 @@ fn stop_tasks_of(ended: ProcessBarrier) {
         return;
     };
     runtime.spawn(async move {
-        if let Err(error) = crate::chat_tasks::stop_launched_by(&pool, &chat_id, &served).await {
+        if let Err(error) = crate::chats::tasks::stop_launched_by(&pool, &chat_id, &served).await {
             tracing::warn!(chat_id = %chat_id, %error, "could not close the tasks of a conversation's ended process");
         }
     });
@@ -555,7 +555,7 @@ static ENDED_TASKS: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, H
 /// The three are told apart because two of them are safe to start over from and one is not.
 enum LiveTurn {
     /// It answered.
-    Answered(crate::runner::TurnOutcome),
+    Answered(crate::execution::runner::TurnOutcome),
     /// Nothing was written: the process was already gone. The turn can be started fresh, because
     /// as far as anything outside is concerned it never happened.
     NotWritten,
@@ -596,11 +596,11 @@ impl LiveChat {
     async fn turn(
         &mut self,
         text: &str,
-        images: &[crate::runner::Attachment],
+        images: &[crate::execution::runner::Attachment],
         transcript: &std::sync::Arc<Mutex<String>>,
         silence: Option<std::time::Duration>,
     ) -> LiveTurn {
-        let said = crate::runner::LaterTurn {
+        let said = crate::execution::runner::LaterTurn {
             text: text.to_owned(),
             images: images.to_vec(),
             interrupt: false,
@@ -649,7 +649,7 @@ impl LiveChat {
             };
             let Some(event) = next else { break };
             match event {
-                crate::runner::TurnEvent::Line(line) => {
+                crate::execution::runner::TurnEvent::Line(line) => {
                     // Carried lines were tracked when they were read; only a fresh one is new.
                     if fresh {
                         self.track(&line);
@@ -661,7 +661,9 @@ impl LiveChat {
                         shared.push('\n');
                     }
                 }
-                crate::runner::TurnEvent::Ended(outcome) => return LiveTurn::Answered(outcome),
+                crate::execution::runner::TurnEvent::Ended(outcome) => {
+                    return LiveTurn::Answered(outcome);
+                }
             }
         }
         LiveTurn::DiedMidTurn(self.why_it_stopped().await)
@@ -674,7 +676,7 @@ impl LiveChat {
     fn drain_idle(&mut self) -> bool {
         let was_working = !self.background.is_empty();
         while let Ok(event) = self.events.try_recv() {
-            if let crate::runner::TurnEvent::Line(line) = &event {
+            if let crate::execution::runner::TurnEvent::Line(line) = &event {
                 self.track(line);
             }
             self.carried.push_back(event);
@@ -684,8 +686,8 @@ impl LiveChat {
             self.idle_since = std::time::Instant::now();
         }
         self.carried.iter().any(|event| match event {
-            crate::runner::TurnEvent::Line(line) => !is_task_bookkeeping(line),
-            crate::runner::TurnEvent::Ended(_) => true,
+            crate::execution::runner::TurnEvent::Line(line) => !is_task_bookkeeping(line),
+            crate::execution::runner::TurnEvent::Ended(_) => true,
         })
     }
 
@@ -823,8 +825,8 @@ fn make_room(
 
 /// Whether a turn runs with the user's ambient MCP servers: only when the conversation opted in
 /// and the turn is not restricted to NucleOS's own tools.
-pub fn ambient_mcp_for(policy: crate::runner::ToolPolicy, opted_in: bool) -> bool {
-    opted_in && policy == crate::runner::ToolPolicy::Unrestricted
+pub fn ambient_mcp_for(policy: crate::execution::runner::ToolPolicy, opted_in: bool) -> bool {
+    opted_in && policy == crate::execution::runner::ToolPolicy::Unrestricted
 }
 
 /// Stops a conversation's process for good, if it has one.
@@ -900,14 +902,14 @@ fn worth_keeping(
 /// go without a new stream event.
 #[allow(clippy::too_many_arguments)]
 async fn serve_turn(
-    runner: &std::sync::Arc<dyn crate::runner::CommandRunner>,
-    mut request: crate::runner::RunRequest,
+    runner: &std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
+    mut request: crate::execution::runner::RunRequest,
     session_tx: tokio::sync::mpsc::UnboundedSender<String>,
     transcript: &std::sync::Arc<Mutex<String>>,
     chat_id: &str,
     deadlines: TurnDeadlines,
     may_live: bool,
-) -> Result<std::io::Result<crate::runner::RunOutcome>, tokio::time::error::Elapsed> {
+) -> Result<std::io::Result<crate::execution::runner::RunOutcome>, tokio::time::error::Elapsed> {
     if !may_live {
         request.progress_timeout = deadlines.silence;
         return tokio::time::timeout(
@@ -997,15 +999,16 @@ async fn serve_turn(
 
 /// Starts a conversation's process, gathers the turn it was started with, and keeps it for the next.
 async fn start_live_chat(
-    runner: &std::sync::Arc<dyn crate::runner::CommandRunner>,
-    mut request: crate::runner::RunRequest,
+    runner: &std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
+    mut request: crate::execution::runner::RunRequest,
     session_tx: tokio::sync::mpsc::UnboundedSender<String>,
     transcript: &std::sync::Arc<Mutex<String>>,
     chat_id: &str,
     deadlines: TurnDeadlines,
-) -> Result<std::io::Result<crate::runner::RunOutcome>, tokio::time::error::Elapsed> {
+) -> Result<std::io::Result<crate::execution::runner::RunOutcome>, tokio::time::error::Elapsed> {
     let began = std::time::Instant::now();
-    let (messages, incoming) = tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
+    let (messages, incoming) =
+        tokio::sync::mpsc::unbounded_channel::<crate::execution::runner::LaterTurn>();
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (process_session_tx, mut process_session_rx) =
         tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1164,11 +1167,11 @@ async fn start_live_chat(
 /// same reason: it belongs to the process, which is still using it, and a turn that answered has no
 /// failure to explain. A turn that did not answer never comes through here.
 fn gathered(
-    outcome: crate::runner::TurnOutcome,
+    outcome: crate::execution::runner::TurnOutcome,
     stdout: String,
     session_id: String,
-) -> crate::runner::RunOutcome {
-    crate::runner::RunOutcome {
+) -> crate::execution::runner::RunOutcome {
+    crate::execution::runner::RunOutcome {
         exit_code: 0,
         stdout,
         stderr: String::new(),
@@ -1189,9 +1192,9 @@ fn went_silent(
     transcript: &std::sync::Arc<Mutex<String>>,
     after: std::time::Duration,
     session_id: Option<String>,
-) -> crate::runner::RunOutcome {
-    crate::runner::RunOutcome {
-        exit_code: crate::runner::PROGRESS_TIMEOUT_EXIT_CODE,
+) -> crate::execution::runner::RunOutcome {
+    crate::execution::runner::RunOutcome {
+        exit_code: crate::execution::runner::PROGRESS_TIMEOUT_EXIT_CODE,
         stdout: transcript
             .lock()
             .map(|held| held.clone())
@@ -1281,11 +1284,13 @@ fn track_background(line: &str, running: &mut HashSet<String>) {
 
 /// What a turn the assistant started on its own is recorded as having been asked: the task
 /// notifications that woke it, one per line.
-fn spontaneous_prompt(carried: &std::collections::VecDeque<crate::runner::TurnEvent>) -> String {
+fn spontaneous_prompt(
+    carried: &std::collections::VecDeque<crate::execution::runner::TurnEvent>,
+) -> String {
     let notices: Vec<String> = carried
         .iter()
         .filter_map(|event| {
-            let crate::runner::TurnEvent::Line(line) = event else {
+            let crate::execution::runner::TurnEvent::Line(line) = event else {
                 return None;
             };
             let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
@@ -1360,7 +1365,7 @@ fn watch_between_turns(state: &crate::state::AppState, chat_id: &str) {
                             .iter()
                             .skip(recorded)
                             .filter_map(|event| match event {
-                                crate::runner::TurnEvent::Line(line)
+                                crate::execution::runner::TurnEvent::Line(line)
                                     if is_task_bookkeeping(line) =>
                                 {
                                     Some(line.clone())
@@ -1376,7 +1381,7 @@ fn watch_between_turns(state: &crate::state::AppState, chat_id: &str) {
             };
             // A task that ends between turns is recorded now, not when a later turn reads the line.
             for line in &task_lines {
-                crate::chat_tasks::apply_line(&state.pool, &chat_id, line).await;
+                crate::chats::tasks::apply_line(&state.pool, &chat_id, line).await;
             }
             if !begun {
                 continue;
@@ -1494,12 +1499,12 @@ async fn start_spontaneous_turn(
     let deadlines = turn_deadlines(
         state.run_timeout,
         state.progress_timeout,
-        crate::runner::ToolPolicy::Unrestricted,
+        crate::execution::runner::ToolPolicy::Unrestricted,
     );
     let pool = state.pool.clone();
     let after = state.clone();
     let chat = chat_id.to_owned();
-    crate::runs::spawn_registered(state, id, async move {
+    crate::execution::runs::spawn_registered(state, id, async move {
         let began = std::time::Instant::now();
         let served = tokio::time::timeout(
             deadlines.ceiling,
@@ -1577,7 +1582,7 @@ async fn close_spontaneous(pool: &SqlitePool, id: i64, status: &str, stderr: &st
     .bind(id)
     .execute(pool)
     .await;
-    crate::runs::warn_on_terminal_write_err(&written, id, status);
+    crate::execution::runs::warn_on_terminal_write_err(&written, id, status);
 }
 
 /// Writes a spontaneous turn's answer the way a person's turn writes its own, without sharing the
@@ -1586,7 +1591,7 @@ async fn record_spontaneous_answer(
     pool: &SqlitePool,
     id: i64,
     chat_id: &str,
-    o: &crate::runner::RunOutcome,
+    o: &crate::execution::runner::RunOutcome,
     completed_at: &str,
 ) {
     let Some(reply) = extract_reply(&o.stdout) else {
@@ -1600,12 +1605,12 @@ async fn record_spontaneous_answer(
         .await;
         return;
     };
-    let stream = crate::runner::live_from_stream(&o.stdout);
+    let stream = crate::execution::runner::live_from_stream(&o.stdout);
     let tools_used = serde_json::to_string(&stream.did).unwrap_or_else(|_| "[]".to_string());
     let thought = serde_json::to_string(&stream.thought).unwrap_or_else(|_| "[]".to_string());
-    let model = crate::runner::model_from_stream(&o.stdout);
+    let model = crate::execution::runner::model_from_stream(&o.stdout);
     // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
-    crate::chat_tasks::record_turn(pool, chat_id, id, &o.stdout).await;
+    crate::chats::tasks::record_turn(pool, chat_id, id, &o.stdout).await;
     let completed = sqlx::query(
         "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, compacted = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
     )
@@ -1627,10 +1632,10 @@ async fn record_spontaneous_answer(
     .bind(id)
     .execute(pool)
     .await;
-    crate::runs::warn_on_terminal_write_err(&completed, id, "completed");
+    crate::execution::runs::warn_on_terminal_write_err(&completed, id, "completed");
     if let Some(session_id) = o.session_id.as_deref() {
         // The same rule as a person's turn: a session that read third-party text is not resumable.
-        match crate::runs::read_untrusted_context(pool, id).await {
+        match crate::execution::runs::read_untrusted_context(pool, id).await {
             Ok(false) => {
                 let _ = upsert_session(pool, chat_id, session_id, completed_at).await;
             }
@@ -1981,7 +1986,7 @@ pub async fn send_or_queue(
     state: &crate::state::AppState,
     chat_id: &str,
     text: &str,
-    images: &[crate::runner::Attachment],
+    images: &[crate::execution::runner::Attachment],
     origin: Origin,
 ) -> Result<Sent, String> {
     match send_message_with(state, chat_id, text, images, origin).await {
@@ -2023,7 +2028,7 @@ pub async fn send_or_queue(
 fn keep_images(
     state: &crate::state::AppState,
     id: i64,
-    images: &[crate::runner::Attachment],
+    images: &[crate::execution::runner::Attachment],
 ) -> Vec<String> {
     use base64::Engine;
     let Some(root) = state.files_root.as_deref() else {
@@ -2183,13 +2188,13 @@ async fn drain_queued(state: &crate::state::AppState, chat_id: &str) {
             // A queue row that will not parse is sent without its pictures rather than not sent at
             // all: the words are the part somebody is waiting on an answer to, and refusing the
             // whole turn over an unreadable column would lose those too.
-            let images: Vec<crate::runner::Attachment> = carried
+            let images: Vec<crate::execution::runner::Attachment> = carried
                 .as_deref()
                 .and_then(|stored| serde_json::from_str::<Vec<serde_json::Value>>(stored).ok())
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|image| {
-                    Some(crate::runner::Attachment {
+                    Some(crate::execution::runner::Attachment {
                         media_type: image.get("media_type")?.as_str()?.to_string(),
                         data: image.get("data")?.as_str()?.to_string(),
                     })
@@ -2289,7 +2294,7 @@ pub async fn send_message_with(
     state: &crate::state::AppState,
     chat_id: &str,
     text: &str,
-    images: &[crate::runner::Attachment],
+    images: &[crate::execution::runner::Attachment],
     origin: Origin,
 ) -> Result<i64, String> {
     send_message_inner(state, chat_id, text, images, origin, None).await
@@ -2370,7 +2375,7 @@ async fn send_message_inner(
     state: &crate::state::AppState,
     chat_id: &str,
     text: &str,
-    images: &[crate::runner::Attachment],
+    images: &[crate::execution::runner::Attachment],
     origin: Origin,
     relay_id: Option<i64>,
 ) -> Result<i64, String> {
@@ -2493,7 +2498,7 @@ async fn send_message_inner(
         cwd.as_deref(),
         origin,
         cwd.as_deref().is_some_and(|dir| {
-            crate::autopilot::classifier_hook_is_wired(std::path::Path::new(dir))
+            crate::governance::autopilot::classifier_hook_is_wired(std::path::Path::new(dir))
         }),
         // Whether another conversation handed this turn over. `relay_id` is the fact, already in
         // hand, and no walk is needed to read it — which is what makes this brake one line rather
@@ -2852,7 +2857,7 @@ async fn spawn_local_turn(
     state: &crate::state::AppState,
     slot: ChatSlot,
     text: String,
-    assistant: std::sync::Arc<crate::local_agent::LocalAssistant>,
+    assistant: std::sync::Arc<crate::models::local_agent::LocalAssistant>,
     relay_id: Option<i64>,
     origin: Origin,
     // The `runs.answered_by` wire word for this turn: `"local"` or `"openrouter"`, matching
@@ -2914,7 +2919,7 @@ async fn spawn_local_turn(
 
     let pool = state.pool.clone();
     let run_timeout = state.run_timeout;
-    crate::runs::spawn_registered(state, id, async move {
+    crate::execution::runs::spawn_registered(state, id, async move {
         // Holds the chat for the length of the turn and releases it however this ends, including by
         // being aborted mid-await — the same guarantee `TurnGuard` gives the CLI path.
         let _slot = slot;
@@ -2942,7 +2947,7 @@ async fn spawn_local_turn(
         // text is dropped rather than stored and handed to the next turn as history.
         let mut unmarked = false;
         if taint.load(std::sync::atomic::Ordering::SeqCst)
-            && let Err(error) = crate::runs::mark_untrusted_context(&pool, id).await
+            && let Err(error) = crate::execution::runs::mark_untrusted_context(&pool, id).await
         {
             tracing::error!(
                 run_id = id,
@@ -2972,7 +2977,7 @@ async fn spawn_local_turn(
                 .await
             }
             Ok(Ok(turn)) => {
-                if turn.ending != crate::local_agent::Ending::Answered {
+                if turn.ending != crate::models::local_agent::Ending::Answered {
                     // Worth a log line and not worth an error: the person gets a usable sentence
                     // either way, and this is the only place recording WHY it was that sentence.
                     tracing::warn!(
@@ -3022,7 +3027,7 @@ async fn spawn_local_turn(
                 .await
             }
         };
-        crate::runs::warn_on_terminal_write_err(&written, id, "completed");
+        crate::execution::runs::warn_on_terminal_write_err(&written, id, "completed");
     });
 
     Ok(id)
@@ -3073,12 +3078,12 @@ pub fn tool_policy_for(
     origin: Origin,
     hook_is_wired: bool,
     relayed: bool,
-) -> crate::runner::ToolPolicy {
+) -> crate::execution::runner::ToolPolicy {
     match (cwd, origin, hook_is_wired, relayed) {
         (Some(_), Origin::Shell | Origin::Voice | Origin::BrowserPanel, true, false) => {
-            crate::runner::ToolPolicy::Unrestricted
+            crate::execution::runner::ToolPolicy::Unrestricted
         }
-        _ => crate::runner::ToolPolicy::McpOnly,
+        _ => crate::execution::runner::ToolPolicy::McpOnly,
     }
 }
 
@@ -3088,7 +3093,7 @@ pub fn answering_cli(config: &crate::config::ModelsConfig, pinned: Option<&str>)
         .and_then(|id| {
             config
                 .runner_of(id)
-                .or_else(|| crate::model_catalog::runner_by_id(id))
+                .or_else(|| crate::models::model_catalog::runner_by_id(id))
         })
         .unwrap_or_else(|| {
             if config.active_runner() == "codex" {
@@ -3101,12 +3106,12 @@ pub fn answering_cli(config: &crate::config::ModelsConfig, pinned: Option<&str>)
 
 /// Chooses a runner for a turn without replacing the daemon's default unnecessarily.
 pub fn runner_for_turn(
-    daemon: &std::sync::Arc<dyn crate::runner::CommandRunner>,
+    daemon: &std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
     assistants: &dyn crate::assistants::Assistants,
     config: &crate::config::ModelsConfig,
     pinned: Option<&str>,
 ) -> (
-    std::sync::Arc<dyn crate::runner::CommandRunner>,
+    std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
     &'static str,
 ) {
     let cli = answering_cli(config, pinned);
@@ -3123,8 +3128,8 @@ pub fn runner_for_turn(
 }
 
 /// Whether this turn may retain a live CLI process for a later turn.
-pub fn may_keep_process(policy: crate::runner::ToolPolicy, cli: &str) -> bool {
-    matches!(policy, crate::runner::ToolPolicy::Unrestricted) && cli == "claude"
+pub fn may_keep_process(policy: crate::execution::runner::ToolPolicy, cli: &str) -> bool {
+    matches!(policy, crate::execution::runner::ToolPolicy::Unrestricted) && cli == "claude"
 }
 
 /// How long a chat turn may run: `silence` is how long without a new stream event, `ceiling` the
@@ -3139,10 +3144,10 @@ struct TurnDeadlines {
 fn turn_deadlines(
     run_timeout: std::time::Duration,
     progress_timeout: std::time::Duration,
-    policy: crate::runner::ToolPolicy,
+    policy: crate::execution::runner::ToolPolicy,
 ) -> TurnDeadlines {
     match policy {
-        crate::runner::ToolPolicy::Unrestricted => TurnDeadlines {
+        crate::execution::runner::ToolPolicy::Unrestricted => TurnDeadlines {
             silence: Some(progress_timeout * crate::state::ROOTED_CHAT_PROGRESS_TIMEOUT_MULTIPLIER),
             ceiling: run_timeout * crate::state::ROOTED_CHAT_RUN_TIMEOUT_MULTIPLIER,
         },
@@ -3184,14 +3189,14 @@ struct TurnLaunch {
     ///
     /// Carried here rather than fetched later because they decide which door the run goes through:
     /// bytes only fit on stdin, so a turn with any of these is `steerable` and one without is not.
-    images: Vec<crate::runner::Attachment>,
+    images: Vec<crate::execution::runner::Attachment>,
     /// The session this turn continues, or `None` to start on a fresh context.
     resume: Option<String>,
     /// The id this turn is recorded under, which is `resume` when there is one.
     session_id: String,
     mcp_path: std::path::PathBuf,
     cwd: Option<std::path::PathBuf>,
-    tool_policy: crate::runner::ToolPolicy,
+    tool_policy: crate::execution::runner::ToolPolicy,
     /// The configured Telegram doctrine, already resolved against `origin` in `send_message` —
     /// `Some` only for an `Origin::Telegram` turn whose operator configured one, `None` otherwise.
     ///
@@ -3251,7 +3256,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         .unwrap()
         .insert(id, std::sync::Arc::clone(&transcript));
 
-    crate::runs::spawn_registered(state, id, async move {
+    crate::execution::runs::spawn_registered(state, id, async move {
         // WHICH key this turn carries follows from what it can read, and the two must be decided
         // together or not at all.
         //
@@ -3276,7 +3281,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         // the conversation is running, so the key stays true as the turns change under it, and names
         // nothing at all in between.
         let env = match tool_policy {
-            crate::runner::ToolPolicy::Unrestricted => {
+            crate::execution::runner::ToolPolicy::Unrestricted => {
                 let key = match crate::auth::mint_chat_token(&pool, &turn.slot.chat_id).await {
                     Ok(key) => key,
                     Err(error) => {
@@ -3296,9 +3301,14 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                         )
                     }
                 };
-                crate::runs::run_env(&key, id, None, crate::speed::Capacity::solo())
+                crate::execution::runs::run_env(&key, id, None, crate::speed::Capacity::solo())
             }
-            _ => crate::runs::run_env(&control_token, id, None, crate::speed::Capacity::solo()),
+            _ => crate::execution::runs::run_env(
+                &control_token,
+                id,
+                None,
+                crate::speed::Capacity::solo(),
+            ),
         };
         let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         {
@@ -3346,7 +3356,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         let mode = crate::chats::permission_mode_of(&pool, &turn.slot.chat_id)
             .await
             .unwrap_or(crate::chats::PermissionMode::Auto);
-        let permission = crate::runner::Permission::for_chat(mode);
+        let permission = crate::execution::runner::Permission::for_chat(mode);
 
         // The turn's SNAPSHOT, written before anything can observe it.
         //
@@ -3388,7 +3398,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             .bind(id)
             .execute(&pool)
             .await;
-            crate::runs::warn_on_terminal_write_err(&failed, id, "failed");
+            crate::execution::runs::warn_on_terminal_write_err(&failed, id, "failed");
             return;
         }
 
@@ -3453,7 +3463,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             None
         };
 
-        let request = crate::runner::RunRequest {
+        let request = crate::execution::runner::RunRequest {
             prompt: text,
             env,
             // Set for every rooted conversation, elevated or not: this is how the CLI finds
@@ -3586,7 +3596,8 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         // anything to say at all — a chat answered by a fake or by the Codex CLI authors no prompt
         // this daemon can price, and answers `None`, which leaves the column NULL rather than
         // claiming a zero.
-        crate::runs::record_authored_prompt(&pool, id, runner.authored_prompt(&request)).await;
+        crate::execution::runs::record_authored_prompt(&pool, id, runner.authored_prompt(&request))
+            .await;
 
         let result = serve_turn(
             &runner,
@@ -3646,7 +3657,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // belongs to, and a table would be a join for something no query ever asks
                     // about on its own. An empty list is stored as `[]`, which says "acted on
                     // nothing" — NULL is reserved for turns nobody asked.
-                    let live = crate::runner::live_from_stream(&o.stdout);
+                    let live = crate::execution::runner::live_from_stream(&o.stdout);
                     let tools_used =
                         serde_json::to_string(&live.did).unwrap_or_else(|_| "[]".to_string());
                     // The same argument as the line above, about the other half of the stream. The
@@ -3667,7 +3678,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // fresh input does. A resumed conversation is nearly all cache: reading only
                     // `input_tokens` would report a session at 96k as sitting at 9k.
                     let context_fill = o.stdout.lines().fold(None, |fill, line| {
-                        crate::runner::context_fill_from_line(line, fill)
+                        crate::execution::runner::context_fill_from_line(line, fill)
                     });
                     // Taken off the outcome and not re-derived from the transcript beside it: on the
                     // multi-turn path the transcript belongs to a PROCESS that may have served several
@@ -3676,13 +3687,14 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     let compacted = o.compacted;
                     // What the Chats window needs for its cache countdown and its model label,
                     // read off the same stream.
-                    let cache_ttl = crate::runner::cache_ttl_from_stream(&o.stdout);
-                    let model = crate::runner::model_from_stream(&o.stdout);
+                    let cache_ttl = crate::execution::runner::cache_ttl_from_stream(&o.stdout);
+                    let model = crate::execution::runner::model_from_stream(&o.stdout);
                     // The tokens and the turn count too, which every other terminal write in the
                     // core already takes off the outcome and this one did not: a chat turn read back
                     // "none recorded" under numbers the runner had measured and handed it.
                     // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
-                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
+                    crate::chats::tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout)
+                        .await;
                     let completed = sqlx::query(
                         "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, cache_ttl = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
                     )
@@ -3708,13 +3720,13 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .bind(id)
                     .execute(&pool)
                     .await;
-                    crate::runs::warn_on_terminal_write_err(&completed, id, status);
+                    crate::execution::runs::warn_on_terminal_write_err(&completed, id, status);
                     if let Some(session_id) = o.session_id.as_deref() {
                         // `get_session` would refuse to resume this session anyway, by looking at the
                         // runs that produced it. Dropping the row here as well closes the one case that
                         // check cannot see: a session recorded against a run that never took the id has
                         // nothing pointing at it, so nothing marks it as having read anything.
-                        match crate::runs::read_untrusted_context(&pool, id).await {
+                        match crate::execution::runs::read_untrusted_context(&pool, id).await {
                             Ok(false) => {
                                 let _ = upsert_session(
                                     &pool,
@@ -3746,13 +3758,15 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                 // still spent what it spent, and one stopped at its ceiling has read the most.
                 None => {
                     // A silence kill is a timeout, as `runs.rs` records it.
-                    let status = if o.exit_code == crate::runner::PROGRESS_TIMEOUT_EXIT_CODE {
-                        "timed_out"
-                    } else {
-                        "failed"
-                    };
+                    let status =
+                        if o.exit_code == crate::execution::runner::PROGRESS_TIMEOUT_EXIT_CODE {
+                            "timed_out"
+                        } else {
+                            "failed"
+                        };
                     // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
-                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
+                    crate::chats::tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout)
+                        .await;
                     let failed = sqlx::query(
                         "UPDATE runs SET status = ?, exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
@@ -3770,7 +3784,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     .bind(id)
                     .execute(&pool)
                     .await;
-                    crate::runs::warn_on_terminal_write_err(&failed, id, status);
+                    crate::execution::runs::warn_on_terminal_write_err(&failed, id, status);
                 }
             },
             Ok(Err(e)) => {
@@ -3782,7 +3796,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                 .bind(id)
                 .execute(&pool)
                 .await;
-                crate::runs::warn_on_terminal_write_err(&failed, id, "failed");
+                crate::execution::runs::warn_on_terminal_write_err(&failed, id, "failed");
             }
             Err(_) => {
                 let timed_out = sqlx::query(
@@ -3792,7 +3806,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                 .bind(id)
                 .execute(&pool)
                 .await;
-                crate::runs::warn_on_terminal_write_err(&timed_out, id, "timed_out");
+                crate::execution::runs::warn_on_terminal_write_err(&timed_out, id, "timed_out");
             }
         }
 
@@ -3820,8 +3834,8 @@ fn settled_reply(stdout: &str) -> Option<(&'static str, Option<String>)> {
     if let Some(reply) = extract_reply(stdout) {
         return Some(("completed", Some(reply)));
     }
-    if crate::runner::interrupted_by_user(stdout) {
-        let partial = crate::runner::live_from_stream(stdout).text;
+    if crate::execution::runner::interrupted_by_user(stdout) {
+        let partial = crate::execution::runner::live_from_stream(stdout).text;
         return Some((
             "cancelled",
             Some(partial).filter(|text| !text.trim().is_empty()),
@@ -3835,7 +3849,7 @@ mod tests {
     use super::*;
     use crate::assistants::{FixedAssistants, NoAssistants, RecordingAssistants};
     use crate::auth::Token;
-    use crate::runner::FakeCommandRunner;
+    use crate::execution::runner::FakeCommandRunner;
     use crate::state::AppState;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -3854,8 +3868,8 @@ mod tests {
     }
 
     struct CliAssistants {
-        claude: Option<Arc<dyn crate::runner::CommandRunner>>,
-        codex: Option<Arc<dyn crate::runner::CommandRunner>>,
+        claude: Option<Arc<dyn crate::execution::runner::CommandRunner>>,
+        codex: Option<Arc<dyn crate::execution::runner::CommandRunner>>,
     }
 
     #[async_trait::async_trait]
@@ -3864,7 +3878,8 @@ mod tests {
             &self,
             _brain: crate::chats::Brain,
             _model: Option<&str>,
-        ) -> Result<Arc<crate::local_agent::LocalAssistant>, crate::assistants::Refusal> {
+        ) -> Result<Arc<crate::models::local_agent::LocalAssistant>, crate::assistants::Refusal>
+        {
             Err(crate::assistants::Refusal::RouteNotConfigured)
         }
 
@@ -3892,7 +3907,7 @@ mod tests {
             &self,
             cli: &str,
             _model: Option<&str>,
-        ) -> Option<Arc<dyn crate::runner::CommandRunner>> {
+        ) -> Option<Arc<dyn crate::execution::runner::CommandRunner>> {
             match cli {
                 "claude" => self.claude.clone(),
                 "codex" => self.codex.clone(),
@@ -3979,13 +3994,13 @@ mod tests {
             machine_config_root: None,
             secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
             email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
-            voice: std::sync::Arc::new(crate::voice::VoiceRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
             browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
-            github: std::sync::Arc::new(crate::github::GithubRuntime::default()),
-            web: std::sync::Arc::new(crate::web::WebRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
             quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
             judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
-            calendar: std::sync::Arc::new(crate::calendar::CalendarRuntime::default()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
@@ -3993,10 +4008,12 @@ mod tests {
     }
 
     /// A local assistant that answers one fixed sentence and calls no tools.
-    fn fake_local_assistant(answer: &'static str) -> Arc<crate::local_agent::LocalAssistant> {
+    fn fake_local_assistant(
+        answer: &'static str,
+    ) -> Arc<crate::models::local_agent::LocalAssistant> {
         struct OneLiner(&'static str);
         #[async_trait::async_trait]
-        impl crate::local_agent::LocalChat for OneLiner {
+        impl crate::models::local_agent::LocalChat for OneLiner {
             async fn exchange(
                 &self,
                 _messages: Vec<serde_json::Value>,
@@ -4008,7 +4025,7 @@ mod tests {
 
         struct NoTools;
         #[async_trait::async_trait]
-        impl crate::local_agent::ToolBox for NoTools {
+        impl crate::models::local_agent::ToolBox for NoTools {
             fn schemas(&self) -> Vec<serde_json::Value> {
                 Vec::new()
             }
@@ -4016,12 +4033,12 @@ mod tests {
                 &self,
                 _name: &str,
                 _arguments: &serde_json::Value,
-            ) -> crate::local_agent::ToolAnswer {
+            ) -> crate::models::local_agent::ToolAnswer {
                 unreachable!("this assistant answers without calling tools")
             }
         }
 
-        Arc::new(crate::local_agent::LocalAssistant::new(
+        Arc::new(crate::models::local_agent::LocalAssistant::new(
             Box::new(OneLiner(answer)),
             Box::new(NoTools),
         ))
@@ -4031,10 +4048,11 @@ mod tests {
     ///
     /// The shape that matters: the taint happens, and then there is no `Turn` to carry it. It is
     /// why the flag became an `AtomicBool` the caller owns, and it had no test.
-    fn local_assistant_that_reads_mail_then_dies() -> Arc<crate::local_agent::LocalAssistant> {
+    fn local_assistant_that_reads_mail_then_dies() -> Arc<crate::models::local_agent::LocalAssistant>
+    {
         struct CallsThenDies;
         #[async_trait::async_trait]
-        impl crate::local_agent::LocalChat for CallsThenDies {
+        impl crate::models::local_agent::LocalChat for CallsThenDies {
             async fn exchange(
                 &self,
                 messages: Vec<serde_json::Value>,
@@ -4054,7 +4072,7 @@ mod tests {
 
         struct MailBox;
         #[async_trait::async_trait]
-        impl crate::local_agent::ToolBox for MailBox {
+        impl crate::models::local_agent::ToolBox for MailBox {
             fn schemas(&self) -> Vec<serde_json::Value> {
                 vec![serde_json::json!({
                     "type": "function",
@@ -4065,15 +4083,15 @@ mod tests {
                 &self,
                 _name: &str,
                 _arguments: &serde_json::Value,
-            ) -> crate::local_agent::ToolAnswer {
-                crate::local_agent::ToolAnswer {
+            ) -> crate::models::local_agent::ToolAnswer {
+                crate::models::local_agent::ToolAnswer {
                     text: serde_json::json!({"body": "olá"}).to_string(),
                     untrusted: true,
                 }
             }
         }
 
-        Arc::new(crate::local_agent::LocalAssistant::new(
+        Arc::new(crate::models::local_agent::LocalAssistant::new(
             Box::new(CallsThenDies),
             Box::new(MailBox),
         ))
@@ -4193,8 +4211,10 @@ mod tests {
 
     #[test]
     fn a_pinned_codex_model_is_answered_by_the_codex_runner() {
-        let daemon: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
-        let codex: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let daemon: Arc<dyn crate::execution::runner::CommandRunner> =
+            Arc::new(FakeCommandRunner::default());
+        let codex: Arc<dyn crate::execution::runner::CommandRunner> =
+            Arc::new(FakeCommandRunner::default());
         let assistants = CliAssistants {
             claude: None,
             codex: Some(codex.clone()),
@@ -4217,7 +4237,8 @@ mod tests {
 
     #[test]
     fn an_unpinned_or_claude_pinned_turn_keeps_the_daemons_runner() {
-        let daemon: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let daemon: Arc<dyn crate::execution::runner::CommandRunner> =
+            Arc::new(FakeCommandRunner::default());
         let assistants = CliAssistants {
             claude: Some(Arc::new(FakeCommandRunner::default())),
             codex: Some(Arc::new(FakeCommandRunner::default())),
@@ -4234,15 +4255,15 @@ mod tests {
     #[test]
     fn a_codex_turn_never_keeps_a_live_process() {
         assert!(!may_keep_process(
-            crate::runner::ToolPolicy::Unrestricted,
+            crate::execution::runner::ToolPolicy::Unrestricted,
             "codex"
         ));
         assert!(may_keep_process(
-            crate::runner::ToolPolicy::Unrestricted,
+            crate::execution::runner::ToolPolicy::Unrestricted,
             "claude"
         ));
         assert!(!may_keep_process(
-            crate::runner::ToolPolicy::McpOnly,
+            crate::execution::runner::ToolPolicy::McpOnly,
             "claude"
         ));
     }
@@ -4564,7 +4585,7 @@ mod tests {
     async fn a_local_chat_turn_declares_as_its_own_run() {
         struct DeclaresOnce;
         #[async_trait::async_trait]
-        impl crate::local_agent::LocalChat for DeclaresOnce {
+        impl crate::models::local_agent::LocalChat for DeclaresOnce {
             async fn exchange(
                 &self,
                 messages: Vec<serde_json::Value>,
@@ -4607,7 +4628,10 @@ mod tests {
             state.pool.clone(),
         );
         state.assistants = Arc::new(FixedAssistants(Arc::new(
-            crate::local_agent::LocalAssistant::new(Box::new(DeclaresOnce), Box::new(toolbox)),
+            crate::models::local_agent::LocalAssistant::new(
+                Box::new(DeclaresOnce),
+                Box::new(toolbox),
+            ),
         )));
 
         let run_id = send_message(&state, "local-declares", "remember that", Origin::Telegram)
@@ -4751,7 +4775,7 @@ mod tests {
 
         struct Recorder(Arc<StdMutex<Vec<serde_json::Value>>>);
         #[async_trait::async_trait]
-        impl crate::local_agent::LocalChat for Recorder {
+        impl crate::models::local_agent::LocalChat for Recorder {
             async fn exchange(
                 &self,
                 messages: Vec<serde_json::Value>,
@@ -4763,11 +4787,15 @@ mod tests {
         }
         struct NoTools;
         #[async_trait::async_trait]
-        impl crate::local_agent::ToolBox for NoTools {
+        impl crate::models::local_agent::ToolBox for NoTools {
             fn schemas(&self) -> Vec<serde_json::Value> {
                 Vec::new()
             }
-            async fn call(&self, _: &str, _: &serde_json::Value) -> crate::local_agent::ToolAnswer {
+            async fn call(
+                &self,
+                _: &str,
+                _: &serde_json::Value,
+            ) -> crate::models::local_agent::ToolAnswer {
                 unreachable!()
             }
         }
@@ -4775,7 +4803,7 @@ mod tests {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let mut state = test_state().await;
         state.assistants = Arc::new(FixedAssistants(Arc::new(
-            crate::local_agent::LocalAssistant::new(
+            crate::models::local_agent::LocalAssistant::new(
                 Box::new(Recorder(seen.clone())),
                 Box::new(NoTools),
             ),
@@ -4798,7 +4826,7 @@ mod tests {
         assert_eq!(
             contents,
             vec![
-                crate::local_agent::SYSTEM_PROMPT.to_string(),
+                crate::models::local_agent::SYSTEM_PROMPT.to_string(),
                 "primeira".to_string(),
                 "ok".to_string(),
                 "segunda".to_string(),
@@ -5063,7 +5091,7 @@ mod tests {
             r#"{"type":"result","subtype":"success","result":"pronto"}"#,
         );
         state.runner = Arc::new(FakeCommandRunner {
-            canned: Mutex::new(Some(crate::runner::RunOutcome {
+            canned: Mutex::new(Some(crate::execution::runner::RunOutcome {
                 exit_code: 0,
                 stdout: stream,
                 stderr: String::new(),
@@ -5107,7 +5135,10 @@ mod tests {
     );
 
     /// Runs one chat turn against `outcome` and reads back what its row recorded.
-    async fn measured_turn(chat_id: &str, outcome: crate::runner::RunOutcome) -> Measured {
+    async fn measured_turn(
+        chat_id: &str,
+        outcome: crate::execution::runner::RunOutcome,
+    ) -> Measured {
         let mut state = test_state().await;
         state.runner = Arc::new(FakeCommandRunner {
             canned: Mutex::new(Some(outcome)),
@@ -5127,8 +5158,8 @@ mod tests {
         .unwrap()
     }
 
-    fn measured_outcome(exit_code: i32, stdout: &str) -> crate::runner::RunOutcome {
-        crate::runner::RunOutcome {
+    fn measured_outcome(exit_code: i32, stdout: &str) -> crate::execution::runner::RunOutcome {
+        crate::execution::runner::RunOutcome {
             exit_code,
             stdout: stdout.to_string(),
             stderr: String::new(),
@@ -5176,7 +5207,7 @@ mod tests {
 
         let row = measured_turn(
             "ceiling-chat",
-            measured_outcome(crate::runner::TURN_CEILING_EXIT_CODE, stream),
+            measured_outcome(crate::execution::runner::TURN_CEILING_EXIT_CODE, stream),
         )
         .await;
 
@@ -5211,7 +5242,7 @@ mod tests {
             r#"{"type":"system","subtype":"init","session_id":"s","tools":["TaskCreate"]}"#,
         );
         state.runner = Arc::new(FakeCommandRunner {
-            canned: Mutex::new(Some(crate::runner::RunOutcome {
+            canned: Mutex::new(Some(crate::execution::runner::RunOutcome {
                 exit_code: -1,
                 stdout: stream.clone(),
                 stderr: "nucleos: ToolPolicy::McpOnly violated by CLI-advertised tools: TaskCreate"
@@ -5301,7 +5332,7 @@ mod tests {
             Some("fake-session-id".to_string()),
             "the turn should have recorded its session before reading anything"
         );
-        crate::runs::mark_untrusted_context(&state.pool, first)
+        crate::execution::runs::mark_untrusted_context(&state.pool, first)
             .await
             .unwrap();
 
@@ -5626,7 +5657,7 @@ mod tests {
         let runner = Arc::new(FakeCommandRunner {
             // Silent about its session, like a stream that never emits an init event. Whatever the
             // turn ends up carrying is therefore the daemon's own doing, not the CLI's.
-            canned: Mutex::new(Some(crate::runner::RunOutcome {
+            canned: Mutex::new(Some(crate::execution::runner::RunOutcome {
                 exit_code: 0,
                 stdout: "hello back".into(),
                 stderr: String::new(),
@@ -5701,7 +5732,7 @@ mod tests {
 
         assert_eq!(
             *runner.last_tool_policy.lock().unwrap(),
-            Some(crate::runner::ToolPolicy::McpOnly),
+            Some(crate::execution::runner::ToolPolicy::McpOnly),
             "a Telegram turn must not be launched with the built-in tools available"
         );
     }
@@ -5843,7 +5874,7 @@ mod tests {
         );
 
         assert!(
-            crate::runs::finalize_termination(&state, id, "cancelled").await,
+            crate::execution::runs::finalize_termination(&state, id, "cancelled").await,
             "the turn should still have been in flight"
         );
 
@@ -6186,7 +6217,7 @@ mod tests {
         crate::chats::set_agents(
             &state.pool,
             &id,
-            &[crate::runner::Subagent {
+            &[crate::execution::runner::Subagent {
                 name: "reviewer".to_string(),
                 description: "Reviews code".to_string(),
                 prompt: "You are a code reviewer".to_string(),
@@ -6547,7 +6578,7 @@ mod tests {
     #[tokio::test]
     async fn the_kill_switch_does_not_silence_an_ordinary_chat() {
         let state = test_state().await;
-        crate::autopilot::set_kill_switch(&state.pool, true)
+        crate::governance::autopilot::set_kill_switch(&state.pool, true)
             .await
             .unwrap();
 
@@ -6567,7 +6598,7 @@ mod tests {
     /// where that condition is actually exercised.
     #[test]
     fn only_a_rooted_conversation_spoken_to_from_the_machine_with_a_wired_hook_gets_the_tools() {
-        use crate::runner::ToolPolicy;
+        use crate::execution::runner::ToolPolicy;
         let root = Some("C:/Projects/nucleos");
 
         for (cwd, origin, wired, expected, why) in [
@@ -6659,7 +6690,7 @@ mod tests {
                 for wired in [true, false] {
                     assert_eq!(
                         tool_policy_for(cwd, origin, wired, true),
-                        crate::runner::ToolPolicy::McpOnly,
+                        crate::execution::runner::ToolPolicy::McpOnly,
                         "relayed: cwd={cwd:?} origin={origin:?} wired={wired}"
                     );
                 }
@@ -6670,11 +6701,11 @@ mod tests {
         // difference this test exists for is legible without reading the loop above.
         assert_eq!(
             tool_policy_for(Some("C:/repo"), Origin::Shell, true, false),
-            crate::runner::ToolPolicy::Unrestricted
+            crate::execution::runner::ToolPolicy::Unrestricted
         );
         assert_eq!(
             tool_policy_for(Some("C:/repo"), Origin::Shell, true, true),
-            crate::runner::ToolPolicy::McpOnly
+            crate::execution::runner::ToolPolicy::McpOnly
         );
     }
 
@@ -6686,7 +6717,7 @@ mod tests {
             for wired in [true, false] {
                 assert_eq!(
                     tool_policy_for(None, origin, wired, false),
-                    crate::runner::ToolPolicy::McpOnly
+                    crate::execution::runner::ToolPolicy::McpOnly
                 );
             }
         }
@@ -6715,7 +6746,7 @@ mod tests {
         // And the direction is the permissive one, so this cannot pass by both being McpOnly.
         assert_eq!(
             tool_policy_for(Some("C:/Projects/nucleos"), Origin::Voice, true, false),
-            crate::runner::ToolPolicy::Unrestricted
+            crate::execution::runner::ToolPolicy::Unrestricted
         );
     }
 
@@ -6728,7 +6759,7 @@ mod tests {
     fn a_message_over_the_network_is_still_kept_off_the_machine() {
         assert_eq!(
             tool_policy_for(Some("C:/Projects/nucleos"), Origin::Telegram, true, false),
-            crate::runner::ToolPolicy::McpOnly
+            crate::execution::runner::ToolPolicy::McpOnly
         );
     }
 
@@ -6802,22 +6833,22 @@ mod tests {
             tool_policy_for(
                 Some(dir),
                 Origin::Shell,
-                crate::autopilot::classifier_hook_is_wired(root.path()),
+                crate::governance::autopilot::classifier_hook_is_wired(root.path()),
                 false
             ),
-            crate::runner::ToolPolicy::McpOnly,
+            crate::execution::runner::ToolPolicy::McpOnly,
         );
 
-        crate::autopilot::wire_classifier_hook(root.path()).unwrap();
+        crate::governance::autopilot::wire_classifier_hook(root.path()).unwrap();
 
         assert_eq!(
             tool_policy_for(
                 Some(dir),
                 Origin::Shell,
-                crate::autopilot::classifier_hook_is_wired(root.path()),
+                crate::governance::autopilot::classifier_hook_is_wired(root.path()),
                 false
             ),
-            crate::runner::ToolPolicy::Unrestricted,
+            crate::execution::runner::ToolPolicy::Unrestricted,
         );
     }
 
@@ -6898,7 +6929,7 @@ mod tests {
     /// A runner whose stream carries a tool call before its result.
     fn ran_a_tool(stdout_lines: &[&str]) -> Arc<FakeCommandRunner> {
         Arc::new(FakeCommandRunner {
-            canned: Mutex::new(Some(crate::runner::RunOutcome {
+            canned: Mutex::new(Some(crate::execution::runner::RunOutcome {
                 exit_code: 0,
                 stdout: stdout_lines.join(
                     "
@@ -6941,7 +6972,7 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        let did: Vec<crate::runner::ToolCall> =
+        let did: Vec<crate::execution::runner::ToolCall> =
             serde_json::from_str(&stored.expect("the turn recorded no actions")).unwrap();
 
         assert_eq!(did.len(), 1);
@@ -7367,7 +7398,7 @@ mod tests {
         let fake = std::sync::Arc::new(FakeCommandRunner::default());
         let mut state = test_state().await;
         state.runner = fake.clone();
-        let images = vec![crate::runner::Attachment {
+        let images = vec![crate::execution::runner::Attachment {
             media_type: "image/png".into(),
             data: "aGVsbG8=".into(),
         }];
@@ -7404,11 +7435,13 @@ mod tests {
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
         events
-            .send(crate::runner::TurnEvent::Line("hello".to_owned()))
+            .send(crate::execution::runner::TurnEvent::Line(
+                "hello".to_owned(),
+            ))
             .unwrap();
         events
-            .send(crate::runner::TurnEvent::Ended(
-                crate::runner::TurnOutcome {
+            .send(crate::execution::runner::TurnEvent::Ended(
+                crate::execution::runner::TurnOutcome {
                     cost_usd: Some(0.08),
                     ..Default::default()
                 },
@@ -7441,10 +7474,14 @@ mod tests {
         let second = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
         for event in [
-            crate::runner::TurnEvent::Line("mine".to_owned()),
-            crate::runner::TurnEvent::Ended(crate::runner::TurnOutcome::default()),
-            crate::runner::TurnEvent::Line("theirs".to_owned()),
-            crate::runner::TurnEvent::Ended(crate::runner::TurnOutcome::default()),
+            crate::execution::runner::TurnEvent::Line("mine".to_owned()),
+            crate::execution::runner::TurnEvent::Ended(
+                crate::execution::runner::TurnOutcome::default(),
+            ),
+            crate::execution::runner::TurnEvent::Line("theirs".to_owned()),
+            crate::execution::runner::TurnEvent::Ended(
+                crate::execution::runner::TurnOutcome::default(),
+            ),
         ] {
             events.send(event).unwrap();
         }
@@ -7494,7 +7531,9 @@ mod tests {
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
         events
-            .send(crate::runner::TurnEvent::Line("working on it".to_owned()))
+            .send(crate::execution::runner::TurnEvent::Line(
+                "working on it".to_owned(),
+            ))
             .unwrap();
         drop(events);
 
@@ -7515,11 +7554,12 @@ mod tests {
     /// some other task happened to have run yet.
     fn live_chat_for_testing() -> (
         LiveChat,
-        tokio::sync::mpsc::UnboundedReceiver<crate::runner::LaterTurn>,
-        tokio::sync::mpsc::UnboundedSender<crate::runner::TurnEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::execution::runner::LaterTurn>,
+        tokio::sync::mpsc::UnboundedSender<crate::execution::runner::TurnEvent>,
         tokio::sync::watch::Sender<Option<String>>,
     ) {
-        let (messages, said) = tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
+        let (messages, said) =
+            tokio::sync::mpsc::unbounded_channel::<crate::execution::runner::LaterTurn>();
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         // The supervisor's voice: in a real one this is the task that owns the process saying why it
         // stopped, and here it is whatever the test wants said.
@@ -7532,7 +7572,7 @@ mod tests {
                 // Nothing to stop, but the field is what stops a real one, so it is not optional.
                 abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
                 stopped_because,
-                permission: crate::runner::Permission::Default,
+                permission: crate::execution::runner::Permission::Default,
                 cwd: None,
                 idle_since: std::time::Instant::now(),
                 idle_for: LIVE_IDLE,
@@ -7558,7 +7598,7 @@ mod tests {
     /// conversation whose working directory vanished is not the thing under test.
     async fn rooted_chat(state: &AppState, chat_id: &str) -> tempfile::TempDir {
         let root = tempfile::TempDir::new().unwrap();
-        crate::autopilot::wire_classifier_hook(root.path()).unwrap();
+        crate::governance::autopilot::wire_classifier_hook(root.path()).unwrap();
         sqlx::query(
             "INSERT INTO chats (chat_id, brain, created_at, cwd)
              VALUES (?, 'cloud', '2026-01-01T00:00:00Z', ?)",
@@ -7682,13 +7722,15 @@ mod tests {
             let chat = a_chat(prefix);
             let (live, _said, events, _why) = live_chat_for_testing();
             LIVE_CHATS.lock().unwrap().insert(chat.clone(), live);
-            events.send(crate::runner::TurnEvent::Line(line)).unwrap();
             events
-                .send(crate::runner::TurnEvent::Ended(
-                    crate::runner::TurnOutcome::default(),
+                .send(crate::execution::runner::TurnEvent::Line(line))
+                .unwrap();
+            events
+                .send(crate::execution::runner::TurnEvent::Ended(
+                    crate::execution::runner::TurnOutcome::default(),
                 ))
                 .unwrap();
-            let runner: Arc<dyn crate::runner::CommandRunner> =
+            let runner: Arc<dyn crate::execution::runner::CommandRunner> =
                 Arc::new(FakeCommandRunner::default());
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let transcript = Arc::new(Mutex::new(String::new()));
@@ -7817,7 +7859,9 @@ mod tests {
         kept.get_mut("c0")
             .unwrap()
             .carried
-            .push_back(crate::runner::TurnEvent::Line("an answer".to_owned()));
+            .push_back(crate::execution::runner::TurnEvent::Line(
+                "an answer".to_owned(),
+            ));
 
         let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP, &HashSet::new());
 
@@ -7960,7 +8004,9 @@ mod tests {
         kept.get_mut("c0")
             .unwrap()
             .carried
-            .push_back(crate::runner::TurnEvent::Line("an answer".to_owned()));
+            .push_back(crate::execution::runner::TurnEvent::Line(
+                "an answer".to_owned(),
+            ));
         let evicted = make_room(&mut kept, 6, "c5", LIVE_CAP, &open);
         assert_eq!(evicted.len(), 1);
         assert!(kept.contains_key("c0"), "unclaimed answer: pinned");
@@ -8137,7 +8183,7 @@ mod tests {
         // Wired in the new place too, so what this test measures is the MOVE and not the loss of
         // tools: an unwired directory would take the one-shot path anyway and pass for free.
         let elsewhere = tempfile::TempDir::new().unwrap();
-        crate::autopilot::wire_classifier_hook(elsewhere.path()).unwrap();
+        crate::governance::autopilot::wire_classifier_hook(elsewhere.path()).unwrap();
         sqlx::query("UPDATE chats SET cwd = ? WHERE chat_id = 'moving-chat'")
             .bind(elsewhere.path().to_str().unwrap())
             .execute(&state.pool)
@@ -8178,30 +8224,32 @@ mod tests {
         /// The real runner with a tally, because "one process served both" is a claim about
         /// LAUNCHES and the real runner keeps no count of its own.
         struct Counting {
-            inner: crate::runner::ClaudeCliRunner,
+            inner: crate::execution::runner::ClaudeCliRunner,
             launches: Mutex<u32>,
         }
 
         #[async_trait::async_trait]
-        impl crate::runner::CommandRunner for Counting {
+        impl crate::execution::runner::CommandRunner for Counting {
             async fn run_prompt(
                 &self,
-                request: crate::runner::RunRequest,
+                request: crate::execution::runner::RunRequest,
                 session_tx: tokio::sync::mpsc::UnboundedSender<String>,
                 transcript: std::sync::Arc<Mutex<String>>,
-            ) -> std::io::Result<crate::runner::RunOutcome> {
+            ) -> std::io::Result<crate::execution::runner::RunOutcome> {
                 *self.launches.lock().unwrap() += 1;
                 self.inner.run_prompt(request, session_tx, transcript).await
             }
 
             async fn run_prompt_with_turns(
                 &self,
-                request: crate::runner::RunRequest,
+                request: crate::execution::runner::RunRequest,
                 session_tx: tokio::sync::mpsc::UnboundedSender<String>,
                 transcript: std::sync::Arc<Mutex<String>>,
                 context_fill: std::sync::Arc<Mutex<Option<i64>>>,
-                turn_events: Option<tokio::sync::mpsc::UnboundedSender<crate::runner::TurnEvent>>,
-            ) -> std::io::Result<crate::runner::RunOutcome> {
+                turn_events: Option<
+                    tokio::sync::mpsc::UnboundedSender<crate::execution::runner::TurnEvent>,
+                >,
+            ) -> std::io::Result<crate::execution::runner::RunOutcome> {
                 *self.launches.lock().unwrap() += 1;
                 self.inner
                     .run_prompt_with_turns(
@@ -8219,7 +8267,7 @@ mod tests {
         // counter nobody asserts on is the shape of a test that passes for the wrong reason, which
         // is the failure this whole test exists to rule out.
         let counting = std::sync::Arc::new(Counting {
-            inner: crate::runner::ClaudeCliRunner {
+            inner: crate::execution::runner::ClaudeCliRunner {
                 model: "sonnet".to_owned(),
                 plan_model: None,
                 review_model: None,
@@ -8228,7 +8276,7 @@ mod tests {
             },
             launches: Mutex::new(0),
         });
-        let runner: std::sync::Arc<dyn crate::runner::CommandRunner> = counting.clone();
+        let runner: std::sync::Arc<dyn crate::execution::runner::CommandRunner> = counting.clone();
         let root = tempfile::TempDir::new().unwrap();
         let chat_id = "the-seam";
 
@@ -8301,17 +8349,17 @@ mod tests {
         prompt: &str,
         cwd: &std::path::Path,
         resume: Option<String>,
-    ) -> crate::runner::RunRequest {
-        crate::runner::RunRequest {
+    ) -> crate::execution::runner::RunRequest {
+        crate::execution::runner::RunRequest {
             prompt: prompt.to_owned(),
             env: Vec::new(),
             cwd: Some(cwd.to_path_buf()),
-            permission: crate::runner::Permission::Default,
+            permission: crate::execution::runner::Permission::Default,
             resume_session_id: resume,
             mcp_config: None,
             mcp_job: None,
             mcp_team_run: None,
-            tool_policy: crate::runner::ToolPolicy::Unrestricted,
+            tool_policy: crate::execution::runner::ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
             session_id: Some(crate::auth::generate_uuid_v4()),
@@ -8359,7 +8407,7 @@ mod tests {
             .unwrap();
         settled_turn(&state.pool, first).await;
 
-        let images = vec![crate::runner::Attachment {
+        let images = vec![crate::execution::runner::Attachment {
             media_type: "image/png".into(),
             data: "aGVsbG8=".into(),
         }];
@@ -8399,7 +8447,7 @@ mod tests {
             session_id: std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
             abort: running.abort_handle(),
             stopped_because: tokio::sync::watch::channel(None).1,
-            permission: crate::runner::Permission::Default,
+            permission: crate::execution::runner::Permission::Default,
             cwd: None,
             idle_since: std::time::Instant::now(),
             idle_for: LIVE_IDLE,
@@ -8438,7 +8486,7 @@ mod tests {
             session_id: std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
             abort: running.abort_handle(),
             stopped_because: tokio::sync::watch::channel(None).1,
-            permission: crate::runner::Permission::Default,
+            permission: crate::execution::runner::Permission::Default,
             cwd: None,
             idle_since: std::time::Instant::now(),
             idle_for: LIVE_IDLE,
@@ -8524,7 +8572,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        crate::runs::cancel_run(
+        crate::execution::runs::cancel_run(
             axum::extract::State(state.clone()),
             axum::extract::Path(second),
         )
@@ -8571,7 +8619,7 @@ mod tests {
         tokio::sync::mpsc::UnboundedSender<String>,
     ) {
         let fake = Arc::new(FakeCommandRunner::default());
-        *fake.canned.lock().unwrap() = Some(crate::runner::RunOutcome {
+        *fake.canned.lock().unwrap() = Some(crate::execution::runner::RunOutcome {
             exit_code: 0,
             stdout: LAUNCHES_A_TASK.to_owned(),
             stderr: String::new(),
@@ -8773,7 +8821,7 @@ mod tests {
     #[tokio::test]
     async fn a_background_task_is_recorded_from_its_launch_to_its_end_between_turns() {
         let fake = Arc::new(FakeCommandRunner::default());
-        *fake.canned.lock().unwrap() = Some(crate::runner::RunOutcome {
+        *fake.canned.lock().unwrap() = Some(crate::execution::runner::RunOutcome {
             exit_code: 0,
             stdout: concat!(
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bg","name":"Bash","input":{"command":"sleep 20","run_in_background":true}}]}}"#,
@@ -8809,7 +8857,7 @@ mod tests {
 
         let mut rows = Vec::new();
         for _ in 0..300 {
-            rows = crate::chat_tasks::for_chat(&state.pool, &chat)
+            rows = crate::chats::tasks::for_chat(&state.pool, &chat)
                 .await
                 .unwrap();
             if !rows.is_empty() {
@@ -8832,7 +8880,7 @@ mod tests {
             )
             .unwrap();
         for _ in 0..300 {
-            rows = crate::chat_tasks::for_chat(&state.pool, &chat)
+            rows = crate::chats::tasks::for_chat(&state.pool, &chat)
                 .await
                 .unwrap();
             if rows.first().is_some_and(|row| row.status != "running") {
@@ -9012,7 +9060,8 @@ mod tests {
 
         // Replaces the turn's own entry, so the interrupt goes to a channel nobody reads for the
         // double. The receiver is kept to see what was written.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::execution::runner::LaterTurn>();
         let _guard = SteerGuard::open(&chat, &tx);
 
         let stopped = stop_turn_within(&state, second, Duration::from_millis(200)).await;
@@ -9177,7 +9226,7 @@ mod tests {
                 .unwrap();
         assert_eq!(recorded, 0, "nothing was said into a turn");
 
-        crate::runs::finalize_termination(&state, turn, "cancelled").await;
+        crate::execution::runs::finalize_termination(&state, turn, "cancelled").await;
     }
 
     /// Send now does not carry a message across a change of permission mode.
@@ -9456,7 +9505,7 @@ mod tests {
 
         assert_eq!(
             *fake.last_permission.lock().unwrap(),
-            Some(crate::runner::Permission::Plan)
+            Some(crate::execution::runner::Permission::Plan)
         );
     }
 
@@ -9618,7 +9667,7 @@ mod tests {
         );
         assert_eq!(
             *fake.last_permission.lock().unwrap(),
-            Some(crate::runner::Permission::Plan)
+            Some(crate::execution::runner::Permission::Plan)
         );
     }
 
@@ -9725,7 +9774,7 @@ mod tests {
         let root = crate::files::ensure_root(dir.path()).unwrap();
         let mut state = test_state().await;
         state.files_root = Some(root.clone());
-        let images = vec![crate::runner::Attachment {
+        let images = vec![crate::execution::runner::Attachment {
             media_type: "image/png".into(),
             // "hello" — not a real PNG, and nothing here claims to check.
             data: "aGVsbG8=".into(),
@@ -9945,14 +9994,14 @@ mod tests {
 
     /// The request a rooted live turn is served with: `take_live` only reuses a process standing on
     /// the same ground (here no cwd, default permission) and resuming the session it already has.
-    fn silence_request() -> crate::runner::RunRequest {
+    fn silence_request() -> crate::execution::runner::RunRequest {
         let mut request = seam_request("go", &std::env::temp_dir(), Some("s-1".into()));
         request.cwd = None;
         request
     }
 
     /// A canned one-shot answer: `lines` assistant events and a closing `result`.
-    fn silence_canned(lines: usize) -> crate::runner::RunOutcome {
+    fn silence_canned(lines: usize) -> crate::execution::runner::RunOutcome {
         let mut stdout = String::new();
         for n in 0..lines {
             stdout.push_str(&format!(
@@ -9961,7 +10010,7 @@ mod tests {
             stdout.push('\n');
         }
         stdout.push_str(r#"{"type":"result","subtype":"success","result":"done"}"#);
-        crate::runner::RunOutcome {
+        crate::execution::runner::RunOutcome {
             exit_code: 0,
             stdout,
             stderr: String::new(),
@@ -9979,7 +10028,7 @@ mod tests {
     fn silence_runner(
         lines: usize,
         delay: Duration,
-    ) -> std::sync::Arc<dyn crate::runner::CommandRunner> {
+    ) -> std::sync::Arc<dyn crate::execution::runner::CommandRunner> {
         Arc::new(FakeCommandRunner {
             canned: Mutex::new(Some(silence_canned(lines))),
             delay: Mutex::new(Some(delay)),
@@ -9992,7 +10041,7 @@ mod tests {
         let deadlines = turn_deadlines(
             crate::state::DEFAULT_RUN_TIMEOUT,
             crate::state::DEFAULT_PROGRESS_TIMEOUT,
-            crate::runner::ToolPolicy::Unrestricted,
+            crate::execution::runner::ToolPolicy::Unrestricted,
         );
         assert_eq!(
             deadlines,
@@ -10008,7 +10057,7 @@ mod tests {
         let deadlines = turn_deadlines(
             crate::state::DEFAULT_RUN_TIMEOUT,
             crate::state::DEFAULT_PROGRESS_TIMEOUT,
-            crate::runner::ToolPolicy::McpOnly,
+            crate::execution::runner::ToolPolicy::McpOnly,
         );
         assert_eq!(
             deadlines,
@@ -10027,19 +10076,22 @@ mod tests {
         let deadlines = turn_deadlines(
             Duration::from_millis(100),
             Duration::from_millis(100),
-            crate::runner::ToolPolicy::Unrestricted,
+            crate::execution::runner::ToolPolicy::Unrestricted,
         );
         let feeder = tokio::spawn(async move {
             for n in 0..20 {
-                let _ = events.send(crate::runner::TurnEvent::Line(format!("line {n}")));
+                let _ = events.send(crate::execution::runner::TurnEvent::Line(format!(
+                    "line {n}"
+                )));
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
-            let _ = events.send(crate::runner::TurnEvent::Ended(
-                crate::runner::TurnOutcome::default(),
+            let _ = events.send(crate::execution::runner::TurnEvent::Ended(
+                crate::execution::runner::TurnOutcome::default(),
             ));
             events
         });
-        let runner: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let runner: Arc<dyn crate::execution::runner::CommandRunner> =
+            Arc::new(FakeCommandRunner::default());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let transcript = Arc::new(Mutex::new(String::new()));
 
@@ -10076,13 +10128,16 @@ mod tests {
         let deadlines = turn_deadlines(
             Duration::from_millis(100),
             Duration::from_millis(100),
-            crate::runner::ToolPolicy::Unrestricted,
+            crate::execution::runner::ToolPolicy::Unrestricted,
         );
         // One line, then the stream stays open and says nothing: `events` is held, not dropped.
         events
-            .send(crate::runner::TurnEvent::Line("one line".to_owned()))
+            .send(crate::execution::runner::TurnEvent::Line(
+                "one line".to_owned(),
+            ))
             .unwrap();
-        let runner: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let runner: Arc<dyn crate::execution::runner::CommandRunner> =
+            Arc::new(FakeCommandRunner::default());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let transcript = Arc::new(Mutex::new(String::new()));
 
@@ -10105,7 +10160,10 @@ mod tests {
         let outcome = served
             .expect("silence is reported as an outcome, not as the ceiling elapsing")
             .expect("the turn was written");
-        assert_eq!(outcome.exit_code, crate::runner::PROGRESS_TIMEOUT_EXIT_CODE);
+        assert_eq!(
+            outcome.exit_code,
+            crate::execution::runner::PROGRESS_TIMEOUT_EXIT_CODE
+        );
         assert!(outcome.stderr.contains("went silent"), "{}", outcome.stderr);
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
         assert!(!still_kept, "a process that went silent must be dropped");
@@ -10122,13 +10180,16 @@ mod tests {
         };
         let feeder = tokio::spawn(async move {
             while events
-                .send(crate::runner::TurnEvent::Line("still going".to_owned()))
+                .send(crate::execution::runner::TurnEvent::Line(
+                    "still going".to_owned(),
+                ))
                 .is_ok()
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         });
-        let runner: Arc<dyn crate::runner::CommandRunner> = Arc::new(FakeCommandRunner::default());
+        let runner: Arc<dyn crate::execution::runner::CommandRunner> =
+            Arc::new(FakeCommandRunner::default());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let transcript = Arc::new(Mutex::new(String::new()));
 
@@ -10160,7 +10221,7 @@ mod tests {
         let deadlines = turn_deadlines(
             Duration::from_millis(100),
             Duration::from_millis(100),
-            crate::runner::ToolPolicy::Unrestricted,
+            crate::execution::runner::ToolPolicy::Unrestricted,
         );
         let runner = silence_runner(20, Duration::from_millis(30));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10205,7 +10266,10 @@ mod tests {
         .expect("silence is the runner's outcome, not the ceiling elapsing")
         .expect("the runner answered");
 
-        assert_eq!(served.exit_code, crate::runner::PROGRESS_TIMEOUT_EXIT_CODE);
+        assert_eq!(
+            served.exit_code,
+            crate::execution::runner::PROGRESS_TIMEOUT_EXIT_CODE
+        );
     }
 
     #[tokio::test]
@@ -10242,7 +10306,7 @@ mod tests {
         let deadlines = turn_deadlines(
             Duration::from_millis(100),
             Duration::from_millis(100),
-            crate::runner::ToolPolicy::McpOnly,
+            crate::execution::runner::ToolPolicy::McpOnly,
         );
         let runner = silence_runner(5, Duration::from_secs(2));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10298,7 +10362,7 @@ mod tests {
     /// the NucleOS server is reachable, so no toggle may widen it. `None` offers no tools to widen.
     #[test]
     fn ambient_mcp_never_reaches_an_mcp_only_turn() {
-        use crate::runner::ToolPolicy;
+        use crate::execution::runner::ToolPolicy;
 
         assert!(ambient_mcp_for(ToolPolicy::Unrestricted, true));
         assert!(!ambient_mcp_for(ToolPolicy::Unrestricted, false));

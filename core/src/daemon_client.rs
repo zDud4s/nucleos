@@ -4,7 +4,8 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use crate::autopilot::{Mode, ProjectSummary};
+use crate::governance::autopilot::{Mode, ProjectSummary};
+use crate::integrations::github;
 
 /// The header that says WHICH NODE is calling.
 ///
@@ -220,7 +221,7 @@ impl DaemonClient {
         team_id: Option<&str>,
     ) -> Result<i64, String> {
         let projects = self.list_projects().await?;
-        crate::job::resolve_start(&projects, project_id)
+        crate::execution::job::resolve_start(&projects, project_id)
             .map_err(|refusal| refusal.reason(project_id))?;
 
         // Whether the team EXISTS is deliberately not checked here, unlike the project above, and
@@ -1193,12 +1194,12 @@ impl DaemonClient {
         repo: String,
         id: Option<String>,
     ) -> Result<Value, String> {
-        let op = crate::github::ReadOp::from_request(crate::github::ReadRequest {
+        let op = github::ReadOp::from_request(github::ReadRequest {
             operation,
             repo,
             id,
         })?;
-        self.github_request(&crate::github::Op::Read(op)).await
+        self.github_request(&github::Op::Read(op)).await
     }
 
     /// Asks GitHub for something that changes it.
@@ -1206,9 +1207,9 @@ impl DaemonClient {
     /// The answer says which of two things happened — `ran`, or `filed_for_approval` with the number
     /// a person will see beside it. **Neither blocks**, and the caller is meant to read the status
     /// rather than assume the first.
-    pub async fn github_act(&self, request: crate::github::ActRequest) -> Result<Value, String> {
-        let op = crate::github::ActOp::from_request(request)?;
-        self.github_request(&crate::github::Op::Act(op)).await
+    pub async fn github_act(&self, request: github::ActRequest) -> Result<Value, String> {
+        let op = github::ActOp::from_request(request)?;
+        self.github_request(&github::Op::Act(op)).await
     }
 
     /// The one request both halves make.
@@ -1217,7 +1218,7 @@ impl DaemonClient {
     /// `(StatusCode, String)`), unlike `/vcs/requests` where the status IS the message — so the body
     /// is read first and the status is only the fallback. Told "no github token is stored", a caller
     /// knows what to do; told "403", it guesses.
-    async fn github_request(&self, op: &crate::github::Op) -> Result<Value, String> {
+    async fn github_request(&self, op: &github::Op) -> Result<Value, String> {
         let response = self
             .request(reqwest::Method::POST, "/github/requests")
             .json(&serde_json::json!({ "op": op }))
@@ -1410,7 +1411,7 @@ const REFUSAL_DETAIL_LIMIT: usize = 300;
 #[derive(Serialize)]
 pub struct VcsSubmitBody {
     pub project_id: String,
-    pub operation: crate::vcs::Op,
+    pub operation: crate::execution::vcs::Op,
 }
 
 /// PURE: the body for one queue submission, or why the request is not one.
@@ -1422,7 +1423,7 @@ pub fn vcs_submit_body(
 ) -> Result<VcsSubmitBody, String> {
     Ok(VcsSubmitBody {
         project_id: project_id.to_owned(),
-        operation: crate::vcs::Op::from_request(operation, source, target)?,
+        operation: crate::execution::vcs::Op::from_request(operation, source, target)?,
     })
 }
 
@@ -1620,7 +1621,7 @@ mod tests {
             "shadow"
         );
         // The job path refuses it, and says which state it found.
-        let refusal = crate::job::resolve_start(&projects, "shadow-project")
+        let refusal = crate::execution::job::resolve_start(&projects, "shadow-project")
             .expect_err("a job must not be accepted for a plan-only project");
         assert!(refusal.reason("shadow-project").contains("shadow"));
 
@@ -1628,14 +1629,14 @@ mod tests {
         // the thing that lets one through.
         assert!(resolve_run_request(&projects, "nao-existe", "x").is_err());
         assert_eq!(
-            crate::job::resolve_start(&projects, "nao-existe"),
-            Err(crate::job::StartRefusal::UnknownProject)
+            crate::execution::job::resolve_start(&projects, "nao-existe"),
+            Err(crate::execution::job::StartRefusal::UnknownProject)
         );
 
         // And the one that must still work, without which the assertions above pass by refusing
         // everything.
         assert_eq!(
-            crate::job::resolve_start(&projects, "live-project")
+            crate::execution::job::resolve_start(&projects, "live-project")
                 .unwrap()
                 .project_root,
             "C:/projects/live"

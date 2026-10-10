@@ -44,10 +44,10 @@ const SWEEP_BATCH: i64 = 64;
 const FINAL_ITEM_STATUSES: [&str; 7] = [
     "passed",
     "failed",
-    crate::job::STATUS_CANCELLED,
+    crate::execution::job::STATUS_CANCELLED,
     "gate_errored",
-    crate::job::STATUS_SKIPPED,
-    crate::job::STATUS_SUPERSEDED,
+    crate::execution::job::STATUS_SKIPPED,
+    crate::execution::job::STATUS_SUPERSEDED,
     "orphaned",
 ];
 
@@ -61,7 +61,7 @@ const UNTRACED_MODES: [&str; 4] = [
     "assistant",
     crate::council::COUNCIL_MODE,
     crate::team::TEAM_MODE,
-    crate::email::TRIAGE_MODE,
+    crate::integrations::email::TRIAGE_MODE,
 ];
 
 /// The trace window, overridable independently from the other hourly retention sweeps.
@@ -460,7 +460,7 @@ pub fn run_verdict(
     exit_code: Option<i64>,
     gate_status: Option<&str>,
 ) -> Option<Verdict> {
-    if !crate::runs::TERMINAL_RUN_STATUSES.contains(&status) {
+    if !crate::execution::runs::TERMINAL_RUN_STATUSES.contains(&status) {
         return None;
     }
     Some(match gate_status {
@@ -477,12 +477,12 @@ pub fn run_verdict(
 
 /// Map an item state and its stored gate/run evidence to a final verdict.
 pub fn item_verdict(
-    state: crate::job::ItemState,
+    state: crate::execution::job::ItemState,
     gate_status: Option<&str>,
     job_ended: bool,
     run: Option<(&str, Option<i64>)>,
 ) -> Option<Verdict> {
-    use crate::job::ItemState;
+    use crate::execution::job::ItemState;
 
     let run_without_gate = || {
         run.and_then(|(status, exit_code)| run_verdict(status, exit_code, None))
@@ -664,8 +664,8 @@ async fn credit_item_by_id(pool: &SqlitePool, item_id: i64) -> sqlx::Result<u64>
         }
         None => None,
     };
-    let state = crate::job::item_state_from(&status, attempts, retries);
-    let job_ended = crate::job::TERMINAL_STATUSES.contains(&job_status.as_str());
+    let state = crate::execution::job::item_state_from(&status, attempts, retries);
+    let job_ended = crate::execution::job::TERMINAL_STATUSES.contains(&job_status.as_str());
     let verdict = item_verdict(
         state,
         gate_status.as_deref(),
@@ -728,7 +728,8 @@ pub async fn credit_run(pool: &SqlitePool, run_id: i64) -> sqlx::Result<u64> {
 /// take a slot until that tail ends, when `credit_run` follows the chain and credits it.
 async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
     let final_item_placeholders = vec!["?"; FINAL_ITEM_STATUSES.len()].join(", ");
-    let terminal_job_placeholders = vec!["?"; crate::job::TERMINAL_STATUSES.len()].join(", ");
+    let terminal_job_placeholders =
+        vec!["?"; crate::execution::job::TERMINAL_STATUSES.len()].join(", ");
     let mut item_query = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT DISTINCT rk.item_id
            FROM run_knowledge rk
@@ -745,7 +746,7 @@ async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
     for status in FINAL_ITEM_STATUSES {
         item_query = item_query.bind(status);
     }
-    for status in crate::job::TERMINAL_STATUSES {
+    for status in crate::execution::job::TERMINAL_STATUSES {
         item_query = item_query.bind(status);
     }
     let item_ids: Vec<i64> = item_query.bind(batch).fetch_all(pool).await?;
@@ -759,7 +760,8 @@ async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
         }
     }
 
-    let terminal_run_placeholders = vec!["?"; crate::runs::TERMINAL_RUN_STATUSES.len()].join(", ");
+    let terminal_run_placeholders =
+        vec!["?"; crate::execution::runs::TERMINAL_RUN_STATUSES.len()].join(", ");
     let mut run_query = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT DISTINCT rk.run_id
            FROM run_knowledge rk
@@ -771,7 +773,7 @@ async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
           ORDER BY rk.run_id
           LIMIT ?"
     )));
-    for status in crate::runs::TERMINAL_RUN_STATUSES {
+    for status in crate::execution::runs::TERMINAL_RUN_STATUSES {
         run_query = run_query.bind(status);
     }
     let run_ids: Vec<i64> = run_query.bind(batch).fetch_all(pool).await?;
@@ -802,20 +804,20 @@ mod tests {
         SWEEP_BATCH, Verdict, credit_item, credit_run, fts_ranks, item_verdict, match_expression,
         normalise_fts, of, prune, record, run_verdict, sweep, sweep_at_most, trace_of,
     };
-    use crate::job::ItemState;
+    use crate::execution::job::ItemState;
     use crate::knowledge::{Context, Scope, Scored};
 
     const BRIEFED_CONTEXTS: &[&str] = &[
         "assistant.rs",
         "council.rs",
         "http.rs",
-        "job.rs",
+        "execution/job.rs",
         "loadout.rs",
-        "runs.rs",
+        "execution/runs.rs",
         "team.rs",
     ];
     const UNBRIEFED_LAUNCHERS: &[(&str, &str)] = &[(
-        "map_intent.rs",
+        "map/intent.rs",
         "map derivation is deliberately unbriefed because it creates the map that later scopes briefing",
     )];
 
@@ -1703,8 +1705,9 @@ mod tests {
                     record(&pool, run_id, Some(item_id), &[scored(knowledge_id, true)]).await?;
                     all.insert(item_id);
 
-                    let state = crate::job::item_state_from(status, gate_attempts, gate_retries);
-                    let job_ended = crate::job::TERMINAL_STATUSES.contains(&job_status);
+                    let state =
+                        crate::execution::job::item_state_from(status, gate_attempts, gate_retries);
+                    let job_ended = crate::execution::job::TERMINAL_STATUSES.contains(&job_status);
                     if item_verdict(state, None, job_ended, None).is_some() {
                         expected.insert(item_id);
                     }
@@ -2000,7 +2003,7 @@ mod tests {
     /// `BRIEFED_CONTEXTS` is a constant: this test fails the day a new context appears outside
     /// it. It is a list rather than discovery because the limits below make discovery incomplete.
     ///
-    /// Launches do have a marker, `crate::runner::RunRequest {`, so this scan can find them. The
+    /// Launches do have a marker, `crate::execution::runner::RunRequest {`, so this scan can find them. The
     /// append channel has no marker at all because it is ordinary `String` concatenation. The
     /// house gives that channel a marker by making `brief` the only module that produces the block:
     /// only `brief.rs` calls `knowledge::select`, and only `knowledge.rs` writes `PREAMBLE`. Without
@@ -2011,8 +2014,8 @@ mod tests {
     /// team's `local_agent::run_turn` branch, and `assistant::spawn_local_turn`: they
     /// build prompts and are deliberately not briefed. (b) It reads only `core/src/*.rs`, not
     /// subdirectories or other crates such as `shell/src-tauri` and `sidecars/`. (c) A launcher that
-    /// does not spell `crate::runner::RunRequest {` (for example, imported `RunRequest {` or a
-    /// builder) is invisible. (d) `map_seam.rs` is the nearest relative and a warning, not a
+    /// does not spell `crate::execution::runner::RunRequest {` (for example, imported `RunRequest {` or a
+    /// builder) is invisible. (d) `map/seam.rs` is the nearest relative and a warning, not a
     /// precedent: it enforces the inverse direction. It derives `Seam::uncalled` on every read but
     /// never asserts it, because "Served routes no call here reaches -- and no screen is not
     /// nothing." A static scan does not see who calls over HTTP.
@@ -2030,14 +2033,12 @@ mod tests {
             running_in.display(),
         );
 
-        let mut sources = crate::source_scan::top_level_rust_files()
+        // Every file at any depth, named by its path from its root (`runs.rs`, `council/store.rs`):
+        // a context built inside a module folder is as much a context as one at the top.
+        let mut sources = crate::source_scan::rust_files()
             .into_iter()
             .map(|path| {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .expect("core source file names must be UTF-8")
-                    .to_owned();
+                let name = crate::source_scan::module_path(&path);
                 let source = fs::read_to_string(&path).expect("core source file must be readable");
                 let source = source.replace("\r\n", "\n");
                 let production = source
@@ -2076,7 +2077,7 @@ mod tests {
 
         let launchers = sources
             .iter()
-            .filter(|(_, source)| source.contains("crate::runner::RunRequest {"))
+            .filter(|(_, source)| source.contains("crate::execution::runner::RunRequest {"))
             .map(|(name, _)| name.clone())
             .collect::<BTreeSet<_>>();
         let unbriefed = UNBRIEFED_LAUNCHERS

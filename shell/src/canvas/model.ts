@@ -174,7 +174,7 @@ export function noExceptions(): Exceptions {
  *
  * Four rungs, in the order the headline says them. A fault — a leaked slot, two trees measured
  * writing the same file — outranks an item put down on a merge conflict, which is not a fault
- * (`core/src/job.rs`, `ItemState::Conflicted`: "a conflict is a question about two pieces of
+ * (`core/src/execution/job.rs`, `ItemState::Conflicted`: "a conflict is a question about two pieces of
  * work, not a verdict on either") but is work that stopped; that outranks a job waiting on a
  * person, which outranks a job a rule is holding back. Nothing at all is last.
  */

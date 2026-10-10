@@ -8,7 +8,7 @@
 //! uses the `.ai` workflow is none of its business. What activation actually needs to know is that
 //! a PERSON brought the project in: looked at what is in it, confirmed which command decides
 //! *green*, and had the classifier hook installed. That is a decision, so it is recorded, as
-//! [`MARKER_FILE`] in the project's state directory (`project_state.rs`), keyed by `project_id` and
+//! [`MARKER_FILE`] in the project's state directory (`project/state.rs`), keyed by `project_id` and
 //! found the same way from every worktree of the project.
 //!
 //! # What onboarding does, in order
@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// The marker's name, in the project's state directory. Named once, in `project_state.rs`.
-pub const MARKER_FILE: &str = crate::project_state::ONBOARDED_FILE;
+/// The marker's name, in the project's state directory. Named once, in `project/state.rs`.
+pub const MARKER_FILE: &str = crate::project::state::ONBOARDED_FILE;
 
 /// What "onboarded" meant before the marker existed, relative to the project root. Read by
 /// [`migrate_legacy`] and nothing else, so no project that was activatable yesterday stops being so.
@@ -107,7 +107,7 @@ impl std::fmt::Display for OnboardError {
 /// An unreadable marker is "not onboarded" rather than an error: onboarding again is idempotent and
 /// rewrites it, which is the one repair anybody needs.
 pub fn read_marker(machine_root: Option<&Path>, project_id: &str) -> Option<Marker> {
-    let path = crate::project_state::file(machine_root, project_id, MARKER_FILE)?;
+    let path = crate::project::state::file(machine_root, project_id, MARKER_FILE)?;
     let text = std::fs::read_to_string(path).ok()?;
     serde_yaml::from_str(&text).ok()
 }
@@ -201,8 +201,8 @@ pub fn onboard(
     gate_command: Option<&str>,
     now: &str,
 ) -> Result<Marker, OnboardError> {
-    let dir = crate::project_state::dir(machine_root, project_id).ok_or(OnboardError::BadId)?;
-    let rules_path = dir.join(crate::project_state::AUTOPILOT_FILE);
+    let dir = crate::project::state::dir(machine_root, project_id).ok_or(OnboardError::BadId)?;
+    let rules_path = dir.join(crate::project::state::AUTOPILOT_FILE);
 
     let rules = match gate_command {
         Some(command) => {
@@ -215,9 +215,9 @@ pub fn onboard(
             crate::config::parse_schedule_rules(&existing).map_err(|error| {
                 OnboardError::Rules(format!(
                     "{} is unreadable ({error}); fix it before onboarding sets a gate in it",
-                    crate::project_state::display_path(
+                    crate::project::state::display_path(
                         project_id,
-                        crate::project_state::AUTOPILOT_FILE
+                        crate::project::state::AUTOPILOT_FILE
                     )
                 ))
             })?;
@@ -232,10 +232,10 @@ pub fn onboard(
         .map(|harness| harness.path)
         .collect();
 
-    crate::autopilot::wire_classifier_hook(project_root).map_err(OnboardError::Hook)?;
+    crate::governance::autopilot::wire_classifier_hook(project_root).map_err(OnboardError::Hook)?;
 
     if let Some(text) = rules {
-        crate::project_state::write_atomically(&rules_path, &text).map_err(OnboardError::Io)?;
+        crate::project::state::write_atomically(&rules_path, &text).map_err(OnboardError::Io)?;
     }
 
     let marker = Marker {
@@ -246,7 +246,7 @@ pub fn onboard(
         hook_installed: true,
         migrated: false,
     };
-    crate::project_state::write_atomically(
+    crate::project::state::write_atomically(
         &dir.join(MARKER_FILE),
         &render(&marker).map_err(OnboardError::Io)?,
     )
@@ -260,7 +260,7 @@ pub fn onboard(
 /// `.ai/workflow/workflow.md` — and has no marker yet. Returns the ids it wrote one for.
 ///
 /// So that nobody loses autopilot on update: a project that could be activated yesterday can be
-/// today, without anybody having to onboard it again. The rules are [`crate::project_state::
+/// today, without anybody having to onboard it again. The rules are [`crate::project::state::
 /// migrate_legacy`]'s: never over an existing marker (opened `create_new`, so that holds even
 /// against the route racing this), the old file is only read, and a failure is logged and skipped,
 /// project by project — such a project simply reads as not onboarded until somebody onboards it.
@@ -277,7 +277,7 @@ pub fn migrate_legacy(
         if !project_root.join(LEGACY_MARKER).is_file() {
             continue;
         }
-        let Some(dir) = crate::project_state::dir(machine_root, project_id) else {
+        let Some(dir) = crate::project::state::dir(machine_root, project_id) else {
             tracing::warn!(
                 project_id = %project_id,
                 "this project's id cannot name a directory, so it was not marked onboarded and \
@@ -310,7 +310,7 @@ pub fn migrate_legacy(
             Ok(()) => {
                 tracing::info!(
                     project_id = %project_id,
-                    to = %crate::project_state::display_path(project_id, MARKER_FILE),
+                    to = %crate::project::state::display_path(project_id, MARKER_FILE),
                     "marked a project onboarded because it had .ai/workflow/workflow.md, which is \
                      what onboarded meant before the marker"
                 );
@@ -340,7 +340,7 @@ mod tests {
     fn rules_path(home: &Path, id: &str) -> PathBuf {
         home.join("projects")
             .join(id)
-            .join(crate::project_state::AUTOPILOT_FILE)
+            .join(crate::project::state::AUTOPILOT_FILE)
     }
 
     /// No marker, or one that is not a marker, is "not onboarded" — never an error.
@@ -349,7 +349,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         assert!(!is_onboarded(Some(home.path()), "alpha"));
         assert!(!is_onboarded(None, "alpha"));
-        crate::project_state::write_for_test(home.path(), "alpha", MARKER_FILE, "[not a marker");
+        crate::project::state::write_for_test(home.path(), "alpha", MARKER_FILE, "[not a marker");
         assert!(!is_onboarded(Some(home.path()), "alpha"));
     }
 
@@ -412,7 +412,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(crate::autopilot::classifier_hook_is_wired(project.path()));
+        assert!(crate::governance::autopilot::classifier_hook_is_wired(
+            project.path()
+        ));
         assert_eq!(marker.harnesses, vec![".claude".to_string()]);
         assert!(marker.hook_installed && !marker.migrated);
         assert_eq!(read_marker(Some(home.path()), "alpha"), Some(marker));

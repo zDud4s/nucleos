@@ -642,7 +642,7 @@ pub async fn observe_run(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<(
         //
         // Logged rather than propagated: a `?` here would abandon every signal after this one for
         // this run, and the streaks they were about to record with it.
-        if let Err(error) = crate::notify::deliver_or_defer(
+        if let Err(error) = crate::integrations::notify::deliver_or_defer(
             pool,
             FEED_KIND,
             &summarise(signal, &measures, &baseline, streak),

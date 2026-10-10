@@ -12,7 +12,7 @@
  * implementations of one wire format drift, and the transcript is the thing that would quietly differ.
  */
 
-/** What `core/src/voice.rs` sizes its body limit against, and what whisper wants. */
+/** What `core/src/integrations/voice.rs` sizes its body limit against, and what whisper wants. */
 export const TARGET_SAMPLE_RATE = 16000;
 
 /**

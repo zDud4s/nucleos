@@ -13,7 +13,7 @@ import { POLL } from "./poll";
  * design §6.16's mistake. `content_md` under `trust: "quarantined"` is the
  * local model's own rendered prose: a literal banner line, a blank line, the
  * summary, then optional `- `-prefixed fact bullets, all as ONE string
- * (`core/src/web.rs:353-450,616-620`). There is no `quotes` field anywhere.
+ * (`core/src/integrations/web.rs:353-450,616-620`). There is no `quotes` field anywhere.
  * Every reader of `content_md` renders it as plain text with a badge beside
  * it — never parsed apart, never `dangerouslySetInnerHTML` — because the
  * banner and the bullets are exactly as trustworthy as the rest of it: a
