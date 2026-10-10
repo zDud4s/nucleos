@@ -1,8 +1,8 @@
 //! `nucleos-core --verify`: the command-line client of covered verification (F3-14).
 //!
 //! Run from inside a worktree, it asks the RUNNING daemon to verify that worktree
-//! (`POST /verify` with `kind: test, scope: scope, cover: true, wait: true`), follows the ticket
-//! through `/verify/status` up to a wait limit, prints one line per unit (plus the tail of every
+//! (`POST /verify` with `kind: test, scope: scope, cover: true, wait: false`, so the ticket id comes
+//! back at once), follows the ticket through `/verify/status` up to a wait limit, prints one line per unit (plus the tail of every
 //! red unit) and turns the verdict into an exit code. The daemon does the work; this is the thin
 //! client that makes it reachable from a shell, a hook or a script, so the logic of "ask, follow,
 //! render, map" lives here, testable against an in-process server, and `main.rs` only gathers the
@@ -560,7 +560,7 @@ mod tests {
                 "scope": "scope",
                 "worktree": WORKTREE,
                 "cover": true,
-                "wait": true,
+                "wait": false,
             })],
             "the one submission is a covered scope test of the given worktree, and the client \
              sends no files and no base"

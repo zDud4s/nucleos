@@ -549,13 +549,23 @@ async fn main() {
     // the wait is bounded (`--verify-wait`, `NUCLEOS_VERIFY_WAIT`, an hour by default) and a ticket
     // that outlives it exits 3 with its id. All the logic lives in `verify_cli`, tested against an
     // in-process server; this block gathers the token, the cwd and the arguments, prints, exits.
-    // It never starts a daemon. The guard is an exact match so `--verify-wait` is not a trigger.
-    if std::env::args().any(|a| a == "--verify") {
+    // It never starts a daemon. The guard matches `--verify` and every `--verify-*` spelling, the
+    // same bug class as the `--land=` note above: `--verify-wait 30` without `--verify` used to
+    // fall past this block and every other one, and start a daemon. Without `--verify` itself
+    // the arguments are a usage error, answered with the usage and exit 4, contacting nothing.
+    if std::env::args().any(|a| a == "--verify" || a.starts_with("--verify-")) {
         use std::io::Write;
         let args: Vec<String> = std::env::args().collect();
         if args.iter().any(|a| a == "--help") {
             println!("{}", verify_cli::USAGE);
             return;
+        }
+        if !args.iter().any(|a| a == "--verify") {
+            eprintln!(
+                "not verified: --verify-* needs --verify\n\n{}",
+                verify_cli::USAGE
+            );
+            std::process::exit(verify_cli::EXIT_NOT_VERIFIED);
         }
         let env_wait = std::env::var("NUCLEOS_VERIFY_WAIT").ok();
         let limit = match verify_cli::wait_limit(&args, env_wait.as_deref()) {
