@@ -2650,9 +2650,41 @@ pub struct LocalToolBox {
     /// all of it kept in step by hand. What differs between a chat and a seat is exactly one list,
     /// so exactly one list is what varies.
     allowed: &'static [&'static str],
+    /// The loadout-driven doors (`BOX_ONLY_TOOLS`) this box offers on top of `allowed`. Empty
+    /// unless `with_loadout` found the run's resolved tools listing them.
+    ///
+    /// A separate field because `allowed` is a compile-time list shared by every run of one kind,
+    /// where whether THIS run holds `read_context` or `request_tool` is the run's own
+    /// `run_loadout` row. Names are `'static` because they are picked out of `BOX_ONLY_TOOLS`, never
+    /// taken from the loadout's strings.
+    granted: Vec<&'static str>,
 }
 
 impl LocalToolBox {
+    /// Whether this box advertises and will dispatch one name: the list it was built with, or a
+    /// loadout door it was granted.
+    fn offers(&self, name: &str) -> bool {
+        self.allowed.contains(&name) || self.granted.contains(&name)
+    }
+
+    /// Offers the loadout doors (`BOX_ONLY_TOOLS`: `read_context`, `request_tool`) that `tools`, the
+    /// run's resolved loadout, lists, and no others.
+    ///
+    /// This is the local twin of the Team box, which serves a loadout tool only while the run's
+    /// `run_loadout` row lists it. Only `BOX_ONLY_TOOLS` can be granted this way: the rest of the
+    /// team surface stays the fixed `TEAM_TOOLS`, whose members were graded one by one for a path
+    /// that never passes `hooks.rs`. The daemon admits both doors by that same row on its side
+    /// (`auth::loadout_admits`), so a name offered here and absent from the row would be refused
+    /// there as well.
+    pub fn with_loadout(mut self, tools: &[String]) -> Self {
+        self.granted = BOX_ONLY_TOOLS
+            .iter()
+            .copied()
+            .filter(|door| tools.iter().any(|listed| listed == door))
+            .collect();
+        self
+    }
+
     /// Whether a tool that starts work may run.
     ///
     /// This is a precondition in the daemon and not an instruction in the prompt, and the
@@ -2721,6 +2753,7 @@ impl LocalToolBox {
         Self {
             pool: pool.clone(),
             allowed: TEAM_TOOLS,
+            granted: Vec::new(),
             tools: NucleosTools::for_box(
                 crate::daemon_client::DaemonClient::as_run(base_url, token, run_id),
                 McpBox::All,
@@ -2737,6 +2770,7 @@ impl LocalToolBox {
         Self {
             pool,
             allowed,
+            granted: Vec::new(),
             tools: NucleosTools::for_box(
                 crate::daemon_client::DaemonClient::new(base_url, token),
                 McpBox::All,
@@ -2754,7 +2788,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
         NucleosTools::tool_router()
             .list_all()
             .into_iter()
-            .filter(|tool| self.allowed.contains(&tool.name.as_ref()))
+            .filter(|tool| self.offers(tool.name.as_ref()))
             .map(|tool| {
                 serde_json::json!({
                     "type": "function",
@@ -2773,6 +2807,7 @@ impl crate::local_agent::ToolBox for LocalToolBox {
             tools: NucleosTools::for_box(self.tools.client.for_run(run_id), McpBox::All),
             pool: self.pool.clone(),
             allowed: self.allowed,
+            granted: self.granted.clone(),
         }))
     }
 
@@ -2788,9 +2823,9 @@ impl crate::local_agent::ToolBox for LocalToolBox {
         arguments: &serde_json::Value,
     ) -> crate::local_agent::ToolAnswer {
         // A name outside the offered set is refused here rather than dispatched, because the model
-        // is the only thing that chose it: `self.allowed` is what was advertised, and anything else
+        // is the only thing that chose it: `self.offers` is what was advertised, and anything else
         // is a hallucinated name or a tool this turn was deliberately not given.
-        if !self.allowed.contains(&name) {
+        if !self.offers(name) {
             return crate::local_agent::ToolAnswer::own(error_json(format!(
                 "{name} is not a tool this conversation can use"
             )));
@@ -2894,6 +2929,21 @@ impl crate::local_agent::ToolBox for LocalToolBox {
                     .await
             }
             "web_read" => self.tools.web_read(Parameters(parsed!(UrlParams))).await,
+            // The two loadout doors, reachable only through `granted`. Both go over the same
+            // loopback route as the MCP box, as this run (`RUN_ID_HEADER`), so the daemon decides
+            // the scope: `read_context` opens only the refs of the run's own loadout, and
+            // `request_tool` files a request for the run's own agent. `read_context` grades
+            // `ReadsUntrusted`, so `effect` above already fenced it and marks the turn tainted.
+            "read_context" => {
+                self.tools
+                    .read_context(Parameters(parsed!(PathParams)))
+                    .await
+            }
+            "request_tool" => {
+                self.tools
+                    .request_tool(Parameters(parsed!(RequestToolParams)))
+                    .await
+            }
             "vcs_ticket" => {
                 self.tools
                     .vcs_ticket(Parameters(parsed!(VcsTicketParams)))
@@ -4467,6 +4517,165 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The names a local box advertises, read from its schemas the way a model reads them.
+    fn offered_names(toolbox: &LocalToolBox) -> Vec<String> {
+        use crate::local_agent::ToolBox;
+
+        toolbox
+            .schemas()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// A team agent's local box for run 1, pointed at a port nothing listens on, holding whatever
+    /// `loadout` lists.
+    async fn team_box_with(loadout: &[&str]) -> LocalToolBox {
+        let pool = crate::testdb::fresh_shared_pool().await;
+        let tools: Vec<String> = loadout.iter().map(|name| (*name).to_owned()).collect();
+        LocalToolBox::for_team(
+            "http://127.0.0.1:1".to_string(),
+            "unused".to_string(),
+            pool,
+            1,
+        )
+        .with_loadout(&tools)
+    }
+
+    /// A local team agent whose run holds `read_context` and `request_tool` is offered them, beside
+    /// the fixed team tools and without anything that acts. This is the local twin of the Team box
+    /// serving a loadout tool because the run's `run_loadout` row lists it.
+    #[tokio::test]
+    async fn a_local_team_box_offers_the_loadout_doors_its_loadout_lists() {
+        let toolbox = team_box_with(&["read_context", "request_tool", "web_read"]).await;
+        let names = offered_names(&toolbox);
+
+        for door in ["read_context", "request_tool"] {
+            assert!(names.iter().any(|name| name == door), "{door}: {names:?}");
+        }
+        for name in TEAM_TOOLS {
+            assert!(
+                names.iter().any(|offered| offered == *name),
+                "{name} left the team box: {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|name| name == "create_run"),
+            "a loadout never widens the box past its doors: {names:?}"
+        );
+        assert_eq!(names.len(), TEAM_TOOLS.len() + 2, "{names:?}");
+    }
+
+    /// With no listing, or a listing of other tools, the box is exactly what it was: the doors are
+    /// neither advertised nor dispatched.
+    #[tokio::test]
+    async fn a_local_team_box_without_the_loadout_doors_does_not_offer_them() {
+        use crate::local_agent::ToolBox;
+
+        for loadout in [&[][..], &["web_read", "get_email"][..]] {
+            let toolbox = team_box_with(loadout).await;
+            let names = offered_names(&toolbox);
+            for door in BOX_ONLY_TOOLS {
+                assert!(
+                    !names.iter().any(|name| name == *door),
+                    "{door} offered with loadout {loadout:?}"
+                );
+                let answer = toolbox
+                    .call(
+                        door,
+                        &serde_json::json!({"path": "/x", "tool": "web_read", "reason": "r"}),
+                    )
+                    .await;
+                assert!(
+                    answer
+                        .text
+                        .contains("is not a tool this conversation can use"),
+                    "{door} was dispatched with loadout {loadout:?}: {}",
+                    answer.text
+                );
+                assert!(!answer.untrusted, "{door}");
+            }
+            assert_eq!(names.len(), TEAM_TOOLS.len(), "{names:?}");
+        }
+
+        // A box that never saw a loadout at all (`for_team` alone) is the same box.
+        let pool = crate::testdb::fresh_shared_pool().await;
+        let bare = LocalToolBox::for_team(
+            "http://127.0.0.1:1".to_string(),
+            "unused".to_string(),
+            pool,
+            1,
+        );
+        assert_eq!(offered_names(&bare).len(), TEAM_TOOLS.len());
+    }
+
+    /// Each door is granted by its own name, survives `for_run`, and a granted `read_context` comes
+    /// back untrusted -- that mark is what makes the local loop taint the run, exactly as the hook
+    /// does for the Claude path. Nothing listens on the port, so a dispatched call fails to
+    /// connect, which is different from both refusals this test rules out.
+    #[tokio::test]
+    async fn a_granted_door_is_dispatched_alone_and_read_context_is_untrusted() {
+        use crate::local_agent::ToolBox;
+
+        let only_read = team_box_with(&["read_context"]).await;
+        let answer = only_read
+            .call("read_context", &serde_json::json!({"path": "/ctx/a.md"}))
+            .await;
+        assert!(answer.untrusted, "{}", answer.text);
+        assert!(
+            !answer
+                .text
+                .contains("is not a tool this conversation can use")
+        );
+        assert!(!answer.text.contains("has no local dispatch"));
+        let refused = only_read
+            .call(
+                "request_tool",
+                &serde_json::json!({"tool": "web_read", "reason": "r"}),
+            )
+            .await;
+        assert!(
+            refused
+                .text
+                .contains("is not a tool this conversation can use")
+        );
+
+        let only_request = team_box_with(&["request_tool"]).await;
+        let answer = only_request
+            .call(
+                "request_tool",
+                &serde_json::json!({"tool": "web_read", "reason": "r"}),
+            )
+            .await;
+        assert!(
+            !answer
+                .text
+                .contains("is not a tool this conversation can use")
+        );
+        assert!(!answer.text.contains("has no local dispatch"));
+        let refused = only_request
+            .call("read_context", &serde_json::json!({"path": "/ctx/a.md"}))
+            .await;
+        assert!(
+            refused
+                .text
+                .contains("is not a tool this conversation can use")
+        );
+
+        // `for_run` rebuilds the box for a node; the grant must go with it.
+        let rebuilt = only_read.for_run(7).expect("a team box rebuilds for a run");
+        let names: Vec<String> = rebuilt
+            .schemas()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str().map(str::to_owned))
+            .collect();
+        assert!(names.iter().any(|name| name == "read_context"), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name == "request_tool"),
+            "{names:?}"
+        );
     }
 
     /// The two exclusions that were decided rather than defaulted, pinned so removing either is a
