@@ -30,6 +30,7 @@ import {
   roundsOf,
   type CourtDraft,
 } from "./council/court-draft";
+import { chairsOf, rememberChairs } from "./council/court-chairs";
 import { buildSessionCourt, buildSetupCourt, liveMoment, momentKey, processLine } from "./council/court-model";
 import {
   Button,
@@ -200,6 +201,7 @@ function CourtSetup() {
     create.mutate(requestFrom(question, draft, pickedRounds, config), {
       onSuccess: (result) => {
         setQuestion("");
+        rememberChairs(result.id, draft);
         void navigate({ to: `/council/${result.id}` });
       },
     });
@@ -376,7 +378,7 @@ function CouncilSession({ id, detail }: { id: string; detail: CouncilView }) {
   const picked = viewing === "live" ? undefined : phases.find((phase) => phase.key === viewing);
   const at = picked ?? "live";
   const moment = picked ?? liveMoment(detail);
-  const court = buildSessionCourt(detail, at);
+  const court = buildSessionCourt(detail, at, chairsOf(id));
 
   // Follow live: whoever is speaking, or the bench while the chair writes.
   const speaking = court.seats.find((seat) => seat.state === "speaking");

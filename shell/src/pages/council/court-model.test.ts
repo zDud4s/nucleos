@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Agreement, CouncilConfig, CouncilView, SeatView, StepView, Synthesis } from "../../data/council";
 import * as court from "./court-model";
+import { chairsOf, rememberChairs } from "./court-chairs";
 import { draftFromConfig, release } from "./court-draft";
 
 /* ------------------------------------------------------------ fixtures -- */
@@ -303,6 +304,27 @@ describe("the session court", () => {
     expect(c.seats[0].x).toBeLessThan(280);
     expect(c.seats[1].x).toBeGreaterThan(280);
     expect(c.seats[0].sublabel).toBe("skeptic");
+  });
+
+  it("settles each seat in from the setup chair it occupied, gaps and all", () => {
+    const three = view({ seats: [0, 1, 2].map((i) => seat({ seat_idx: i, ref: `m${i}`, steps: [step()] })) });
+    const c = court.buildSessionCourt(three, "live", [0, 2, 5]);
+    expect(c.seats.map((s) => s.from)).toEqual([0, 2, 5].map((chair) => court.pointAt(court.setupAngle(chair))));
+  });
+
+  it("remembers the occupied chairs of the draft a council was convened from", () => {
+    const d = draftFromConfig(null);
+    const o = { seat: null, name: "x" };
+    d.chairs[0] = o; d.chairs[2] = o; d.chairs[5] = o;
+    rememberChairs("c-1", d);
+    expect(chairsOf("c-1")).toEqual([0, 2, 5]);
+    expect(chairsOf("c-2")).toBeUndefined();
+  });
+
+  it("falls back to the compact chairs when the setup layout is unknown or does not fit", () => {
+    const compact = [0, 1].map((chair) => court.pointAt(court.setupAngle(chair)));
+    expect(court.buildSessionCourt(running, "live").seats.map((s) => s.from)).toEqual(compact);
+    expect(court.buildSessionCourt(running, "live", [4]).seats.map((s) => s.from)).toEqual(compact);
   });
 
   it("counts the ballots of the round's critique", () => {

@@ -18,6 +18,7 @@ import {
 // `court-constants.ts` holds `MAX_COUNCIL_SEATS = 8` (`config::MAX_COUNCIL_SEATS`) on its own,
 // because `court-draft.ts` needs it and imports from this file's neighbourhood.
 import { MAX_COUNCIL_SEATS } from "./court-constants";
+import { fitsRoom } from "./court-chairs";
 import { ceilingLine, occupiedCount, type CourtDraft } from "./court-draft";
 
 export { MAX_COUNCIL_SEATS };
@@ -361,12 +362,19 @@ function stepAt(seat: SeatView, m: Moment): StepView | undefined {
   return seat.steps.find((s) => s.round === m.round && s.phase === m.phase);
 }
 
-export function buildSessionCourt(view: CouncilView, at: Moment | "live"): Court {
+/**
+ * `chairs` is the setup chair of each member, in seat order, when the council was
+ * convened from the setup room (see `court-chairs.ts`); a seat then settles in
+ * from the chair it occupied. Without it, or if it does not fit, the n seats
+ * settle in from the first n chairs.
+ */
+export function buildSessionCourt(view: CouncilView, at: Moment | "live", chairs?: number[]): Court {
   const live = liveMoment(view);
   const m = at === "live" ? live : at;
   const stalledHere = sameMoment(m, live);
   const seats = [...view.seats].sort((a, b) => a.seat_idx - b.seat_idx);
   const n = seats.length;
+  const origin = chairs !== undefined && fitsRoom(chairs, n) ? chairs : null;
   const letters: Record<number, string> = Object.fromEntries(
     Object.entries(view.anon_map).map(([letter, idx]) => [idx, letter]),
   );
@@ -392,7 +400,7 @@ export function buildSessionCourt(view: CouncilView, at: Moment | "live"): Court
       dissent: dissent.has(seat.seat_idx),
       runId: step?.run_id ?? null,
       step,
-      from: pointAt(setupAngle(i)),
+      from: pointAt(setupAngle(origin === null ? i : origin[i])),
     };
   });
 
