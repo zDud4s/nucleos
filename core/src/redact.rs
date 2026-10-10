@@ -1335,10 +1335,10 @@ A fatura de julho segue em anexo.\n\n\
             "prompt_text",
         ];
 
-        // The top-level files of every source root: the core's own `src/` and, once modules move
-        // out of it, the `src/` of each crate under `core/crates/`.
-        for path in crate::source_scan::top_level_rust_files() {
-            if path.file_name().and_then(|name| name.to_str()) == Some("redact.rs") {
+        // Every file of every source root, at any depth: the core's own `src/`, its module folders
+        // (`council/`, `judge/`) and the `src/` of each crate under `core/crates/`.
+        for path in crate::source_scan::rust_files() {
+            if crate::source_scan::module_path(&path) == "redact.rs" {
                 continue;
             }
 

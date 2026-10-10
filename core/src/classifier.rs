@@ -580,7 +580,7 @@ pub fn classify(
     tool_input: &Value,
     cwd: Option<&Path>,
     policy: &crate::github::Policy,
-    rules: &crate::project_policy::ShellRules,
+    rules: &crate::project::policy::ShellRules,
     unrecognized: Unrecognized,
 ) -> Classification {
     if WRITE_TOOLS.contains(&tool_name) && writes_outside_cwd(tool_input, cwd) {
@@ -750,7 +750,7 @@ fn classify_shell_command(
     command: &str,
     cwd: Option<&Path>,
     policy: &crate::github::Policy,
-    rules: &crate::project_policy::ShellRules,
+    rules: &crate::project::policy::ShellRules,
     shell: crate::command_reader::Shell,
     unrecognized: Unrecognized,
 ) -> Classification {
@@ -1034,7 +1034,7 @@ fn classify_segment(
     segment: &str,
     cwd: Option<&Path>,
     policy: &crate::github::Policy,
-    rules: &crate::project_policy::ShellRules,
+    rules: &crate::project::policy::ShellRules,
     shell: crate::command_reader::Shell,
     unrecognized: Unrecognized,
 ) -> Segment {
@@ -2015,7 +2015,7 @@ const HOME_SPELLINGS: &[&str] = &["~/", "$home/", "${home}/", "%userprofile%/", 
 /// activation requires) and `materialized.yaml` with its per-worktree siblings under
 /// `materialized/` (what the app last wrote of a workflow into a checkout, and so which of those
 /// files it may overwrite) live in `~/.nucleos/projects/<id>/`
-/// (`project_state.rs`). The home spelling is covered by the first answer above; the absolute one
+/// (`project/state.rs`). The home spelling is covered by the first answer above; the absolute one
 /// is matched here as `.nucleos/projects/<any id>/<file>`, which a job worktree
 /// (`.nucleos/worktrees/...`) never is. The old `.ai/workflows.yaml` is guarded for the reason the
 /// old settings files are: startup copies it into a project's state directory when that has none.
@@ -2041,7 +2041,7 @@ fn names_machine_settings(raw: &str) -> bool {
 /// [`names_machine_settings`].
 fn names_project_state(normalized: &str) -> bool {
     let parts: Vec<&str> = normalized.split('/').collect();
-    let in_state_dir = crate::project_state::ALL_FILES.iter().any(|file| {
+    let in_state_dir = crate::project::state::ALL_FILES.iter().any(|file| {
         matches!(
             parts.as_slice(),
             [.., ".nucleos", "projects", id, name] if !id.is_empty() && name == file
@@ -2051,14 +2051,14 @@ fn names_project_state(normalized: &str) -> bool {
         parts.as_slice(),
         [.., ".nucleos", "projects", id, dir, name]
             if !id.is_empty()
-                && *dir == crate::project_state::WORKTREE_RECORDS_DIR
+                && *dir == crate::project::state::WORKTREE_RECORDS_DIR
                 && !name.is_empty()
     );
     in_state_dir
         || worktree_record
         || path_has_suffix(
             normalized,
-            &format!(".ai/{}", crate::project_state::PINS_FILE),
+            &format!(".ai/{}", crate::project::state::PINS_FILE),
         )
 }
 
@@ -2249,7 +2249,7 @@ fn write_denied_by_project(
     tool_name: &str,
     tool_input: &Value,
     cwd: Option<&Path>,
-    rules: &crate::project_policy::ShellRules,
+    rules: &crate::project::policy::ShellRules,
 ) -> bool {
     // A project that declared no write refusals cannot enter this block at all — the same
     // structural non-regression the shell side's empty-list guard buys, and for the same reason: no
@@ -3318,7 +3318,7 @@ mod tests {
             tool_input,
             cwd,
             &crate::github::Policy::empty(),
-            &crate::project_policy::ShellRules::default(),
+            &crate::project::policy::ShellRules::default(),
             Unrecognized::AsksAPerson,
         )
     }
@@ -3330,7 +3330,7 @@ mod tests {
             &json!({ "command": command }),
             None,
             policy,
-            &crate::project_policy::ShellRules::default(),
+            &crate::project::policy::ShellRules::default(),
             Unrecognized::AsksAPerson,
         )
     }
@@ -3347,13 +3347,13 @@ mod tests {
             &json!({ "command": command }),
             cwd,
             &crate::github::Policy::empty(),
-            &crate::project_policy::ShellRules::default(),
+            &crate::project::policy::ShellRules::default(),
             Unrecognized::MayBeConfined,
         )
     }
 
-    fn shell_rules(allow: &[&str], deny: &[&str]) -> crate::project_policy::ShellRules {
-        crate::project_policy::ShellRules {
+    fn shell_rules(allow: &[&str], deny: &[&str]) -> crate::project::policy::ShellRules {
+        crate::project::policy::ShellRules {
             allow: allow.iter().map(|entry| (*entry).to_owned()).collect(),
             deny: deny.iter().map(|entry| (*entry).to_owned()).collect(),
             deny_writes: Vec::new(),
@@ -3363,8 +3363,8 @@ mod tests {
     /// The write half, built the same way and kept separate from `shell_rules` on purpose: every
     /// test that reaches the shell lists through the helper above is also an assertion that a
     /// project's command rules leave a write alone, and vice versa.
-    fn write_rules(deny_writes: &[(&str, &str)]) -> crate::project_policy::ShellRules {
-        crate::project_policy::ShellRules {
+    fn write_rules(deny_writes: &[(&str, &str)]) -> crate::project::policy::ShellRules {
+        crate::project::policy::ShellRules {
             deny_writes: deny_writes
                 .iter()
                 .map(|(tool, prefix)| ((*tool).to_owned(), (*prefix).to_owned()))
@@ -3376,7 +3376,7 @@ mod tests {
     /// The shape for the tests that are about a project's write refusals: a real workspace, because
     /// a relative prefix means nothing without one.
     fn classify_writes(
-        rules: &crate::project_policy::ShellRules,
+        rules: &crate::project::policy::ShellRules,
         tool_name: &str,
         file_path: &str,
         cwd: Option<&Path>,
@@ -3393,7 +3393,7 @@ mod tests {
 
     /// The shape for the tests that are about a project's own two lists.
     fn classify_with_rules(
-        rules: &crate::project_policy::ShellRules,
+        rules: &crate::project::policy::ShellRules,
         command: &str,
     ) -> Classification {
         super::classify(
@@ -6909,7 +6909,7 @@ mod tests {
     /// predicted from reading it.
     #[test]
     fn a_project_that_declared_nothing_changes_no_verdict() {
-        let nothing = crate::project_policy::ShellRules::default();
+        let nothing = crate::project::policy::ShellRules::default();
         for (command, decision, action_class) in [
             ("ls", "allow", "read-local"),
             ("cargo test", "allow", "read-local"),
@@ -7298,7 +7298,7 @@ mod tests {
             &json!({ "command": format!("python {heavy} --prio 2 --agent a -- cargo test foo") }),
             Some(workspace),
             &policy,
-            &crate::project_policy::ShellRules::default(),
+            &crate::project::policy::ShellRules::default(),
             Unrecognized::AsksAPerson,
         );
         assert_eq!(wrapped_under.decision.decision, "allow");

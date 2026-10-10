@@ -269,7 +269,7 @@ async fn job_rows(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Vec<SpendRow>>
 
 /// What one project's runs cost over a window, for the workspace's cost reading.
 ///
-/// The third sibling of the two above, and here rather than in `project_readings.rs` for the reason
+/// The third sibling of the two above, and here rather than in `project/readings.rs` for the reason
 /// the note below already gives: what a run contributed to spend is decided in one place. A reading
 /// that computed its own total would drift from the ceiling that governs the same runs, and the two
 /// numbers disagreeing on the same screen is worse than either being slightly wrong.
@@ -285,7 +285,7 @@ pub async fn project_spend(
     project_id: &str,
     since: DateTime<Utc>,
     now: DateTime<Utc>,
-) -> sqlx::Result<crate::project_readings::Cost> {
+) -> sqlx::Result<crate::project::readings::Cost> {
     let cfg = load_budget_config(pool).await?;
     let raw: Vec<RawRow> = sqlx::query_as(
         "SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
@@ -300,7 +300,7 @@ pub async fn project_spend(
     .await?;
 
     let rows = spend_rows(raw)?;
-    Ok(crate::project_readings::Cost {
+    Ok(crate::project::readings::Cost {
         usd: compute_spend(&rows, now, &cfg)
             + judge_spend(
                 pool,

@@ -2,7 +2,7 @@
 #
 # This is a controller INPUT for `--workflow-package`, not an embedded seeded copy of the
 # workflow core: `--workflow-package` reads a project's live `.ai/`, `.claude/`, `.agents/` trees
-# and writes a bundle into the library (`workflow_package.rs`); this file is the `owns:` list that
+# and writes a bundle into the library (`workflows/package.rs`); this file is the `owns:` list that
 # packaging step ships alongside the packaged files, in the one shape `workflows.rs` parses
 # (`ManifestFile`: `description`, `origin`, `owns`, `agents_block`).
 # `name` and `version` are NOT fields in this file — they come from where the bundle sits in the
@@ -11,7 +11,7 @@
 # `owns:` is the only thing this file's `owns` list is for: the set of PROJECT files this workflow
 # claims authorship of (`ownership.rs`, `workflow_materialize::owns_entries`). It is not a listing
 # of what gets copied — the graph and this manifest are the library's own, never materialized into
-# a project (`workflow_materialize.rs` tests: `!checkout.join("graph.yaml").exists()`). A row here
+# a project (`workflows/materialize.rs` tests: `!checkout.join("graph.yaml").exists()`). A row here
 # with no trailing `/` claims exactly that file; a row ending `/` claims everything under that
 # directory (`normalise` drops the trailing slash; `owner_of` then matches the exact path or a
 # `/`-bounded prefix underneath it — both forms end up compared the same way).
@@ -68,9 +68,9 @@ origin: ai-dev-workflow-template
 
 # The managed block at the top of a project's AGENTS.md (between the `AI WORKFLOW MANAGED BLOCK`
 # markers) is this file verbatim, markers included, and only that region is written: the rest of
-# AGENTS.md is the project's own (`workflow_materialize.rs`, "The managed block in AGENTS.md").
+# AGENTS.md is the project's own (`workflows/materialize.rs`, "The managed block in AGENTS.md").
 # It must sit under an `owns:` entry and carry both markers, or packaging refuses
-# (`workflow_package.rs`) — here, under `.ai/workflow/`.
+# (`workflows/package.rs`) — here, under `.ai/workflow/`.
 agents_block: .ai/workflow/agents-block.md
 
 owns:

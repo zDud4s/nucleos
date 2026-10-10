@@ -33,7 +33,7 @@ function anchored(overrides: Partial<Anchored> = {}): Anchored {
     text: "O modelo e compressor e triador, nunca certificador.",
     kind: "character",
     anchor: "ambiguous",
-    modules: ["core/src/map_triage.rs"],
+    modules: ["core/src/map/triage.rs"],
     foreign: [],
     // Nobody has written down which files this decision's code is, which is every
     // decision on day one and the state each of these fixtures is about.

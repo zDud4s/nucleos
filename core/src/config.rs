@@ -2841,23 +2841,23 @@ impl AutopilotRules {
 
 /// A project's rules, from `~/.nucleos/projects/<project_id>/autopilot.yaml`.
 ///
-/// Keyed by the project's id and not by a folder, which is the whole of `project_state.rs`'s
+/// Keyed by the project's id and not by a folder, which is the whole of `project/state.rs`'s
 /// argument: the same file is found from the main checkout and from every worktree the daemon opens
 /// of it, and it does not move when the project's folder does. `machine_root` is
 /// `AppState::machine_config_root` in production and a temporary directory in a test.
 ///
 /// No root, or an id that cannot name a directory, reads as a project with no file — the ordinary
 /// state, answered with `AutopilotRules::default()`. The file is named once, as
-/// [`crate::project_state::AUTOPILOT_FILE`], because two things have to agree about it: this loader
+/// [`crate::project::state::AUTOPILOT_FILE`], because two things have to agree about it: this loader
 /// and `ownership.rs`, which declares it writable by the app.
 pub fn load_schedule_rules(
     machine_root: Option<&Path>,
     project_id: &str,
 ) -> std::io::Result<AutopilotRules> {
-    match crate::project_state::file(
+    match crate::project::state::file(
         machine_root,
         project_id,
-        crate::project_state::AUTOPILOT_FILE,
+        crate::project::state::AUTOPILOT_FILE,
     ) {
         Some(path) => load_schedule_rules_from(&path),
         None => Ok(AutopilotRules::default()),
@@ -2960,7 +2960,7 @@ fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
                 ));
             }
             if let Err(fault) =
-                crate::project_commands::validate(&rule.name, command, rule.cwd.as_deref())
+                crate::project::commands::validate(&rule.name, command, rule.cwd.as_deref())
             {
                 return Err(invalid(&format!("command: {fault}")));
             }

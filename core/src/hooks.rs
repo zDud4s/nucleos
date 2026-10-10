@@ -462,7 +462,7 @@ fn deny_with(reason: &str) -> Decision {
 enum ProjectRules {
     /// What the project declared — and an empty pair when there was no project to ask, or when the
     /// call is one no rule could reach. Both of those are the whole truth rather than a stand-in.
-    Declared(crate::project_policy::ShellRules),
+    Declared(crate::project::policy::ShellRules),
     /// The table would not answer. Carries NO lists, because a state that held both "unreadable"
     /// and a set of rules would be a state nothing can act on — and the struct this replaces could
     /// represent it.
@@ -484,7 +484,7 @@ enum ProjectRules {
 /// It is also why `ShellRules::deny_writes` is a `Vec` of pairs and not a map keyed by tool: a
 /// `HashMap::new()` is not a `const fn`, so a shape chosen for the read side would have taken this
 /// `static` away and the `E0515` above with it.
-static NO_SHELL_RULES: crate::project_policy::ShellRules = crate::project_policy::ShellRules {
+static NO_SHELL_RULES: crate::project::policy::ShellRules = crate::project::policy::ShellRules {
     allow: Vec::new(),
     deny: Vec::new(),
     deny_writes: Vec::new(),
@@ -495,10 +495,10 @@ impl ProjectRules {
     /// rules could not change anyway. Distinct from `Unreadable` in exactly the way that matters —
     /// there is nothing here that needs repairing afterwards.
     fn none() -> Self {
-        Self::Declared(crate::project_policy::ShellRules::default())
+        Self::Declared(crate::project::policy::ShellRules::default())
     }
 
-    fn declared(&self) -> &crate::project_policy::ShellRules {
+    fn declared(&self) -> &crate::project::policy::ShellRules {
         match self {
             Self::Declared(rules) => rules,
             // Classified under an empty pair and repaired afterwards: `downgrade_if_unreadable` is
@@ -582,7 +582,7 @@ async fn shell_rules_of(state: &AppState, project_id: Option<&str>) -> ProjectRu
     let Some(project_id) = project_id else {
         return ProjectRules::none();
     };
-    match crate::project_policy::shell_rules(&state.pool, project_id).await {
+    match crate::project::policy::shell_rules(&state.pool, project_id).await {
         Ok(declared) => ProjectRules::Declared(declared),
         Err(error) => {
             tracing::warn!(
@@ -712,7 +712,7 @@ async fn observe_verification(
     }
     let map = match (tree, target) {
         (MapState::Valid(tree), Some(MapState::Valid(target))) => {
-            crate::verify_guard::detection_union(&target, &tree)
+            crate::verify::guard::detection_union(&target, &tree)
         }
         (MapState::Valid(map), _) | (_, Some(MapState::Valid(map))) => map,
         _ => return false,
@@ -729,7 +729,7 @@ async fn observe_verification(
             (None, crate::config::VerifyGuardMode::Observe)
         }
     };
-    let Some(hit) = crate::verify_guard::detect(
+    let Some(hit) = crate::verify::guard::detect(
         command,
         classifier::shell_for(&payload.tool_name),
         &map,
@@ -738,9 +738,9 @@ async fn observe_verification(
         return false;
     };
     let refused = guard == crate::config::VerifyGuardMode::Refuse && decision != "deny";
-    if let Err(error) = crate::verify_observe::record(
+    if let Err(error) = crate::verify::observe::record(
         &state.pool,
-        &crate::verify_observe::Observation {
+        &crate::verify::observe::Observation {
             project_id,
             run_id,
             shadow_decision_id,
@@ -1443,7 +1443,7 @@ async fn pretooluse_decision_from(
             // a person could still approve, and a failed submission leaves no ticket to name.
             let declared_git_decision: Option<Decision> = async {
                 let project_id = project_id.as_deref()?;
-                let declared = crate::project_policy::git_ops(&state.pool, project_id).await;
+                let declared = crate::project::policy::git_ops(&state.pool, project_id).await;
                 if declared.is_empty() {
                     return None;
                 }
@@ -2505,13 +2505,13 @@ async fn judge_for(
     // nothing: `auto` means the same thing wherever it is switched on. The read itself lives in
     // `project_policy`, with the other three answers to "what may this project do without asking".
     let configured = match project_id {
-        Some(project_id) => crate::project_policy::judge(&state.pool, project_id).await,
-        None => crate::project_policy::Judge::Default,
+        Some(project_id) => crate::project::policy::judge(&state.pool, project_id).await,
+        None => crate::project::policy::Judge::Default,
     };
     let (brain, model) = match configured {
-        crate::project_policy::Judge::Off => return None,
-        crate::project_policy::Judge::Named { brain, model } => (brain, model),
-        crate::project_policy::Judge::Default => (crate::chats::Brain::Local, None),
+        crate::project::policy::Judge::Off => return None,
+        crate::project::policy::Judge::Named { brain, model } => (brain, model),
+        crate::project::policy::Judge::Default => (crate::chats::Brain::Local, None),
     };
     match state.assistants.assistant_for(brain, model.as_deref()) {
         Ok(assistant) => Some(assistant),
@@ -4595,7 +4595,7 @@ mod tests {
             &serde_json::json!({ "command": PARKED }),
             Some(Path::new("C:\\work\\repo")),
             &crate::github::Policy::empty(),
-            &crate::project_policy::ShellRules::default(),
+            &crate::project::policy::ShellRules::default(),
             classifier::Unrecognized::AsksAPerson,
         )
         .action_class;
@@ -5765,7 +5765,7 @@ mod tests {
         assert_eq!(granted.decision, "allow");
 
         let repo = rostered_repo(&state, "hook-judge-declared-push").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+        crate::project::policy::declare_git_op(&state.pool, "p", "push")
             .await
             .unwrap();
         let declared_run = in_flight_run(
@@ -7028,7 +7028,7 @@ mod tests {
             &tool_input,
             None,
             &crate::github::Policy::empty(),
-            &crate::project_policy::ShellRules::default(),
+            &crate::project::policy::ShellRules::default(),
             classifier::Unrecognized::AsksAPerson,
         );
         assert_eq!(classification.action_class, "unrecognized");
@@ -7051,12 +7051,12 @@ mod tests {
     #[tokio::test]
     async fn a_prefix_the_project_declared_runs_where_a_run_with_no_project_parks() {
         let state = test_state().await;
-        crate::project_policy::declare_shell_rule(
+        crate::project::policy::declare_shell_rule(
             &state.pool,
             "alpha",
             None,
             "bash scripts/gates.sh",
-            crate::project_policy::Verdict::Allow,
+            crate::project::policy::Verdict::Allow,
             None,
         )
         .await
@@ -7098,7 +7098,7 @@ mod tests {
     #[tokio::test]
     async fn an_operation_the_project_declared_reaches_github_where_a_run_with_no_project_parks() {
         let state = test_state().await;
-        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_list")
+        crate::project::policy::declare_github_op(&state.pool, "alpha", "run_list")
             .await
             .unwrap();
 
@@ -7138,7 +7138,7 @@ mod tests {
     #[tokio::test]
     async fn a_declared_read_that_asks_for_a_strangers_words_parks_anyway() {
         let state = test_state().await;
-        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_status")
+        crate::project::policy::declare_github_op(&state.pool, "alpha", "run_status")
             .await
             .unwrap();
 
@@ -7176,12 +7176,12 @@ mod tests {
     #[tokio::test]
     async fn a_projects_refusal_overrides_a_compiled_permission() {
         let state = test_state().await;
-        crate::project_policy::declare_shell_rule(
+        crate::project::policy::declare_shell_rule(
             &state.pool,
             "alpha",
             None,
             "ls",
-            crate::project_policy::Verdict::Deny,
+            crate::project::policy::Verdict::Deny,
             None,
         )
         .await
@@ -7348,12 +7348,12 @@ mod tests {
     #[tokio::test]
     async fn a_rooted_turn_is_bound_by_its_projects_refusals() {
         let state = test_state().await;
-        crate::project_policy::declare_shell_rule(
+        crate::project::policy::declare_shell_rule(
             &state.pool,
             "alpha",
             None,
             "ls",
-            crate::project_policy::Verdict::Deny,
+            crate::project::policy::Verdict::Deny,
             None,
         )
         .await
@@ -7400,7 +7400,7 @@ mod tests {
     #[tokio::test]
     async fn a_rooted_turn_reaches_github_through_its_projects_declared_operations() {
         let state = test_state().await;
-        crate::project_policy::declare_github_op(&state.pool, "alpha", "run_list")
+        crate::project::policy::declare_github_op(&state.pool, "alpha", "run_list")
             .await
             .unwrap();
 
@@ -9310,12 +9310,12 @@ mod tests {
     async fn bypass_never_lowers_a_refusal_about_where_a_command_points_or_what_a_project_declared()
     {
         let state = test_state().await;
-        crate::project_policy::declare_shell_rule(
+        crate::project::policy::declare_shell_rule(
             &state.pool,
             "alpha",
             None,
             "npm ci",
-            crate::project_policy::Verdict::Deny,
+            crate::project::policy::Verdict::Deny,
             None,
         )
         .await
@@ -10958,7 +10958,7 @@ mod tests {
     async fn a_declared_git_op_is_queued_instead_of_stopping_the_run() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-declared-push").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+        crate::project::policy::declare_git_op(&state.pool, "p", "push")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11032,17 +11032,17 @@ mod tests {
     async fn a_denied_prefix_beats_a_declared_git_op() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-denied-push").await;
-        crate::project_policy::declare_shell_rule(
+        crate::project::policy::declare_shell_rule(
             &state.pool,
             "p",
             None,
             "git push",
-            crate::project_policy::Verdict::Deny,
+            crate::project::policy::Verdict::Deny,
             None,
         )
         .await
         .unwrap();
-        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+        crate::project::policy::declare_git_op(&state.pool, "p", "push")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11069,7 +11069,7 @@ mod tests {
     async fn unreadable_rules_stop_a_declared_git_op() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-unreadable-rules").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+        crate::project::policy::declare_git_op(&state.pool, "p", "push")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11098,7 +11098,7 @@ mod tests {
     async fn a_declared_git_op_is_found_per_segment() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-segmented-merge").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "merge")
+        crate::project::policy::declare_git_op(&state.pool, "p", "merge")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11137,7 +11137,7 @@ mod tests {
     async fn a_git_op_spelling_the_queue_cannot_build_still_stops_the_run() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-bare-push").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "push")
+        crate::project::policy::declare_git_op(&state.pool, "p", "push")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11168,7 +11168,7 @@ mod tests {
             .await
             .unwrap();
         let another_repo = rostered_repo(&state, "hook-run-another-project").await;
-        crate::project_policy::declare_git_op(&state.pool, "other", "push")
+        crate::project::policy::declare_git_op(&state.pool, "other", "push")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -11195,7 +11195,7 @@ mod tests {
     async fn a_declared_git_op_that_blocks_is_still_admitted() {
         let state = test_state().await;
         let repo = rostered_repo(&state, "hook-run-declared-rebase").await;
-        crate::project_policy::declare_git_op(&state.pool, "p", "rebase")
+        crate::project::policy::declare_git_op(&state.pool, "p", "rebase")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -12017,10 +12017,10 @@ mod tests {
         let mut state = test_state().await;
         let root = tempfile::tempdir().unwrap();
         state.machine_config_root = Some(root.path().to_path_buf());
-        let rules = crate::project_state::file(
+        let rules = crate::project::state::file(
             Some(root.path()),
             "p",
-            crate::project_state::AUTOPILOT_FILE,
+            crate::project::state::AUTOPILOT_FILE,
         )
         .unwrap();
         std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
@@ -12058,7 +12058,7 @@ mod tests {
 
     fn write_rules(root: &Path, project: &str, text: &str) {
         let rules =
-            crate::project_state::file(Some(root), project, crate::project_state::AUTOPILOT_FILE)
+            crate::project::state::file(Some(root), project, crate::project::state::AUTOPILOT_FILE)
                 .unwrap();
         std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
         std::fs::write(&rules, text).unwrap();

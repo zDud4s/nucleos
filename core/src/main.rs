@@ -108,7 +108,7 @@ async fn migrate_machine_settings(pool: &sqlx::SqlitePool, root: &std::path::Pat
 /// Copies each rostered project's state files from its old `<project root>/.ai/` into
 /// `~/.nucleos/projects/<project_id>/`, and puts a line in that project's feed for each one.
 ///
-/// The copying is [`project_state::migrate_legacy`]'s, and so is every rule about when it does and
+/// The copying is [`project::state::migrate_legacy`]'s, and so is every rule about when it does and
 /// does not happen; this only reads the roster and tells somebody, for the reason
 /// [`migrate_machine_settings`] gives. The roster is every project with a root on record — a
 /// project in `off` has none, and its old files are copied the next time it is given one and the
@@ -135,7 +135,7 @@ async fn migrate_project_state(pool: &sqlx::SqlitePool, root: &std::path::Path) 
         .collect();
     let root = root.to_path_buf();
     let copied =
-        match tokio::task::spawn_blocking(move || project_state::migrate_legacy(&root, &roster))
+        match tokio::task::spawn_blocking(move || project::state::migrate_legacy(&root, &roster))
             .await
         {
             Ok(copied) => copied,
@@ -148,7 +148,7 @@ async fn migrate_project_state(pool: &sqlx::SqlitePool, root: &std::path::Path) 
         let summary = format!(
             "{} copied from .ai/{file} in this project's folder; the old file was left where it \
              was and is no longer read",
-            project_state::display_path(&project_id, file)
+            project::state::display_path(&project_id, file)
         );
         if let Err(error) = feed::append(
             pool,
@@ -206,7 +206,7 @@ async fn migrate_onboarding(pool: &sqlx::SqlitePool, root: &std::path::Path) {
         let summary = format!(
             "marked onboarded in {}, because this project had .ai/workflow/workflow.md, which is \
              what onboarded meant before; that file is no longer read",
-            project_state::display_path(&project_id, onboarding::MARKER_FILE)
+            project::state::display_path(&project_id, onboarding::MARKER_FILE)
         );
         if let Err(error) = feed::append(
             pool,
@@ -880,7 +880,7 @@ async fn main() {
             eprintln!("this machine has no home directory, so it has no workflow library");
             std::process::exit(1);
         };
-        match workflow_package::package(&library, &name, &version, &from, &manifest).await {
+        match workflows::package::package(&library, &name, &version, &from, &manifest).await {
             Ok(packaged) => {
                 println!(
                     "{name}@{version}: {} files into {} ({})",
@@ -971,7 +971,7 @@ async fn main() {
     // has not existed since the last restart would refuse every future click with "already
     // running". Best-effort — a project command left unsettled is a button that will not press, not
     // a daemon that must not start.
-    match project_commands::reconcile_orphaned_commands(&pool).await {
+    match project::commands::reconcile_orphaned_commands(&pool).await {
         Ok(0) => {}
         Ok(settled) => tracing::info!(
             settled,
@@ -991,7 +991,7 @@ async fn main() {
 
     // Spec 2026-10-04 §4.2 item 5: a task caught mid-flight by a restart is `orphaned`, beside the
     // turns marked `interrupted` above. Best effort: a stale task row must not stop the daemon.
-    match chat_tasks::orphan_running(&pool).await {
+    match chats::tasks::orphan_running(&pool).await {
         Ok(0) => {}
         Ok(orphaned) => tracing::warn!(
             orphaned,
@@ -1050,8 +1050,8 @@ async fn main() {
     //
     // A verification unit left `running` was cut off by the restart, and the agent holding its ticket
     // is still waiting: put it back in the queue. One that keeps taking the daemon down gives up
-    // after `verify_runs::MAX_INTERRUPTIONS` instead of looping.
-    match verify_runs::requeue_interrupted(&pool).await {
+    // after `verify::runs::MAX_INTERRUPTIONS` instead of looping.
+    match verify::runs::requeue_interrupted(&pool).await {
         Ok((requeued, given_up)) if requeued + given_up > 0 => tracing::warn!(
             "requeued {requeued} verification unit(s) interrupted by the restart; gave up on {given_up}"
         ),
@@ -1157,7 +1157,7 @@ async fn main() {
     // install; `embed::install` is called again by the settings door when the choice changes.
     embed::install(Arc::new(embed::OllamaEmbedder::new(
         runner::OLLAMA_BASE_URL.to_string(),
-        embed_model::effective(&pool, &models_config.embedding_model).await,
+        embed::model::effective(&pool, &models_config.embedding_model).await,
     )));
     let (triage_runner, local_triage_disabled): (
         Option<Arc<dyn runner::CommandRunner>>,
@@ -1755,7 +1755,7 @@ async fn main() {
             http: reqwest::Client::new(),
         }),
         quota: Arc::new(quota::QuotaRuntime::new(
-            quota_client::QuotaClient::new(sidecar::QUOTA_ADDR, quota_sidecar_token.clone()),
+            quota::client::QuotaClient::new(sidecar::QUOTA_ADDR, quota_sidecar_token.clone()),
             models_config.active_runner().to_string(),
         )),
         judge: Arc::new(judge::JudgeRuntime::jev()),
@@ -1934,7 +1934,7 @@ async fn main() {
     // starts is a different question from how it runs — the same separation `scheduler.rs` has from
     // `job.rs` — and it could not have gone in `scheduler_tick` at all: that loop is per project,
     // and a department has no project, no root and no HEAD.
-    tokio::spawn(team_trigger::run_team_trigger_loop(state.clone()));
+    tokio::spawn(team::trigger::run_team_trigger_loop(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(worktree::run_gc(state.pool.clone()));
     // The worktree GC's counterpart inside the database. It collects the directories a finished run
@@ -1959,20 +1959,20 @@ async fn main() {
     // `POST /verify` submits to it, so the handlers need the very instance the worker drains: it is
     // parked in `verify::install` (an `OnceLock`, because `AppState` is built literally in dozens of
     // places) before the worker starts. The restart above hands interrupted units straight back to it.
-    let verify_executor = verify_exec::Executor::new(
+    let verify_executor = verify::exec::Executor::new(
         state.pool.clone(),
         verify_config,
         machine_config_root.clone(),
     );
     verify::install(verify_executor.clone());
     // Off for every project unless its rules set `gate_after_land`.
-    tokio::spawn(verify_postgate_worker::run_postgate_worker(
+    tokio::spawn(verify::postgate_worker::run_postgate_worker(
         verify_executor.clone(),
     ));
     // Opens the correction run of a `fix/` branch the gate worker prepared; with `revert_on_red` off
     // for every project there is never one, and a pass reads an empty query.
-    tokio::spawn(verify_postgate_worker::run_correction_loop(state.clone()));
-    tokio::spawn(verify_exec::run_executor(verify_executor));
+    tokio::spawn(verify::postgate_worker::run_correction_loop(state.clone()));
+    tokio::spawn(verify::exec::run_executor(verify_executor));
     tokio::spawn(vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(git_exec::GitExecutor {

@@ -3300,7 +3300,7 @@ pub async fn run_stdio(
         tokio::spawn(async move {
             loop {
                 let _ = beat_client.verify_box_beat(&path).await;
-                tokio::time::sleep(crate::verify_box::BEAT_EVERY).await;
+                tokio::time::sleep(crate::verify::ide_box::BEAT_EVERY).await;
             }
         });
     }

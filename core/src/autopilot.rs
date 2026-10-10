@@ -53,7 +53,7 @@ pub struct ProjectSummary {
     /// The last thing this project's gate said, and when it said it.
     ///
     /// The LAST verdict and not a tally over a window, because the roster's question is *is this
-    /// one broken right now*. [`crate::project_readings`] already answers "how has it been going"
+    /// one broken right now*. [`crate::project::readings`] already answers "how has it been going"
     /// for the one project somebody opened, and a thirty-day count in a roster column would read
     /// green for a project that broke this morning.
     ///
@@ -1696,7 +1696,7 @@ pub mod tests {
     /// Records `project_id` as onboarded under `root`'s stand-in home — the marker, and nothing
     /// that onboarding would also have done, so each prerequisite stays testable on its own.
     fn onboard(root: &TempDir, project_id: &str) {
-        crate::project_state::write_for_test(
+        crate::project::state::write_for_test(
             &home(root),
             project_id,
             crate::onboarding::MARKER_FILE,

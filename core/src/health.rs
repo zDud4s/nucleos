@@ -103,7 +103,7 @@ pub const BREACH_INTENT_KIND: &str = "health_breach_intent";
 ///
 /// **The feed, and no longer `.ai/local/ledgers/intents.jsonl`.** That ledger is the AI dev
 /// workflow's, in the project's own `.ai/` folder, and the product has no business writing into it
-/// — the same line `project_state.rs` draws for the rules file. The feed is the daemon's own record
+/// — the same line `project/state.rs` draws for the rules file. The feed is the daemon's own record
 /// of what happened to a project, it is where a person already looks, and it needed no new table.
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn record_breach_intent(
@@ -431,7 +431,7 @@ fn router_plan(text: Option<&str>) -> RouterPlan {
 /// `None` means nothing has run yet, which is green: a daemon that has just started has not failed
 /// at anything. Past the failure rate is `degraded` and never `down`, because ingestion only feeds
 /// a reading and stops nothing else.
-fn devtime_row(status: Option<crate::devtime_store::IngestStatus>) -> SubsystemReadout {
+fn devtime_row(status: Option<crate::devtime::store::IngestStatus>) -> SubsystemReadout {
     let Some(status) = status else {
         return SubsystemReadout::ok("devtime_ingest");
     };
@@ -457,7 +457,7 @@ fn devtime_row(status: Option<crate::devtime_store::IngestStatus>) -> SubsystemR
 }
 
 async fn devtime_probe(pool: sqlx::SqlitePool) -> SubsystemReadout {
-    match crate::devtime_store::read_ingest_status(&pool).await {
+    match crate::devtime::store::read_ingest_status(&pool).await {
         Ok(status) => devtime_row(status),
         Err(_) => SubsystemReadout::down("devtime_ingest", FailureCategory::Unknown),
     }
@@ -562,7 +562,7 @@ fn embeddings_row(model: Option<&str>, listed: &[String]) -> SubsystemReadout {
     };
     if listed.is_empty() {
         SubsystemReadout::degraded("embeddings", FailureCategory::Unreachable)
-    } else if !crate::embed_model::is_pulled(model, listed) {
+    } else if !crate::embed::model::is_pulled(model, listed) {
         SubsystemReadout::degraded("embeddings", FailureCategory::Missing)
     } else {
         SubsystemReadout::ok("embeddings")
@@ -1798,8 +1798,8 @@ url: http://127.0.0.1:{port}
         enabled: bool,
         lines_read: i64,
         lines_failed: i64,
-    ) -> crate::devtime_store::IngestStatus {
-        crate::devtime_store::IngestStatus {
+    ) -> crate::devtime::store::IngestStatus {
+        crate::devtime::store::IngestStatus {
             enabled,
             cycle_at: "2026-10-04T10:00:00.000Z".to_string(),
             lines_read,

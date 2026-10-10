@@ -815,7 +815,7 @@ mod tests {
         "team.rs",
     ];
     const UNBRIEFED_LAUNCHERS: &[(&str, &str)] = &[(
-        "map_intent.rs",
+        "map/intent.rs",
         "map derivation is deliberately unbriefed because it creates the map that later scopes briefing",
     )];
 
@@ -2012,7 +2012,7 @@ mod tests {
     /// build prompts and are deliberately not briefed. (b) It reads only `core/src/*.rs`, not
     /// subdirectories or other crates such as `shell/src-tauri` and `sidecars/`. (c) A launcher that
     /// does not spell `crate::runner::RunRequest {` (for example, imported `RunRequest {` or a
-    /// builder) is invisible. (d) `map_seam.rs` is the nearest relative and a warning, not a
+    /// builder) is invisible. (d) `map/seam.rs` is the nearest relative and a warning, not a
     /// precedent: it enforces the inverse direction. It derives `Seam::uncalled` on every read but
     /// never asserts it, because "Served routes no call here reaches -- and no screen is not
     /// nothing." A static scan does not see who calls over HTTP.
@@ -2030,14 +2030,12 @@ mod tests {
             running_in.display(),
         );
 
-        let mut sources = crate::source_scan::top_level_rust_files()
+        // Every file at any depth, named by its path from its root (`runs.rs`, `council/store.rs`):
+        // a context built inside a module folder is as much a context as one at the top.
+        let mut sources = crate::source_scan::rust_files()
             .into_iter()
             .map(|path| {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .expect("core source file names must be UTF-8")
-                    .to_owned();
+                let name = crate::source_scan::module_path(&path);
                 let source = fs::read_to_string(&path).expect("core source file must be readable");
                 let source = source.replace("\r\n", "\n");
                 let production = source

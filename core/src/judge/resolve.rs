@@ -1322,9 +1322,9 @@ mod tests {
     }
 
     fn write_rules(root: &std::path::Path, yaml: &str) {
-        let dir = crate::project_state::dir(root, "p").unwrap();
+        let dir = crate::project::state::dir(root, "p").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(crate::project_state::AUTOPILOT_FILE), yaml).unwrap();
+        std::fs::write(dir.join(crate::project::state::AUTOPILOT_FILE), yaml).unwrap();
     }
 
     /// D4/D1: an unreadable `autopilot.yaml` may be looser than what the project wrote down, so

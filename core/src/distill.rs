@@ -5,6 +5,9 @@
 //! §4 the causes and the worker). Phase A, packet P1 covers the queue, the cause vocabulary and
 //! the in-transaction enqueue helpers; nothing here reads a job's text yet.
 
+pub mod model;
+pub mod origin;
+
 use sqlx::SqliteConnection;
 
 /// Why a job or run was queued. The spelling is what `distill_queue.cause` holds; the
@@ -530,7 +533,7 @@ pub fn retry_at(
 // ---- P4: the worker ----
 
 use crate::embed::Embedder;
-use crate::map_intent::Extractor;
+use crate::map::intent::Extractor;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
@@ -786,7 +789,7 @@ async fn gather(pool: &SqlitePool, row: &QueueRow) -> sqlx::Result<Option<Dossie
 async fn ask(asked: Extractor<'_>, prompt: String) -> std::io::Result<String> {
     match asked {
         Extractor::Cli(runner) => {
-            crate::map_intent::ask_once(runner, prompt, "distillation", Some(STANDING)).await
+            crate::map::intent::ask_once(runner, prompt, "distillation", Some(STANDING)).await
         }
         Extractor::Loopback {
             client,
@@ -1100,7 +1103,7 @@ pub async fn run_distill_loop(state: crate::state::AppState) {
         // Read per tick so a change of model needs no restart. A choice this machine cannot serve
         // leaves the rows pending until it can: the distiller never falls back to the cloud for a
         // dossier its owner sent somewhere else, and the refusal is logged once by `route_for`.
-        let route = match crate::distill_model::route_for(&state).await {
+        let route = match crate::distill::model::route_for(&state).await {
             Ok(route) => route,
             Err(_) => continue,
         };
@@ -1811,7 +1814,7 @@ mod tests {
     // ---- P4: the worker ----
 
     use super::{claim_next, items_format, process_one, recover_running};
-    use crate::map_intent::Extractor;
+    use crate::map::intent::Extractor;
 
     fn fake_answering(stdout: &str) -> crate::runner::FakeCommandRunner {
         crate::runner::FakeCommandRunner {
@@ -2432,7 +2435,7 @@ mod tests {
         assert_eq!(learnings(&pool).await, 0);
     }
 
-    /// Copied from `map_intent.rs`'s `loopback_answering`: a local server that records every chat
+    /// Copied from `map/intent.rs`'s `loopback_answering`: a local server that records every chat
     /// body it is posted and answers with `answer`.
     async fn loopback_answering(
         answer: &'static str,

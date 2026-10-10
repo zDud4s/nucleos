@@ -4472,7 +4472,7 @@ mod tests {
         let roots = container.path().join("worktrees");
         let _env = WorktreeRootEnv::set(Some(roots.as_path()));
 
-        let postgate = crate::verify_postgate::postgate_worktree(&project_root);
+        let postgate = crate::verify::postgate::postgate_worktree(&project_root);
         std::fs::create_dir_all(&postgate).expect("create the postgate worktree directory");
         std::fs::create_dir_all(roots.join("run-99")).expect("create the control directory");
 

@@ -600,13 +600,13 @@ mod tests {
 
     async fn seed_due_repo_project(state: &crate::state::AppState, project_id: &str, repo: &Path) {
         let branch = git_stdout(repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
-        crate::project_state::write_for_test(
+        crate::project::state::write_for_test(
             state
                 .machine_config_root
                 .as_deref()
                 .expect("the test state has a stand-in home"),
             project_id,
-            crate::project_state::AUTOPILOT_FILE,
+            crate::project::state::AUTOPILOT_FILE,
             &format!("repo_triggers:\n  - name: t1\n    branch: {branch}\n    prompt: \"go\"\n"),
         );
 
@@ -700,13 +700,13 @@ mod tests {
         let repo = init_repo();
         let branch = git_stdout(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
         let (state, _home) = test_state().await;
-        crate::project_state::write_for_test(
+        crate::project::state::write_for_test(
             state
                 .machine_config_root
                 .as_deref()
                 .expect("the test state has a stand-in home"),
             "proj",
-            crate::project_state::AUTOPILOT_FILE,
+            crate::project::state::AUTOPILOT_FILE,
             &format!("repo_triggers:\n  - name: t1\n    branch: {branch}\n    prompt: \"go\"\n"),
         );
         sqlx::query(

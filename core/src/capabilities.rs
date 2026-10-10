@@ -377,7 +377,7 @@ fn undeclared(context: runner::ModelError) -> Declared {
 
 /// Reads a top-level string array off a parsed JSON value, tolerating non-string entries by
 /// dropping them one at a time rather than discarding the whole array — the same lesson a null
-/// array element already cost elsewhere in this crate (see `map_intent.rs`'s `Option<String>`
+/// array element already cost elsewhere in this crate (see `map/intent.rs`'s `Option<String>`
 /// fields): one malformed entry must cost its own row, never the whole reading.
 fn string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
     value

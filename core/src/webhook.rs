@@ -217,13 +217,13 @@ mod tests {
 
     async fn configured_project(state: &AppState) -> tempfile::TempDir {
         let project = tempfile::tempdir().unwrap();
-        crate::project_state::write_for_test(
+        crate::project::state::write_for_test(
             state
                 .machine_config_root
                 .as_deref()
                 .expect("the test state has a stand-in home"),
             "configured",
-            crate::project_state::AUTOPILOT_FILE,
+            crate::project::state::AUTOPILOT_FILE,
             "repo_triggers:\n  - name: pushed-main\n    branch: main\n    prompt: \"review the push\"\n",
         );
         sqlx::query(

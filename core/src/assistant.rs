@@ -440,7 +440,7 @@ fn stop_tasks_of(ended: ProcessBarrier) {
         return;
     };
     runtime.spawn(async move {
-        if let Err(error) = crate::chat_tasks::stop_launched_by(&pool, &chat_id, &served).await {
+        if let Err(error) = crate::chats::tasks::stop_launched_by(&pool, &chat_id, &served).await {
             tracing::warn!(chat_id = %chat_id, %error, "could not close the tasks of a conversation's ended process");
         }
     });
@@ -1365,7 +1365,7 @@ fn watch_between_turns(state: &crate::state::AppState, chat_id: &str) {
             };
             // A task that ends between turns is recorded now, not when a later turn reads the line.
             for line in &task_lines {
-                crate::chat_tasks::apply_line(&state.pool, &chat_id, line).await;
+                crate::chats::tasks::apply_line(&state.pool, &chat_id, line).await;
             }
             if !begun {
                 continue;
@@ -1594,7 +1594,7 @@ async fn record_spontaneous_answer(
     let thought = serde_json::to_string(&stream.thought).unwrap_or_else(|_| "[]".to_string());
     let model = crate::runner::model_from_stream(&o.stdout);
     // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
-    crate::chat_tasks::record_turn(pool, chat_id, id, &o.stdout).await;
+    crate::chats::tasks::record_turn(pool, chat_id, id, &o.stdout).await;
     let completed = sqlx::query(
         "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, compacted = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
     )
@@ -3679,7 +3679,8 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                     // core already takes off the outcome and this one did not: a chat turn read back
                     // "none recorded" under numbers the runner had measured and handed it.
                     // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
-                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
+                    crate::chats::tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout)
+                        .await;
                     let completed = sqlx::query(
                         "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, cache_ttl = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
                     )
@@ -3749,7 +3750,8 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
                         "failed"
                     };
                     // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
-                    crate::chat_tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout).await;
+                    crate::chats::tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout)
+                        .await;
                     let failed = sqlx::query(
                         "UPDATE runs SET status = ?, exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
@@ -8738,7 +8740,7 @@ mod tests {
 
         let mut rows = Vec::new();
         for _ in 0..300 {
-            rows = crate::chat_tasks::for_chat(&state.pool, &chat)
+            rows = crate::chats::tasks::for_chat(&state.pool, &chat)
                 .await
                 .unwrap();
             if !rows.is_empty() {
@@ -8761,7 +8763,7 @@ mod tests {
             )
             .unwrap();
         for _ in 0..300 {
-            rows = crate::chat_tasks::for_chat(&state.pool, &chat)
+            rows = crate::chats::tasks::for_chat(&state.pool, &chat)
                 .await
                 .unwrap();
             if rows.first().is_some_and(|row| row.status != "running") {

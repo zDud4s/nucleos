@@ -1,6 +1,6 @@
 //! Typed HTTP client for the local llm-router's route-only API (`jev-model-router`).
 //!
-//! Transport only, for the reason `quota_client.rs` is: `route_advice.rs` owns what the daemon asks
+//! Transport only, for the reason `quota/client.rs` is: `route_advice.rs` owns what the daemon asks
 //! and what it does with the answer, and never learns that the router speaks HTTP. The router never
 //! runs anything for the daemon — this client knows `POST /v1/route` and `GET /v1/route/targets`,
 //! and nothing of the router's proxy mode.

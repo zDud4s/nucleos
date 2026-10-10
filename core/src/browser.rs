@@ -23,6 +23,10 @@
 //! document — nothing ran — and this module reopens the same request in a throwaway. That is spec
 //! §5.4's "the url is handed to an ephemeral session", and it is a downgrade rather than a failure.
 
+pub mod live;
+pub mod seat;
+pub mod wheel;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -41,9 +45,9 @@ pub struct BrowserRuntime {
     pub enabled: bool,
     pub client: BrowserClient,
     /// Where a session's mode changes are announced to whoever is watching its live view.
-    pub modes: crate::browser_live::ModeChannels,
+    pub modes: crate::browser::live::ModeChannels,
     /// Who holds the person's seat in each session, kept in memory only (spec browser-volante §4.3).
-    pub seats: crate::browser_seat::SeatState,
+    pub seats: crate::browser::seat::SeatState,
 }
 
 impl BrowserRuntime {
@@ -749,7 +753,7 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
 /// agent clicking on a page a person had just been handed.
 pub async fn set_mode(
     pool: &SqlitePool,
-    modes: &crate::browser_live::ModeChannels,
+    modes: &crate::browser::live::ModeChannels,
     id: i64,
     from: &str,
     to: &str,
@@ -768,7 +772,7 @@ pub async fn set_mode(
         // that did not happen.
         modes.publish(
             id,
-            crate::browser_live::LiveMode {
+            crate::browser::live::LiveMode {
                 mode: to.to_owned(),
                 seat: None,
             },
@@ -783,7 +787,7 @@ pub async fn set_mode(
 /// writes would leave a window where a `human` row has no seat yet.
 pub async fn set_mode_seat(
     pool: &SqlitePool,
-    modes: &crate::browser_live::ModeChannels,
+    modes: &crate::browser::live::ModeChannels,
     id: i64,
     from: &str,
     to: &str,
@@ -803,7 +807,7 @@ pub async fn set_mode_seat(
         // Published even when the mode string is unchanged: human/shell -> human/window must cut.
         modes.publish(
             id,
-            crate::browser_live::LiveMode {
+            crate::browser::live::LiveMode {
                 mode: to.to_owned(),
                 seat: seat.map(str::to_owned),
             },
@@ -2555,7 +2559,7 @@ mod tests {
     async fn volante_set_mode_seat_moves_mode_and_seat_together() {
         let db = TempDb::new().await;
         let id = raw_session(&db.pool, "project", "acme", false).await;
-        let modes = crate::browser_live::ModeChannels::default();
+        let modes = crate::browser::live::ModeChannels::default();
         let mut watcher = modes.subscribe(id);
 
         assert!(

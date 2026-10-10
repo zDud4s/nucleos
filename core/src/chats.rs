@@ -1,3 +1,7 @@
+pub mod groups;
+pub mod notices;
+pub mod tasks;
+
 use sqlx::SqlitePool;
 
 /// Which model answers a conversation.

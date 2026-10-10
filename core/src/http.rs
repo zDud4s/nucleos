@@ -62,8 +62,8 @@ pub fn build_router(state: AppState) -> Router {
         // In no `auth.rs` table on purpose: Control and Admin only, like `/config/machine`.
         .route(
             "/config/distiller",
-            get(crate::distill_model::get_distiller_config)
-                .post(crate::distill_model::post_distiller_config),
+            get(crate::distill::model::get_distiller_config)
+                .post(crate::distill::model::post_distiller_config),
         )
         .route(
             "/config/capture-wait",
@@ -71,8 +71,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/config/embedding",
-            get(crate::embed_model::get_embedding_config)
-                .post(crate::embed_model::post_embedding_config),
+            get(crate::embed::model::get_embedding_config)
+                .post(crate::embed::model::post_embedding_config),
         )
         .route("/config/secrets", get(get_machine_secrets))
         .route(
@@ -115,7 +115,7 @@ pub fn build_router(state: AppState) -> Router {
         // separate quota-brake route owns settings for acting on it.
         //
         // Registered here BEFORE anything in the shell calls it, which is the order
-        // `map_seam::no_screen_in_this_repository_asks_for_a_route_the_daemon_does_not_serve`
+        // `map::seam::no_screen_in_this_repository_asks_for_a_route_the_daemon_does_not_serve`
         // enforces: a screen asking for a route the daemon does not serve fails that assertion,
         // while a route served with no caller is explicitly allowed.
         .route("/quota", get(get_quota))
@@ -249,7 +249,7 @@ pub fn build_router(state: AppState) -> Router {
         // Control/admin only: absent from the `auth.rs` scope tables; the handler re-checks the owner.
         .route(
             "/projects/{id}/ide-verify",
-            post(crate::verify_provision::post_project_ide_verify),
+            post(crate::verify::provision::post_project_ide_verify),
         )
         // Two doors and not one PUT with a nullable field, because the three states are not a value
         // and its absence: naming nobody is a decision, and taking the row away is withdrawing one.
@@ -291,7 +291,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         // The reach this project declares for itself: what its worktrees may run unattended, what
         // the GitHub manager may do on its remote, what the shared git queue may do on its
-        // repository, and where a landing may be sent. `project_policy.rs` holds all four tables
+        // repository, and where a landing may be sent. `project/policy.rs` holds all four tables
         // and says why they are one module; until these routes there was no way into them but SQL
         // typed by hand.
         //
@@ -412,7 +412,7 @@ pub fn build_router(state: AppState) -> Router {
             "/projects/{id}/workflows/{name}/diff",
             get(get_project_workflow_diff),
         )
-        // Put the pinned bundle's files where agents read them (`workflow_materialize.rs`). The GET
+        // Put the pinned bundle's files where agents read them (`workflows/materialize.rs`). The GET
         // is the same computation with nothing written — which files would be written, replaced,
         // adopted, removed, and which are left alone because somebody edited them. Both in no scope
         // table: the POST writes files that govern what an agent does, and the GET names them.
@@ -528,19 +528,19 @@ pub fn build_router(state: AppState) -> Router {
         // the graph the cycle check walks.
         .route(
             "/team-triggers",
-            get(crate::team_trigger::list_triggers).post(crate::team_trigger::create_trigger),
+            get(crate::team::trigger::list_triggers).post(crate::team::trigger::create_trigger),
         )
         .route(
             "/team-triggers/{id}",
-            axum::routing::delete(crate::team_trigger::delete_trigger),
+            axum::routing::delete(crate::team::trigger::delete_trigger),
         )
         .route(
             "/team-triggers/{id}/enable",
-            post(crate::team_trigger::post_trigger_enable),
+            post(crate::team::trigger::post_trigger_enable),
         )
         .route(
             "/team-triggers/{id}/next",
-            get(crate::team_trigger::get_trigger_next),
+            get(crate::team::trigger::get_trigger_next),
         )
         .route("/presets", get(list_presets).post(create_preset))
         .route(
@@ -603,12 +603,12 @@ pub fn build_router(state: AppState) -> Router {
         // only, like `/knowledge` above.
         .route(
             "/distill/causes",
-            get(crate::distill_origin::get_distill_causes),
+            get(crate::distill::origin::get_distill_causes),
         )
         // Rows the distiller flagged as near-duplicates; same access as `/distill/causes`.
         .route(
             "/distill/duplicates",
-            get(crate::distill_origin::get_near_duplicates),
+            get(crate::distill::origin::get_near_duplicates),
         )
         // The owner's own notes. In no `auth.rs` table on purpose: the table is default-deny, so a
         // route nobody lists is reachable by Control and Admin alone — the same reasoning as
@@ -832,7 +832,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/verify/status", post(crate::verify::post_verify_status))
         // Control/admin only, on purpose: absent from the `auth.rs` scope tables, so a run key
         // cannot keep a worktree's verify box alive.
-        .route("/verify/box/beat", post(crate::verify_box::post_box_beat))
+        .route(
+            "/verify/box/beat",
+            post(crate::verify::ide_box::post_box_beat),
+        )
         // Admin-only by construction: absent from BOTH scope tables in `auth.rs`, for the
         // `POST /email/send` reason rather than the `POST /runs` one. It is not out of a scoped
         // key's reach because it is expensive; it is out of reach because it LEAVES THE MACHINE.
@@ -986,38 +989,42 @@ pub fn build_router(state: AppState) -> Router {
         //
         // `/keep` is the closest thing to a grant on this surface, and it names no host: it answers
         // yes or no to a chain a browser recorded under a person's own hands.
-        .route("/browser/handoff", post(crate::browser_wheel::post_handoff))
+        .route(
+            "/browser/handoff",
+            post(crate::browser::wheel::post_handoff),
+        )
         // A window a person opens for themselves. It skips the proposal that `/handoff` raises,
         // because the dialogue there defends against an AGENT having chosen the destination and here
         // nobody did — and it refuses outright when nobody is at the machine, which is the check that
         // stops it being a route any run could use to open a browser over the owner's live cookies.
-        .route("/browser/window", post(crate::browser_wheel::post_window))
-        .route("/browser/return", post(crate::browser_wheel::post_return))
-        .route("/browser/keep", post(crate::browser_wheel::post_keep))
+        .route("/browser/window", post(crate::browser::wheel::post_window))
+        .route("/browser/return", post(crate::browser::wheel::post_return))
+        .route("/browser/keep", post(crate::browser::wheel::post_keep))
         .route("/browser/sessions", get(crate::browser::list_open_sessions))
         .route(
             "/browser/sessions/{id}/live",
-            get(crate::browser_live::get_live_checked),
+            get(crate::browser::live::get_live_checked),
         )
         // In no scope table on purpose: a run's key gets 403 here before the handler, and the handler
         // refuses a control-token holder that carries a run id.
         .route(
             "/browser/sessions/{id}/take",
-            post(crate::browser_seat::post_take),
+            post(crate::browser::seat::post_take),
         )
         .route(
             "/browser/sessions/{id}/window",
-            post(crate::browser_wheel::post_window_seat),
+            post(crate::browser::wheel::post_window_seat),
         )
         .route(
             "/browser/sessions/{id}/input",
-            post(crate::browser_seat::post_input)
-                .layer(DefaultBodyLimit::max(crate::browser_seat::INPUT_BODY_LIMIT)),
+            post(crate::browser::seat::post_input).layer(DefaultBodyLimit::max(
+                crate::browser::seat::INPUT_BODY_LIMIT,
+            )),
         )
         .route(
             "/browser/sessions/{id}/answer",
-            post(crate::browser_seat::post_answer).layer(DefaultBodyLimit::max(
-                crate::browser_seat::ANSWER_BODY_LIMIT,
+            post(crate::browser::seat::post_answer).layer(DefaultBodyLimit::max(
+                crate::browser::seat::ANSWER_BODY_LIMIT,
             )),
         )
         .route(
@@ -3825,13 +3832,13 @@ async fn resolve_run_worktree(
 
 /// Which documents this project has, from the table first and the folder second.
 ///
-/// **The union, and the order of the two words is the whole argument.** `map_intent::specs_in`
-/// answers *what is in `.ai/specs` right now*; `map_store::slugs` answers *what this project has
+/// **The union, and the order of the two words is the whole argument.** `map::intent::specs_in`
+/// answers *what is in `.ai/specs` right now*; `map::store::slugs` answers *what this project has
 /// ever extracted decisions from*. Only the second is durable — spec files are gitignored working
 /// material that gets archived, renamed and reorganised, and the slug is the FILENAME, so a rename
 /// silently retires every slug the approved rows still carry.
 ///
-/// What the list is for is [`crate::map_join::evidence`]'s one refusal: a citation whose candidate
+/// What the list is for is [`crate::map::join::evidence`]'s one refusal: a citation whose candidate
 /// names a DIFFERENT document of this project is evidence against, and is skipped rather than
 /// counted. A list that lost a slug therefore does not fail loudly — it quietly stops being able to
 /// tell two documents apart, every anchor degrades to ambiguous, and nothing on screen says why.
@@ -3842,14 +3849,14 @@ async fn resolve_run_worktree(
 /// never loses a slug; either source alone does.
 ///
 /// Sorted and deduplicated so two reads of an unchanged project cannot produce two different lists,
-/// which `map_join::join`'s determinism rests on.
+/// which `map::join::join`'s determinism rests on.
 async fn document_slugs(
     state: &AppState,
     id: &str,
     on_disk: Vec<String>,
 ) -> Result<Vec<String>, StatusCode> {
     let mut all: std::collections::BTreeSet<String> = on_disk.into_iter().collect();
-    all.extend(crate::map_store::slugs(&state.pool, id).await.map_err(
+    all.extend(crate::map::store::slugs(&state.pool, id).await.map_err(
         |error| {
             tracing::warn!(%error, project_id = %id, "reading this project's document slugs failed");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -3953,8 +3960,8 @@ struct PostgateView {
     also_suspect: Vec<String>,
 }
 
-impl From<crate::verify_postgate::State> for PostgateView {
-    fn from(state: crate::verify_postgate::State) -> Self {
+impl From<crate::verify::postgate::State> for PostgateView {
+    fn from(state: crate::verify::postgate::State) -> Self {
         PostgateView {
             target: state.target,
             last_green: state.last_green_sha,
@@ -4049,10 +4056,10 @@ async fn get_project_rules(
     let (rules_file, rules_error, loaded) = tokio::task::spawn_blocking(move || {
         match crate::config::load_schedule_rules(machine_root.as_deref(), &rules_id) {
             Ok(rules) => {
-                let present = crate::project_state::file(
+                let present = crate::project::state::file(
                     machine_root.as_deref(),
                     &rules_id,
-                    crate::project_state::AUTOPILOT_FILE,
+                    crate::project::state::AUTOPILOT_FILE,
                 )
                 .is_some_and(|path| path.exists());
                 (if present { "present" } else { "absent" }, None, rules)
@@ -4066,7 +4073,8 @@ async fn get_project_rules(
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let rules_path = crate::project_state::display_path(&id, crate::project_state::AUTOPILOT_FILE);
+    let rules_path =
+        crate::project::state::display_path(&id, crate::project::state::AUTOPILOT_FILE);
 
     let state_rows: Vec<RuleRunState> = sqlx::query_as(
         "SELECT rule_name, last_fired_at, last_head_sha, fires_date, fires_today,
@@ -4183,11 +4191,11 @@ async fn get_project_rules(
 
     // Read before the struct takes `id`, which is what the borrow checker was pointing at and is
     // also the clearer order: every other field here is gathered above.
-    let judge: JudgeView = crate::project_policy::judge(&state.pool, &id).await.into();
+    let judge: JudgeView = crate::project::policy::judge(&state.pool, &id).await.into();
     let ide_verify = crate::autopilot::ide_verify_enabled(&state.pool, &id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let (postgate, postgate_error) = match crate::verify_postgate::load(&state.pool, &id).await {
+    let (postgate, postgate_error) = match crate::verify::postgate::load(&state.pool, &id).await {
         Ok(row) => (row.map(PostgateView::from), None),
         Err(error) => {
             tracing::warn!(
@@ -4585,13 +4593,15 @@ async fn post_machine_config(
     }
 
     let contents = body.contents;
-    tokio::task::spawn_blocking(move || crate::project_state::write_atomically(&target, &contents))
-        .await
-        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
-        .map_err(|error| {
-            tracing::warn!(%error, path = %setting.path, "writing a machine settings file failed");
-            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
-        })?;
+    tokio::task::spawn_blocking(move || {
+        crate::project::state::write_atomically(&target, &contents)
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(|error| {
+        tracing::warn!(%error, path = %setting.path, "writing a machine settings file failed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
 
     // `None` for the project, because there is not one — this is the machine's own line. After the
     // write and loudly on failure, for the reason `post_project_write` gives: a feed line about a
@@ -5209,11 +5219,11 @@ async fn get_project_readings(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<WindowQuery>,
-) -> Result<Json<crate::project_readings::Readings>, StatusCode> {
+) -> Result<Json<crate::project::readings::Readings>, StatusCode> {
     let days = query
         .days
-        .unwrap_or(crate::project_readings::DEFAULT_WINDOW_DAYS);
-    crate::project_readings::readings(&state.pool, &id, days, chrono::Utc::now())
+        .unwrap_or(crate::project::readings::DEFAULT_WINDOW_DAYS);
+    crate::project::readings::readings(&state.pool, &id, days, chrono::Utc::now())
         .await
         .map(Json)
         .map_err(|error| {
@@ -5231,7 +5241,7 @@ async fn get_project_readings(
 #[derive(Serialize)]
 struct MapAnswer {
     #[serde(flatten)]
-    structure: crate::project_map::Structure,
+    structure: crate::map::Structure,
     /// §16.4's L0: the boundary between the two sides of this product, read from both ends.
     ///
     /// **On this answer and not on a route of its own, unlike `map/items`, and the difference is
@@ -5241,24 +5251,24 @@ struct MapAnswer {
     /// walk the tree again to learn what `structure` above already knows. It is computed from
     /// exactly those modules for the same reason: one definition of *which files are this
     /// project*.
-    seam: crate::map_seam::Seam,
-    junction: crate::map_join::Junction,
+    seam: crate::map::seam::Seam,
+    junction: crate::map::join::Junction,
     /// Where each decision stands, by `decision_id`.
     ///
     /// **A map and never a parallel array.** Two arrays that must stay index-aligned is a bug
     /// waiting for the first re-sort, and the re-sort duly arrived: `junction.decisions` leaves
-    /// [`crate::map_join::join`] in `spec_slug, ordinal, id` and leaves this handler in §10's
+    /// [`crate::map::join::join`] in `spec_slug, ordinal, id` and leaves this handler in §10's
     /// recency order. Keyed by id, the client survived that; keyed by position it would now be
     /// drawing one decision's verdict against another's text, and nothing on the screen would look
     /// wrong.
-    standings: std::collections::BTreeMap<i64, crate::map_stamp::Standing>,
+    standings: std::collections::BTreeMap<i64, crate::map::stamp::Standing>,
     /// §5.3's header, tallied from exactly the standings above.
-    stamps: crate::map_stamp::StampCounts,
+    stamps: crate::map::stamp::StampCounts,
     /// What the triager said about each decision, by `decision_id` — and only where that is still
     /// an answer about this map.
     ///
-    /// **Two filters stand between [`crate::map_store::judgements`] and this field, and both are
-    /// required for §5.3's numbers to add up.** [`crate::map_triage::reconcile`] argues them in
+    /// **Two filters stand between [`crate::map::store::judgements`] and this field, and both are
+    /// required for §5.3's numbers to add up.** [`crate::map::triage::reconcile`] argues them in
     /// full; the short of it is that a judgement about a decision somebody has since stamped
     /// describes a decision that has left triage's scope (§10), and a judgement whose
     /// `inputs_digest` no longer matches describes code that has since moved. Counting either
@@ -5270,8 +5280,8 @@ struct MapAnswer {
     ///
     /// **The staleness test is three-valued, and the third value is why a judgement is kept rather
     /// than dropped when git will not answer.** A judgement whose digest cannot be COMPUTED — the
-    /// decision's anchors came back [`crate::map_stamp::Anchors::Failed`] — is neither current nor
-    /// expired, so it arrives here [`crate::map_triage::Held::checked`] `false` and counts in
+    /// decision's anchors came back [`crate::map::stamp::Anchors::Failed`] — is neither current nor
+    /// expired, so it arrives here [`crate::map::triage::Held::checked`] `false` and counts in
     /// whichever pile it was already in. Dropping it was the first shape of this field and it was
     /// wrong at the scale of the whole project: every stored judgement is written against a
     /// `Computed(...)` reading, so one git hiccup made all of them stale at once and the map
@@ -5282,21 +5292,21 @@ struct MapAnswer {
     ///
     /// A judgement that WAS tested and failed is genuinely dropped, and the decision reads
     /// untriaged, which is what it is: §10 sends the triager back over it.
-    triage: std::collections::BTreeMap<i64, crate::map_triage::Held>,
+    triage: std::collections::BTreeMap<i64, crate::map::triage::Held>,
     /// §5.3's `J à tua espera` and `K nunca vistas`, tallied in the same pass that built `triage`.
     ///
     /// **Beside [`MapAnswer::stamps`] rather than inside it**, which is
-    /// [`crate::map_triage::TriageCounts`]'s own argument: `stamps` is the denominator these numbers
+    /// [`crate::map::triage::TriageCounts`]'s own argument: `stamps` is the denominator these numbers
     /// are checked against, and one function producing both sides of `flagged + silenced + untriaged
     /// == never` could not be checked by anything.
-    triage_counts: crate::map_triage::TriageCounts,
+    triage_counts: crate::map::triage::TriageCounts,
     /// **One fact about this whole reading, and never a fact about any single decision.**
     ///
-    /// `map_stamp::digest` is all-or-nothing on purpose — one record it cannot parse takes the
+    /// `map::stamp::digest` is all-or-nothing on purpose — one record it cannot parse takes the
     /// entire call to a failure, because dropping an anchor would read as `gone`, a file that never
     /// went anywhere. Correct for one anchor set; combined with this route calling it **once** for
     /// the union of every decision's anchors, it means a git that will not answer takes every
-    /// settled stamp in the project to [`crate::map_stamp::Lapse::Unreadable`] at the same instant.
+    /// settled stamp in the project to [`crate::map::stamp::Lapse::Unreadable`] at the same instant.
     ///
     /// That blast radius is accepted — the alternative is up to 350 process spawns on a route the
     /// window calls every time the map opens — and this flag is the price of accepting it. The
@@ -5306,26 +5316,26 @@ struct MapAnswer {
     ///
     /// **Named for git refusing, and it was renamed from `anchors_unreadable` to make one thing
     /// impossible: printing *try again* at somebody with nothing to retry.** This flag is
-    /// [`crate::map_stamp::Anchors::Failed`] and nothing else. A project with no git repository at
+    /// [`crate::map::stamp::Anchors::Failed`] and nothing else. A project with no git repository at
     /// all — §11's ordinary case — leaves it `false`, because there is nothing wrong there and no
     /// retry that could help; what that project gets instead is
-    /// [`crate::map_stamp::Watch::NoRepository`] on each of its greens, which is a permanent fact
+    /// [`crate::map::stamp::Watch::NoRepository`] on each of its greens, which is a permanent fact
     /// and reads as one. The older name covered both, and the sentence a shell would have written
     /// under it was false for exactly the project that could do least about it.
     ///
     /// A decision with no anchor paths is untouched by this either way: git was never asked about
     /// it, so its digest is `""` however git is faring, and it stays
-    /// [`crate::map_stamp::Watch::NoAnchor`] rather than flapping every time this goes up.
+    /// [`crate::map::stamp::Watch::NoAnchor`] rather than flapping every time this goes up.
     git_would_not_answer: bool,
     /// §10's ordering — what `junction.decisions` is sorted by, and how far that sort can see.
     ///
     /// **Beside the list rather than folded into it, because the order is only half the answer.**
     /// A list carries the sequence and nothing about which part of it is a fact: on this repository
     /// 83 of the 112 anchor files fall inside the window and every decision behind the other 29
-    /// ties, so a panel drawing this without [`crate::map_recency::Recency::window`] would present
+    /// ties, so a panel drawing this without [`crate::map::recency::Recency::window`] would present
     /// a mostly arbitrary tail with the same confidence as the head. §10 offers this ordering as
     /// *um facto do git*, and the honest way to keep that true is to say how far the git looked.
-    recency: crate::map_recency::Recency,
+    recency: crate::map::recency::Recency,
     /// When this project's triager last answered anything, or `null` if it never has.
     ///
     /// **The one thing `triage` and `triage_counts` cannot say, and a panel was reduced to guessing
@@ -5338,7 +5348,7 @@ struct MapAnswer {
     /// daemon declines a question it could answer.
     ///
     /// **Deliberately unfiltered by staleness and by standing.** See
-    /// [`crate::map_store::last_triaged`]: filtering either way would make `null` mean *nothing it
+    /// [`crate::map::store::last_triaged`]: filtering either way would make `null` mean *nothing it
     /// said still stands*, which is a different sentence and one the numbers already carry.
     last_triaged_at: Option<String>,
 }
@@ -5372,9 +5382,9 @@ struct MapAnswer {
 /// nodes: the disease with better pixels. It also means `map_join`'s tests are tests of what ships,
 /// rather than of a library the product bypasses.
 ///
-/// **Nothing here filters on `approved_at`.** [`crate::map_store::approved`] already selects
+/// **Nothing here filters on `approved_at`.** [`crate::map::store::approved`] already selects
 /// `approved_at IS NOT NULL AND retired_at IS NULL`, and a second filter in this handler is the
-/// one that goes stale — the argument [`crate::map_store::decide`] makes about checks that live in
+/// one that goes stale — the argument [`crate::map::store::decide`] makes about checks that live in
 /// handlers, and the failure `from_row` next door already had once.
 ///
 /// A missing folder is a 404 and a failed query is a 500 — see [`project_junction`], which is where
@@ -5394,7 +5404,7 @@ async fn get_project_map(
     let seam = {
         let root = root.clone();
         let modules = structure.modules.clone();
-        tokio::task::spawn_blocking(move || crate::map_seam::seam(&root, &modules))
+        tokio::task::spawn_blocking(move || crate::map::seam::seam(&root, &modules))
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .map_err(|error| {
@@ -5411,16 +5421,16 @@ async fn get_project_map(
     // §10's order, and the SAME call `POST /map/triage` makes before its sweep. Two orderings would
     // be two answers to one sentence of the spec, and the one deciding which twenty decisions get a
     // model call spent on them would be the one nobody ever looked at.
-    let walked = crate::map_recency::walk(&root).await;
-    let recency = crate::map_recency::order(&mut junction.decisions, &walked);
+    let walked = crate::map::recency::walk(&root).await;
+    let recency = crate::map::recency::order(&mut junction.decisions, &walked);
 
-    let stamped = crate::map_store::stamps(&state.pool, &id)
+    let stamped = crate::map::store::stamps(&state.pool, &id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "project map stamps failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    let latest: std::collections::BTreeMap<i64, &crate::map_store::Stamp> = stamped
+    let latest: std::collections::BTreeMap<i64, &crate::map::store::Stamp> = stamped
         .iter()
         .map(|stamp| (stamp.decision_id, stamp))
         .collect();
@@ -5430,7 +5440,7 @@ async fn get_project_map(
     // gone stale comes back from it empty — identical to a project nobody ever pressed the button
     // on. One `MAX` over the table tells those two apart, and it is the difference between a panel
     // saying *it has never run here* and a panel hedging.
-    let last_triaged_at = crate::map_store::last_triaged(&state.pool, &id)
+    let last_triaged_at = crate::map::store::last_triaged(&state.pool, &id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "reading the last triage run failed");
@@ -5438,16 +5448,16 @@ async fn get_project_map(
         })?;
 
     // The whole pile, stale rows and all, and the staleness decided below where the reading of the
-    // repository is. `map_store::judgements` cannot decide it — see `Judged`, which argues why the
+    // repository is. `map::store::judgements` cannot decide it — see `Judged`, which argues why the
     // comparison belongs to whoever holds that reading, and what a store that filtered would have
     // cost §6.2's pile.
-    let answered = crate::map_store::judgements(&state.pool, &id)
+    let answered = crate::map::store::judgements(&state.pool, &id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "reading the triage pile failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    let mut stored: std::collections::BTreeMap<i64, crate::map_store::Judged> = answered
+    let mut stored: std::collections::BTreeMap<i64, crate::map::store::Judged> = answered
         .into_iter()
         .map(|judged| (judged.decision_id, judged))
         .collect();
@@ -5458,22 +5468,22 @@ async fn get_project_map(
     let now = chrono::Utc::now();
     let mut standings = std::collections::BTreeMap::new();
     // The judgements that survived the staleness test, in the order the decisions come in.
-    // `map_triage::reconcile` applies the other filter — the one about standing — and tallies what
+    // `map::triage::reconcile` applies the other filter — the one about standing — and tallies what
     // is left in the same pass that builds the map this answer ships.
     let mut current = Vec::new();
     for anchored in &junction.decisions {
         let anchors = anchor_reading(&readings, anchored.decision_id);
         standings.insert(
             anchored.decision_id,
-            crate::map_stamp::standing(
+            crate::map::stamp::standing(
                 latest.get(&anchored.decision_id).copied(),
-                crate::map_stamp::Anchoring {
+                crate::map::stamp::Anchoring {
                     current: anchors,
                     named: anchored.modules.len(),
                     // `Declared` and not merely *something names this section*. §8 is unfixed, so
                     // this is `false` for every decision in this repository today, and that is the
                     // measurement rather than a defect — see `Watch::Guessed`.
-                    declared: anchored.anchor == crate::map_join::Anchor::Declared,
+                    declared: anchored.anchor == crate::map::join::Anchor::Declared,
                 },
                 now,
             ),
@@ -5492,19 +5502,19 @@ async fn get_project_map(
             // staleness test at all, it would be a guaranteed *no* dressed as one. The judgement is
             // kept and marked instead, exactly as `POST /map/triage` skips such a decision rather
             // than triaging it under a digest that dies when git recovers.
-            if matches!(anchors, crate::map_stamp::Anchors::Failed) {
-                current.push(crate::map_triage::Held {
+            if matches!(anchors, crate::map::stamp::Anchors::Failed) {
+                current.push(crate::map::triage::Held {
                     checked: false,
                     judged,
                 });
                 continue;
             }
-            let digest = crate::map_triage::inputs_digest(crate::map_triage::Evidence {
+            let digest = crate::map::triage::inputs_digest(crate::map::triage::Evidence {
                 decision: anchored,
                 anchors,
             });
-            if crate::map_triage::is_current(&judged.inputs_digest, &digest) {
-                current.push(crate::map_triage::Held {
+            if crate::map::triage::is_current(&judged.inputs_digest, &digest) {
+                current.push(crate::map::triage::Held {
                     checked: true,
                     judged,
                 });
@@ -5512,14 +5522,14 @@ async fn get_project_map(
         }
     }
 
-    let stamps = crate::map_stamp::counts(&standings.values().cloned().collect::<Vec<_>>());
+    let stamps = crate::map::stamp::counts(&standings.values().cloned().collect::<Vec<_>>());
     // The map the panel draws and the two numbers above it, out of one pass over one reading. Two
     // calls — one to filter, one to tally — would be two chances to ship one set and count another,
     // and the screen would look entirely correct while doing it.
-    let crate::map_triage::Reconciled {
+    let crate::map::triage::Reconciled {
         judgements: triage,
         counts: triage_counts,
-    } = crate::map_triage::reconcile(&standings, &stamps, current);
+    } = crate::map::triage::reconcile(&standings, &stamps, current);
     // The two header lines on that screen come from different places — this one from
     // `standings.len()`, the other from the join — and they can only agree if the loop above put
     // exactly one standing against every approved decision. A test asserts it too, because a
@@ -5537,7 +5547,7 @@ async fn get_project_map(
         stamps,
         triage,
         triage_counts,
-        git_would_not_answer: anchors == crate::map_stamp::Anchors::Failed,
+        git_would_not_answer: anchors == crate::map::stamp::Anchors::Failed,
         recency,
         last_triaged_at,
     }))
@@ -5561,7 +5571,7 @@ async fn get_project_map(
 /// the window opens, so a call each would be ~350 process spawns on a route somebody is waiting
 /// on. The second is the ceiling: the union of this repository's paths measures 732 entries and
 /// **24 224 characters of argv — 75 % of the 32 767 Windows allows** — so the chunking
-/// `map_stamp::digest` already does is load-bearing here rather than decorative, and a project a
+/// `map::stamp::digest` already does is load-bearing here rather than decorative, and a project a
 /// third larger than this one goes over it.
 ///
 /// The union must produce exactly what the per-decision loop would have, or it is an optimisation
@@ -5576,10 +5586,10 @@ async fn get_project_map(
 /// only the union call holds.
 async fn anchor_digests(
     root: &std::path::Path,
-    decisions: &[crate::map_join::Anchored],
+    decisions: &[crate::map::join::Anchored],
 ) -> (
-    std::collections::BTreeMap<i64, crate::map_stamp::Anchors>,
-    crate::map_stamp::Anchors,
+    std::collections::BTreeMap<i64, crate::map::stamp::Anchors>,
+    crate::map::stamp::Anchors,
 ) {
     // `watched` and not `modules`, which is the whole of §14's cure reaching the expiry rule: a
     // stamp has to keep watching the files somebody wrote down even after the comment that first
@@ -5594,11 +5604,11 @@ async fn anchor_digests(
         union.extend(paths.iter().map(String::as_str));
     }
     let union: Vec<String> = union.into_iter().map(str::to_owned).collect();
-    let anchors = crate::map_stamp::digest(root, &union).await;
+    let anchors = crate::map::stamp::digest(root, &union).await;
     // Parsed once and not once per decision: 350 decisions against a 52 KB digest is 350 walks of
     // the same text for an answer that cannot change between them.
     let tracked = match &anchors {
-        crate::map_stamp::Anchors::Computed(text) => Some(crate::map_stamp::parse(text)),
+        crate::map::stamp::Anchors::Computed(text) => Some(crate::map::stamp::parse(text)),
         _ => None,
     };
 
@@ -5612,11 +5622,11 @@ async fn anchor_digests(
             .get(&anchored.decision_id)
             .expect("every decision was given a watched set just above");
         let current = if watched.is_empty() {
-            crate::map_stamp::Anchors::Computed(String::new())
+            crate::map::stamp::Anchors::Computed(String::new())
         } else {
             match (&anchors, &tracked) {
-                (crate::map_stamp::Anchors::Computed(_), Some(tracked)) => {
-                    crate::map_stamp::Anchors::Computed(crate::map_stamp::canonical(
+                (crate::map::stamp::Anchors::Computed(_), Some(tracked)) => {
+                    crate::map::stamp::Anchors::Computed(crate::map::stamp::canonical(
                         watched.iter().filter_map(|path| {
                             tracked
                                 .get(path.as_str())
@@ -5624,10 +5634,10 @@ async fn anchor_digests(
                         }),
                     ))
                 }
-                (crate::map_stamp::Anchors::NoRepository, _) => {
-                    crate::map_stamp::Anchors::NoRepository
+                (crate::map::stamp::Anchors::NoRepository, _) => {
+                    crate::map::stamp::Anchors::NoRepository
                 }
-                _ => crate::map_stamp::Anchors::Failed,
+                _ => crate::map::stamp::Anchors::Failed,
             }
         };
         per_decision.insert(anchored.decision_id, current);
@@ -5642,15 +5652,15 @@ async fn anchor_digests(
 /// because the alternative to a fallback here is a panic in a handler and the alternative to both
 /// is dropping the decision, which would take it silently out of a header §5.3 requires to add up.
 ///
-/// [`crate::map_stamp::Anchors::Failed`] is the one value that is safe to be wrong with. It means
+/// [`crate::map::stamp::Anchors::Failed`] is the one value that is safe to be wrong with. It means
 /// *this daemon could not read the anchors*, which is exactly true if this were ever reached: a
 /// stamp reads as unreadable rather than as green, and a judgement made against it goes stale the
 /// moment git answers again. Both err towards asking, which is the direction §1 can afford.
 fn anchor_reading(
-    readings: &std::collections::BTreeMap<i64, crate::map_stamp::Anchors>,
+    readings: &std::collections::BTreeMap<i64, crate::map::stamp::Anchors>,
     decision_id: i64,
-) -> &crate::map_stamp::Anchors {
-    const UNREADABLE: crate::map_stamp::Anchors = crate::map_stamp::Anchors::Failed;
+) -> &crate::map::stamp::Anchors {
+    const UNREADABLE: crate::map::stamp::Anchors = crate::map::stamp::Anchors::Failed;
     readings.get(&decision_id).unwrap_or(&UNREADABLE)
 }
 
@@ -5675,16 +5685,16 @@ async fn project_junction(
     state: &AppState,
     id: &str,
     root: PathBuf,
-) -> Result<(crate::project_map::Structure, crate::map_join::Junction), StatusCode> {
+) -> Result<(crate::map::Structure, crate::map::join::Junction), StatusCode> {
     let walked = tokio::task::spawn_blocking(move || {
-        let structure = crate::project_map::structure(&root)?;
+        let structure = crate::map::structure(&root)?;
         // Slugs and not paths, for the reason `get_project_map_specs` gives below: a decision row
         // carries the slug, and the slug is what `join` checks a citation's candidate against.
         // Handing it paths would make every candidate fail to name its document, which reads as
         // "§8 is unfixed" and is indistinguishable from it.
-        let slugs: Vec<String> = crate::map_intent::specs_in(&root)
+        let slugs: Vec<String> = crate::map::intent::specs_in(&root)
             .iter()
-            .map(|path| crate::map_intent::spec_slug(path))
+            .map(|path| crate::map::intent::spec_slug(path))
             .collect();
         Ok::<_, std::io::Error>((structure, slugs))
     })
@@ -5703,7 +5713,7 @@ async fn project_junction(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let decisions = crate::map_store::approved(&state.pool, id)
+    let decisions = crate::map::store::approved(&state.pool, id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "project map decisions failed");
@@ -5716,14 +5726,14 @@ async fn project_junction(
     // rather than merged into the payload afterwards, because `join` needs them: a file somebody
     // wrote down as a decision's code is CLAIMED, and deciding that after the fact would mean a
     // second place that knows what §5.1's two piles mean.
-    let records = crate::map_store::anchors(&state.pool, id)
+    let records = crate::map::store::anchors(&state.pool, id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "reading the recorded anchors failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let junction = crate::map_join::join(
+    let junction = crate::map::join::join(
         &decisions,
         &structure.modules,
         &structure.foreign,
@@ -5736,7 +5746,7 @@ async fn project_junction(
 /// Which specs this project has, named the way the owner reads them.
 ///
 /// **Slugs and not paths.** The path is where the file happens to sit; the slug is what
-/// [`crate::map_intent::spec_slug`] produces, what the owner reads, what they hand back to
+/// [`crate::map::intent::spec_slug`] produces, what the owner reads, what they hand back to
 /// `POST /map/extract`, and what a decision row carries forever. Two projects keeping their specs
 /// in different folders name one document alike.
 ///
@@ -5744,7 +5754,7 @@ async fn project_junction(
 /// missing, and an empty list is that sentence's input — the same posture `map` itself takes
 /// about a folder with nothing in it.
 ///
-/// [`crate::map_intent::specs_in`] probes three conventional folders rather than reading a
+/// [`crate::map::intent::specs_in`] probes three conventional folders rather than reading a
 /// setting, and this route inherits that whole: a project matching none of them is not broken, it
 /// is unconfigured in a way nobody has to configure.
 ///
@@ -5756,9 +5766,9 @@ async fn get_project_map_specs(
 ) -> Result<Json<Vec<String>>, StatusCode> {
     let root = resolve_read_root(&state, &id, None).await?;
     tokio::task::spawn_blocking(move || {
-        crate::map_intent::specs_in(&root)
+        crate::map::intent::specs_in(&root)
             .iter()
-            .map(|path| crate::map_intent::spec_slug(path))
+            .map(|path| crate::map::intent::spec_slug(path))
             .collect::<Vec<_>>()
     })
     .await
@@ -5794,13 +5804,13 @@ struct MapItemsQuery {
 ///
 /// **A file this reader does not understand is a `200` and not a `404`**, carrying `reader: null`
 /// and no items. *I cannot read Go* and *there is no such file* are opposite answers, and the
-/// structure layer already spent a paragraph refusing to collapse them — [`crate::project_map`]'s
+/// structure layer already spent a paragraph refusing to collapse them — [`crate::map`]'s
 /// `unread` exists for that reason. A `404` here would reopen it one level down.
 async fn get_project_map_items(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<MapItemsQuery>,
-) -> Result<Json<crate::map_items::Items>, StatusCode> {
+) -> Result<Json<crate::map::items::Items>, StatusCode> {
     let root = resolve_read_root(&state, &id, None).await?;
 
     // On `spawn_blocking` for the reason `get_project_map` gives: this canonicalizes and reads a
@@ -5813,7 +5823,7 @@ async fn get_project_map_items(
                 _ => StatusCode::NOT_FOUND,
             })?;
         let source = std::fs::read_to_string(&full).map_err(|_| StatusCode::NOT_FOUND)?;
-        Ok(crate::map_items::items(&asked, &source))
+        Ok(crate::map::items::items(&asked, &source))
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -5823,7 +5833,7 @@ async fn get_project_map_items(
 #[derive(Deserialize)]
 struct MapExtractBody {
     /// The document's name, which is its filename without the extension — what
-    /// [`crate::map_intent::spec_slug`] produces and what a decision row carries forever. NOT a
+    /// [`crate::map::intent::spec_slug`] produces and what a decision row carries forever. NOT a
     /// path: two projects keeping their specs in different folders must name the same document the
     /// same way, and a path would also be a way to ask this route to read an arbitrary file.
     spec_slug: String,
@@ -5842,7 +5852,7 @@ struct MapExtractBody {
 /// **Sized knowing the staleness rate rather than guessing it.** Counted on this repository on
 /// 2026-08-26: 109 files under `core/src` and `shell/src` name a `§`, and **17 of them were touched
 /// in the last 20 commits** — 26 in the last 50. An anchor set is several files, so a decision's
-/// chance of going stale is HIGHER than that per-file sixth, and `map_triage::inputs_digest` covers
+/// chance of going stale is HIGHER than that per-file sixth, and `map::triage::inputs_digest` covers
 /// the anchor blobs precisely so it does. This repository will therefore rarely be in the "nothing
 /// stale" state, and the cap will sit saturated rather than draining once.
 ///
@@ -5855,8 +5865,8 @@ struct MapExtractBody {
 /// What stops the first twenty being the only twenty ever looked at is that a judgement still
 /// current costs no call, so the next press starts where the last one stopped.
 ///
-/// **Which twenty is [`crate::map_recency`]'s answer and not this constant's**, and the two were
-/// separated late: the sweep used to run in `map_store::approved`'s order — `spec_slug, ordinal,
+/// **Which twenty is [`crate::map::recency`]'s answer and not this constant's**, and the two were
+/// separated late: the sweep used to run in `map::store::approved`'s order — `spec_slug, ordinal,
 /// id` — which meant a saturated cap paid for the first twenty decisions alphabetically by
 /// document, every press, for ever. §10 says the order is by recency of the anchor code's last
 /// change, and until that landed this comment recorded the gap rather than pretending the order had
@@ -5898,7 +5908,7 @@ async fn post_project_map_extract(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<MapExtractBody>,
-) -> Result<Json<Vec<crate::map_store::Decision>>, StatusCode> {
+) -> Result<Json<Vec<crate::map::store::Decision>>, StatusCode> {
     let brain = read_brain(&body.brain).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
     let root = resolve_read_root(&state, &id, None).await?;
 
@@ -5909,9 +5919,9 @@ async fn post_project_map_extract(
     // is a fault of this daemon.
     let wanted = body.spec_slug.clone();
     let source = tokio::task::spawn_blocking(move || {
-        let path = crate::map_intent::specs_in(&root)
+        let path = crate::map::intent::specs_in(&root)
             .into_iter()
-            .find(|path| crate::map_intent::spec_slug(path) == wanted)?;
+            .find(|path| crate::map::intent::spec_slug(path) == wanted)?;
         std::fs::read_to_string(root.join(path)).ok()
     })
     .await
@@ -5922,11 +5932,13 @@ async fn post_project_map_extract(
     // `match` that creates it.
     let local_model;
     let asked = match brain {
-        crate::chats::Brain::Cloud => crate::map_intent::Extractor::Cli(state.runner.as_ref()),
+        crate::chats::Brain::Cloud => crate::map::intent::Extractor::Cli(state.runner.as_ref()),
         // `read_brain` above (~3068) only ever yields `cloud` or `local` — this arm exists to
         // satisfy exhaustiveness over the full `Brain` type, not to describe a state this route can
         // reach today. Whoever makes the hosted route selectable HERE owns replacing it.
-        crate::chats::Brain::OpenRouter => crate::map_intent::Extractor::Cli(state.runner.as_ref()),
+        crate::chats::Brain::OpenRouter => {
+            crate::map::intent::Extractor::Cli(state.runner.as_ref())
+        }
         crate::chats::Brain::Local => {
             // Read per request rather than cached on `AppState`, which is the argument
             // `models_config`'s own doc comment makes: a name cached at startup is one the owner
@@ -5945,7 +5957,7 @@ async fn post_project_map_extract(
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             };
             local_model = model;
-            crate::map_intent::Extractor::Loopback {
+            crate::map::intent::Extractor::Loopback {
                 client: &state.web.http,
                 base_url: crate::runner::OLLAMA_BASE_URL,
                 model: &local_model,
@@ -5953,7 +5965,7 @@ async fn post_project_map_extract(
         }
     };
 
-    let decisions = crate::map_intent::extract(asked, &body.spec_slug, &source)
+    let decisions = crate::map::intent::extract(asked, &body.spec_slug, &source)
         .await
         .map_err(|error| {
             // 502 and not 500: the daemon did its part and the thing it asked did not answer. An
@@ -5970,7 +5982,7 @@ async fn post_project_map_extract(
             StatusCode::BAD_GATEWAY
         })?;
 
-    crate::map_store::record(&state.pool, &id, &body.spec_slug, brain, &decisions)
+    crate::map::store::record(&state.pool, &id, &body.spec_slug, brain, &decisions)
         .await
         .map_err(|error| {
             tracing::warn!(
@@ -5984,7 +5996,7 @@ async fn post_project_map_extract(
 
     // The whole pile and not this extraction, because the pile is what the owner reads. A window
     // handed only what just arrived would show a shrinking list every time a second spec was read.
-    crate::map_store::pending(&state.pool, &id)
+    crate::map::store::pending(&state.pool, &id)
         .await
         .map(Json)
         .map_err(|error| {
@@ -5998,7 +6010,7 @@ async fn post_project_map_extract(
 /// The same list `POST …/map/extract` hands back. Separate because a window that was already open
 /// has to be able to refresh the pile, and the only other way to ask for it costs a model run.
 ///
-/// Ordered by [`crate::map_store::pending`]: oldest extraction first, because a pile read in the
+/// Ordered by [`crate::map::store::pending`]: oldest extraction first, because a pile read in the
 /// order it arrived is a pile that ends.
 ///
 /// The project is resolved first, the way `map` and `map/extract` do it, so an id nobody registered
@@ -6009,9 +6021,9 @@ async fn post_project_map_extract(
 async fn get_project_map_decisions(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<crate::map_store::Decision>>, StatusCode> {
+) -> Result<Json<Vec<crate::map::store::Decision>>, StatusCode> {
     resolve_project_root(&state, &id).await?;
-    crate::map_store::pending(&state.pool, &id)
+    crate::map::store::pending(&state.pool, &id)
         .await
         .map(Json)
         .map_err(|error| {
@@ -6031,7 +6043,7 @@ async fn get_project_map_decisions(
 /// does with the same table, and all three departures are deliberate.** That route answers *what is
 /// true now*: a judgement about a decision the owner has since stamped, or about code that has
 /// since moved, is not an answer to its question, and a retired decision is not in its map at all
-/// — see [`crate::map_triage::reconcile`], which is where §5.3's numbers would otherwise stop
+/// — see [`crate::map::triage::reconcile`], which is where §5.3's numbers would otherwise stop
 /// reconciling. This route answers *what the triager did*, and each of the three filters would
 /// delete part of that record:
 ///
@@ -6049,7 +6061,7 @@ async fn get_project_map_decisions(
 /// `a_silencing_survives_the_decision_being_retired` are the tests that stop it.
 ///
 /// **Every silencing ever written and not the latest judgement per decision**, which is
-/// [`crate::map_store::silencings`] rather than `judgements` and is what §6.2 literally asks for:
+/// [`crate::map::store::silencings`] rather than `judgements` and is what §6.2 literally asks for:
 /// *"a razão de **cada** silenciamento"*. A decision silenced last week and flagged today has a
 /// silencing in the table, and until this route read the history it had none in the pile —
 /// `map_triage` was made append-only for precisely that row and nothing was reading it.
@@ -6061,10 +6073,10 @@ async fn get_project_map_decisions(
 /// different answers and only one of them is true.
 ///
 /// The order is the store's — newest first, ties broken by insertion order — and the argument for
-/// it is [`crate::map_store::silencings`]'s. Sorted in SQL and not here, because with the whole
+/// it is [`crate::map::store::silencings`]'s. Sorted in SQL and not here, because with the whole
 /// history in the pile the tie-break has to be `id` and a handler cannot see one.
 ///
-/// **Capped at [`crate::map_store::SILENCED_PAGE`], with the uncapped total on the answer.** *Sempre
+/// **Capped at [`crate::map::store::SILENCED_PAGE`], with the uncapped total on the answer.** *Sempre
 /// acessível* is not *all at once*, and this table only grows: append-only by design, by up to
 /// `MAX_TRIAGE_BATCH` rows per press of the button the feature exists to encourage, on a route the
 /// window performs every time the map opens. The write side was bounded from the first commit and
@@ -6073,24 +6085,24 @@ async fn get_project_map_decisions(
 /// [`TriageReport::left_over`] strikes one route over, and the same one every capped pile in the
 /// window keeps.
 ///
-/// **It answers [`crate::map_store::Silencing`] rows and nothing wrapped around them, and the
+/// **It answers [`crate::map::store::Silencing`] rows and nothing wrapped around them, and the
 /// wrapper's removal is a correction rather than a tidy-up.** A `SilencedRow` here added
 /// `machine_written`, which could not be `true` on this route: the one producer of a daemon-written
-/// reason is [`crate::map_triage::unreadable_flag`], which may only ever reach
-/// [`crate::map_triage::Judgement::Flagged`], while [`crate::map_store::silencings`] selects the
+/// reason is [`crate::map::triage::unreadable_flag`], which may only ever reach
+/// [`crate::map::triage::Judgement::Flagged`], while [`crate::map::store::silencings`] selects the
 /// silenced. So the payload where the answer is provably always `false` carried the field and
 /// `GET /map`'s `triage` — the only place a `nucleos:` sentence can appear at all — carried nothing,
-/// which made a client re-spell [`crate::map_triage::DAEMON_MARK`] in its own language to keep §6.2's
-/// attribution. It now lives on [`crate::map_store::Judged`], computed at the only place a row of
+/// which made a client re-spell [`crate::map::triage::DAEMON_MARK`] in its own language to keep §6.2's
+/// attribution. It now lives on [`crate::map::store::Judged`], computed at the only place a row of
 /// that table becomes a value. A field that can never be true is worse than an absent one: it is a
 /// promise somebody eventually relies on, and this one would have been relied on for the wrong pile.
 async fn get_project_map_silenced(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<crate::map_store::SilencedPile>, StatusCode> {
+) -> Result<Json<crate::map::store::SilencedPile>, StatusCode> {
     resolve_project_root(&state, &id).await?;
 
-    crate::map_store::silencings(&state.pool, &id)
+    crate::map::store::silencings(&state.pool, &id)
         .await
         .map(Json)
         .map_err(|error| {
@@ -6106,7 +6118,7 @@ struct MapOrphanQuery {
     slug: String,
     /// The heading the decision was copied from, **verbatim** — `## 4.1 Três tipos de decisão`.
     ///
-    /// The heading and not the number, so that [`crate::map_join::section_number`] stays the one
+    /// The heading and not the number, so that [`crate::map::join::section_number`] stays the one
     /// place that knows how one becomes the other. A client that sent the number would be a second
     /// implementation of that rule, and the day the two disagreed the guard would be searching the
     /// history for a section the junction never anchored anything to.
@@ -6116,15 +6128,15 @@ struct MapOrphanQuery {
 /// Whether a decision with no code was never built, or lost the comment that anchored it (§14).
 ///
 /// **Three refusals, and each is a different sentence.** `422` for a heading carrying no number:
-/// that is [`crate::map_join::Anchor::Unnumbered`], where no search ever ran, and answering
+/// that is [`crate::map::join::Anchor::Unnumbered`], where no search ever ran, and answering
 /// *nothing ever named it* about a question nobody could ask would be the silent wrong answer this
 /// whole feature refuses. `404` for a slug this project has no document for — the same answer
 /// `map/extract` gives it, and for its reason. Everything else is a `200` carrying one of
-/// [`crate::map_orphan::Orphan`]'s six states, including the two that mean *I could not look*: a
+/// [`crate::map::orphan::Orphan`]'s six states, including the two that mean *I could not look*: a
 /// git that would not answer is a finding and not a fault of this daemon.
 ///
 /// **There is deliberately NO refusal for a document that is not on disk**, and the first version
-/// of this route had one. It answered `404` when the slug was missing from `map_intent::specs_in`,
+/// of this route had one. It answered `404` when the slug was missing from `map::intent::specs_in`,
 /// which made the guard the only part of this map that stops working when a spec file is archived
 /// or renamed — `GET /map` keeps showing those decisions, because their text was copied into the
 /// table at extraction and the folder was never where they lived. Worse, the slug IS the filename,
@@ -6136,10 +6148,10 @@ async fn get_project_map_orphan(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<MapOrphanQuery>,
-) -> Result<Json<crate::map_orphan::Orphan>, StatusCode> {
+) -> Result<Json<crate::map::orphan::Orphan>, StatusCode> {
     let root = resolve_read_root(&state, &id, None).await?;
 
-    let Some(section) = crate::map_join::section_number(&query.section) else {
+    let Some(section) = crate::map::join::section_number(&query.section) else {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     };
 
@@ -6148,9 +6160,9 @@ async fn get_project_map_orphan(
     // it, because the slug is what a citation's candidate is checked against.
     let listing = root.clone();
     let on_disk: Vec<String> = tokio::task::spawn_blocking(move || {
-        crate::map_intent::specs_in(&listing)
+        crate::map::intent::specs_in(&listing)
             .iter()
-            .map(|path| crate::map_intent::spec_slug(path))
+            .map(|path| crate::map::intent::spec_slug(path))
             .collect()
     })
     .await
@@ -6159,7 +6171,7 @@ async fn get_project_map_orphan(
     let slugs = document_slugs(&state, &id, on_disk).await?;
 
     Ok(Json(
-        crate::map_orphan::orphan(&root, &section, &query.slug, &slugs).await,
+        crate::map::orphan::orphan(&root, &section, &query.slug, &slugs).await,
     ))
 }
 
@@ -6176,7 +6188,7 @@ struct MapDecisionBody {
 /// **No bulk form, and that is §4 rather than an omission.** The list is approved line by line; a
 /// route that took the whole list would be the thousand-line plan again, wearing a smaller shape.
 ///
-/// `204` when a row changed and `404` when none did. [`crate::map_store::decide`] returns `false`
+/// `204` when a row changed and `404` when none did. [`crate::map::store::decide`] returns `false`
 /// for three different reasons — a line belonging to another project, an id that never existed, and
 /// a line somebody already answered — and they are deliberately one answer here. All three mean
 /// *that line is not yours to answer now*; telling them apart would tell a caller which ids exist
@@ -6193,7 +6205,7 @@ async fn post_project_map_decision(
     Path((id, decision)): Path<(String, i64)>,
     Json(body): Json<MapDecisionBody>,
 ) -> Result<StatusCode, StatusCode> {
-    match crate::map_store::decide(&state.pool, &id, decision, body.approved).await {
+    match crate::map::store::decide(&state.pool, &id, decision, body.approved).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(error) => {
@@ -6210,11 +6222,11 @@ struct MapStampBody {
     ///
     /// Typed rather than taken as a `String` and read afterwards, which is where `read_brain` next
     /// door had to end up and why the two differ. `Brain::from_wire` reads anything unfamiliar as
-    /// `Cloud`, so that route needed a stricter reader of its own; [`crate::map_stamp::Verdict`]'s
+    /// `Cloud`, so that route needed a stricter reader of its own; [`crate::map::stamp::Verdict`]'s
     /// derived `Deserialize` is already exact — §5.2 has three and `0124`'s CHECK admits three — so
     /// a fourth is refused before this function runs at all. That is the earliest place it can be
     /// refused, and the only one where nothing has yet had a chance to guess what was meant.
-    verdict: crate::map_stamp::Verdict,
+    verdict: crate::map::stamp::Verdict,
     /// Obligatory on amber and optional on the other two (§7).
     ///
     /// `serde(default)` so a client that has nothing to say may omit the field rather than having
@@ -6251,7 +6263,7 @@ struct MapStampBody {
 ///   the only verdict the code moving can falsify, so it is the only one that may not be recorded
 ///   without knowing what it is anchored to; the other two take a NULL digest without complaint,
 ///   because neither has an expiry the code can reach. **A project with no git repository is not
-///   this case** and gets a `204` — see the `NoRepository` arm below, and [`crate::map_stamp::Anchors`]
+///   this case** and gets a `204` — see the `NoRepository` arm below, and [`crate::map::stamp::Anchors`]
 ///   for what telling the two apart cost when they were one value.
 ///
 /// **The tree walk on this path is deliberate, and it is the second one this click pays for.** The
@@ -6265,8 +6277,8 @@ struct MapStampBody {
 /// by a git call and by the join, and a client guessing `Watched` would put a certain word on screen
 /// over an anchor set nobody has read yet.
 ///
-/// **The decision is looked up here, and that is not the handler check [`crate::map_store::decide`]
-/// argues against.** `map_store::stamp` still puts `project_id`, `approved_at` and `retired_at` in
+/// **The decision is looked up here, and that is not the handler check [`crate::map::store::decide`]
+/// argues against.** `map::store::stamp` still puts `project_id`, `approved_at` and `retired_at` in
 /// its own `WHERE`, and that INSERT is what actually refuses the write — this lookup cannot replace
 /// it and does not try. It is forced: without finding the decision there is no anchor set to compute
 /// a digest from. Short-circuiting on it also fixes an ordering that would otherwise be wrong, and
@@ -6283,7 +6295,7 @@ async fn post_project_map_stamp(
     // and one that says nothing, and the failure that matters is being LOOSER than the CHECK, which
     // turns a client's mistake into a 500 about this daemon.
     let note = body.note.as_deref();
-    if body.verdict == crate::map_stamp::Verdict::Partial
+    if body.verdict == crate::map::stamp::Verdict::Partial
         && !note.is_some_and(|note| !note.trim().is_empty())
     {
         return Err(StatusCode::BAD_REQUEST);
@@ -6307,14 +6319,14 @@ async fn post_project_map_stamp(
     // the stamp adds nothing.
     let already_chosen = matches!(
         anchored.record.as_ref().map(|record| record.source),
-        Some(crate::map_store::AnchorSource::Owner)
+        Some(crate::map::store::AnchorSource::Owner)
     );
 
     // `Anchored::modules` and never `foreign` beside it. `Anchor::Declared` spends a paragraph on
     // why: watching an anchor means being able to read it, and promising an expiry over a Go file
     // this map cannot parse is a promise the read side cannot keep.
-    let digest = match crate::map_stamp::digest(&root, &anchors).await {
-        crate::map_stamp::Anchors::Computed(text) => Some(text),
+    let digest = match crate::map::stamp::digest(&root, &anchors).await {
+        crate::map::stamp::Anchors::Computed(text) => Some(text),
         // §11: a project added from outside may have no git repository at all, and that is not a
         // fault of anything. The stamp is **allowed**, and `''` is not a lie here — with no
         // repository there is genuinely nothing that could ever move, which is the same claim `''`
@@ -6323,10 +6335,10 @@ async fn post_project_map_stamp(
         // `503` would tell their owner to try again at something that cannot succeed.
         // `Watch::NoRepository` is what carries the reason back out, so the green is visible as one
         // that will never come and ask rather than passing for one that will.
-        crate::map_stamp::Anchors::NoRepository => Some(String::new()),
-        crate::map_stamp::Anchors::Failed => None,
+        crate::map::stamp::Anchors::NoRepository => Some(String::new()),
+        crate::map::stamp::Anchors::Failed => None,
     };
-    if digest.is_none() && body.verdict == crate::map_stamp::Verdict::Settled {
+    if digest.is_none() && body.verdict == crate::map::stamp::Verdict::Settled {
         tracing::warn!(
             project_id = %id,
             decision = body.decision_id,
@@ -6336,7 +6348,7 @@ async fn post_project_map_stamp(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    match crate::map_store::stamp(
+    match crate::map::store::stamp(
         &state.pool,
         &id,
         body.decision_id,
@@ -6353,12 +6365,12 @@ async fn post_project_map_stamp(
             // mirror-image reason — the owner's verdict IS recorded, and answering `500` would tell
             // them their stamp did not land when it did.
             if !already_chosen
-                && let Err(error) = crate::map_store::record_anchor(
+                && let Err(error) = crate::map::store::record_anchor(
                     &state.pool,
                     &id,
                     body.decision_id,
                     &anchors,
-                    crate::map_store::AnchorSource::Stamp,
+                    crate::map::store::AnchorSource::Stamp,
                 )
                 .await
             {
@@ -6414,7 +6426,7 @@ struct MapTriageBody {
 /// the other two hundred and ninety-seven were skipped.
 #[derive(Debug, Default, Serialize)]
 struct TriageReport {
-    /// Decisions in [`crate::map_stamp::Standing::Never`], which is the whole of what the triager
+    /// Decisions in [`crate::map::stamp::Standing::Never`], which is the whole of what the triager
     /// is allowed to look at (§10). Everything below is a bucket of this number.
     in_scope: usize,
     /// Judged already, against inputs that have not moved since. Cost nothing and asked nothing.
@@ -6428,7 +6440,7 @@ struct TriageReport {
     ///
     /// Counted apart from [`Self::unanswered`] because the two send whoever is debugging to
     /// different places: this one to the prompt, that one to the machine. See
-    /// [`crate::map_triage::unreadable_flag`] for why the row exists at all and what it costs.
+    /// [`crate::map::triage::unreadable_flag`] for why the row exists at all and what it costs.
     unreadable: usize,
     /// Nobody answered: the run itself failed. A brain that is down fails on every decision and a
     /// brain that is confused fails on one, so folding this into [`Self::unreadable`] would report
@@ -6451,8 +6463,8 @@ struct TriageReport {
     /// **Skipped and not triaged, which dissolves a storm rather than reporting one.** An earlier
     /// version of this route triaged them anyway and put a boolean on the report. The trouble is
     /// not the answer — the model reads none of its evidence from git, so an answer given during an
-    /// outage is as good as any other — it is the digest: `map_triage::inputs_digest` keeps all four
-    /// states of [`crate::map_stamp::Anchors`] apart on purpose, which is what `0124` was amended to
+    /// outage is as good as any other — it is the digest: `map::triage::inputs_digest` keeps all four
+    /// states of [`crate::map::stamp::Anchors`] apart on purpose, which is what `0124` was amended to
     /// require, so a judgement recorded under `git-failed` dies the moment git recovers. Every row
     /// written during an outage would have to be bought again.
     ///
@@ -6466,7 +6478,7 @@ struct TriageReport {
     /// neither *unchanged* nor *changed*, and acting on either guess is the error.
     ///
     /// **Not the same as §11's project with no repository**, which is
-    /// [`crate::map_stamp::Anchors::NoRepository`] and is triaged normally — with no repository
+    /// [`crate::map::stamp::Anchors::NoRepository`] and is triaged normally — with no repository
     /// there is genuinely nothing that could ever move, which is a permanent fact and an honest
     /// digest. Nor does it touch a decision no module names: that is `Computed("")`, reached without
     /// git being asked at all.
@@ -6475,13 +6487,13 @@ struct TriageReport {
 
 /// Ask a model which of the decisions nobody has stamped deserve their owner's eyes (§6, §10).
 ///
-/// **Only [`crate::map_stamp::Standing::Never`], and that is §10's table rather than a shortcut.**
+/// **Only [`crate::map::stamp::Standing::Never`], and that is §10's table rather than a shortcut.**
 /// A decision whose anchor code moved — *"se estava carimbada, caducou (§7.1); se nunca foi vista,
 /// o triador decide se vale o teu olhar."* A stamped decision already carries the owner's answer and
 /// a lapsed one already reaches them through §5.3's `J`, so running a model over either is the model
 /// second-guessing a human: the one authority §6 takes away from it, recovered through a sweep.
 ///
-/// **And only rows whose judgement is stale or absent.** `map_triage::is_current` against a digest
+/// **And only rows whose judgement is stale or absent.** `map::triage::is_current` against a digest
 /// computed now, so a second press over a repository nothing has happened to writes nothing and
 /// spends nothing. That is not an optimisation: without it the bill grows with how often somebody
 /// presses a button rather than with what changed, and a feature whose cost is unrelated to its
@@ -6540,18 +6552,18 @@ struct MapAnchorBody {
 /// junction pointing out of the tree are all refused by the function that already knows how,
 /// rather than by a second rule written here. A path that does not exist is refused too, and
 /// that is not tidiness: an anchor naming a file the project does not have would sit in
-/// [`crate::map_stamp::Lapse::Moved`]'s `gone` for ever, nagging about a file that was never
+/// [`crate::map::stamp::Lapse::Moved`]'s `gone` for ever, nagging about a file that was never
 /// there.
 ///
-/// **Deliberately not restricted to files the map can READ.** [`crate::project_map::scanned`]
+/// **Deliberately not restricted to files the map can READ.** [`crate::map::scanned`]
 /// decides whose `§` this reader parses; it has no standing over which files somebody’s code
 /// lives in. A Go sidecar, a migration, a stylesheet — the owner is entitled to say a
-/// decision's code is there, and `map_stamp::digest` watches any tracked path perfectly well.
+/// decision's code is there, and `map::stamp::digest` watches any tracked path perfectly well.
 /// Refusing them would make this route unusable for exactly the languages §11 already admits
 /// the map cannot read.
 ///
 /// `204` when a row was written, `404` when the decision is not this project’s, not approved,
-/// or retired — [`crate::map_store::decide`]'s three-reasons-one-answer, for its reason.
+/// or retired — [`crate::map::store::decide`]'s three-reasons-one-answer, for its reason.
 async fn post_project_map_anchors(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -6564,7 +6576,7 @@ async fn post_project_map_anchors(
         let mut kept: Vec<String> = Vec::with_capacity(asked.len());
         for path in &asked {
             // Backslashes normalised before anything looks at the string, because the map
-            // spells every path with forward slashes (`project_map::collect` does the same
+            // spells every path with forward slashes (`map::collect` does the same
             // `replace`) and a record written the other way would never match an anchor again.
             let cleaned = path.trim().replace('\\', "/");
             if cleaned.is_empty() {
@@ -6584,12 +6596,12 @@ async fn post_project_map_anchors(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
 
-    match crate::map_store::record_anchor(
+    match crate::map::store::record_anchor(
         &state.pool,
         &id,
         body.decision_id,
         &checked,
-        crate::map_store::AnchorSource::Owner,
+        crate::map::store::AnchorSource::Owner,
     )
     .await
     {
@@ -6622,33 +6634,33 @@ async fn post_project_map_triage(
     // sweep below caps at [`MAX_TRIAGE_BATCH`] and spends one model call per decision, so the order
     // it walks in decides which twenty of a three-hundred-row backlog get money spent on them —
     // every press, for as long as the cap stays saturated, which `MAX_TRIAGE_BATCH`'s own
-    // measurement says is the state this repository lives in. `map_store::approved`'s order is
+    // measurement says is the state this repository lives in. `map::store::approved`'s order is
     // `spec_slug, ordinal, id`, so what that bought was the first twenty decisions alphabetically by
     // document. The answer is discarded here and kept by `GET /map`: what this route needs is the
     // order, and what the panel needs is the order plus the window it is a fact about.
-    let walked = crate::map_recency::walk(&root).await;
-    let _ = crate::map_recency::order(&mut junction.decisions, &walked);
+    let walked = crate::map::recency::walk(&root).await;
+    let _ = crate::map::recency::order(&mut junction.decisions, &walked);
 
-    let stamped = crate::map_store::stamps(&state.pool, &id)
+    let stamped = crate::map::store::stamps(&state.pool, &id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "project map stamps failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    let latest: std::collections::BTreeMap<i64, &crate::map_store::Stamp> = stamped
+    let latest: std::collections::BTreeMap<i64, &crate::map::store::Stamp> = stamped
         .iter()
         .map(|stamp| (stamp.decision_id, stamp))
         .collect();
     // Read once, before any call. A judgement written by this very run cannot make one of its own
     // decisions "already current" — every decision is visited once — and reading per decision would
     // be one query per model call for an answer that cannot change under us.
-    let answered = crate::map_store::judgements(&state.pool, &id)
+    let answered = crate::map::store::judgements(&state.pool, &id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "reading the triage pile failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    let known: std::collections::BTreeMap<i64, &crate::map_store::Judged> = answered
+    let known: std::collections::BTreeMap<i64, &crate::map::store::Judged> = answered
         .iter()
         .map(|judged| (judged.decision_id, judged))
         .collect();
@@ -6658,7 +6670,7 @@ async fn post_project_map_triage(
     let local_model;
     let (asked, model) = match brain {
         crate::chats::Brain::Cloud => (
-            crate::map_intent::Extractor::Cli(state.runner.as_ref()),
+            crate::map::intent::Extractor::Cli(state.runner.as_ref()),
             // The brain and not a model name, and the limit is worth stating rather than hiding
             // behind a plausible string. §6.2 asks for *o modelo que o produziu*; the CLI chooses
             // its own model per run and `CommandRunner::model_for_stage` answers `None` for an
@@ -6678,7 +6690,7 @@ async fn post_project_map_triage(
         // A pile is read months later by somebody asking where their words went.
         //
         // Whoever makes the hosted route selectable here owns replacing this with a real extractor,
-        // and will find no extractor to reach for: `map_intent::Extractor` has `Cli` and `Loopback`
+        // and will find no extractor to reach for: `map::intent::Extractor` has `Cli` and `Loopback`
         // and nothing hosted. That is the work, not this arm.
         crate::chats::Brain::OpenRouter => {
             tracing::warn!(
@@ -6700,7 +6712,7 @@ async fn post_project_map_triage(
             };
             local_model = model;
             (
-                crate::map_intent::Extractor::Loopback {
+                crate::map::intent::Extractor::Loopback {
                     client: &state.web.http,
                     base_url: crate::runner::OLLAMA_BASE_URL,
                     model: &local_model,
@@ -6725,16 +6737,16 @@ async fn post_project_map_triage(
     // the next press starts where this one stopped, which is the drain `MAX_TRIAGE_BATCH` describes.
     for anchored in &junction.decisions {
         let current = anchor_reading(&readings, anchored.decision_id);
-        let standing = crate::map_stamp::standing(
+        let standing = crate::map::stamp::standing(
             latest.get(&anchored.decision_id).copied(),
-            crate::map_stamp::Anchoring {
+            crate::map::stamp::Anchoring {
                 current,
                 named: anchored.modules.len(),
-                declared: anchored.anchor == crate::map_join::Anchor::Declared,
+                declared: anchored.anchor == crate::map::join::Anchor::Declared,
             },
             now,
         );
-        if !matches!(standing, crate::map_stamp::Standing::Never) {
+        if !matches!(standing, crate::map::stamp::Standing::Never) {
             continue;
         }
         report.in_scope += 1;
@@ -6745,19 +6757,19 @@ async fn post_project_map_triage(
         // report three hundred decisions as freshly in need of a model when the only thing that
         // happened is that git hiccuped. Counted here, the number says what it is: the run was this
         // much narrower than it looks.
-        if matches!(current, crate::map_stamp::Anchors::Failed) {
+        if matches!(current, crate::map::stamp::Anchors::Failed) {
             report.unreadable_anchors += 1;
             continue;
         }
 
-        let evidence = crate::map_triage::Evidence {
+        let evidence = crate::map::triage::Evidence {
             decision: anchored,
             anchors: current,
         };
-        let digest = crate::map_triage::inputs_digest(evidence);
+        let digest = crate::map::triage::inputs_digest(evidence);
         if known
             .get(&anchored.decision_id)
-            .is_some_and(|judged| crate::map_triage::is_current(&judged.inputs_digest, &digest))
+            .is_some_and(|judged| crate::map::triage::is_current(&judged.inputs_digest, &digest))
         {
             report.already_current += 1;
             continue;
@@ -6772,7 +6784,7 @@ async fn post_project_map_triage(
         }
         attempted += 1;
 
-        let said = match crate::map_triage::ask(asked, evidence).await {
+        let said = match crate::map::triage::ask(asked, evidence).await {
             Ok(said) => said,
             Err(error) => {
                 tracing::warn!(
@@ -6791,10 +6803,10 @@ async fn post_project_map_triage(
         // starves the queue: with no record that it was attempted it consumes a slot of
         // [`MAX_TRIAGE_BATCH`] on every future run, so twenty decisions that reliably confuse the
         // model mean nothing behind them is ever triaged again — a map that has stopped working
-        // while going on reporting honestly that it has. See [`crate::map_triage::unreadable_flag`],
+        // while going on reporting honestly that it has. See [`crate::map::triage::unreadable_flag`],
         // which argues why `flagged` is the one verdict a machine may reach for and what the trade
         // costs.
-        let (answer, readable) = match crate::map_triage::parse_answer(&said) {
+        let (answer, readable) = match crate::map::triage::parse_answer(&said) {
             Ok(answer) => (answer, true),
             Err(why) => {
                 // What the model actually said travels into the log AND into the row, because
@@ -6806,11 +6818,11 @@ async fn post_project_map_triage(
                     brain = %brain.as_str(),
                     "the triager answered something that is not a judgement: {why}"
                 );
-                (crate::map_triage::unreadable_flag(&why, &said), false)
+                (crate::map::triage::unreadable_flag(&why, &said), false)
             }
         };
 
-        let wrote = crate::map_store::triage(
+        let wrote = crate::map::store::triage(
             &state.pool,
             &id,
             anchored.decision_id,
@@ -7015,13 +7027,13 @@ async fn get_project_ownership(
 ///
 /// Two refusals, and they are different facts: `no_machine_root` is this machine having no home
 /// directory — the same name `/config/machine` refuses with — and `bad_project_id` is an id that
-/// cannot name a directory without meaning another one (`project_state::valid_id`).
+/// cannot name a directory without meaning another one (`project::state::valid_id`).
 fn project_state_dir(
     state: &AppState,
     id: &str,
 ) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
     let root = machine_config_root(state)?;
-    crate::project_state::dir(&root, id)
+    crate::project::state::dir(&root, id)
         .ok_or_else(|| refusal(StatusCode::UNPROCESSABLE_ENTITY, "bad_project_id"))
 }
 
@@ -7111,10 +7123,10 @@ async fn claims_for_project(
     root: PathBuf,
 ) -> Result<Vec<crate::ownership::Claim>, StatusCode> {
     let library = state.workflow_library.clone();
-    let pins = crate::project_state::file(
+    let pins = crate::project::state::file(
         state.machine_config_root.as_deref(),
         id,
-        crate::project_state::PINS_FILE,
+        crate::project::state::PINS_FILE,
     );
     tokio::task::spawn_blocking(move || match library {
         Some(library) => crate::ownership::claims_for(&root, pins.as_deref(), &library),
@@ -7166,7 +7178,7 @@ struct WriteRequest {
 /// normalise to the same file by the time (3) passes, and joining the caller's spelling anyway
 /// would make every future change to `normalise` a security question instead of a tidiness one.
 /// It is joined onto the claim's HOME: the núcleo's own rows land in
-/// `~/.nucleos/projects/<id>/`, not in the project — see `project_state.rs`.
+/// `~/.nucleos/projects/<id>/`, not in the project — see `project/state.rs`.
 ///
 /// This route is in no table in `auth.rs`, so `permits` — which is default-deny — leaves it to
 /// Control and Admin. That is not an omission: the project's `autopilot.yaml` carries
@@ -7240,13 +7252,15 @@ async fn post_project_write(
     }
 
     let contents = body.contents;
-    tokio::task::spawn_blocking(move || crate::project_state::write_atomically(&target, &contents))
-        .await
-        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
-        .map_err(|error| {
-            tracing::warn!(%error, project_id = %id, %path, "writing a project file failed");
-            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
-        })?;
+    tokio::task::spawn_blocking(move || {
+        crate::project::state::write_atomically(&target, &contents)
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(|error| {
+        tracing::warn!(%error, project_id = %id, %path, "writing a project file failed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
 
     // After the write, not before, and loudly on failure. A feed line about a write that then failed
     // claims something that did not happen; a write whose line was lost is recoverable from the log,
@@ -7355,7 +7369,7 @@ async fn onboarding_view(
             .and_then(|rules| rules.gate_command);
         OnboardingView {
             onboarded: crate::onboarding::read_marker(Some(&machine_root), &project_id),
-            marker_path: crate::project_state::display_path(
+            marker_path: crate::project::state::display_path(
                 &project_id,
                 crate::onboarding::MARKER_FILE,
             ),
@@ -7517,8 +7531,8 @@ async fn post_project_onboard(
 async fn get_project_commands(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<crate::project_commands::ProjectCommand>>, StatusCode> {
-    crate::project_commands::list(&state.pool, &id)
+) -> Result<Json<Vec<crate::project::commands::ProjectCommand>>, StatusCode> {
+    crate::project::commands::list(&state.pool, &id)
         .await
         .map(Json)
         .map_err(|error| {
@@ -7541,7 +7555,7 @@ struct DeclareRequest {
     /// Absent means `person`. Default-deny: a command declared by somebody who never thought about
     /// this question must not thereby become something an autonomous run may execute.
     #[serde(default)]
-    runnable_by: Option<crate::project_commands::RunnableBy>,
+    runnable_by: Option<crate::project::commands::RunnableBy>,
 }
 
 /// Declares one of this project's own commands, replacing any of the same name.
@@ -7560,7 +7574,7 @@ async fn post_project_command(
         .map_err(|status| refusal(status, "no_project_root"))?;
 
     if let Err(invalid) =
-        crate::project_commands::validate(&body.name, &body.command, body.cwd.as_deref())
+        crate::project::commands::validate(&body.name, &body.command, body.cwd.as_deref())
     {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -7577,10 +7591,10 @@ async fn post_project_command(
     }
 
     let id_for_log = id.clone();
-    let new_id = crate::project_commands::declare(
+    let new_id = crate::project::commands::declare(
         &state.pool,
         &id,
-        crate::project_commands::Declaration {
+        crate::project::commands::Declaration {
             name: body.name,
             command: body.command,
             cwd: body.cwd,
@@ -7588,7 +7602,7 @@ async fn post_project_command(
             pass_exit_code: body.pass_exit_code.unwrap_or(0),
             runnable_by: body
                 .runnable_by
-                .unwrap_or(crate::project_commands::RunnableBy::Person),
+                .unwrap_or(crate::project::commands::RunnableBy::Person),
         },
     )
     .await
@@ -7605,7 +7619,7 @@ async fn delete_project_command(
     State(state): State<AppState>,
     Path((id, command_id)): Path<(String, i64)>,
 ) -> Result<StatusCode, StatusCode> {
-    match crate::project_commands::remove(&state.pool, &id, command_id).await {
+    match crate::project::commands::remove(&state.pool, &id, command_id).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(error) => {
@@ -7676,13 +7690,13 @@ async fn post_project_command_run(
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
 
-    let command = crate::project_commands::get(&state.pool, &id, command_id)
+    let command = crate::project::commands::get(&state.pool, &id, command_id)
         .await
         .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
         .ok_or_else(|| refusal(StatusCode::NOT_FOUND, "no_such_command"))?;
 
-    if crate::project_commands::caller_is_an_agent(&scope)
-        && command.runnable_by != crate::project_commands::RunnableBy::Agent
+    if crate::project::commands::caller_is_an_agent(&scope)
+        && command.runnable_by != crate::project::commands::RunnableBy::Agent
     {
         return Err(refusal(StatusCode::FORBIDDEN, "person_only"));
     }
@@ -7704,7 +7718,7 @@ async fn post_project_command_run(
     let claimed = uncancellable(async move {
         // A failed claim is a storage error, not a command already running: reporting it as
         // `already_running` would send the owner looking for a second click that never happened.
-        match crate::project_commands::mark_running(&pool, &project_id, command_id).await {
+        match crate::project::commands::mark_running(&pool, &project_id, command_id).await {
             Ok(true) => {}
             Ok(false) => return Ok(false),
             Err(error) => return Err(error),
@@ -7722,24 +7736,24 @@ async fn post_project_command_run(
             // `finish` below. Without that the row would say `running` until the next restart,
             // and the conditional claim above would refuse every later click as `already_running`.
             let measured = tokio::spawn(async move {
-                crate::gate::run_gate(&cwd, &cwd, &text, crate::project_commands::COMMAND_TIMEOUT)
+                crate::gate::run_gate(&cwd, &cwd, &text, crate::project::commands::COMMAND_TIMEOUT)
                     .await
             })
             .await;
             let finished = match measured {
-                Ok(outcome) => crate::project_commands::verdict(pass, outcome),
+                Ok(outcome) => crate::project::commands::verdict(pass, outcome),
                 Err(error) => {
                     tracing::error!(%error, command_id, "a project command's task ended without a result");
-                    crate::project_commands::Finished {
-                        outcome: crate::project_commands::Outcome::Errored,
+                    crate::project::commands::Finished {
+                        outcome: crate::project::commands::Outcome::Errored,
                         exit_code: None,
                         output: Some(format!("the command's task ended without a result: {error}")),
                     }
                 }
             };
             let said = match finished.outcome {
-                crate::project_commands::Outcome::Passed => format!("{name} passed"),
-                crate::project_commands::Outcome::Failed => match finished.exit_code {
+                crate::project::commands::Outcome::Passed => format!("{name} passed"),
+                crate::project::commands::Outcome::Failed => match finished.exit_code {
                     Some(code) => format!("{name} failed with exit {code}"),
                     None => format!("{name} failed"),
                 },
@@ -7748,7 +7762,7 @@ async fn post_project_command_run(
                 _ => format!("{name} could not be measured"),
             };
             if let Err(error) =
-                crate::project_commands::finish(&pool, command_id, finished).await
+                crate::project::commands::finish(&pool, command_id, finished).await
             {
                 tracing::error!(%error, command_id, "a project command finished and was not recorded");
             }
@@ -7904,7 +7918,7 @@ fn within_length(
 ///
 /// The prefixes come back FOLDED, because that is how the table stores them and how they are
 /// enforced. Serving the typed spelling would show an owner a `Remove-Item` the classifier knows as
-/// `remove-item`, which is the very lie `project_policy::fold_prefix` exists to stop. WHICH fold a
+/// `remove-item`, which is the very lie `project::policy::fold_prefix` exists to stop. WHICH fold a
 /// prefix got follows `tool`: a command is lower-cased and a path is not, so two rows that look
 /// alike on screen were folded by two different functions and only that field says which.
 ///
@@ -7932,7 +7946,7 @@ struct ShellRuleView {
     /// business, forced by a UNIQUE index that treats every NULL as distinct, and a page made to
     /// compare against a magic empty string would get it wrong once.
     tool: Option<String>,
-    verdict: crate::project_policy::Verdict,
+    verdict: crate::project::policy::Verdict,
     /// `null` for a rule declared with no justification — an absent note and not an absent field,
     /// so a page can tell "nobody said why" from a shape it failed to parse.
     note: Option<String>,
@@ -7951,7 +7965,7 @@ async fn get_project_shell_rules(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<ShellRuleView>>, StatusCode> {
-    crate::project_policy::declared_shell_rules(&state.pool, &id)
+    crate::project::policy::declared_shell_rules(&state.pool, &id)
         .await
         .map(|rules| {
             Json(
@@ -7996,7 +8010,7 @@ struct ShellRuleDeclaration {
     /// offending value is worth more here than an enum's parse error — see `unknown_tool`.
     #[serde(default)]
     tool: Option<String>,
-    verdict: crate::project_policy::Verdict,
+    verdict: crate::project::policy::Verdict,
     /// Why, for whoever reads the list next. Never consulted by the classifier.
     #[serde(default)]
     note: Option<String>,
@@ -8014,7 +8028,7 @@ struct ShellRuleDeclaration {
 /// `UNIQUE constraint failed` and a 500, and `DO NOTHING` — the spelling its two siblings in
 /// `project_policy` use — is worse for being silent, leaving the first verdict standing while the
 /// caller is told 204. `a_declared_shell_rule_comes_back_folded_and_then_goes` pins the edit through
-/// this route; `project_policy::tests::declaring_the_same_prefix_again_changes_its_verdict` pins it
+/// this route; `project::policy::tests::declaring_the_same_prefix_again_changes_its_verdict` pins it
 /// one layer down.
 ///
 /// **`note = excluded.note` is the half a caller has to know about.** The clause is a plain
@@ -8041,7 +8055,7 @@ struct ShellRuleDeclaration {
 /// **A write rule can only DENY, and this route is the third place that says so and the only one a
 /// person meets.** The other two are silent by construction: `classifier::classify` has no allow
 /// branch anywhere on a write path — "there is no `allow` counterpart here, and there must not be
-/// one" — and `project_policy::shell_rules` drops a tool-carrying `allow` on its way out of the
+/// one" — and `project::policy::shell_rules` drops a tool-carrying `allow` on its way out of the
 /// table, with a `tracing::warn!` nobody standing at a screen will ever read. An owner who wrote
 /// one would be holding a permission that decides nothing, believing it decides something. So an
 /// `allow` that names a tool is refused at the door with `unenforceable_allow`, and the sentence
@@ -8059,7 +8073,7 @@ async fn post_project_shell_rule(
     // The stop first, following `post_project_command_run`: it is the one refusal that is about the
     // machine rather than about this request. Asked only for an `allow`, which is the only verdict
     // here that widens — see `declaration_halted`.
-    if body.verdict == crate::project_policy::Verdict::Allow {
+    if body.verdict == crate::project::policy::Verdict::Allow {
         declaration_halted(&state, &id).await?;
     }
     project_is_on_the_roster(&state, &id).await?;
@@ -8068,7 +8082,7 @@ async fn post_project_shell_rule(
     //
     // What follows asks whether anything ARRIVED, and until there were write rules that was the
     // whole guard — correctly, because there was one fold and it cannot do this. A command prefix
-    // goes through `project_policy::fold_prefix`, which is `classifier::normalize_command`: it
+    // goes through `project::policy::fold_prefix`, which is `classifier::normalize_command`: it
     // collapses whitespace and lower-cases, so it can shorten a string and never empty one that
     // survived `trim()`. A PATH prefix goes through `fold_path_prefix` instead, which rewrites `\`
     // as `/` and only THEN strips the trailing `/` — so `"/"`, `"\\"` and `"///"` arrive non-empty,
@@ -8135,7 +8149,7 @@ async fn post_project_shell_rule(
     match tool {
         // See the doc above for why this is inside the `Allow` arm and must stay there.
         None => {
-            if body.verdict == crate::project_policy::Verdict::Allow
+            if body.verdict == crate::project::policy::Verdict::Allow
                 && !crate::classifier::shell_form_is_readable(prefix)
             {
                 return Err((
@@ -8155,7 +8169,7 @@ async fn post_project_shell_rule(
         Some(tool) => {
             // The rule this whole chunk is built around, refused where somebody can read it. The
             // doc above names the two silent places that already enforce it.
-            if body.verdict == crate::project_policy::Verdict::Allow {
+            if body.verdict == crate::project::policy::Verdict::Allow {
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(serde_json::json!({
@@ -8164,7 +8178,7 @@ async fn post_project_shell_rule(
                             "a rule about a tool can only REFUSE. `{tool}` allowed to write to \
                              `{prefix}` would be stored and decide nothing: the write chain in \
                              `classifier::classify` ends at `read-local`, so there is no allow \
-                             side for it to reach, and `project_policy::shell_rules` drops such a \
+                             side for it to reach, and `project::policy::shell_rules` drops such a \
                              row on the way back out of the table. Declared as a `deny` the same \
                              path WOULD be enforced — `{tool}` would be refused at it and at \
                              everything under it."
@@ -8185,7 +8199,7 @@ async fn post_project_shell_rule(
             // fold learns to strip something else, and what it lets back through is this same
             // nameless 500. `fold_for` is `pub(crate)` for exactly that reason: one function
             // answers what gets stored, and every guard about what gets stored asks that function.
-            if crate::project_policy::fold_for(Some(tool), prefix).is_empty() {
+            if crate::project::policy::fold_for(Some(tool), prefix).is_empty() {
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(serde_json::json!({
@@ -8239,7 +8253,7 @@ async fn post_project_shell_rule(
 
     // The tool goes down as it arrived — `None` is a shell rule and `Some` is a write rule, and
     // `declare_shell_rule` folds the prefix by whichever of the two folds that answer picks.
-    crate::project_policy::declare_shell_rule(&state.pool, &id, tool, prefix, body.verdict, note)
+    crate::project::policy::declare_shell_rule(&state.pool, &id, tool, prefix, body.verdict, note)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "declaring a project shell rule failed");
@@ -8273,10 +8287,10 @@ struct ShellRuleTarget {
 /// Withdraws one shell rule.
 ///
 /// **404 when nothing matched, and the answer comes from the DELETE itself.** `forget_shell_rule`
-/// returns `Ok(false)` off `rows_affected`, which is `project_commands::remove`'s shape one section
+/// returns `Ok(false)` off `rows_affected`, which is `project::commands::remove`'s shape one section
 /// up. Asking a reader first and then deleting would be two queries answering about two moments,
 /// and — worse — the presence check would have had to fold the prefix itself, which is a second
-/// spelling of the key `project_policy::fold_prefix` exists to be the only one of.
+/// spelling of the key `project::policy::fold_prefix` exists to be the only one of.
 ///
 /// **No shape guard and no kill switch.** A rule stored before either existed still has to be
 /// withdrawable, and an emergency stop must never stand between somebody and narrowing what their
@@ -8304,7 +8318,7 @@ async fn delete_project_shell_rule(
     }
 
     let tool = body.tool.as_deref();
-    let forgotten = crate::project_policy::forget_shell_rule(&state.pool, &id, tool, prefix)
+    let forgotten = crate::project::policy::forget_shell_rule(&state.pool, &id, tool, prefix)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "forgetting a project shell rule failed");
@@ -8317,7 +8331,7 @@ async fn delete_project_shell_rule(
         // still there" has no answer without the missing word.
         //
         // The COMMAND half names the folded spelling — the answer somebody who typed the wrong case
-        // needs — through `normalize_command`, which is the function `project_policy::fold_prefix`
+        // needs — through `normalize_command`, which is the function `project::policy::fold_prefix`
         // wraps and therefore not a second spelling of the fold. The write half deliberately echoes
         // what was sent instead: `fold_path_prefix` is private to `project_policy`, and restating
         // its three steps here to decorate a 404 would be exactly the second spelling of a key that
@@ -8418,7 +8432,7 @@ async fn get_project_github_ops(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<String>>, StatusCode> {
-    crate::project_policy::try_github_ops(&state.pool, &id)
+    crate::project::policy::try_github_ops(&state.pool, &id)
         .await
         .map(Json)
         .map_err(|error| {
@@ -8529,7 +8543,7 @@ async fn post_project_github_op(
         ));
     }
 
-    crate::project_policy::declare_github_op(&state.pool, &id, op_kind)
+    crate::project::policy::declare_github_op(&state.pool, &id, op_kind)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "declaring a project github op failed");
@@ -8559,7 +8573,7 @@ async fn delete_project_github_op(
     within_length("op kind", op_kind)?;
     named_op_kind(op_kind)?;
 
-    let forgotten = crate::project_policy::forget_github_op(&state.pool, &id, op_kind)
+    let forgotten = crate::project::policy::forget_github_op(&state.pool, &id, op_kind)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "forgetting a project github op failed");
@@ -8602,7 +8616,7 @@ async fn get_project_git_ops(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<String>>, StatusCode> {
-    crate::project_policy::try_git_ops(&state.pool, &id)
+    crate::project::policy::try_git_ops(&state.pool, &id)
         .await
         .map(Json)
         .map_err(|error| {
@@ -8665,7 +8679,7 @@ async fn post_project_git_op(
         ));
     }
 
-    crate::project_policy::declare_git_op(&state.pool, &id, op_kind)
+    crate::project::policy::declare_git_op(&state.pool, &id, op_kind)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "declaring a project git op failed");
@@ -8693,7 +8707,7 @@ async fn delete_project_git_op(
     within_length("op kind", op_kind)?;
     named_git_op_kind(op_kind)?;
 
-    let forgotten = crate::project_policy::forget_git_op(&state.pool, &id, op_kind)
+    let forgotten = crate::project::policy::forget_git_op(&state.pool, &id, op_kind)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "forgetting a project git op failed");
@@ -8736,7 +8750,7 @@ async fn get_project_land_targets(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<LandingView>, StatusCode> {
-    let targets = crate::project_policy::try_land_targets(&state.pool, &id)
+    let targets = crate::project::policy::try_land_targets(&state.pool, &id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "reading a project's land targets failed");
@@ -8821,7 +8835,7 @@ async fn post_project_land_target(
         )
     })?;
 
-    crate::project_policy::declare_land_target(&state.pool, &id, branch.as_str())
+    crate::project::policy::declare_land_target(&state.pool, &id, branch.as_str())
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "declaring a project land target failed");
@@ -8858,7 +8872,7 @@ async fn delete_project_land_target(
         ));
     }
 
-    let forgotten = crate::project_policy::forget_land_target(&state.pool, &id, branch)
+    let forgotten = crate::project::policy::forget_land_target(&state.pool, &id, branch)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "forgetting a project land target failed");
@@ -8924,7 +8938,7 @@ async fn get_project_workflows(
         .map_err(|status| refusal(status, "no_project_root"))?;
     let library = library_or_refusal(&state)?;
     let pins = pins_file(&state, &id)?;
-    let shown = crate::project_state::display_path(&id, crate::project_state::PINS_FILE);
+    let shown = crate::project::state::display_path(&id, crate::project::state::PINS_FILE);
     tokio::task::spawn_blocking(move || crate::workflows::installed(&root, &pins, &library))
         .await
         .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
@@ -9006,7 +9020,7 @@ fn bundle_or_refusal(
 /// This project's pins file, `~/.nucleos/projects/<id>/workflows.yaml`, or the refusal
 /// [`project_state_dir`] gives for a project with no state directory.
 fn pins_file(state: &AppState, id: &str) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
-    Ok(project_state_dir(state, id)?.join(crate::project_state::PINS_FILE))
+    Ok(project_state_dir(state, id)?.join(crate::project::state::PINS_FILE))
 }
 
 /// Every route below writes this project's pins, so every one of them asks the same two questions
@@ -9079,7 +9093,7 @@ fn materialized_record(
     state: &AppState,
     id: &str,
 ) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
-    Ok(project_state_dir(state, id)?.join(crate::project_state::MATERIALIZED_FILE))
+    Ok(project_state_dir(state, id)?.join(crate::project::state::MATERIALIZED_FILE))
 }
 
 /// Put a just-pinned workflow's files into the project, and say in a few words what happened.
@@ -9095,7 +9109,7 @@ fn materialize_after_pin(
     record: &std::path::Path,
     name: &str,
 ) -> String {
-    use crate::workflow_materialize as materialize;
+    use crate::workflows::materialize;
     match materialize::sync(
         root,
         pins,
@@ -9124,7 +9138,7 @@ fn materialize_after_pin(
 /// Stop using a workflow, and take back the files it placed in the project.
 ///
 /// The pin goes first — a project that does not use `name` is refused before a file is touched —
-/// and then `workflow_materialize::unmaterialize` removes every file the record says this workflow
+/// and then `workflows::materialize::unmaterialize` removes every file the record says this workflow
 /// wrote and that is still exactly what it wrote, the managed block in `AGENTS.md` included. An
 /// edited or missing file stays and is named under `kept`; what went is under `removed`.
 ///
@@ -9142,7 +9156,7 @@ async fn delete_project_workflow(
 
     let cleaned = tokio::task::spawn_blocking(move || {
         crate::workflows::uninstall(&pins, &name)?;
-        Ok::<_, crate::workflows::Refused>(crate::workflow_materialize::unmaterialize(
+        Ok::<_, crate::workflows::Refused>(crate::workflows::materialize::unmaterialize(
             &root, &record, &name,
         ))
     })
@@ -9332,7 +9346,7 @@ struct GraphView {
     source: &'static str,
     version: String,
     #[serde(flatten)]
-    resolved: crate::workflow_graph::Resolved,
+    resolved: crate::workflows::graph::Resolved,
 }
 
 /// What this project's workflow looks like, ready to be drawn.
@@ -9378,19 +9392,18 @@ async fn get_project_workflow_graph(
             ),
         };
 
-        let text = std::fs::read_to_string(from.join(crate::workflow_graph::GRAPH_FILE)).map_err(
-            |error| match error.kind() {
+        let text = std::fs::read_to_string(from.join(crate::workflows::graph::GRAPH_FILE))
+            .map_err(|error| match error.kind() {
                 std::io::ErrorKind::NotFound => crate::workflows::Refused::NoGraph,
                 _ => crate::workflows::Refused::Io(error.to_string()),
-            },
-        )?;
-        let graph =
-            crate::workflow_graph::parse(&text).map_err(crate::workflows::Refused::InvalidGraph)?;
+            })?;
+        let graph = crate::workflows::graph::parse(&text)
+            .map_err(crate::workflows::Refused::InvalidGraph)?;
 
         Ok::<_, crate::workflows::Refused>(GraphView {
             source,
             version: pinned.version,
-            resolved: crate::workflow_graph::resolve(&graph, &pinned.nodes),
+            resolved: crate::workflows::graph::resolve(&graph, &pinned.nodes),
         })
     })
     .await
@@ -9586,15 +9599,15 @@ fn materialize_one(
     library: &std::path::Path,
     record: &std::path::Path,
     name: &str,
-    mode: crate::workflow_materialize::Mode,
-) -> Result<crate::workflow_materialize::PinOutcome, (StatusCode, Json<serde_json::Value>)> {
+    mode: crate::workflows::materialize::Mode,
+) -> Result<crate::workflows::materialize::PinOutcome, (StatusCode, Json<serde_json::Value>)> {
     let pinned = crate::workflows::read_pins(pins).map_err(|detail| {
         refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "unreadable_pins", detail)
     })?;
     if !pinned.workflows.iter().any(|pin| pin.name == name) {
         return Err(workflow_refusal(crate::workflows::Refused::NotInstalled));
     }
-    crate::workflow_materialize::sync(root, pins, library, record, Some(name), mode)
+    crate::workflows::materialize::sync(root, pins, library, record, Some(name), mode)
         .map_err(|detail| {
             refusal_with_detail(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -9614,7 +9627,8 @@ fn materialize_one(
 async fn get_project_workflow_materialize(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
-) -> Result<Json<crate::workflow_materialize::PinOutcome>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<crate::workflows::materialize::PinOutcome>, (StatusCode, Json<serde_json::Value>)>
+{
     let root = resolve_project_root(&state, &id)
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
@@ -9628,7 +9642,7 @@ async fn get_project_workflow_materialize(
             &library,
             &record,
             &name,
-            crate::workflow_materialize::Mode::Preview,
+            crate::workflows::materialize::Mode::Preview,
         )
     })
     .await
@@ -9637,7 +9651,7 @@ async fn get_project_workflow_materialize(
 }
 
 /// Put this workflow's files into the project. Never over a file somebody edited — see
-/// `workflow_materialize.rs` — and the answer lists every file left alone and why.
+/// `workflows/materialize.rs` — and the answer lists every file left alone and why.
 ///
 /// **The stop first**, through `workflow_write_root` like every workflow write: these are files
 /// that govern what an agent does, the same class of write `POST /write` refuses while the kill
@@ -9645,7 +9659,8 @@ async fn get_project_workflow_materialize(
 async fn post_project_workflow_materialize(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
-) -> Result<Json<crate::workflow_materialize::PinOutcome>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<crate::workflows::materialize::PinOutcome>, (StatusCode, Json<serde_json::Value>)>
+{
     let (root, pins, library) = workflow_write_root(&state, &id).await?;
     let record = materialized_record(&state, &id)?;
     let outcome = tokio::task::spawn_blocking(move || {
@@ -9655,7 +9670,7 @@ async fn post_project_workflow_materialize(
             &library,
             &record,
             &name,
-            crate::workflow_materialize::Mode::Apply,
+            crate::workflows::materialize::Mode::Apply,
         )
     })
     .await
@@ -9684,7 +9699,7 @@ struct WorkflowSyncRequest {
 #[derive(serde::Serialize)]
 struct WorkflowSyncAnswer {
     project_id: String,
-    outcomes: Vec<crate::workflow_materialize::PinOutcome>,
+    outcomes: Vec<crate::workflows::materialize::PinOutcome>,
 }
 
 /// Materialize a project's pinned workflows into a checkout somebody made by hand.
@@ -9779,22 +9794,22 @@ async fn post_workflow_sync(
 
     let library = library_or_refusal(&state)?;
     let state_dir = project_state_dir(&state, &project_id)?;
-    let pins = state_dir.join(crate::project_state::PINS_FILE);
+    let pins = state_dir.join(crate::project::state::PINS_FILE);
     let is_main = tokio::fs::canonicalize(&root).await.ok().as_ref() == Some(&checkout);
     let record = if is_main {
-        state_dir.join(crate::project_state::MATERIALIZED_FILE)
+        state_dir.join(crate::project::state::MATERIALIZED_FILE)
     } else {
-        crate::workflow_materialize::worktree_record(&state_dir, &checkout)
+        crate::workflows::materialize::worktree_record(&state_dir, &checkout)
     };
     let target = checkout.clone();
     let outcomes = tokio::task::spawn_blocking(move || {
-        crate::workflow_materialize::sync(
+        crate::workflows::materialize::sync(
             &target,
             &pins,
             &library,
             &record,
             None,
-            crate::workflow_materialize::Mode::Apply,
+            crate::workflows::materialize::Mode::Apply,
         )
     })
     .await
@@ -11333,7 +11348,7 @@ struct TranscriptOut {
     /// turn: nothing was asked, nothing ran, nothing was spent, and there is no answer. Giving it a
     /// turn's shape would mean inventing a prompt nobody typed. The window interleaves the two by
     /// `created_at`, which is the only place the two orders have to meet.
-    notices: Vec<crate::chat_notices::ChatNotice>,
+    notices: Vec<crate::chats::notices::ChatNotice>,
 }
 
 /// Which slice of a conversation to read back.
@@ -11473,7 +11488,7 @@ async fn get_chat_diff(
 async fn get_chat_tasks(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
-) -> Result<Json<Vec<crate::chat_tasks::ChatTask>>, StatusCode> {
+) -> Result<Json<Vec<crate::chats::tasks::ChatTask>>, StatusCode> {
     crate::chats::opened_in(&state.pool, &chat_id)
         .await
         .map_err(|error| {
@@ -11481,7 +11496,7 @@ async fn get_chat_tasks(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
-    crate::chat_tasks::for_chat(&state.pool, &chat_id)
+    crate::chats::tasks::for_chat(&state.pool, &chat_id)
         .await
         .map(Json)
         .map_err(|error| {
@@ -11971,7 +11986,7 @@ async fn get_assistant_chat(
         // Empty on a failure rather than a 500, the same trade the two reads above make: a
         // transcript is the point of this request, and losing a department's aside is a smaller loss
         // than a conversation that will not open.
-        notices: crate::chat_notices::for_chat(&state.pool, &chat_id)
+        notices: crate::chats::notices::for_chat(&state.pool, &chat_id)
             .await
             .unwrap_or_default(),
         turns: turns
@@ -12869,7 +12884,7 @@ struct OfferedSession {
 ///
 /// Tagged rather than flattened into two nullable fields, because the three states are what this
 /// type is FOR and `{"brain": null}` cannot tell "nobody has chosen" from "somebody chose nobody" —
-/// which is the whole distinction `project_policy::Judge` exists to keep.
+/// which is the whole distinction `project::policy::Judge` exists to keep.
 #[derive(serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum JudgeView {
@@ -12884,12 +12899,12 @@ enum JudgeView {
     },
 }
 
-impl From<crate::project_policy::Judge> for JudgeView {
-    fn from(judge: crate::project_policy::Judge) -> Self {
+impl From<crate::project::policy::Judge> for JudgeView {
+    fn from(judge: crate::project::policy::Judge) -> Self {
         match judge {
-            crate::project_policy::Judge::Default => Self::Default,
-            crate::project_policy::Judge::Off => Self::Off,
-            crate::project_policy::Judge::Named { brain, model } => Self::Named {
+            crate::project::policy::Judge::Default => Self::Default,
+            crate::project::policy::Judge::Off => Self::Off,
+            crate::project::policy::Judge::Named { brain, model } => Self::Named {
                 brain: brain.as_str().to_owned(),
                 model,
             },
@@ -12991,7 +13006,7 @@ async fn post_project_judge(
         }
     }
 
-    crate::project_policy::declare_judge(&state.pool, &id, brain, model)
+    crate::project::policy::declare_judge(&state.pool, &id, brain, model)
         .await
         .map_err(unusable_judge)?;
 
@@ -13018,7 +13033,7 @@ async fn delete_project_judge(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     project_is_on_the_roster(&state, &id).await?;
 
-    let cleared = crate::project_policy::clear_judge(&state.pool, &id)
+    let cleared = crate::project::policy::clear_judge(&state.pool, &id)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "clearing a project judge failed");
@@ -14680,8 +14695,8 @@ async fn post_chat_restore(
 /// Chat groups (P4): the list, create, rename, delete and assign handlers.
 async fn list_chat_groups(
     State(state): State<AppState>,
-) -> Result<Json<Vec<crate::chat_groups::ChatGroup>>, StatusCode> {
-    crate::chat_groups::list(&state.pool)
+) -> Result<Json<Vec<crate::chats::groups::ChatGroup>>, StatusCode> {
+    crate::chats::groups::list(&state.pool)
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -14692,8 +14707,8 @@ struct ChatGroupName {
     name: String,
 }
 
-fn group_refusal(error: crate::chat_groups::GroupError) -> (StatusCode, Json<serde_json::Value>) {
-    use crate::chat_groups::GroupError;
+fn group_refusal(error: crate::chats::groups::GroupError) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::chats::groups::GroupError;
     match error {
         GroupError::Blank => refusal(StatusCode::BAD_REQUEST, "blank_name"),
         GroupError::TooLong => refusal(StatusCode::BAD_REQUEST, "name_too_long"),
@@ -14708,9 +14723,11 @@ fn group_refusal(error: crate::chat_groups::GroupError) -> (StatusCode, Json<ser
 async fn create_chat_group(
     State(state): State<AppState>,
     Json(body): Json<ChatGroupName>,
-) -> Result<(StatusCode, Json<crate::chat_groups::ChatGroup>), (StatusCode, Json<serde_json::Value>)>
-{
-    crate::chat_groups::create(&state.pool, &body.name)
+) -> Result<
+    (StatusCode, Json<crate::chats::groups::ChatGroup>),
+    (StatusCode, Json<serde_json::Value>),
+> {
+    crate::chats::groups::create(&state.pool, &body.name)
         .await
         .map(|group| (StatusCode::CREATED, Json(group)))
         .map_err(group_refusal)
@@ -14720,8 +14737,8 @@ async fn rename_chat_group(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
     Json(body): Json<ChatGroupName>,
-) -> Result<Json<crate::chat_groups::ChatGroup>, (StatusCode, Json<serde_json::Value>)> {
-    crate::chat_groups::rename(&state.pool, group_id, &body.name)
+) -> Result<Json<crate::chats::groups::ChatGroup>, (StatusCode, Json<serde_json::Value>)> {
+    crate::chats::groups::rename(&state.pool, group_id, &body.name)
         .await
         .map(Json)
         .map_err(group_refusal)
@@ -14731,7 +14748,7 @@ async fn delete_chat_group(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
-    match crate::chat_groups::delete(&state.pool, group_id).await {
+    match crate::chats::groups::delete(&state.pool, group_id).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
@@ -14748,7 +14765,7 @@ async fn put_chat_group(
     Path(chat_id): Path<String>,
     Json(body): Json<ChatGroupAssignment>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    crate::chat_groups::assign(&state.pool, &chat_id, body.group_id)
+    crate::chats::groups::assign(&state.pool, &chat_id, body.group_id)
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(group_refusal)
@@ -15489,8 +15506,8 @@ async fn approve_browser_wheel(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let choice = match seat.as_deref() {
         None => None,
-        Some("shell") => Some(crate::browser_wheel::SeatChoice::Shell),
-        Some("window") => Some(crate::browser_wheel::SeatChoice::Window),
+        Some("shell") => Some(crate::browser::wheel::SeatChoice::Shell),
+        Some("window") => Some(crate::browser::wheel::SeatChoice::Window),
         Some(_) => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -15520,7 +15537,7 @@ async fn approve_browser_wheel(
     // An explicit shell seat that is not on offer is refused BEFORE the decision is made: once the
     // proposal is approved, a refusal would strand the row in `wheel-requested`. Reads only the
     // database, so it does not depend on the pillar being on.
-    if choice == Some(crate::browser_wheel::SeatChoice::Shell) {
+    if choice == Some(crate::browser::wheel::SeatChoice::Shell) {
         let offered = crate::browser::session_row(&state.pool, session_id)
             .await
             .map_err(|error| {
@@ -15557,7 +15574,7 @@ async fn approve_browser_wheel(
 
     let handover = state.clone();
     match uncancellable(async move {
-        crate::browser_wheel::accept_with_seat(&handover, session_id, choice).await
+        crate::browser::wheel::accept_with_seat(&handover, session_id, choice).await
     })
     .await
     .map_err(|status| (status, "the handover task did not finish".to_owned()))?
@@ -15569,7 +15586,7 @@ async fn approve_browser_wheel(
             }
             Ok(Json(answer))
         }
-        Err(crate::browser_wheel::WheelError::NoSuchSession) => Err((
+        Err(crate::browser::wheel::WheelError::NoSuchSession) => Err((
             StatusCode::NOT_FOUND,
             "the session this wheel was asked for is gone".to_owned(),
         )),
@@ -15603,7 +15620,7 @@ async fn reject_browser_wheel(state: AppState, id: i64) -> Result<StatusCode, St
         return Err(StatusCode::CONFLICT);
     }
     if let Some(session_id) = session_id
-        && let Err(error) = crate::browser_wheel::refuse(&state, session_id).await
+        && let Err(error) = crate::browser::wheel::refuse(&state, session_id).await
     {
         // Logged and not returned. The refusal is recorded and that is the part the person asked
         // for; a session left open by a sidecar that did not answer is retired on its next restart.
@@ -17372,7 +17389,7 @@ mod tests {
         .execute(&state.pool)
         .await
         .unwrap();
-        crate::project_policy::declare_land_target(&state.pool, "alpha", "release")
+        crate::project::policy::declare_land_target(&state.pool, "alpha", "release")
             .await
             .unwrap();
 
@@ -20290,10 +20307,10 @@ mod tests {
     async fn project_with_rules(state: &AppState, id: &str, yaml: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         if let Some(home) = state.machine_config_root.as_deref() {
-            crate::project_state::write_for_test(
+            crate::project::state::write_for_test(
                 home,
                 id,
-                crate::project_state::AUTOPILOT_FILE,
+                crate::project::state::AUTOPILOT_FILE,
                 yaml,
             );
         }
@@ -20921,15 +20938,15 @@ mod tests {
         assert_eq!(body["refusal"], "kill_switch");
 
         assert!(
-            crate::project_state::file(Some(home.path()), "alpha", crate::onboarding::MARKER_FILE)
+            crate::project::state::file(Some(home.path()), "alpha", crate::onboarding::MARKER_FILE)
                 .is_none_or(|path| !path.exists()),
             "no marker for a project the stop never let onboarding reach"
         );
         assert!(
-            crate::project_state::file(
+            crate::project::state::file(
                 Some(home.path()),
                 "alpha",
-                crate::project_state::AUTOPILOT_FILE
+                crate::project::state::AUTOPILOT_FILE
             )
             .is_none_or(|path| !path.exists()),
             "no gate command for a project the stop never let onboarding reach"
@@ -21486,7 +21503,7 @@ mod tests {
     /// `record` then `decide`, never an `INSERT` that stamps `approved_at` itself. The map is made
     /// of what the owner said yes to, so a fixture that wrote the column directly would go on
     /// passing on the day the approval path stopped writing it — which is the failure
-    /// `map_store::from_row` already had once, and the one that would have emptied this map for
+    /// `map::store::from_row` already had once, and the one that would have emptied this map for
     /// every project.
     async fn seed_approved(
         state: &AppState,
@@ -21495,21 +21512,21 @@ mod tests {
         ordinal: i64,
         text: &str,
     ) -> i64 {
-        crate::map_store::record(
+        crate::map::store::record(
             &state.pool,
             project,
             "design",
             crate::chats::Brain::Cloud,
-            &[crate::map_intent::Extracted {
+            &[crate::map::intent::Extracted {
                 section: section.to_owned(),
                 ordinal,
                 text: text.to_owned(),
-                kind: crate::map_intent::Kind::Countable,
+                kind: crate::map::intent::Kind::Countable,
             }],
         )
         .await
         .unwrap();
-        let id = crate::map_store::pending(&state.pool, project)
+        let id = crate::map::store::pending(&state.pool, project)
             .await
             .unwrap()
             .into_iter()
@@ -21517,7 +21534,7 @@ mod tests {
             .expect("the line just recorded is in the pile")
             .id;
         assert!(
-            crate::map_store::decide(&state.pool, project, id, true)
+            crate::map::store::decide(&state.pool, project, id, true)
                 .await
                 .unwrap(),
             "the approval landed on a row"
@@ -21689,7 +21706,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_this_project_s_approved_decisions_reach_its_map() {
-        // `map_store::approved` puts `project_id` in its own `WHERE`; this asserts the route hands
+        // `map::store::approved` puts `project_id` in its own `WHERE`; this asserts the route hands
         // it the id from the path rather than losing it somewhere between the two. One owner's map
         // carrying another owner's decisions is worse than a missing feature — it is the false
         // confidence this mode treats, sourced from a project they have never opened.
@@ -21808,12 +21825,12 @@ mod tests {
             StatusCode::NO_CONTENT
         );
 
-        let held = crate::map_store::anchors(&state.pool, "alpha")
+        let held = crate::map::store::anchors(&state.pool, "alpha")
             .await
             .unwrap();
         let record = held.get(&decision).expect("the stamp wrote a record");
         assert_eq!(record.paths, ["core/src/a.rs"]);
-        assert_eq!(record.source, crate::map_store::AnchorSource::Stamp);
+        assert_eq!(record.source, crate::map::store::AnchorSource::Stamp);
     }
 
     /// **A stamp never overwrites a set the owner pointed at**, and this is the rule that keeps a
@@ -21849,12 +21866,12 @@ mod tests {
             StatusCode::NO_CONTENT
         );
 
-        let held = crate::map_store::anchors(&state.pool, "alpha")
+        let held = crate::map::store::anchors(&state.pool, "alpha")
             .await
             .unwrap();
         let record = held.get(&decision).expect("the record is still there");
         assert_eq!(record.paths, ["core/src/b.rs"], "the choice stands");
-        assert_eq!(record.source, crate::map_store::AnchorSource::Owner);
+        assert_eq!(record.source, crate::map::store::AnchorSource::Owner);
     }
 
     /// A path that leaves the project is refused before anything is written.
@@ -21886,7 +21903,7 @@ mod tests {
         }
 
         assert!(
-            crate::map_store::anchors(&state.pool, "alpha")
+            crate::map::store::anchors(&state.pool, "alpha")
                 .await
                 .unwrap()
                 .is_empty(),
@@ -21906,7 +21923,7 @@ mod tests {
 
     /// A registered project whose folder is also a git repository.
     ///
-    /// Needed by every test that wants a real anchor digest, because `map_stamp::digest` asks git
+    /// Needed by every test that wants a real anchor digest, because `map::stamp::digest` asks git
     /// and a folder that is not a repository is exactly the input that makes it answer `None`.
     /// `core.autocrlf false` for the reason `map_stamp`'s own fixture gives: it is `true` from the
     /// system config on a default Windows install, and a blob hash of bytes git rewrote on the way
@@ -21966,7 +21983,7 @@ mod tests {
     ///
     /// The point of running it through the route rather than through `map_orphan` alone is the two
     /// things only the route does: it turns a heading into a section number through
-    /// `map_join::section_number`, and it hands the guard the project's real spec slugs, which is
+    /// `map::join::section_number`, and it hands the guard the project's real spec slugs, which is
     /// what keeps the answer about ONE document.
     #[tokio::test]
     async fn the_orphan_guard_says_which_commit_took_the_citation_away() {
@@ -21993,7 +22010,7 @@ mod tests {
 
     /// A heading carrying no number is refused, and is not answered *nothing ever named it*.
     ///
-    /// That is `map_join::Anchor::Unnumbered` reaching the route: an approved decision copied from
+    /// That is `map::join::Anchor::Unnumbered` reaching the route: an approved decision copied from
     /// `## Contrato` anchors nothing because nothing could be looked for, and a `200` here saying
     /// the section was never named would be the report of a search that never ran — over a decision
     /// that may well be implemented.
@@ -22018,7 +22035,7 @@ mod tests {
     /// A slug is a filename without its extension, these filenames carry dates, and the folder they
     /// sit in is gitignored working material that gets reorganised. Every approved decision keeps
     /// the slug it was extracted under for ever. So a route that answered `404` for a slug missing
-    /// from `map_intent::specs_in` would refuse to answer about rows `GET /map` was still happily
+    /// from `map::intent::specs_in` would refuse to answer about rows `GET /map` was still happily
     /// drawing — the guard being the one part of this map that stops working because a file moved.
     ///
     /// The fixture deletes the document outright, which is the harsher half of the same case.
@@ -22166,7 +22183,7 @@ mod tests {
         // The digest is the DAEMON's and the body never carried one — a client that could supply
         // it is a client that could mint a green which never expires. Asserted by looking at what
         // was stored: it names the anchor file, which no part of the request did.
-        let stored = crate::map_store::stamps(&state.pool, "alpha")
+        let stored = crate::map::store::stamps(&state.pool, "alpha")
             .await
             .unwrap();
         assert_eq!(stored.len(), 1);
@@ -22175,7 +22192,7 @@ mod tests {
             .as_deref()
             .expect("a settled stamp cannot be written without one");
         assert!(
-            crate::map_stamp::parse(digest).contains_key("core/src/a.rs"),
+            crate::map::stamp::parse(digest).contains_key("core/src/a.rs"),
             "{digest}"
         );
     }
@@ -22251,7 +22268,7 @@ mod tests {
         }
 
         assert!(
-            crate::map_store::stamps(&state.pool, "alpha")
+            crate::map::store::stamps(&state.pool, "alpha")
                 .await
                 .unwrap()
                 .is_empty(),
@@ -22292,7 +22309,7 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert!(
-            crate::map_store::stamps(&state.pool, "alpha")
+            crate::map::store::stamps(&state.pool, "alpha")
                 .await
                 .unwrap()
                 .is_empty(),
@@ -22385,7 +22402,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert!(
-            crate::map_store::stamps(&state.pool, "alpha")
+            crate::map::store::stamps(&state.pool, "alpha")
                 .await
                 .unwrap()
                 .is_empty(),
@@ -22401,7 +22418,7 @@ mod tests {
         let state = test_state().await;
         let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
         seed_two_pending(&state, "alpha").await;
-        let id = crate::map_store::pending(&state.pool, "alpha")
+        let id = crate::map::store::pending(&state.pool, "alpha")
             .await
             .unwrap()[0]
             .id;
@@ -22416,7 +22433,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert!(
-            crate::map_store::stamps(&state.pool, "alpha")
+            crate::map::store::stamps(&state.pool, "alpha")
                 .await
                 .unwrap()
                 .is_empty()
@@ -22457,7 +22474,7 @@ mod tests {
             );
         }
         assert!(
-            crate::map_store::stamps(&state.pool, "alpha")
+            crate::map::store::stamps(&state.pool, "alpha")
                 .await
                 .unwrap()
                 .is_empty()
@@ -22517,7 +22534,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_unreadable_digest_is_reported_once_and_not_per_decision() {
-        // `map_stamp::digest` is all-or-nothing by design, and the map calls it once for the union
+        // `map::stamp::digest` is all-or-nothing by design, and the map calls it once for the union
         // of every decision's anchors — so a git that will not answer takes every settled stamp in
         // the project to `Lapse::Unreadable` at the same instant. That is accepted: the alternative
         // is one process spawn per decision, which is ~350 of them on a read the window makes every
@@ -22539,13 +22556,13 @@ mod tests {
         // digests are hand-made so the read has something real to fail to compare against.
         for (id, path) in [(one, "core/src/a.rs"), (two, "core/src/c.rs")] {
             let digest =
-                crate::map_stamp::canonical([(path, "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567")]);
+                crate::map::stamp::canonical([(path, "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567")]);
             assert!(
-                crate::map_store::stamp(
+                crate::map::store::stamp(
                     &state.pool,
                     "alpha",
                     id,
-                    crate::map_stamp::Verdict::Settled,
+                    crate::map::stamp::Verdict::Settled,
                     Some(&digest),
                     None,
                 )
@@ -22676,7 +22693,7 @@ mod tests {
         // gives — which is why it is read back through `pending` below rather than trusted here.
         assert_eq!(body.as_array().unwrap().len(), 2);
 
-        let waiting = crate::map_store::pending(&state.pool, "alpha")
+        let waiting = crate::map::store::pending(&state.pool, "alpha")
             .await
             .unwrap();
         assert!(!waiting.is_empty(), "the model's proposals are in the pile");
@@ -22734,7 +22751,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            crate::map_store::pending(&state.pool, "alpha")
+            crate::map::store::pending(&state.pool, "alpha")
                 .await
                 .unwrap()
                 .is_empty(),
@@ -22927,7 +22944,7 @@ mod tests {
             1,
             "one model call, for the unstamped decision"
         );
-        let judged = crate::map_store::judgements(&state.pool, "alpha")
+        let judged = crate::map::store::judgements(&state.pool, "alpha")
             .await
             .unwrap();
         assert_eq!(judged.len(), 1);
@@ -22965,7 +22982,7 @@ mod tests {
         );
         // Append-only, so a second row would be visible as one. There is none: the run wrote
         // nothing at all.
-        let judged = crate::map_store::judgements(&state.pool, "alpha")
+        let judged = crate::map::store::judgements(&state.pool, "alpha")
             .await
             .unwrap();
         assert_eq!(judged.len(), 2);
@@ -23004,7 +23021,7 @@ mod tests {
             3,
             "the confused answer did not stop the sweep at the decision after it"
         );
-        let judged = crate::map_store::judgements(&state.pool, "alpha")
+        let judged = crate::map::store::judgements(&state.pool, "alpha")
             .await
             .unwrap();
         assert_eq!(
@@ -23019,7 +23036,7 @@ mod tests {
             .expect("the decision nobody could read an answer for still has a row");
         assert_eq!(
             confused.judgement,
-            crate::map_triage::Judgement::Flagged,
+            crate::map::triage::Judgement::Flagged,
             "never `silenced` — a failure may ask for the owner's eyes and may never clear a \
              decision out of his queue"
         );
@@ -23165,11 +23182,11 @@ mod tests {
         // triager, and what it must never become is `silenced` — that would clear the decision out
         // of the owner's queue on the strength of a word nobody could read. It becomes a flag whose
         // reason says a machine wrote it, which asks for his eyes and claims nothing.
-        let judged = crate::map_store::judgements(&state.pool, "alpha")
+        let judged = crate::map::store::judgements(&state.pool, "alpha")
             .await
             .unwrap();
         assert_eq!(judged.len(), 1);
-        assert_eq!(judged[0].judgement, crate::map_triage::Judgement::Flagged);
+        assert_eq!(judged[0].judgement, crate::map::triage::Judgement::Flagged);
         assert!(
             judged[0].reason.starts_with("nucleos:"),
             "{}",
@@ -23219,7 +23236,7 @@ mod tests {
             "the other project's decision was not asked about"
         );
         assert!(
-            crate::map_store::judgements(&state.pool, "beta")
+            crate::map::store::judgements(&state.pool, "beta")
                 .await
                 .unwrap()
                 .is_empty(),
@@ -23335,7 +23352,7 @@ mod tests {
         // reporting, accurately, that it has.
         //
         // The row carries an `inputs_digest` like any other, so the decision reads current and the
-        // slot is released. What it costs is named in `map_triage::unreadable_flag` and is asserted
+        // slot is released. What it costs is named in `map::triage::unreadable_flag` and is asserted
         // at the end here: the flag is pinned until the inputs move.
         let mut state = test_state().await;
         let runner = Arc::new(TriagingRunner {
@@ -23371,11 +23388,11 @@ mod tests {
         // decision whose text nobody has touched keeps a verdict a machine wrote about one bad
         // answer — a visible wrong flag, which is the right way round against an invisible dead
         // queue.
-        let judged = crate::map_store::judgements(&state.pool, "alpha")
+        let judged = crate::map::store::judgements(&state.pool, "alpha")
             .await
             .unwrap();
         assert_eq!(judged.len(), 1);
-        assert_eq!(judged[0].judgement, crate::map_triage::Judgement::Flagged);
+        assert_eq!(judged[0].judgement, crate::map::triage::Judgement::Flagged);
         assert!(!judged[0].inputs_digest.is_empty());
     }
 
@@ -23383,7 +23400,7 @@ mod tests {
     ///
     /// Writing one AFTER a triage run is how these tests move a decision's `inputs_digest`: the
     /// anchor set grows, so the evidence the model was shown is no longer the evidence that stands,
-    /// which is `map_triage::inputs_digest`'s whole subject. Cheaper and more honest than editing
+    /// which is `map::triage::inputs_digest`'s whole subject. Cheaper and more honest than editing
     /// the decision's text, because a decision whose words changed is a different question, while
     /// this is the same question over code that moved — §10's first trigger, in a fixture.
     fn anchor_file(dir: &tempfile::TempDir, name: &str, section: u32) {
@@ -23579,7 +23596,7 @@ mod tests {
         header_reconciles(&map);
 
         // The row is still in the table. Nothing here deleted it, and §6.2 is why.
-        let rows = crate::map_store::judgements(&state.pool, "alpha")
+        let rows = crate::map::store::judgements(&state.pool, "alpha")
             .await
             .unwrap();
         assert_eq!(rows.len(), 2, "the judgement was filtered, never deleted");
@@ -23820,7 +23837,7 @@ mod tests {
         // them mismatches a `git-failed` digest — and a two-valued staleness test drops all of
         // them, emptying `triage` and reporting a whole backlog as *nunca vista*. That is a fact
         // about this daemon presented as a fact about the project, which is exactly the collapse
-        // `map_stamp::Lapse::Unreadable` exists one table over to prevent.
+        // `map::stamp::Lapse::Unreadable` exists one table over to prevent.
         //
         // A flag we could not re-verify is still a flag; a flag we discarded becomes a claim that
         // nobody ever looked.
@@ -23887,7 +23904,7 @@ mod tests {
     #[tokio::test]
     async fn the_silenced_pile_shows_every_silencing_and_not_only_the_latest_judgement() {
         // §6.2 asks for *"a razão de **cada** silenciamento"*. A pile built on
-        // `map_store::judgements` answers with one row per decision, so a decision silenced twice
+        // `map::store::judgements` answers with one row per decision, so a decision silenced twice
         // and then flagged had two silencings in the table and none in the pile — `map_triage` was
         // made append-only for exactly those rows and nothing was reading them.
         let mut state = test_state().await;
@@ -24136,26 +24153,26 @@ mod tests {
 
     /// Two unapproved lines in a project's pile, put there the way the extract route puts them.
     ///
-    /// Through `map_store::record` and not raw SQL: the same door the routes use, so a test that
+    /// Through `map::store::record` and not raw SQL: the same door the routes use, so a test that
     /// passes cannot be passing against a row shape the writer never produces.
     async fn seed_two_pending(state: &AppState, project: &str) {
-        crate::map_store::record(
+        crate::map::store::record(
             &state.pool,
             project,
             "design",
             crate::chats::Brain::Cloud,
             &[
-                crate::map_intent::Extracted {
+                crate::map::intent::Extracted {
                     section: "## 1. Alfa".to_owned(),
                     ordinal: 1,
                     text: "O mapa deriva-se a cada leitura.".to_owned(),
-                    kind: crate::map_intent::Kind::Countable,
+                    kind: crate::map::intent::Kind::Countable,
                 },
-                crate::map_intent::Extracted {
+                crate::map::intent::Extracted {
                     section: "## 2. Beta".to_owned(),
                     ordinal: 2,
                     text: "Nada chega aprovado.".to_owned(),
-                    kind: crate::map_intent::Kind::Character,
+                    kind: crate::map::intent::Kind::Character,
                 },
             ],
         )
@@ -24208,14 +24225,14 @@ mod tests {
     #[tokio::test]
     async fn answering_a_line_of_another_project_answers_nothing_over_http() {
         // The id is a global integer, so the project in the path is the only thing standing
-        // between one project's owner and another project's pile. `map_store::decide` already
+        // between one project's owner and another project's pile. `map::store::decide` already
         // filters by project; this asserts the route actually passes it and turns "no row changed"
         // into a 404 rather than a cheerful 204 about nothing.
         let state = test_state().await;
         let _a = project_with_rules(&state, "alpha", "gate_command: x\n").await;
         let _b = project_with_rules(&state, "beta", "gate_command: x\n").await;
         seed_two_pending(&state, "alpha").await;
-        let id = crate::map_store::pending(&state.pool, "alpha")
+        let id = crate::map::store::pending(&state.pool, "alpha")
             .await
             .unwrap()[0]
             .id;
@@ -24225,7 +24242,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            crate::map_store::pending(&state.pool, "alpha")
+            crate::map::store::pending(&state.pool, "alpha")
                 .await
                 .unwrap()
                 .len(),
@@ -24241,7 +24258,7 @@ mod tests {
         let state = test_state().await;
         let _dir = project_with_rules(&state, "alpha", "gate_command: x\n").await;
         seed_two_pending(&state, "alpha").await;
-        let id = crate::map_store::pending(&state.pool, "alpha")
+        let id = crate::map::store::pending(&state.pool, "alpha")
             .await
             .unwrap()[0]
             .id;
@@ -24255,7 +24272,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            crate::map_store::pending(&state.pool, "alpha")
+            crate::map::store::pending(&state.pool, "alpha")
                 .await
                 .unwrap()
                 .len(),
@@ -24670,7 +24687,7 @@ mod tests {
         assert!(
             home.path()
                 .join("projects/alpha")
-                .join(crate::project_state::MATERIALIZED_FILE)
+                .join(crate::project::state::MATERIALIZED_FILE)
                 .is_file(),
             "the record is the project's state, outside the project"
         );
@@ -24783,7 +24800,7 @@ mod tests {
                 .clone()
                 .unwrap()
                 .join("projects/alpha")
-                .join(crate::project_state::PINS_FILE),
+                .join(crate::project::state::PINS_FILE),
             &crate::workflows::read_bundle(
                 &state.workflow_library.clone().unwrap().join("dev/1.0"),
                 "dev",
@@ -24851,7 +24868,7 @@ mod tests {
             &home
                 .path()
                 .join("projects/alpha")
-                .join(crate::project_state::PINS_FILE),
+                .join(crate::project::state::PINS_FILE),
             &crate::workflows::read_bundle(&library.join("dev/1.0"), "dev", "1.0")
                 .unwrap()
                 .unwrap(),
@@ -24880,7 +24897,7 @@ mod tests {
         let records = home
             .path()
             .join("projects/alpha")
-            .join(crate::project_state::WORKTREE_RECORDS_DIR);
+            .join(crate::project::state::WORKTREE_RECORDS_DIR);
         assert_eq!(std::fs::read_dir(&records).unwrap().count(), 1);
         // The main checkout was not touched by a sync of its worktree.
         assert!(!project.path().join(".ai/workflow/workflow.md").exists());
@@ -24933,7 +24950,7 @@ mod tests {
                     .path()
                     .join("projects")
                     .join(id)
-                    .join(crate::project_state::PINS_FILE),
+                    .join(crate::project::state::PINS_FILE),
                 &crate::workflows::read_bundle(&library.join("dev/1.0"), "dev", "1.0")
                     .unwrap()
                     .unwrap(),
@@ -24975,7 +24992,7 @@ mod tests {
                     .path()
                     .join("projects")
                     .join(id)
-                    .join(crate::project_state::MATERIALIZED_FILE)
+                    .join(crate::project::state::MATERIALIZED_FILE)
                     .exists()
             );
         }
@@ -25023,7 +25040,7 @@ mod tests {
             home.path()
                 .join("projects")
                 .join(id)
-                .join(crate::project_state::MATERIALIZED_FILE)
+                .join(crate::project::state::MATERIALIZED_FILE)
         };
         assert!(record("beta").is_file());
         assert!(!record("alpha").exists());
@@ -26086,11 +26103,11 @@ mod tests {
         state: &AppState,
         id: &str,
         command_id: i64,
-    ) -> crate::project_commands::LastRun {
+    ) -> crate::project::commands::LastRun {
         for _ in 0..200 {
-            if let Ok(Some(row)) = crate::project_commands::get(&state.pool, id, command_id).await
+            if let Ok(Some(row)) = crate::project::commands::get(&state.pool, id, command_id).await
                 && let Some(last) = row.last
-                && last.outcome != crate::project_commands::Outcome::Running
+                && last.outcome != crate::project::commands::Outcome::Running
             {
                 return last;
             }
@@ -26137,7 +26154,7 @@ mod tests {
         );
 
         let last = settled(&state, "alpha", command_id).await;
-        assert_eq!(last.outcome, crate::project_commands::Outcome::Passed);
+        assert_eq!(last.outcome, crate::project::commands::Outcome::Passed);
         assert_eq!(last.exit_code, Some(0));
         assert!(last.ended_at.is_some());
 
@@ -26194,7 +26211,7 @@ mod tests {
             StatusCode::ACCEPTED
         );
         let last = settled(&state, "alpha", command_id).await;
-        assert_eq!(last.outcome, crate::project_commands::Outcome::Errored);
+        assert_eq!(last.outcome, crate::project::commands::Outcome::Errored);
         // No exit code at all, because there was no process to exit.
         assert_eq!(last.exit_code, None);
         assert!(last.output.unwrap().contains("failed to start"));
@@ -26293,7 +26310,7 @@ mod tests {
         );
 
         // Nothing was claimed, so nothing has a result — the refusal is not a run that failed.
-        let row = crate::project_commands::get(&state.pool, "alpha", command_id)
+        let row = crate::project::commands::get(&state.pool, "alpha", command_id)
             .await
             .unwrap()
             .unwrap();
@@ -26315,7 +26332,7 @@ mod tests {
         let command_id = body["id"].as_i64().unwrap();
 
         assert!(
-            crate::project_commands::mark_running(&state.pool, "alpha", command_id)
+            crate::project::commands::mark_running(&state.pool, "alpha", command_id)
                 .await
                 .unwrap()
         );
@@ -26497,7 +26514,7 @@ mod tests {
     /// Declared, listed on its own side, and withdrawn — with the fold visible in what comes back.
     ///
     /// The prefixes are typed mixed-case and double-spaced on purpose. What the route serves is what
-    /// is ENFORCED, and `project_policy::fold_prefix` is the reason those are the same string; a GET
+    /// is ENFORCED, and `project::policy::fold_prefix` is the reason those are the same string; a GET
     /// that echoed the typed spelling would show an owner a `Remove-Item` the classifier knows only
     /// as `remove-item`.
     #[tokio::test]
@@ -26868,7 +26885,7 @@ mod tests {
                 "`{prefix}` is a refusal worth writing down and the route must store it"
             );
 
-            let rules = crate::project_policy::shell_rules(&state.pool, "alpha")
+            let rules = crate::project::policy::shell_rules(&state.pool, "alpha")
                 .await
                 .unwrap();
             let verdict = crate::classifier::classify(
@@ -27869,8 +27886,8 @@ mod tests {
         );
 
         assert_eq!(
-            crate::project_policy::judge(&state.pool, "alpha").await,
-            crate::project_policy::Judge::Default,
+            crate::project::policy::judge(&state.pool, "alpha").await,
+            crate::project::policy::Judge::Default,
             "a refused naming must leave the project on the default, not half-written"
         );
 
@@ -27885,8 +27902,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(
-            crate::project_policy::judge(&state.pool, "alpha").await,
-            crate::project_policy::Judge::Named {
+            crate::project::policy::judge(&state.pool, "alpha").await,
+            crate::project::policy::Judge::Named {
                 brain: crate::chats::Brain::Local,
                 model: None,
             }
@@ -27934,8 +27951,8 @@ mod tests {
         );
 
         assert_eq!(
-            crate::project_policy::judge(&state.pool, "alpha").await,
-            crate::project_policy::Judge::Default,
+            crate::project::policy::judge(&state.pool, "alpha").await,
+            crate::project::policy::Judge::Default,
         );
 
         // The switch-off is checked against nothing, because it names nothing: `declare_judge`
@@ -27949,8 +27966,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(
-            crate::project_policy::judge(&state.pool, "alpha").await,
-            crate::project_policy::Judge::Off,
+            crate::project::policy::judge(&state.pool, "alpha").await,
+            crate::project::policy::Judge::Off,
         );
     }
 
@@ -39612,7 +39629,7 @@ mod tests {
     async fn volante_input_body_over_64_kib_is_refused() {
         let status = post_browser_body(
             "/browser/sessions/1/input",
-            vec![b'x'; crate::browser_seat::INPUT_BODY_LIMIT + 1],
+            vec![b'x'; crate::browser::seat::INPUT_BODY_LIMIT + 1],
         )
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
@@ -39622,7 +39639,7 @@ mod tests {
     /// default: a 3 MiB body gets past the limit, one over 14 MiB does not.
     #[tokio::test]
     async fn volante_answer_body_limit_is_14_mib() {
-        assert_eq!(crate::browser_seat::ANSWER_BODY_LIMIT, 14 * 1024 * 1024);
+        assert_eq!(crate::browser::seat::ANSWER_BODY_LIMIT, 14 * 1024 * 1024);
 
         let padding = "a".repeat(3 * 1024 * 1024);
         let body = serde_json::json!({ "seat_nonce": "n", "prompt": "p", "answer": padding });
@@ -39637,7 +39654,7 @@ mod tests {
 
         let status = post_browser_body(
             "/browser/sessions/1/answer",
-            vec![b'x'; crate::browser_seat::ANSWER_BODY_LIMIT + 1],
+            vec![b'x'; crate::browser::seat::ANSWER_BODY_LIMIT + 1],
         )
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);

@@ -15,13 +15,13 @@
 //! **The rule for membership: the núcleo owns a file if the núcleo PARSES it.** A claim and a
 //! validator arrive together or not at all — a claim without a parser is permission to write bytes
 //! nobody checks, which is exactly what the registry exists to prevent. The núcleo's claims below
-//! are asserted against [`crate::project_state`]'s file names rather than written out again, so a
+//! are asserted against [`crate::project::state`]'s file names rather than written out again, so a
 //! claim cannot come to name a file no loader reads.
 //!
 //! # Two homes: the project's state directory, and the project
 //!
 //! The núcleo's own two files no longer live in the project. They are
-//! `~/.nucleos/projects/<id>/autopilot.yaml` and `.../workflows.yaml` — see `project_state.rs` for
+//! `~/.nucleos/projects/<id>/autopilot.yaml` and `.../workflows.yaml` — see `project/state.rs` for
 //! why neither the project's `.ai/` nor a folder inside the project could hold them. A workflow's
 //! claims are still files IN the project, relative to its root. So every row says which of the two
 //! it is relative to ([`Home`]), and the write door resolves a row against that home and nothing
@@ -131,7 +131,7 @@ impl Claim {
     /// file, the path relative to the project root for a project file.
     pub fn display(&self, project_id: &str) -> String {
         match self.home {
-            Home::State => crate::project_state::display_path(project_id, &self.path),
+            Home::State => crate::project::state::display_path(project_id, &self.path),
             Home::Project => self.path.clone().into_owned(),
         }
     }
@@ -164,7 +164,7 @@ fn validate_autopilot(contents: &str) -> Result<(), String> {
 /// The núcleo's own claims. See the module header for why there are two and not eight.
 pub static CLAIMS: &[Claim] = &[
     Claim {
-        path: std::borrow::Cow::Borrowed(crate::project_state::AUTOPILOT_FILE),
+        path: std::borrow::Cow::Borrowed(crate::project::state::AUTOPILOT_FILE),
         home: Home::State,
         owner: std::borrow::Cow::Borrowed("core"),
         what: std::borrow::Cow::Borrowed(
@@ -173,7 +173,7 @@ pub static CLAIMS: &[Claim] = &[
         validate: Some(validate_autopilot),
     },
     Claim {
-        path: std::borrow::Cow::Borrowed(crate::project_state::PINS_FILE),
+        path: std::borrow::Cow::Borrowed(crate::project::state::PINS_FILE),
         home: Home::State,
         owner: std::borrow::Cow::Borrowed("core"),
         what: std::borrow::Cow::Borrowed(
@@ -278,7 +278,7 @@ pub fn normalise(rel: &str) -> Option<String> {
 /// Who owns `rel` in this project.
 ///
 /// A workflow's row may name a DIRECTORY — `owns: [.ai/workflow/]` provides every file under it
-/// (`workflow_materialize.rs`) — so a project row also answers for the paths beneath it. Only a
+/// (`workflows/materialize.rs`) — so a project row also answers for the paths beneath it. Only a
 /// project row: the núcleo's own rows are single files in the state directory, and a path under
 /// one of them is not a question with an answer.
 ///
@@ -320,8 +320,8 @@ mod tests {
     #[test]
     fn every_claim_names_a_file_the_nucleo_actually_parses() {
         assert_eq!(CLAIMS.len(), 2, "see the module header before adding a row");
-        assert_eq!(CLAIMS[0].path, crate::project_state::AUTOPILOT_FILE);
-        assert_eq!(CLAIMS[1].path, crate::project_state::PINS_FILE);
+        assert_eq!(CLAIMS[0].path, crate::project::state::AUTOPILOT_FILE);
+        assert_eq!(CLAIMS[1].path, crate::project::state::PINS_FILE);
         // Both are the project's STATE, never a file in the project: see the module header.
         assert!(CLAIMS.iter().all(|claim| claim.home == Home::State));
         // A `static` row with no parser would be write access to bytes nobody checks. The `None`
@@ -541,7 +541,7 @@ mod tests {
         let pins = temp
             .path()
             .join("state")
-            .join(crate::project_state::PINS_FILE);
+            .join(crate::project::state::PINS_FILE);
         crate::workflows::install(&pins, &bundle).unwrap();
 
         let claims = claims_for(&project, Some(&pins), &library);
@@ -625,7 +625,7 @@ mod tests {
         let pins = temp
             .path()
             .join("state")
-            .join(crate::project_state::PINS_FILE);
+            .join(crate::project::state::PINS_FILE);
         crate::workflows::install(&pins, &bundle).unwrap();
 
         let claims = claims_for(&project, Some(&pins), &library);
@@ -650,7 +650,7 @@ mod tests {
         let pins = temp
             .path()
             .join("state")
-            .join(crate::project_state::PINS_FILE);
+            .join(crate::project::state::PINS_FILE);
         let claims = claims_for(&project, Some(&pins), &temp.path().join("no-library-here"));
         assert_eq!(claims.len(), CLAIMS.len());
         assert_eq!(

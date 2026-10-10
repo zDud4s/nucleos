@@ -420,7 +420,7 @@ pub struct AppState {
     /// fraction, so the one secret on this path is the daemon's bearer for its own sidecar. That
     /// bearer is a smaller secret than the ones `EmailRuntime` and `CouncilRuntime` hold and it is
     /// still a secret, so `QuotaClient` carries a `Debug` guard of the same kind — see
-    /// `quota_client.rs`. What D2 buys is that a leak here opens the sidecar, never the vendor.
+    /// `quota/client.rs`. What D2 buys is that a leak here opens the sidecar, never the vendor.
     pub quota: Arc<crate::quota::QuotaRuntime>,
     /// Spec A: the autopilot's judge, its occupant and its four permits (D10/D11). Built once at
     /// startup; `runs.judge` decides per run whether it is asked at all.

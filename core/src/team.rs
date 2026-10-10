@@ -18,6 +18,8 @@
 //! borrowed: a pass launches up to `max_parallel` subprocesses and writes files at a cadence
 //! nothing else in the house shares.
 
+pub mod trigger;
+
 use crate::state::AppState;
 
 /// The `runs.mode` every invocation of a department carries — director and specialist alike.
@@ -251,7 +253,7 @@ fn validate(request: &TeamRequest) -> Result<(), TeamError> {
             "max_open_actions is outside what a daemon allows",
         ));
     }
-    if !(1..=crate::team_trigger::MAX_LIVE_TEAM_RUNS).contains(&request.max_live_runs) {
+    if !(1..=crate::team::trigger::MAX_LIVE_TEAM_RUNS).contains(&request.max_live_runs) {
         return Err(TeamError::Invalid(
             "max_live_runs is outside what a daemon allows",
         ));
@@ -1459,7 +1461,7 @@ pub async fn report(
         return Err(ReportError::Ceiling(MAX_REPORTS_PER_RUN));
     }
 
-    let id = crate::chat_notices::post(
+    let id = crate::chats::notices::post(
         &state.pool,
         &chat_id,
         team_run_id,
@@ -4679,7 +4681,7 @@ pub async fn post_read_file(
 
 /// The one piece of this module's test scaffolding another module needs.
 ///
-/// `team_trigger.rs` starts real departments to test what starts them, and a second copy of this
+/// `team/trigger.rs` starts real departments to test what starts them, and a second copy of this
 /// `AppState` would be a second set of answers to "what does a daemon with a files folder look
 /// like" — kept in step by hand, and wrong on the day somebody adds a field.
 #[cfg(test)]
@@ -5093,7 +5095,7 @@ mod tests {
         .await;
         crate::quota::test_support::arm(&state.pool, true, 85, 90).await;
         state.quota = std::sync::Arc::new(crate::quota::QuotaRuntime::new(
-            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            crate::quota::client::QuotaClient::new(&address, "bearer".into()),
             "claude".into(),
         ));
         (state, root)
@@ -6097,7 +6099,7 @@ mod tests {
         .await
         .expect("a director may speak in the conversation its run was pointed at");
 
-        let told = crate::chat_notices::for_chat(&state.pool, &chat_id)
+        let told = crate::chats::notices::for_chat(&state.pool, &chat_id)
             .await
             .unwrap();
         assert_eq!(told.len(), 1);
@@ -6149,7 +6151,7 @@ mod tests {
             "the refusal did not say what to do with the finding: {refusal}"
         );
         assert!(
-            crate::chat_notices::for_chat(&state.pool, &chat_id)
+            crate::chats::notices::for_chat(&state.pool, &chat_id)
                 .await
                 .unwrap()
                 .is_empty()

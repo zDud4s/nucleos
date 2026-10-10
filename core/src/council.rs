@@ -3981,7 +3981,7 @@ mod tests {
         .await;
         crate::quota::test_support::arm(&state.pool, true, 85, 90).await;
         state.quota = std::sync::Arc::new(crate::quota::QuotaRuntime::new(
-            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            crate::quota::client::QuotaClient::new(&address, "bearer".into()),
             "claude".into(),
         ));
 

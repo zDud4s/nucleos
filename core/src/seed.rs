@@ -8,7 +8,7 @@
 //! one way and worse in every other. Two sources of graph is the two-engines smell one level down:
 //! the canvas would either not show the workflow that runs most often in this app, or show it
 //! through a second path that could disagree with the first. Seeding it means **one code path** —
-//! [`crate::workflows`] lists it, [`crate::workflow_graph`] parses it, the canvas draws it, and a
+//! [`crate::workflows`] lists it, [`crate::workflows::graph`] parses it, the canvas draws it, and a
 //! person can open it, read it, fork it or eject it like anything else in the library.
 //!
 //! # Why nothing is lost when it is overwritten
@@ -127,10 +127,10 @@ mod tests {
     fn the_bundle_this_binary_carries_parses_as_a_graph() {
         let graph = FILES
             .iter()
-            .find(|(path, _)| *path == crate::workflow_graph::GRAPH_FILE)
+            .find(|(path, _)| *path == crate::workflows::graph::GRAPH_FILE)
             .map(|(_, contents)| *contents)
             .expect("the seeded bundle has a graph");
-        let parsed = crate::workflow_graph::parse(graph).expect("the seeded graph is valid");
+        let parsed = crate::workflows::graph::parse(graph).expect("the seeded graph is valid");
 
         // The sequence `job.rs` runs, by the names `runs.stage` already uses.
         let ids: Vec<&str> = parsed.nodes.iter().map(|node| node.id.as_str()).collect();
@@ -140,7 +140,7 @@ mod tests {
         // §4.4 gives the condition to the decision node and leaves `when` on any other edge as a
         // label nothing evaluates — so the second spelling would be a branch nothing ever takes.
         let more = parsed.nodes.iter().find(|n| n.id == "more").unwrap();
-        assert_eq!(more.kind, crate::workflow_graph::Kind::Decision);
+        assert_eq!(more.kind, crate::workflows::graph::Kind::Decision);
         assert!(more.condition.is_some());
 
         // And the two things about it that no prose ever managed to state: the gate is inside the
@@ -149,17 +149,17 @@ mod tests {
         assert_eq!(fan.each, ["implement", "gate"]);
         let gate = parsed.nodes.iter().find(|n| n.id == "gate").unwrap();
         assert_eq!(
-            crate::workflow_graph::command_source(gate.command.as_deref().unwrap()),
-            crate::workflow_graph::CommandSource::Project("gate")
+            crate::workflows::graph::command_source(gate.command.as_deref().unwrap()),
+            crate::workflows::graph::CommandSource::Project("gate")
         );
     }
 
     /// A gate is what stops a pipeline, so the picture has to draw it as one.
     #[test]
     fn the_gate_of_the_seeded_bundle_is_a_gate_by_role() {
-        let graph = crate::workflow_graph::parse(FILES[1].1).unwrap();
-        assert!(crate::workflow_graph::is_gate(&graph.edges, "gate"));
-        assert!(!crate::workflow_graph::is_gate(&graph.edges, "plan"));
+        let graph = crate::workflows::graph::parse(FILES[1].1).unwrap();
+        assert!(crate::workflows::graph::is_gate(&graph.edges, "gate"));
+        assert!(!crate::workflows::graph::is_gate(&graph.edges, "plan"));
     }
 
     #[test]
@@ -187,7 +187,7 @@ mod tests {
             .path()
             .join(NAME)
             .join(VERSION)
-            .join(crate::workflow_graph::GRAPH_FILE);
+            .join(crate::workflows::graph::GRAPH_FILE);
         std::fs::write(&graph, "nodes: []\n").unwrap();
 
         assert_eq!(seed(library.path()).unwrap(), Seeded::Restored);

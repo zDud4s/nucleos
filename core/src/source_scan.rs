@@ -30,24 +30,6 @@ pub fn source_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// Every `*.rs` file directly inside one of the roots, sorted. Subdirectories are not entered.
-///
-/// For scans that only ever covered the top level of `core/src`.
-pub fn top_level_rust_files() -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for root in source_roots() {
-        let entries = std::fs::read_dir(&root).expect("core source directory must be readable");
-        for entry in entries {
-            let path = entry.expect("core source entry must be readable").path();
-            if is_rust(&path) {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
-    files
-}
-
 /// Every `*.rs` file under all roots, recursively, sorted.
 pub fn rust_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -73,6 +55,25 @@ pub fn rust_files() -> Vec<PathBuf> {
 pub fn is_top_level(path: &Path) -> bool {
     path.parent()
         .is_some_and(|parent| source_roots().iter().any(|root| root == parent))
+}
+
+/// `path` from the root of its source tree, with `/` between folders: `runs.rs`,
+/// `council/store.rs`. What a scan names a file by, because a bare file name repeats as soon as
+/// modules live in folders (`council/store.rs`, `verify/store.rs`).
+pub fn module_path(path: &Path) -> String {
+    let root = source_roots()
+        .into_iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count());
+    let below = root
+        .as_deref()
+        .and_then(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path);
+    below
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn is_rust(path: &Path) -> bool {
@@ -103,14 +104,12 @@ mod tests {
     }
 
     #[test]
-    fn the_top_level_files_are_a_subset_without_subdirectories() {
-        let all = rust_files();
-        let top = top_level_rust_files();
-        assert!(!top.is_empty());
-        assert!(top.len() < all.len());
-        assert!(
-            top.iter()
-                .all(|path| all.contains(path) && is_top_level(path))
+    fn a_file_is_named_by_its_path_from_its_root() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert_eq!(module_path(&src.join("runs.rs")), "runs.rs");
+        assert_eq!(
+            module_path(&src.join("council").join("store.rs")),
+            "council/store.rs"
         );
     }
 }

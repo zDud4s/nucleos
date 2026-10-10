@@ -60,6 +60,10 @@
 //! reported separately as `update_available`, because "somebody published 1.1" and "the 1.0 you
 //! pinned is not the 1.0 you have" are opposite facts that would send a person to opposite places.
 
+pub mod graph;
+pub mod materialize;
+pub mod package;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -69,7 +73,7 @@ use sha2::{Digest, Sha256};
 /// Where an ejected bundle's copy lands, per §6.1. One directory per workflow name.
 ///
 /// Relative to the PROJECT root, and it stays there. The pins file moved out of the project into
-/// `~/.nucleos/projects/<id>/workflows.yaml` (see `project_state.rs`), because a pin is this app's
+/// `~/.nucleos/projects/<id>/workflows.yaml` (see `project/state.rs`), because a pin is this app's
 /// record of what a project uses. An ejected copy is the opposite kind of thing: the project's own
 /// files, which is what ejecting means, and they belong under the project's version control.
 ///
@@ -226,7 +230,7 @@ struct ManifestFile {
     #[serde(default)]
     owns: Vec<String>,
     /// A bundle-relative file whose text is the managed block of the project's `AGENTS.md`. See
-    /// [`crate::workflow_materialize`]. Absent, and the bundle never touches `AGENTS.md`.
+    /// [`crate::workflows::materialize`]. Absent, and the bundle never touches `AGENTS.md`.
     agents_block: Option<String>,
 }
 
@@ -688,7 +692,7 @@ pub enum Refused {
     /// The bundle has no `graph.yaml`. Not a fault — skills and scripts with no sequence yet is an
     /// ordinary halfway state, and this module is not the one that decides a bundle needs a graph.
     NoGraph,
-    /// It has one and it does not parse, in [`crate::workflow_graph`]'s own words.
+    /// It has one and it does not parse, in [`crate::workflows::graph`]'s own words.
     InvalidGraph(String),
     /// The pins file, or the ejected copy, could not be read or written.
     Io(String),
@@ -1000,7 +1004,7 @@ mod tests {
             .parent()
             .expect("a test project sits in a temporary directory")
             .join("state")
-            .join(crate::project_state::PINS_FILE)
+            .join(crate::project::state::PINS_FILE)
     }
 
     /// A pin is this app's record, not the project's file: installing writes nothing into the

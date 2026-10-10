@@ -1773,7 +1773,7 @@ impl Policy {
         // `deny`, where an empty list would lose a refusal somebody wrote down and the `Result`
         // reader is the only honest one; `project_policy` carries both halves for exactly this
         // reason, and picking the wrong one is how a database hiccup becomes a permission.
-        let declared = crate::project_policy::github_ops(pool, project_id).await;
+        let declared = crate::project::policy::github_ops(pool, project_id).await;
         // One narrowing against the whole declarable set, so a row that is in neither half warns
         // once and by name...
         let kept = narrow(&declared, &declarable_ops(), "project operation");
@@ -3320,7 +3320,7 @@ mod tests {
 
         // And a project that declared something gets a label of its own, suffix and all:
         // `v1\nreads=gh run list\nactions=pr_comment\nread_ops=pr_list`
-        crate::project_policy::declare_github_op(&pool, "alpha", "pr_list")
+        crate::project::policy::declare_github_op(&pool, "alpha", "pr_list")
             .await
             .unwrap();
         assert_eq!(
@@ -3758,10 +3758,10 @@ mod tests {
     #[tokio::test]
     async fn a_declared_operation_runs_without_asking_in_this_project_and_in_no_other() {
         let pool = test_pool().await;
-        crate::project_policy::declare_github_op(&pool, "alpha", "run_list")
+        crate::project::policy::declare_github_op(&pool, "alpha", "run_list")
             .await
             .unwrap();
-        crate::project_policy::declare_github_op(&pool, "alpha", "pr_comment")
+        crate::project::policy::declare_github_op(&pool, "alpha", "pr_comment")
             .await
             .unwrap();
 
@@ -3788,7 +3788,7 @@ mod tests {
     #[tokio::test]
     async fn a_projects_declaration_adds_to_the_machine_default_and_never_replaces_it() {
         let pool = test_pool().await;
-        crate::project_policy::declare_github_op(&pool, "alpha", "pr_list")
+        crate::project::policy::declare_github_op(&pool, "alpha", "pr_list")
             .await
             .unwrap();
 
@@ -3860,7 +3860,7 @@ mod tests {
     async fn a_declared_action_never_becomes_an_autonomous_bash_line() {
         let pool = test_pool().await;
         for kind in declarable_act_ops() {
-            crate::project_policy::declare_github_op(&pool, "alpha", kind)
+            crate::project::policy::declare_github_op(&pool, "alpha", kind)
                 .await
                 .unwrap();
         }
@@ -3895,7 +3895,7 @@ mod tests {
     async fn a_declared_name_does_not_survive_a_flag_that_changes_what_comes_back() {
         let pool = test_pool().await;
         for kind in ["run_status", "pr_list", "run_list"] {
-            crate::project_policy::declare_github_op(&pool, "alpha", kind)
+            crate::project::policy::declare_github_op(&pool, "alpha", kind)
                 .await
                 .unwrap();
         }
@@ -3931,7 +3931,7 @@ mod tests {
     #[tokio::test]
     async fn a_switched_off_pillar_stays_off_whatever_the_project_declared() {
         let pool = test_pool().await;
-        crate::project_policy::declare_github_op(&pool, "alpha", "run_list")
+        crate::project::policy::declare_github_op(&pool, "alpha", "run_list")
             .await
             .unwrap();
 
@@ -4125,7 +4125,7 @@ mod tests {
         // `for_project` reaches only the Bash door.
         let pool = test_pool().await;
         for kind in declarable_ops() {
-            crate::project_policy::declare_github_op(&pool, "alpha", kind)
+            crate::project::policy::declare_github_op(&pool, "alpha", kind)
                 .await
                 .unwrap();
         }

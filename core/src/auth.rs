@@ -3290,7 +3290,7 @@ mod tests {
 
     /// The reach a project declares for itself is the owner's, and nobody else's.
     ///
-    /// These twelve routes are the only way into the four tables `project_policy.rs` holds: what a
+    /// These twelve routes are the only way into the four tables `project/policy.rs` holds: what a
     /// project's worktrees may run unattended, what the GitHub manager may do on its remote, and
     /// what the shared git queue may do on its repository, and where a landing may be sent. **They
     /// are a live autonomy control, not a configuration edit.**

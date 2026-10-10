@@ -965,13 +965,13 @@ def verify_hint_cases():
     cases.append(_guarded("the hint follows the settled notice", after_notice))
 
     def same_file_name():
-        with open(os.path.join(ROOT, "core", "src", "verify_box.rs"), encoding="utf-8") as handle:
+        with open(os.path.join(ROOT, "core", "src", "verify", "ide_box.rs"), encoding="utf-8") as handle:
             source = handle.read()
         found = re.search(r'HINTS_FILE:\s*&str\s*=\s*"(.*?)"', source)
         rust = found.group(1) if found else None
         return _verdict(rust == hook.HINTS_FILE, f"{rust!r} vs {hook.HINTS_FILE!r}")
 
-    cases.append(_guarded("HINTS_FILE equals verify_box.rs HINTS_FILE", same_file_name))
+    cases.append(_guarded("HINTS_FILE equals verify/ide_box.rs HINTS_FILE", same_file_name))
     return cases
 
 

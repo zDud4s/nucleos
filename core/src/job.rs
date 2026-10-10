@@ -2321,7 +2321,7 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
     // their like are usually gitignored, so a fresh worktree has none of them; without this every
     // job ran without the rules its project pinned, and nothing said so. Fail-soft: a missing
     // workflow is a feed line, never a failed job (`workflow_materialize::into_worktree`).
-    crate::workflow_materialize::into_worktree(
+    crate::workflows::materialize::into_worktree(
         &state.pool,
         state.machine_config_root.as_deref(),
         state.workflow_library.as_deref(),
@@ -4463,7 +4463,7 @@ async fn gate_item_with(
     job: &JobRow,
     ordinal: usize,
     items: usize,
-    installed: Option<std::sync::Arc<crate::verify_exec::Executor>>,
+    installed: Option<std::sync::Arc<crate::verify::exec::Executor>>,
 ) -> Step {
     let pool = &state.pool;
     let last = ordinal + 1 == items;
@@ -4613,11 +4613,11 @@ async fn gate_item_with(
     if matches!(set_live_status(pool, job.id, "gating").await, Ok(false)) {
         return Step::Stopped;
     }
-    let outcome = crate::verify_runs::timed_gate(
+    let outcome = crate::verify::runs::timed_gate(
         Some(pool),
-        crate::verify_runs::GateContext {
+        crate::verify::runs::GateContext {
             project_id: Some(&job.project_id),
-            origin: crate::verify_runs::ORIGIN_JOB_ITEM,
+            origin: crate::verify::runs::ORIGIN_JOB_ITEM,
             origin_id: Some(job.id),
             ordinal: Some(ordinal as i64),
         },
@@ -6587,7 +6587,7 @@ mod tests {
         crate::quota::test_support::arm(&pool, true, 85, 90).await;
         let mut state = test_state(pool).await;
         state.quota = std::sync::Arc::new(crate::quota::QuotaRuntime::new(
-            crate::quota_client::QuotaClient::new(&address, "bearer".into()),
+            crate::quota::client::QuotaClient::new(&address, "bearer".into()),
             "claude".into(),
         ));
         state
@@ -10212,10 +10212,10 @@ mod tests {
         // that lives in the same container (see `with_home`). Written for both ids these walks use,
         // since the rules are keyed by the project and not by the folder.
         for project_id in ["nucleos", "project-a"] {
-            crate::project_state::write_for_test(
+            crate::project::state::write_for_test(
                 &container.path().join(WALK_HOME),
                 project_id,
-                crate::project_state::AUTOPILOT_FILE,
+                crate::project::state::AUTOPILOT_FILE,
                 &format!("gate_command: {gate}\nschedules: []\n"),
             );
         }
@@ -11449,10 +11449,10 @@ mod tests {
         let bundle = crate::workflows::read_bundle(&bundle_dir, "dev", "1.0")
             .unwrap()
             .unwrap();
-        let pins = crate::project_state::file(
+        let pins = crate::project::state::file(
             state.machine_config_root.as_deref(),
             "nucleos",
-            crate::project_state::PINS_FILE,
+            crate::project::state::PINS_FILE,
         )
         .unwrap();
         crate::workflows::install(&pins, &bundle).unwrap();
@@ -11607,9 +11607,9 @@ mod tests {
         );
         assert_eq!(rows.len() as i64, gated);
         for (origin, ordinal, status, project_id) in &rows {
-            assert_eq!(origin, crate::verify_runs::ORIGIN_JOB_ITEM);
+            assert_eq!(origin, crate::verify::runs::ORIGIN_JOB_ITEM);
             assert!(ordinal.is_some());
-            assert_eq!(status, crate::verify_runs::STATUS_FAILED);
+            assert_eq!(status, crate::verify::runs::STATUS_FAILED);
             assert!(project_id.is_some());
         }
     }
@@ -13206,10 +13206,10 @@ mod tests {
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
         let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        crate::project_state::write_for_test(
+        crate::project::state::write_for_test(
             worktree.path(),
             "project-a",
-            crate::project_state::AUTOPILOT_FILE,
+            crate::project::state::AUTOPILOT_FILE,
             "attention_brake: false\n",
         );
         let state = AppState {
@@ -14637,10 +14637,10 @@ mod tests {
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
         let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        crate::project_state::write_for_test(
+        crate::project::state::write_for_test(
             worktree.path(),
             "project-a",
-            crate::project_state::AUTOPILOT_FILE,
+            crate::project::state::AUTOPILOT_FILE,
             "gate_command: definitely-not-a-real-binary\n",
         );
         let state = AppState {
@@ -15762,7 +15762,7 @@ tests:
         pool: sqlx::SqlitePool,
         state: AppState,
         job: JobRow,
-        executor: std::sync::Arc<crate::verify_exec::Executor>,
+        executor: std::sync::Arc<crate::verify::exec::Executor>,
         _repo: tempfile::TempDir,
         _machine: tempfile::TempDir,
     }
@@ -15816,10 +15816,10 @@ tests:
         assert!(git_ok(root, &["commit", "-q", "-am", "two"]));
 
         let machine = tempfile::tempdir().unwrap();
-        crate::project_state::write_for_test(
+        crate::project::state::write_for_test(
             machine.path(),
             "project-a",
-            crate::project_state::AUTOPILOT_FILE,
+            crate::project::state::AUTOPILOT_FILE,
             rules,
         );
         let pool = test_pool().await;
@@ -15858,12 +15858,12 @@ tests:
         }
         seed_items(&pool, job_id, &["implemented", "implemented"]).await;
 
-        let executor = crate::verify_exec::Executor::new(
+        let executor = crate::verify::exec::Executor::new(
             pool.clone(),
             crate::config::VerifyConfig::default(),
             Some(machine.path().to_path_buf()),
         );
-        tokio::spawn(crate::verify_exec::run_executor(executor.clone()));
+        tokio::spawn(crate::verify::exec::run_executor(executor.clone()));
         let job = load_job(&pool, job_id).await.unwrap();
         ScopeJob {
             pool,

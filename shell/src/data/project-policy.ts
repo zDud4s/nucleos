@@ -10,7 +10,7 @@ import { keys } from "./keys";
  *
  * **Not `project-commands.ts`.** That one holds commands somebody presses a button to run — `gate`,
  * `fmt`, `typecheck`. Nothing here is ever executed. These are permissions, and the two modules
- * share a first word and nothing else. `core/src/project_policy.rs` makes the same distinction in
+ * share a first word and nothing else. `core/src/project/policy.rs` makes the same distinction in
  * the same words, and this is the shell's half of it.
  *
  * Fourteen routes, read off `core/src/http.rs` rather than inferred from the names:

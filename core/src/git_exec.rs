@@ -1566,7 +1566,7 @@ pub(crate) async fn prepare_postgate_worktree(
     sha: &str,
     deadline: std::time::Instant,
 ) -> Result<std::path::PathBuf, String> {
-    let path = crate::verify_postgate::postgate_worktree(project_root);
+    let path = crate::verify::postgate::postgate_worktree(project_root);
     let path = reset_or_create_worktree(project_root, &path, "postgate", deadline)
         .await
         .map_err(|outcome| match outcome {
@@ -2414,7 +2414,7 @@ pub struct GitExecutor {
     /// The verification executor a merge's `scope` gate is submitted to (spec 2026-10-05 §6.1).
     /// `None` - what `Default` gives - means every merge takes the full gate, which is how a test
     /// that never installed one behaves.
-    pub verify: Option<std::sync::Arc<crate::verify_exec::Executor>>,
+    pub verify: Option<std::sync::Arc<crate::verify::exec::Executor>>,
 }
 
 impl Default for GitExecutor {
@@ -2595,7 +2595,7 @@ impl crate::vcs::VcsExecutor for GitExecutor {
                         if measured == MergeGate::FullCovering
                             && let Outcome::Succeeded { sha: Some(sha), .. } = &outcome
                             && let Some(pool) = self.pool.as_ref()
-                            && let Err(error) = crate::verify_postgate::mark_covered(
+                            && let Err(error) = crate::verify::postgate::mark_covered(
                                 pool,
                                 &request.project_id,
                                 target.as_str(),
@@ -2734,7 +2734,7 @@ async fn gate_the_merge(
     timeout: Duration,
     scope_wait: Duration,
     land_target: Option<&str>,
-    verify: Option<&std::sync::Arc<crate::verify_exec::Executor>>,
+    verify: Option<&std::sync::Arc<crate::verify::exec::Executor>>,
 ) -> Result<MergeGate, Outcome> {
     let refuse = |reason: String| Outcome::Failed {
         reason,
@@ -2743,7 +2743,7 @@ async fn gate_the_merge(
     };
 
     let rules_path =
-        crate::project_state::display_path(project_id, crate::project_state::AUTOPILOT_FILE);
+        crate::project::state::display_path(project_id, crate::project::state::AUTOPILOT_FILE);
     let rules = match crate::config::load_schedule_rules(machine_root, project_id) {
         Ok(rules) => rules,
         Err(error) => {
@@ -2822,11 +2822,11 @@ async fn gate_the_merge(
         }
     }
 
-    let measured = crate::verify_runs::timed_gate(
+    let measured = crate::verify::runs::timed_gate(
         pool,
-        crate::verify_runs::GateContext {
+        crate::verify::runs::GateContext {
             project_id: Some(project_id),
-            origin: crate::verify_runs::ORIGIN_MERGE,
+            origin: crate::verify::runs::ORIGIN_MERGE,
             origin_id: Some(request_id),
             ordinal: None,
         },
@@ -4014,9 +4014,9 @@ gate_command: git --version
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(origin, crate::verify_runs::ORIGIN_MERGE);
+        assert_eq!(origin, crate::verify::runs::ORIGIN_MERGE);
         assert_eq!(origin_id, Some(41));
-        assert_eq!(status, crate::verify_runs::STATUS_PASSED);
+        assert_eq!(status, crate::verify::runs::STATUS_PASSED);
         assert_eq!(project_id.as_deref(), Some("alpha"));
         assert!(sha.is_some(), "the merge commit that was measured");
     }
@@ -4074,10 +4074,10 @@ gate_command: git --version
     /// Writes project `alpha`'s rules where the queue reads them: `<machine_root>/projects/alpha/`,
     /// with `machine_root` a temporary directory standing in for `~/.nucleos`.
     fn write_autopilot_rules(machine_root: &Path, contents: &str) {
-        let path = crate::project_state::file(
+        let path = crate::project::state::file(
             Some(machine_root),
             "alpha",
-            crate::project_state::AUTOPILOT_FILE,
+            crate::project::state::AUTOPILOT_FILE,
         )
         .expect("alpha names a directory");
         std::fs::create_dir_all(path.parent().expect("the rules file sits in a folder"))
@@ -4143,13 +4143,13 @@ gate_command: git --version
     fn verify_executor(
         pool: &sqlx::SqlitePool,
         machine_root: &Path,
-    ) -> std::sync::Arc<crate::verify_exec::Executor> {
-        let executor = crate::verify_exec::Executor::new(
+    ) -> std::sync::Arc<crate::verify::exec::Executor> {
+        let executor = crate::verify::exec::Executor::new(
             pool.clone(),
             crate::config::VerifyConfig::default(),
             Some(machine_root.to_path_buf()),
         );
-        tokio::spawn(crate::verify_exec::run_executor(executor.clone()));
+        tokio::spawn(crate::verify::exec::run_executor(executor.clone()));
         executor
     }
 
@@ -4168,7 +4168,7 @@ gate_command: git --version
         repo: &Path,
         machine_root: &Path,
         pool: Option<sqlx::SqlitePool>,
-        verify: Option<std::sync::Arc<crate::verify_exec::Executor>>,
+        verify: Option<std::sync::Arc<crate::verify::exec::Executor>>,
         integration_branch: Option<&str>,
         id: i64,
     ) -> Outcome {
@@ -4204,7 +4204,7 @@ gate_command: git --version
 
     async fn merge_gate_rows(pool: &sqlx::SqlitePool) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM verify_runs WHERE origin = ?")
-            .bind(crate::verify_runs::ORIGIN_MERGE)
+            .bind(crate::verify::runs::ORIGIN_MERGE)
             .fetch_one(pool)
             .await
             .expect("count verify_runs")
@@ -4242,7 +4242,7 @@ gate_command: git --version
         assert!(request_callers(&pool).await.is_empty(), "no verify request");
         assert_eq!(sha_of(&repo, "master"), before);
         assert!(
-            crate::verify_postgate::load(&pool, "alpha")
+            crate::verify::postgate::load(&pool, "alpha")
                 .await
                 .unwrap()
                 .is_none()
@@ -4280,7 +4280,7 @@ gate_command: git --version
         assert_eq!(request_callers(&pool).await, vec!["merge:7".to_owned()]);
         assert_eq!(merge_gate_rows(&pool).await, 0, "the full gate did not run");
         assert!(
-            crate::verify_postgate::load(&pool, "alpha")
+            crate::verify::postgate::load(&pool, "alpha")
                 .await
                 .unwrap()
                 .is_none(),
@@ -4351,7 +4351,7 @@ gate_command: git --version
             other => panic!("a green full gate must publish, got {other:?}"),
         };
         assert_eq!(merge_gate_rows(&pool).await, 1);
-        let state = crate::verify_postgate::load(&pool, "alpha")
+        let state = crate::verify::postgate::load(&pool, "alpha")
             .await
             .unwrap()
             .expect("the published merge is recorded as covered");
@@ -4388,7 +4388,7 @@ gate_command: git --version
         assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
         assert_eq!(sha_of(&repo, "master"), before);
         assert!(
-            crate::verify_postgate::load(&pool, "alpha")
+            crate::verify::postgate::load(&pool, "alpha")
                 .await
                 .unwrap()
                 .is_none(),
@@ -4428,7 +4428,7 @@ gate_command: git --version
             other => panic!("the fallback to the full gate must publish, got {other:?}"),
         };
         assert_eq!(merge_gate_rows(&pool).await, 1, "the full gate ran");
-        let state = crate::verify_postgate::load(&pool, "alpha")
+        let state = crate::verify::postgate::load(&pool, "alpha")
             .await
             .unwrap()
             .expect("the full gate covered the published merge");
@@ -4452,7 +4452,7 @@ gate_command: git --version
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         // No `run_executor`: the scope's units are accepted and never run.
-        let executor = crate::verify_exec::Executor::new(
+        let executor = crate::verify::exec::Executor::new(
             pool.clone(),
             crate::config::VerifyConfig::default(),
             Some(container.path().to_path_buf()),
@@ -4496,7 +4496,7 @@ gate_command: git --version
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         // No `run_executor`: the scope's units are accepted and never run.
-        let executor = crate::verify_exec::Executor::new(
+        let executor = crate::verify::exec::Executor::new(
             pool.clone(),
             crate::config::VerifyConfig::default(),
             Some(container.path().to_path_buf()),
@@ -4523,7 +4523,7 @@ gate_command: git --version
         let still_queued: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM verify_runs WHERE origin = ? AND status = 'queued'",
         )
-        .bind(crate::verify_runs::ORIGIN_VERIFY)
+        .bind(crate::verify::runs::ORIGIN_VERIFY)
         .fetch_one(&pool)
         .await
         .expect("count queued verify units");
@@ -4533,7 +4533,7 @@ gate_command: git --version
         );
         let cancelled: Vec<(String, Option<String>)> =
             sqlx::query_as("SELECT status, output_tail FROM verify_runs WHERE origin = ?")
-                .bind(crate::verify_runs::ORIGIN_VERIFY)
+                .bind(crate::verify::runs::ORIGIN_VERIFY)
                 .fetch_all(&pool)
                 .await
                 .expect("read the scope's units");
@@ -4670,7 +4670,7 @@ gate_command: git --version
         assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
         assert!(request_callers(&pool).await.is_empty(), "no verify request");
         assert!(
-            crate::verify_postgate::load(&pool, "alpha")
+            crate::verify::postgate::load(&pool, "alpha")
                 .await
                 .unwrap()
                 .is_none()

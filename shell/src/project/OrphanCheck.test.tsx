@@ -35,7 +35,7 @@ function anchored(overrides: Partial<Anchored> = {}): Anchored {
 
 function loss(overrides: Partial<Loss> = {}): Loss {
   return {
-    path: "core/src/map_join.rs",
+    path: "core/src/map/join.rs",
     commit: "2a4d4af1a332feec8f0f4fba1fe81ea4cca8b28d",
     at: 1_787_788_755,
     subject: "refactor: rewrite the module header",
@@ -113,7 +113,7 @@ describe("whether a decision with no code lost the comment that anchored it", ()
     press();
 
     const said = await screen.findByRole("list", { name: /where the citation went/i });
-    expect(said.textContent).toContain("core/src/map_join.rs");
+    expect(said.textContent).toContain("core/src/map/join.rs");
     expect(said.textContent).toContain("refactor: rewrite the module header");
     // The whole object id and never an abbreviation: this sentence exists to be pasted into
     // `git show`, and an abbreviation is a hash that stops working when the repository grows.
@@ -152,14 +152,14 @@ describe("whether a decision with no code lost the comment that anchored it", ()
   it("says where a renamed file went", async () => {
     daemon.apiFetch.mockResolvedValue({
       state: "lost",
-      losses: [loss({ renamed_to: "core/src/map_orphan.rs" })],
+      losses: [loss({ renamed_to: "core/src/map/orphan.rs" })],
     } satisfies Orphan);
 
     open();
     press();
 
     const said = await screen.findByRole("list", { name: /where the citation went/i });
-    expect(said.textContent).toContain("that commit moved it to core/src/map_orphan.rs");
+    expect(said.textContent).toContain("that commit moved it to core/src/map/orphan.rs");
   });
 
   /**
@@ -273,7 +273,7 @@ describe("whether a decision with no code lost the comment that anchored it", ()
     expect(String(uri)).toBe("/projects/alpha/map/anchors");
     expect(JSON.parse(String((init as { body: string }).body))).toEqual({
       decision_id: 1,
-      paths: ["core/src/map_join.rs"],
+      paths: ["core/src/map/join.rs"],
     });
   });
 
@@ -287,7 +287,7 @@ describe("whether a decision with no code lost the comment that anchored it", ()
   it("writes down where the file went and not where it was", async () => {
     daemon.apiFetch.mockResolvedValue({
       state: "lost",
-      losses: [loss({ renamed_to: "core/src/map_orphan.rs" })],
+      losses: [loss({ renamed_to: "core/src/map/orphan.rs" })],
     } satisfies Orphan);
 
     open();
@@ -300,7 +300,7 @@ describe("whether a decision with no code lost the comment that anchored it", ()
     await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledTimes(2));
     const [, init] = daemon.apiFetch.mock.calls[1];
     expect(JSON.parse(String((init as { body: string }).body)).paths).toEqual([
-      "core/src/map_orphan.rs",
+      "core/src/map/orphan.rs",
     ]);
   });
   /**

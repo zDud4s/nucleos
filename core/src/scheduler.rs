@@ -503,7 +503,7 @@ async fn fire_command(
         String::new()
     };
 
-    let refusal = match crate::project_policy::shell_rules(&state.pool, project_id).await {
+    let refusal = match crate::project::policy::shell_rules(&state.pool, project_id).await {
         Ok(rules) => {
             let judged = crate::classifier::classify(
                 "Bash",
@@ -584,7 +584,7 @@ async fn fire_command(
                     &words,
                     &cwd,
                     &[],
-                    crate::project_commands::COMMAND_TIMEOUT,
+                    crate::project::commands::COMMAND_TIMEOUT,
                 )
                 .await;
                 if ran.timed_out {
@@ -593,7 +593,7 @@ async fn fire_command(
                         None,
                         format!(
                             "timed out after {} seconds\n{}",
-                            crate::project_commands::COMMAND_TIMEOUT.as_secs(),
+                            crate::project::commands::COMMAND_TIMEOUT.as_secs(),
                             ran.tail
                         ),
                         "could not be measured: it timed out".to_string(),
@@ -1370,13 +1370,13 @@ mod tests {
     /// Writes `project_id`'s rules where the scheduler reads them: its directory under the state's
     /// stand-in home.
     fn write_rules(state: &AppState, project_id: &str, contents: &str) {
-        crate::project_state::write_for_test(
+        crate::project::state::write_for_test(
             state
                 .machine_config_root
                 .as_deref()
                 .expect("the test state has a stand-in home"),
             project_id,
-            crate::project_state::AUTOPILOT_FILE,
+            crate::project::state::AUTOPILOT_FILE,
             contents,
         );
     }
@@ -2021,12 +2021,12 @@ mod tests {
             Some(&timestamp("2026-07-18T10:00:00Z").to_rfc3339()),
         )
         .await;
-        crate::project_policy::declare_shell_rule(
+        crate::project::policy::declare_shell_rule(
             &state.pool,
             "proj",
             None,
             "git --version",
-            crate::project_policy::Verdict::Deny,
+            crate::project::policy::Verdict::Deny,
             None,
         )
         .await

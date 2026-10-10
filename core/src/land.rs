@@ -346,7 +346,7 @@ async fn resolve_target(
         return integration_branch(pool, project_id, project_root, deadline).await;
     };
 
-    let recorded = crate::project_policy::land_targets(pool, project_id).await;
+    let recorded = crate::project::policy::land_targets(pool, project_id).await;
     if recorded.iter().any(|branch| branch == requested) || escalation_target == Some(requested) {
         // Validated BEFORE it reaches git, because `declare_land_target` trims a branch name but
         // does not check it: a name `Branch::new` rejects would otherwise be told it does not
@@ -1432,7 +1432,7 @@ mod tests {
         let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
-        crate::project_policy::declare_land_target(&pool, "alpha", "release")
+        crate::project::policy::declare_land_target(&pool, "alpha", "release")
             .await
             .unwrap();
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
@@ -1465,7 +1465,7 @@ mod tests {
         let pool = test_pool().await;
         let (_container, repo) = repo_parked_off_target("nucleos-land-gone-", "chore/other");
         seed_project(&pool, "alpha", &repo, Some("master")).await;
-        crate::project_policy::declare_land_target(&pool, "alpha", "release")
+        crate::project::policy::declare_land_target(&pool, "alpha", "release")
             .await
             .unwrap();
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
@@ -1503,7 +1503,7 @@ mod tests {
         let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, Some("master")).await;
-        crate::project_policy::declare_land_target(&pool, "alpha", "release")
+        crate::project::policy::declare_land_target(&pool, "alpha", "release")
             .await
             .unwrap();
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
@@ -1552,7 +1552,7 @@ mod tests {
         let roots = crate::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         seed_project(&pool, "alpha", &repo, None).await;
-        crate::project_policy::declare_land_target(&pool, "alpha", "release")
+        crate::project::policy::declare_land_target(&pool, "alpha", "release")
             .await
             .unwrap();
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
@@ -1596,10 +1596,10 @@ mod tests {
         let _env = crate::git_exec::tests::WorktreeRootEnv::set(roots.path());
         // Where the queue reads `alpha`'s rules: a temporary stand-in for `~/.nucleos`.
         let machine_root = container.path().join("nucleos-home");
-        let rules = crate::project_state::file(
+        let rules = crate::project::state::file(
             Some(&machine_root),
             "alpha",
-            crate::project_state::AUTOPILOT_FILE,
+            crate::project::state::AUTOPILOT_FILE,
         )
         .unwrap();
         std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
