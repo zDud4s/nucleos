@@ -2136,6 +2136,12 @@ ol.ui-well {
   color: var(--text);
 }
 
+/* A count is a reading beside the label, not part of the selection: it stays muted
+   when the tab it sits on turns to full-contrast text. */
+.ui-tab[data-state="active"] .ui-count {
+  color: var(--text-muted);
+}
+
 .ui-tab:disabled {
   pointer-events: none;
   opacity: var(--opacity-disabled);
@@ -2143,6 +2149,11 @@ ol.ui-well {
 
 .ui-tab-panel {
   min-width: 0;
+}
+
+/* The panel is focusable (Radix makes it a tab stop) so only the mouse-focus ring goes;
+   a keyboard user still sees where they are. */
+.ui-tab-panel:focus:not(:focus-visible) {
   outline: none;
 }
 

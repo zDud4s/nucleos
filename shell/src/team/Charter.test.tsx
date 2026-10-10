@@ -58,7 +58,10 @@ function teamView(overrides: Partial<TeamView> = {}): TeamView {
  * which is the whole subject: the guard exists because the daemon's copy can
  * change while the form is open.
  */
-async function renderCharter(seed: TeamView, opts: { later?: TeamView; knowledge?: Known[] } = {}) {
+async function renderCharter(
+  seed: TeamView,
+  opts: { later?: TeamView; knowledge?: Known[]; others?: TeamView[] } = {},
+) {
   const state = { team: seed, reads: 0 };
 
   daemon.apiFetch.mockImplementation(async (path: string) => {
@@ -69,7 +72,7 @@ async function renderCharter(seed: TeamView, opts: { later?: TeamView; knowledge
         { id: "tax-analyst", name: "tax-analyst", speciality: "", prompt: "", engine: "claude", model: null, tool_policy: "", created_at: "", updated_at: "" },
       ];
     }
-    if (path === "/teams") return [state.team];
+    if (path === "/teams") return [state.team, ...(opts.others ?? [])];
     const listed = knowledgeAnswer(path, opts.knowledge ?? []);
     if (listed !== undefined) return listed;
     if (/^\/teams\/[^/]+$/.exec(path) !== null) {
@@ -166,14 +169,166 @@ describe("Charter - saving", () => {
   it("writes an absent budget ceiling as no ceiling and never as zero", async () => {
     await renderCharter(teamView({ budget_usd: null }));
 
-    const box = (await screen.findByLabelText(/Budget ceiling/)) as HTMLInputElement;
+    const box = (await screen.findByLabelText("Spending ceiling per task")) as HTMLInputElement;
     expect(box.value).toBe("");
-    expect(screen.getByText("no ceiling")).toBeDefined();
+    // "None" is a ticked box beside a disabled amount, not a blank left to mean it.
+    expect(box.disabled).toBe(true);
+    expect((screen.getByLabelText("No ceiling") as HTMLInputElement).checked).toBe(true);
 
     fireEvent.change(screen.getByLabelText("Mission"), { target: { value: "and file them" } });
     fireEvent.click(await screen.findByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(lastPut().budget_usd).toBeNull());
+  });
+});
+
+describe("Charter - the form's own checks", () => {
+  it("marks an out-of-range ceiling, says the range, and refuses to save it", async () => {
+    await renderCharter(teamView());
+
+    const rounds = (await screen.findByLabelText("Rounds per task")) as HTMLInputElement;
+    expect(rounds.getAttribute("aria-invalid")).toBeNull();
+    expect(screen.getByText(/1–6\.$/)).toBeDefined();
+
+    fireEvent.change(rounds, { target: { value: "9" } });
+    expect(rounds.getAttribute("aria-invalid")).toBe("true");
+    expect(screen.getByText("Use 1 to 6")).toBeDefined();
+    expect(screen.getByText(/Fix the limits marked above to save/)).toBeDefined();
+    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true);
+
+    // A blank count is not "no ceiling": only the budget has that meaning.
+    fireEvent.change(rounds, { target: { value: "" } });
+    expect(rounds.getAttribute("aria-invalid")).toBe("true");
+
+    fireEvent.change(rounds, { target: { value: "5" } });
+    expect(rounds.getAttribute("aria-invalid")).toBeNull();
+    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("says what is missing next to a disabled Save", async () => {
+    await renderCharter(teamView());
+
+    fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "" } });
+    fireEvent.change(screen.getByLabelText("Mission"), { target: { value: "" } });
+
+    expect(screen.getByText("Add a name and a mission to save")).toBeDefined();
+    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("counts sections, not fields, and confirms a save with Saved", async () => {
+    await renderCharter(teamView());
+
+    fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "Finance" } });
+    fireEvent.change(screen.getByLabelText("Mission"), { target: { value: "and file them" } });
+    expect(screen.getByText(/^1 section changed/)).toBeDefined();
+
+    fireEvent.change(screen.getByLabelText("Rounds per task"), { target: { value: "5" } });
+    expect(screen.getByText(/^2 sections changed/)).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect((await screen.findByRole("status")).textContent).toBe("Saved");
+  });
+
+  it("saves on Ctrl+S by the same road as the button", async () => {
+    await renderCharter(teamView());
+
+    const mission = await screen.findByLabelText("Mission");
+    fireEvent.change(mission, { target: { value: "and file them" } });
+    fireEvent.keyDown(mission, { key: "s", ctrlKey: true });
+
+    await waitFor(() => expect(lastPut().mission).toBe("and file them"));
+  });
+
+  it("writes Required only when a required field has been emptied", async () => {
+    await renderCharter(teamView());
+
+    const name = await screen.findByLabelText("Name");
+    expect(screen.queryByText("Required")).toBeNull();
+    expect(name.getAttribute("aria-required")).toBe("true");
+
+    fireEvent.change(name, { target: { value: "" } });
+    expect(screen.getByText("Add a name")).toBeDefined();
+  });
+});
+
+/* -------------------------------------------------------------- limits -- */
+
+describe("Charter - limits", () => {
+  it("steps a count inside its range and stops at the bounds", async () => {
+    await renderCharter(teamView({ max_rounds: 4, max_live_runs: 1 }));
+
+    const rounds = (await screen.findByLabelText("Rounds per task")) as HTMLInputElement;
+    const more = screen.getByRole("button", { name: "More rounds" }) as HTMLButtonElement;
+    fireEvent.click(more);
+    fireEvent.click(more);
+    expect(rounds.value).toBe("6");
+    expect(more.disabled).toBe(true);
+    // The arrow keys step too, inside the same range.
+    fireEvent.keyDown(rounds, { key: "ArrowUp" });
+    expect(rounds.value).toBe("6");
+    fireEvent.keyDown(rounds, { key: "ArrowDown" });
+    expect(rounds.value).toBe("5");
+
+    // Already at its floor: the one-task team cannot be stepped below one.
+    expect((screen.getByRole("button", { name: "Fewer tasks at once" }) as HTMLButtonElement).disabled).toBe(true);
+
+    // A typed value outside the range is still answered, and a step brings it back in.
+    fireEvent.change(rounds, { target: { value: "9" } });
+    expect(rounds.getAttribute("aria-invalid")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Fewer rounds" }));
+    expect(rounds.value).toBe("6");
+    expect(rounds.getAttribute("aria-invalid")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(lastPut().max_rounds).toBe(6));
+  });
+
+  it("ticking No ceiling clears and disables the amount and saves no ceiling", async () => {
+    await renderCharter(teamView({ budget_usd: 5 }));
+
+    const amount = (await screen.findByLabelText("Spending ceiling per task")) as HTMLInputElement;
+    const none = screen.getByLabelText("No ceiling") as HTMLInputElement;
+    expect(amount.value).toBe("5");
+    expect(amount.disabled).toBe(false);
+    expect(none.checked).toBe(false);
+
+    fireEvent.click(none);
+    expect(none.checked).toBe(true);
+    expect(amount.value).toBe("");
+    expect(amount.disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(lastPut().budget_usd).toBeNull());
+  });
+
+  it("gives the amount back when No ceiling is unticked again", async () => {
+    await renderCharter(teamView({ budget_usd: 5 }));
+
+    const none = (await screen.findByLabelText("No ceiling")) as HTMLInputElement;
+    fireEvent.click(none);
+    fireEvent.click(none);
+    const amount = screen.getByLabelText("Spending ceiling per task") as HTMLInputElement;
+    expect(amount.disabled).toBe(false);
+    expect(amount.value).toBe("5");
+  });
+});
+
+/* --------------------------------------------------------------- staff -- */
+
+describe("Charter - staff", () => {
+  it("says where else a member works in their own row, with no chip row under the list", async () => {
+    const marketing = teamView({ id: "marketing", name: "Marketing", director_agent_id: "tax-analyst", members: ["auditor"] });
+    const { container } = await renderCharter(teamView(), { others: [marketing] });
+
+    const roster = await screen.findByRole("group", { name: "Members" });
+    const rows = await within(roster).findAllByText("also in Marketing");
+    // auditor is a member there; tax-analyst directs it, which counts as working there too.
+    expect(rows.map((said) => said.closest("li")?.querySelector(".teams-check-name")?.textContent)).toEqual([
+      "auditor",
+      "tax-analyst",
+    ]);
+    expect(within(roster).queryAllByText(/also in/)).toHaveLength(2);
+    expect(container.querySelector(".teams-charter-people")).toBeNull();
   });
 });
 
@@ -194,11 +349,28 @@ describe("Charter - the drift guard", () => {
 
     // Three answers, and none of them is a save that says nothing.
     expect(within(guard).getByRole("button", { name: "Take theirs and save" })).toBeDefined();
-    expect(within(guard).getByRole("button", { name: "Reload the form" })).toBeDefined();
+    expect(within(guard).getByRole("button", { name: "Discard my edits and reload" })).toBeDefined();
+    expect(within(guard).getByRole("button", { name: "Keep editing" })).toBeDefined();
     expect(within(guard).getByRole("button", { name: "Save mine anyway" })).toBeDefined();
 
     // And nothing has been sent while the question is open.
     expect(puts()).toHaveLength(0);
+  });
+
+  it("brings the question into focus and lets the person keep editing", async () => {
+    const after = teamView({ members: ["controller", "auditor", "tax-analyst"] });
+    await renderCharter(teamView(), { later: after });
+
+    fireEvent.change(await screen.findByLabelText("Mission"), { target: { value: "and file them" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Save" }));
+
+    const guard = await screen.findByRole("alert", { name: "Changed while you were editing" });
+    expect(document.activeElement).toBe(guard);
+
+    fireEvent.click(within(guard).getByRole("button", { name: "Keep editing" }));
+    expect(screen.queryByRole("alert", { name: "Changed while you were editing" })).toBeNull();
+    expect(puts()).toHaveLength(0);
+    expect((screen.getByLabelText("Mission") as HTMLTextAreaElement).value).toBe("and file them");
   });
 
   it("takes the new roster and keeps the half-typed edit when told to", async () => {

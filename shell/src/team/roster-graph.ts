@@ -1,4 +1,4 @@
-import { CHAR_W, GAP_X, MIN_W, PAD_X, wrap } from "../canvas/layered";
+import { GAP_X, MIN_W, wrap } from "../canvas/layered";
 import type { Agent } from "../data/agents";
 import type { TeamRunView, TeamView } from "../data/teams";
 
@@ -303,13 +303,26 @@ const rowY = (layer: RosterLayer): number =>
  * about numbers the daemon holds; measuring them clipped is how the department's limits came out
  * as `no ceiling of its own · 5 ope…` in a box that had refused to grow to hold them.
  */
-function boxWidth(lines: string[], said: string, facts: string[]): number {
+/**
+ * The chart's own measure. `layered.ts`' CHAR_W is tuned to its 12px job graph; this chart is drawn
+ * at 13px (`.teams-org-svg`), and at the old measure the department's limits ran to its border.
+ */
+const CHAR_W = 7.4;
+const PAD_X = 40;
+
+/**
+ * A floor per rank, so one department reads as one set of boxes and not a box per label length —
+ * a two-letter specialist beside a long one drew as a stub next to a slab.
+ */
+export const RANK_MIN: Record<RosterLayer, number> = { 0: 300, 1: 200, 2: 200, 3: 220 };
+
+function boxWidth(layer: RosterLayer, lines: string[], said: string, facts: string[]): number {
   const longest = Math.max(
     ...lines.map((line) => line.length),
     clip(said).length,
     ...facts.map((fact) => fact.length),
   );
-  return Math.max(MIN_W, Math.round(longest * CHAR_W + PAD_X));
+  return Math.max(RANK_MIN[layer], Math.round(longest * CHAR_W + PAD_X));
 }
 
 /**
@@ -347,7 +360,7 @@ export function placeRoster(nodes: RosterNode[]): RosterLayout {
   for (const node of nodes) {
     const folded = fold(node.label);
     lines.set(node.id, folded);
-    own.set(node.id, boxWidth(folded, node.said, node.facts));
+    own.set(node.id, boxWidth(node.layer, folded, node.said, node.facts));
   }
 
   const span = new Map<string, number>();

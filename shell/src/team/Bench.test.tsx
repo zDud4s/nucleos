@@ -275,7 +275,7 @@ describe("Bench - Routines", () => {
     expect(within(panel).getByRole("button", { name: "Duplicate" })).toBeDefined();
     expect(within(panel).queryByRole("button", { name: /^Edit/i })).toBeNull();
     expect(within(panel).queryByRole("button", { name: /Save changes/i })).toBeNull();
-    expect(within(panel).getByText(/cannot be edited/)).toBeDefined();
+    expect(within(panel).getByText(/can't be edited/)).toBeDefined();
   });
 
   it("fills the write-a-rule form from the rule that was duplicated", async () => {
@@ -348,7 +348,12 @@ describe("Bench - Work", () => {
     const live = teamRun({ id: "run-1", state: "working", round: 2, request: "reconcile October" });
     await renderBench({
       team: teamView(),
-      runs: [live],
+      // A hundred rows is what the daemon's cut looks like from here: the cap line is
+      // said only when the list reached it.
+      runs: [
+        live,
+        ...Array.from({ length: 99 }, (_, i) => teamRun({ id: `other-${i}`, team_id: "outro", state: "done" })),
+      ],
       runViews: {
         "run-1": {
           ...live,
@@ -371,8 +376,8 @@ describe("Bench - Work", () => {
     expect(within(panel).getByRole("img", { name: "spent on this task: $1.20 of $10.00" })).toBeDefined();
 
     // The honest footer: this department's tasks out of the newest hundred
-    // runs across every department, with no paging past it.
-    expect(within(panel).getByText(/newest 100 runs across all teams/)).toBeDefined();
+    // across every department, with no paging past it.
+    expect(within(panel).getByText(/newest 100 tasks across all teams/)).toBeDefined();
   });
 
   it("the rounds strip says what its marks mean", async () => {
@@ -396,6 +401,13 @@ describe("Bench - Work", () => {
     expect(key?.textContent).toContain("· not started");
     expect(key?.textContent).toContain("✗ failed");
     expect(within(panel).getByRole("list", { name: "Rounds" })).toBeDefined();
+  });
+
+  it("says nothing about a cap while the list is short", async () => {
+    await renderBench({ team: teamView(), runs: [teamRun({ state: "done" })] });
+    const panel = await screen.findByRole("tabpanel");
+    expect(within(panel).getByRole("heading", { name: "Finished" })).toBeDefined();
+    expect(panel.querySelector(".teams-cap")).toBeNull();
   });
 
   it("keeps the composer to one line until it is being used", async () => {
@@ -424,7 +436,7 @@ describe("Bench - Work", () => {
     fireEvent.change(within(panel).getByLabelText("Ask this team for something"), {
       target: { value: "find leads" },
     });
-    fireEvent.click(within(panel).getByRole("button", { name: "Start" }));
+    fireEvent.click(within(panel).getByRole("button", { name: "Start task" }));
 
     // The daemon's own sentence, verbatim — no toast and no modal anywhere.
     expect(await within(panel).findByText(/pesquisa.*not in the catalogue/)).toBeDefined();
