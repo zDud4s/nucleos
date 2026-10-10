@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { Agreement, CouncilView, SeatView, StepView, Synthesis } from "../../data/council";
+import type { Agreement, CouncilConfig, CouncilView, SeatView, StepView, Synthesis } from "../../data/council";
 import * as court from "./court-model";
+import { draftFromConfig, release } from "./court-draft";
 
 /* ------------------------------------------------------------ fixtures -- */
 
@@ -62,6 +63,14 @@ function view(overrides: Partial<CouncilView> = {}): CouncilView {
     ...overrides,
   };
 }
+
+const cfg: CouncilConfig = {
+  configured: true, default_rounds: 2, max_rounds: 3, roles: ["skeptic"],
+  default_roster: {
+    chairman: { kind: "cloud", ref: "opus" },
+    members: [{ kind: "cloud", ref: "opus" }, { agent: "ag-1" }, { kind: null, ref: null }],
+  },
+};
 
 /* ------------------------------------------------------------ tests -- */
 
@@ -343,5 +352,33 @@ describe("the session court", () => {
     const mid = court.buildSessionCourt(done, { round: 1, phase: "critique" });
     expect(mid.seats.map((x) => x.rank)).toEqual([null, null]);
     expect(mid.links).toEqual([]);
+  });
+});
+
+describe("the setup court", () => {
+  it("always draws eight chairs over the whole arc, occupied or empty", () => {
+    const c = court.buildSetupCourt(cfg, draftFromConfig(cfg), "why?", 2);
+    expect(c.seats).toHaveLength(8);
+    expect(c.seats.map((s) => s.state)).toEqual(["seated", "seated", "seated", "empty", "empty", "empty", "empty", "empty"]);
+    expect(c.seats[3].label).toBe("+");
+    expect(c.seats[0].x).toBeCloseTo(court.pointAt(168).x);
+  });
+  it("says on the left wing that fewer than three seats cannot measure agreement", () => {
+    const two = release(draftFromConfig(cfg), 2);
+    expect(court.buildSetupCourt(cfg, two, "", 2).balance).toMatchObject({ tone: "insufficient", label: "fewer than 3 seats: no agreement measure" });
+    expect(court.buildSetupCourt(cfg, draftFromConfig(cfg), "", 2).balance.tone).toBe("empty");
+  });
+  it("shows rounds and the call ceiling on the right wing", () => {
+    expect(court.buildSetupCourt(cfg, draftFromConfig(cfg), "", 2).wing).toEqual({ title: "ROUNDS 2", sub: "≤ 14 calls · 5 steps in sequence" });
+  });
+  it("truncates the question on the lectern and keeps it whole for the dossier", () => {
+    const long = "x".repeat(60);
+    const c = court.buildSetupCourt(cfg, draftFromConfig(cfg), long, 2);
+    expect(c.lectern.text).toHaveLength(court.LECTERN_CHARS);
+    expect(c.lectern.full).toBe(long);
+  });
+  it("puts the chairman on the bench, or leaves it empty", () => {
+    expect(court.buildSetupCourt(cfg, draftFromConfig(cfg), "", 2).judge).toMatchObject({ state: "seated", name: "opus" });
+    expect(court.buildSetupCourt(null, draftFromConfig(null), "", undefined).judge.state).toBe("empty");
   });
 });

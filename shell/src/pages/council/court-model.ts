@@ -9,6 +9,7 @@ import {
   AGREEMENT_WORDS,
   type Agreement,
   type BordaRow,
+  type CouncilConfig,
   type CouncilView,
   type SeatView,
   type StepView,
@@ -17,6 +18,7 @@ import {
 // `court-constants.ts` holds `MAX_COUNCIL_SEATS = 8` (`config::MAX_COUNCIL_SEATS`) on its own,
 // because `court-draft.ts` needs it and imports from this file's neighbourhood.
 import { MAX_COUNCIL_SEATS } from "./court-constants";
+import { ceilingLine, occupiedCount, type CourtDraft } from "./court-draft";
 
 export { MAX_COUNCIL_SEATS };
 
@@ -435,4 +437,47 @@ function wingOf(view: CouncilView, m: Moment, live: boolean, seats: CourtSeat[])
   const title = m.phase === "synthesis" ? "VERDICT · the chair is writing" : `ROUND ${roman(Math.max(m.round, 1))} · ${PHASE_WORDS[m.phase]}`;
   const done = seats.filter((s) => s.state === "ok").length;
   return { title: m.phase === "answer" ? "OPENING" : title, sub: live ? `${done} of ${seats.length} seats` : "from the record" };
+}
+
+/* ------------------------------------------------------------ setup court -- */
+
+/**
+ * The room while it is being set up: always the eight chairs over the whole
+ * arc, occupied or empty, with the chairman on the bench. `config` is not read
+ * today (the draft already holds what it said); it stays in the signature so a
+ * caller hands the setup everything the session builder takes.
+ */
+export function buildSetupCourt(
+  _config: CouncilConfig | null,
+  d: CourtDraft,
+  question: string,
+  rounds: number | undefined,
+): Court {
+  const seats = d.chairs.map((chair, i): CourtSeat => {
+    const at = pointAt(setupAngle(i));
+    const role = d.roles[i];
+    return {
+      key: `chair-${i}`, index: i, x: at.x, y: at.y, r: R_EVEN,
+      label: chair === null ? "+" : chair.name,
+      name: chair === null ? "" : chair.name,
+      sublabel: chair !== null && role !== null && role !== "" ? role.replace(/_/g, " ") : null,
+      state: chair === null ? "empty" : "seated",
+      reason: null, masked: false, rank: null, dissent: false, runId: null, step: undefined,
+      from: at,
+    };
+  });
+  const balance: Balance = occupiedCount(d) < MIN_BALLOTS
+    ? { angle: 0, tone: "insufficient", label: "fewer than 3 seats: no agreement measure", sub: null }
+    : balanceOf(null);
+  const wing = rounds === undefined
+    ? { title: "ROUNDS", sub: null }
+    : { title: `ROUNDS ${rounds}`, sub: ceilingLine(d, rounds) };
+  const judge: CourtJudge = d.chairman === null
+    ? { name: "", label: "+", sub: "choose a chairman", state: "empty" }
+    : { name: d.chairman.name, label: d.chairman.name, sub: null, state: "seated" };
+  return {
+    seats, judge, balance, wing,
+    lectern: { text: truncate(question), full: question },
+    ballots: null, links: [], dimmed: false,
+  };
 }
