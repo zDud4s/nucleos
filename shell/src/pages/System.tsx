@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import { routeTriple, useRouteReport, type RoutePair } from "../data/route";
+import { NotchProviders } from "./NotchProviders";
 import {
   scopeEngaged,
   useScopedKills,
@@ -916,6 +917,7 @@ function BudgetPanel() {
             )}
           </section>
         )}
+        <NotchProviders />
       </div>
     </Panel>
   );

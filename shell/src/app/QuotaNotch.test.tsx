@@ -125,11 +125,32 @@ describe("QuotaNotch", () => {
    * because nobody drew its logo yet would be a quota nobody is watching.
    */
   it("falls back to an initial for a provider it has no mark for", async () => {
-    answer({ providers: [claude({ provider: "gemini" })] });
+    answer({ providers: [claude({ provider: "mistral" })] });
     const { container, findByText } = renderWithQuery(<QuotaNotch />);
-    await findByText(/gemini: 7d 46% /);
+    await findByText(/mistral: 7d 46% /);
     expect(container.querySelector(".ui-provider-mark path")).toBeNull();
-    expect(container.querySelector(".ui-provider-mark-initial")?.textContent).toBe("G");
+    expect(container.querySelector(".ui-provider-mark-initial")?.textContent).toBe("M");
+  });
+
+  /**
+   * A subscription the owner unticked in settings (`notch-providers.ts`) is left off the rail, and
+   * unticking every one takes the notch away rather than drawing it empty.
+   */
+  it("leaves out the providers hidden in settings", async () => {
+    try {
+      window.localStorage.setItem("nucleos.notch-hidden", JSON.stringify(["codex"]));
+      answer({ providers: [claude(), claude({ provider: "codex" })] });
+      const { container, findByText } = renderWithQuery(<QuotaNotch />);
+      await findByText(/claude: 7d 46% /);
+      expect(container.querySelectorAll(".quota-notch-slot")).toHaveLength(1);
+
+      window.localStorage.setItem("nucleos.notch-hidden", JSON.stringify(["codex", "claude"]));
+      const none = renderWithQuery(<QuotaNotch />);
+      await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledTimes(2));
+      expect(none.container.querySelector(".quota-notch")).toBeNull();
+    } finally {
+      window.localStorage.removeItem("nucleos.notch-hidden");
+    }
   });
 
   /**
