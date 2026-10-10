@@ -69,11 +69,16 @@ impl NucleosTools {
     /// of it. A tool that somehow fails to serialise counts as nothing instead of panicking — this
     /// is an estimate feeding a display, and no reading here is worth taking a daemon down for.
     pub fn advertised_schema_chars(job: Option<i64>) -> usize {
-        let served = job.map_or(McpBox::All, McpBox::JobNode);
+        Self::advertised_box_schema_chars(&job.map_or(McpBox::All, McpBox::JobNode))
+    }
+
+    /// [`Self::advertised_schema_chars`] for any box, which is how a Team box is priced: its scope
+    /// is a node run id and not a job, so `Option<i64>` cannot name it.
+    pub fn advertised_box_schema_chars(served: &McpBox) -> usize {
         Self::tool_router()
             .list_all()
             .into_iter()
-            .filter(|tool| served_in_box(&served, tool.name.as_ref()))
+            .filter(|tool| served_in_box(served, tool.name.as_ref()))
             .filter_map(|tool| serde_json::to_string(&tool).ok())
             .map(|json| json.len())
             .sum()

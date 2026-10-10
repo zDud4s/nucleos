@@ -1746,6 +1746,7 @@ impl Driver {
             resume_session_id: None,
             mcp_config: with_tools.then(|| mcp_config_path(&self.id)),
             mcp_job: None,
+            mcp_team_run: None,
             // The council writes its config with `build_mcp_config(&exe)` above, so a seat that is
             // given tools is offered the whole surface and pays for the whole surface, which
             // `runner::authored_prompt` reads off the line above.

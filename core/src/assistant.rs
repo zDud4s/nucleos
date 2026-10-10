@@ -3462,6 +3462,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             resume_session_id: resume,
             mcp_config: Some(turn.mcp_path.clone()),
             mcp_job: None,
+            mcp_team_run: None,
             // Decided by `tool_policy_for`, which is where the rule is written out. The
             // default remains what it always was — the orchestrator talks to NucleOS and to
             // nothing else, and the MCP allowlist does not enforce that on its own, because
@@ -8238,6 +8239,7 @@ mod tests {
             resume_session_id: resume,
             mcp_config: None,
             mcp_job: None,
+            mcp_team_run: None,
             tool_policy: crate::runner::ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
