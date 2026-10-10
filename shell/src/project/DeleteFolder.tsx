@@ -4,6 +4,7 @@ import { isApiRefusal } from "../data/client";
 import { useDeleteProjectFolder, useProjectFolder } from "../data/projects";
 import { heldBy } from "../data/roster";
 import { Button } from "../ui/Button";
+import { Modal } from "../ui/Modal";
 import { RefusalNote } from "../ui/RefusalNote";
 
 /**
@@ -52,7 +53,7 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
     stole focus into its last section on arrival would be the opposite bug.
   */
   const warning = useRef<HTMLParagraphElement>(null);
-  const trigger = useRef<HTMLParagraphElement>(null);
+  const trigger = useRef<HTMLDivElement>(null);
   const [settle, setSettle] = useState<"opened" | "closed" | null>(null);
 
   useEffect(() => {
@@ -84,19 +85,19 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
     close();
   }
 
-  if (!open) {
-    return (
-      <p ref={trigger} className="flex flex-wrap items-baseline gap-3 text-sm text-text-muted">
-        <span>
-          Removing this project from NucleOS leaves its folder alone. Deleting the folder is a
-          separate thing, and it is permanent.
-        </span>
-        <Button variant="quiet" onClick={show}>
-          delete this folder…
-        </Button>
+  const row = (
+    /* What it does on the leading side, the control on the trailing one, outlined in danger so
+         the permanent exit never looks like the reversible one above it. Both were underlined
+         words, and the only thing telling them apart was a sentence under the wrong one. */
+    <div ref={trigger} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+      <p className="text-sm text-text-muted">
+        Deletes the folder and everything in it. This is permanent.
       </p>
-    );
-  }
+      <Button variant="danger" onClick={show}>
+        delete this folder…
+      </Button>
+    </div>
+  );
 
   const reading = folder.data;
   const held = reading === undefined ? null : heldBy(reading.holds);
@@ -105,98 +106,124 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
   const gone = reading !== undefined && !reading.exists;
   const armed = typed === projectId && stopped === null && held === null && !gone;
 
+  /*
+    The panel opens as a modal over a dimmed page, the owner's call: the one irreversible act in the
+    app should take the page away until it is answered, not unfold at the foot of it. The group keeps
+    its name and its own Escape; the modal's Escape, scrim and close button go through `close` too,
+    except while the request is in flight.
+  */
   return (
-    <div
-      role="group"
-      aria-label={`Delete ${projectId}'s folder`}
-      onKeyDown={onKeyDown}
-      className="flex flex-col gap-3 rounded-md border border-tone-danger-border bg-surface-sunken p-3"
-    >
-      {/* `tabIndex={-1}`: a target for the focus the opening hands over, not a tab stop. The
-          global ring's 2px offset sat flush on the glyphs of a block of prose, so this one
-          stands further off — same colour and width, only the offset, as the house overrides do.
-          Inline, because the ring in `base.css` is unlayered on purpose and beats any utility;
-          inline still wins over it, and changes nothing but the distance. */}
-      <p
-        ref={warning}
-        tabIndex={-1}
-        style={{ outlineOffset: "4px" }}
-        className="max-w-prose text-sm text-text"
+    <>
+      {row}
+      <Modal
+        open={open}
+        onOpenChange={(next) => {
+          if (!next && !deletion.isPending) close();
+        }}
+        title="Delete this folder"
+        size="md"
+        initialFocus={warning}
       >
-        This deletes <code className="font-mono text-xs">{named}</code> and everything in it,
-        permanently, and takes the project off the roster. Nothing here can undo it.
-      </p>
+        {open && (
+          <div
+            role="group"
+            aria-label={`Delete ${projectId}'s folder`}
+            onKeyDown={onKeyDown}
+            className="flex flex-col gap-4"
+          >
+            {/* `tabIndex={-1}`: a target for the focus the opening hands over, not a tab stop. No
+                ring: inside the modal it was clipped by the body's edge, and the dialog itself
+                already says where focus is — the reader hears this sentence first. Inline,
+                because the ring in `base.css` is unlayered on purpose and beats any utility. */}
+            <p
+              ref={warning}
+              tabIndex={-1}
+              style={{ outline: "none" }}
+              className="text-sm leading-relaxed text-text"
+            >
+              This deletes <code className="font-mono text-xs">{named}</code> and everything in it,
+              permanently, and takes the project off the roster. Nothing here can undo it.
+            </p>
 
-      {folder.isError ? (
-        <p className="text-xs text-text-faint">
-          the núcleo did not say what is in that folder — nothing has been deleted
-        </p>
-      ) : reading === undefined ? (
-        <p className="text-xs text-text-faint">reading what is in that folder…</p>
-      ) : (
-        <Standing reading={reading} />
-      )}
+            {folder.isError ? (
+              <p className="text-xs text-text-faint">
+                the núcleo did not say what is in that folder — nothing has been deleted
+              </p>
+            ) : reading === undefined ? (
+              <p className="text-xs text-text-faint">reading what is in that folder…</p>
+            ) : (
+              <Standing reading={reading} />
+            )}
 
-      {/*
+            {/*
         The same checkbox the remove control above offers, and the same default. Deleting the
         folder does not imply forgetting what the project did: the two are separate losses, and the
         owner's standing decision is that history stays unless somebody says otherwise.
       */}
-      <label className="flex max-w-prose items-baseline gap-2 text-sm text-text-muted">
-        <input
-          type="checkbox"
-          checked={forget}
-          onChange={(event) => setForget(event.target.checked)}
-        />
-        <span>
-          Forget what this project did as well — its runs, proposals and stamps. Left unticked they
-          stay in the núcleo, which is what happens by default.
-        </span>
-      </label>
+            <label className="ws-dialog-option">
+              <input
+                type="checkbox"
+                checked={forget}
+                onChange={(event) => setForget(event.target.checked)}
+              />
+              <span className="flex flex-col gap-0.5">
+                <span className="font-medium text-text">Forget its history too</span>
+                <span>
+                  Its runs, proposals and stamps. Left unticked they stay in the núcleo, which is
+                  what happens by default.
+                </span>
+              </span>
+            </label>
 
-      {deletion.isError &&
-        (isApiRefusal(deletion.error) ? (
-          <RefusalNote
-            refusal={deletion.error}
-            sentences={{
-              kill_switch: "the kill switch is engaged — nothing was deleted",
-              in_flight: "work is still in flight here — nothing was deleted",
-              not_registered: `${projectId} is already off the roster, and its folder was not touched`,
-              not_found: `${projectId} is already off the roster, and its folder was not touched`,
-            }}
-          />
-        ) : (
-          <p className="text-xs text-text-faint">the núcleo did not answer — nothing was deleted</p>
-        ))}
+            {deletion.isError &&
+              (isApiRefusal(deletion.error) ? (
+                <RefusalNote
+                  refusal={deletion.error}
+                  sentences={{
+                    kill_switch: "the kill switch is engaged — nothing was deleted",
+                    in_flight: "work is still in flight here — nothing was deleted",
+                    not_registered: `${projectId} is already off the roster, and its folder was not touched`,
+                    not_found: `${projectId} is already off the roster, and its folder was not touched`,
+                  }}
+                />
+              ) : (
+                <p className="text-xs text-text-faint">
+                  the núcleo did not answer — nothing was deleted
+                </p>
+              ))}
 
-      <label className="flex flex-wrap items-baseline gap-2 text-sm text-text-muted">
-        <span>
-          Type <code className="font-mono text-xs text-text">{projectId}</code> to confirm:
-        </span>
-        <input
-          type="text"
-          value={typed}
-          spellCheck={false}
-          autoComplete="off"
-          aria-label={`Type ${projectId} to confirm`}
-          onChange={(event) => setTyped(event.target.value)}
-          className="rounded-md border border-border bg-surface px-2 py-1 font-mono text-xs text-text"
-        />
-      </label>
+            <label className="flex flex-col gap-1.5 text-sm text-text-muted">
+              <span>
+                Type <code className="font-mono text-xs text-text">{projectId}</code> to confirm
+              </span>
+              <input
+                type="text"
+                value={typed}
+                spellCheck={false}
+                autoComplete="off"
+                aria-label={`Type ${projectId} to confirm`}
+                onChange={(event) => setTyped(event.target.value)}
+                className="rounded-md border border-border bg-surface-sunken px-2.5 py-1.5 font-mono text-sm text-text"
+              />
+            </label>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <Button
-          variant="danger-solid"
-          disabled={!armed || deletion.isPending}
-          onClick={() => deletion.mutate({ projectId, forgetHistory: forget })}
-        >
-          {deletion.isPending ? "deleting…" : "delete the folder"}
-        </Button>
-        <Button variant="quiet" onClick={close}>
-          cancel
-        </Button>
-      </div>
-    </div>
+            {/* The modal's answer row: bottom edge, right-aligned, the act last. */}
+            <div className="ws-dialog-actions">
+              <Button variant="ghost" onClick={close}>
+                cancel
+              </Button>
+              <Button
+                variant="danger-solid"
+                disabled={!armed || deletion.isPending}
+                onClick={() => deletion.mutate({ projectId, forgetHistory: forget })}
+              >
+                {deletion.isPending ? "deleting…" : "delete the folder"}
+              </Button>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </>
   );
 }
 
@@ -208,7 +235,11 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
  * anywhere else, so the reassurance the other branches can offer does not apply to it. Printing
  * `0 uncommitted` over that case would be reassuring somebody about the most dangerous one there is.
  */
-function Standing({ reading }: { reading: NonNullable<ReturnType<typeof useProjectFolder>["data"]> }) {
+function Standing({
+  reading,
+}: {
+  reading: NonNullable<ReturnType<typeof useProjectFolder>["data"]>;
+}) {
   if (reading.blocked !== null) {
     return <p className="max-w-prose text-sm text-tone-danger-fg">{reading.blocked.detail}</p>;
   }
@@ -225,7 +256,7 @@ function Standing({ reading }: { reading: NonNullable<ReturnType<typeof useProje
   const only = reading.only_here;
 
   return (
-    <div className="flex flex-col gap-1 text-sm">
+    <div className="flex flex-col gap-3 text-sm">
       {only === null ? (
         <p className="max-w-prose text-tone-paused-fg">
           That folder is not a git repository, so nothing in it exists anywhere else. Everything
@@ -244,7 +275,7 @@ function Standing({ reading }: { reading: NonNullable<ReturnType<typeof useProje
         </p>
       )}
       {held !== null && (
-        <p className="max-w-prose text-tone-paused-fg">
+        <p className="ws-dialog-note">
           Work is still in flight here — {held}. Nothing is deleted while it runs.
         </p>
       )}

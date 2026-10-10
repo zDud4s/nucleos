@@ -10,7 +10,6 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 import { Contacts } from "./Contacts";
-import { ApiRefusal } from "../data/client";
 import type { Correspondent, MergeSuggestion } from "../data/contacts";
 import { renderWithQuery } from "../test/harness";
 
@@ -125,36 +124,75 @@ describe("Contacts — the roster", () => {
 /* ---------------------------------------------------- identity questions -- */
 
 describe("Contacts — identity questions", () => {
-  it("surfaces the conflicting-verdict refusal prose when a merge is approved", async () => {
-    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+  it("names the pair by display name in the question's head", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
       if (path === "/contacts") return [];
       if (path === "/contacts/merges") return [merge({ proposal_id: 21 })];
-      if (path === "/proposals/21/approve" && init?.method === "POST") {
-        // The daemon's own bare prose — worth quoting verbatim, and long
-        // enough (well over four words) to clear the shell's floor.
-        throw new ApiRefusal(
-          409,
-          "conflict",
-          "these two people carry standing decisions that disagree — Ana against Ana Silva; settle one of them and decide this again",
-        );
+      return undefined;
+    });
+
+    renderWithQuery(<Contacts />);
+
+    // The head is "A ↔ B" (display names, else the first address) and no longer carries the
+    // proposal number.
+    expect(await screen.findByText("Ana ↔ Ana Silva")).toBeDefined();
+    expect(screen.queryByText("question #21")).toBeNull();
+  });
+
+  it("shows a predicted conflict before the button is pressed, and the button cannot send it", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/contacts") return [];
+      if (path === "/contacts/merges") {
+        // Two standing decisions that disagree: the daemon would answer 409 on approve.
+        return [
+          merge({
+            proposal_id: 21,
+            keep: { ...merge().keep, verdict: "pin" },
+            absorb: { ...merge().absorb, verdict: "mute" },
+          }),
+        ];
       }
       return undefined;
     });
 
     renderWithQuery(<Contacts />);
 
-    expect(await screen.findByText("question #21")).toBeDefined();
+    const note = await screen.findByText(/standing decisions that disagree/);
+    const approve = screen.getByRole("button", { name: "Yes, one person" });
 
-    // Arm, then confirm — two separate gestures, genuinely apart in time so
-    // the second click does not land inside the interlock's dwell.
-    fireEvent.click(screen.getByRole("button", { name: "Yes, one person" }));
+    // The conflict is said up front, and the approve control is unavailable (aria-disabled, still
+    // focusable) and described by that note.
+    expect(approve.getAttribute("aria-disabled")).toBe("true");
+    expect(note.parentElement?.id).not.toBe("");
+    expect(approve.getAttribute("aria-describedby")).toBe(note.parentElement?.id);
+
+    // Pressing it, by pointer and by a bare activation, arms nothing and sends nothing — so the
+    // 409 prose can no longer be reached from this screen.
+    fireEvent.pointerDown(approve, { button: 0, isPrimary: true, pointerId: 1 });
+    fireEvent.pointerUp(approve, { button: 0, isPrimary: true, pointerId: 1 });
+    fireEvent.click(approve);
     await afterDwell();
-    fireEvent.click(screen.getByRole("button", { name: "They are one person" }));
+    fireEvent.click(approve);
+    await afterDwell();
 
+    expect(screen.queryByRole("button", { name: "They are one person" })).toBeNull();
     expect(
-      await screen.findByText(
-        "these two people carry standing decisions that disagree — Ana against Ana Silva; settle one of them and decide this again",
-      ),
-    ).toBeDefined();
+      daemon.apiFetch.mock.calls.filter(([path]) => String(path).startsWith("/proposals/")),
+    ).toHaveLength(0);
+  });
+
+  it("leaves the approve control available when the two sides do not disagree", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/contacts") return [];
+      if (path === "/contacts/merges") return [merge({ proposal_id: 21 })];
+      return undefined;
+    });
+
+    renderWithQuery(<Contacts />);
+
+    const approve = await screen.findByRole("button", { name: "Yes, one person" });
+    expect(approve.getAttribute("aria-disabled")).toBeNull();
+    expect(approve.getAttribute("aria-describedby")).toBeNull();
+    expect(screen.queryByText(/standing decisions that disagree/)).toBeNull();
   });
 });

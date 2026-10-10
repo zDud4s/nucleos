@@ -99,7 +99,7 @@ export function Occupancy({ projectId }: OccupancyProps) {
           in use.
         </p>
         {slots.length === 0 ? null : (
-          <ul aria-label="Worktree slots" className="m-0 flex list-none flex-wrap gap-2 p-0">
+          <ul aria-label="Worktree slots" className="ws-slots">
             {slots.map((slot) => (
               <Slot
                 key={`${slot.owner_kind}-${slot.owner_id}`}
@@ -124,10 +124,10 @@ export function Occupancy({ projectId }: OccupancyProps) {
         proposals waiting on a person, not on worktrees — and two unlabelled fours on one page
         were two numbers a reader had to guess apart.
       */}
-      <p className="text-xs text-text-muted">
+      <p className="ws-foot">
         {Math.min(slots.length, limit)} of {limit} worktree {limit === 1 ? "slot" : "slots"} in use
       </p>
-      <ul aria-label="Worktree slots" className="m-0 flex list-none flex-wrap gap-2 p-0">
+      <ul aria-label="Worktree slots" className="ws-slots">
         {Array.from({ length: boxes }, (_, index) => {
           const taken = slots[index];
           return taken === undefined ? (
@@ -164,9 +164,7 @@ export function Occupancy({ projectId }: OccupancyProps) {
 */
 function Free() {
   return (
-    <li className="grid h-16 w-40 place-items-center rounded-md border border-dashed border-border text-xs text-text-faint">
-      free
-    </li>
+    <li className="ws-slot ws-slot-free">free</li>
   );
 }
 
@@ -190,25 +188,23 @@ function Slot({
 }) {
   const body = (
     <>
-      <span className="text-xs uppercase tracking-wide text-text-faint">{taken.owner_kind}</span>
-      <span className="font-mono text-sm text-text">#{taken.owner_id}</span>
+      <span className="ws-slot-kind">{taken.owner_kind}</span>
+      <span className="ws-mono">#{taken.owner_id}</span>
     </>
   );
 
   if (taken.owner_kind !== "run") {
     return (
-      <li className="flex h-16 w-40 flex-col justify-between rounded-md border border-border bg-surface p-2">
-        {body}
-      </li>
+      <li className="ws-slot">{body}</li>
     );
   }
 
   return (
-    <li className="flex">
+    <li className="ws-slot ws-slot-door">
       <Link
         to={`/projects/${projectId}/code`}
         search={{ run: taken.owner_id }}
-        className="flex h-16 w-40 flex-col justify-between rounded-md border border-border bg-surface p-2 hover:border-border-strong"
+        className="ws-slot-link"
         aria-label={`Review run ${taken.owner_id}`}
       >
         {body}

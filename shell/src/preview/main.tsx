@@ -52,8 +52,15 @@ adoptStyleNonce();
  *
  * Nothing under `src/` reaches this file, so no shipped code is affected.
  */
+/**
+ * `?live=<port>`: answer from the running núcleo instead of the table, through the local proxy
+ * that listens on that port and adds the token and the CORS header the daemon only grants the
+ * app's own origins. The clock is left alone then — the data is today's.
+ */
+const LIVE = new URLSearchParams(window.location.search).get("live");
+
 const RealDate = Date;
-const SKEW = NOW - RealDate.now();
+const SKEW = LIVE === null ? NOW - RealDate.now() : 0;
 
 class PreviewDate extends RealDate {
   constructor(...args: ConstructorParameters<typeof Date> | []) {
@@ -81,6 +88,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (!url.startsWith("http://127.0.0.1:8791")) return real(input as RequestInfo, init);
 
   const path = url.slice("http://127.0.0.1:8791".length);
+  if (LIVE !== null) return real(`http://127.0.0.1:${LIVE}${path}`, init);
   if (path === "/health") return new Response("ok", { status: 200 });
   // `apiText`, not `apiFetch` — the connection gate reads this one as prose.
   if (path === "/status") return new Response("daemon running", { status: 200 });
@@ -233,15 +241,18 @@ function shownText(node: Node): string {
  * this always read.
  */
 function pressButton(name: string): boolean {
-  const buttons = [...document.querySelectorAll("button")];
+  // `[role="button"]` reaches a node of an SVG graph, which has no `<button>` to be.
+  const buttons = [...document.querySelectorAll('button, [role="button"]')];
   const label = (one: Element) => {
     const shown = shownText(one).trim();
     return shown === "" ? (one.textContent ?? "").trim() : shown;
   };
   const wanted =
-    buttons.find((one) => label(one) === name) ?? buttons.find((one) => label(one).startsWith(name));
+    buttons.find((one) => label(one) === name) ??
+    buttons.find((one) => label(one).startsWith(name));
   if (wanted === undefined) return false;
-  wanted.click();
+  // An SVG element has no `.click()`; a dispatched click reaches React the same way.
+  wanted.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   return true;
 }
 
@@ -302,9 +313,17 @@ function hoverElement(selector: string): boolean {
   const at = element.getBoundingClientRect();
   const origin = { clientX: at.left + at.width / 2, clientY: at.top + at.height / 2 };
   element.dispatchEvent(
-    new PointerEvent("pointerover", { ...origin, bubbles: true, cancelable: true, pointerId: 1, pointerType: "mouse" }),
+    new PointerEvent("pointerover", {
+      ...origin,
+      bubbles: true,
+      cancelable: true,
+      pointerId: 1,
+      pointerType: "mouse",
+    }),
   );
-  element.dispatchEvent(new MouseEvent("mouseover", { ...origin, bubbles: true, cancelable: true }));
+  element.dispatchEvent(
+    new MouseEvent("mouseover", { ...origin, bubbles: true, cancelable: true }),
+  );
   return true;
 }
 

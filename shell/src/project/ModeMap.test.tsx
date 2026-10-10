@@ -1,6 +1,6 @@
 // §spec mapa-do-projeto
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn() }));
@@ -27,13 +27,35 @@ beforeEach(() => {
 function dayOne(over: Partial<ProjectMap> = {}): ProjectMap {
   return {
     modules: [
-      { path: "core/src/a.rs", reader: "rust", declares: false, cites: [], spec: null, tested: false },
-      { path: "shell/src/x.ts", reader: "typescript", declares: false, cites: [], spec: null, tested: false },
+      {
+        path: "core/src/a.rs",
+        reader: "rust",
+        declares: false,
+        cites: [],
+        spec: null,
+        tested: false,
+      },
+      {
+        path: "shell/src/x.ts",
+        reader: "typescript",
+        declares: false,
+        cites: [],
+        spec: null,
+        tested: false,
+      },
     ],
     imports: [],
     unread: [],
     foreign: [],
-    seam: { served: [], calls: 0, matched: 0, computed: [], unmatched: [], opaque: [], uncalled: [] },
+    seam: {
+      served: [],
+      calls: 0,
+      matched: 0,
+      computed: [],
+      unmatched: [],
+      opaque: [],
+      uncalled: [],
+    },
     junction: {
       decisions: [],
       unclaimed: ["core/src/a.rs"],
@@ -89,78 +111,116 @@ function open(map: ProjectMap | Error, specs: string[] = ["2026-08-24-mapa-do-pr
   );
 }
 
-describe("the map as five doors", () => {
-  it("opens on the picture and offers the other four", async () => {
-    open(dayOne());
-    expect(await screen.findByText(/this reader could read/)).toBeTruthy();
+/** Three folders on two sides: the pages lean on the data, and core stands on its own. */
+function threeFolders(over: Partial<ProjectMap> = {}): ProjectMap {
+  const module = (path: string, reader: "rust" | "typescript", tested = false) => ({
+    path,
+    reader,
+    declares: false,
+    cites: [],
+    spec: null,
+    tested,
+  });
+  return dayOne({
+    modules: [
+      module("core/src/a.rs", "rust", true),
+      module("shell/src/pages/Home.tsx", "typescript"),
+      module("shell/src/pages/Runs.tsx", "typescript"),
+      module("shell/src/data/client.ts", "typescript", true),
+    ],
+    imports: [
+      { from: "shell/src/pages/Home.tsx", to: "shell/src/data/client.ts" },
+      { from: "shell/src/pages/Runs.tsx", to: "shell/src/data/client.ts" },
+    ],
+    ...over,
+  });
+}
 
-    for (const door of ["Picture", "Junction", "Stamps", "Triage", "Specs"]) {
-      expect(screen.getByRole("button", { name: new RegExp(`^${door}`) })).toBeTruthy();
-    }
-    expect(
-      screen.getByRole("button", { name: /^Picture/ }).getAttribute("aria-current"),
-    ).toBe("true");
+describe("the architecture", () => {
+  it("draws each side as a column of its folders", async () => {
+    open(threeFolders());
+    expect(await screen.findByRole("region", { name: "shell · typescript" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "core · rust" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^pages/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^data/ })).toBeTruthy();
+    expect(screen.getByText("4 files in 2 sides.")).toBeTruthy();
   });
 
-  it("swaps the panel rather than adding one", async () => {
-    open(dayOne());
-    await screen.findByText(/this reader could read/);
+  it("shows what a chosen folder uses and what uses it", async () => {
+    open(threeFolders());
+    fireEvent.click(await screen.findByRole("button", { name: /^pages/ }));
 
-    fireEvent.click(screen.getByRole("button", { name: /^Junction/ }));
-    expect(screen.getByText(/module nobody asked for/)).toBeTruthy();
-    // The matrix is gone rather than scrolled past, which is the whole point of the row.
-    expect(screen.queryByLabelText("Every community")).toBeNull();
+    const detail = screen.getByRole("region", { name: "The folder pages" });
+    expect(detail.textContent).toContain("2 imports");
+    expect(detail.textContent).toContain("Home.tsx");
+    const shell = within(screen.getByRole("region", { name: "shell · typescript" }));
+    expect(shell.getByRole("button", { name: /^data/ }).getAttribute("data-state")).toBe("uses");
+    // A folder on another side is unrelated, and is dimmed rather than hidden.
+    expect(screen.getByRole("button", { name: /^core/ }).getAttribute("data-state")).toBe("far");
 
-    fireEvent.click(screen.getByRole("button", { name: /^Picture/ }));
-    expect(screen.queryByText(/module nobody asked for/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^pages/ }));
+    expect(screen.queryByRole("region", { name: "The folder pages" })).toBeNull();
   });
 
-  /**
-   * §16.5, applied to the row itself. *Descending may hide detail; it may never hide a seam* — and
-   * a header that had stayed with the picture would be a seam behind a click for four doors out of
-   * five, on a page where the junction, the stamps and the triage are all counted over the same
-   * partial reading the drawing is.
-   */
-  it("keeps the seam on screen whichever door is open", async () => {
+  it("puts the seam between the sides and opens what broke on it", async () => {
     open(
-      dayOne({
-        unread: ["sidecars/echo/main.go", "sidecars/echo/quiet.go"],
-        seam: { served: [], calls: 3, matched: 0, computed: [], unmatched: [], opaque: [], uncalled: [] },
+      threeFolders({
+        seam: {
+          served: ["/runs", "/home"],
+          calls: 3,
+          matched: 2,
+          computed: [],
+          unmatched: [{ path: "/gone", file: "shell/src/pages/Runs.tsx", line: 7 }],
+          opaque: [],
+          uncalled: [],
+        },
       }),
     );
-    expect(await screen.findByText("sidecars/")).toBeTruthy();
+    fireEvent.click(await screen.findByRole("button", { name: /HTTP/ }));
+    expect(screen.getByText("Calls to a route nobody serves")).toBeTruthy();
+    expect(screen.getByText("/gone")).toBeTruthy();
+    expect(screen.getByText(/1 call reaches nothing/)).toBeTruthy();
+  });
 
-    for (const door of ["Junction", "Stamps", "Triage", "Specs"]) {
-      fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${door}`) }));
-      expect(screen.getByText("sidecars/")).toBeTruthy();
-      expect(screen.getByText(/the boundary could not be read/)).toBeTruthy();
+  it("lists what it could not read rather than leaving it out", async () => {
+    open(threeFolders({ unread: ["sidecars/echo/main.go", "sidecars/echo/quiet.go"] }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Not read/ }));
+    expect(screen.getByText("sidecars/echo")).toBeTruthy();
+    expect(screen.getByText(/files in languages the map cannot follow/)).toBeTruthy();
+  });
+
+  it("opens on the drawing, and keeps the decision tabs for when something is decided", async () => {
+    open(dayOne());
+    await screen.findByText("2 files in 2 sides.");
+    expect(screen.getByRole("button", { name: /^Architecture/ }).getAttribute("aria-current")).toBe(
+      "true",
+    );
+    for (const door of ["Junction", "Stamps", "Triage"]) {
+      expect(screen.queryByRole("button", { name: new RegExp(`^${door}`) })).toBeNull();
     }
+
+    fireEvent.click(screen.getByRole("button", { name: /^Specs/ }));
+    expect(screen.getByText(/Nothing decided yet/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^Architecture/ }));
+    expect(screen.queryByText(/Nothing decided yet/)).toBeNull();
   });
 });
 
 describe("the number on a door", () => {
   /**
    * `JunctionPanel` refuses to draw a grid of zeros on a project with nothing approved — "a row of `0`s
-   * reads as a measurement, and here nothing has been measured". A chip saying `Junction 0` is
-   * that same claim in less space, so it says nothing instead.
+   * reads as a measurement, and here nothing has been measured". A tab saying `Junction 0` is that
+   * same claim in less space, so the tab is not drawn at all until there is something to count.
    */
-  it("is an em dash where nothing has been measured, and never a nought", async () => {
+  it("is no tab at all where nothing has been measured, and never a nought", async () => {
     open(dayOne());
-    // Waited for on purpose: the row renders before the answer does, and a dash asserted against
-    // an unanswered query would pass for the wrong reason for ever.
-    await screen.findByText(/this reader could read/);
-    const junction = screen.getByRole("button", { name: /^Junction/ });
+    // Waited for on purpose: the row renders before the answer does, and an absence asserted
+    // against an unanswered query would pass for the wrong reason for ever.
+    await screen.findByText("2 files in 2 sides.");
+    const tabs = screen.getByRole("navigation", { name: "Views of this map" });
 
-    expect(junction.textContent).toContain("—");
-    expect(junction.textContent).not.toContain("0");
-    expect(screen.getByRole("button", { name: /^Stamps/ }).textContent).toContain("—");
-    expect(screen.getByRole("button", { name: /^Triage/ }).textContent).toContain("—");
-    // And it says why, rather than leaving a dash to be guessed at — on hover, and to a screen
-    // reader, which would otherwise announce "em dash" and nothing else.
-    expect(junction.getAttribute("title")).toMatch(/No decision has been approved/);
-    expect(junction.textContent).toContain("not measured");
-    const why = document.getElementById(junction.getAttribute("aria-describedby") ?? "");
-    expect(why?.textContent).toMatch(/No decision has been approved/);
+    expect(tabs.textContent).not.toMatch(/Junction|Stamps|Triage/);
+    expect(screen.getByRole("button", { name: /^Specs/ })).toBeTruthy();
   });
 
   it("is the count once there is a layer to count over", async () => {
@@ -180,11 +240,18 @@ describe("the number on a door", () => {
             unmatched: 0,
           },
         },
-        triage_counts: { flagged: 3, silenced: 0, untriaged: 0, unseen: 0, waiting: 5, unchecked: 0 },
+        triage_counts: {
+          flagged: 3,
+          silenced: 0,
+          untriaged: 0,
+          unseen: 0,
+          waiting: 5,
+          unchecked: 0,
+        },
       }),
     );
 
-    await screen.findByText(/this reader could read/);
+    await screen.findByText("2 files in 2 sides.");
     expect(screen.getByRole("button", { name: /^Junction/ }).textContent).toContain("12");
     // Two different questions and two different numbers: what is on your desk, and what a model
     // asked for your eyes on. One chip carrying both would be the flattening §5 refuses.
@@ -206,53 +273,24 @@ describe("the number on a door", () => {
  * lead with its size — `245` at display size — and bury the exceptions in three paragraphs.
  */
 describe("the answer before the detail", () => {
-  it("leads with a verdict, then says how big the reading is and when it was taken", async () => {
+  it("leads with the size of the ground, and says when it was read", async () => {
     open(dayOne());
-    expect(await screen.findByText("Nothing this reading checks came back wrong")).toBeTruthy();
+    expect(await screen.findByText("2 files in 2 sides.")).toBeTruthy();
     // Principle 4: never claim currency you do not have. The map is not polled, so it says when
     // the tree was read, and reading it again is one press.
     const read = document.querySelector("time");
     expect(read?.textContent).toBe("just now");
     // A phrase in the sentence, not a value the daemon wrote: never the mono face.
     expect(read?.className ?? "").not.toMatch(/mono|ui-reading/);
-    const before = daemon.apiFetch.mock.calls.filter(([path]) => String(path).endsWith("/map")).length;
+    const before = daemon.apiFetch.mock.calls.filter(([path]) =>
+      String(path).endsWith("/map"),
+    ).length;
     fireEvent.click(screen.getByRole("button", { name: "read again" }));
     await waitFor(() =>
       expect(
         daemon.apiFetch.mock.calls.filter(([path]) => String(path).endsWith("/map")).length,
       ).toBe(before + 1),
     );
-  });
-
-  it("counts what points backwards and takes the reader to the drawing that shows it", async () => {
-    open(
-      dayOne({
-        modules: ["a1", "a2", "b1", "b2"].map((name) => ({
-          path: `core/src/${name}.rs`,
-          reader: "rust" as const,
-          declares: false,
-          cites: [],
-          spec: null,
-          tested: false,
-        })),
-        imports: [
-          { from: "core/src/a1.rs", to: "core/src/a2.rs" },
-          { from: "core/src/b1.rs", to: "core/src/b2.rs" },
-          { from: "core/src/a1.rs", to: "core/src/b1.rs" },
-          { from: "core/src/b2.rs", to: "core/src/a2.rs" },
-        ],
-      }),
-    );
-    await screen.findByText(/this reader could read/);
-    fireEvent.click(screen.getByRole("button", { name: /^Junction/ }));
-    expect(screen.queryByRole("table")).toBeNull();
-    const show = screen.queryByRole("button", { name: "show them" });
-    // Two communities joined both ways: one of the two threads has to point backwards, whatever
-    // the order.
-    expect(show).toBeTruthy();
-    fireEvent.click(show!);
-    expect(screen.getByRole("table")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /^Picture/ }).getAttribute("aria-current")).toBe("true");
   });
 
   it("offers to read a map again when it could not be read", async () => {
@@ -268,12 +306,12 @@ describe("the answer before the detail", () => {
  * has moved, which is exactly the state somebody is looking at a broken project in.
  */
 describe("a map that could not be read", () => {
-  it("says so on the four doors that need it, and leaves the fifth working", async () => {
+  it("says so where the map is needed, and leaves the specs working", async () => {
     open(new Error("no such folder"));
     expect(await screen.findByText(/could not read this project/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /^Specs/ }));
-    expect(await screen.findByText(/One model reads one document/)).toBeTruthy();
     expect(screen.queryByText(/could not read this project/)).toBeNull();
+    expect(await screen.findByRole("region", { name: "Read a spec" })).toBeTruthy();
   });
 });

@@ -13,7 +13,7 @@ import {
 import {
   Button,
   ErrorNote,
-  Inset,
+  Modal,
   Quiet,
   SHORTCUT_HINT,
   StaleNote,
@@ -56,10 +56,12 @@ export function Commands({ projectId }: CommandsProps) {
     heading: `Run in ${projectId}`,
     items: rows.map((row) => ({
       id: `project-command-${row.id}`,
-      label: <>
-        <span className="text-text">{row.name}</span>
-        <span className="ml-2 font-mono text-xs text-text-faint">{row.command}</span>
-      </>,
+      label: (
+        <>
+          <span className="text-text">{row.name}</span>
+          <span className="ml-2 font-mono text-xs text-text-faint">{row.command}</span>
+        </>
+      ),
       match: `${row.name} ${row.command}`,
       disabled: row.last?.outcome === "running",
       // The outcome belongs to the palette's own trailing slot and is drawn there ONCE. It
@@ -89,10 +91,20 @@ export function Commands({ projectId }: CommandsProps) {
   const gates = rows.filter((row) => row.is_gate);
   const refused = run.isError && isApiRefusal(run.error) ? run.error : null;
 
+  /*
+    A real button, outlined, at the row's trailing edge; the form it opens is a modal over a dimmed
+    page, the owner's call for every control on this page that opens something. It was an
+    underlined word beside the ⓘ, and the form unfolded inside the Setup row.
+  */
   const declare = (
-    <Button variant="quiet" onClick={() => setManaging(!managing)}>
-      {managing ? "done" : "declare a command"}
+    <Button variant="ghost" onClick={() => setManaging(true)}>
+      declare a command
     </Button>
+  );
+  const manage = (
+    <Modal open={managing} onOpenChange={setManaging} title="Commands" size="md">
+      {managing ? <Manage projectId={projectId} rows={rows} /> : null}
+    </Modal>
   );
 
   /*
@@ -101,15 +113,15 @@ export function Commands({ projectId }: CommandsProps) {
     that failed to load, and this one never fills itself — but it is worth a click rather than a
     paragraph of every visit. The one gesture that would fill the section stays in front of you.
   */
-  if (rows.length === 0 && !managing) {
+  if (rows.length === 0) {
     return (
       <>
         <Quiet says="none declared" action={declare}>
-          A command is a name, something to run, and whether its result is a verdict on the
-          project — declaration rather than detection, so a list nobody agreed to cannot appear on
-          its own.
+          A command is a name, something to run, and whether its result is a verdict on the project
+          — declaration rather than detection, so a list nobody agreed to cannot appear on its own.
         </Quiet>
         {stale}
+        {manage}
       </>
     );
   }
@@ -149,14 +161,15 @@ export function Commands({ projectId }: CommandsProps) {
           </div>
 
           {refused !== null ? (
-            <p className="text-xs text-tone-danger-fg">{REFUSALS[refused.code] ?? refused.detail}</p>
+            <p className="text-xs text-tone-danger-fg">
+              {REFUSALS[refused.code] ?? refused.detail}
+            </p>
           ) : null}
         </>
       )}
 
       <div>{declare}</div>
-      {managing ? <Manage projectId={projectId} rows={rows} /> : null}
-
+      {manage}
     </div>
   );
 }
@@ -187,7 +200,7 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
   const ready = name.trim() !== "" && command.trim() !== "";
 
   return (
-    <Inset>
+    <div className="flex flex-col gap-4">
       {rows.length > 0 ? (
         <ul className="flex flex-col gap-1">
           {rows.map((row) => (
@@ -218,36 +231,46 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
         </ul>
       ) : null}
 
-      <div className="flex flex-col gap-2">
-        <div className="flex flex-wrap gap-2">
-          <input
-            aria-label="Command name"
-            placeholder="gate"
-            value={name}
-            spellCheck={false}
-            onChange={(event) => setName(event.target.value)}
-            className="w-32 rounded-md border border-border bg-surface-sunken px-2 py-1 text-sm text-text"
-          />
-          <input
-            aria-label="What it runs"
-            placeholder="cargo test"
-            value={command}
-            spellCheck={false}
-            onChange={(event) => setCommand(event.target.value)}
-            className="min-w-48 flex-1 rounded-md border border-border bg-surface-sunken px-2 py-1 font-mono text-sm text-text"
-          />
-          <input
-            aria-label="Folder it runs in"
-            placeholder="the project root"
-            value={cwd}
-            spellCheck={false}
-            onChange={(event) => setCwd(event.target.value)}
-            className="w-40 rounded-md border border-border bg-surface-sunken px-2 py-1 font-mono text-sm text-text"
-          />
+      {/*
+        Every field named on screen, not by a placeholder that vanishes on the first keystroke; the
+        name and the folder side by side, the command on its own line because it is the long one.
+      */}
+      <div className="flex flex-col gap-4">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-[10rem_1fr]">
+          <label className="flex flex-col gap-1 text-sm text-text-muted">
+            Command name
+            <input
+              placeholder="gate"
+              value={name}
+              spellCheck={false}
+              onChange={(event) => setName(event.target.value)}
+              className="rounded-md border border-border bg-surface-sunken px-2.5 py-1.5 text-sm text-text"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-sm text-text-muted">
+            Folder it runs in
+            <input
+              placeholder="the project root"
+              value={cwd}
+              spellCheck={false}
+              onChange={(event) => setCwd(event.target.value)}
+              className="rounded-md border border-border bg-surface-sunken px-2.5 py-1.5 text-sm text-text font-mono"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-sm text-text-muted sm:col-span-2">
+            What it runs
+            <input
+              placeholder="cargo test"
+              value={command}
+              spellCheck={false}
+              onChange={(event) => setCommand(event.target.value)}
+              className="rounded-md border border-border bg-surface-sunken px-2.5 py-1.5 text-sm text-text font-mono"
+            />
+          </label>
         </div>
 
-        <div className="flex flex-wrap items-center gap-4 text-xs text-text-muted">
-          <label className="flex items-center gap-1.5">
+        <div className="flex flex-col gap-2 text-sm text-text">
+          <label className="flex items-center gap-2">
             <input
               type="checkbox"
               checked={isGate}
@@ -255,7 +278,7 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
             />
             its result says whether this project is green
           </label>
-          <label className="flex items-center gap-1.5">
+          <label className="flex items-center gap-2">
             <input
               type="checkbox"
               checked={agentMayRun}
@@ -265,7 +288,10 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
           </label>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="ws-dialog-actions items-center">
+          <span className="mr-auto text-xs text-text-faint">
+            A name already declared is replaced rather than duplicated.
+          </span>
           <button
             type="button"
             disabled={!ready || declare.isPending}
@@ -292,13 +318,10 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
                 },
               )
             }
-            className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
+            className="rounded-md border border-border-strong px-4 py-1.5 text-sm text-text enabled:hover:bg-surface-raised disabled:opacity-40"
           >
             {declare.isPending ? "declaring…" : "declare"}
           </button>
-          <span className="text-xs text-text-faint">
-            A name already declared is replaced rather than duplicated.
-          </span>
         </div>
 
         {/* The núcleo's own words for `invalid`, which name the part that was wrong. */}
@@ -306,7 +329,7 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
           <ErrorNote>{DECLARE_REFUSALS[refused.code] ?? refused.detail}</ErrorNote>
         ) : null}
       </div>
-    </Inset>
+    </div>
   );
 }
 
@@ -374,4 +397,3 @@ function GateButton({
     </button>
   );
 }
-

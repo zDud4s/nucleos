@@ -11,9 +11,9 @@ import { describe, expect, it } from "vitest";
  * queue. This test is the fence: a new page that borrows the phrase fails here
  * rather than in a screenshot nobody reads.
  *
- * Waiting.tsx keeps two matches on purpose, both scoped by the word "git" (an
- * empty-state sentence and an `aria-label` that `getByRole("list", { name })`
- * depends on), so the rule for that file is "every match also says git".
+ * Waiting.tsx keeps one match on purpose, scoped by the word "git" (an
+ * `aria-label` that `getByRole("list", { name })` depends on), so the rule for
+ * that file is "every match also says git".
  */
 
 const moduleUrl = import.meta.url.startsWith("file:")

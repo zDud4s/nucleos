@@ -46,7 +46,7 @@ export {
 } from "./Palette";
 export { Panel, type PanelProps, type PanelVariant } from "./Panel";
 export { ProviderMark, type ProviderMarkProps } from "./ProviderMark";
-export { Quiet, type QuietProps } from "./Quiet";
+export { Quiet, QuietTips, type QuietProps } from "./Quiet";
 export { Ring, type RingProps, type RingTrack } from "./Ring";
 /**
  * Three formatters in one module — the recorded exception to one primitive per

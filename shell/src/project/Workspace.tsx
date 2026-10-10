@@ -1,13 +1,15 @@
+import { useEffect } from "react";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { useConcurrency } from "../data/fleet";
 import { useProjects } from "../data/system";
 import { useProjectWorkflows } from "../data/workflows";
-import { Count, PageHeader, StateBadge } from "../ui";
+import { Count, PageHeader, QuietTips, StateBadge } from "../ui";
 import { ModeState } from "./ModeState";
 import { ModeMap } from "./ModeMap";
 import { ModeCode } from "./ModeCode";
 import { ModeWorkflows } from "./ModeWorkflows";
 import { ModeGithub } from "./ModeGithub";
+import "../pages/workspace.css";
 
 /**
  * One project, as a place rather than as a row.
@@ -177,8 +179,45 @@ function useHolding(projectId: string): Partial<Record<ProjectMode, Holding>> {
   return holding;
 }
 
+/**
+ * Whether a key press belongs to a field somebody is typing in — the switcher's own rule in
+ * `Sidebar.tsx`, for the same reason: an editor may mean something by Ctrl+digit.
+ */
+function typing(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.isContentEditable || target.matches("input, textarea, select");
+}
+
+/**
+ * Ctrl+1…5 (Cmd on a Mac) opens the modes in the order the tabs read.
+ *
+ * A desktop app with five fixed views and no way to reach them but the pointer is a keyboard user
+ * tabbing through the whole header every time. The chord is the one every tabbed desktop app uses
+ * for "the nth tab", and `aria-keyshortcuts` on each link says it to a screen reader. Anything that
+ * already answered the chord keeps it (`defaultPrevented`), as with the switcher's Ctrl+P.
+ */
+function useModeShortcuts(projectId: string) {
+  const navigate = useNavigate();
+  useEffect(() => {
+    function onKey(event: globalThis.KeyboardEvent) {
+      if (event.defaultPrevented || event.altKey || event.shiftKey) return;
+      if (!(event.ctrlKey || event.metaKey) || typing(event.target)) return;
+      const index = Number(event.key) - 1;
+      const mode = MODES[index];
+      if (!Number.isInteger(index) || mode === undefined) return;
+      event.preventDefault();
+      void navigate({ to: `/projects/${projectId}/${mode}` });
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [navigate, projectId]);
+}
+
 export function Workspace() {
-  const params = useParams({ strict: false }) as { projectId?: string; view?: string };
+  const params = useParams({ strict: false }) as {
+    projectId?: string;
+    view?: string;
+  };
   const search = useSearch({ strict: false }) as { run?: number };
   const navigate = useNavigate();
   const projectId = params.projectId ?? "";
@@ -187,6 +226,7 @@ export function Workspace() {
   const projects = useProjects();
   const project = projects.data?.find((row) => row.project_id === projectId);
   const holding = useHolding(projectId);
+  useModeShortcuts(projectId);
 
   return (
     <>
@@ -230,8 +270,8 @@ export function Workspace() {
         does not fit here: it is an inset rule on the LEADING edge, and the mark a tab strip
         needs is under the label.
       */}
-      <nav aria-label="Project modes" className="ui-tab-list mb-6">
-        {MODES.map((candidate) => {
+      <nav aria-label="Project modes" className="ui-tab-list ws-tabs mb-6">
+        {MODES.map((candidate, index) => {
           const holds = holding[candidate];
           // Quiet is for a door somebody has not walked through. The tab they are standing in keeps
           // full weight whatever it counts, or the strip's one "here" mark is the dimmest thing on it.
@@ -241,11 +281,15 @@ export function Workspace() {
               key={candidate}
               to={`/projects/${projectId}/${candidate}`}
               aria-current={candidate === mode ? "page" : undefined}
+              aria-keyshortcuts={`Control+${index + 1} Meta+${index + 1}`}
               /* What the vendored trigger says about itself, said the same way, so one
                  rule in `ui.css` draws the selected tab wherever it is. */
               data-state={candidate === mode ? "active" : "inactive"}
               title={holds?.means}
-              className={quiet ? "ui-tab opacity-[var(--opacity-quiet)]" : "ui-tab"}
+              /* A colour and not an opacity: `--text-muted` at 0.7 measured 4.17:1 in dark and 3.18:1
+                 in light, under the 4.5:1 a 14px label needs. `.ui-tab[data-quiet]` stays above it. */
+              data-quiet={quiet ? "" : undefined}
+              className="ui-tab"
             >
               {MODE_LABEL[candidate]}
               {/*
@@ -262,26 +306,33 @@ export function Workspace() {
         })}
       </nav>
 
-      {mode === "state" ? (
-        <ModeState projectId={projectId} answered={projects.data !== undefined} />
-      ) : null}
-      {mode === "map" ? <ModeMap projectId={projectId} /> : null}
-      {mode === "code" ? (
-        <ModeCode
-          projectId={projectId}
-          run={search.run ?? null}
-          /*
+      {/* Every mode's ⓘ opens as a tip over the page, never as a paragraph inside its group. */}
+      <QuietTips.Provider value={true}>
+        {mode === "state" ? (
+          <ModeState projectId={projectId} answered={projects.data !== undefined} />
+        ) : null}
+        {mode === "map" ? <ModeMap projectId={projectId} /> : null}
+        {mode === "code" ? (
+          <ModeCode
+            projectId={projectId}
+            run={search.run ?? null}
+            /*
             Replaces rather than pushes: choosing a different run to review is changing what you are
             looking at, not going somewhere new, and a back button that walked through every run
             somebody glanced at would be a worse back button.
           */
-          onPickRun={(run) =>
-            void navigate({ to: `/projects/${projectId}/code`, search: { run }, replace: true })
-          }
-        />
-      ) : null}
-      {mode === "workflows" ? <ModeWorkflows projectId={projectId} /> : null}
-      {mode === "authority" ? <ModeGithub projectId={projectId} /> : null}
+            onPickRun={(run) =>
+              void navigate({
+                to: `/projects/${projectId}/code`,
+                search: { run },
+                replace: true,
+              })
+            }
+          />
+        ) : null}
+        {mode === "workflows" ? <ModeWorkflows projectId={projectId} /> : null}
+        {mode === "authority" ? <ModeGithub projectId={projectId} /> : null}
+      </QuietTips.Provider>
     </>
   );
 }

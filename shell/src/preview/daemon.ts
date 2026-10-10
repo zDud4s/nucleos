@@ -1,3 +1,6 @@
+import type { DeclarableGitOp, DeclarableOp, Landing, ShellRule } from "../data/project-policy";
+import type { ProjectRepo, ReadOutcome } from "../data/project-github";
+import type { TestsMapView } from "../data/project-tests-map";
 import type { Agent } from "../data/agents";
 import type { Detected } from "../data/detect";
 import type { Known } from "../data/knowledge";
@@ -561,6 +564,22 @@ const PROJECT_KNOWLEDGE: Known[] = [
   known({ id: 2, layer: "procedural", title: "Suite needs PATH", body: "Five tests spawn echo as a program; under PowerShell prepend Git's usr/bin.", status: "proposed", proposal_id: 31, observations: 3, created_at: ago(5 * HOUR), activated_at: null }),
   known({ id: 3, layer: "episodic", title: "Gate flaked under load", body: "Timing tests in vcs:: failed while another suite ran; each passed alone.", status: "active", observations: 2, created_at: ago(2 * DAY), activated_at: ago(2 * DAY) }),
   known({ id: 4, layer: "semantic", title: "Sidecars own their DB", body: "Each sidecar keeps its own store.", status: "superseded", source: "run", ended_at: ago(4 * DAY), created_at: ago(12 * DAY) }),
+  /* Scoped to an agent, a team, another project and the machine: what the Memory section of
+     the Auditor Sénior's editor and of Finanças's Charter shows, and the Brain's queue. */
+  known({ id: 5, layer: "semantic", source: "run", generator: null, scope_kind: "agent", scope_id: "auditor", status: "active", activated_at: ago(6 * DAY),
+    title: "Reconcile against the bank export, not the ledger", body: "The ledger lags a day; the bank export is the second source that settles a disagreement.", shown_count: 14, outcome_count: 9, green_count: 8 }),
+  known({ id: 6, source: "run", generator: null, scope_kind: "agent", scope_id: "auditor", status: "active", activated_at: ago(2 * DAY), layer: "procedural", kind: "skill",
+    title: "Quote the line that does not add up", body: "A finding names the row and the two numbers; a summary without them gets sent back.", shown_count: 5, outcome_count: 3, green_count: 3 }),
+  known({ id: 7, layer: "semantic", source: "run", generator: null, scope_kind: "agent", scope_id: "auditor", status: "proposed", activated_at: null, proposal_id: 903,
+    title: "VAT returns close on the 20th", body: "Seen in three runs: the draft is rejected after the 20th of the following month." }),
+  known({ id: 8, layer: "semantic", source: "run", generator: null, scope_kind: "team", scope_id: "financas", status: "active", activated_at: ago(9 * DAY),
+    title: "Invoices above 5 000 EUR need a second signature", body: "The charter's own rule, learned from a refused payment in March.", shown_count: 21, outcome_count: 12, green_count: 11 }),
+  known({ id: 9, source: "run", generator: null, scope_kind: "team", scope_id: "financas", status: "active", activated_at: ago(1 * DAY), layer: "episodic",
+    title: "The supplier portal is down on Sunday nights", body: "Runs scheduled then fail on login; move them to Monday morning.", shown_count: 2, outcome_count: 1, green_count: 1 }),
+  known({ id: 10, layer: "semantic", scope_kind: "project", scope_id: "nucleos", status: "proposed", activated_at: null, proposal_id: 901, source: "distiller", generator: "refine",
+    title: "Run http.rs tests in the bin target", body: "`cargo test --lib` never reaches them; `--bin nucleos-core` does." }),
+  known({ id: 11, layer: "semantic", scope_kind: "machine", scope_id: null, status: "proposed", activated_at: null, proposal_id: 902, source: "consolidator",
+    title: "Git's bash is the POSIX shell here", body: "`bash` on PATH is WSL; name Git's bash.exe explicitly." }),
 ];
 
 export const OPEN_CAPTURES: CaptureRequest[] = [
@@ -2192,6 +2211,27 @@ const CONTACTS = [
 ];
 
 /**
+ * Two identity questions: an ordinary one, and one whose two sides carry opposite verdicts, so
+ * the conflict note shows before either button is pressed.
+ */
+const CONTACT_MERGES = [
+  {
+    proposal_id: 41,
+    reasoning: "Both addresses signed their mail \"João Pereira\" this week, and one replied in the other's thread.",
+    created_at: ago(5 * HOUR),
+    keep: { contact_id: 6, addresses: ["joao@example.org"], display_name: "João", messages_in: 1, verdict: null },
+    absorb: { contact_id: 7, addresses: ["joao.pereira@work.example.com"], display_name: "João Pereira", messages_in: 12, verdict: null },
+  },
+  {
+    proposal_id: 42,
+    reasoning: "Same display name and the same phone number in the signature.",
+    created_at: ago(DAY),
+    keep: { contact_id: 1, addresses: ["mira.chen@example.com"], display_name: "Mira Chen", messages_in: 42, verdict: "pin" },
+    absorb: { contact_id: 8, addresses: ["m.chen@personal.example.org"], display_name: "Mira C.", messages_in: 4, verdict: "mute" },
+  },
+];
+
+/**
  * The inbound queue, drawn to carry every fact a row can state at once: each of the five
  * classes, a message triage has not reached (`null`, which must NOT read as `noise`), both
  * sender verdicts, an attachment, a subject long enough to wrap, and one with no subject at
@@ -2928,6 +2968,67 @@ export function answer(path: string, init?: RequestInit): unknown {
   }
 
   /*
+    The test map, absent, with something proposed. An object and not a list, so
+    the empty default drew State as a crash: `TestsMap` reads `proposal.sources`.
+  */
+  const testsMap = /^\/projects\/([^/]+)\/tests-map$/.exec(route);
+  if (testsMap !== null && init?.method === undefined) {
+    return {
+      state: "absent",
+      errors: [],
+      groups: [],
+      proposal: {
+        yaml: "groups:\n  core:\n    paths: [core/]\n    run: cargo test -p nucleos-core\n",
+        sources: ["Cargo.toml", "shell/package.json"],
+      },
+    } satisfies TestsMapView;
+  }
+
+  /*
+    The Authority mode's reads. Two are objects -- the remote and where work lands --
+    and the empty-list default drew the whole mode as a crash on `targets.length`.
+    `alpha` has one shell rule each way and two declared operations, so every table
+    photographs with a row in it.
+  */
+  if (/^\/projects\/([^/]+)\/github-repo$/.test(route)) {
+    return { state: "known", repo: "dudas/alpha", remote: "git@github.com:dudas/alpha.git" } satisfies ProjectRepo;
+  }
+  if (/^\/projects\/([^/]+)\/land-targets$/.test(route) && init?.method === undefined) {
+    return { integration: { state: "declared", branch: "master" }, targets: ["release"] } satisfies Landing;
+  }
+  if (/^\/projects\/([^/]+)\/shell-rules$/.test(route) && init?.method === undefined) {
+    return [
+      { prefix: "cargo test", tool: null, verdict: "allow", note: "the gate runs it", created_at: ago(5 * DAY).replace("T", " ").slice(0, 19) },
+      { prefix: "git push --force", tool: null, verdict: "deny", note: null, created_at: ago(5 * DAY).replace("T", " ").slice(0, 19) },
+    ] satisfies ShellRule[];
+  }
+  if (/^\/projects\/([^/]+)\/github-ops$/.test(route) && init?.method === undefined) return ["pr_create"];
+  if (/^\/projects\/([^/]+)\/git-ops$/.test(route) && init?.method === undefined) return ["push"];
+  /* The two listings the Authority mode reads, as `gh` prints them: tab-separated rows. */
+  if (route === "/github/requests" && init?.method === "POST") {
+    const op = (JSON.parse(String(init.body ?? "{}")) as { op?: { op?: string } }).op?.op;
+    const stdout =
+      op === "run_list"
+        ? "completed\tsuccess\tgates\tmaster\ncompleted\tfailure\tgates\tfeat/leitor-de-comandos\n"
+        : "12\tfeat: leitor de comandos\tfeat/leitor-de-comandos\tOPEN\n";
+    return { status: "ran", operation: op ?? "pr_list", exit_code: 0, stdout, output_tail: "" } satisfies ReadOutcome;
+  }
+  if (route === "/github/declarable-ops") {
+    return [
+      { kind: "pr_list", half: "read", declarable: false },
+      { kind: "run_list", half: "read", declarable: false },
+      { kind: "pr_create", half: "action", declarable: true },
+      { kind: "pr_merge", half: "action", declarable: true },
+    ] satisfies DeclarableOp[];
+  }
+  if (route === "/vcs/declarable-ops") {
+    return [
+      { kind: "push", declarable: true },
+      { kind: "branch_delete", declarable: true },
+    ] satisfies DeclarableGitOp[];
+  }
+
+  /*
     Where work lands, and what is standing beside it. An object and not a list,
     which is why the empty default could not stand in for it: the panel reads
     `.branches.length` and an array has no such field.
@@ -3017,6 +3118,7 @@ export function answer(path: string, init?: RequestInit): unknown {
   }
 
   if (path === "/contacts") return CONTACTS;
+  if (path === "/contacts/merges") return CONTACT_MERGES;
   if (path === "/teams") return TEAMS;
   if (path === "/team-runs") return RUNS;
   if (path === "/team-triggers") return TRIGGERS;

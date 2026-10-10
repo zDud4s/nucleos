@@ -387,7 +387,7 @@
 .runs-row-meta {
   grid-column: 2;
   display: grid;
-  grid-template-columns: 4.5rem 5.5rem 7rem 7rem minmax(0, 1fr);
+  grid-template-columns: 4.5rem 5.5rem 7rem 7rem minmax(0, 1fr) 9.5rem;
   align-items: baseline;
   gap: var(--space-3);
   margin: 0;
@@ -399,6 +399,7 @@
 .runs-row-id,
 .runs-row-mode,
 .runs-row-project,
+.runs-row-ran,
 .runs-row-cost,
 .runs-row-meta .ui-reading-time {
   font-family: var(--font-mono);
@@ -407,9 +408,21 @@
   white-space: nowrap;
 }
 
+/* What ran (`model · effort`) is the fifth column and gets the slack: a model
+   name is the one cell here whose length varies, so it is allowed to truncate
+   rather than push the cost off its column. The columns are placed explicitly
+   because a conversation row has no such cell and its cost must still land in
+   the last column, under the cost of the runs around it. */
+.runs-row-ran {
+  grid-column: 5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* The money is the one figure worth reading down the column, so it ends the
    metadata line rather than sitting in the middle of the words. */
 .runs-row-cost {
+  grid-column: 6;
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
@@ -436,14 +449,15 @@
 }
 
 /* Each row is its own container, so the metadata line decides by the width the
-   row actually has. The fixed columns need about 44rem of row; under that they
-   ran past the excerpt's column and `.ui-rows` clipped the time and the cost off
-   the edge at 800px. Narrower, the facts wrap as a line of words instead. */
+   row actually has. The fixed columns need about 44rem of row, and the "what
+   ran" column added to them needs about ten more; under that they ran past the
+   excerpt's column and `.ui-rows` clipped the time and the cost off the edge at
+   800px. Narrower, the facts wrap as a line of words instead. */
 .runs-row {
   container-type: inline-size;
 }
 
-@container (max-width: 44rem) {
+@container (max-width: 54rem) {
   .runs-row-meta {
     display: flex;
     flex-wrap: wrap;
@@ -451,7 +465,13 @@
   }
 
   .runs-row-cost {
+    grid-column: auto;
     text-align: left;
+  }
+
+  .runs-row-ran {
+    grid-column: auto;
+    overflow: visible;
   }
 }
 
@@ -791,7 +811,10 @@
   color: var(--text-muted);
 }
 
-/* What ran, under the metadata line; the router's differing advice is quieter still. */
+/* The router's advice, under the metadata line, only when it differs from what
+   ran. Muted, not faint (faint measured 3.45:1 here, under the 4.5:1 floor), so
+   what sets it apart from the facts above is not colour: it is italic and the
+   text itself leads with an arrow. */
 .runs-row-route {
   grid-column: 2;
   display: flex;
@@ -804,41 +827,6 @@
 }
 
 .runs-row-route-advice {
-  color: var(--text-faint);
-}
-
-/* The router panel: a line of totals, then a compact pairs table. */
-.runs-router-totals {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-1) var(--space-4);
-  margin: 0 0 var(--space-3);
-  font-size: var(--text-sm);
+  font-style: italic;
   color: var(--text-muted);
-}
-
-.runs-router-pairs {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: var(--text-sm);
-}
-
-.runs-router-caption {
-  text-align: left;
-  color: var(--text-muted);
-  padding-bottom: var(--space-1);
-}
-
-.runs-router-pairs th,
-.runs-router-pairs td {
-  text-align: right;
-  padding: var(--space-1) var(--space-2);
-  font-variant-numeric: tabular-nums;
-}
-
-.runs-router-pairs th:first-child,
-.runs-router-pairs td:first-child {
-  text-align: left;
-  padding-left: 0;
-  font-family: var(--font-mono);
 }

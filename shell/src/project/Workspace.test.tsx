@@ -28,16 +28,22 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 /** Mount the workspace over a daemon holding exactly these facts. */
-async function openWorkspace(options: {
-  openProposals?: number;
-  engaged?: boolean;
-  mode?: string;
-  readings?: ProjectReadings;
-} = {}) {
+async function openWorkspace(
+  options: {
+    openProposals?: number;
+    engaged?: boolean;
+    mode?: string;
+    readings?: ProjectReadings;
+  } = {},
+) {
   const state = daemonState({
     kill: { engaged: options.engaged === true },
     projects: [
-      project({ project_id: "nucleos", mode: "shadow", open_review_items: options.openProposals ?? 0 }),
+      project({
+        project_id: "nucleos",
+        mode: "shadow",
+        open_review_items: options.openProposals ?? 0,
+      }),
     ],
     ...(options.readings === undefined ? {} : { readings: options.readings }),
   });
@@ -56,9 +62,7 @@ function reviewState(): DaemonState {
     projects: [project({ project_id: "nucleos", mode: "shadow", wip_limit: 2 })],
     concurrency: {
       house: { limit: 4, held: 1 },
-      projects: [
-        heldSlots("nucleos", 2, [slot({ project_id: "nucleos", owner_id: 41 })]),
-      ],
+      projects: [heldSlots("nucleos", 2, [slot({ project_id: "nucleos", owner_id: 41 })])],
     },
     changed: { paths: ["core/src/http.rs", "shell/src/a.tsx"], tracked: 3_214 },
   });
@@ -176,7 +180,8 @@ describe("the project workspace", () => {
     expect(screen.getByRole("link", { name: "Map" }).textContent).toBe("Map");
 
     // Quiet is drawn, and it is drawn by the tone rather than by taking anything away.
-    expect(code.className).not.toBe(screen.getByRole("link", { name: "Map" }).className);
+    expect(code.hasAttribute("data-quiet")).toBe(true);
+    expect(screen.getByRole("link", { name: "Map" }).hasAttribute("data-quiet")).toBe(false);
     expect(code.getAttribute("href")).toBe("/projects/nucleos/code");
   });
 
@@ -213,10 +218,10 @@ describe("the project workspace", () => {
     const code = await screen.findByRole("link", { name: /^Code/ });
     await waitFor(() => expect(code.textContent).toBe("Code0"));
     expect(code.getAttribute("aria-current")).toBe("page");
-    expect(code.className).not.toContain("opacity");
+    expect(code.hasAttribute("data-quiet")).toBe(false);
 
     // And the other empty door, not current, still recedes.
-    expect(screen.getByRole("link", { name: /^Workflows/ }).className).toContain("opacity");
+    expect(screen.getByRole("link", { name: /^Workflows/ }).hasAttribute("data-quiet")).toBe(true);
   });
 
   it("answers a kept Portuguese link, and hands back English tabs", async () => {
@@ -260,9 +265,9 @@ describe("the project workspace", () => {
       "Readings",
       "Occupancy",
       "Branches",
+      "Settings",
       "Workflow",
       "Commands",
-      "Settings",
       "Files the app owns",
       "Test map",
       // Last, because it is the only thing on this page that cannot be undone — and present in
@@ -374,9 +379,9 @@ describe("the project workspace", () => {
       "Readings",
       "Occupancy",
       "Branches",
+      "Settings",
       "Workflow",
       "Commands",
-      "Settings",
       "Files the app owns",
       "Test map",
       // Last, because it is the only thing on this page that cannot be undone — and present in
@@ -531,7 +536,30 @@ describe("the project workspace", () => {
 
   it("offers no review when nothing holds a worktree here", async () => {
     await openWorkspace({ mode: "code" });
-    expect(await screen.findByText(/Nothing to review in nucleos/)).toBeTruthy();
+    expect(await screen.findByText("Nothing to review")).toBeTruthy();
+  });
+
+  /**
+   * Ctrl+digit opens the nth mode, and a field somebody is typing in keeps the chord.
+   *
+   * The second half is the one that would bite: a Ctrl+3 typed into the shell-rule prefix field on
+   * Authority must not throw the page over to Code under the cursor.
+   */
+  it("opens a mode from the keyboard, and leaves a field's chord alone", async () => {
+    await openWorkspace({ mode: "state" });
+    const map = await screen.findByRole("link", { name: "Map" });
+    expect(map.getAttribute("aria-keyshortcuts")).toBe("Control+2 Meta+2");
+
+    fireEvent.keyDown(window, { key: "2", ctrlKey: true });
+    await waitFor(() =>
+      expect(screen.getByRole("link", { name: "Map" }).getAttribute("aria-current")).toBe("page"),
+    );
+
+    const field = document.createElement("input");
+    document.body.appendChild(field);
+    fireEvent.keyDown(field, { key: "1", ctrlKey: true });
+    expect(screen.getByRole("link", { name: "Map" }).getAttribute("aria-current")).toBe("page");
+    field.remove();
   });
 
   /**
@@ -629,18 +657,15 @@ describe("the project workspace", () => {
     daemon.probeHealth.mockResolvedValue(true);
     await renderApp({ initialPath: "/projects/nucleos/map" });
 
-    // Was `/declaring nothing they implement/`, which this mode no longer says: that count is the
-    // junction's `unclaimed` now, and the headline reports what it alone knows.
-    expect(await screen.findByText(/this reader could read/)).toBeTruthy();
+    // The headline is the size of the ground now; the junction's counts live behind its door.
+    expect(await screen.findByText(/files in \d+ sides?/)).toBeTruthy();
 
     /*
-      The junction is behind its own door since the mode became five views, so the click is part of
-      what this test proves: the door is there, it is wired, and the panel behind it reads the same
-      answer the headline did. Asserting only the headline would leave a typo in the view condition
-      showing an empty page under a chip that still looked right.
+      The map opens on its drawing, so the side the headline counted is on screen as a graph: the
+      tab is wired and the canvas reads the same answer the headline did. Asserting only the
+      headline would leave a typo in the view condition showing an empty page under it.
     */
-    fireEvent.click(screen.getByRole("button", { name: /^Junction/ }));
-    expect(screen.getByText(/module nobody asked for/)).toBeTruthy();
+    expect(screen.getByRole("region", { name: "core · rust" })).toBeTruthy();
   });
 });
 
@@ -753,7 +778,13 @@ describe("what the app may author", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "edit" }));
     expect(await screen.findByText(/no such file yet/)).toBeTruthy();
-    expect((await screen.findByLabelText("~/.nucleos/projects/alpha/autopilot.yaml") as HTMLTextAreaElement).value).toBe("");
+    expect(
+      (
+        (await screen.findByLabelText(
+          "~/.nucleos/projects/alpha/autopilot.yaml",
+        )) as HTMLTextAreaElement
+      ).value,
+    ).toBe("");
   });
 });
 
@@ -780,9 +811,7 @@ describe("the settings this app authors", () => {
     expect(await screen.findByText("2 of 3 taken")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "no ceiling" }));
-    await waitFor(() =>
-      expect(state.projects[0].wip_limit).toBe(null),
-    );
+    await waitFor(() => expect(state.projects[0].wip_limit).toBe(null));
     expect(await screen.findByText(/no ceiling — 2 proposals waiting on you/)).toBeTruthy();
   });
 
@@ -1063,9 +1092,7 @@ describe("what this project can be asked to do", () => {
    * than drawing an empty bar that reads as "nothing is wrong".
    */
   it("says nothing here claims to know whether the project is green", async () => {
-    await openState(
-      withCommands([projectCommand({ id: 2, name: "fmt", is_gate: false })]),
-    );
+    await openState(withCommands([projectCommand({ id: 2, name: "fmt", is_gate: false })]));
     expect(await screen.findByText(/No command here is marked a gate/)).toBeTruthy();
   });
 
@@ -1181,9 +1208,7 @@ describe("what this project can be asked to do", () => {
     await openState(
       daemonState({
         projects: [project({ project_id: "nucleos", mode: "shadow" })],
-        workflows: [
-          installedWorkflow({ standing: "ejected", ejected_at: "2026-02-01T00:00:00Z" }),
-        ],
+        workflows: [installedWorkflow({ standing: "ejected", ejected_at: "2026-02-01T00:00:00Z" })],
       }),
     );
     expect(await screen.findAllByText(/Nothing waiting on you/)).toBeTruthy();

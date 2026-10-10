@@ -811,6 +811,130 @@ a.ui-button:not(.ui-button-link):is(:hover, :focus-visible) {
   outline-offset: 4px;
 }
 
+/* ------------------------------------------------------------ press and hold -- */
+
+/**
+ * `ConfirmButton` is a press-and-hold: the fill below sweeps while the pointer or the key is
+ * down, and `onConfirm` runs when it completes. The rules in this block draw that; the
+ * `.ui-confirm-armed` ones above are now the screen-reader FALLBACK's two-step and are unchanged.
+ *
+ * No text selection and no touch scrolling on the button: a held press that selects the label, or
+ * hands the gesture to the page as a pan, is a hold that cancels itself.
+ */
+.ui-confirm > .ui-button {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: none;
+}
+
+/**
+ * Holding. The fill is a `::after` layer under the label (`z-index: -1` inside the isolated
+ * button), because `::before` is already spent on the go / create glyphs.
+ *
+ * Its colour is the button's own text colour at low alpha: `currentColor` is the tone for every
+ * variant (approve green, danger red, the neutral greys), so one rule answers all of them in
+ * both themes without a per-variant token. `--ui-confirm-fill` lets a page whose button inverts
+ * that (Waiting's `--text`-filled approve) supply its own.
+ *
+ * The sweep is a CSS animation of `transform`, timed by `--ui-confirm-hold`, which the
+ * component sets on the wrapper from the same constant that drives its timer — so the fill and
+ * the clock cannot drift apart. It restarts from empty every time because the layer only exists
+ * while the class does; there is no retreat animation on release, the layer simply goes.
+ */
+.ui-confirm-holding > .ui-button {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+
+/* A quiet button has no box for the fill to sweep across: give it the armed box, same maths. */
+.ui-confirm-holding > .ui-button-quiet {
+  padding: 0.34rem var(--space-1);
+  margin: -0.34rem calc(-1 * var(--space-1));
+}
+
+.ui-confirm-holding > .ui-button::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--ui-confirm-fill, color-mix(in srgb, currentColor 22%, transparent));
+  transform-origin: left center;
+  animation: ui-confirm-sweep var(--ui-confirm-hold, 1000ms) linear forwards;
+  pointer-events: none;
+}
+
+@keyframes ui-confirm-sweep {
+  from {
+    transform: scaleX(0);
+  }
+
+  to {
+    transform: scaleX(1);
+  }
+}
+
+/**
+ * `.ui-button:active` drops every variant to the `--surface` rung, which is right for a click
+ * that is over in a frame and wrong for a hold that stays pressed for a second or more: the
+ * tone would drain out of the button exactly while the fill is trying to show it. Each variant
+ * is restated at its hover look, which is what the pointer was already doing before it pressed.
+ */
+.ui-confirm-holding > .ui-button-ghost:active:not(:disabled) {
+  background: var(--surface-raised);
+  border-color: var(--text-faint);
+}
+
+.ui-confirm-holding > .ui-button-approve:active:not(:disabled) {
+  background: var(--tone-active-bg);
+  border-color: var(--tone-active-fg);
+}
+
+.ui-confirm-holding > .ui-button-danger:active:not(:disabled) {
+  background: var(--tone-danger-bg);
+  border-color: var(--tone-danger-fg);
+}
+
+.ui-confirm-holding > .ui-button-danger-solid:active:not(:disabled) {
+  background: var(--tone-danger-fg);
+  border-color: var(--tone-danger-fg);
+}
+
+.ui-confirm-holding > .ui-button-quiet:active:not(:disabled) {
+  background: none;
+  border-color: transparent;
+}
+
+/**
+ * Reduced motion: no sweep, but the hold keeps its duration.
+ *
+ * The state change is static instead: a 2px ring drawn INSIDE the box (an inset shadow, so
+ * nothing grows and nothing moves, where thickening the border would shift the label by a
+ * pixel) and the label reads "Keep holding…". The third cell is always in the stack so the width
+ * is already reserved; it is shown here and the swapped-in consequence label is hidden, and
+ * only outside a `ModeSwitch` segment, whose own rules turn the hidden cells off and would be
+ * left with nothing visible at all.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .ui-confirm-holding > .ui-button::after {
+    animation: none;
+    transform: scaleX(0);
+  }
+
+  .ui-confirm-holding > .ui-button {
+    box-shadow: inset 0 0 0 2px currentColor;
+  }
+
+  :not(.ui-switch-seg-wrap) > .ui-confirm-holding .ui-confirm-stack > .ui-confirm-keep {
+    visibility: visible;
+  }
+
+  :not(.ui-switch-seg-wrap) > .ui-confirm-holding .ui-confirm-stack > :not(.ui-confirm-keep) {
+    visibility: hidden;
+  }
+}
+
 /* ----------------------------------------------------------------- teach -- */
 
 /**
@@ -994,6 +1118,50 @@ a.ui-button:not(.ui-button-link):is(:hover, :focus-visible) {
   font-size: var(--text-xs);
   line-height: var(--leading-normal);
   color: var(--text-faint);
+}
+
+/**
+ * The same reasoning as a tip, under `QuietTips` (the project workspace).
+ *
+ * It floats over the page instead of unfolding inside the row, so reading it moves nothing. The
+ * tip sits inside the anchor with its gap drawn as padding, so the pointer can travel from the
+ * mark onto the text without the anchor losing the hover.
+ */
+.ui-quiet-anchor {
+  position: relative;
+  display: inline-flex;
+  align-self: center;
+}
+
+.ui-quiet-tip {
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  z-index: 30;
+  display: block;
+  padding-top: var(--space-2);
+  transform: translateX(-50%);
+}
+
+.ui-quiet-tip[hidden] {
+  display: none;
+}
+
+.ui-quiet-tip-box {
+  display: block;
+  width: max-content;
+  max-width: min(22rem, 80vw);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-lg);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  text-align: left;
+  white-space: normal;
 }
 
 /* --------------------------------------------------------------- current -- */
@@ -2136,6 +2304,17 @@ ol.ui-well {
   color: var(--text);
 }
 
+/* A door with nothing behind it, receding by tone. `--text-faint` is the quietest
+   text token that still clears 4.5:1 on the page in both themes (5.54:1 dark,
+   4.9:1 light); an opacity over `--text-muted` did not (4.17:1, 3.18:1). */
+.ui-tab[data-quiet] {
+  color: var(--text-faint);
+}
+
+.ui-tab[data-quiet]:hover {
+  color: var(--text);
+}
+
 /* A count is a reading beside the label, not part of the selection: it stays muted
    when the tab it sits on turns to full-contrast text. */
 .ui-tab[data-state="active"] .ui-count {
@@ -2589,8 +2768,10 @@ ol.ui-well {
 .ui-modal-body {
   min-height: 0;
   overflow-y: auto;
-  margin-top: var(--space-4);
-  padding: 0 var(--space-5);
+  /* A scrolling box clips what crosses its edge, focus rings included: the first field's ring was
+     cut off under the title. Room for the ring inside, taken back from the margin outside. */
+  margin-top: calc(var(--space-4) - var(--space-1));
+  padding: var(--space-1) var(--space-5);
 }
 
 .ui-modal-foot {
@@ -3141,5 +3322,18 @@ ol.ui-well {
     forced-color-adjust: none;
     background: Highlight;
     color: HighlightText;
+  }
+
+  /*
+   * Forced colours replace every background, and a fill carried by a translucent background
+   * would vanish with it. The hold layer opts out of the adjustment and becomes a solid `Highlight`
+   * bar along the bottom edge instead: a full-height `Highlight` fill would put the label's
+   * `ButtonText` on a selection colour it was never paired with.
+   */
+  .ui-confirm-holding > .ui-button::after {
+    forced-color-adjust: none;
+    top: auto;
+    height: 4px;
+    background: Highlight;
   }
 }

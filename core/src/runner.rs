@@ -3419,6 +3419,73 @@ pub struct CodexStaged {
     pub sandbox_mode: Option<&'static str>,
 }
 
+/// The prefix Codex gives the daemon's own MCP tools: `mcp__<server>__<tool>`, server `nucleos`.
+pub const DAEMON_MCP_TOOL_PREFIX: &str = "mcp__nucleos__";
+
+/// The Codex features an `McpOnly` turn switches off (`-c features.<name>=false`).
+pub const CODEX_MCP_ONLY_DISABLED_FEATURES: [&str; 10] = [
+    "shell_tool",
+    "browser_use",
+    "browser_use_external",
+    "in_app_browser",
+    "computer_use",
+    "image_generation",
+    "apps",
+    "plugins",
+    "tool_suggest",
+    "multi_agent",
+];
+
+/// The reason the deny hook prints. No character in it is syntax to `sh` or `cmd`.
+pub const CODEX_MCP_ONLY_DENIAL: &str = "nucleos: this chat may only call the nucleos MCP tools";
+
+/// A regex over tool names that matches every name NOT starting with `prefix`: for each position
+/// `i`, the proper prefix `prefix[..i]` itself, or `prefix[..i]` followed by any character other
+/// than `prefix[i]`. No lookahead, so it behaves the same under search and under full-match.
+pub fn codex_deny_matcher(prefix: &str) -> String {
+    assert!(
+        prefix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "the deny matcher prefix must be ASCII alphanumerics and underscores: {prefix}"
+    );
+    let chars: Vec<char> = prefix.chars().collect();
+    let mut branches = Vec::new();
+    for i in 0..chars.len() {
+        let head: String = chars[..i].iter().collect();
+        branches.push(head.clone());
+        branches.push(format!("{head}[^{}].*", chars[i]));
+    }
+    format!("(?s)^(?:{})$", branches.join("|"))
+}
+
+/// The `-c hooks.PreToolUse=[...]` override that blocks every tool outside the daemon's own MCP
+/// tools. Only exit code 2 plus stderr blocks a tool call; anything else (a missing interpreter,
+/// a parse error, a crash) fails open, hence shell builtins only and no interpreter. Codex runs a
+/// hook through the session's shell: `$SHELL -c` (or bash/zsh) on Unix, and PowerShell, never cmd,
+/// on Windows (`shell_detect::default_user_shell`, 0.144.4). Measured live: cmd syntax there was a
+/// PowerShell parse error, so the hook failed open and every tool ran.
+///
+/// KNOWN LIMITATION: Codex emits no init event, so the surviving tool set cannot be verified as
+/// the Claude path does. Measured live on 0.144.4: with the feature flags off, `apply_patch`,
+/// `view_image`, `update_plan`, `request_user_input`, the goal tools, the MCP resource tools and
+/// `multi_agent_v1__*` remain, and this hook blocks each of them, including when called from
+/// inside code mode (`functions.exec`). Code mode itself is not a hooked tool; it computes, and any
+/// I/O it attempts goes through a hooked tool.
+pub fn codex_deny_hook_override(prefix: &str) -> String {
+    fn json(value: &str) -> String {
+        serde_json::to_string(value).expect("serializing a string cannot fail")
+    }
+    let unix = format!("echo {CODEX_MCP_ONLY_DENIAL} >&2; exit 2");
+    let windows = format!("[Console]::Error.WriteLine('{CODEX_MCP_ONLY_DENIAL}'); exit 2");
+    format!(
+        "hooks.PreToolUse=[{{matcher={},hooks=[{{type=\"command\",command={},commandWindows={}}}]}}]",
+        json(&codex_deny_matcher(prefix)),
+        json(&unix),
+        json(&windows),
+    )
+}
+
 /// Translates the daemon's stdio MCP configuration into Codex overrides.
 /// `codex exec` runs with approval policy `never`, so Codex immediately declines an MCP tool call
 /// that needs confirmation ("user cancelled MCP tool call" on 0.144.4). `approve` pre-approves
@@ -3592,6 +3659,20 @@ pub fn codex_cli_args(
         args.push("--json".to_string());
     }
     args.push("--skip-git-repo-check".to_string());
+    if request.tool_policy == ToolPolicy::McpOnly {
+        // Codex has no allow-list flag, so everything but the daemon's own MCP tools is switched
+        // off one by one. `-c`, not `--disable`: `codex exec resume` lacks several exec flags.
+        args.push("--ignore-user-config".to_string());
+        args.push("--dangerously-bypass-hook-trust".to_string());
+        for feature in CODEX_MCP_ONLY_DISABLED_FEATURES {
+            args.push("-c".to_string());
+            args.push(format!("features.{feature}=false"));
+        }
+        args.push("-c".to_string());
+        args.push(r#"web_search="disabled""#.to_string());
+        args.push("-c".to_string());
+        args.push(codex_deny_hook_override(DAEMON_MCP_TOOL_PREFIX));
+    }
     for image in &staged.images {
         args.push("-i".to_string());
         args.push(image.to_string_lossy().into_owned());
@@ -3623,7 +3704,12 @@ pub fn codex_cli_args(
     }
     // Use `-c`, not `-s`, because `codex exec resume` has no `-s` flag.
     // It beats `sandbox_mode` in the user's `~/.codex/config.toml`, which exec's default does not.
-    if let Some(mode) = staged.sandbox_mode {
+    // An `McpOnly` turn pins read-only itself when the runner pins nothing, so a no-project chat
+    // never inherits the user's sandbox config.
+    let sandbox_mode = staged
+        .sandbox_mode
+        .or((request.tool_policy == ToolPolicy::McpOnly).then_some("read-only"));
+    if let Some(mode) = sandbox_mode {
         args.extend([
             "-c".to_string(),
             format!(
@@ -3712,7 +3798,8 @@ pub struct CodexCliRunner {
 
 impl CodexCliRunner {
     /// Builds the runner used for a chat turn answered by Codex (`Assistants::cli_runner`).
-    /// The owner's 2026-09-14 decision pins chat turns read-only.
+    /// The owner's 2026-09-14 decision pins chat turns read-only; an `McpOnly` turn is pinned
+    /// read-only by `codex_cli_args` too, whichever runner it goes through.
     /// KNOWN LIMITATION: a daemon whose primary runner is Codex uses its run runner through
     /// `assistant::runner_for_turn`, so it keeps the user's Codex config as before this branch.
     pub fn for_chat(model: String) -> Self {
@@ -3731,12 +3818,14 @@ impl CommandRunner for CodexCliRunner {
         session_tx: UnboundedSender<String>,
         transcript: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::io::Result<RunOutcome> {
-        // Refused before anything is sent, exactly as `OllamaRunner` refuses a policy it cannot
-        // apply. Barrier 1 of the tool model is the CLI's OWN refusal (see `ToolPolicy`), and
-        // `codex exec` has neither a flag that denies a tool nor an init event advertising which
-        // ones survived — so a run launched here under a restrictive policy would hold every tool
-        // while `runs.rs` recorded the restriction as applied.
-        if request.tool_policy != ToolPolicy::Unrestricted {
+        // `McpOnly` is applied by the flags and the deny hook `codex_cli_args` adds. `None` is
+        // refused before anything is sent, exactly as `OllamaRunner` refuses a policy it cannot
+        // apply: `codex exec` has no way to express "no tools at all" and no init event advertising
+        // which ones survived — so a run launched here under it would hold every tool while
+        // `runs.rs` recorded the restriction as applied.
+        if request.tool_policy != ToolPolicy::Unrestricted
+            && request.tool_policy != ToolPolicy::McpOnly
+        {
             return Err(std::io::Error::other(format!(
                 "codex exec cannot honour ToolPolicy::{:?}: it has no tool-restriction flag",
                 request.tool_policy
@@ -3768,8 +3857,9 @@ impl CommandRunner for CodexCliRunner {
         // MCP config is honoured through `codex_mcp_overrides`, which translates it into
         // `-c mcp_servers.<name>...` overrides.
         // The daemon's own servers are pre-approved (`default_tools_approval_mode = "approve"`).
-        // Servers in the user's `~/.codex/config.toml` still load with that file's approval because
-        // `codex exec` has no counterpart to the Claude CLI's `--strict-mcp-config`.
+        // Under `McpOnly` the user's servers no longer load (`--ignore-user-config`). Under
+        // `Unrestricted`, servers in the user's `~/.codex/config.toml` still load with that file's
+        // approval because `codex exec` has no counterpart to the Claude CLI's `--strict-mcp-config`.
         //
         // The barrier this used to stand down is `Permission::Bypass`'s to stand down now, and the
         // guard above refuses that. What is left here is a BELIEF and it is still worth refusing:
@@ -3780,7 +3870,7 @@ impl CommandRunner for CodexCliRunner {
         // block exists to refuse.
         if request.classifier_governs_tools {
             return Err(std::io::Error::other(
-                "codex exec cannot honour classifier_governs_tools: it has no PreToolUse hook, so nothing would do the governing the daemon believes is happening",
+                "codex exec cannot honour classifier_governs_tools: the daemon wires no classifier hook into codex, so nothing would do the governing the daemon believes is happening",
             ));
         }
         // Every per-conversation control this launch surface has no counterpart for, refused in
@@ -8633,7 +8723,9 @@ mod tests {
             sandbox_mode: None,
         };
 
-        for policy in [ToolPolicy::None, ToolPolicy::McpOnly] {
+        // `McpOnly` left this list: a Codex chat turn applies it with feature flags and a deny
+        // hook (`codex_cli_args`), so only the policy that cannot be expressed is still refused.
+        for policy in [ToolPolicy::None] {
             let mut request = baseline_run_request();
             request.tool_policy = policy;
             let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -8686,6 +8778,286 @@ mod tests {
         assert!(
             !stopped_later.contains("ToolPolicy"),
             "the tool policy must not be what stops an unrestricted run: {stopped_later}"
+        );
+
+        // The same control for `McpOnly`, which now passes the policy gate and is stopped one
+        // step later by the arg builder on `fork_session` (so no `codex` has to be spawned).
+        let mut mcp_only = baseline_run_request();
+        mcp_only.tool_policy = ToolPolicy::McpOnly;
+        mcp_only.fork_session = true;
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mcp_only_stopped_later = runner
+            .run_prompt(
+                mcp_only,
+                session_tx,
+                std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            )
+            .await
+            .expect_err("this control request is refused by the arg builder, not by the policy")
+            .to_string();
+
+        assert!(
+            mcp_only_stopped_later.contains("fork_session"),
+            "an McpOnly run must reach the arg builder: {mcp_only_stopped_later}"
+        );
+        assert!(
+            !mcp_only_stopped_later.contains("ToolPolicy"),
+            "the tool policy must not be what stops an McpOnly run: {mcp_only_stopped_later}"
+        );
+    }
+
+    /// The features an `McpOnly` Codex turn switches off, spelled as the `-c` override each one is.
+    fn mcp_only_feature_overrides() -> Vec<String> {
+        [
+            "shell_tool",
+            "browser_use",
+            "browser_use_external",
+            "in_app_browser",
+            "computer_use",
+            "image_generation",
+            "apps",
+            "plugins",
+            "tool_suggest",
+            "multi_agent",
+        ]
+        .iter()
+        .map(|feature| format!("features.{feature}=false"))
+        .collect()
+    }
+
+    /// An `McpOnly` Codex turn (a chat with no project) must leave the model nothing but the
+    /// daemon's own MCP tools. Codex has no allow-list flag, so every built-in is switched off one
+    /// by one with `-c` (not `--disable`, because `codex exec resume` lacks several exec flags), the
+    /// user's config is ignored, and a deny hook covers what has no feature flag. All of it sits
+    /// before the session id and the prompt, on both launch shapes.
+    #[test]
+    fn codex_mcp_only_args_disable_every_builtin_feature() {
+        let mut fresh_request = baseline_run_request();
+        fresh_request.tool_policy = ToolPolicy::McpOnly;
+        let mut resumed_request = baseline_run_request();
+        resumed_request.tool_policy = ToolPolicy::McpOnly;
+        resumed_request.resume_session_id =
+            Some("123e4567-e89b-42d3-a456-426614174002".to_string());
+
+        let fresh = codex_cli_args(&fresh_request, "gpt-5.5", &CodexStaged::default()).unwrap();
+        let resumed = codex_cli_args(&resumed_request, "gpt-5.5", &CodexStaged::default()).unwrap();
+
+        for args in [&fresh, &resumed] {
+            // Everything the hardening adds must precede the trailing session id and prompt.
+            let tail = if args.iter().any(|arg| arg == "resume") {
+                2
+            } else {
+                1
+            };
+            let flags = &args[..args.len() - tail];
+
+            for flag in ["--ignore-user-config", "--dangerously-bypass-hook-trust"] {
+                assert_eq!(
+                    flags.iter().filter(|arg| *arg == flag).count(),
+                    1,
+                    "{flag} must appear once, before the session id and prompt: {args:?}"
+                );
+            }
+            for feature in mcp_only_feature_overrides() {
+                assert!(
+                    flags
+                        .windows(2)
+                        .any(|pair| pair[0] == "-c" && pair[1] == feature),
+                    "{feature} must be switched off through -c: {args:?}"
+                );
+            }
+            assert!(
+                flags
+                    .windows(2)
+                    .any(|pair| pair[0] == "-c" && pair[1] == r#"web_search="disabled""#),
+                "web search must be disabled: {args:?}"
+            );
+            let hooks: Vec<&String> = flags
+                .windows(2)
+                .filter(|pair| pair[0] == "-c" && pair[1].starts_with("hooks.PreToolUse="))
+                .map(|pair| &pair[1])
+                .collect();
+            assert_eq!(hooks.len(), 1, "exactly one deny hook override: {args:?}");
+            let hook = hooks[0];
+            assert!(
+                hook.contains("matcher=") && hook.contains("commandWindows="),
+                "the hook carries a matcher, a Unix command and a Windows command: {hook}"
+            );
+            assert_eq!(
+                hook,
+                &codex_deny_hook_override(DAEMON_MCP_TOOL_PREFIX),
+                "the hook is the one the generator builds for the daemon's prefix"
+            );
+            assert_eq!(
+                args.last().map(String::as_str),
+                Some("test prompt"),
+                "the prompt stays the trailing positional: {args:?}"
+            );
+        }
+        assert_eq!(
+            &resumed[resumed.len() - 2..],
+            ["123e4567-e89b-42d3-a456-426614174002", "test prompt"],
+            "{resumed:?}"
+        );
+    }
+
+    /// The hardening is keyed on the policy and nothing else: an unrestricted turn (a run, or a
+    /// rooted chat) keeps exactly the argv it had before, and the constants the policy adds stay in
+    /// one place so a typo cannot hide in a test.
+    #[test]
+    fn codex_unrestricted_args_carry_no_mcp_only_hardening() {
+        let mut resumed_request = baseline_run_request();
+        resumed_request.resume_session_id =
+            Some("123e4567-e89b-42d3-a456-426614174003".to_string());
+        for request in [baseline_run_request(), resumed_request] {
+            assert_eq!(request.tool_policy, ToolPolicy::Unrestricted);
+            let args = codex_cli_args(&request, "gpt-5.5", &CodexStaged::default()).unwrap();
+            for forbidden in [
+                "--ignore-user-config",
+                "--dangerously-bypass-hook-trust",
+                "--disable",
+            ] {
+                assert!(
+                    !args.iter().any(|arg| arg == forbidden),
+                    "{forbidden} belongs to McpOnly only: {args:?}"
+                );
+            }
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("features.")
+                    || arg.starts_with("hooks.")
+                    || arg.starts_with("web_search")),
+                "no McpOnly override may reach an unrestricted launch: {args:?}"
+            );
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("sandbox_mode=")),
+                "an unrestricted launch pins no sandbox of its own: {args:?}"
+            );
+        }
+    }
+
+    /// The deny hook is a regex over tool names. Codex names an MCP tool `mcp__<server>__<tool>`, so
+    /// the matcher must hit everything that is not under the daemon's own prefix and miss every
+    /// daemon tool. It is built without lookahead, so it behaves the same under search and under
+    /// full-match semantics, which is why both are asserted here.
+    #[test]
+    fn codex_deny_matcher_denies_everything_but_the_daemons_tools() {
+        let matcher = codex_deny_matcher(DAEMON_MCP_TOOL_PREFIX);
+        let pattern = regex::Regex::new(&matcher).expect("the matcher must be a valid regex");
+        let full = regex::Regex::new(&format!("^(?:{matcher})$")).unwrap();
+
+        for denied in [
+            "Bash",
+            "apply_patch",
+            "view_image",
+            "update_plan",
+            "spawn_agent",
+            "list_mcp_resources",
+            "mcp__other__x",
+            "mcp__nucleo",
+            "mcp__nucleosX__y",
+        ] {
+            assert!(
+                pattern.is_match(denied),
+                "{denied} must be denied: {matcher}"
+            );
+            assert!(full.is_match(denied), "{denied} must be denied: {matcher}");
+        }
+        for allowed in [
+            "mcp__nucleos__send_to_chat",
+            "mcp__nucleos__anything_at_all",
+        ] {
+            assert!(
+                !pattern.is_match(allowed),
+                "{allowed} is the daemon's own tool and must pass: {matcher}"
+            );
+            assert!(
+                !full.is_match(allowed),
+                "{allowed} is the daemon's own tool and must pass: {matcher}"
+            );
+        }
+    }
+
+    /// A hook that cannot start fails OPEN (only exit code 2 blocks), so the commands are plain
+    /// `echo` + `exit 2` builtins with no interpreter, and the reason carries no character either
+    /// shell would read as syntax.
+    #[test]
+    fn codex_deny_hook_commands_are_shell_inert() {
+        let reason = CODEX_MCP_ONLY_DENIAL;
+        assert!(!reason.is_empty());
+        for metacharacter in [
+            '&', '|', ';', '<', '>', '`', '$', '"', '\'', '\\', '(', ')', '%', '^', '!', '\n',
+        ] {
+            assert!(
+                !reason.contains(metacharacter),
+                "the denial reason must not contain {metacharacter:?}: {reason}"
+            );
+        }
+
+        let hook = codex_deny_hook_override(DAEMON_MCP_TOOL_PREFIX);
+        assert!(hook.starts_with("hooks.PreToolUse=["), "{hook}");
+        let unix = serde_json::to_string(&format!("echo {reason} >&2; exit 2")).unwrap();
+        let windows =
+            serde_json::to_string(&format!("[Console]::Error.WriteLine('{reason}'); exit 2"))
+                .unwrap();
+        assert!(
+            hook.contains(&format!("command={unix}")),
+            "the Unix command must be `echo <reason> >&2; exit 2`: {hook}"
+        );
+        // Codex runs Windows hooks under PowerShell, not cmd: cmd syntax there is a parse error,
+        // which fails open.
+        assert!(
+            hook.contains(&format!("commandWindows={windows}")),
+            "the Windows command must be PowerShell `[Console]::Error.WriteLine('<reason>'); exit 2`: {hook}"
+        );
+        assert!(
+            hook.contains(r#"type="command""#),
+            "the hook is a command hook: {hook}"
+        );
+    }
+
+    /// `for_chat` pins read-only, but a daemon whose primary runner is Codex builds the runner
+    /// without a pinned sandbox, and a no-project chat must not inherit the user's config there.
+    /// So the policy itself pins it when the runner does not, and the runner's own pin still wins.
+    #[test]
+    fn codex_mcp_only_pins_read_only_when_the_runner_pins_nothing() {
+        let sandbox = r#"sandbox_mode="read-only""#;
+        let mut mcp_only = baseline_run_request();
+        mcp_only.tool_policy = ToolPolicy::McpOnly;
+        let mut resumed = baseline_run_request();
+        resumed.tool_policy = ToolPolicy::McpOnly;
+        resumed.resume_session_id = Some("123e4567-e89b-42d3-a456-426614174004".to_string());
+
+        for request in [&mcp_only, &resumed] {
+            let args = codex_cli_args(request, "gpt-5.5", &CodexStaged::default()).unwrap();
+            assert_eq!(
+                args.windows(2)
+                    .filter(|pair| pair[0] == "-c" && pair[1] == sandbox)
+                    .count(),
+                1,
+                "McpOnly pins read-only even with an unpinned runner: {args:?}"
+            );
+
+            let pinned = CodexStaged {
+                sandbox_mode: Some("read-only"),
+                ..CodexStaged::default()
+            };
+            let args = codex_cli_args(request, "gpt-5.5", &pinned).unwrap();
+            assert_eq!(
+                args.windows(2)
+                    .filter(|pair| pair[0] == "-c" && pair[1] == sandbox)
+                    .count(),
+                1,
+                "a runner that already pins read-only must not double it: {args:?}"
+            );
+        }
+
+        let unrestricted =
+            codex_cli_args(&baseline_run_request(), "gpt-5.5", &CodexStaged::default()).unwrap();
+        assert!(
+            !unrestricted
+                .iter()
+                .any(|arg| arg.starts_with("sandbox_mode=")),
+            "only McpOnly pins a sandbox on its own: {unrestricted:?}"
         );
     }
 

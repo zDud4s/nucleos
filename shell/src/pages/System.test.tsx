@@ -37,6 +37,7 @@ import type {
   VoiceConfig,
 } from "../data/system";
 import type { ScopedKill } from "../data/autopilot";
+import type { RouteReport } from "../data/route";
 import { daemonFetch, daemonState, project, renderWithRouter } from "../test/harness";
 
 /** The dwell `ConfirmButton` needs between arming and confirming — a fast `findBy*` resolves inside it. */
@@ -122,6 +123,8 @@ interface SystemWorld {
   calendarConfig: CalendarConfig;
   machine: MachineConfig;
   secrets: MachineSecret[];
+  /** What `/route/report` answers; `undefined` is an older daemon's 404. */
+  routeReport?: RouteReport;
 }
 
 /**
@@ -360,6 +363,9 @@ function systemFetch(
         return world.machine;
       case "/config/secrets":
         return { secrets: world.secrets };
+      case "/route/report?days=30":
+        if (world.routeReport === undefined) throw new ApiRefusal(404, "not_found", "no such route");
+        return world.routeReport;
       default:
         return await shared(path, init);
     }
@@ -625,6 +631,77 @@ describe("System - health readout", () => {
     );
 
     expect(await within(list).findByText(/nothing is supervising it/)).toBeDefined();
+  });
+});
+
+/* ---------------------------------------------------------------- router -- */
+
+describe("System - router report", () => {
+  const report: RouteReport = {
+    days: 30,
+    runs: 12,
+    shadow: 10,
+    apply: 2,
+    advised: 10,
+    shadow_advised: 8,
+    matched: 6,
+    pairs: [
+      {
+        runner: "claude", model: "sonnet", effort: "high",
+        advised_runner: "claude", advised_model: "haiku", advised_effort: "low",
+        runs: 4, passed: 3, failed: 1,
+      },
+    ],
+  };
+
+  /** The value printed under a label of the totals list. */
+  function totalOf(label: string): string | null {
+    return screen.getByText(label).parentElement?.querySelector("dd")?.textContent ?? null;
+  }
+
+  it("renders the report's totals as label-above-value pairs and its pairs table", async () => {
+    daemon.apiFetch.mockImplementation(systemFetch(systemWorld({ routeReport: report })));
+
+    await renderSystem();
+
+    expect(await screen.findByRole("heading", { name: "Router (last 30 days)" })).toBeTruthy();
+    expect(totalOf("Routed runs")).toBe("12");
+    expect(totalOf("Match rate")).toBe("75%");
+    expect(screen.getByText("claude · sonnet · high → claude · haiku · low")).toBeTruthy();
+  });
+
+  it("names the router's modes so they are not mistaken for a run's shadow mode, raw words kept", async () => {
+    daemon.apiFetch.mockImplementation(systemFetch(systemWorld({ routeReport: report })));
+
+    await renderSystem();
+
+    await screen.findByRole("heading", { name: "Router (last 30 days)" });
+    expect(totalOf("Advice only (shadow)")).toBe("10");
+    expect(totalOf("Advice applied (apply)")).toBe("2");
+    expect(totalOf("With advice")).toBe("10");
+  });
+
+  it("renders nothing when no run was routed", async () => {
+    daemon.apiFetch.mockImplementation(
+      systemFetch(systemWorld({ routeReport: { ...report, runs: 0, pairs: [] } })),
+    );
+
+    await renderSystem();
+
+    await screen.findByRole("list", { name: "Subsystems" });
+    await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/route/report?days=30"));
+    expect(screen.queryByText(/Router \(last/)).toBeNull();
+  });
+
+  it("an older daemon's 404 shows no panel and no error", async () => {
+    daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
+
+    await renderSystem();
+
+    await screen.findByRole("list", { name: "Subsystems" });
+    await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/route/report?days=30"));
+    expect(screen.queryByText(/Router \(last/)).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });
 

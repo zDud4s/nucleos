@@ -457,23 +457,29 @@ describe("ConfirmButton", () => {
         .getByRole("button", { name: /Delete series|Really delete/ })
         .querySelectorAll(".ui-confirm-stack > *");
 
+    // Three cells: the rest label (which holds the label and nothing else — the visible "hold"
+    // hint was dropped), the armed label, and the always-hidden "Keep holding…" cell.
     const atRest = labels();
-    expect(atRest).toHaveLength(2);
+    expect(atRest).toHaveLength(3);
+    expect(atRest[0].className).toBe("ui-confirm-rest");
     expect(atRest[0].textContent).toBe("Delete series");
     expect(atRest[0].getAttribute("aria-hidden")).toBeNull();
     expect(atRest[1].textContent).toBe("Really delete");
     expect(atRest[1].getAttribute("aria-hidden")).toBe("true");
+    expect(atRest[2].getAttribute("aria-hidden")).toBe("true");
+    expect(document.querySelector(".ui-confirm-hint")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
 
     // Neither label ever leaves the DOM — that IS the width. All that moves is which of the
     // two is hidden.
     const armed = labels();
-    expect(armed).toHaveLength(2);
+    expect(armed).toHaveLength(3);
     expect(armed[0].textContent).toBe("Delete series");
     expect(armed[0].getAttribute("aria-hidden")).toBe("true");
     expect(armed[1].textContent).toBe("Really delete");
     expect(armed[1].getAttribute("aria-hidden")).toBeNull();
+    expect(armed[2].getAttribute("aria-hidden")).toBe("true");
   });
 
   /**
