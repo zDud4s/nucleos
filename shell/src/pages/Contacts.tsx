@@ -1,4 +1,5 @@
 // §spec correspondent-contacts
+import { useId, useState, type KeyboardEvent, type ReactNode } from "react";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   mergeVerdictsConflict,
@@ -20,7 +21,6 @@ import {
   ErrorNote,
   PageHeader,
   Panel,
-  Quiet,
   RefusalNote,
   RelativeTime,
   Row,
@@ -49,10 +49,13 @@ import "./contacts.css";
 function headline(rows: Correspondent[] | undefined): string | undefined {
   if (rows === undefined) return undefined;
   if (rows.length === 0) return "no one has written in yet";
-  const merged = mergedContactIds(rows).size;
+  const shared = mergedContactIds(rows);
   const noun = rows.length === 1 ? "address" : "addresses";
   const first = `${rows.length} ${noun}`;
-  return merged === 0 ? first : `${first}, ${merged} sharing an identity with another`;
+  // Count addresses and not contacts: the number sits beside the address total, and
+  // "2 sharing" next to "7 addresses" read as two addresses when it was two people.
+  const sharing = rows.filter((row) => shared.has(row.contact_id)).length;
+  return sharing === 0 ? first : `${first}, ${sharing} belonging to someone with another address`;
 }
 
 export function Contacts() {
@@ -69,9 +72,9 @@ export function Contacts() {
 
       {rows !== undefined && rows.length === 0 ? (
         <Section label="People">
-          <Quiet says="no one has written in yet">
-            <p>Every address that has sent or received mail lands here, one row per address.</p>
-          </Quiet>
+          <QuietLine says="no one has written in yet">
+            Every address that has sent or received mail lands here, one row per address.
+          </QuietLine>
         </Section>
       ) : (
         <Panel title="People" aside={<Count n={rows?.length} />}>
@@ -101,6 +104,39 @@ function RosterError({ error }: { error: unknown }) {
   return <ErrorNote>the núcleo did not answer — nothing is known about the roster</ErrorNote>;
 }
 
+/**
+ * A run of text whose reasoning is drawn as a tip under it on hover or focus.
+ * No "why?" button and no paragraph unfolding beside it — the owner's call
+ * (2026-10-09). The tip stays in the document as the text's description, so a
+ * screen reader still hears it. Escape drops focus, which is how a keyboard
+ * user dismisses it.
+ */
+function Tip({ says, children }: { says: ReactNode; children: ReactNode }) {
+  const tipId = useId();
+  const dismiss = (event: KeyboardEvent<HTMLSpanElement>) => {
+    if (event.key === "Escape") event.currentTarget.blur();
+  };
+  return (
+    <span className="contacts-quiet-says" tabIndex={0} aria-describedby={tipId} onKeyDown={dismiss}>
+      {says}
+      <span className="contacts-quiet-tip" role="tooltip" id={tipId}>
+        <span className="contacts-quiet-tip-box">{children}</span>
+      </span>
+    </span>
+  );
+}
+
+/** An empty section's one line, with its reasoning in a {@link Tip}. */
+function QuietLine({ says, children }: { says: string; children: ReactNode }) {
+  return (
+    <div className="ui-quiet">
+      <p>
+        <Tip says={says}>{children}</Tip>
+      </p>
+    </div>
+  );
+}
+
 /* -------------------------------------------------------- identity questions -- */
 
 /**
@@ -120,22 +156,27 @@ function IdentityQuestions({ view }: { view: ReturnType<typeof useContactMerges>
   if (view.data !== undefined && rows.length === 0) {
     return (
       <Section label="Identity questions">
-        <Quiet says="nothing looks like the same person">
-          <p>
-            The heuristic sweeps the roster on its own; an empty list is it finding no match, not a
-            sign anything here is stuck.
-          </p>
-        </Quiet>
+        <QuietLine says="nothing looks like the same person">
+          The heuristic sweeps the roster on its own; an empty list is it finding no match, not a
+          sign anything here is stuck.
+        </QuietLine>
       </Section>
+    );
+  }
+
+  if (view.data === undefined && !view.isError) {
+    return (
+      <Panel title="Identity questions" aside={<Count n={undefined} />}>
+        <p className="contacts-loading">reading the suggestions…</p>
+      </Panel>
     );
   }
 
   return (
     <Panel title="Identity questions" aside={<Count n={view.data?.length} />}>
       <p className="contacts-note">
-        Two records that look like one person. Saying yes moves a pointer, undoable one address at a
-        time from the roster below. Saying no is recorded too — permanently: the pair is refused in
-        the same transaction as the answer, so this exact question is never asked again.
+        Two records that may be one person. Yes merges them — undo it per address in People below.
+        No is permanent: this pair is never suggested again.
       </p>
       {view.isError && rows.length === 0 && <MergesError error={view.error} />}
       {rows.length > 0 && (
@@ -162,10 +203,14 @@ function IdentityQuestion({
   suggestion: MergeSuggestion;
   decide: ReturnType<typeof useDecideContactMerge>;
 }) {
+  const conflict = mergeVerdictsConflict(suggestion);
+  const noteId = useId();
   return (
     <Row className="contacts-question">
       <div className="contacts-question-head">
-        <span className="contacts-question-id">question #{suggestion.proposal_id}</span>
+        <span className="contacts-question-who">
+          {sideName(suggestion.keep)} ↔ {sideName(suggestion.absorb)}
+        </span>
         <RelativeTime at={suggestion.created_at} />
       </div>
       <p className="contacts-reasoning">{suggestion.reasoning}</p>
@@ -173,19 +218,22 @@ function IdentityQuestion({
         <MergeSideView side={suggestion.keep} role="kept" />
         <MergeSideView side={suggestion.absorb} role="absorbed" />
       </div>
-      {mergeVerdictsConflict(suggestion) && (
-        <ConflictNote>
-          These two carry standing decisions that disagree, so approving will be refused — settle one
-          of them and decide this again.
-        </ConflictNote>
+      {conflict && (
+        <div id={noteId}>
+          <ConflictNote>
+            These two carry standing decisions that disagree, so approving will be refused — settle one
+            of them and decide this again.
+          </ConflictNote>
+        </div>
       )}
-      <p className="contacts-permanent">Refusing below is permanent — this exact pair is never suggested again.</p>
       <div className="contacts-actions">
         <ConfirmButton
           label="Yes, one person"
           confirmLabel="They are one person"
           variant="approve"
           disabled={decide.isPending}
+          unavailable={conflict}
+          describedBy={conflict ? noteId : undefined}
           onConfirm={() => decide.mutate({ proposalId: suggestion.proposal_id, verdict: "approve" })}
         />
         <ConfirmButton
@@ -198,6 +246,11 @@ function IdentityQuestion({
       </div>
     </Row>
   );
+}
+
+/** What a side is called in a question's head: its display name, else its first address. */
+function sideName(side: MergeSide): string {
+  return side.display_name ?? side.addresses[0] ?? "no name recorded";
 }
 
 /**
@@ -223,7 +276,7 @@ function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
             <li key={address}>{address}</li>
           ))}
         </ul>
-        <p className="contacts-meta">{side.messages_in} messages in</p>
+        <p className="contacts-meta">{side.messages_in} message{side.messages_in === 1 ? "" : "s"} in</p>
       </div>
     </Section>
   );
@@ -262,7 +315,7 @@ function DecisionNotes({ outcome, error }: { outcome: ApprovalOutcome | undefine
     <>
       {outcome !== undefined && (
         <p className="contacts-outcome" role="status">
-          {outcome.merged === true ? "the two are one person now" : "recorded"}
+          {outcome.merged === true ? "the two are one person now" : "refused — this pair won't be suggested again"}
         </p>
       )}
       {error !== null && <IdentityRefusal error={error} />}
@@ -278,17 +331,54 @@ function IdentityRefusal({ error }: { error: unknown }) {
 
 /* --------------------------------------------------------------- roster -- */
 
+/** A mutation that failed on one card: whose address, and the note that says why. */
+type Problem = { address: string; node: ReactNode };
+
+/**
+ * Tells the roster a card's mutation failed (`node`) or went through (`null`).
+ * The note is drawn once above the grid, never inside the card, so a refusal
+ * cannot grow one card and break the equal heights.
+ */
+type ReportProblem = (address: string, node: ReactNode | null) => void;
+
+/** Rows with the addresses of one contact side by side, each contact where it first appears. */
+function groupByContact(rows: Correspondent[]): Correspondent[] {
+  const groups = new Map<number, Correspondent[]>();
+  for (const row of rows) {
+    const group = groups.get(row.contact_id);
+    if (group === undefined) groups.set(row.contact_id, [row]);
+    else group.push(row);
+  }
+  return [...groups.values()].flat();
+}
+
 function PeopleRoster({ rows }: { rows: Correspondent[] }) {
-  const merged = mergedContactIds(rows);
+  const [problem, setProblem] = useState<Problem | null>(null);
+  const report: ReportProblem = (address, node) => setProblem(node === null ? null : { address, node });
+  const ordered = groupByContact(rows);
   // A grid of profile cards, one per address — the owner's call (2026-10-02):
   // the roster is browsed for people, not scanned down like the mail queue.
   // Each card is the inset rank, the one card a Panel is allowed to hold.
   return (
-    <ul className="contacts-cards" aria-label="People">
-      {rows.map((row) => (
-        <PersonCard key={row.address} row={row} merged={merged.has(row.contact_id)} />
-      ))}
-    </ul>
+    <>
+      {problem !== null && (
+        <div role="status" className="contacts-problem">
+          {problem.address} — {problem.node}
+        </div>
+      )}
+      <ul className="contacts-cards" aria-label="People">
+        {ordered.map((row) => (
+          <PersonCard
+            key={row.address}
+            row={row}
+            sameAs={ordered
+              .filter((other) => other.contact_id === row.contact_id && other.address !== row.address)
+              .map((other) => other.address)}
+            onProblem={report}
+          />
+        ))}
+      </ul>
+    </>
   );
 }
 
@@ -300,7 +390,17 @@ function initials(row: Correspondent): string {
   return row.address.slice(0, 1).toUpperCase();
 }
 
-function PersonCard({ row, merged }: { row: Correspondent; merged: boolean }) {
+function PersonCard({
+  row,
+  sameAs,
+  onProblem,
+}: {
+  row: Correspondent;
+  /** The other addresses of this contact — empty unless the row is merged. */
+  sameAs: string[];
+  onProblem: ReportProblem;
+}) {
+  const merged = sameAs.length > 0;
   return (
     <li className="ui-panel-inset contacts-card">
       <div className="contacts-card-head">
@@ -308,27 +408,37 @@ function PersonCard({ row, merged }: { row: Correspondent; merged: boolean }) {
           {initials(row)}
         </span>
         <div className="contacts-card-who">
-          <span className="contacts-card-name">{row.display_name ?? "no name recorded"}</span>
+          <span className="contacts-card-name" title={row.display_name ?? undefined}>
+            {row.display_name ?? "no name recorded"}
+          </span>
           <span className="contacts-card-address">{row.address}</span>
         </div>
       </div>
       {/* §6.13's badges, every one derived from this one row — there is no
           daemon-side rollup to read any of them off instead. */}
-      {(row.verdict !== null || row.outbound_ever === 1 || merged) && (
+      {/* The unmerge rides beside the badges, not in the action row: an extra
+          control there wrapped to a second line and lifted that card's Pin
+          above every other card's (owner's call, 2026-10-09). */}
+      {(row.verdict !== null || row.outbound_ever === 1 || merged || row.linked_by === "human") && (
         <div className="contacts-card-badges">
           {row.verdict === "pin" && <Badge tone="pending">urgent</Badge>}
           {row.verdict === "mute" && <Badge tone="off">noise</Badge>}
           {row.outbound_ever === 1 && <Badge tone="info">you write back</Badge>}
-          {merged && <Badge tone="shadow">merged</Badge>}
+          {merged && (
+            <Badge tone="shadow">
+              <Tip says="merged">same person as {sameAs.join(", ")}</Tip>
+            </Badge>
+          )}
+          <UnmergeButton address={row.address} linkedBy={row.linked_by} onProblem={onProblem} />
         </div>
       )}
       <p className="contacts-meta">
-        {row.messages_in} messages in · last <RelativeTime at={row.last_seen} /> · first seen{" "}
+        {row.messages_in} message{row.messages_in === 1 ? "" : "s"} in · last seen{" "}
+        <RelativeTime at={row.last_seen} /> · first seen{" "}
         <RelativeTime at={row.first_seen} />
       </p>
       <div className="contacts-card-actions">
-        <SenderVerdictToggles address={row.address} verdict={row.verdict} />
-        <UnmergeButton address={row.address} linkedBy={row.linked_by} />
+        <SenderVerdictToggles address={row.address} verdict={row.verdict} onProblem={onProblem} />
       </div>
     </li>
   );
@@ -336,27 +446,37 @@ function PersonCard({ row, merged }: { row: Correspondent; merged: boolean }) {
 
 /* -------------------------------------------------------- sender verdict -- */
 
-function SenderVerdictToggles({ address, verdict }: { address: string; verdict: string | null }) {
+function SenderVerdictToggles({
+  address,
+  verdict,
+  onProblem,
+}: {
+  address: string;
+  verdict: string | null;
+  onProblem: ReportProblem;
+}) {
   const mutate = useSenderVerdict();
+  const send = (next: "pin" | "mute" | null) =>
+    mutate.mutate(
+      { address, verdict: next },
+      {
+        onSuccess: () => onProblem(address, null),
+        onError: (error) => onProblem(address, <VerdictError error={error} />),
+      },
+    );
+  // `aria-pressed` and not a variant swap: a button that changes weight when pressed
+  // changes the card's metrics, and the "urgent" / "noise" badge already says it.
   return (
     <div className="contacts-actions">
-      <Button
-        variant={verdict === "pin" ? "approve" : "ghost"}
-        disabled={mutate.isPending}
-        onClick={() => mutate.mutate({ address, verdict: "pin" })}
-      >
+      <Button variant="ghost" aria-pressed={verdict === "pin"} disabled={mutate.isPending} onClick={() => send("pin")}>
         Pin
       </Button>
-      <Button disabled={mutate.isPending} onClick={() => mutate.mutate({ address, verdict: "mute" })}>
+      <Button aria-pressed={verdict === "mute"} disabled={mutate.isPending} onClick={() => send("mute")}>
         Mute
       </Button>
-      <Button
-        disabled={mutate.isPending || verdict === null}
-        onClick={() => mutate.mutate({ address, verdict: null })}
-      >
+      <Button disabled={mutate.isPending || verdict === null} onClick={() => send(null)}>
         Clear
       </Button>
-      {mutate.isError && <VerdictError error={mutate.error} />}
     </div>
   );
 }
@@ -380,20 +500,32 @@ function VerdictError({ error }: { error: unknown }) {
  * trusting the door to refuse it, is what stops a person from pulling apart a
  * connection nobody actually decided.
  */
-function UnmergeButton({ address, linkedBy }: { address: string; linkedBy: string }) {
+function UnmergeButton({
+  address,
+  linkedBy,
+  onProblem,
+}: {
+  address: string;
+  linkedBy: string;
+  onProblem: ReportProblem;
+}) {
   const unmerge = useUnmerge();
   if (linkedBy !== "human") return null;
 
   return (
-    <div className="contacts-actions">
+    <div className="contacts-actions contacts-unmerge">
       <ConfirmButton
         label="Not the same person"
         confirmLabel="Pull this address back apart"
         variant="quiet"
         disabled={unmerge.isPending}
-        onConfirm={() => unmerge.mutate(address)}
+        onConfirm={() =>
+          unmerge.mutate(address, {
+            onSuccess: () => onProblem(address, null),
+            onError: (error) => onProblem(address, <UnmergeError error={error} />),
+          })
+        }
       />
-      {unmerge.isError && <UnmergeError error={unmerge.error} />}
     </div>
   );
 }
