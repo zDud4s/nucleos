@@ -1,4 +1,5 @@
 import { useId, useState, type ReactNode } from "react";
+import { Check, FolderRoot } from "lucide-react";
 import { Button, Modal } from "../ui";
 import { useHome, useProjects } from "../data/system";
 
@@ -50,11 +51,14 @@ export function ProjectPicker({
     (project): project is typeof project & { project_root: string } =>
       project.project_root !== null,
   );
-  const choices: Choice[] = rooted.map((project) => ({
-    key: `project:${project.project_id}`,
-    label: project.project_id,
-    path: project.project_root,
-  }));
+  // By name, ignoring case: the roster's own order put every lower-case name after every capital.
+  const choices: Choice[] = rooted
+    .map((project) => ({
+      key: `project:${project.project_id}`,
+      label: project.project_id,
+      path: project.project_root,
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
   // Whatever the daemon says and nothing else: until it has, Root is not offered a path.
   const root = home.data?.root ?? null;
   const picked =
@@ -102,38 +106,100 @@ export function ProjectPicker({
             no project on the roster has a folder yet — add one on the Projects page
           </p>
         )}
-        {choices.map((choice) => (
-          <label key={choice.key} className="chats-picker-row">
-            <input
-              type="radio"
-              name={group}
-              checked={chosen === choice.key}
-              onChange={() => setChosen(choice.key)}
-            />
-            <span className="chats-picker-name">{choice.label}</span>
-            <span className="chats-picker-path">{choice.path}</span>
-          </label>
-        ))}
         {projects.data !== undefined && (
-          <label className="chats-picker-row">
-            <input
-              type="radio"
-              name={group}
-              checked={chosen === "root"}
-              disabled={root === null}
-              onChange={() => setChosen("root")}
-            />
-            <span className="chats-picker-name">Root</span>
-            <span className="chats-picker-path">
-              {root ??
-                (home.isPending
-                  ? "reading where NucleOS lives…"
-                  : "the núcleo did not say where it lives")}
-            </span>
-          </label>
+          /* First, and set apart: it is not a project but the folder NucleOS itself runs from. */
+          <PickerRow
+            group={group}
+            checked={chosen === "root"}
+            disabled={root === null}
+            onPick={() => setChosen("root")}
+            onUse={() => {
+              if (root !== null && !pending) onChoose(root);
+            }}
+            name="Root"
+            icon
+            path={
+              root ??
+              (home.isPending
+                ? "reading where NucleOS lives…"
+                : "the núcleo did not say where it lives")
+            }
+          />
         )}
+        {choices.length > 0 && <div className="chats-picker-rule" aria-hidden="true" />}
+        {choices.map((choice) => (
+          <PickerRow
+            key={choice.key}
+            group={group}
+            checked={chosen === choice.key}
+            onPick={() => setChosen(choice.key)}
+            onUse={() => {
+              if (!pending) onChoose(choice.path);
+            }}
+            name={choice.label}
+            path={choice.path}
+          />
+        ))}
       </div>
       {refusal}
     </Modal>
+  );
+}
+
+/**
+ * A path as this machine writes it. The roster stores some with forward slashes and some with
+ * back, and a list that mixes the two reads as two kinds of thing. Display only: what is chosen is
+ * the path exactly as the daemon sent it.
+ */
+export function displayPath(path: string): string {
+  return /^[A-Za-z]:[\\/]/.test(path) ? path.replace(/\//g, "\\") : path;
+}
+
+/**
+ * One choice: a real radio, hidden but focusable, inside a row that is the target. A double click
+ * chooses and confirms at once, which is what a list of places is usually asked for twice over.
+ */
+function PickerRow({
+  group,
+  checked,
+  disabled = false,
+  onPick,
+  onUse,
+  name,
+  path,
+  icon = false,
+}: {
+  group: string;
+  checked: boolean;
+  disabled?: boolean;
+  onPick: () => void;
+  onUse: () => void;
+  name: string;
+  path: string;
+  icon?: boolean;
+}) {
+  return (
+    <label
+      className="chats-picker-row"
+      data-disabled={disabled ? "" : undefined}
+      onDoubleClick={disabled ? undefined : onUse}
+    >
+      <input
+        type="radio"
+        className="sr-only"
+        name={group}
+        checked={checked}
+        disabled={disabled}
+        onChange={onPick}
+      />
+      {icon && <FolderRoot className="chats-picker-icon" aria-hidden="true" />}
+      <span className="chats-picker-text">
+        <span className="chats-picker-name">{name}</span>
+        <span className="chats-picker-path" title={path}>
+          {displayPath(path)}
+        </span>
+      </span>
+      <Check className="chats-picker-check" aria-hidden="true" />
+    </label>
   );
 }

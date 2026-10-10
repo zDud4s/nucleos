@@ -12,7 +12,8 @@ import { NotchWindow } from "../app/NotchWindow";
 import { windowKind } from "../app/notch-mode";
 import { createAppRouter } from "../router";
 import { adoptStyleNonce } from "../lib/style-nonce";
-import { NOW, answer, answerText, refusal } from "./daemon";
+import { CHAT_HELD_ID, NOW, answer, answerText, refusal } from "./daemon";
+import { holdMessage } from "../chats/held";
 
 /**
  * The page the screenshot harness loads.
@@ -32,6 +33,9 @@ import { NOW, answer, answerText, refusal } from "./daemon";
 
 /* Exactly what the app's entry does, first thing, for the same reason. */
 adoptStyleNonce();
+
+/* The held message lives in memory only, so the preview says it here: see `CHAT_HELD_ID`. */
+holdMessage(CHAT_HELD_ID, { text: "yo", images: [] });
 
 /**
  * The clock, moved to where the fixtures live.

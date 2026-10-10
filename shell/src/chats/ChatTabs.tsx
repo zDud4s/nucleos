@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { Link } from "@tanstack/react-router";
 import { X } from "lucide-react";
 import type { ChatSummary } from "../data/chats";
@@ -29,11 +30,29 @@ export function ChatTabs({
   onOpenChat: () => void;
   onClose: (id: string) => void;
 }) {
+  const strip = useRef<HTMLDivElement | null>(null);
+  // The open conversation's tab is brought into view, or opening one from the list could leave it
+  // selected somewhere past the strip's edge.
+  useEffect(() => {
+    const tab = strip.current?.querySelector<HTMLElement>(".chats-tab-active");
+    tab?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [current, tabs.length]);
   if (tabs.length === 0) return null;
   const byId = new Map(rows.map((row) => [row.chat_id, row]));
 
   return (
-    <div className="chats-tabs" role="tablist" aria-label="Open conversations">
+    <div
+      ref={strip}
+      className="chats-tabs"
+      role="tablist"
+      aria-label="Open conversations"
+      /* The strip draws no scrollbar, so a mouse wheel — which only scrolls up and down — is turned
+         sideways here, or tabs past the edge could only be reached by a trackpad. */
+      onWheel={(event) => {
+        if (event.deltaY === 0 || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+        event.currentTarget.scrollLeft += event.deltaY;
+      }}
+    >
       {tabs.map((id) => {
         const row = byId.get(id);
         const active = id === current;
@@ -54,8 +73,8 @@ export function ChatTabs({
               className="chats-tab-link"
               onClick={onOpenChat}
             >
-              {/* The same colour as this chat's row in the column, so tab and row correspond. */}
-              <StateDot dot={lit === undefined ? null : dotFor(lit, true)} chatId={id} />
+              {/* The same state mark as this chat's row in the column. */}
+              <StateDot dot={lit === undefined ? null : dotFor(lit, true)} />
               <span className="chats-tab-title">{name}</span>
             </Link>
             <button

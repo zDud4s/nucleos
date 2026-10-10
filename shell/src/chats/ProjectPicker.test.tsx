@@ -17,7 +17,7 @@ vi.mock("../data/system", () => ({
   }),
 }));
 
-import { ProjectPicker } from "./ProjectPicker";
+import { ProjectPicker, displayPath } from "./ProjectPicker";
 
 describe("ProjectPicker", () => {
   function draw(onChoose = vi.fn()) {
@@ -44,8 +44,8 @@ describe("ProjectPicker", () => {
 
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getAllByRole("radio")).toHaveLength(3);
-    // Root is the folder the daemon runs in, shown as it said it.
-    expect(within(dialog).getAllByText("C:/Projects/nucleos")).toHaveLength(2);
+    // Root is the folder the daemon runs in, written the way this machine writes paths.
+    expect(within(dialog).getAllByText(String.raw`C:\Projects\nucleos`)).toHaveLength(2);
     expect(within(dialog).queryByText("unpromoted")).toBeNull();
     expect(within(dialog).queryByRole("textbox")).toBeNull();
     expect(within(dialog).getByText(/your message is held/i)).toBeTruthy();
@@ -79,5 +79,13 @@ describe("ProjectPicker", () => {
     draw();
 
     expect((screen.getByRole("radio", { name: /root/i }) as HTMLInputElement).disabled).toBe(true);
+  });
+});
+
+describe("displayPath", () => {
+  it("writes a drive path with one kind of slash, and leaves anything else alone", () => {
+    expect(displayPath("C:/Projects/nucleos")).toBe(String.raw`C:\Projects\nucleos`);
+    expect(displayPath(String.raw`C:\Projects/a/b`)).toBe(String.raw`C:\Projects\a\b`);
+    expect(displayPath("/home/me/project")).toBe("/home/me/project");
   });
 });

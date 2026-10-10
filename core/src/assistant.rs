@@ -197,6 +197,35 @@ async fn stop_turn_within(
     }
 }
 
+/// What became of a request to stop one agent of a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoppedTask {
+    /// The running process was asked to stop it; the CLI reports the task ended on its stream.
+    Asked,
+    /// No turn of the conversation is running, so there is no process listening to ask.
+    NotRunning,
+}
+
+/// Asks the conversation's running process to stop ONE task — a subagent or a background shell —
+/// by the CLI's own `task_id`, leaving the turn and every other task to carry on.
+///
+/// Only while a turn runs: that is when the process reads its stdin. A task outliving its turn
+/// cannot be reached this way, and the answer says so rather than pretending.
+pub fn stop_task(chat_id: &str, task_id: &str) -> StoppedTask {
+    let asked = steer(
+        chat_id,
+        crate::runner::LaterTurn {
+            stop_task: Some(task_id.to_owned()),
+            ..Default::default()
+        },
+    );
+    if asked {
+        StoppedTask::Asked
+    } else {
+        StoppedTask::NotRunning
+    }
+}
+
 /// What became of text said NOW, into a turn that was running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaidNow {
@@ -282,6 +311,7 @@ pub async fn say_now_from(
                 text: text.to_owned(),
                 images: Vec::new(),
                 interrupt: false,
+                stop_task: None,
             },
         );
         if delivered {
@@ -604,6 +634,7 @@ impl LiveChat {
             text: text.to_owned(),
             images: images.to_vec(),
             interrupt: false,
+            stop_task: None,
         };
         if self.messages.send(said).is_err() {
             return LiveTurn::NotWritten;
@@ -9036,6 +9067,22 @@ mod tests {
             "the kill path stops the process"
         );
         LIVE_CHATS.lock().unwrap().remove(&chat);
+    }
+
+    /// Stop agent writes one stop of that task into the running process, never an interrupt, and
+    /// says so when there is no running process to write it into.
+    #[test]
+    fn stopping_one_task_asks_the_running_process_and_nothing_else() {
+        let chat = "stop-task-chat";
+        assert_eq!(stop_task(chat, "b84qqcytz"), StoppedTask::NotRunning);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::runner::LaterTurn>();
+        let _guard = SteerGuard::open(chat, &tx);
+        assert_eq!(stop_task(chat, "b84qqcytz"), StoppedTask::Asked);
+        let written = rx.try_recv().expect("the stop was written");
+        assert_eq!(written.stop_task.as_deref(), Some("b84qqcytz"));
+        assert!(!written.interrupt, "the turn itself goes on");
+        assert!(written.text.is_empty());
     }
 
     /// A turn with no process of its own to talk to is cancelled exactly as it always was.

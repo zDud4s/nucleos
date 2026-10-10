@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft } from "lucide-react";
-import { useLiveTurn, useChatTasks, type ChatTask } from "../data/chats";
+import { useLiveTurn, useChatTasks, useStopTask, useTurnTools, type ChatTask } from "../data/chats";
 import { turnIsLive, type ToolCall, type Turn } from "../lib/turns";
 import { displayName } from "../lib/modelName";
 import { Modal } from "../ui/Modal";
+import { Button } from "../ui/Button";
 import { cacheState, leftText } from "./cache";
 
 /** A Task or Agent call is a subagent; nothing else spawns a child conversation. */
@@ -21,6 +21,8 @@ export interface AgentCard {
   task?: ChatTask;
   /** Calls this subagent made itself: those whose `parent` is its id. */
   calls: ToolCall[];
+  /** The turn it ran under, whose tool results `useTurnTools` reads for the transcript. */
+  turnId?: number;
 }
 
 export interface AgentGroups {
@@ -57,7 +59,7 @@ export function groupAgents(turns: Turn[] | undefined, tasks?: ChatTask[]): Agen
           (c) => c.parent !== undefined && c.parent !== null && c.parent === call.id,
         );
         const working = task !== undefined ? task.status === "running" : live && !call.finished_at;
-        subagents.push({ key, kind: "subagent", call: shown, working, task, calls });
+        subagents.push({ key, kind: "subagent", call: shown, working, task, calls, turnId: turn.id });
       } else {
         // Only a live turn's word is current: a settled turn's row was saved when the turn ended,
         // and a task still running then stays "running" in it forever.
@@ -65,7 +67,7 @@ export function groupAgents(turns: Turn[] | undefined, tasks?: ChatTask[]): Agen
           task !== undefined
             ? task.status === "running"
             : live && (call.status !== undefined ? call.status === "running" : !call.finished_at);
-        background.push({ key, kind: "background", call: shown, working, task, calls: [] });
+        background.push({ key, kind: "background", call: shown, working, task, calls: [], turnId: turn.id });
       }
     });
   }
@@ -89,6 +91,7 @@ export function groupAgents(turns: Turn[] | undefined, tasks?: ChatTask[]): Agen
       call,
       working: t.status === "running",
       calls: [],
+      turnId: t.launched_by_run_id,
       task: t,
     };
     (card.kind === "subagent" ? subagents : background).push(card);
@@ -128,8 +131,15 @@ function statusLabel(card: AgentCard): string {
   return card.working ? "working" : "finished";
 }
 
-function Dot({ working }: { working: boolean }) {
-  return <span className={working ? "agent-dot agent-dot-on" : "agent-dot"} aria-hidden="true" />;
+function Dot({ working, failed = false }: { working: boolean; failed?: boolean }) {
+  const className = working ? "agent-dot agent-dot-on" : failed ? "agent-dot agent-dot-failed" : "agent-dot";
+  return <span className={className} aria-hidden="true" />;
+}
+
+/** Ended badly: a task row that says so, or a background call that does. */
+function failedCard(card: AgentCard): boolean {
+  const status = statusLabel(card);
+  return status === "failed" || status === "killed" || status === "orphaned";
 }
 
 function Card({ card, now, onOpen }: { card: AgentCard; now: number; onOpen: () => void }) {
@@ -139,6 +149,11 @@ function Card({ card, now, onOpen }: { card: AgentCard; now: number; onOpen: () 
   else if (duration) meta.push(duration);
   const used = spent(card);
   if (used != null) meta.push(`${tokens(used)} tokens`);
+  // How much it did, at a glance; what it did is one click away.
+  if (card.kind === "subagent" && card.calls.length > 0)
+    meta.push(`${card.calls.length} tool call${card.calls.length === 1 ? "" : "s"}`);
+  const failed = failedCard(card);
+  if (failed) meta.push(statusLabel(card));
   return (
     <button
       type="button"
@@ -147,7 +162,7 @@ function Card({ card, now, onOpen }: { card: AgentCard; now: number; onOpen: () 
       aria-label={`${titleOf(card)} — ${statusLabel(card)}`}
     >
       <span className="agent-card-title">
-        <Dot working={card.working} />
+        <Dot working={card.working} failed={failed} />
         <span className="agent-card-text">{titleOf(card)}</span>
       </span>
       {meta.length > 0 && <span className="agent-card-meta">{meta.join(" · ")}</span>}
@@ -155,10 +170,36 @@ function Card({ card, now, onOpen }: { card: AgentCard; now: number; onOpen: () 
   );
 }
 
-function Detail({ card, now, onBack }: { card: AgentCard; now: number; onBack: () => void }) {
+/** "working" → "Working": the status opens the facts line, so it is said as its first word. */
+const capital = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
+
+/** What it is doing right now: its newest call still open, else its newest call. */
+function doingNow(card: AgentCard): ToolCall | undefined {
+  const open = [...card.calls].reverse().find((c) => c.finished_at === undefined);
+  return open ?? card.calls[card.calls.length - 1];
+}
+
+/**
+ * One agent, in a dialog of its own over the map — the map stays where it was underneath, so
+ * closing this is going back to it. What it is, how long and how much, what it is doing now, what
+ * it answered, and its calls; the whole run, call by call, is one more dialog away.
+ */
+function AgentDetail({
+  card,
+  now,
+  chatId,
+  onClose,
+}: {
+  card: AgentCard;
+  now: number;
+  /** Absent where the map is drawn outside a conversation, and Stop agent with it. */
+  chatId?: string;
+  onClose: () => void;
+}) {
+  const [transcript, setTranscript] = useState(false);
   const duration = cardDuration(card.call, card.working, now);
   const facts = [
-    statusLabel(card),
+    capital(statusLabel(card)),
     card.call.subagent_type ?? (card.kind === "background" ? "shell" : null),
     card.call.model ? displayName(card.call.model) : null,
   ].filter((x): x is string => x !== null);
@@ -167,31 +208,178 @@ function Detail({ card, now, onBack }: { card: AgentCard; now: number; onBack: (
     (x): x is string => x !== null,
   );
   const answer = card.task?.summary ?? card.call.result ?? null;
+  const doing = card.working ? doingNow(card) : undefined;
   return (
-    <div className="agent-detail">
-      <button type="button" className="agent-back" onClick={onBack} aria-label="Back to the map">
-        <ArrowLeft aria-hidden="true" />
-      </button>
-      <h3 className="agent-detail-title">{titleOf(card)}</h3>
-      <p className="agent-detail-facts">{facts.join(" · ")}</p>
-      <p className="agent-detail-facts">{timing.length > 0 ? timing.join(" · ") : "no timing recorded"}</p>
-      {answer !== null && answer !== "" && (
-        <p className="agent-detail-facts" aria-label="Final answer">
-          {answer}
+    <>
+      <Modal
+        open
+        onOpenChange={(open) => {
+          if (!open) onClose();
+        }}
+        title={titleOf(card)}
+        size="sm"
+        footer={
+          <>
+            <Button type="button" onClick={() => setTranscript(true)}>
+              Open transcript
+            </Button>
+            {chatId !== undefined && <StopAgent chatId={chatId} card={card} />}
+          </>
+        }
+      >
+        <div className="agent-detail">
+          <p className="agent-detail-facts agent-detail-state">
+            <Dot working={card.working} failed={failedCard(card)} />
+            {facts.join(" · ")}
+          </p>
+          <p className="agent-detail-facts">
+            {card.kind === "subagent" ? "Spawned by the main agent" : "A background shell task"}
+          </p>
+          <p className="agent-detail-facts">
+            {timing.length > 0 ? timing.join(" · ") : "no timing recorded"}
+          </p>
+          {doing !== undefined && (
+            <p className="agent-detail-doing">
+              Running <span className="agent-detail-doing-what">{doing.detail ?? doing.name}</span>
+            </p>
+          )}
+          {answer !== null && answer !== "" && (
+            <details className="agent-section" open={!card.working}>
+              <summary>Result</summary>
+              <p className="agent-section-text" aria-label="Final answer">
+                {answer}
+              </p>
+            </details>
+          )}
+          {card.kind === "subagent" && (
+            <details className="agent-section">
+              <summary>{`Tool calls (${card.calls.length})`}</summary>
+              <ul className="agent-calls" aria-label="Its tool calls">
+                {card.calls.length === 0 && <li className="agent-calls-none">No tool calls recorded.</li>}
+                {card.calls.map((c, i) => (
+                  <li key={`${c.id ?? c.name}-${i}`}>
+                    <span className="agent-calls-name">{c.name}</span>
+                    {c.detail !== null && <span className="agent-calls-detail">{c.detail}</span>}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+      </Modal>
+      {transcript && <AgentTranscript card={card} onClose={() => setTranscript(false)} />}
+    </>
+  );
+}
+
+/**
+ * Stops this one agent, and nothing else: the turn goes on, told it stopped. Offered only while it
+ * works and the CLI has named its task — the name is what the stop is addressed to.
+ */
+function StopAgent({ chatId, card }: { chatId: string; card: AgentCard }) {
+  const stop = useStopTask(chatId);
+  const taskId = card.call.task_id ?? card.task?.task_id ?? undefined;
+  if (!card.working) return null;
+  return (
+    <>
+      <Button
+        type="button"
+        variant="danger"
+        disabled={taskId === undefined || stop.isPending || stop.isSuccess}
+        title={
+          taskId === undefined
+            ? "the CLI has not named this task yet, so it cannot be stopped on its own"
+            : "stop this agent; the turn and the other agents go on"
+        }
+        onClick={() => {
+          if (taskId !== undefined) stop.mutate(taskId);
+        }}
+      >
+        {stop.isSuccess ? "Stopping…" : "Stop agent"}
+      </Button>
+      {stop.isError && (
+        <p className="agent-stop-error" role="status">
+          the turn is no longer running, so nothing was there to stop it
         </p>
       )}
-      {card.kind === "subagent" && (
-        <ul className="agent-calls" aria-label="Its tool calls">
-          {card.calls.length === 0 && <li className="agent-calls-none">No tool calls recorded.</li>}
-          {card.calls.map((c, i) => (
-            <li key={`${c.id ?? c.name}-${i}`}>
-              <span className="agent-calls-name">{c.name}</span>
-              {c.detail !== null && <span className="agent-calls-detail">{c.detail}</span>}
+    </>
+  );
+}
+
+/**
+ * The whole run of one agent, call by call, the way Claude Code shows a subagent: each call named,
+ * what went IN and what came OUT. The results are not on the transcript poll (see `ToolCall.result`),
+ * so they are read here, once, from the turn's own tool record.
+ */
+function AgentTranscript({ card, onClose }: { card: AgentCard; onClose: () => void }) {
+  const tools = useTurnTools(card.turnId ?? 0, card.turnId !== undefined);
+  const full = new Map<string, ToolCall>();
+  for (const c of tools.data?.did ?? []) if (c.id !== undefined) full.set(c.id, c);
+  const steps = card.kind === "subagent" ? card.calls : [card.call];
+  const own = card.call.id !== undefined ? full.get(card.call.id) : undefined;
+  const answer = card.task?.summary ?? own?.result ?? card.call.result ?? null;
+  return (
+    <Modal
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+      title={titleOf(card)}
+      size="lg"
+    >
+      <ol className="agent-transcript" aria-label="Transcript">
+        {steps.length === 0 && <li className="agent-calls-none">No tool calls recorded.</li>}
+        {steps.map((step, i) => {
+          const c = (step.id !== undefined ? full.get(step.id) : undefined) ?? step;
+          const running = c.finished_at === undefined && card.working;
+          const failed = c.result_failed === true || c.status === "failed";
+          const dot = running
+            ? "agent-step-dot agent-step-dot-on"
+            : failed
+              ? "agent-step-dot agent-step-dot-failed"
+              : "agent-step-dot";
+          const out =
+            c.result != null && c.result !== ""
+              ? c.result
+              : running
+                ? "running…"
+                : tools.isPending && card.turnId !== undefined
+                  ? "reading…"
+                  : "no output recorded";
+          return (
+            <li key={`${c.id ?? c.name}-${i}`} className="agent-step">
+              <span className={dot} aria-hidden="true" />
+              <p className="agent-step-name">{c.name}</p>
+              <div className="agent-io">
+                {c.detail !== null && (
+                  <div className="agent-io-row">
+                    <span className="agent-io-tag">IN</span>
+                    <pre className="agent-io-text">{c.detail}</pre>
+                  </div>
+                )}
+                <div className="agent-io-row">
+                  <span className="agent-io-tag">OUT</span>
+                  <pre className={failed ? "agent-io-text agent-io-failed" : "agent-io-text"}>{out}</pre>
+                </div>
+              </div>
             </li>
-          ))}
-        </ul>
-      )}
-    </div>
+          );
+        })}
+        {answer !== null && answer !== "" && (
+          <li className="agent-step">
+            <span className="agent-step-dot" aria-hidden="true" />
+            <p className="agent-step-name">Answer</p>
+            <p className="agent-step-answer">{answer}</p>
+          </li>
+        )}
+        {card.working && (
+          <li className="agent-step">
+            <span className="agent-step-dot agent-step-dot-on" aria-hidden="true" />
+            <p className="agent-step-name agent-step-live">Working…</p>
+          </li>
+        )}
+      </ol>
+    </Modal>
   );
 }
 
@@ -201,25 +389,33 @@ export function AgentMapBody({
   tasks,
   chatTitle,
   now,
+  chatId,
 }: {
   turns: Turn[];
   tasks?: ChatTask[];
   chatTitle: string;
   now: number;
+  /** The conversation, for Stop agent; absent, the detail offers no stop. */
+  chatId?: string;
 }) {
   const groups = useMemo(() => groupAgents(turns, tasks), [turns, tasks]);
   const [picked, setPicked] = useState<string | null>(null);
   const all = [...groups.subagents, ...groups.background];
   const card = picked === null ? undefined : all.find((c) => c.key === picked);
-  if (card !== undefined) return <Detail card={card} now={now} onBack={() => setPicked(null)} />;
 
   const last = turns[turns.length - 1];
+  // The orchestrator's tokens, said the way its subagents' are: what its context holds, from the
+  // newest turn that reported it — a running turn has not yet, and the one before it still holds.
+  const filled = [...turns].reverse().find((t) => t.contextFill != null)?.contextFill ?? null;
   const rootMeta = [
     last?.model ? displayName(last.model) : null,
-    last?.contextFill != null ? `${tokens(last.contextFill)} context` : null,
+    filled !== null ? `${tokens(filled)} tokens` : "tokens not reported yet",
   ].filter((x): x is string => x !== null);
   return (
     <div className="agent-map">
+      {card !== undefined && (
+        <AgentDetail card={card} now={now} chatId={chatId} onClose={() => setPicked(null)} />
+      )}
       <div className="agent-tree">
         <div className="agent-root">
           <span className="agent-card agent-card-root">
@@ -304,6 +500,7 @@ export function ChatChips({
   const cacheTitle =
     "Prompt cache: while it is warm, the next message re-reads the conversation at a fraction of the cost. " +
     "It runs from the end of the last turn, and every turn refreshes it." +
+    (cache?.kind === "refreshing" ? " A turn is running now, so it is being refreshed." : "") +
     (cache?.approx ? " The daemon did not say which lifetime applies, so 5 minutes is assumed." : "");
   const shown = groups.running > 0 ? groups.running : groups.total;
   return (
@@ -311,8 +508,8 @@ export function ChatChips({
       {cache !== null && (
         <span className={cache.kind === "cold" ? "chats-chip chats-chip-muted" : "chats-chip"} title={cacheTitle}>
           <span aria-hidden="true">⏱</span>{" "}
-          {cache.kind === "cold" ? "cold" : `${cache.approx ? "~" : ""}${leftText(cache.ms)}`}
-          {cache.kind === "refreshing" && <span className="chats-chip-note"> refreshing</span>}
+          {/* Only the time: the rest of the sentence — refreshing, assumed lifetime — is on the title. */}
+          {cache.kind === "cold" ? "cold" : leftText(cache.ms)}
         </span>
       )}
       {groups.total > 0 && (
@@ -327,7 +524,7 @@ export function ChatChips({
       )}
       {open && (
         <Modal open onOpenChange={setOpen} title="Agent map" size="md">
-          <AgentMapBody turns={merged} tasks={tasks.data} chatTitle={chatTitle} now={now} />
+          <AgentMapBody turns={merged} tasks={tasks.data} chatTitle={chatTitle} now={now} chatId={chatId} />
         </Modal>
       )}
     </>

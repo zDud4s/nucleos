@@ -74,6 +74,8 @@ export interface ToolCall {
   tokens?: number;
   /** State of a background task. */
   status?: "running" | "completed" | "failed" | "killed";
+  /** The CLI's id for this call's task: what Stop agent names (`/tasks/{task_id}/stop`). */
+  task_id?: string;
 }
 
 /** One line of a plan, as the daemon read it out of a `TodoWrite`. */

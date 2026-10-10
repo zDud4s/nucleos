@@ -708,6 +708,11 @@ pub fn build_router(state: AppState) -> Router {
         // The work this conversation's turns launched, including what outlived them. Control/Admin
         // like every chat route: no `auth.rs` entry.
         .route("/assistant/chats/{chat_id}/tasks", get(get_chat_tasks))
+        // Stop agent: one subagent or background shell, by the CLI's task id. See `assistant::stop_task`.
+        .route(
+            "/assistant/chats/{chat_id}/tasks/{task_id}/stop",
+            post(post_stop_task),
+        )
         // The act that turns a conversation with a directory into one with tools. The same thing
         // `wire_ide_session_tools` does before a pick-up, reached from the other side.
         .route("/assistant/chats/{chat_id}/tools", post(wire_chat_tools))
@@ -11099,6 +11104,7 @@ async fn post_run_message(
             text: body.message,
             images: Vec::new(),
             interrupt: false,
+            stop_task: None,
         })
         .map_err(|_| StatusCode::CONFLICT)?;
     Ok(StatusCode::ACCEPTED)
@@ -12043,6 +12049,28 @@ async fn post_stop_turn(
         }
         crate::assistant::Stopped::Killed => Ok(Json(serde_json::json!({ "stopped": "killed" }))),
         crate::assistant::Stopped::NotRunning => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// Stops one agent of a running conversation. 404 when no turn of it is running to ask.
+async fn post_stop_task(
+    Path((chat_id, task_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // The CLI's ids are short and plain; anything else is not one of them, and is not written into
+    // the process's stdin.
+    if task_id.is_empty()
+        || task_id.len() > 128
+        || !task_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(refusal(StatusCode::BAD_REQUEST, "task_id"));
+    }
+    match crate::assistant::stop_task(&chat_id, &task_id) {
+        crate::assistant::StoppedTask::Asked => Ok(Json(serde_json::json!({ "stopped": "asked" }))),
+        crate::assistant::StoppedTask::NotRunning => {
+            Err(refusal(StatusCode::NOT_FOUND, "not_running"))
+        }
     }
 }
 
