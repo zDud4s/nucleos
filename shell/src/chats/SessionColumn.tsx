@@ -1,11 +1,10 @@
-import { useState, type CSSProperties, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import {
   Archive,
   ArchiveRestore,
   ListFilter,
   MoreHorizontal,
-  PanelRightClose,
   Plus,
   Search,
   SquareCode,
@@ -38,13 +37,12 @@ import {
   type ChatSummary,
   type IdeSession,
 } from "../data/chats";
-import { ErrorNote, IconButton, RelativeTime, Teach, relativeText } from "../ui";
+import { ErrorNote, RelativeTime, Teach, relativeText } from "../ui";
 import { stillGoing } from "../lib/editor";
 import { BAND_TITLE, inBands } from "../lib/when";
 import {
   applyFilters,
   byGroup,
-  chatHue,
   countSessions,
   dotFor,
   type Dot,
@@ -122,16 +120,40 @@ function rowLabel(row: ChatSummary, live: boolean): string {
 }
 
 /**
- * The conversation's mark. Given `chatId`, it is filled with that chat's own colour (`chatHue`),
- * the same on its row and on its tab, so the two can be matched at a glance; the state, when there
- * is one, is then a ring around it. Never the accent: see `reserved-cyan.test.ts`.
+ * The conversation's mark: its state, in that state's tone, and nothing else. It used to be filled
+ * with a colour of the chat's own, hashed from its id, with the state as a thin ring around it —
+ * which made the list a rainbow whose colours meant nothing and hid the one that did. The colour
+ * now appears only when there is something to see. Never the accent: see `reserved-cyan.test.ts`.
  */
-export function StateDot({ dot, chatId }: { dot: Dot | null; chatId?: string }) {
-  const own = chatId !== undefined;
-  const className = `chats-dot chats-dot-${dot ?? "none"}${own ? " chats-dot-chat" : ""}`;
-  const style = own ? ({ "--chat-hue": chatHue(chatId) } as CSSProperties) : undefined;
-  if (dot === null) return <span className={className} style={style} aria-hidden="true" />;
-  return <span className={className} style={style} role="img" aria-label={DOT_NAME[dot]} />;
+export function StateDot({ dot }: { dot: Dot | null }) {
+  const className = `chats-dot chats-dot-${dot ?? "none"}`;
+  if (dot === null) return <span className={className} aria-hidden="true" />;
+  return <span className={className} role="img" aria-label={DOT_NAME[dot]} />;
+}
+
+const SHOW_EDITOR_KEY = "chats.showEditor";
+
+/**
+ * Whether the editor's own sessions are listed, remembered per window. On unless turned off: they
+ * were always listed, and a list that shrank on its own would read as sessions gone missing.
+ */
+function useShowEditorSessions(): [boolean, (next: boolean) => void] {
+  const [show, setShow] = useState(() => {
+    try {
+      return window.localStorage.getItem(SHOW_EDITOR_KEY) !== "false";
+    } catch {
+      return true;
+    }
+  });
+  const put = (next: boolean) => {
+    setShow(next);
+    try {
+      window.localStorage.setItem(SHOW_EDITOR_KEY, String(next));
+    } catch {
+      // A full or blocked store costs the choice its persistence, never the list.
+    }
+  };
+  return [show, put];
 }
 
 export interface SessionColumnProps {
@@ -144,12 +166,8 @@ export interface SessionColumnProps {
   onPickUp: (sessionId: string) => void;
   /** Told before a `<Link>` navigates, so the editor preview does not outlive the press. */
   onOpenChat: () => void;
+  /** Opens an empty conversation: the front door. */
   onNew: () => void;
-  /**
-   * Folds the column away. Optional, because the column does not own whether it is shown: the page
-   * does, and draws the way back at the start of its tabs strip.
-   */
-  onHide?: () => void;
   openTabs: string[];
 }
 
@@ -162,7 +180,6 @@ export function SessionColumn({
   onPickUp,
   onOpenChat,
   onNew,
-  onHide,
   openTabs,
 }: SessionColumnProps) {
   // Watched, because one of these may be being typed into in the editor while it is on screen here.
@@ -176,6 +193,7 @@ export function SessionColumn({
   const [query, setQuery] = useState("");
   const [naming, setNaming] = useState(false);
   const [newName, setNewName] = useState("");
+  const [showEditor, setShowEditor] = useShowEditorSessions();
 
   // The open conversation is running before the list has been told; trust the transcript.
   const live = (row: ChatSummary) =>
@@ -192,10 +210,11 @@ export function SessionColumn({
   const split = byGroup(shown, groups);
 
   const needle = query.trim().toLowerCase();
+  const fromEditor = sessions.data ?? [];
   const editors: IdeSession[] =
-    statuses.size > 0 || tabStates.size > 0
+    !showEditor || statuses.size > 0 || tabStates.size > 0
       ? []
-      : (sessions.data ?? []).filter(
+      : fromEditor.filter(
           (session) =>
             needle === "" ||
             (session.title ?? session.session_id).toLowerCase().includes(needle),
@@ -246,6 +265,7 @@ export function SessionColumn({
 
   return (
     <>
+      {/* At the head of the list they add to, and folded away with it. */}
       <div className="chats-rail-actions">
         {/* Opens an empty chat, and asks nothing: the model is a control in the box, answerable
             while you type the first sentence and changeable after it. */}
@@ -262,10 +282,6 @@ export function SessionColumn({
           <Plus className="chats-rail-icon" aria-hidden="true" />
           New group
         </button>
-        {/* At the column's inner edge, beside the conversation it gives the width back to. */}
-        {onHide !== undefined && (
-          <IconButton label="Hide conversations" icon={PanelRightClose} onClick={onHide} />
-        )}
       </div>
 
       <div className="chats-session-tools">
@@ -273,7 +289,7 @@ export function SessionColumn({
           <DropdownMenuTrigger
             className="chats-session-filter"
             aria-label="Filter sessions"
-            data-on={statuses.size + tabStates.size > 0 ? "" : undefined}
+            data-on={statuses.size + tabStates.size > 0 || !showEditor ? "" : undefined}
           >
             <ListFilter className="chats-rail-icon" aria-hidden="true" />
           </DropdownMenuTrigger>
@@ -312,6 +328,17 @@ export function SessionColumn({
                 {`${label} (${n})`}
               </DropdownMenuCheckboxItem>
             ))}
+            <DropdownMenuSeparator />
+            {/* Sessions the editor started and NucleOS has not picked up. Once picked up one is a
+                conversation here like any other, so it stays whatever this says. */}
+            <DropdownMenuLabel>Source</DropdownMenuLabel>
+            <DropdownMenuCheckboxItem
+              checked={showEditor}
+              onCheckedChange={() => setShowEditor(!showEditor)}
+              onSelect={(event) => event.preventDefault()}
+            >
+              {`From the editor (${mergeRows(rows, fromEditor).filter((row) => row.kind === "editor").length})`}
+            </DropdownMenuCheckboxItem>
           </DropdownMenuContent>
         </DropdownMenu>
 
@@ -508,7 +535,7 @@ function ArchivedSection() {
         <ul className="chats-list" aria-label="Archived sessions">
           {list.map((chat) => (
             <li key={chat.chat_id} className="chats-row chats-session-archived">
-              <StateDot dot={null} chatId={chat.chat_id} />
+              <StateDot dot={null} />
               <span className="chats-row-title">{sessionTitle(chat)}</span>
               <button
                 type="button"
@@ -564,7 +591,7 @@ function SessionRow({
            to work too — that is the case an effect watching the id would sleep through. */
         onClick={onOpen}
       >
-        <StateDot dot={dot} chatId={row.chat_id} />
+        <StateDot dot={dot} />
         <span className={said ?"chats-row-title" : "chats-row-title chats-row-unsaid"}>
           {name}
         </span>

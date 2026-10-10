@@ -1,3 +1,4 @@
+import type { ChatSummary } from "../data/chats";
 import type { DeclarableGitOp, DeclarableOp, Landing, ShellRule } from "../data/project-policy";
 import type { ProjectRepo, ReadOutcome } from "../data/project-github";
 import type { TestsMapView } from "../data/project-tests-map";
@@ -1961,7 +1962,7 @@ const SPECS: string[] = [
  */
 const CHAT_ID = "c-preview";
 
-export const CHATS = [
+export const CHATS: ChatSummary[] = [
   {
     chat_id: CHAT_ID,
     title: "the permission rungs",
@@ -1982,6 +1983,186 @@ export const CHATS = [
     first_message: "o que muda entre os cinco degraus?",
     last_activity: "2026-08-24T09:05:00Z",
     waiting: 0,
+  },
+];
+
+/*
+  Two more conversations, for the states a person can only otherwise see by causing them: one with a
+  turn still running and two subagents under it (the Stop in the box, Kill beside it, and the agent
+  map behind the "2 agents" chip), and one with no project yet and a message held (the held strip,
+  and the project picker, which opens by itself). `preview/main.tsx` holds the message.
+*/
+export const CHAT_RUNNING_ID = "c-preview-running";
+export const CHAT_HELD_ID = "c-preview-held";
+
+CHATS.push(
+  {
+    ...CHATS[0],
+    chat_id: CHAT_RUNNING_ID,
+    title: "rever a página dos chats",
+    first_message: "põe agentes a rever a página dos chats antes do PR",
+    last_activity: "2026-08-24T09:20:00Z",
+    working: true,
+    activity: "working",
+  },
+  {
+    ...CHATS[0],
+    chat_id: CHAT_HELD_ID,
+    title: null,
+    cwd: null,
+    first_message: null,
+    last_activity: "2026-08-24T09:10:00Z",
+  },
+);
+
+/*
+  Five helpers and a shell task under one running turn, each in a different state, so the agent map
+  has something to show for every one: two still working with a call in flight, two finished, one
+  that failed, and a background `npm` run still going. Each subagent's own tool calls hang off it by
+  `parent`, the way the daemon sends them; the orchestrator's own calls have none.
+*/
+const T0 = Date.parse("2026-08-24T09:19:45Z");
+const at = (s: number) => new Date(T0 + s * 1000).toISOString();
+
+function toolCall(
+  id: string,
+  name: string,
+  detail: string,
+  from: number,
+  to: number | null,
+  more: Record<string, unknown> = {},
+) {
+  return {
+    name,
+    detail,
+    todos: [],
+    id,
+    parent: null as string | null,
+    started_at: at(from),
+    ...(to === null ? {} : { finished_at: at(to) }),
+    ...more,
+  };
+}
+
+function helper(id: string, detail: string, type: string, from: number, to: number | null, tokens: number) {
+  return toolCall(id, "Agent", detail, from, to, {
+    subagent_type: type,
+    model: "claude-sonnet-5-5",
+    tokens,
+    task_id: `t${id.slice(-2)}`,
+  });
+}
+
+function inside(parent: string, calls: ReturnType<typeof toolCall>[]) {
+  return calls.map((c) => ({ ...c, parent }));
+}
+
+const RUNNING_DID = [
+  toolCall("toolu_o1", "Read", "core/src/runner.rs", 1, 2),
+  toolCall("toolu_o2", "Grep", "fn stop_turn", 2, 3),
+  helper("toolu_a1", "Mapear o runner do daemon", "Explore", 4, 41, 31_400),
+  ...inside("toolu_a1", [
+    toolCall("toolu_a1_1", "Glob", "core/src/**/*.rs", 5, 6),
+    toolCall("toolu_a1_2", "Grep", "spawn_turn", 6, 8),
+    toolCall("toolu_a1_3", "Read", "core/src/runner.rs", 8, 12),
+    toolCall("toolu_a1_4", "Read", "core/src/turns.rs", 12, 15),
+    toolCall("toolu_a1_5", "Read", "core/src/live.rs", 15, 19),
+  ]),
+  helper("toolu_a2", "Rever os testes do shell", "general-purpose", 5, null, 48_900),
+  ...inside("toolu_a2", [
+    toolCall("toolu_a2_1", "Glob", "shell/src/**/*.test.tsx", 6, 7),
+    toolCall("toolu_a2_2", "Read", "shell/src/pages/Chats.test.tsx", 7, 14),
+    toolCall("toolu_a2_3", "Grep", "stopping a turn", 14, 15),
+    toolCall("toolu_a2_4", "Bash", "npx vitest run src/pages/Chats.test.tsx", 16, null, { status: "running" }),
+  ]),
+  helper("toolu_a3", "Procurar regressões no CSS", "Explore", 6, null, 19_200),
+  ...inside("toolu_a3", [
+    toolCall("toolu_a3_1", "Grep", ".chats-topbar", 7, 8),
+    toolCall("toolu_a3_2", "Read", "shell/src/pages/chats.css", 8, null),
+  ]),
+  helper("toolu_a4", "Escrever o resumo para o PR", "general-purpose", 8, 30, 12_600),
+  ...inside("toolu_a4", [
+    toolCall("toolu_a4_1", "Bash", "git log --oneline -20", 9, 10),
+    toolCall("toolu_a4_2", "Bash", "git diff --stat master", 10, 12),
+    toolCall("toolu_a4_3", "Write", ".ai/local/pr-body.md", 25, 29),
+  ]),
+  helper("toolu_a5", "Medir o tempo de arranque", "general-purpose", 9, 22, 8_300),
+  ...inside("toolu_a5", [
+    toolCall("toolu_a5_1", "Bash", "scripts/run-daemon.ps1 -NoStart", 10, 21, {
+      result: "error: failed to remove file nucleos-core.exe (os error 5)",
+      result_failed: true,
+    }),
+  ]),
+  toolCall("toolu_b1", "Bash", "npm run build --prefix shell", 20, null, { background: true, status: "running" }),
+];
+
+/* What each call answered. Only on the turn's own tool record, never on the transcript poll —
+   the same split the daemon makes (see `ToolCall.result`). */
+const RUNNING_RESULTS: Record<string, string> = {
+  toolu_o1: "pub async fn run_turn(state: &AppState, chat: &Chat, asked: &str) -> Result<Turn> {\n    let session = state.sessions.open(chat).await?;\n    …",
+  toolu_o2: "core/src/runner.rs:812:pub async fn stop_turn(state: &AppState, turn_id: i64) -> Result<()> {",
+  toolu_a1: "O runner abre um processo por conversa e reutiliza-o entre turnos.",
+  toolu_a1_1: "core/src/runner.rs\ncore/src/turns.rs\ncore/src/live.rs\ncore/src/http.rs\n… 212 more",
+  toolu_a1_2: "core/src/runner.rs:640:    let child = spawn_turn(&cmd, &env)?;\ncore/src/turns.rs:88:/// spawn_turn is the only door",
+  toolu_a1_3: "   640  let child = spawn_turn(&cmd, &env)?;\n   641  let mut stream = child.stdout.take().expect(\"piped\");\n   642  …",
+  toolu_a1_4: "    88  /// spawn_turn is the only door into a CLI process.\n    89  pub fn spawn_turn(…",
+  toolu_a1_5: "    12  pub struct LiveTurn {\n    13      pub text: String,\n    14      pub doing: Option<String>,",
+  toolu_a2_1: "shell/src/pages/Chats.test.tsx\nshell/src/chats/SessionColumn.test.tsx\nshell/src/chats/AgentMap.test.tsx\n… 61 more",
+  toolu_a2_2: "  4906  describe(\"stopping a turn\", () => {\n  4907    it(\"Stop interrupts the turn through the chat's own route\", …",
+  toolu_a2_3: "shell/src/pages/Chats.test.tsx:4906:describe(\"stopping a turn\", () => {",
+  toolu_a3_1: "shell/src/pages/chats.css:3746:.chats-topbar {\nshell/src/pages/chats.css:3771:.chats-topbar-side,",
+  toolu_a4: "Resumo escrito em .ai/local/pr-body.md.",
+  toolu_a4_1: "30d6e4ed merge fix/project-page-design into master\n198bc214 merge master into fix/project-page-design\n37fdfad6 fix(shell): group a Rust parent module…",
+  toolu_a4_2: " shell/src/chats/AgentMap.tsx    | 214 +++++++++++++++++------\n shell/src/pages/chats.css       | 388 ++++++++++++++++++++------\n 2 files changed, 471 insertions(+), 131 deletions(-)",
+  toolu_a4_3: "File created successfully at: .ai/local/pr-body.md",
+};
+
+/* What the daemon's task rows say about the same calls: the failed one is only known from here. */
+const RUNNING_TASKS = [
+  ["toolu_a1", "subagent", "Explore", "completed", 41, 31_400, "O runner abre um processo por conversa e reutiliza-o entre turnos."],
+  ["toolu_a2", "subagent", "general-purpose", "running", null, 48_900, null],
+  ["toolu_a3", "subagent", "Explore", "running", null, 19_200, null],
+  ["toolu_a4", "subagent", "general-purpose", "completed", 30, 12_600, "Resumo escrito em .ai/local/pr-body.md."],
+  ["toolu_a5", "subagent", "general-purpose", "failed", 22, 8_300, "O executável estava em uso pelo daemon."],
+  ["toolu_b1", "background_bash", null, "running", null, null, null],
+].map(([id, kind, type, status, to, tokens, summary], i) => ({
+  id: i + 1,
+  chat_id: "c-preview-running",
+  launched_by_run_id: 2,
+  tool_use_id: id,
+  task_id: null,
+  kind,
+  subagent_type: type,
+  model: kind === "subagent" ? "claude-sonnet-5-5" : null,
+  status,
+  started_at: at(4 + i),
+  finished_at: to === null ? null : at(to as number),
+  total_tokens: tokens,
+  cost_usd: null,
+  summary,
+}));
+
+export const CHAT_RUNNING_TURNS = [
+  {
+    id: 2,
+    asked: "põe agentes a rever a página dos chats antes do PR",
+    answer: null,
+    error: null,
+    status: "running",
+    cost_usd: null,
+    answered_by: "cloud",
+    session_id: "s-preview-running",
+    created_at: "2026-08-24T09:19:45Z",
+    did: RUNNING_DID,
+    images: [],
+    thought: [],
+    thought_tokens: null,
+    context_fill: 41_200,
+    context_window: 140000,
+    compacted: false,
+    relayed_from_chat_id: null,
+    relayed_from_title: null,
+    relayed_to: [],
   },
 ];
 
@@ -3181,6 +3362,33 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (splitQuery(path)[0] === `/assistant/chats/${CHAT_ID}`) {
     return { turns: CHAT_TURNS, more: false };
   }
+  if (path === `/assistant/chats/${CHAT_RUNNING_ID}/project`) {
+    return { cwd: "C:/Projects/nucleos", tools: true, session: "s-preview-running", permission_mode: "auto" };
+  }
+  if (splitQuery(path)[0] === `/assistant/chats/${CHAT_RUNNING_ID}`) {
+    return { turns: CHAT_RUNNING_TURNS, more: false };
+  }
+  if (path === `/assistant/chats/${CHAT_RUNNING_ID}/tasks`) return RUNNING_TASKS;
+  /* Stop agent: the daemon only asks the process, so the preview only says it asked. */
+  if (/^\/assistant\/chats\/[^/]+\/tasks\/[^/]+\/stop$/.test(path)) return { stopped: "asked" };
+  if (path === "/assistant/turns/2/tools") {
+    return {
+      did: RUNNING_DID.map((c) =>
+        "result" in c ? c : { ...c, result: RUNNING_RESULTS[c.id] ?? null },
+      ),
+    };
+  }
+  if (path === "/assistant/2/live") {
+    return { text: "", doing: null, did: CHAT_RUNNING_TURNS[0].did, thought: [], thought_tokens: null };
+  }
+  if (path === `/assistant/chats/${CHAT_HELD_ID}/project`) {
+    return { cwd: null, tools: false, session: null, permission_mode: "default" };
+  }
+  if (splitQuery(path)[0] === `/assistant/chats/${CHAT_HELD_ID}`) {
+    return { turns: [], more: false };
+  }
+  /* Where NucleOS itself lives: the project picker's Root row. */
+  if (path === "/home") return { root: "C:/Projects/nucleos" };
 
   {
     const [base, params] = splitQuery(path);

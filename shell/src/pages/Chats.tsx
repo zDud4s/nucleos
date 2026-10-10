@@ -30,9 +30,12 @@ import {
 import {
   ArrowUp,
   ChevronDown,
+  Clock,
+  FolderOpen,
   Mic,
   MicOff,
   MoreHorizontal,
+  PanelRightClose,
   PanelRightOpen,
   ChevronRight,
   FileMinus,
@@ -78,7 +81,6 @@ import {
   useSendMessage,
   useStartConversation,
   useStopTurn,
-  useKillTurn,
   useSayNow,
   type Attachment,
   type ChatSummary,
@@ -327,12 +329,57 @@ export function Chats() {
     /* The class that turns this route from a document into an application: see `.chats-app`, which
        stops the shell scrolling the whole page and hands the height to the two columns below. */
     <div className="chats-app">
-      {/* No header band. The page's top row is the tabs strip, and the conversation's own controls
-          ride at its end — so the heading the outline needs is said to a screen reader only. The
+      {/* No header band. The page's top row is the tabs bar, and the conversation's own controls
+          ride in it — so the heading the outline needs is said to a screen reader only. The
           subject is the conversation on screen when there is one, and "Chats" when there is not. */}
       <h1 className="sr-only">
         {open === null ? "Chats" : (open.title ?? "New conversation")}
       </h1>
+
+      {/* The page's top row, across both columns: the open conversations as tabs and, at the end,
+          the switch that folds the list away and brings it back. Nothing about ONE conversation is
+          here — that is the conversation's own head (`ConversationHead`). */}
+      <div className="chats-topbar">
+        <ChatTabs
+          tabs={tabs.tabs}
+          rows={rows}
+          current={pickingUp === null ? chatId : null}
+          selectedLive={selectedLive}
+          onOpenChat={openingAChat}
+          onClose={closeTab}
+        />
+        <div className="chats-topbar-side">
+          {railOpen ? (
+            <IconButton
+              label="Hide conversations"
+              icon={PanelRightClose}
+              onClick={() => setRailOpen(false)}
+            />
+          ) : (
+            /* Never only a shortcut: a closed list with no visible way to reopen it is a dead end. */
+            <span className="chats-topbar-show">
+              <IconButton
+                /* The count is in the name, because the badge beside the glyph is drawn for
+                   the eye only — "Show conversations" and "5" would otherwise read as one word. */
+                label={
+                  unseen > 0
+                    ? `Show conversations, ${unseen} unseen`
+                    : "Show conversations"
+                }
+                icon={PanelRightOpen}
+                onClick={() => setRailOpen(true)}
+              />
+              {/* Answers that landed while you were elsewhere. Shown here precisely because the
+                  list they are in is closed. */}
+              {unseen > 0 && (
+                <span className="chats-unseen" aria-hidden="true">
+                  {unseen}
+                </span>
+              )}
+            </span>
+          )}
+        </div>
+      </div>
 
       {stale && <StaleNote dataUpdatedAt={chats.dataUpdatedAt} />}
       {chats.isError && chats.data === undefined && (
@@ -345,55 +392,6 @@ export function Chats() {
         }
       >
         <div className="chats-detail">
-          {/* The top row of the conversation pane. Empty — no tabs, the list open, nothing
-              chosen — it draws nothing at all: see `.chats-topbar:empty`. */}
-          <div className="chats-topbar">
-            <ChatTabs
-              tabs={tabs.tabs}
-              rows={rows}
-              current={pickingUp === null ? chatId : null}
-              selectedLive={selectedLive}
-              onOpenChat={openingAChat}
-              onClose={closeTab}
-            />
-            {open !== null && chatId !== null && (
-              /* What the header band used to carry beside the conversation's name: where it runs,
-                 the cache and agent chips, and the `⋯` — rename included now, see `ChatMenu`. */
-              <div className="chats-topbar-actions">
-                <ChatWhere chatId={chatId} />
-                <ChatChips
-                  chatId={chatId}
-                  turns={transcript.data?.turns}
-                  chatTitle={open.title ?? "Conversation"}
-                />
-                <ChatMenu chatId={chatId} />
-              </div>
-            )}
-            {!railOpen && (
-              /* The way back to the list, at the end of the row, where the list's own edge was. Never only a shortcut:
-                 a closed list with no visible way to reopen it is a dead end. */
-              <span className="chats-topbar-show">
-                <IconButton
-                  /* The count is in the name, because the badge beside the glyph is drawn for
-                     the eye only — "Show conversations" and "5" would otherwise read as one word. */
-                  label={
-                    unseen > 0
-                      ? `Show conversations, ${unseen} unseen`
-                      : "Show conversations"
-                  }
-                  icon={PanelRightOpen}
-                  onClick={() => setRailOpen(true)}
-                />
-                {/* Answers that landed while you were elsewhere. Shown here precisely because the
-                    list they are in is closed. */}
-                {unseen > 0 && (
-                  <span className="chats-unseen" aria-hidden="true">
-                    {unseen}
-                  </span>
-                )}
-              </span>
-            )}
-          </div>
           {/* An editor conversation opens in this column like any other, because to the person
               looking at the list it IS any other — see `EditorDetail`. */}
           {pickingUp !== null && (
@@ -436,7 +434,6 @@ export function Chats() {
                 setPickingUp(null);
                 void navigate({ to: "/chats" });
               }}
-              onHide={() => setRailOpen(false)}
               openTabs={tabs.tabs}
             />
           </div>
@@ -460,21 +457,43 @@ export function Chats() {
  * this and the menu below out of one cache entry, so the line and the settings cannot
  * disagree about which folder a conversation is in.
  */
+/**
+ * The open conversation's own head, one quiet line above its record: where it runs, and at the end
+ * what is done to it as a whole, its changes and its settings. Not in the tabs row, which says WHICH
+ * conversation. The cache and the agents are in the box, beside the effort: they are about the
+ * next message.
+ */
+function ConversationHead({ chatId }: { chatId: string }) {
+  const rooted = (useChatProject(chatId).data?.cwd ?? null) !== null;
+  return (
+    <header className="chats-conv-head">
+      <div className="chats-conv-facts">
+        <ChatWhere chatId={chatId} />
+      </div>
+      <div className="chats-conv-acts">
+        {rooted && <ProjectChanges chatId={chatId} />}
+        <ChatMenu chatId={chatId} />
+      </div>
+    </header>
+  );
+}
+
 function ChatWhere({ chatId }: { chatId: string }) {
   const project = useChatProject(chatId);
   const cwd = project.data?.cwd ?? null;
   const tools = project.data?.tools ?? false;
-  if (cwd === null) return null;
+  if (cwd === null || !tools) return null;
   return (
-    <>
-      {tools && (
-        <p className="chats-where" title={cwd}>
-          {cwd}
-        </p>
-      )}
-      <ProjectChanges chatId={chatId} />
-    </>
+    <p className="chats-where" title={cwd}>
+      {folderName(cwd)}
+    </p>
   );
+}
+
+/** The last segment of a folder path, either slash; the path itself when it has none. */
+export function folderName(path: string): string {
+  const parts = path.split(/[\\/]+/).filter((part) => part !== "");
+  return parts[parts.length - 1] ?? path;
 }
 
 function ListError({ error }: { error: unknown }) {
@@ -906,6 +925,9 @@ function ChatDetail({
    * stands in for a missing project, and the composer when somebody speaks before choosing one.
    */
   const [picking, setPicking] = useState(false);
+  // No project yet: the middle of the window is the question of where it runs (`NoProject`), and
+  // "nothing has been said yet" under it would be a second, lesser sentence about the same void.
+  const unrooted = useChatProject(chatId).data?.cwd === null;
 
   // Once per chat opened, after the transcript has loaded — not on every poll
   // tick that follows. `markedSeen` is fresh per mount, and `ChatDetail` is
@@ -933,8 +955,7 @@ function ChatDetail({
        "Conversation" around a conversation was a label for a thing nobody was confused about, plus
        a border down both sides of the reading. */
     <section className="chats-detail-inner">
-      {/* The head that was here — the name and the `⋯` — lives in the tabs strip above: the tab
-          carries the name, and the strip's end carries the `⋯` (see `chats-topbar-actions`). */}
+      <ConversationHead chatId={chatId} />
 
       {/* Everything that is a RECORD of the conversation scrolls; the header above and the box
           below do not. One scrollbar used to move all three, so reading the middle of a long
@@ -962,7 +983,8 @@ function ChatDetail({
         {!transcript.isError && transcript.data === undefined && (
           <p className="chats-loading">reading the conversation…</p>
         )}
-        {transcript.data !== undefined && (
+        {transcript.data !== undefined &&
+          !(unrooted && transcript.data.turns.length === 0 && transcript.data.notices.length === 0) && (
           <Transcript
             turns={transcript.data.turns}
             notices={transcript.data.notices}
@@ -989,7 +1011,16 @@ function ChatDetail({
         chat={summary}
         reuse={reuse}
         onNeedsProject={() => setPicking(true)}
-        turnRunning={(transcript.data?.turns ?? []).some((t) => turnIsLive(t.status))}
+        runningTurn={
+          (transcript.data?.turns ?? []).find((t) => turnIsLive(t.status))?.id ?? null
+        }
+        chips={
+          <ChatChips
+            chatId={chatId}
+            turns={transcript.data?.turns}
+            chatTitle={summary?.title ?? "Conversation"}
+          />
+        }
       />
     </section>
   );
@@ -1787,13 +1818,17 @@ function PermissionMenu({ chatId }: { chatId: string }) {
  * go.
  */
 function CarryOn({ cwd, session }: { cwd: string; session: string }) {
+  const command = `cd ${cwd} && claude --resume ${session}`;
   return (
-    <p className="chats-project-carry">
-      to carry this on at a terminal:{" "}
-      <code className="chats-project-command">
-        cd {cwd} &amp;&amp; claude --resume {session}
-      </code>
-    </p>
+    <div className="chats-project-carry">
+      <p className="chats-project-carry-label">Continue in a terminal</p>
+      <div className="chats-project-carry-line">
+        <code className="chats-project-command" title={command}>
+          {command}
+        </code>
+        <CopyButton value={command} label="the terminal command" spoken={false} />
+      </div>
+    </div>
   );
 }
 
@@ -1831,15 +1866,21 @@ function NoProject({
   }, []);
 
   return (
-    <div className="chats-project">
-      <p className="chats-new-warning" role="status">
-        {held === null
-          ? "this conversation has no project yet — nothing is sent until one is chosen"
-          : "a message is held — it is sent as soon as this conversation has a project"}
-      </p>
-      <Button type="button" intent="go" onClick={() => onPicking(true)}>
-        Choose a project
-      </Button>
+    <>
+      {/* The whole of an empty window, centred: the one question this conversation is waiting on,
+          and the one way to answer it. The held message, if any, says only that it waits. */}
+      <div className="chats-unrooted" role="status">
+        <FolderOpen className="chats-unrooted-icon" strokeWidth={1.5} aria-hidden="true" />
+        <p className="chats-unrooted-title">Choose where this conversation works</p>
+        <p className="chats-unrooted-why">
+          {held === null
+            ? "It runs inside a project folder. Nothing is sent until one is chosen."
+            : "Your message is held, and goes out as soon as it has a project."}
+        </p>
+        <Button type="button" onClick={() => onPicking(true)}>
+          Choose a project
+        </Button>
+      </div>
       <ProjectPicker
         open={picking}
         onOpenChange={onPicking}
@@ -1851,7 +1892,7 @@ function NoProject({
         }}
         refusal={point.isError ? <ProjectRefusal error={point.error} /> : undefined}
       />
-    </div>
+    </>
   );
 }
 
@@ -2999,22 +3040,24 @@ function ContextControls({ chatId }: { chatId: string }) {
 
   return (
     <div className="chats-context">
-      <Button disabled={fresh.isPending} onClick={() => fresh.mutate(chatId)}>
-        Fresh context
-      </Button>
-      <p className="chats-context-why">
-        the next turn starts on a new window and is told what was recently said
-      </p>
+      <div className="chats-context-row">
+        <Button variant="quiet" disabled={fresh.isPending} onClick={() => fresh.mutate(chatId)}>
+          Fresh context
+        </Button>
+        <p className="chats-context-why">a new window, told what was recently said</p>
+      </div>
       {/* The interlock, because this one cannot be undone by pressing it again: the floor only ever
           moves forward. `ConfirmButton` is why this block is menu CONTENT — a menu item would close
           on the first click and collapse two deliberate steps into one. */}
-      <ConfirmButton
-        label="Clear"
-        confirmLabel="Clear — the turns stay, the model stops seeing them"
-        variant="ghost"
-        onConfirm={() => clear.mutate(chatId)}
-      />
-      <p className="chats-context-why">and this one tells it nothing at all</p>
+      <div className="chats-context-row">
+        <ConfirmButton
+          label="Clear context"
+          confirmLabel="Keep holding to clear"
+          variant="quiet"
+          onConfirm={() => clear.mutate(chatId)}
+        />
+        <p className="chats-context-why">hold — the model stops seeing every turn so far; they stay here</p>
+      </div>
       {fresh.isError && <HelperRefusal error={fresh.error} />}
       {clear.isError && <HelperRefusal error={clear.error} />}
     </div>
@@ -3422,10 +3465,10 @@ function ArchiveControl({ chatId }: { chatId: string }) {
   const navigate = useNavigate();
 
   return (
-    <div className="chats-archive">
+    <div className="chats-archive chats-context-row">
       <ConfirmButton
         label="Archive"
-        confirmLabel="Archive — every turn stays readable"
+        confirmLabel="Keep holding to archive"
         variant="quiet"
         onConfirm={() =>
           archive.mutate(chatId, {
@@ -3433,6 +3476,7 @@ function ArchiveControl({ chatId }: { chatId: string }) {
           })
         }
       />
+      <p className="chats-context-why">hold — off the list; every turn stays readable</p>
       {archive.isError && <ArchiveRefusal error={archive.error} />}
     </div>
   );
@@ -4234,14 +4278,18 @@ function AmbientMcpToggle({ chatId }: { chatId: string }) {
   const set = useSetAmbientMcp(chatId);
   if (project.data?.tools !== true) return null;
   return (
+    /* A row like every other setting here — the name, its value at the end — rather than a
+       checkbox item, whose indent for the tick put this one name out of line with the rest. */
     <DropdownMenuCheckboxItem
+      className="chats-meta-toggle"
       checked={project.data.ambient_mcp === true}
       disabled={set.isPending}
+      title="your own MCP servers, e.g. context7; off by default"
       onSelect={(event) => event.preventDefault()}
       onCheckedChange={(on) => set.mutate(on === true)}
     >
       Ambient MCP servers
-      <span className="chats-tool-why">your own MCP servers, e.g. context7; off by default</span>
+      <span className="chats-tool-why">{project.data.ambient_mcp === true ? "on" : "off"}</span>
     </DropdownMenuCheckboxItem>
   );
 }
@@ -4322,8 +4370,6 @@ const TurnBlock = memo(function TurnBlock({
       ))}
       <p className="chats-turn-who">núcleo</p>
       {live && <LiveAnswer turnId={turn.id} since={turn.createdAt} />}
-      {live && <StopTurn chatId={chatId} turnId={turn.id} />}
-      {live && <KillTurn chatId={chatId} turnId={turn.id} />}
       {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
       {!live && <Plan todos={planOf(turn.did)} />}
       {!live && <WhatItDid did={turn.did} turnId={turn.id} settled />}
@@ -4404,43 +4450,19 @@ function ContextFill({
  * a run that has already landed would be asking the daemon to un-bill it.
  *
  * Stop interrupts the turn and keeps the conversation's process and session, so the next message
- * continues warm; `KillTurn` beside it is the old, harder way out.
+ * continues warm. (`KillTurn`, which also ended the process, was taken out: Stop is the way out.)
  *
  * It is not a refusal of the answer — the turn is a run and stays in the history, cancelled, with
  * whatever it cost up to that point. That is the honest record and it is why this says "stop"
  * rather than "undo".
  */
-function StopTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
+function useStopControl(
+  chatId: string,
+  turnId: number | null | undefined,
+): { onStop: () => void; pending: boolean } | undefined {
   const stop = useStopTurn(chatId);
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      disabled={stop.isPending}
-      onClick={() => stop.mutate(turnId)}
-    >
-      Stop
-    </Button>
-  );
-}
-
-/**
- * The hard way out: ends the turn AND the conversation's process, so the next message starts cold.
- * For a turn that Stop cannot reach.
- */
-function KillTurn({ chatId, turnId }: { chatId: string; turnId: number }) {
-  const kill = useKillTurn(chatId);
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      disabled={kill.isPending}
-      title="end the turn and stop this conversation's process"
-      onClick={() => kill.mutate(turnId)}
-    >
-      Kill
-    </Button>
-  );
+  if (turnId == null) return undefined;
+  return { onStop: () => stop.mutate(turnId), pending: stop.isPending };
 }
 
 /**
@@ -5245,7 +5267,8 @@ function Composer({
   chat,
   reuse,
   onNeedsProject,
-  turnRunning,
+  runningTurn,
+  chips,
 }: {
   chatId: string;
   /** The row, or undefined while the list is still being read. */
@@ -5254,9 +5277,18 @@ function Composer({
   reuse?: { text: string; at: number } | null;
   /** Open the project picker: something was said to a conversation that has nowhere to run. */
   onNeedsProject?: () => void;
-  /** A turn of this conversation is running now: the box may offer "Send now". */
-  turnRunning?: boolean;
+  /**
+   * The turn of this conversation running now, or null. The box then offers "Send now", and turns
+   * its send button into Stop while it is empty.
+   */
+  runningTurn?: number | null;
+  /**
+   * The cache timer and the agent map, after the effort: what the next message is sent into —
+   * whether it re-reads the conversation cheaply, and who is still working.
+   */
+  chips?: React.ReactNode;
 }) {
+  const turnRunning = runningTurn != null;
   const [text, setText] = useState("");
   const [caret, setCaret] = useState(0);
   // Escape closes the list without closing what is being typed: the sigil and what follows it stay
@@ -5276,8 +5308,9 @@ function Composer({
   // it is not "some" either, and what is said while it is being read waits the half-second.
   const rooted = project.data !== undefined && project.data.cwd !== null;
   // Send now steers a running turn of a rooted conversation, and carries text only.
-  const steerable = turnRunning === true && rooted && attached.length === 0;
+  const steerable = turnRunning && rooted && attached.length === 0;
   const held = useHeldMessage(chatId);
+  const stop = useStopControl(chatId, runningTurn);
   // Held here rather than inside the toggle, because the toggle and the line below the box are two
   // views of ONE microphone. Two `useDictation` calls would be two recordings.
   const dictation = useDictationInto(text, setText, setCaret, box);
@@ -5469,23 +5502,22 @@ ${was}`));
       }}
     >
       {held !== null && (
+        /* Above the box, drawn as what it is: your message, on your side, in your bubble — dashed,
+           because it has not happened yet, and labelled with why. The way on is the question in the
+           middle of the window. */
         <div className="chats-held" role="status" aria-label="Held message">
-          <p className="chats-held-text">
+          <p className="chats-held-label">
+            <Clock className="chats-held-icon" aria-hidden="true" />
+            Not sent · waiting for a project
+          </p>
+          <p className="chats-turn-asked chats-held-bubble">
             {held.text}
             {held.images.length > 0 &&
               ` (+${held.images.length} ${held.images.length === 1 ? "picture" : "pictures"})`}
           </p>
-          <p className="chats-held-why">
-            held — not sent yet; it goes out as soon as this conversation has a project
-          </p>
-          <div className="chats-held-actions">
-            <Button type="button" intent="go" onClick={() => onNeedsProject?.()}>
-              Choose a project
-            </Button>
-            <Button type="button" variant="quiet" onClick={unhold}>
-              Edit
-            </Button>
-          </div>
+          <button type="button" className="chats-held-edit" onClick={unhold}>
+            Edit
+          </button>
         </div>
       )}
       {nowhere && (
@@ -5535,6 +5567,7 @@ ${was}`));
       <ComposerBox
         text={text}
         boxRef={box}
+        stop={stop}
         sendDisabled={!sayable}
         onSubmit={say}
         onText={(value, at) => {
@@ -5594,6 +5627,7 @@ ${was}`));
                 effort={chat.effort}
               />
             )}
+            {chips}
             <span className="chats-composer-gap" />
             {/* The one word about the microphone, on a row that exists at this height whether it
                 says anything or not. It shrinks rather than grows, with the whole sentence on
@@ -5609,11 +5643,11 @@ ${was}`));
             {/* Last before send, because it is the answer most likely to be changed in the moment
                 of sending — "actually, plan this one" — and the hand is already on that corner. */}
             <PermissionMenu chatId={chatId} />
-            {steerable && (
+            {steerable && text.trim() !== "" && (
               <Button
                 type="button"
                 variant="quiet"
-                disabled={text.trim() === "" || sayNow.isPending}
+                disabled={sayNow.isPending}
                 onClick={sayItNow}
                 title="say it to the running turn instead of waiting"
               >

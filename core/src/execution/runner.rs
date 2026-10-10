@@ -479,6 +479,9 @@ pub struct LaterTurn {
     pub images: Vec<Attachment>,
     /// True writes a `control_request` interrupt instead of a user turn; text and images are ignored.
     pub interrupt: bool,
+    /// Some writes a `control_request` that stops that one task (a subagent or a background shell)
+    /// and nothing else; text and images are ignored, and the turn goes on.
+    pub stop_task: Option<String>,
 }
 
 /// One line of `--input-format stream-json` stdin that interrupts the running turn.
@@ -493,6 +496,25 @@ pub fn interrupt_line() -> String {
         "type": "control_request",
         "request_id": format!("nucleos-interrupt-{n}"),
         "request": { "subtype": "interrupt" },
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
+/// One line of `--input-format stream-json` stdin that stops ONE task of the running process: a
+/// subagent or a background shell, named by the CLI's own `task_id` (see `ToolCall::task_id`).
+///
+/// The CLI's `stop_task` control request (present in 2.1.280: it refuses a `task_id` that is not a
+/// string). Unlike the interrupt, the turn that launched the task carries on; it is told the task
+/// stopped, as it is when one ends on its own. Its own id per request, for the interrupt's reason.
+pub fn stop_task_line(task_id: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut line = serde_json::json!({
+        "type": "control_request",
+        "request_id": format!("nucleos-stop-task-{n}"),
+        "request": { "subtype": "stop_task", "task_id": task_id },
     })
     .to_string();
     line.push('\n');
@@ -3140,6 +3162,8 @@ impl CommandRunner for ClaudeCliRunner {
                     // An interrupt is not a turn: it is one control line and carries no text.
                     let line = if turn.interrupt {
                         interrupt_line()
+                    } else if let Some(task) = &turn.stop_task {
+                        stop_task_line(task)
                     } else {
                         user_message_line(&turn.text, &turn.images)
                     };
@@ -4383,11 +4407,11 @@ impl CommandRunner for FakeCommandRunner {
                     None => {}
                 }
                 let Some(turn) = turn else { break };
-                let interrupt = turn.interrupt;
+                // A control line (an interrupt, or a stop of one task) is not a turn: with no turn
+                // in flight it is recorded and answers nothing, as the real CLI does.
+                let control = turn.interrupt || turn.stop_task.is_some();
                 self.later_turns.lock().unwrap().push(turn);
-                // An interrupt with no turn in flight is recorded and answers nothing, as the
-                // real CLI does for one that arrives between turns.
-                if interrupt {
+                if control {
                     continue;
                 }
                 // A process that does not answer instantly, so a test can catch a turn in flight.
@@ -5517,6 +5541,7 @@ mod tests {
                         text: "Reply with the single word two.".to_owned(),
                         images: Vec::new(),
                         interrupt: false,
+                        stop_task: None,
                     })
                     .unwrap();
             } else {
@@ -5985,6 +6010,23 @@ mod tests {
         assert_eq!(
             value.pointer("/message/content").unwrap(),
             "arranja o parser"
+        );
+    }
+
+    /// Stopping one task is one `control_request` line naming it, and never an interrupt.
+    #[test]
+    fn stopping_a_task_is_one_control_request_naming_it() {
+        let line = stop_task_line("b84qqcytz");
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\n').count(), 1);
+        let value: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(value["type"], "control_request");
+        assert_eq!(value.pointer("/request/subtype").unwrap(), "stop_task");
+        assert_eq!(value.pointer("/request/task_id").unwrap(), "b84qqcytz");
+        assert_ne!(
+            value["request_id"],
+            serde_json::from_str::<serde_json::Value>(stop_task_line("b84qqcytz").trim_end())
+                .unwrap()["request_id"],
         );
     }
 

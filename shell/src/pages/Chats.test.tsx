@@ -2008,11 +2008,11 @@ describe("Chats - what a conversation is told, and what it may not touch", () =>
 
     // The stronger one is behind the interlock: the floor only ever moves forward, so pressing it
     // again cannot undo it.
-    fireEvent.click(screen.getByRole("button", { name: /^clear$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^clear context$/i }));
     expect(daemon.apiFetch).not.toHaveBeenCalledWith("/assistant/chats/c-1/clear", {
       method: "POST",
     });
-    const confirm = await screen.findByRole("button", { name: /the turns stay/i });
+    const confirm = await screen.findByRole("button", { name: /^keep holding to clear$/i });
     // The 300ms dwell: a click inside it is read as the tail of a double-click and swallowed, so
     // the two clicks have to be apart in TIME and not only in await points.
     await afterDwell();
@@ -2506,7 +2506,7 @@ describe("Chats - archiving a conversation", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Archive" }));
 
     // First wait: the interlock has armed and swapped its own label.
-    const confirm = await screen.findByRole("button", { name: /every turn stays readable/i });
+    const confirm = await screen.findByRole("button", { name: /^keep holding to archive$/i });
     await afterDwell();
     fireEvent.click(confirm);
 
@@ -2768,7 +2768,7 @@ describe("Chats - what is different in the project", () => {
     await screen.findByRole("list", { name: "Transcript" });
 
     const chip = await screen.findByRole("button", { name: /what is different in this project/i });
-    expect(chip.closest(".chats-topbar-actions")).not.toBeNull();
+    expect(chip.closest(".chats-conv-head")).not.toBeNull();
     // Walking a working tree is not something the page does on arrival.
     expect(daemon.apiText).not.toHaveBeenCalled();
     expect(screen.queryByLabelText("What is different")).toBeNull();
@@ -2852,7 +2852,7 @@ describe("Chats - what is different in the project", () => {
     );
     // ...and the transcript's own Project block has drawn that answer, so the same cache entry the
     // chip would read from is settled.
-    await waitFor(() => expect(document.querySelector(".chats-project")).not.toBeNull());
+    await waitFor(() => expect(document.querySelector(".chats-unrooted")).not.toBeNull());
 
     expect(screen.queryByRole("button", { name: /what is different in this project/i })).toBeNull();
   });
@@ -3091,8 +3091,11 @@ describe("Chats - giving a conversation a project", () => {
     const held = screen.getByRole("status", { name: "Held message" });
     expect(within(held).getByText("hello")).toBeTruthy();
     expect(sentMessages()).toHaveLength(0);
+    // Asked once, in the middle of the window; the held message only says that it waits.
+    expect(screen.getAllByRole("button", { name: "Choose a project" })).toHaveLength(1);
+    expect(within(held).queryByRole("button", { name: "Choose a project" })).toBeNull();
 
-    fireEvent.click(within(held).getByRole("button", { name: "Choose a project" }));
+    fireEvent.click(screen.getByRole("button", { name: "Choose a project" }));
     expect(await screen.findByRole("dialog", { name: /where this conversation runs/i })).toBeTruthy();
   });
 
@@ -3651,9 +3654,10 @@ describe("Chats - what the page is about", () => {
     expect(
       within(strip).getByRole("tab", { name: /arranja o parser de datas/ }).getAttribute("aria-selected"),
     ).toBe("true");
-    // The conversation's settings ride at the strip's end.
+    // The conversation's settings are at the end of its own head, not in the tabs row or the box.
     const more = await screen.findByRole("button", { name: "Conversation settings" });
-    expect(more.closest(".chats-topbar-actions")).not.toBeNull();
+    expect(more.closest(".chats-conv-head")).not.toBeNull();
+    expect(more.closest(".chats-composer-box")).toBeNull();
 
     // And renaming is still possible, from the menu, seeded with the current name.
     await openConversationSettings();
@@ -4928,7 +4932,7 @@ describe("stopping a turn", () => {
     );
   });
 
-  it("Kill ends the turn and its process the old way", async () => {
+  it("puts Stop in send's place while the box is empty, and gives send back on typing", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1" })], {
         "c-1": [turnRow({ id: 1, status: "running", answer: null })],
@@ -4937,19 +4941,16 @@ describe("stopping a turn", () => {
 
     await renderChats("/chats/c-1");
 
-    fireEvent.click(await screen.findByRole("button", { name: /^kill$/i }));
+    const stop = await screen.findByRole("button", { name: /^stop$/i });
+    // In the box, not in the transcript.
+    expect(stop.closest(".chats-composer-box")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+    // Stop is the only way out; Kill is gone.
+    expect(screen.queryByRole("button", { name: /^kill$/i })).toBeNull();
 
-    // `apiText` and not `apiFetch`: cancel answers `200` with an empty body, and a JSON parse of
-    // nothing is how that route used to fail.
-    await waitFor(() =>
-      expect(
-        daemon.apiText.mock.calls.some(
-          (call) =>
-            String(call[0]) === "/runs/1/cancel" &&
-            (call[1] as RequestInit | undefined)?.method === "POST",
-        ),
-      ).toBe(true),
-    );
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "also this" } });
+    expect(screen.getByRole("button", { name: "Send" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: /^stop$/i })).toBeNull();
   });
 
   it("offers nothing to stop on a turn that has landed", async () => {
@@ -5045,7 +5046,8 @@ describe("Chats - what the header says without being asked", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Hide conversations" }));
 
     // The line above the transcript says where this runs, and stops there.
-    expect(await screen.findByText("C:/Projects/nucleos")).toBeDefined();
+    // The folder's name, with the whole path on hover.
+    expect((await screen.findByText("nucleos")).getAttribute("title")).toBe("C:/Projects/nucleos");
 
     // Which model answers, and what it may do without asking, are controls in the
     // composer — beside the words they govern rather than behind a menu at the top of the
@@ -5087,13 +5089,13 @@ describe("Chats - what the header says without being asked", () => {
     await renderChats("/chats/c-1");
     fireEvent.click(await screen.findByRole("button", { name: "Hide conversations" }));
 
-    await screen.findByText("C:/Projects/nucleos");
+    await screen.findByText("nucleos");
     expect(await screen.findByRole("button", { name: /^Permissions: Auto/ })).toBeDefined();
   });
 });
 
 describe("Chats - closing the list", () => {
-  it("hides the conversations from the list's own header and brings them back from the tabs strip", async () => {
+  it("hides the conversations from the top bar and brings them back from the same place", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
         [chatSummary({ chat_id: "c-1", waiting: 3 }), chatSummary({ chat_id: "c-2", waiting: 2 })],
@@ -5104,13 +5106,18 @@ describe("Chats - closing the list", () => {
     await renderChats("/chats/c-1");
     await screen.findByRole("list", { name: "Conversations" });
 
-    // An icon in the list's own header row, beside New session, named and titled in words.
+    // An icon at the end of the page's top bar, named and titled in words. New session and New
+    // group are in the list itself, and go with it.
     const hide = screen.getByRole("button", { name: "Hide conversations" });
     expect(hide.getAttribute("title")).toBe("Hide conversations");
-    expect(hide.closest(".chats-rail-actions")).not.toBeNull();
+    expect(hide.closest(".chats-topbar-side")).not.toBeNull();
+    expect(
+      screen.getByRole("button", { name: "New session" }).closest(".chats-rail"),
+    ).not.toBeNull();
     fireEvent.click(hide);
 
     expect(screen.queryByRole("list", { name: "Conversations" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "New session" })).toBeNull();
     // Five answers landed across two conversations, and the list they are in is shut. The way
     // back sits where the tabs strip starts, so a closed list is never a dead end.
     const show = await screen.findByRole("button", { name: "Show conversations, 5 unseen" });
@@ -6246,12 +6253,11 @@ describe("Chats - conversations as tabs", () => {
     expect(router.state.location.pathname).toBe("/chats/c-2");
     expect(JSON.parse(localStorage.getItem("chats.tabs") ?? "[]")).toEqual(["c-1", "c-2"]);
 
-    // A tab wears the same colour as its row in the column.
-    const hueOf = (el: Element | null | undefined) =>
-      el?.querySelector<HTMLElement>(".chats-dot-chat")?.style.getPropertyValue("--chat-hue");
-    const tabHue = hueOf(within(strip).getByRole("tab", { name: /beta/ }));
-    expect(tabHue).toBeTruthy();
-    expect(hueOf(screen.getByRole("link", { name: /^beta, cloud/ }))).toBe(tabHue);
+    // A tab wears the same state mark as its row in the column.
+    const markOf = (el: Element | null | undefined) => el?.querySelector(".chats-dot")?.className;
+    const tabMark = markOf(within(strip).getByRole("tab", { name: /beta/ }));
+    expect(tabMark).toBeTruthy();
+    expect(markOf(screen.getByRole("link", { name: /^beta, cloud/ }))).toBe(tabMark);
 
     // Clicking a tab navigates back.
     fireEvent.click(within(strip).getByRole("tab", { name: /alpha/ }));

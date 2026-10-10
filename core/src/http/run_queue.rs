@@ -619,6 +619,7 @@ pub(super) async fn post_run_message(
             text: body.message,
             images: Vec::new(),
             interrupt: false,
+            stop_task: None,
         })
         .map_err(|_| StatusCode::CONFLICT)?;
     Ok(StatusCode::ACCEPTED)
