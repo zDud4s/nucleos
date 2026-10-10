@@ -94,6 +94,15 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 		objectID = resolved
 	}
 
+	// The panel is the person's. A ref that is one of its nodes is refused here, before it can be
+	// focused. Where a key or text LANDS is decided later, by press and typeInto themselves, after
+	// their focus step: see panelFocusGuard.
+	if action.Ref != "" {
+		if refusal := d.panelNodeGuard(ctx, entry, action.Kind, pageSession, key); refusal != nil {
+			return browser.Refused(refusal.Consequence, refusal.Detail), nil
+		}
+	}
+
 	d.mu.Lock()
 	before := entry.reportedUpTo
 	d.mu.Unlock()
@@ -128,7 +137,7 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 	var err error
 	switch action.Kind {
 	case browser.ActionClick:
-		refusal, err = d.click(ctx, on, objectID)
+		refusal, err = d.click(ctx, entry, on, objectID)
 	case browser.ActionScroll:
 		if objectID == "" {
 			refusal, err = d.scrollPage(ctx, on, action.Text)
@@ -136,13 +145,13 @@ func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.A
 			err = d.callOn(ctx, on, objectID, "function() { this.scrollIntoView({block: 'center'}); }")
 		}
 	case browser.ActionType:
-		err = d.typeInto(ctx, on, objectID, action.Text)
+		refusal, err = d.typeInto(ctx, entry, on, objectID, action.Text)
 	case browser.ActionSelect:
 		refusal, err = d.choose(ctx, on, objectID, action.Text)
 	case browser.ActionUpload:
 		refusal, err = d.attach(ctx, entry, on, objectID, action)
 	case browser.ActionPress:
-		refusal, err = d.press(ctx, on, objectID, action.Text)
+		refusal, err = d.press(ctx, entry, on, objectID, action.Text)
 	case browser.ActionBack:
 		refusal, err = d.goBack(ctx, entry)
 	case browser.ActionGoto:
@@ -260,14 +269,18 @@ func (d *Driver) afterAct(ctx context.Context, entry *session, moved *watcher, r
 	return result
 }
 
-func (d *Driver) typeInto(ctx context.Context, on cdp.SessionID, objectID, text string) error {
+func (d *Driver) typeInto(ctx context.Context, entry *session, on cdp.SessionID, objectID, text string) (*browser.Refusal, error) {
 	if err := d.callOn(ctx, on, objectID, "function() { this.focus(); }"); err != nil {
-		return err
+		return nil, err
+	}
+	// The text lands where focus is now, which is not the ref's node when that cannot take focus.
+	if refusal := d.panelFocusGuard(ctx, entry, browser.ActionType, on); refusal != nil {
+		return refusal, nil
 	}
 	// Input.insertText rather than synthesising key events: it is what a paste does, it does not
 	// need a keymap, and it cannot accidentally send a modifier combination.
 	_, err := d.conn.Call(ctx, on, "Input.insertText", map[string]any{"text": text})
-	return err
+	return nil, err
 }
 
 func (d *Driver) resolve(ctx context.Context, key nodeKey) (string, error) {

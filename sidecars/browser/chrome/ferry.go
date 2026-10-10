@@ -244,6 +244,9 @@ var ferryShim = `(() => {
 type executionContext struct {
 	origin string
 	frame  string
+	// name is the world's name as Chromium reports it: empty for a page's own, panelWorld for the
+	// panel's. It is what tells the two apart, and it comes from the browser, never the page.
+	name string
 }
 
 // armFerry installs the binding and the shim on a target.
@@ -273,6 +276,7 @@ func (d *Driver) onRuntimeEvent(event cdp.Event) {
 			Context struct {
 				ID      int64  `json:"id"`
 				Origin  string `json:"origin"`
+				Name    string `json:"name"`
 				AuxData struct {
 					FrameID string `json:"frameId"`
 				} `json:"auxData"`
@@ -285,8 +289,12 @@ func (d *Driver) onRuntimeEvent(event cdp.Event) {
 		d.contexts[contextKey{session: event.Session, id: params.Context.ID}] = executionContext{
 			origin: params.Context.Origin,
 			frame:  params.Context.AuxData.FrameID,
+			name:   params.Context.Name,
 		}
 		d.mu.Unlock()
+		if params.Context.Name == panelWorld {
+			go d.replayPanel(event.Session, params.Context.ID)
+		}
 
 	case "Runtime.executionContextsCleared":
 		d.mu.Lock()
@@ -315,6 +323,9 @@ func (d *Driver) onRuntimeEvent(event cdp.Event) {
 			// request inline would hold up every refusal, navigation and lifecycle event behind it
 			// for as long as the network takes.
 			go d.serveFerry(event.Session, params.ContextID, params.Payload)
+		case panelBinding:
+			// Judged inline: it is a lookup and a channel send, and message order matters.
+			d.panelCalled(event.Session, params.ContextID, params.Payload)
 		}
 	}
 }

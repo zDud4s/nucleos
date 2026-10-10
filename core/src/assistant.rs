@@ -238,6 +238,17 @@ pub async fn say_now(
     chat_id: &str,
     text: &str,
 ) -> Result<SaidNow, String> {
+    say_now_from(state, chat_id, text, Origin::Shell).await
+}
+
+/// `say_now` for a client that is not the shell: the origin is recorded on the steering row and
+/// carried to `send_or_queue` when there is no running turn.
+pub async fn say_now_from(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    text: &str,
+    origin: Origin,
+) -> Result<SaidNow, String> {
     let running: Option<(i64, Option<String>)> = sqlx::query_as(
         "SELECT id, permission_mode FROM runs
          WHERE chat_id = ? AND mode = 'assistant' AND status = 'running'
@@ -260,7 +271,7 @@ pub async fn say_now(
         .bind(chat_id)
         .bind(run_id)
         .bind(text)
-        .bind(Origin::Shell.as_wire())
+        .bind(origin.as_wire())
         .bind(chrono::Utc::now().to_rfc3339())
         .execute(&state.pool)
         .await
@@ -283,7 +294,7 @@ pub async fn say_now(
             .await;
     }
 
-    send_or_queue(state, chat_id, text, &[], Origin::Shell)
+    send_or_queue(state, chat_id, text, &[], origin)
         .await
         .map(SaidNow::Sent)
 }
@@ -1884,6 +1895,8 @@ pub enum Origin {
     /// a shell turn is read, a voice turn is spoken. Recorded on the row for the same reason the
     /// other two are — a queued message must be sent as the thing it was.
     Voice,
+    /// Typed in the panel of a NucleOS browser window on this machine; answered like `Shell`.
+    BrowserPanel,
 }
 
 impl Origin {
@@ -1893,6 +1906,7 @@ impl Origin {
         match value {
             Some("telegram") => Self::Telegram,
             Some("voice") => Self::Voice,
+            Some("browser-panel") => Self::BrowserPanel,
             _ => Self::Shell,
         }
     }
@@ -1906,6 +1920,7 @@ impl Origin {
         match self {
             Self::Telegram => "telegram",
             Self::Voice => "voice",
+            Self::BrowserPanel => "browser-panel",
             Self::Shell => "shell",
         }
     }
@@ -2499,7 +2514,7 @@ async fn send_message_inner(
     // doctrine a Telegram channel was given.
     let doctrine = match origin {
         Origin::Telegram => state.telegram_doctrine.clone(),
-        Origin::Shell | Origin::Voice => None,
+        Origin::Shell | Origin::Voice | Origin::BrowserPanel => None,
     };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().to_string();
@@ -3060,7 +3075,7 @@ pub fn tool_policy_for(
     relayed: bool,
 ) -> crate::runner::ToolPolicy {
     match (cwd, origin, hook_is_wired, relayed) {
-        (Some(_), Origin::Shell | Origin::Voice, true, false) => {
+        (Some(_), Origin::Shell | Origin::Voice | Origin::BrowserPanel, true, false) => {
             crate::runner::ToolPolicy::Unrestricted
         }
         _ => crate::runner::ToolPolicy::McpOnly,
@@ -4262,6 +4277,84 @@ mod tests {
         for value in [None, Some("shell"), Some("Telegram"), Some(""), Some("tg")] {
             assert_eq!(Origin::from_wire(value), Origin::Shell, "{value:?}");
         }
+    }
+
+    /// A queued message carries its origin through the database, so the browser panel's spelling
+    /// must come back as the panel and not decay into the shell.
+    #[test]
+    fn browser_panel_origin_round_trips_through_the_wire() {
+        assert_eq!(Origin::BrowserPanel.as_wire(), "browser-panel");
+        assert_eq!(
+            Origin::from_wire(Some("browser-panel")),
+            Origin::BrowserPanel
+        );
+        assert_eq!(
+            Origin::from_wire(Some(Origin::BrowserPanel.as_wire())),
+            Origin::BrowserPanel
+        );
+    }
+
+    /// Send now from the browser panel is recorded as the panel, not fixed to the shell.
+    #[tokio::test]
+    async fn say_now_from_records_the_browser_panel_origin_mid_turn() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("said-now-panel");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+
+        *fake.delay.lock().unwrap() = Some(Duration::from_secs(2));
+        let second = send_message(&state, &chat, "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        the_process_is_steerable(&chat).await;
+
+        let said = say_now_from(&state, &chat, "e também isto", Origin::BrowserPanel).await;
+        assert!(
+            matches!(said, Ok(SaidNow::Injected)),
+            "a live steerable turn takes the text"
+        );
+
+        let (run_id, origin): (i64, String) =
+            sqlx::query_as("SELECT run_id, origin FROM chat_said_now WHERE chat_id = ?")
+                .bind(&chat)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(run_id, second);
+        assert_eq!(origin, Origin::BrowserPanel.as_wire());
+
+        settled_turn(&state.pool, second).await;
+        LIVE_CHATS.lock().unwrap().remove(&chat);
+    }
+
+    /// With no turn running the text is sent the ordinary way, as the panel.
+    #[tokio::test]
+    async fn say_now_from_with_no_running_turn_sends_with_the_browser_panel_origin() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("said-now-panel-idle");
+        unrooted_chat(&state, &chat).await;
+
+        let said = say_now_from(&state, &chat, "olá", Origin::BrowserPanel).await;
+
+        let Ok(SaidNow::Sent(Sent::Turn(turn))) = said else {
+            panic!("nothing was running, so the text becomes a turn: {said:?}");
+        };
+        let recorded: Option<String> = sqlx::query_scalar("SELECT origin FROM runs WHERE id = ?")
+            .bind(turn)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(recorded.as_deref(), Some("browser-panel"));
+        settled_turn(&state.pool, turn).await;
+        LIVE_CHATS.lock().unwrap().remove(&chat);
     }
 
     /// The ship-dark guarantee, and the test most likely to be needed later: with no model

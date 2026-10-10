@@ -3205,7 +3205,7 @@ mod tests {
         ("core/src/email.rs", "2026-07-28-email-pillar-design"),
         ("core/src/browser.rs", "2026-08-15-pilar-de-browser-design"),
         (
-            "core/src/browser_policy.rs",
+            "core/crates/nucleos-base/src/browser_policy.rs",
             "2026-08-15-pilar-de-browser-design",
         ),
         (
@@ -3213,7 +3213,10 @@ mod tests {
             "2026-08-15-pilar-de-browser-design",
         ),
         ("core/src/web.rs", "2026-08-01-pilar-de-web-design"),
-        ("core/src/web_client.rs", "2026-08-01-pilar-de-web-design"),
+        (
+            "core/crates/nucleos-base/src/web_client.rs",
+            "2026-08-01-pilar-de-web-design",
+        ),
         ("core/src/vcs.rs", "2026-08-02-fila-vcs-design"),
         ("core/src/git_exec.rs", "2026-08-02-fila-vcs-design"),
         ("core/src/github.rs", "2026-08-19-modulo-de-github-design"),

@@ -710,9 +710,14 @@ impl DaemonClient {
     // finishes a login and keeps the chain, and by no other means (spec §5.2).
 
     /// Open a browsing session. The profile is chosen by the daemon, never named here.
-    pub async fn browser_open(&self, project_id: &str, url: &str) -> Result<Value, String> {
+    pub async fn browser_open(
+        &self,
+        project_id: &str,
+        url: &str,
+        visible: bool,
+    ) -> Result<Value, String> {
         self.request(reqwest::Method::POST, "/browser/open")
-            .json(&serde_json::json!({ "project_id": project_id, "url": url }))
+            .json(&serde_json::json!({ "project_id": project_id, "url": url, "visible": visible }))
             .send()
             .await
             .map_err(|e| e.to_string())?

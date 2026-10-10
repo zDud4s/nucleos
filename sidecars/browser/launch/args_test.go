@@ -224,3 +224,49 @@ func TestNoWebRTCFlagIsBelieved(t *testing.T) {
 		}
 	}
 }
+
+// TestArgsVisibleAgentModeDropsHeadlessAndBlockNewWebContents. A visible agent session has a window
+// the person can watch; everything else about the fence stays.
+func TestArgsVisibleAgentModeDropsHeadlessAndBlockNewWebContents(t *testing.T) {
+	opts := agentOptions()
+	opts.Visible = true
+	args, err := Args(opts)
+	if err != nil {
+		t.Fatalf("args: %v", err)
+	}
+	for _, flag := range []string{"--headless", "--block-new-web-contents"} {
+		if has(args, flag) {
+			t.Errorf("a visible agent session carries %s", flag)
+		}
+	}
+	for _, flag := range []string{"--proxy-server=", "--proxy-bypass-list="} {
+		if !has(args, flag) {
+			t.Errorf("a visible agent session lost %s: the proxy fence must stay", flag)
+		}
+	}
+	if !slices.Contains(args, "about:blank") {
+		t.Error("a visible agent session has no blank startup page")
+	}
+}
+
+// TestArgsWithoutVisibleAreUnchanged: the zero value of Visible is the headless fenced launch.
+func TestArgsWithoutVisibleAreUnchanged(t *testing.T) {
+	opts := agentOptions()
+	opts.Visible = false
+	args, err := Args(opts)
+	if err != nil {
+		t.Fatalf("args: %v", err)
+	}
+	for _, flag := range []string{"--headless=new", "--block-new-web-contents", "--proxy-server=", "--proxy-bypass-list="} {
+		if !has(args, flag) {
+			t.Errorf("headless agent mode is missing %s", flag)
+		}
+	}
+	plain, err := Args(agentOptions())
+	if err != nil {
+		t.Fatalf("args: %v", err)
+	}
+	if !slices.Equal(args, plain) {
+		t.Errorf("Visible=false changed the argv: %v vs %v", args, plain)
+	}
+}

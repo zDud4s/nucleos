@@ -321,6 +321,22 @@ func TestThePlacementReachesTheDriverUnchanged(t *testing.T) {
 	}
 }
 
+// TestOpenForwardsVisibleToTheDriver: a field the wire shape lacks is dropped by encoding/json in
+// silence, so the flag is asserted on what the driver received.
+func TestOpenForwardsVisibleToTheDriver(t *testing.T) {
+	driver := &browser.Fake{FenceAttached: true}
+	server := testServer(t, driver)
+
+	sent := opening("https://example.org/")
+	sent.Placement.Visible = true
+	if response := post(t, server, "/open", sent, true); response.StatusCode != http.StatusOK {
+		t.Fatalf("open: got %d", response.StatusCode)
+	}
+	if len(driver.Opened) != 1 || !driver.Opened[0].Placement.Visible {
+		t.Fatalf("the driver did not receive visible: %+v", driver.Opened)
+	}
+}
+
 func TestGetIsNotAllowed(t *testing.T) {
 	server := testServer(t, &browser.Fake{FenceAttached: true})
 	request, _ := http.NewRequest(http.MethodGet, server.URL+"/open", nil)

@@ -28,6 +28,7 @@ pub mod brief;
 pub mod browser;
 pub use nucleos_base::browser_client;
 pub mod browser_live;
+pub mod browser_panel;
 pub use nucleos_base::browser_policy;
 pub mod browser_seat;
 pub mod browser_wheel;
