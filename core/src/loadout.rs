@@ -257,6 +257,26 @@ pub async fn record(pool: &sqlx::SqlitePool, run_id: i64, run: &RunTools) -> sql
     Ok(())
 }
 
+/// Copies one run's frozen loadout to the run that continues it (a handoff successor or an
+/// approval resume): the same work, so the same tools, including an extra approved mid-run. A
+/// predecessor with no row gives the successor none, so it stays on its box's base tools.
+pub async fn carry(pool: &sqlx::SqlitePool, from_run: i64, to_run: i64) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO run_loadout (run_id, agent_id, team_id, tools, resolved_at)
+         SELECT ?, agent_id, team_id, tools, resolved_at FROM run_loadout WHERE run_id = ?
+         ON CONFLICT(run_id) DO UPDATE SET
+           agent_id = excluded.agent_id,
+           team_id = excluded.team_id,
+           tools = excluded.tools,
+           resolved_at = excluded.resolved_at",
+    )
+    .bind(to_run)
+    .bind(from_run)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// The agent and team of an input, each only when it has a row (the skip is logged).
 async fn owners<'a>(
     pool: &sqlx::SqlitePool,
@@ -330,7 +350,8 @@ pub fn node_kind(stage: &str) -> Option<NodeKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Equipment, Loadout, LoadoutInput, RunTools, effective_tools, node_kind, record, resolve,
+        Equipment, Loadout, LoadoutInput, RunTools, carry, effective_tools, node_kind, record,
+        resolve,
     };
     use crate::knowledge::NodeKind;
     use crate::mcp_tools::{JOB_NODE_BASE, JOB_NODE_EXTRAS, TEAM_BASE, TEAM_EXTRAS};
@@ -1191,6 +1212,67 @@ mod tests {
                 .unwrap(),
             (Some("a".to_owned()), None)
         );
+    }
+
+    /// A run continuing another (handoff successor, approval resume) gets the predecessor's row as
+    /// it stands, and a predecessor with no row leaves the successor with none (fail closed).
+    #[tokio::test]
+    async fn loadout_carry_copies_the_row_and_writes_none_without_one() {
+        let pool = crate::testdb::fresh_pool().await;
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO runs (prompt, status, mode, created_at)
+                 VALUES ('t', 'running', 'real', '2026-10-10T00:00:00Z') RETURNING id",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let (from, to, bare_from, bare_to) = (ids[0], ids[1], ids[2], ids[3]);
+        let tools = sorted(&["read_context", "request_tool", "web_read"]);
+        record(
+            &pool,
+            from,
+            &RunTools {
+                agent: Some("a".to_owned()),
+                team: Some("x".to_owned()),
+                tools: tools.clone(),
+                add_dirs: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        carry(&pool, from, to).await.unwrap();
+
+        let row: (Option<String>, Option<String>, String) =
+            sqlx::query_as("SELECT agent_id, team_id, tools FROM run_loadout WHERE run_id = ?")
+                .bind(to)
+                .fetch_one(&pool)
+                .await
+                .expect("the successor has a run_loadout row");
+        assert_eq!(row.0.as_deref(), Some("a"));
+        assert_eq!(row.1.as_deref(), Some("x"));
+        let stored: Vec<String> = serde_json::from_str(&row.2).unwrap();
+        assert_eq!(
+            stored, tools,
+            "the successor keeps every tool the predecessor had"
+        );
+        assert!(
+            crate::tool_loadout::run_lists_tool(&pool, to, "web_read")
+                .await
+                .unwrap()
+        );
+
+        carry(&pool, bare_from, bare_to).await.unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_loadout WHERE run_id = ?")
+            .bind(bare_to)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "no predecessor row, no successor row");
     }
 
     #[test]

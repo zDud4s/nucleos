@@ -1873,6 +1873,14 @@ async fn prepare_handoff_successor(
         }
     }
 
+    // The tools follow the work too: `create_run_with` froze them into `run_loadout` for the
+    // predecessor only, and a successor without the row falls back to its box's base tools,
+    // losing any extra (an approved `web_read`, say) halfway through the same task. Not fatal,
+    // like the write it copies: a missed copy fails closed.
+    if let Err(error) = crate::loadout::carry(pool, run_id, successor_id).await {
+        tracing::warn!(run_id = successor_id, %error, "could not carry a run's loadout");
+    }
+
     // And the conflict follows its resolver, exactly as it does across `resume_approved_run`. Both
     // callers reach here after the predecessor's terminal write, so a link left on it names a run
     // that reads `completed`. `resolver.rs` asks both of its questions by joining this column onto a
@@ -4763,6 +4771,13 @@ async fn continue_paused_run(
     .await?;
 
     tx.commit().await?;
+
+    // The resume continues the paused run's work, so it keeps the tools that run was frozen with,
+    // like the handoff successor (`prepare_handoff_successor`). After the commit, for the same
+    // reason as the token below. A missed copy fails closed.
+    if let Err(error) = crate::loadout::carry(&state.pool, original_run_id, resume_id).await {
+        tracing::warn!(run_id = resume_id, %error, "could not carry a run's loadout");
+    }
 
     // After the commit, because the resume row does not exist to be UPDATEd before it.
     let daemon_token = mint_run_token(&state.pool, resume_id).await;
@@ -9086,6 +9101,95 @@ pub mod tests {
             .expect("the run was over the threshold and had no successor yet");
 
         assert!(!successor.steerable);
+    }
+
+    /// Freezes `tools` as `run_id`'s loadout, as `create_run_with` does for a job node.
+    async fn seed_run_loadout(pool: &sqlx::SqlitePool, run_id: i64, tools: &str) {
+        sqlx::query(
+            "INSERT INTO run_loadout (run_id, agent_id, team_id, tools, resolved_at)
+             VALUES (?, 'agent-l', NULL, ?, '2026-10-10T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(tools)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn run_loadout_tools(pool: &sqlx::SqlitePool, run_id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT tools FROM run_loadout WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A handoff successor keeps the tools its predecessor was frozen with — an approved extra
+    /// included — and a predecessor with no row hands on none.
+    #[tokio::test]
+    async fn a_handoff_successor_keeps_the_predecessors_loadout() {
+        let pool = crate::testdb::fresh_pool().await;
+        for id in [43211, 43212] {
+            sqlx::query(
+                "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill, created_at)
+                 VALUES (?, 'project-s', 'the task', 'running', 'worktree', ?, '2026-10-10T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let tools = r#"["read_context","request_tool","web_read"]"#;
+        seed_run_loadout(&pool, 43211, tools).await;
+
+        let successor = prepare_handoff_successor(&pool, 43211)
+            .await
+            .unwrap()
+            .expect("the run was over the threshold and had no successor yet");
+        assert_eq!(
+            run_loadout_tools(&pool, successor.id).await.as_deref(),
+            Some(tools),
+            "the successor lost the tools its predecessor had"
+        );
+
+        let bare = prepare_handoff_successor(&pool, 43212)
+            .await
+            .unwrap()
+            .expect("the run was over the threshold and had no successor yet");
+        assert_eq!(run_loadout_tools(&pool, bare.id).await, None);
+    }
+
+    /// An approval resume keeps the paused run's tools, like the handoff successor above.
+    #[tokio::test]
+    async fn an_approval_resume_keeps_the_paused_runs_loadout() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (original_run_id, proposal_id, _worktree_path) =
+            seed_resumable_action_approval(&state, Some("sess-loadout")).await;
+        let tools = r#"["read_context","request_tool","web_read"]"#;
+        seed_run_loadout(&state.pool, original_run_id, tools).await;
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        assert_eq!(
+            run_loadout_tools(&state.pool, resume_id).await.as_deref(),
+            Some(tools),
+            "the resume lost the tools the paused run had"
+        );
+    }
+
+    /// And a paused run with no row resumes with none: the fallback stays closed.
+    #[tokio::test]
+    async fn an_approval_resume_of_a_run_without_a_loadout_writes_none() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (_original_run_id, proposal_id, _worktree_path) =
+            seed_resumable_action_approval(&state, Some("sess-no-loadout")).await;
+
+        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        assert_eq!(run_loadout_tools(&state.pool, resume_id).await, None);
     }
 
     /// owner, so the successor would ask for a SECOND slot while the predecessor still held the
