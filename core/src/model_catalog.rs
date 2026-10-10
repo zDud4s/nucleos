@@ -873,12 +873,12 @@ pub fn cached_or_fallback() -> Vec<Discovered> {
 }
 
 /// Whether a model answered by `runner` may be offered: the daemon's own menu follows the active
-/// runner; a rooted chat may use either CLI; an unrooted one the active runner, and never Codex.
+/// runner; any chat, rooted or not, may use either CLI (an unrooted Codex turn is hardened by
+/// `ToolPolicy::McpOnly` instead of being kept off the menu).
 pub fn admits(active_runner: &str, rooted: Option<bool>, runner: &str) -> bool {
     match rooted {
         None => runner == active_runner,
-        Some(true) => true,
-        Some(false) => runner == active_runner && runner != "codex",
+        Some(_) => true,
     }
 }
 
@@ -1176,10 +1176,12 @@ mod tests {
         // A rooted chat may use either CLI.
         assert!(admits("claude", Some(true), "codex"));
         assert!(admits("claude", Some(true), "claude"));
-        // An unrooted chat: the active runner, and never Codex.
+        // So may a chat with no project: Codex answers it under `McpOnly`, whatever runner the
+        // daemon itself runs on.
         assert!(admits("claude", Some(false), "claude"));
-        assert!(!admits("claude", Some(false), "codex"));
-        assert!(!admits("codex", Some(false), "codex"));
+        assert!(admits("claude", Some(false), "codex"));
+        assert!(admits("codex", Some(false), "codex"));
+        assert!(admits("codex", Some(false), "claude"));
     }
 
     #[test]

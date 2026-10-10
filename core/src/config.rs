@@ -255,15 +255,9 @@ impl ModelsConfig {
             })
     }
 
-    /// Returns the model catalogue available to a chat's rooted state.
-    pub fn catalogue_for_chat(&self, installed: &[String], rooted: bool) -> Vec<AssistantChoice> {
-        let mut choices = self.catalogue_scoped(installed, rooted);
-        if !rooted {
-            choices.retain(|choice| {
-                choice.brain != "cloud" || choice.runner.as_deref() != Some("codex")
-            });
-        }
-        choices
+    /// Returns the model catalogue a chat is offered: both CLIs, whether or not it has a project.
+    pub fn catalogue_for_chat(&self, installed: &[String]) -> Vec<AssistantChoice> {
+        self.catalogue_scoped(installed, true)
     }
 
     /// The model a conversation runs on when it has pinned none — what the runner was built with.
@@ -3058,7 +3052,7 @@ mod tests {
             assistant_choices: chat_choices(),
             ..ModelsConfig::default()
         };
-        let chat_catalogue = config.catalogue_for_chat(&[], true);
+        let chat_catalogue = config.catalogue_for_chat(&[]);
         let offered: Vec<&str> = chat_catalogue
             .iter()
             .map(|choice| choice.id.as_str())
@@ -3074,18 +3068,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unrooted_chat_is_never_offered_a_codex_model() {
+    fn every_chat_is_offered_both_clis() {
         for primary_runner in [None, Some("codex".to_string())] {
             let config = ModelsConfig {
-                primary_runner,
+                primary_runner: primary_runner.clone(),
                 assistant_choices: chat_choices(),
                 ..ModelsConfig::default()
             };
+            let catalogue = config.catalogue_for_chat(&[]);
+            let offered: Vec<&str> = catalogue.iter().map(|choice| choice.id.as_str()).collect();
             assert!(
-                config
-                    .catalogue_for_chat(&[], false)
-                    .iter()
-                    .all(|choice| choice.runner.as_deref() != Some("codex"))
+                offered.contains(&"sonnet"),
+                "primary_runner {primary_runner:?}: Claude must be offered: {offered:?}"
+            );
+            assert!(
+                offered.contains(&"gpt-5.5"),
+                "primary_runner {primary_runner:?}: Codex must be offered: {offered:?}"
             );
         }
     }

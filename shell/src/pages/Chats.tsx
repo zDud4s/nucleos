@@ -2328,7 +2328,6 @@ function ModelMenu({
   // The agent-CLI section is drawn from the daemon's discovered, grouped list when it has one.
   const grouped = useModelGroups(chatId).data;
   const groups = grouped?.groups;
-  const needsRoot = new Set(grouped?.needs_root ?? []);
   const localModel = useLocalModel();
   const localUnavailable = localModel.data?.available === false;
   const pull = useLocalPull();
@@ -2432,26 +2431,11 @@ function ModelMenu({
                       aria-label={group.label}
                     >
                       {(index > 0 || defaultHere) && <DropdownMenuSeparator />}
-                      {group.models.map((choice) => {
-                        const closed = needsRoot.has(choice.id);
-                        return (
-                          <DropdownMenuRadioItem
-                            key={choice.id}
-                            value={choice.id}
-                            disabled={closed}
-                          >
-                            {choice.label}
-                            {closed && (
-                              /* Listed and closed rather than left out: Codex answers only in a
-                                 conversation rooted in a project with the classifier hook wired,
-                                 and a vendor missing from the menu reads as a missing feature. */
-                              <span className="chats-tool-why">
-                                needs a project with the hook wired
-                              </span>
-                            )}
-                          </DropdownMenuRadioItem>
-                        );
-                      })}
+                      {group.models.map((choice) => (
+                        <DropdownMenuRadioItem key={choice.id} value={choice.id}>
+                          {choice.label}
+                        </DropdownMenuRadioItem>
+                      ))}
                     </DropdownMenuGroup>
                   ))}
                 </DropdownMenuRadioGroup>

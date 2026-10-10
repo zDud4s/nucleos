@@ -547,9 +547,6 @@ export interface ModelGroup {
 /** `GET /assistant/models/groups`. */
 export interface ModelGroups {
   groups: ModelGroup[];
-  /** Ids listed but not pickable here: Codex models, which need a conversation rooted in a
-   * project with the classifier hook wired. Absent from an older daemon. */
-  needs_root?: string[];
   /** Where the list came from: `live` (a vendor API, with a key), `keyless` (the Codex CLI's
    * cache or models.dev) or `fallback` (the versioned built-in list). */
   source: string;

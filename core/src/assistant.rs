@@ -3135,18 +3135,6 @@ fn system_prompt_with_knowledge(
     }
 }
 
-/// Whether a rooted shell conversation may answer through Codex.
-pub fn may_answer_on_codex(cwd: Option<&str>) -> bool {
-    tool_policy_for(
-        cwd,
-        Origin::Shell,
-        cwd.is_some_and(|directory| {
-            crate::autopilot::classifier_hook_is_wired(std::path::Path::new(directory))
-        }),
-        false,
-    ) == crate::runner::ToolPolicy::Unrestricted
-}
-
 /// Everything one orchestrator turn is launched with.
 ///
 /// A struct rather than a row of parameters, for the reason `RunRequest` gives about its own: at
@@ -4205,16 +4193,6 @@ mod tests {
             assert!(Arc::ptr_eq(&runner, &daemon), "{pinned:?}");
             assert_eq!(cli, "claude", "{pinned:?}");
         }
-    }
-
-    #[test]
-    fn only_a_rooted_conversation_may_answer_on_codex() {
-        assert!(!may_answer_on_codex(None));
-        let root = tempfile::TempDir::new().unwrap();
-        let cwd = root.path().to_str().unwrap();
-        assert!(!may_answer_on_codex(Some(cwd)));
-        crate::autopilot::wire_classifier_hook(root.path()).unwrap();
-        assert!(may_answer_on_codex(Some(cwd)));
     }
 
     #[test]

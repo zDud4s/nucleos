@@ -101,4 +101,7 @@ libc = "0.2"
 [dev-dependencies]
 nucleos-core = { path = ".", features = ["testkit"] }
 tempfile = "3.27.0"
+# `runner::tests::codex_deny_matcher_denies_everything_but_the_daemons_tools` compiles the generated
+# deny-hook matcher; the daemon itself never needs a regex engine for it.
+regex = "1"
 sqlx = { version = "0.9.0", features = ["sqlite-deserialize"] }
