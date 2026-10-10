@@ -61,7 +61,13 @@ declare module "@tanstack/history" {
   }
 }
 
-export function RemoveProject({ id, projectId, projectRoot, onDone, onCancel }: RemoveProjectProps) {
+export function RemoveProject({
+  id,
+  projectId,
+  projectRoot,
+  onDone,
+  onCancel,
+}: RemoveProjectProps) {
   const record = useProjectRecord(projectId);
   const removal = useRemoveProject();
   const [forget, setForget] = useState(false);
@@ -105,9 +111,9 @@ export function RemoveProject({ id, projectId, projectRoot, onDone, onCancel }: 
       role="group"
       aria-label={`Remove ${projectId} from NucleOS`}
       onKeyDown={onKeyDown}
-      className="flex flex-col gap-3 rounded-md border border-border bg-surface-sunken p-3"
+      className="flex flex-col gap-4"
     >
-      <p id={consequenceId} className="max-w-prose text-sm text-text">
+      <p id={consequenceId} className="text-sm leading-relaxed text-text-muted">
         {/*
           The folder first, because it is the thing somebody is afraid of. A control called `remove`
           sitting on a page full of paths reads as "delete that" until it says otherwise, and the
@@ -121,8 +127,8 @@ export function RemoveProject({ id, projectId, projectRoot, onDone, onCancel }: 
           <>This project has no folder named, so there is no folder for this to touch. </>
         ) : (
           <>
-            The folder <code className="font-mono text-xs">{projectRoot}</code> stays exactly where
-            it is.{" "}
+            The folder <code className="font-mono text-xs text-text">{projectRoot}</code> stays
+            exactly where it is.{" "}
           </>
         )}
         {forgetting ? (
@@ -152,16 +158,18 @@ export function RemoveProject({ id, projectId, projectRoot, onDone, onCancel }: 
       ) : has === null ? (
         <p className="text-xs text-text-muted">{projectId} has nothing on record.</p>
       ) : (
-        <label className="flex max-w-prose items-baseline gap-2 text-sm text-text-muted">
+        <label className="ws-dialog-option">
           <input
             type="checkbox"
             checked={forget}
             onChange={(event) => setForget(event.target.checked)}
-            className="mt-0.5"
           />
-          <span>
-            {projectId} has {has} on record. <span className="text-text">Forget those too</span> —
-            otherwise they stay, and adding the project again finds them where they were.
+          <span className="flex flex-col gap-0.5">
+            <span className="font-medium text-text">Forget its history too</span>
+            <span>
+              {projectId} has {has} on record. Left unticked they stay, and adding the project again
+              finds them where they were.
+            </span>
           </span>
         </label>
       )}
@@ -172,9 +180,9 @@ export function RemoveProject({ id, projectId, projectRoot, onDone, onCancel }: 
         not have to press a button in order to be told they could not.
       */}
       {held !== null && (
-        <p className="max-w-prose text-xs text-tone-paused-fg">
-          Work is still in flight here — {held}. Removing waits until it finishes; nothing here would
-          stop it.
+        <p className="ws-dialog-note">
+          Work is still in flight here — {held}. Removing waits until it finishes; nothing here
+          would stop it.
         </p>
       )}
 
@@ -201,10 +209,14 @@ export function RemoveProject({ id, projectId, projectRoot, onDone, onCancel }: 
           <ErrorNote>the núcleo did not answer — nothing was removed</ErrorNote>
         ))}
 
-      <div className="flex flex-wrap items-center gap-2">
+      {/* Drawn inside a modal: the answer row on its bottom edge, right-aligned, the act last. */}
+      <div className="ws-dialog-actions">
+        <Button variant="ghost" onClick={onCancel}>
+          cancel
+        </Button>
         {forgetting ? (
           <ConfirmButton
-            variant="danger"
+            variant="danger-solid"
             label={removal.isPending ? "removing…" : "remove and forget"}
             confirmLabel={`delete ${has} for good`}
             subject={projectId}
@@ -213,13 +225,10 @@ export function RemoveProject({ id, projectId, projectRoot, onDone, onCancel }: 
             onConfirm={remove}
           />
         ) : (
-          <Button variant="danger" disabled={disabled} onClick={remove}>
+          <Button variant="danger-solid" disabled={disabled} onClick={remove}>
             {removal.isPending ? "removing…" : "remove"}
           </Button>
         )}
-        <Button variant="quiet" onClick={onCancel}>
-          cancel
-        </Button>
       </div>
     </div>
   );

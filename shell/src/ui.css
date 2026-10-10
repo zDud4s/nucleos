@@ -2757,8 +2757,10 @@ ol.ui-well {
 .ui-modal-body {
   min-height: 0;
   overflow-y: auto;
-  margin-top: var(--space-4);
-  padding: 0 var(--space-5);
+  /* A scrolling box clips what crosses its edge, focus rings included: the first field's ring was
+     cut off under the title. Room for the ring inside, taken back from the margin outside. */
+  margin-top: calc(var(--space-4) - var(--space-1));
+  padding: var(--space-1) var(--space-5);
 }
 
 .ui-modal-foot {
