@@ -500,3 +500,42 @@ func TestANavigationThatFailsForRealIsStillAnError(t *testing.T) {
 		t.Fatal("a browser that could not resolve a name reported success")
 	}
 }
+
+// TestVisibleAgentModePopupIsClosedPausedAndNeverResumed. A visible window changes nothing for the
+// agent: its popup is closed while still paused on the debugger (spike G4d: a resumed page has already
+// run its first script) and the popup's session is never told to run.
+func TestVisibleAgentModePopupIsClosedPausedAndNeverResumed(t *testing.T) {
+	fake, conn := dial(t)
+	autoAttachOnCreate(fake)
+	driver, err := Connect(context.Background(), conn, projectPolicy())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	driver.MakeVisible(func(bool) {})
+	session, err := driver.Open(context.Background(), browser.OpenRequest{URL: "https://example.org/"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	before := driver.refusalCount()
+	fake.Emit("", "Target.attachedToTarget", map[string]any{
+		"sessionId": "S2",
+		"targetInfo": map[string]any{
+			"targetId": "T2",
+			"type":     "page",
+			"openerId": "T1",
+			"url":      "",
+		},
+		"waitingForDebugger": true,
+	})
+
+	waitForCall(t, fake, "Target.closeTarget")
+	for _, call := range callsTo(fake, "Runtime.runIfWaitingForDebugger") {
+		if call.Session == "S2" {
+			t.Errorf("the agent's popup was resumed before it was closed: %v", fake.Methods())
+		}
+	}
+	if refusal := driver.refusalFor(context.Background(), session.ID, before); refusal == nil {
+		t.Error("the popup was closed without telling the session that opened it")
+	}
+}

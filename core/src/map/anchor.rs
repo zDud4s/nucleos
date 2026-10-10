@@ -3211,7 +3211,7 @@ mod tests {
         ),
         ("core/src/browser.rs", "2026-08-15-pilar-de-browser-design"),
         (
-            "core/src/browser_policy.rs",
+            "core/crates/nucleos-base/src/browser_policy.rs",
             "2026-08-15-pilar-de-browser-design",
         ),
         (
@@ -3222,7 +3222,10 @@ mod tests {
             "core/src/integrations/web.rs",
             "2026-08-01-pilar-de-web-design",
         ),
-        ("core/src/web_client.rs", "2026-08-01-pilar-de-web-design"),
+        (
+            "core/crates/nucleos-base/src/web_client.rs",
+            "2026-08-01-pilar-de-web-design",
+        ),
         ("core/src/execution/vcs.rs", "2026-08-02-fila-vcs-design"),
         (
             "core/src/execution/git_exec.rs",

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nucleosbrowser/browser"
@@ -57,6 +58,9 @@ type Proxy struct {
 	// dialer is where every upstream connection is opened, the tunnel's and the transport's alike,
 	// so the address a name resolved to is vetted on both paths. See [Dialer].
 	dialer *Dialer
+	// person is the person's switch: while on, the proxy forwards what Decide/DecideTunnel would
+	// refuse. The Dialer stays, so a loopback or private destination is still vetted.
+	person atomic.Bool
 
 	mu       sync.Mutex
 	refusals []ProxyRefusal
@@ -105,6 +109,9 @@ func NewProxy(policy Policy) (*Proxy, error) {
 	return proxy, nil
 }
 
+// SetPerson turns the person's switch on or off. See the person field.
+func (p *Proxy) SetPerson(on bool) { p.person.Store(on) }
+
 // Addr is the "127.0.0.1:port" to put on Chrome's command line.
 func (p *Proxy) Addr() string { return p.listener.Addr().String() }
 
@@ -151,11 +158,14 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	// requests are documents and which act is in flight. Both are left to the layer that can see, and
 	// Decide branches on the empty string to say so. See decideWrite for what this layer still
 	// answers, and for the gate run that found the two layers disagreeing.
-	verdict := Decide(p.policy, Request{
-		Method:  r.Method,
-		URL:     r.URL.String(),
-		Headers: flattenHeaders(r.Header),
-	})
+	verdict := Verdict{Allow: true}
+	if !p.person.Load() {
+		verdict = Decide(p.policy, Request{
+			Method:  r.Method,
+			URL:     r.URL.String(),
+			Headers: flattenHeaders(r.Header),
+		})
+	}
 	if !verdict.Allow {
 		p.refuse(w, r.URL.String(), verdict)
 		return
@@ -166,9 +176,11 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 
 // tunnel answers CONNECT. See [DecideTunnel] for why the rule is as thin as it is.
 func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
-	if verdict := DecideTunnel(p.policy, r.Host); !verdict.Allow {
-		p.refuse(w, r.Host, verdict)
-		return
+	if !p.person.Load() {
+		if verdict := DecideTunnel(p.policy, r.Host); !verdict.Allow {
+			p.refuse(w, r.Host, verdict)
+			return
+		}
 	}
 
 	upstream, err := p.dialer.DialContext(r.Context(), "tcp", r.Host)

@@ -3,7 +3,7 @@
 //! Run from inside a worktree, it asks the RUNNING daemon to verify that worktree
 //! (`POST /verify` with `kind: test, scope: scope, cover: true, wait: false`, so the ticket id comes
 //! back at once), follows the ticket through `/verify/status` up to a wait limit, prints one line per unit (plus the tail of every
-//! red unit) and turns the verdict into an exit code. The daemon does the work; this is the thin
+//! red unit, the ticket's note and the files no unit covers) and turns the verdict into an exit code. The daemon does the work; this is the thin
 //! client that makes it reachable from a shell, a hook or a script, so the logic of "ask, follow,
 //! render, map" lives here, testable against an in-process server, and `main.rs` only gathers the
 //! token, the cwd and the arguments.
@@ -41,7 +41,8 @@ usage: nucleos-core --verify [--verify-wait <secs>]
 
 Asks the running daemon to verify the worktree this command is run from, with covered
 verification (the daemon picks the base), and waits for the verdict. It never starts a daemon.
-Prints one line per unit, and the tail of every unit that failed.
+Prints one line per unit, the tail of every unit that failed, the ticket's note and the files
+no unit covers.
 
   --verify-wait <secs>   longest the whole run may take, in whole seconds (also --verify-wait=<secs>).
                          Else the NUCLEOS_VERIFY_WAIT environment variable, else 3600.
@@ -82,6 +83,47 @@ pub fn wait_limit(args: &[String], env: Option<&str>) -> Result<Duration, String
     match env {
         Some(value) => parse_seconds(value, "NUCLEOS_VERIFY_WAIT"),
         None => Ok(DEFAULT_WAIT),
+    }
+}
+
+/// What the command line asks of `--verify`, decided from the arguments alone so `main` only maps
+/// it to a print or an exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Invocation {
+    /// No `--verify` or `--verify-*` argument: not this command's call, `main` moves on.
+    NotVerify,
+    /// `--help` beside a `--verify` flag: print [`USAGE`], exit 0.
+    Help,
+    /// A `--verify-*` flag without `--verify` itself: a usage error, answered with the usage and
+    /// [`EXIT_NOT_VERIFIED`], contacting nothing.
+    NeedsVerify,
+    /// The wait limit was refused (the reason): usage and [`EXIT_NOT_VERIFIED`].
+    BadWait(String),
+    /// Verify the current worktree, waiting up to this long.
+    Run(Duration),
+}
+
+/// Decide what the arguments ask of `--verify`, in this order: no `--verify` and no `--verify-*`
+/// spelling is not this command's call; `--help` anywhere wins over everything else; a `--verify-*`
+/// flag without `--verify` is a usage error (it used to fall past `main`'s block and every other
+/// one, and start a daemon, the same bug class as the `--land=` note in `main.rs`); then the wait
+/// limit ([`wait_limit`]) is read, and a refusal is [`Invocation::BadWait`].
+pub fn invocation(args: &[String], env_wait: Option<&str>) -> Invocation {
+    if !args
+        .iter()
+        .any(|a| a == "--verify" || a.starts_with("--verify-"))
+    {
+        return Invocation::NotVerify;
+    }
+    if args.iter().any(|a| a == "--help") {
+        return Invocation::Help;
+    }
+    if !args.iter().any(|a| a == "--verify") {
+        return Invocation::NeedsVerify;
+    }
+    match wait_limit(args, env_wait) {
+        Ok(limit) => Invocation::Run(limit),
+        Err(reason) => Invocation::BadWait(reason),
     }
 }
 
@@ -143,11 +185,26 @@ fn render_units(ticket: &Value) -> String {
     out
 }
 
-/// The listing of a finished ticket: its units, then the verdict and the ticket it belongs to.
+/// The listing of a finished ticket: its units, the ticket's note and the files no unit covers
+/// (each only when there is one), then the verdict and the ticket it belongs to.
 pub fn render(ticket: &Value) -> String {
     let id = ticket["ticket"].as_i64().unwrap_or_default();
     let verdict = ticket["verdict"].as_str().unwrap_or("none");
-    format!("{}verdict: {verdict} (ticket {id})\n", render_units(ticket))
+    let mut out = render_units(ticket);
+    if let Some(note) = ticket["note"].as_str().filter(|note| !note.is_empty()) {
+        out.push_str(&format!("note: {note}\n"));
+    }
+    if let Some(unclaimed) = ticket["unclaimed"]
+        .as_array()
+        .filter(|list| !list.is_empty())
+    {
+        out.push_str("unclaimed (no unit covers these files):\n");
+        for path in unclaimed.iter().filter_map(Value::as_str) {
+            out.push_str(&format!("    {path}\n"));
+        }
+    }
+    out.push_str(&format!("verdict: {verdict} (ticket {id})\n"));
+    out
 }
 
 fn not_verified(reason: &str) -> Outcome {
@@ -439,6 +496,94 @@ mod tests {
             outcome.stdout.contains("verdict: passed") && outcome.stdout.contains("41"),
             "the verdict and the ticket close the listing: {:?}",
             outcome.stdout
+        );
+    }
+
+    /// **A finished ticket's listing carries its note and the files no unit covers, before the
+    /// verdict line.**
+    #[tokio::test]
+    async fn a_finished_ticket_prints_the_note_and_the_unclaimed_files() {
+        let mut finished = ticket(
+            43,
+            true,
+            Some("passed"),
+            vec![unit(Some("core"), &["cargo", "test"], "passed", None)],
+        );
+        finished["note"] = json!("every group runs: paths no group claims");
+        finished["unclaimed"] = json!(["README.md", "docs/notes.md"]);
+        let url = answering(finished).await;
+
+        let outcome = run(&client(url), WORKTREE, Duration::from_secs(30)).await;
+
+        assert_eq!(
+            outcome.code, EXIT_PASSED,
+            "stderr said {:?}",
+            outcome.stderr
+        );
+        let stdout = &outcome.stdout;
+        let verdict = stdout
+            .find("verdict: passed")
+            .unwrap_or_else(|| panic!("no verdict line in {stdout:?}"));
+        for needle in [
+            "every group runs: paths no group claims",
+            "README.md",
+            "docs/notes.md",
+        ] {
+            let at = stdout
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from {stdout:?}"));
+            assert!(
+                at < verdict,
+                "{needle:?} must come before the verdict line: {stdout:?}"
+            );
+        }
+    }
+
+    /// **The argument decision is pure: what `main` does is read off [`invocation`] alone.**
+    #[test]
+    fn the_invocation_is_decided_from_the_arguments_alone() {
+        assert_eq!(
+            invocation(&args(&["nucleos-core", "--land"]), None),
+            Invocation::NotVerify,
+            "a call that names no --verify flag is not this command's"
+        );
+        assert_eq!(
+            invocation(&args(&["nucleos-core", "--verify", "--help"]), None),
+            Invocation::Help
+        );
+        assert_eq!(
+            invocation(
+                &args(&["nucleos-core", "--verify-wait", "30", "--help"]),
+                None
+            ),
+            Invocation::Help,
+            "--help wins even beside a bare --verify-* flag"
+        );
+        assert_eq!(
+            invocation(&args(&["nucleos-core", "--verify-wait", "30"]), None),
+            Invocation::NeedsVerify
+        );
+        assert_eq!(
+            invocation(&args(&["nucleos-core", "--verify-wait=30"]), None),
+            Invocation::NeedsVerify
+        );
+        assert!(
+            matches!(
+                invocation(
+                    &args(&["nucleos-core", "--verify", "--verify-wait", "0"]),
+                    None
+                ),
+                Invocation::BadWait(_)
+            ),
+            "a zero wait is refused"
+        );
+        assert_eq!(
+            invocation(&args(&["nucleos-core", "--verify"]), Some("120")),
+            Invocation::Run(Duration::from_secs(120))
+        );
+        assert_eq!(
+            invocation(&args(&["nucleos-core", "--verify"]), None),
+            Invocation::Run(DEFAULT_WAIT)
         );
     }
 

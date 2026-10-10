@@ -182,6 +182,10 @@ struct BrowserOpenParams {
     project_id: String,
     /// The page to open. https only.
     url: String,
+    /// True opens a window the person can see, with a chat panel on the right, on the project's
+    /// profile; use it when the person will take part. Default headless.
+    #[serde(default)]
+    visible: Option<bool>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -1173,13 +1177,23 @@ impl NucleosTools {
                        which means the page was not loaded at all. `still_loading` means the \
                        page had not finished arriving in the time it was given - a snapshot \
                        then may be short because the page is not all there yet, not because \
-                       the page is empty."
+                       the page is empty. Pass `visible: true` only when the person will take \
+                       part: it opens a window they can see, with a chat panel, on the \
+                       project's profile."
     )]
     async fn browser_open(
         &self,
-        Parameters(BrowserOpenParams { project_id, url }): Parameters<BrowserOpenParams>,
+        Parameters(BrowserOpenParams {
+            project_id,
+            url,
+            visible,
+        }): Parameters<BrowserOpenParams>,
     ) -> String {
-        json_result(self.client.browser_open(&project_id, &url).await)
+        json_result(
+            self.client
+                .browser_open(&project_id, &url, visible.unwrap_or(false))
+                .await,
+        )
     }
 
     #[tool(

@@ -45,6 +45,9 @@ type Options struct {
 	// DefaultCacheMB rather than meaning "unlimited": profiles.Admit bounds how many profiles there
 	// are and how much they hold together, and nothing else bounds how much ONE of them grows.
 	CacheMB int
+	// Visible runs the agent's browser headful (agent mode only; ignored in human mode). The fence
+	// is unchanged: proxy, bypass list and about:blank all stay.
+	Visible bool
 }
 
 // DefaultCacheMB matches the value spec §8 ships in `~/.nucleos/browser.yaml`.
@@ -101,22 +104,20 @@ func Args(opts Options) ([]string, error) {
 		return nil, ErrNoProxy
 	}
 
-	return append(args,
-		// Spec §4.1: there is no third rendering state. Agent mode is headless, full stop — a
-		// window rendering where nobody can see it was rejected on both security and VRAM grounds.
-		"--headless=new",
+	if !opts.Visible {
+		// Spec §4.1: there is no third rendering state. Agent mode is headless unless the panel
+		// asked for a visible one — a window rendering where nobody asked was rejected on both
+		// security and VRAM grounds.
+		args = append(args, "--headless=new")
+	}
 
+	args = append(args,
 		// The fence's choke point. SPIKE FINDING: the proxy sees a WebSocket handshake as
 		// `CONNECT host:port` and can refuse it, which is a channel CDP could not see at all.
 		"--proxy-server=http://"+opts.ProxyAddr,
 		// Loopback is bypassed unless this is set, and the fence has to see loopback too —
 		// otherwise a page reaching 127.0.0.1 walks straight past it.
 		"--proxy-bypass-list=<-loopback>",
-
-		// Spec §5.4, measured: window.open returns null and no target is created. The cleaner of
-		// the two mechanisms — the other one is auto-attach, which works but leaves a target to
-		// reason about.
-		"--block-new-web-contents",
 
 		// The startup page, and it is here for a measured reason rather than for tidiness. Without
 		// it Chrome opens the New Tab Page, whose OneGoogle module and logging reach
@@ -133,7 +134,16 @@ func Args(opts Options) ([]string, error) {
 		// Agent mode only. A person's window starting on a blank page instead of their New Tab Page
 		// would be taking something away from them to solve a problem that is not theirs.
 		"about:blank",
-	), nil
+	)
+
+	if !opts.Visible {
+		// Spec §5.4, measured: window.open returns null and no target is created. The cleaner of
+		// the two mechanisms — the other one is auto-attach, which works but leaves a target to
+		// reason about. Omitted when Visible (spec §4.1/§7): new windows in a visible agent
+		// session rely on the driver's paused close instead.
+		args = append(args, "--block-new-web-contents")
+	}
+	return args, nil
 }
 
 // WebRTCIsNotClosedByAnyFlag documents, in the place a reader looking at the command line will

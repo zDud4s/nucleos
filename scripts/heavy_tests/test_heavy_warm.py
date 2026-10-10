@@ -487,7 +487,13 @@ class WarmTests(unittest.TestCase):
     # 7
     def test_a_prio2_waiter_on_the_worktree_lock_lifts_the_warm(self) -> None:
         self.fill_capacity()
-        rc, out, _ = self.warm(self.repo_a, capacity=2)
+        # The lifted warm is admitted and then, by design (test 10), preempted for the very
+        # waiter that lifted it: the yield watcher asks every 2 polls. Under load the fake
+        # needs more than the default 0.2 s to write its marker, and a warm killed before
+        # that looks as if it was never admitted ("no-run never started"). Only the warm's
+        # own broker gets the slow poll, so its first yield check comes 3 s after it starts
+        # and the marker is long written; the other brokers keep polling fast.
+        rc, out, _ = self.warm(self.repo_a, capacity=2, NUCLEOS_HEAVY_POLL_S="1.5")
         self.assertEqual(rc, 0, out)
         self.assert_queued_prio(3)
         # A prio-2 request for ANOTHER worktree, queued after the warm: without inheritance

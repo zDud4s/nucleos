@@ -118,3 +118,54 @@ func TestAnElementWithNoSizeIsNotClicked(t *testing.T) {
 		t.Errorf("%d mouse events were sent at an element that is not on the page", len(sent))
 	}
 }
+
+// TestActRefusesAClickInThePanelStrip. The panel covers the right edge of a visible window: 360 css
+// pixels, 28 when collapsed. A click there would land on the panel and not on the page, so it is
+// refused by name before anything is sent, and the strip's width follows the panel's own state.
+func TestActRefusesAClickInThePanelStrip(t *testing.T) {
+	fake, driver, _ := visiblePersonDriver(t)
+	id := opened(t, driver).ID
+	driver.mu.Lock()
+	entry := driver.sessions[id]
+	entry.refs["e1"] = nodeKey{session: entry.cdp, backend: 42}
+	panel := entry.panel
+	driver.mu.Unlock()
+	if panel == nil {
+		t.Fatal("a visible session has no panel state")
+	}
+	fake.Handle("DOM.resolveNode", func(cdptest.Call) (any, error) {
+		return map[string]any{"object": map[string]any{"objectId": "O1"}}, nil
+	})
+	fake.Handle("Page.getLayoutMetrics", func(cdptest.Call) (any, error) {
+		return map[string]any{"cssVisualViewport": map[string]any{"clientWidth": 1000, "clientHeight": 800}}, nil
+	})
+	fake.Handle("Runtime.callFunctionOn", func(cdptest.Call) (any, error) {
+		return aimAnswer(`{"x":900,"y":48,"sized":true,"reached":true,"on_top":""}`), nil
+	})
+
+	// 900 >= 1000-360: inside the open panel.
+	result := act(t, driver, id, browser.Action{Kind: browser.ActionClick, Ref: "e1"})
+	if result.Outcome != browser.OutcomeRefused || result.Refusal == nil {
+		t.Fatalf("a click under the open panel came back as %q", result.Outcome)
+	}
+	if result.Refusal.Consequence != browser.ConsequenceNotApplicable {
+		t.Errorf("the consequence is %q, want not-applicable", result.Refusal.Consequence)
+	}
+	if !strings.Contains(result.Refusal.Detail, "the browser panel covers that point") {
+		t.Errorf("the refusal does not name the panel: %q", result.Refusal.Detail)
+	}
+	if sent := mouseEvents(fake); len(sent) != 0 {
+		t.Fatalf("%d mouse events were sent into the panel strip", len(sent))
+	}
+
+	// Collapsed, the strip is 28 wide and 900 < 1000-28 is the page again.
+	panel.mu.Lock()
+	panel.collapsed = true
+	panel.mu.Unlock()
+	if result := act(t, driver, id, browser.Action{Kind: browser.ActionClick, Ref: "e1"}); result.Outcome != browser.OutcomeDone {
+		t.Fatalf("a click left of the collapsed strip was refused: %+v", result.Refusal)
+	}
+	if sent := mouseEvents(fake); len(sent) != 3 {
+		t.Errorf("the click sent %d mouse events, want 3", len(sent))
+	}
+}

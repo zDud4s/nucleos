@@ -524,3 +524,42 @@ func TestAGuardedDialConnectsToTheAddressItVetted(t *testing.T) {
 		t.Fatalf("a link-local literal was not refused: %v", err)
 	}
 }
+
+// TestProxyPersonSwitchLetsAnOffListRequestThroughOnlyWhileOn. The panel lifts the fence for the
+// person in-process: while the switch is on, a request the policy refuses is forwarded; the moment it
+// is off again the same request is refused. Without the first and last legs a proxy that ignored the
+// switch, or one that never turned it back, would pass.
+func TestProxyPersonSwitchLetsAnOffListRequestThroughOnlyWhileOn(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "hello")
+	}))
+	defer origin.Close()
+
+	// The policy admits no loopback origin, so the test server is off-list.
+	proxy := startProxy(t, Policy{Profile: Ephemeral})
+	client := throughProxy(t, proxy)
+
+	statusOf := func() int {
+		t.Helper()
+		response, err := client.Get(origin.URL)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		defer response.Body.Close()
+		_, _ = io.Copy(io.Discard, response.Body)
+		return response.StatusCode
+	}
+
+	if got := statusOf(); got != http.StatusForbidden {
+		t.Fatalf("an off-list GET before the switch: status %d, want 403", got)
+	}
+	proxy.SetPerson(true)
+	if got := statusOf(); got != http.StatusOK {
+		t.Errorf("an off-list GET while the person drives: status %d, want 200", got)
+	}
+	proxy.SetPerson(false)
+	if got := statusOf(); got != http.StatusForbidden {
+		t.Errorf("an off-list GET after the switch went off: status %d, want 403", got)
+	}
+}

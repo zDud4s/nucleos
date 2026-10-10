@@ -66,6 +66,7 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 	mux.HandleFunc("/watch", authorized(cfg.DaemonToken, watchHandler(watcher)))
 
 	personRoutes(mux, cfg.DaemonToken, driver)
+	panelRoutes(mux, cfg.DaemonToken, driver)
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
@@ -553,6 +554,10 @@ func writeDriverError(w http.ResponseWriter, verb string, err error) {
 		// 409 and not 403: nothing is wrong with the request, and it may well succeed later. The
 		// wheel is with a person, and spec §4.4 rule 2 puts no bound on how long that lasts.
 		http.Error(w, "a person is driving this profile", http.StatusConflict)
+	case errors.Is(err, browser.ErrVisibilityConflict):
+		// 409, like the person-driving arm: the request is fine and succeeds once the profile's
+		// other browser has no session left.
+		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, browser.ErrTooManySessions):
 		// The REASON in the body, like ErrNotInstalled above, because the ceiling is something the
 		// caller can act on: close a session. `~/.nucleos/browser.yaml` makes the same argument about
