@@ -2686,21 +2686,7 @@ pub async fn get_council(
         steps_by_seat.entry(seat_idx).or_default().push(view);
     }
 
-    let leaderboard_by_round: Vec<Vec<tally::BordaRow>> = ballots_by_round
-        .values()
-        .map(|ballots| tally::borda(ballots, &anon_map))
-        .collect();
-    let leaderboard = leaderboard_by_round.last().cloned().unwrap_or_default();
-    let agreement_by_round: Vec<tally::Agreement> = ballots_by_round
-        .values()
-        .map(|ballots| tally::agreement(ballots, &anon_map))
-        .collect();
-    // A negative round is not one this daemon writes; read as 0, as `step_view` does.
-    let ballot_rounds: Vec<u32> = ballots_by_round
-        .keys()
-        .map(|round| u32::try_from(*round).unwrap_or_default())
-        .collect();
-    let agreement = agreement_by_round.last().cloned();
+    let tallies = tally::by_round(&ballots_by_round, &anon_map);
 
     let (synthesis, synthesis_structured) = synthesis_text(pool, &row).await;
 
@@ -2721,11 +2707,11 @@ pub async fn get_council(
             })
             .collect(),
         anon_map,
-        agreement,
-        leaderboard,
-        leaderboard_by_round,
-        agreement_by_round,
-        ballot_rounds,
+        agreement: tallies.agreement,
+        leaderboard: tallies.leaderboard,
+        leaderboard_by_round: tallies.leaderboard_by_round,
+        agreement_by_round: tallies.agreement_by_round,
+        ballot_rounds: tallies.ballot_rounds,
         synthesis_run_id: row.chairman_run_id,
         synthesis,
         synthesis_structured,
