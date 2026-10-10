@@ -270,3 +270,78 @@ describe("the verdict's lines", () => {
     expect(court.dissenters(synthesis({ minority: "m" }))).toEqual(new Set());
   });
 });
+
+describe("the session court", () => {
+  const two = [
+    seat({ seat_idx: 0, ref: "gpt-5", role: "skeptic", steps: [step(), step({ round: 1, phase: "critique", status: "ok", critique: { reviews: [], ranking: ["B"] } as never })] }),
+    seat({ seat_idx: 1, ref: "opus", steps: [step(), step({ round: 1, phase: "critique", status: "pending", run_id: 9 })] }),
+  ];
+  const running = view({ current_round: 1, current_phase: "critique", anon_map: { A: 0, B: 1 }, seats: two });
+
+  it("masks seats with their anonymous letter in a critique, and only there", () => {
+    const c = court.buildSessionCourt(running, "live");
+    expect(c.seats.map((s) => [s.label, s.masked, s.name])).toEqual([["A", true, "gpt-5"], ["B", true, "opus"]]);
+    const opening = court.buildSessionCourt(running, { round: 0, phase: "answer" });
+    expect(opening.seats.map((s) => [s.label, s.masked])).toEqual([["gpt-5", false], ["opus", false]]);
+  });
+
+  it("centres the seats it shows and states each one", () => {
+    const c = court.buildSessionCourt(running, "live");
+    expect(c.seats.map((s) => s.state)).toEqual(["ok", "speaking"]);
+    expect(c.seats[0].x).toBeLessThan(280);
+    expect(c.seats[1].x).toBeGreaterThan(280);
+    expect(c.seats[0].sublabel).toBe("skeptic");
+  });
+
+  it("counts the ballots of the round's critique", () => {
+    expect(court.buildSessionCourt(running, "live").ballots).toMatchObject({ got: 1, total: 2 });
+    expect(court.buildSessionCourt(running, "live").ballots?.from).toHaveLength(1);
+    expect(court.buildSessionCourt(running, { round: 0, phase: "answer" }).ballots).toBeNull();
+  });
+
+  it("keeps the judge waiting until the synthesis, then speaking, then the verdict", () => {
+    expect(court.buildSessionCourt(running, "live").judge.state).toBe("waiting");
+    const writing = view({ ...running, current_phase: "synthesis" });
+    expect(court.buildSessionCourt(writing, "live").judge.state).toBe("speaking");
+    const done = view({ ...running, status: "done", current_phase: "synthesis", synthesis_structured: synthesis() });
+    expect(court.buildSessionCourt(done, "live").judge).toMatchObject({ state: "verdict", label: "VERDICT", sub: "confidence high" });
+  });
+
+  it("says where the session is on the right wing", () => {
+    expect(court.buildSessionCourt(running, "live").wing).toEqual({ title: "ROUND I · deliberation", sub: "1 of 2 seats" });
+    const done = view({ ...running, status: "done", rounds: 2, rounds_run: 2, stopped_early: true, current_phase: "synthesis", agreement: agreement(0.7, "strong") });
+    expect(court.buildSessionCourt(done, "live").wing.title).toBe("2 ROUNDS · strong consensus · stopped early");
+  });
+
+  it("draws one seat alone at 90° whose scales never leave insufficient", () => {
+    const one = view({ seats: [seat()], current_round: 1, current_phase: "critique" });
+    const c = court.buildSessionCourt(one, "live");
+    expect(c.seats[0].x).toBeCloseTo(280);
+    expect(c.balance.tone).toBe("insufficient");
+  });
+
+  it("turns an error council's unfinished steps cancelled and the judge red", () => {
+    const failed = view({ ...running, status: "error", error: "boom" });
+    const c = court.buildSessionCourt(failed, "live");
+    expect(c.seats.map((s) => s.state)).toEqual(["ok", "cancelled"]);
+    expect(c.judge.state).toBe("failed");
+  });
+
+  it("dims a cancelled council", () => {
+    expect(court.buildSessionCourt(view({ status: "cancelled" }), "live").dimmed).toBe(true);
+  });
+
+  it("sizes, ranks, links and marks dissent only at the verdict", () => {
+    const board = [{ seat_idx: 0, score: 1, n: 1 }, { seat_idx: 1, score: 0, n: 1 }];
+    const s = synthesis({ minority: "m", disagreements: [{ topic: "t", positions: [{ seats: [0], view: "a" }, { seats: [1, 1], view: "b" }] }] });
+    const done = view({ ...running, status: "done", current_phase: "synthesis", leaderboard: board,
+      leaderboard_by_round: [board], agreement_by_round: [agreement(1, "strong")], ballot_rounds: [1], agreement: agreement(1, "strong"),
+      synthesis_structured: s });
+    const c = court.buildSessionCourt(done, "live");
+    expect(c.seats.map((x) => [x.r, x.rank, x.dissent])).toEqual([[24, 1, true], [14, 2, false]]);
+    expect(c.links.map((l) => l.kind)).toEqual(["top", "dissent"]);
+    const mid = court.buildSessionCourt(done, { round: 1, phase: "critique" });
+    expect(mid.seats.map((x) => x.rank)).toEqual([null, null]);
+    expect(mid.links).toEqual([]);
+  });
+});

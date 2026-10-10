@@ -297,3 +297,142 @@ export function dissenters(synthesis: Synthesis | null): Set<number> {
   }
   return out;
 }
+
+/* ------------------------------------------------------------ session court -- */
+
+export interface CourtSeat {
+  key: string;            // seatKey(seat_idx) in session, `chair-${i}` in setup
+  index: number;          // seat_idx in session, chair index in setup
+  x: number; y: number; r: number;
+  /** What the chair shows: the anonymous letter in a critique, else the name; "+" when empty. */
+  label: string;
+  /** The real name, revealed on hover/focus when masked. */
+  name: string;
+  sublabel: string | null; // the role, drawn in lilac
+  state: SeatState;
+  reason: string | null;
+  masked: boolean;
+  rank: number | null;
+  dissent: boolean;
+  /** The step's run, for the dossier's tail while speaking. */
+  runId: number | null;
+  /** The step this seat took at the moment shown (session only): the dossier reads its text from here. */
+  step: StepView | undefined;
+  /** The setup position this seat entered from (for the settle animation). */
+  from: { x: number; y: number };
+}
+
+export type JudgeState = "empty" | "seated" | "waiting" | "speaking" | "verdict" | "failed" | "cancelled";
+export interface CourtJudge { name: string; label: string; sub: string | null; state: JudgeState }
+
+export interface Court {
+  seats: CourtSeat[];
+  judge: CourtJudge;
+  balance: Balance;
+  wing: { title: string; sub: string | null };
+  lectern: { text: string; full: string };
+  /** `from`: one voter-chair position per ballot, in `seat_idx` order, for the fly-in animation. */
+  ballots: { got: number; total: number; from: { x: number; y: number }[] } | null;
+  links: CourtLink[];
+  dimmed: boolean;
+}
+
+/** How many characters of the question the lectern can hold. */
+export const LECTERN_CHARS = 34;
+export function truncate(text: string, room = LECTERN_CHARS): string {
+  const t = text.trim();
+  return t.length > room ? `${t.slice(0, room - 1)}…` : t;
+}
+
+const PHASE_WORDS: Record<PhaseName, string> = {
+  answer: "opening", critique: "deliberation", revise: "rebuttal", synthesis: "verdict",
+};
+
+function stepAt(seat: SeatView, m: Moment): StepView | undefined {
+  if (m.phase === "synthesis") return seat.steps.at(-1);
+  return seat.steps.find((s) => s.round === m.round && s.phase === m.phase);
+}
+
+export function buildSessionCourt(view: CouncilView, at: Moment | "live"): Court {
+  const live = liveMoment(view);
+  const m = at === "live" ? live : at;
+  const stalledHere = sameMoment(m, live);
+  const seats = [...view.seats].sort((a, b) => a.seat_idx - b.seat_idx);
+  const n = seats.length;
+  const letters: Record<number, string> = Object.fromEntries(
+    Object.entries(view.anon_map).map(([letter, idx]) => [idx, letter]),
+  );
+  const { board, agreement } = tallyAt(view, m);
+  const verdict = m.phase === "synthesis";
+  const structured = view.synthesis_status === "degraded" ? null : view.synthesis_structured;
+  const dissent = verdict ? dissenters(structured) : new Set<number>();
+
+  const courtSeats = seats.map((seat, i): CourtSeat => {
+    const { x, y } = pointAt(sessionAngle(i, n));
+    const step = stepAt(seat, m);
+    const { state, reason } = stepState(step, view.status, stalledHere);
+    const name = seat.agent_name ?? seat.ref;
+    const letter = letters[seat.seat_idx];
+    const masked = m.phase === "critique" && letter !== undefined;
+    return {
+      key: seatKey(seat.seat_idx), index: seat.seat_idx, x, y,
+      r: radiusFor(board, seat.seat_idx),
+      label: masked ? letter : name, name,
+      sublabel: seat.role !== null && seat.role !== "" ? seat.role.replace(/_/g, " ") : null,
+      state, reason, masked,
+      rank: verdict && board !== null ? rankIn(board, seat.seat_idx) : null,
+      dissent: dissent.has(seat.seat_idx),
+      runId: step?.run_id ?? null,
+      step,
+      from: pointAt(setupAngle(i)),
+    };
+  });
+
+  const ballotRound = m.phase === "synthesis" ? view.rounds_run : m.round;
+  const voters = courtSeats.filter((_, i) =>
+    seats[i].steps.some((st) => st.round === ballotRound && st.phase === "critique" && st.status === "ok" && st.critique !== null),
+  );
+  const ballots = m.phase === "answer" ? null : {
+    got: voters.length,
+    total: n,
+    from: voters.map((v) => ({ x: v.x, y: v.y })),
+  };
+
+  return {
+    seats: courtSeats,
+    judge: judgeOf(view, m),
+    balance: balanceOf(agreement),
+    wing: wingOf(view, m, at === "live", courtSeats),
+    lectern: { text: truncate(view.question), full: view.question },
+    ballots,
+    links: verdict ? [...topLinks(board), ...dissentLinks(structured)] : [],
+    dimmed: view.status === "cancelled",
+  };
+}
+
+function judgeOf(view: CouncilView, m: Moment): CourtJudge {
+  const name = view.chairman_agent_name ?? view.chairman_agent_id ?? view.chairman_ref;
+  if (view.status === "error") return { name, label: "FAILED", sub: view.error, state: "failed" };
+  if (view.status === "cancelled") return { name, label: "CANCELLED", sub: null, state: "cancelled" };
+  if (view.status === "done" && m.phase === "synthesis") {
+    const level = view.synthesis_structured?.confidence.level;
+    return { name, label: "VERDICT", sub: level !== undefined ? `confidence ${level}` : null, state: "verdict" };
+  }
+  if (view.status === "running" && view.current_phase === "synthesis") {
+    return { name, label: name, sub: "writing the verdict", state: "speaking" };
+  }
+  return { name, label: name, sub: "waiting", state: "waiting" };
+}
+
+function wingOf(view: CouncilView, m: Moment, live: boolean, seats: CourtSeat[]): Court["wing"] {
+  if (view.status === "cancelled") return { title: "COUNCIL CANCELLED", sub: null };
+  if (view.status === "done" && m.phase === "synthesis") {
+    const parts = [`${view.rounds_run} ${view.rounds_run === 1 ? "ROUND" : "ROUNDS"}`];
+    if (view.agreement !== null) parts.push(AGREEMENT_WORDS[view.agreement.level] ?? view.agreement.level);
+    if (view.stopped_early) parts.push("stopped early");
+    return { title: parts.join(" · "), sub: null };
+  }
+  const title = m.phase === "synthesis" ? "VERDICT · the chair is writing" : `ROUND ${roman(Math.max(m.round, 1))} · ${PHASE_WORDS[m.phase]}`;
+  const done = seats.filter((s) => s.state === "ok").length;
+  return { title: m.phase === "answer" ? "OPENING" : title, sub: live ? `${done} of ${seats.length} seats` : "from the record" };
+}
