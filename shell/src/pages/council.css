@@ -757,12 +757,22 @@
   letter-spacing: var(--tracking-wider);
 }
 
-.council-court-judge[data-state="speaking"] .council-court-bench,
-.council-court-judge[aria-pressed="true"] .council-court-bench,
-.council-court-judge:focus-visible .council-court-bench {
-  stroke: var(--accent);
+/* Speaking is the active tone; a selected judge is marked by contrast (heavier, full-text
+   stroke), and the focus ring is the focus ring. Cyan is reserved for links. */
+.council-court-judge[data-state="speaking"] .council-court-bench {
+  stroke: var(--tone-active-fg);
   stroke-width: 2;
-  filter: drop-shadow(0 0 4px var(--accent));
+  filter: drop-shadow(0 0 4px var(--tone-active-fg));
+}
+
+.council-court-judge[aria-pressed="true"] .council-court-bench {
+  stroke: var(--text);
+  stroke-width: 2;
+}
+
+.council-court-judge:focus-visible .council-court-bench {
+  stroke: var(--focus-ring);
+  stroke-width: 2;
 }
 
 .council-court-judge[data-state="failed"] .council-court-bench {
@@ -850,9 +860,14 @@
 }
 
 .council-court-lectern-group[aria-pressed="true"] .council-court-lectern,
-.council-court-lectern-group[data-selected] .council-court-lectern,
+.council-court-lectern-group[data-selected] .council-court-lectern {
+  stroke: var(--text);
+  stroke-width: 2;
+}
+
 .council-court-lectern-group:focus-visible .council-court-lectern {
-  stroke: var(--accent);
+  stroke: var(--focus-ring);
+  stroke-width: 2;
 }
 
 .council-court-svg .council-court-lectern-text {
@@ -953,7 +968,7 @@
 
 .council-court-svg .council-court-tick {
   font-size: 9px;
-  fill: var(--accent);
+  fill: var(--text-muted);
 }
 
 .council-court-svg .council-court-seat-state {
@@ -970,7 +985,7 @@
 }
 
 .council-court-seat[data-state="ok"] .council-court-seat-disc {
-  stroke: var(--accent);
+  stroke: var(--text-muted);
 }
 
 .council-court-seat[data-state="failed"] .council-court-seat-disc {
@@ -985,16 +1000,21 @@
   opacity: 0.45;
 }
 
-.council-court-seat[data-state="speaking"] .council-court-seat-disc,
-.council-court-seat[aria-pressed="true"] .council-court-seat-disc,
-.council-court-seat:focus-visible .council-court-seat-disc {
-  stroke: var(--accent);
+.council-court-seat[data-state="speaking"] .council-court-seat-disc {
+  stroke: var(--tone-active-fg);
   stroke-width: 2;
-  filter: drop-shadow(0 0 4px var(--accent));
+  filter: drop-shadow(0 0 4px var(--tone-active-fg));
+  fill: var(--tone-active-bg);
 }
 
-.council-court-seat[data-state="speaking"] .council-court-seat-disc {
-  fill: var(--accent-quiet);
+.council-court-seat[aria-pressed="true"] .council-court-seat-disc {
+  stroke: var(--text);
+  stroke-width: 2;
+}
+
+.council-court-seat:focus-visible .council-court-seat-disc {
+  stroke: var(--focus-ring);
+  stroke-width: 2;
 }
 
 /* Opening the session: the chairs settle from where the setup had them. */
@@ -1127,7 +1147,7 @@
 }
 
 .council-dossier-chip:hover {
-  border-color: var(--accent);
+  border-color: var(--text-muted);
 }
 
 .council-dossier-chip:focus-visible {
@@ -1221,8 +1241,9 @@
 }
 
 .council-process-phase[data-current] {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--text);
+  color: var(--text);
+  font-weight: 600;
 }
 
 .council-process-step {
