@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import type { Agreement, CouncilConfig, CouncilView, SeatView, StepView, Synthesis } from "../../data/council";
 import { Courtroom, type CourtSelection } from "./Courtroom";
-import { buildSessionCourt, buildSetupCourt } from "./court-model";
+import { ProcessLine } from "./ProcessLine";
+import { buildSessionCourt, buildSetupCourt, processLine } from "./court-model";
 import { draftFromConfig, type CourtDraft } from "./court-draft";
 
 /* ------------------------------------------------------------ fixtures -- */
@@ -269,5 +270,116 @@ describe("Courtroom", () => {
     const { container } = renderSession(v);
     expect(container.querySelectorAll("rect.council-court-ballot-slot")).toHaveLength(2);
     expect((container.querySelector("g.council-court-beam") as SVGElement).style.transform).toBe("rotate(-22deg)");
+  });
+});
+
+/* ------------------------------------------------------------ ProcessLine -- */
+
+describe("ProcessLine", () => {
+  const convene = { disabled: false, reason: null, onConvene: noop, pending: false };
+  const phases = (list: HTMLElement) => within(list).getAllByRole("listitem").map((li) => li.textContent);
+
+  it("lists the phases of the council to be, and steps the rounds", () => {
+    const onRounds = vi.fn();
+    render(<ProcessLine mode="setup" rounds={2} maxRounds={3} onRounds={onRounds} convene={convene} />);
+    expect(phases(screen.getByRole("list", { name: "Process" }))).toEqual([
+      "Opening",
+      "Deliberation I",
+      "Rebuttal I",
+      "Deliberation II",
+      "Verdict",
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Add a round" }));
+    expect(onRounds).toHaveBeenLastCalledWith(3);
+    fireEvent.click(screen.getByRole("button", { name: "Remove the last round" }));
+    expect(onRounds).toHaveBeenLastCalledWith(1);
+  });
+
+  it("stops the round buttons at the ends", () => {
+    const { rerender } = render(<ProcessLine mode="setup" rounds={3} maxRounds={3} onRounds={noop} convene={convene} />);
+    expect((screen.getByRole("button", { name: "Add a round" }) as HTMLButtonElement).disabled).toBe(true);
+    rerender(<ProcessLine mode="setup" rounds={1} maxRounds={3} onRounds={noop} convene={convene} />);
+    expect((screen.getByRole("button", { name: "Remove the last round" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("draws only the opening and the verdict while the rounds are unknown", () => {
+    render(<ProcessLine mode="setup" rounds={undefined} maxRounds={undefined} onRounds={noop} convene={convene} />);
+    expect(phases(screen.getByRole("list", { name: "Process" }))).toEqual(["Opening", "Verdict"]);
+    expect((screen.getByRole("button", { name: "Add a round" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Remove the last round" }) as HTMLButtonElement).disabled).toBe(true);
+    render(<ProcessLine mode="setup" rounds={2} maxRounds={undefined} onRounds={noop} convene={convene} />);
+    expect((screen.getAllByRole("button", { name: "Add a round" })[1] as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("says why Convene is disabled, to the eye and to a screen reader", () => {
+    const onConvene = vi.fn();
+    const reason = "Seat at least one member.";
+    const { container } = render(
+      <ProcessLine mode="setup" rounds={2} maxRounds={3} onRounds={noop} convene={{ disabled: true, reason, onConvene, pending: false }} />,
+    );
+    const button = screen.getByRole("button", { name: "Convene" });
+    expect(button.getAttribute("title")).toBe(reason);
+    const described = container.querySelector(`#${CSS.escape(button.getAttribute("aria-describedby") ?? "")}`);
+    expect(described?.textContent).toBe(reason);
+    expect(described?.className).toBe("sr-only");
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("convenes when it is not blocked", () => {
+    const onConvene = vi.fn();
+    render(<ProcessLine mode="setup" rounds={2} maxRounds={3} onRounds={noop} convene={{ ...convene, onConvene }} />);
+    fireEvent.click(screen.getByRole("button", { name: "Convene" }));
+    expect(onConvene).toHaveBeenCalledTimes(1);
+  });
+
+  describe("in a session", () => {
+    // Round 1 deliberation is under way: the opening has steps, the rest has not happened yet.
+    const live = view({
+      rounds: 2,
+      current_round: 1,
+      current_phase: "critique",
+      seats: [seat({ steps: [step(), step({ round: 1, phase: "critique", status: "pending", run_id: 4 })] })],
+    });
+
+    it("keeps phases that did not happen out of reach and the viewed one current", () => {
+      render(<ProcessLine mode="session" phases={processLine(live)} viewing="live" onView={noop} />);
+      const rebuttal = screen.getByText("Rebuttal I");
+      expect(rebuttal.tagName).toBe("SPAN");
+      expect(rebuttal.className).toContain("council-process-phase-unreachable");
+      expect(screen.queryByRole("button", { name: "Rebuttal I" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Deliberation I" }).getAttribute("aria-current")).toBe("step");
+      expect(screen.getByRole("button", { name: "Opening" }).getAttribute("aria-current")).toBeNull();
+    });
+
+    it("goes back to a phase by its key and returns to live by the current one", () => {
+      const onView = vi.fn();
+      render(<ProcessLine mode="session" phases={processLine(live)} viewing="live" onView={onView} />);
+      fireEvent.click(screen.getByRole("button", { name: "Opening" }));
+      expect(onView).toHaveBeenLastCalledWith("0:answer");
+      fireEvent.click(screen.getByRole("button", { name: "Deliberation I" }));
+      expect(onView).toHaveBeenLastCalledWith("live");
+    });
+
+    it("marks the viewed phase when the reader has stepped back", () => {
+      render(<ProcessLine mode="session" phases={processLine(live)} viewing="0:answer" onView={noop} />);
+      expect(screen.getByRole("button", { name: "Opening" }).getAttribute("aria-current")).toBe("step");
+      expect(screen.getByRole("button", { name: "Deliberation I" }).getAttribute("aria-current")).toBeNull();
+    });
+
+    it("says where a council stopped early", () => {
+      const stopped = view({
+        status: "done",
+        rounds: 3,
+        rounds_run: 1,
+        stopped_early: true,
+        current_round: 1,
+        current_phase: "synthesis",
+        seats: [seat({ steps: [step(), step({ round: 1, phase: "critique", answer: null })] })],
+      });
+      render(<ProcessLine mode="session" phases={processLine(stopped)} viewing="live" onView={noop} />);
+      expect(screen.getByRole("button", { name: "Deliberation I · stopped early" })).toBeDefined();
+      // A finished council is at its verdict, and that is the live view.
+      expect(screen.getByRole("button", { name: "Verdict" }).getAttribute("aria-current")).toBe("step");
+    });
   });
 });
