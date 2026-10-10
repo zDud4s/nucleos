@@ -50,7 +50,9 @@ export function Settings({ projectId }: SettingsProps) {
   if (project === undefined) {
     // A roster that refused is not a roster still being read, and must not keep saying it is.
     return projects.isError && projects.data === undefined ? (
-      <ErrorNote>The núcleo did not answer, so this project&rsquo;s settings are unknown.</ErrorNote>
+      <ErrorNote>
+        The núcleo did not answer, so this project&rsquo;s settings are unknown.
+      </ErrorNote>
     ) : (
       <p className="text-sm text-text-faint">Reading settings…</p>
     );
@@ -65,14 +67,14 @@ export function Settings({ projectId }: SettingsProps) {
   const stale = projects.isError;
 
   /*
-    Two blocks side by side and the evidence under both, `items-start` so neither box is stretched
-    to the other's height. The Mode block used to fill the height of a column holding two others,
-    and stood 40% empty — the most important control on the page, drawn as the emptiest box.
+    Two blocks side by side and the evidence under both. Two cards sharing a row share its height:
+    the owner's rule, since two boxes ending at different lines read as a layout that broke. (The
+    old `items-start` answered a different grid, where Mode filled a column holding two others.)
   */
   return (
     <div className="flex flex-col gap-3">
       {stale ? <StaleNote dataUpdatedAt={projects.dataUpdatedAt} /> : null}
-      <div className="grid grid-cols-1 items-start gap-3 lg:grid-cols-2">
+      <div className="grid grid-cols-1 items-stretch gap-3 lg:grid-cols-2">
         <ModeChoice project={project} />
         <Ceiling project={project} stale={stale} />
         <div className="lg:col-span-2">
@@ -122,7 +124,7 @@ function Block({
   */
   return (
     <Inset>
-      <h3 id={id} className="text-xs font-normal uppercase tracking-wide text-text-faint">
+      <h3 id={id} className="text-sm font-semibold text-text-muted">
         {label}
       </h3>
       {children}
@@ -269,10 +271,51 @@ function Ceiling({ project, stale }: { project: ProjectSummary; stale: boolean }
     would be the collapse the rest of the page is built to avoid.
   */
   const figure = (
-    <span className="min-w-16 text-center font-display text-xl font-bold tabular-nums text-text">
+    <span className="min-w-10 text-center text-sm font-semibold tabular-nums text-text">
       {limit === null ? "off" : limit}
     </span>
   );
+
+  /*
+    Polite and live, because this is what a press on the stepper changes and the stepper
+    itself says nothing: "Raise the ceiling" is the same label before and after. It is also
+    each step's description, so a step that cannot be pressed — lower at zero, "no ceiling"
+    when there is none — is read beside the reason.
+  */
+  const reading = (
+    <p id={readingId} aria-live="polite" className="text-base font-medium tabular-nums text-text">
+      {limit === null
+        ? `no ceiling — ${open} ${open === 1 ? "proposal" : "proposals"} waiting on you`
+        : `${open} of ${limit} taken`}
+    </p>
+  );
+
+  /*
+    The same reading as a gauge, one cell per place under the ceiling, so "3 of 4" is seen before
+    it is read. Decorative: the sentence above is what a screen reader hears. Past a dozen places
+    the cells would be slivers, so it becomes one continuous bar.
+  */
+  const taken = limit === null ? 0 : Math.min(open, limit);
+  const meter =
+    limit === null || limit === 0 ? null : (
+      <div aria-hidden="true" className="flex gap-1">
+        {limit <= 12 ? (
+          Array.from({ length: limit }, (_, i) => (
+            <span
+              key={i}
+              className={`h-1.5 flex-1 rounded-full ${i < taken ? (project.queue_full ? "bg-tone-paused-fg" : "bg-tone-active-fg") : "bg-surface-sunken"}`}
+            />
+          ))
+        ) : (
+          <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-surface-sunken">
+            <span
+              className={`block h-full rounded-full ${project.queue_full ? "bg-tone-paused-fg" : "bg-tone-active-fg"}`}
+              style={{ width: `${(taken / limit) * 100}%` }}
+            />
+          </span>
+        )}
+      </div>
+    );
 
   return (
     <Block label="Open-proposal ceiling" id={headingId}>
@@ -282,49 +325,46 @@ function Ceiling({ project, stale }: { project: ProjectSummary; stale: boolean }
         How many proposals may wait on you before new work here is held.
       </p>
 
-      {stale ? (
-        figure
-      ) : (
+      {reading}
+      {meter}
+
+      {/*
+        The controls sit on the card's floor, not under the text: the card shares its row with Mode
+        and is as tall as it, and the empty air belongs between the reading and the controls rather
+        than under everything. The stepper is one joined control, the way off at the far end.
+      */}
+      {stale ? null : (
         <div
           role="group"
           aria-labelledby={headingId}
           aria-busy={busy}
-          className="flex flex-wrap items-center gap-2"
+          className="mt-auto flex flex-wrap items-center justify-between gap-2 pt-2"
         >
-          <Step
-            label="Lower the ceiling"
-            inert={limit === null || limit <= 0 || busy}
-            describedBy={readingId}
-            onPress={() => set(limit === null ? null : limit - 1)}
-          >
-            −
-          </Step>
-          {figure}
-          <Step
-            label="Raise the ceiling"
-            inert={busy}
-            describedBy={readingId}
-            onPress={() => set(limit === null ? 1 : limit + 1)}
-          >
-            +
-          </Step>
+          <span className="inline-flex items-center rounded-md border border-border-strong">
+            <Step
+              label="Lower the ceiling"
+              inert={limit === null || limit <= 0 || busy}
+              describedBy={readingId}
+              onPress={() => set(limit === null ? null : limit - 1)}
+            >
+              −
+            </Step>
+            {figure}
+            <Step
+              label="Raise the ceiling"
+              inert={busy}
+              describedBy={readingId}
+              onPress={() => set(limit === null ? 1 : limit + 1)}
+            >
+              +
+            </Step>
+          </span>
           <Step inert={limit === null || busy} describedBy={readingId} onPress={() => set(null)}>
             no ceiling
           </Step>
         </div>
       )}
 
-      {/*
-        Polite and live, because this is what a press on the stepper changes and the stepper
-        itself says nothing: "Raise the ceiling" is the same label before and after. It is also
-        each step's description, so a step that cannot be pressed — lower at zero, "no ceiling"
-        when there is none — is read beside the reason.
-      */}
-      <p id={readingId} aria-live="polite" className="text-xs text-text-muted">
-        {limit === null
-          ? `no ceiling — ${open} ${open === 1 ? "proposal" : "proposals"} waiting on you`
-          : `${open} of ${limit} taken`}
-      </p>
       {project.queue_full ? (
         <p className="text-xs text-tone-paused-fg">
           The brake is holding new work here until something is reviewed.
@@ -374,7 +414,7 @@ function Step({
       onClick={() => {
         if (!inert) onPress();
       }}
-      className={`${label === undefined ? "px-2 py-1 text-xs" : "h-8 w-8"} rounded-md border border-border text-text-muted hover:border-border-strong aria-disabled:cursor-not-allowed aria-disabled:opacity-(--opacity-disabled) aria-disabled:hover:border-border`}
+      className={`${label === undefined ? "min-h-[1.875rem] rounded-md border border-border-strong px-3 text-sm hover:border-text-faint aria-disabled:hover:border-border-strong" : "h-[1.875rem] w-8 rounded-md text-base hover:bg-surface-sunken hover:text-text aria-disabled:hover:bg-transparent"} text-text-muted aria-disabled:cursor-not-allowed aria-disabled:opacity-(--opacity-disabled)`}
     >
       {children}
     </button>
@@ -430,16 +470,16 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
             <caption className="sr-only">Shadow decisions by action class</caption>
             <thead>
               <tr className="text-text-faint">
-                <th scope="col" className="pb-1 text-left font-normal uppercase tracking-wide">
+                <th scope="col" className="pb-1 text-left font-normal">
                   Class
                 </th>
-                <th scope="col" className="pb-1 text-right font-normal uppercase tracking-wide">
+                <th scope="col" className="pb-1 text-right font-normal">
                   Decided
                 </th>
-                <th scope="col" className="pb-1 text-right font-normal uppercase tracking-wide">
+                <th scope="col" className="pb-1 text-right font-normal">
                   Reviewed
                 </th>
-                <th scope="col" className="pb-1 text-right font-normal uppercase tracking-wide">
+                <th scope="col" className="pb-1 text-right font-normal">
                   Disagreed
                 </th>
               </tr>

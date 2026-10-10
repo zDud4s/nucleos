@@ -55,9 +55,14 @@ function openExtractor(overrides: Partial<MapState> = {}) {
   return { state, rendered };
 }
 
+/** Picks a document in the select, the way the owner does. */
+function choose(select: HTMLElement, spec: string) {
+  fireEvent.change(select, { target: { value: spec } });
+}
+
 /** Choose a document and a brain, then press the one button that starts the read. */
 async function ask(spec: string, brain: "cloud" | "local") {
-  fireEvent.click(await screen.findByRole("button", { name: spec }));
+  choose(await screen.findByRole("combobox", { name: "Read a spec" }), spec);
   fireEvent.click(screen.getByRole("button", { name: brain }));
   fireEvent.click(screen.getByRole("button", { name: new RegExp(`read ${spec}`) }));
 }
@@ -71,8 +76,8 @@ describe("choosing what gets read, and by whom", () => {
   it("offers this project's specs by name, and offers both brains", async () => {
     openExtractor();
 
-    expect(await screen.findByRole("button", { name: MAP })).toBeTruthy();
-    expect(screen.getByRole("button", { name: WORKSPACE })).toBeTruthy();
+    expect(await screen.findByRole("option", { name: MAP })).toBeTruthy();
+    expect(screen.getByRole("option", { name: WORKSPACE })).toBeTruthy();
     expect(screen.getByRole("button", { name: "cloud" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "local" })).toBeTruthy();
     // There is no box to type a slug into: the picker is the whole way in.
@@ -85,27 +90,31 @@ describe("choosing what gets read, and by whom", () => {
    */
   it("shows which brain is chosen before anything is asked of it", async () => {
     openExtractor();
-    await screen.findByRole("button", { name: MAP });
+    await screen.findByRole("option", { name: MAP });
 
     expect(screen.getByRole("button", { name: "cloud" }).getAttribute("aria-pressed")).toBe("true");
-    expect(screen.getByRole("button", { name: "local" }).getAttribute("aria-pressed")).toBe("false");
+    expect(screen.getByRole("button", { name: "local" }).getAttribute("aria-pressed")).toBe(
+      "false",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "local" }));
     expect(screen.getByRole("button", { name: "local" }).getAttribute("aria-pressed")).toBe("true");
-    expect(screen.getByRole("button", { name: "cloud" }).getAttribute("aria-pressed")).toBe("false");
+    expect(screen.getByRole("button", { name: "cloud" }).getAttribute("aria-pressed")).toBe(
+      "false",
+    );
   });
 
   /** Nothing to read means nothing to press. The document is chosen first, always. */
   it("will not start until a document has been chosen", async () => {
     openExtractor();
-    await screen.findByRole("button", { name: MAP });
+    await screen.findByRole("option", { name: MAP });
 
     expect(screen.getByRole("button", { name: /^read the chosen spec/ })).toHaveProperty(
       "disabled",
       true,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: MAP }));
+    choose(screen.getByRole("combobox", { name: "Read a spec" }), MAP);
     expect(screen.getByRole("button", { name: new RegExp(`read ${MAP}`) })).toHaveProperty(
       "disabled",
       false,
@@ -171,7 +180,7 @@ describe("choosing what gets read, and by whom", () => {
    */
   it("says this machine has no local model, rather than failing generically", async () => {
     openExtractor({ refusal: { status: 503, code: "unavailable", detail: "Service Unavailable" } });
-    fireEvent.click(await screen.findByRole("button", { name: MAP }));
+    choose(await screen.findByRole("combobox", { name: "Read a spec" }), MAP);
     fireEvent.click(screen.getByRole("button", { name: "local" }));
 
     // Nothing on the surface says this yet. Asserted before the press so that what follows can only
@@ -188,7 +197,9 @@ describe("choosing what gets read, and by whom", () => {
 
   /** A model that was reached and failed is a different fact, and reads as one. */
   it("says a model was reached and failed, and that nothing was recorded", async () => {
-    openExtractor({ refusal: { status: 502, code: "http_502", detail: "the extraction run failed" } });
+    openExtractor({
+      refusal: { status: 502, code: "http_502", detail: "the extraction run failed" },
+    });
     await ask(MAP, "cloud");
 
     expect(await screen.findByText(/Nothing was recorded/)).toBeTruthy();

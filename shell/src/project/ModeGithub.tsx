@@ -1,5 +1,5 @@
 // §spec alcada-por-projecto
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useId, useState, type FormEvent, type ReactNode } from "react";
 import type { UseQueryResult } from "@tanstack/react-query";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
@@ -96,7 +96,7 @@ export function ModeGithub({ projectId }: ModeGithubProps) {
   const stopped = kill.data?.engaged === true;
 
   return (
-    <div className="flex flex-col gap-8">
+    <div className="ws-page ws-authority">
       <Standing projectId={projectId} stopped={stopped} />
 
       <Section label="The remote">
@@ -162,7 +162,9 @@ function Standing({ projectId, stopped }: { projectId: string; stopped: boolean 
       ? undefined
       : gitCatalogue.data.filter((op) => op.declarable && gitMine.data.includes(op.kind)).length;
   // A tool-carrying `allow` decides nothing (see `RuleList`), so it is not a command allowed.
-  const allowed = rules.data?.filter((rule) => rule.verdict === "allow" && rule.tool === null).length;
+  const allowed = rules.data?.filter(
+    (rule) => rule.verdict === "allow" && rule.tool === null,
+  ).length;
   const refused = rules.data?.filter((rule) => rule.verdict === "deny").length;
   const ci = runs.data === undefined ? null : ciVerdict(runs.data);
 
@@ -179,18 +181,16 @@ function Standing({ projectId, stopped }: { projectId: string; stopped: boolean 
       ) : (
         // Stale, derived or unknown: nothing lands by default with confidence, and the section
         // below says which. The line only refuses to claim a branch.
-        <>
-          no default{others}
-        </>
+        <>no default{others}</>
       );
   }
 
   return (
     <div className="flex flex-col gap-3" aria-label="Standing" role="group">
       <Quiet says="Changes here reach the very next tool call of every run already working in this project.">
-        The núcleo reads these tables at the moment it decides, with no cache and no restart, so this
-        is a live control and not a preference. Narrowing takes effect at the first press; anything
-        that widens what runs may do on their own asks you to press twice.
+        The núcleo reads these tables at the moment it decides, with no cache and no restart, so
+        this is a live control and not a preference. Narrowing takes effect at the first press;
+        anything that widens what runs may do on their own asks you to press twice.
       </Quiet>
 
       <dl className="flex flex-wrap items-baseline gap-x-6 gap-y-2 text-sm">
@@ -347,7 +347,7 @@ function Remote({ projectId }: { projectId: string }) {
           like success.
         */}
         <span className="font-mono text-xs text-text-muted">{found.remote}</span>
-        <span className="ml-auto flex items-baseline gap-3">
+        <span className="ws-trail">
           {readAt === null ? null : (
             <span className="font-mono text-xs tabular-nums text-text-muted">
               read {clock(readAt)}
@@ -478,8 +478,9 @@ function ListingBody({ read, ci }: { read: UseQueryResult<ReadOutcome>; ci: bool
     return (
       <div className="flex flex-col gap-1">
         <p className="text-sm text-text-muted">
-          gh ran and did not succeed{outcome.exit_code === null ? "" : ` (exit ${outcome.exit_code})`}
-          . This is GitHub's answer rather than the núcleo's, and it is printed whole below.
+          gh ran and did not succeed
+          {outcome.exit_code === null ? "" : ` (exit ${outcome.exit_code})`}. This is GitHub's
+          answer rather than the núcleo's, and it is printed whole below.
         </p>
         {said === "" ? (
           <p className="text-sm text-text-muted">And it printed nothing at all while failing.</p>
@@ -545,11 +546,9 @@ function CiListing({ listed }: { listed: string }) {
   return (
     <>
       {verdict.listed === 0 ? null : verdict.failed === 0 ? (
-        <p className="text-sm text-text-muted">
-          No failed run among the {verdict.listed} listed.
-        </p>
+        <p className="text-sm text-text-muted">No failed run among the {verdict.listed} listed.</p>
       ) : (
-        <p className="max-w-[var(--measure-prose)] rounded-md border border-tone-danger-border bg-tone-danger-bg px-3 py-2 text-sm text-tone-danger-fg">
+        <p className="ws-alert">
           {verdict.failed} of the {verdict.listed} listed runs did not succeed; they are marked
           below.
         </p>
@@ -681,9 +680,10 @@ function ReadFailed({ read, says }: { read: UseQueryResult<unknown>; says: strin
   }
   return (
     <Quiet says={`the núcleo did not answer ${says}`}>
-      The daemon is reachable or this window would be showing nothing at all, so this is the one read
-      failing rather than the connection. Nothing here is lost: the tables are the núcleo's, and it
-      is still enforcing them; this is only the picture of them. Reopening the page asks again.
+      The daemon is reachable or this window would be showing nothing at all, so this is the one
+      read failing rather than the connection. Nothing here is lost: the tables are the núcleo's,
+      and it is still enforcing them; this is only the picture of them. Reopening the page asks
+      again.
     </Quiet>
   );
 }
@@ -698,9 +698,39 @@ const NO_SUCH_PROJECT = "the núcleo has no project by this name.";
  * for once they are in the right section. The label rank (11px, 500, tracked, uppercase) in Muted,
  * one rank under the section title so the two do not read as siblings.
  */
-function GroupTitle({ children }: { children: ReactNode }) {
+function GroupTitle({ children, about }: { children: ReactNode; about?: ReactNode }) {
+  const tipId = useId();
+  // The tip sits beside the heading and not in it, so the heading's name stays the group's name.
   return (
-    <h3 className="text-xs font-medium uppercase tracking-wide text-text-muted">{children}</h3>
+    <div className="ws-subhead">
+      <h3 className="ws-subtitle">{children}</h3>
+      {about === undefined ? null : (
+        <Tip id={tipId} name={`About ${String(children).trim()}`}>
+          {about}
+        </Tip>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A group's one-sentence caption, behind an ⓘ beside its title.
+ *
+ * The owner's words for the inline captions were "fdd de ler": every group opened with a small grey
+ * paragraph before its first row. The sentence is kept — tests and screen readers still find it,
+ * because it is always in the document and the mark is described by it — and it shows on hover or
+ * focus, floating over the page so nothing moves. Pure CSS: there is no state to keep.
+ */
+function Tip({ id, name, children }: { id: string; name: string; children: ReactNode }) {
+  return (
+    <span className="ws-tip">
+      <button type="button" className="ws-tip-mark" aria-label={name} aria-describedby={id}>
+        i
+      </button>
+      <span className="ws-tip-box" role="tooltip" id={id}>
+        {children}
+      </span>
+    </span>
   );
 }
 
@@ -885,17 +915,20 @@ function AutonomousOps({ projectId, stopped }: { projectId: string; stopped: boo
         A granted read is used when an agent types <span className="font-mono">gh …</span> in one of
         this project's worktrees, and only while GitHub is switched on for this machine:{" "}
         <span className="font-mono">enabled: false</span> in{" "}
-        <span className="font-mono">~/.nucleos/github.yaml</span> (System › Settings) makes the núcleo
-        ignore every project's grants, and nothing on this page overrides that. A granted action is
-        stored and does nothing yet. An operation this build does not allow is listed so you know it
-        exists; nothing on this machine can grant it.
+        <span className="font-mono">~/.nucleos/github.yaml</span> (System › Settings) makes the
+        núcleo ignore every project's grants, and nothing on this page overrides that. A granted
+        action is stored and does nothing yet. An operation this build does not allow is listed so
+        you know it exists; nothing on this machine can grant it.
       </Quiet>
 
       <Inset>
-        <GroupTitle>Reads</GroupTitle>
-        <Caption>
-          Used the next time an agent types gh, while GitHub is switched on for this machine.
-        </Caption>
+        <GroupTitle
+          about={
+            <>Used the next time an agent types gh, while GitHub is switched on for this machine.</>
+          }
+        >
+          Reads
+        </GroupTitle>
         {unreachable ? (
           /*
             Said BEFORE anybody grants something, which is the difference between this and the
@@ -911,11 +944,16 @@ function AutonomousOps({ projectId, stopped }: { projectId: string; stopped: boo
       </Inset>
 
       <Inset>
-        <GroupTitle>Actions</GroupTitle>
-        <Caption>
-          Recorded and inert for now: the GitHub tool still asks you first, and wiring this list to
-          it is a later step.
-        </Caption>
+        <GroupTitle
+          about={
+            <>
+              Recorded and inert for now: the GitHub tool still asks you first, and wiring this list
+              to it is a later step.
+            </>
+          }
+        >
+          Actions
+        </GroupTitle>
         <OpList ops={actions} empty="This daemon builds no GitHub actions." {...rowProps} />
       </Inset>
 
@@ -934,11 +972,16 @@ function AutonomousOps({ projectId, stopped }: { projectId: string; stopped: boo
           be removable.
         */
         <Inset>
-          <GroupTitle>No longer built</GroupTitle>
-          <Caption>
-            This project's table names operations this daemon no longer builds. They decide
-            nothing, and you can withdraw them.
-          </Caption>
+          <GroupTitle
+            about={
+              <>
+                This project's table names operations this daemon no longer builds. They decide
+                nothing, and you can withdraw them.
+              </>
+            }
+          >
+            No longer built
+          </GroupTitle>
           <OpList
             ops={stranded.map((kind) => ({ kind, declarable: false }))}
             empty=""
@@ -973,11 +1016,6 @@ const GIT_OP_SENTENCES: Record<string, string> = {
   no_such_op: "this project had not granted that git operation.",
   internal: "the núcleo hit an error of its own writing it down.",
 };
-
-/** One sentence under a group's heading, capped at the note measure. */
-function Caption({ children }: { children: ReactNode }) {
-  return <p className="max-w-[var(--measure-prose)] text-xs text-text-muted">{children}</p>;
-}
 
 /**
  * One operation table — GitHub's halves and the queue's single list are drawn by the same rows.
@@ -1025,37 +1063,47 @@ function OpList({
   }
 
   return (
-    <ul className="flex flex-col gap-1">
+    <ul className="ws-items">
       {ops.map((op) => {
         const has = declared.has(op.kind);
         const busy = writes.isPending(op.kind);
         const label = labels[op.kind];
         return (
-          <li
-            key={op.kind}
-            aria-label={`${named} ${op.kind}`}
-            className="flex min-h-8 flex-wrap items-baseline gap-x-3 gap-y-1 text-sm"
-          >
-            {label === undefined ? null : <span className="text-text">{label}</span>}
-            {/* The id in the machine's face and nothing more: not a pill, which the system keeps
-                for badges, and never the only name the row has when a human one exists. */}
-            <span className={label === undefined ? "font-mono text-xs text-text" : "font-mono text-xs text-text-muted"}>
-              {op.kind}
-            </span>
+          <li key={op.kind} aria-label={`${named} ${op.kind}`} className="ws-item">
+            {/*
+              Two columns and only two: what the row is on the leading side (its name, then the id
+              and where it stands in small type under it), the controls on the trailing one. The
+              state word floated between them, at whatever x the name's length left it.
+            */}
+            <div className="ws-item-main">
+              {label === undefined ? null : <span className="ws-item-name">{label}</span>}
+              <span className="ws-item-sub">
+                {/* The id in the machine's face and nothing more: not a pill, which the system
+                    keeps for badges, and never the only name the row has when a human one exists. */}
+                <span className={label === undefined ? "ws-item-name font-mono" : "font-mono"}>
+                  {op.kind}
+                </span>
+                {op.declarable ? (
+                  has ? (
+                    <span className="ws-item-state-on">without asking</span>
+                  ) : (
+                    <span>asks first</span>
+                  )
+                ) : stranded ? null : (
+                  <span>{has ? OUTSIDE_AND_DECLARED : OUTSIDE_THE_CEILING}</span>
+                )}
+              </span>
+            </div>
 
             {op.declarable ? (
-              <span className="ml-auto flex items-baseline gap-3">
+              <span className="ws-trail">
                 <Receipt stamp={writes.stamp(op.kind)} />
                 {has ? (
-                  <>
-                    <span className="text-xs font-medium text-text">without asking</span>
-                    <Button variant="quiet" disabled={busy} onClick={() => onWithdraw(op.kind)}>
-                      withdraw
-                    </Button>
-                  </>
+                  <Button variant="quiet" disabled={busy} onClick={() => onWithdraw(op.kind)}>
+                    withdraw
+                  </Button>
                 ) : (
                   <>
-                    <span className="text-xs text-text-muted">asks first</span>
                     <ConfirmButton
                       variant="quiet"
                       label="grant"
@@ -1063,7 +1111,11 @@ function OpList({
                       subject={op.kind}
                       disabled={busy}
                       unavailable={stopped}
-                      title={stopped ? "The emergency stop is engaged: nothing may be granted until it is released." : undefined}
+                      title={
+                        stopped
+                          ? "The emergency stop is engaged: nothing may be granted until it is released."
+                          : undefined
+                      }
                       onConfirm={() => onGrant(op.kind)}
                     />
                   </>
@@ -1077,11 +1129,6 @@ function OpList({
                   for a control to be wired to, and one that refused would be a lie about who
                   decides.
                 */}
-                {stranded ? null : (
-                  <span className="text-xs text-text-muted">
-                    {has ? OUTSIDE_AND_DECLARED : OUTSIDE_THE_CEILING}
-                  </span>
-                )}
                 {/*
                   The one legal gesture, and only when there is a row to remove.
                   `delete_project_github_op` has no declarability check, and says why: *"withdrawing
@@ -1090,7 +1137,7 @@ function OpList({
                   row outside the ceilings arrives here on purpose.
                 */}
                 {has ? (
-                  <span className="ml-auto flex items-baseline gap-3">
+                  <span className="ws-trail">
                     <Receipt stamp={writes.stamp(op.kind)} />
                     <Button variant="quiet" disabled={busy} onClick={() => onWithdraw(op.kind)}>
                       withdraw
@@ -1194,23 +1241,32 @@ function GitOps({ projectId, stopped }: { projectId: string; stopped: boolean })
         nothing for them. A matching refusal under "What the worktrees may run" wins and makes the
         grant do nothing. Only spellings the queue can build are covered: bare{" "}
         <span className="font-mono">git push</span>, <span className="font-mono">-u</span>,{" "}
-        <span className="font-mono">--force</span> and <span className="font-mono">git branch -D</span>{" "}
-        still stop and ask. A <span className="font-mono">rebase</span> a run asks for comes back as a
-        blocked ticket, because that run holds the branch, and the ticket says which worktree holds
-        it.
+        <span className="font-mono">--force</span> and{" "}
+        <span className="font-mono">git branch -D</span> still stop and ask. A{" "}
+        <span className="font-mono">rebase</span> a run asks for comes back as a blocked ticket,
+        because that run holds the branch, and the ticket says which worktree holds it.
       </Quiet>
 
       <Inset>
-        <OpList ops={catalogue.data} empty="This daemon builds no queue operations." {...rowProps} />
+        <OpList
+          ops={catalogue.data}
+          empty="This daemon builds no queue operations."
+          {...rowProps}
+        />
       </Inset>
 
       {stranded.length === 0 ? null : (
         <Inset>
-          <GroupTitle>No longer built</GroupTitle>
-          <Caption>
-            This project's table names git operations this daemon no longer builds. They grant
-            nothing, and you can withdraw them.
-          </Caption>
+          <GroupTitle
+            about={
+              <>
+                This project's table names git operations this daemon no longer builds. They grant
+                nothing, and you can withdraw them.
+              </>
+            }
+          >
+            No longer built
+          </GroupTitle>
           <OpList
             ops={stranded.map((kind) => ({ kind, declarable: false }))}
             empty=""
@@ -1296,8 +1352,8 @@ function ShellRules({ projectId, stopped }: { projectId: string; stopped: boolea
         A permission only widens what the núcleo would otherwise have <em>asked</em> about. So{" "}
         <span className="font-mono">rm</span> allowed here leaves{" "}
         <span className="font-mono">rm -rf /</span> refused, and a line carrying{" "}
-        <span className="font-mono">$( )</span> stays refused whatever these lists say. A project with
-        no rules at all classifies exactly as it did before there were any.
+        <span className="font-mono">$( )</span> stays refused whatever these lists say. A project
+        with no rules at all classifies exactly as it did before there were any.
       </Quiet>
 
       {/*
@@ -1336,7 +1392,9 @@ function ShellRules({ projectId, stopped }: { projectId: string; stopped: boolea
 
       {gone === null ? null : (
         <p className="text-xs text-text-muted">
-          <span className="font-mono text-text">{gone[0].split("\u0000").filter(Boolean).join(" ")}</span>{" "}
+          <span className="font-mono text-text">
+            {gone[0].split("\u0000").filter(Boolean).join(" ")}
+          </span>{" "}
           <Receipt stamp={gone[1]} />
         </p>
       )}
@@ -1420,12 +1478,11 @@ function RuleList({
 }) {
   return (
     <Inset>
-      <GroupTitle>{title}</GroupTitle>
-      <Caption>{says}</Caption>
+      <GroupTitle about={says}>{title}</GroupTitle>
       {rows.length === 0 ? (
         <Quiet says="None declared." />
       ) : (
-        <ul className="flex flex-col gap-1">
+        <ul className="ws-items">
           {rows.map((rule) => {
             const key = ruleKey(rule);
             const busy = writes.isPending(key);
@@ -1439,7 +1496,7 @@ function RuleList({
                 */
                 key={key}
                 aria-label={ruleLabel(rule)}
-                className="flex min-h-8 flex-wrap items-baseline gap-x-3 gap-y-1 text-sm"
+                className="ws-item"
               >
                 {/*
                   A write rule wears its tool and a command rule does not, and that IS the visual
@@ -1459,49 +1516,55 @@ function RuleList({
                   they would have to withdraw. So it gets the one sentence that is true of it, the
                   negation FIRST so a fast read cannot take the affirmative half alone.
                 */}
-                {rule.tool === null ? null : rule.verdict === "deny" ? (
-                  <span className="text-xs text-text-muted">
-                    <span className="font-mono text-text">{rule.tool}</span> may not write to
-                  </span>
-                ) : (
-                  <span className="text-xs text-text-muted">
-                    nothing enforces this:{" "}
-                    <span className="font-mono text-text">{rule.tool}</span> allowed to write to
-                  </span>
-                )}
-                {/*
+                <div className="ws-item-main">
+                  <span className="ws-item-name">
+                    {rule.tool === null ? null : rule.verdict === "deny" ? (
+                      <span className="text-xs text-text-muted">
+                        <span className="font-mono text-text">{rule.tool}</span> may not write to
+                      </span>
+                    ) : (
+                      <span className="text-xs text-text-muted">
+                        nothing enforces this:{" "}
+                        <span className="font-mono text-text">{rule.tool}</span> allowed to write to
+                      </span>
+                    )}
+                    {/*
                   The FOLDED spelling, which is what is stored and what is enforced. Echoing what
                   somebody typed would be showing them a rule the classifier has never heard of. A
                   path keeps its case here and a command does not, which is the daemon's doing and
                   not this row's — see `foldPathPrefix`.
                 */}
-                <span className="font-mono text-xs text-text">{rule.prefix}</span>
-                {/*
+                    <span className="font-mono">{rule.prefix}</span>
+                  </span>
+                  {/*
                   What to DO about it, and only on the row that needs doing something about. Both
                   moves are named because they are different intentions — the rule was a mistake, or
                   the rule was meant and was written with the wrong verdict — and this page cannot
                   know which.
                 */}
-                {rule.tool !== null && rule.verdict === "allow" ? (
-                  <span className="text-xs text-text-muted">
-                    a rule about a tool can only refuse; withdraw it, or declare it as a refusal
-                  </span>
-                ) : null}
-                {rule.note === null ? (
-                  <span className="text-xs text-text-faint">no justification</span>
-                ) : (
-                  <span className="text-xs text-text-muted">{rule.note}</span>
-                )}
-                <span className="text-xs text-text-faint" title={`${rule.created_at} UTC`}>
-                  {/*
+                  <span className="ws-item-sub">
+                    {rule.tool !== null && rule.verdict === "allow" ? (
+                      <span className="text-text">
+                        a rule about a tool can only refuse; withdraw it, or declare it as a refusal
+                      </span>
+                    ) : null}
+                    {rule.note === null ? (
+                      <span className="text-text-faint">no justification</span>
+                    ) : (
+                      <span>{rule.note}</span>
+                    )}
+                    <span className="text-text-faint" title={`${rule.created_at} UTC`}>
+                      {/*
                     "declared", and deliberately not "edited". `DO UPDATE` sets `verdict` and `note`
                     and leaves `created_at` alone, so a rule re-verdicted this morning still carries
                     the day somebody first wrote it down — captioning it as a change would invent a
                     fact the daemon does not hold.
                   */}
-                  declared {declaredDay(rule.created_at)}
-                </span>
-                <span className="ml-auto flex items-baseline gap-3">
+                      declared {declaredDay(rule.created_at)}
+                    </span>
+                  </span>
+                </div>
+                <span className="ws-trail">
                   <Receipt stamp={writes.stamp(key)} />
                   {/*
                     **Not offered on a write rule at all**, and absent rather than disabled. The
@@ -1526,7 +1589,11 @@ function RuleList({
                       subject={rule.prefix}
                       disabled={busy}
                       unavailable={stopped}
-                      title={stopped ? "The emergency stop is engaged: nothing may be allowed until it is released." : undefined}
+                      title={
+                        stopped
+                          ? "The emergency stop is engaged: nothing may be allowed until it is released."
+                          : undefined
+                      }
                       onConfirm={() => onFlip(rule)}
                     />
                   )}
@@ -1544,7 +1611,9 @@ function RuleList({
                       variant="quiet"
                       label="withdraw"
                       confirmLabel={
-                        rule.note === null ? "stop refusing this" : "stop refusing this, and drop its justification"
+                        rule.note === null
+                          ? "stop refusing this"
+                          : "stop refusing this, and drop its justification"
                       }
                       subject={rule.prefix}
                       disabled={busy}
@@ -1726,13 +1795,13 @@ function DeclareRule({
           <div className="flex max-w-[var(--measure-prose)] flex-wrap items-baseline gap-x-3 gap-y-2 rounded-md border border-tone-pending-border bg-tone-pending-bg px-3 py-2 text-xs text-tone-pending-fg">
             <p>
               <span className="font-mono">{existing.prefix}</span> is already declared as{" "}
-              {existing.verdict === "allow" ? "allowed" : "refused"}, so this replaces its verdict and
-              its justification rather than adding a second rule.
+              {existing.verdict === "allow" ? "allowed" : "refused"}, so this replaces its verdict
+              and its justification rather than adding a second rule.
               {existing.note !== null && note.trim() === "" ? (
                 <>
                   {" "}
-                  With the justification box empty, declaring it again <strong>erases</strong> the one
-                  it carries.
+                  With the justification box empty, declaring it again <strong>erases</strong> the
+                  one it carries.
                 </>
               ) : null}
             </p>
@@ -1756,7 +1825,11 @@ function DeclareRule({
               subject={folded === "" ? undefined : folded}
               disabled={!ready}
               unavailable={stopped}
-              title={stopped ? "The emergency stop is engaged: nothing may be allowed until it is released." : undefined}
+              title={
+                stopped
+                  ? "The emergency stop is engaged: nothing may be allowed until it is released."
+                  : undefined
+              }
               onConfirm={() => submit("allow")}
             />
           ) : null}
@@ -1765,16 +1838,17 @@ function DeclareRule({
           </Button>
           {tool === null ? (
             <Quiet says="A refusal can name a pipe or a redirection; a permission cannot.">
-              A refusal answers at the whole line and needs no shape the classifier can read, so a pipe,
-              a redirection or an <span className="font-mono">-exec</span> is fine in one. A permission
-              has to match a command the núcleo can take apart. Enter declares a refusal; allowing
-              always asks for a second press.
+              A refusal answers at the whole line and needs no shape the classifier can read, so a
+              pipe, a redirection or an <span className="font-mono">-exec</span> is fine in one. A
+              permission has to match a command the núcleo can take apart. Enter declares a refusal;
+              allowing always asks for a second press.
             </Quiet>
           ) : (
             <Quiet says="A rule about a tool can only refuse.">
               There is nothing to allow: a write the núcleo does not refuse is already local work it
-              does not stop for, so a permission here would widen nothing and be enforced by nothing.
-              The path is read from the project root, and everything under it is refused with it.
+              does not stop for, so a permission here would widen nothing and be enforced by
+              nothing. The path is read from the project root, and everything under it is refused
+              with it.
             </Quiet>
           )}
         </div>
@@ -1852,11 +1926,8 @@ function LandTargets({ projectId }: { projectId: string }) {
       </Quiet>
 
       <Inset>
-        <ul className="flex flex-col gap-1">
-          <li
-            aria-label="land target the integration branch"
-            className="flex min-h-8 flex-wrap items-baseline gap-x-3 gap-y-1 text-sm"
-          >
+        <ul className="ws-items">
+          <li aria-label="land target the integration branch" className="ws-item">
             {integration.state === "unknown" ? (
               <span className="text-xs text-text-muted">{integration.why}</span>
             ) : (
@@ -1874,13 +1945,9 @@ function LandTargets({ projectId }: { projectId: string }) {
             )}
           </li>
           {targets.map((target) => (
-            <li
-              key={target}
-              aria-label={`land target ${target}`}
-              className="flex min-h-8 flex-wrap items-baseline gap-x-3 gap-y-1 text-sm"
-            >
+            <li key={target} aria-label={`land target ${target}`} className="ws-item">
               <span className="font-mono text-xs text-text">{target}</span>
-              <span className="ml-auto flex items-baseline gap-3">
+              <span className="ws-trail">
                 <Receipt stamp={writes.stamp(target)} />
                 <Button
                   variant="quiet"

@@ -2304,6 +2304,17 @@ ol.ui-well {
   color: var(--text);
 }
 
+/* A door with nothing behind it, receding by tone. `--text-faint` is the quietest
+   text token that still clears 4.5:1 on the page in both themes (5.54:1 dark,
+   4.9:1 light); an opacity over `--text-muted` did not (4.17:1, 3.18:1). */
+.ui-tab[data-quiet] {
+  color: var(--text-faint);
+}
+
+.ui-tab[data-quiet]:hover {
+  color: var(--text);
+}
+
 .ui-tab:disabled {
   pointer-events: none;
   opacity: var(--opacity-disabled);
