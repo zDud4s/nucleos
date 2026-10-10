@@ -4872,7 +4872,8 @@ async fn queue_the_verdict(conn: &mut sqlx::SqliteConnection, job_id: i64, ordin
 /// `route_advice` is not told a pass. The status and the checkpoint are ONE statement, for the
 /// reason `record_gate` gives (an item that reads `passed` with no checkpoint, for a moment, can
 /// revert past work that was agreed with). A checkpoint that cannot be taken warns and writes
-/// NULL; it never fails the item.
+/// NULL; it never fails the item. It does not `queue_the_verdict` (distill) because nothing was
+/// measured, same as `pass_without_measuring`.
 async fn pass_unmeasured_with_checkpoint(
     pool: &SqlitePool,
     job: &JobRow,
@@ -4886,7 +4887,7 @@ async fn pass_unmeasured_with_checkpoint(
             None
         }
     };
-    let _ = sqlx::query(
+    let written = sqlx::query(
         "UPDATE job_items SET status = 'passed', checkpoint_sha = ? WHERE job_id = ? AND ordinal = ?",
     )
     .bind(checkpoint_sha)
@@ -4894,6 +4895,10 @@ async fn pass_unmeasured_with_checkpoint(
     .bind(ordinal as i64)
     .execute(pool)
     .await;
+    if let Err(error) = written {
+        tracing::warn!(job_id = job.id, ordinal, %error, "could not record an unmeasured last item");
+        return Step::Stopped;
+    }
     credit_the_briefing(pool, job, ordinal).await;
     tracing::debug!(
         job_id = job.id,
@@ -16139,6 +16144,17 @@ tests:
             checkpoint,
             Some(head),
             "a trusted nothing-ran last item checkpoints the tree"
+        );
+        let gate_status: Option<String> = sqlx::query_scalar(
+            "SELECT gate_status FROM job_items WHERE job_id = ? AND ordinal = 1",
+        )
+        .bind(f.job.id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            gate_status, None,
+            "nothing was measured, so no gate verdict is recorded"
         );
     }
 }
