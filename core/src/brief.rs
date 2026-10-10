@@ -816,10 +816,16 @@ mod tests {
         "execution/runs/create.rs",
         "team.rs",
     ];
-    const UNBRIEFED_LAUNCHERS: &[(&str, &str)] = &[(
-        "map/intent.rs",
-        "map derivation is deliberately unbriefed because it creates the map that later scopes briefing",
-    )];
+    const UNBRIEFED_LAUNCHERS: &[(&str, &str)] = &[
+        (
+            "map/intent.rs",
+            "map derivation is deliberately unbriefed because it creates the map that later scopes briefing",
+        ),
+        (
+            "execution/runs/spawn.rs",
+            "spawn_run is the launcher; create_run_with in runs/create.rs briefs through brief::for_prompt, as when both were runs.rs",
+        ),
+    ];
 
     async fn test_pool() -> SqlitePool {
         crate::testdb::fresh_pool().await
