@@ -10,7 +10,7 @@ src/http.rs 11163
 src/execution/job.rs 3987
 src/execution/runs.rs 3554
 src/team.rs 3368
-src/execution/runner.rs 2752
+src/execution/runner.rs 2812
 src/hooks.rs 2614
 src/assistant.rs 2374
 src/execution/git_exec.rs 2190
