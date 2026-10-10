@@ -60,3 +60,61 @@ describe("the court draft", () => {
     expect(draft.seatOfModel({ id: "o", label: "O", brain: "openrouter" } as never)).toEqual({ kind: "cloud", ref: "o" });
   });
 });
+
+describe("convening from the court", () => {
+  const c = config();
+  it("sends the question and nothing else from the untouched configured room", () => {
+    const req = draft.requestFrom("  well? ", draft.draftFromConfig(c), null, c);
+    expect(req).toEqual({ question: "well?" });
+    expect(Object.keys(req)).toEqual(["question"]);
+  });
+
+  it("sends the roster once touched: occupied chairs in chair order, agent or kind/ref only", () => {
+    let d = draft.draftFromConfig(config({ default_roster: null }));
+    d = draft.withJudge(d, { seat: { agent: "ag-1" }, name: "the sceptic" });
+    d = draft.seatAt(d, 3, { seat: { kind: "local", ref: "qwen" }, name: "Qwen" });
+    d = draft.seatAt(d, 1, { seat: { agent: "ag-1" }, name: "the sceptic" });
+    expect(draft.requestFrom("q", d, null, c)).toEqual({
+      question: "q",
+      roster: { chairman: { agent: "ag-1" }, members: [{ agent: "ag-1" }, { kind: "local", ref: "qwen" }] },
+    });
+  });
+
+  it("keys roles by the member's index in the request, with or without a roster", () => {
+    let d = draft.draftFromConfig(c);
+    d = draft.withRole(d, 1, "skeptic");
+    expect(draft.requestFrom("q", d, null, c)).toEqual({ question: "q", roles: { "1": "skeptic" } });
+    let t = draft.draftFromConfig(config({ default_roster: null }));
+    t = draft.withJudge(t, { seat: { agent: "a" }, name: "a" });
+    t = draft.seatAt(t, 5, { seat: { agent: "b" }, name: "b" });
+    t = draft.withRole(t, 5, "skeptic");
+    expect(draft.requestFrom("q", t, null, c).roles).toEqual({ "0": "skeptic" });
+  });
+
+  it("sends rounds only when they differ from the default, held to [1, max]", () => {
+    const d = draft.draftFromConfig(c);
+    expect(draft.requestFrom("q", d, 2, c).rounds).toBeUndefined();
+    expect(draft.requestFrom("q", d, 3, c).rounds).toBe(3);
+    expect(draft.roundsOf(9, c)).toBe(3);
+    expect(draft.roundsOf(null, c)).toBe(2);
+  });
+
+  it("blocks for the config's reasons, then for an empty room, a missing judge or an unrestateable seat", () => {
+    const d = draft.draftFromConfig(c);
+    expect(draft.conveneBlocked(true, false, null, d)).toBe("Reading the council config…");
+    expect(draft.conveneBlocked(false, true, null, d)).toBe("The council config could not be read.");
+    expect(draft.conveneBlocked(false, false, config({ configured: false }), d)).toMatch(/No roster in ~\/\.nucleos\/council\.yaml/);
+    expect(draft.conveneBlocked(false, false, c, d)).toBeNull(); // untouched: the ref-less seat is the file's business
+    const touched = draft.seatAt(d, 5, { seat: { agent: "x" }, name: "x" });
+    expect(draft.conveneBlocked(false, false, c, touched)).toBe("Seat 3 keeps the file's default model — choose who sits there.");
+    const empty = [0, 1, 2].reduce((acc, i) => draft.release(acc, i), d);
+    expect(draft.conveneBlocked(false, false, c, empty)).toBe("Seat at least one member.");
+    const judgeless = { ...draft.seatAt(empty, 0, { seat: { agent: "x" }, name: "x" }), chairman: null };
+    expect(draft.conveneBlocked(false, false, c, judgeless)).toBe("Choose a chairman.");
+  });
+
+  it("estimates the ceiling from the occupied chairs", () => {
+    // ceilingCalls(3, 2) = 3 answers + 6 critiques + 3 revisions + 2 chairman calls; stepsInSequence(2) = 5.
+    expect(draft.ceilingLine(draft.draftFromConfig(c), 2)).toBe("≤ 14 calls · 5 steps in sequence");
+  });
+});

@@ -1,6 +1,13 @@
 import type { ModelChoice } from "../../data/chats";
-import type { ConfiguredSeat, CouncilConfig, RosterSeat } from "../../data/council";
-import { offeredSeat, type CouncilDraft } from "../council-draft";
+import {
+  ceilingCalls,
+  stepsInSequence,
+  type ConfiguredSeat,
+  type CouncilConfig,
+  type CreateCouncilRequest,
+  type RosterSeat,
+} from "../../data/council";
+import { clampRounds, offeredSeat, type CouncilDraft } from "../council-draft";
 import { MAX_COUNCIL_SEATS } from "./court-constants";
 
 /**
@@ -108,4 +115,58 @@ export function pruneUnoffered(d: CourtDraft, agentIds: ReadonlySet<string>, mod
   const chairs = d.chairs.map(keep);
   if (chairman === d.chairman && chairs.every((c, i) => c === d.chairs[i])) return d;
   return { ...d, chairman, chairs, roles: d.roles.map((r, i) => (chairs[i] === null ? null : r)) };
+}
+
+export function roundsOf(picked: number | null, config: CouncilConfig | null): number | undefined {
+  const fallback = config?.default_rounds;
+  if (picked === null) return fallback;
+  return clampRounds(picked, config?.max_rounds, fallback);
+}
+
+/**
+ * Why Convene cannot be pressed, or `null`. The config reasons first and in
+ * today's order (`conveneBlocked` in the old Council.tsx); then the room's:
+ * at least one occupied chair (no other minimum is invented), a chairman, and
+ * — only once the roster is being overridden — every seat restateable.
+ * An empty question disables the button without a sentence, as before.
+ */
+export function conveneBlocked(pending: boolean, failed: boolean, config: CouncilConfig | null, d: CourtDraft): string | null {
+  if (pending) return "Reading the council config…";
+  if (failed || config === null) return "The council config could not be read.";
+  if (!config.configured) return "No roster in ~/.nucleos/council.yaml — add one and restart the núcleo.";
+  if (occupiedCount(d) === 0) return "Seat at least one member.";
+  if (d.chairman === null) return "Choose a chairman.";
+  if (d.touched) {
+    if (d.chairman.seat === null) return "The chairman keeps the file's default model — choose who presides.";
+    const at = d.chairs.findIndex((c) => c !== null && c.seat === null);
+    if (at >= 0) return `Seat ${at + 1} keeps the file's default model — choose who sits there.`;
+  }
+  return null;
+}
+
+/**
+ * Only called once `conveneBlocked` answered `null`: when the roster travels
+ * (`touched`) every occupied chair and the chairman hold a restateable seat,
+ * which is what the `!` assertions below lean on.
+ */
+export function requestFrom(question: string, d: CourtDraft, picked: number | null, config: CouncilConfig | null): CreateCouncilRequest {
+  const request: CreateCouncilRequest = { question: question.trim() };
+  const seated = d.chairs.map((c, chair) => ({ c, chair })).filter((x) => x.c !== null);
+  if (d.touched && d.chairman?.seat) {
+    request.roster = { chairman: d.chairman.seat, members: seated.map((x) => x.c!.seat!) };
+  }
+  const rounds = roundsOf(picked, config);
+  if (rounds !== undefined && rounds !== config?.default_rounds) request.rounds = rounds;
+  const roles: Record<string, string> = {};
+  seated.forEach((x, member) => {
+    const role = d.roles[x.chair];
+    if (role !== null && role !== "") roles[String(member)] = role;
+  });
+  if (Object.keys(roles).length > 0) request.roles = roles;
+  return request;
+}
+
+export function ceilingLine(d: CourtDraft, rounds: number): string {
+  // The same sentence the old composer printed (Council.tsx ~400), as one string a test finds whole.
+  return `≤ ${ceilingCalls(occupiedCount(d), rounds)} calls · ${stepsInSequence(rounds)} steps in sequence`;
 }
