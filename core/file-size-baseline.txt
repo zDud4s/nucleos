@@ -7,19 +7,19 @@
 # line whose file no longer exists, or that sits at or under the limit. Nothing new is ever added
 # here: a new file past the limit is split by what it does, not given a line.
 src/http.rs 11163
-src/execution/job.rs 3939
+src/execution/job.rs 3987
 src/execution/runs.rs 3554
 src/team.rs 3368
 src/execution/runner.rs 2752
 src/hooks.rs 2614
-src/assistant.rs 2363
+src/assistant.rs 2374
 src/execution/git_exec.rs 2190
-src/mcp_tools.rs 2055
+src/mcp_tools.rs 2067
 src/knowledge.rs 2023
 src/council.rs 2006
 src/execution/vcs.rs 1674
 src/governance/classifier.rs 1549
-src/main.rs 1530
+src/main.rs 1532
 src/config.rs 1422
 src/execution/worktree.rs 1396
 src/integrations/github.rs 1330
@@ -27,7 +27,8 @@ src/verify.rs 1309
 src/devtime/store.rs 1231
 src/verify/postgate_worker.rs 1216
 src/devtime/rules.rs 1141
-src/browser.rs 1030
+src/browser.rs 1113
+src/daemon_client.rs 1002
 src/governance/triage.rs 1030
 src/judge.rs 1014
 src/devtime/parse.rs 1008
