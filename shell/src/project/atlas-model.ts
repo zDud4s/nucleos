@@ -90,6 +90,27 @@ export function blockKey(path: string): string {
   return kept.slice(0, depth).join("/") || ".";
 }
 
+/**
+ * The path a module is grouped by: its own, except that a Rust `verify.rs` beside a `verify/`
+ * folder is that folder's parent module (`verify/batch.rs` is `crate::verify::batch`, declared in
+ * `verify.rs`) and belongs in the folder's block, not alone at the root above it.
+ */
+export function groupingPath(path: string, folders: Set<string>): string {
+  if (!path.endsWith(".rs")) return path;
+  const own = path.slice(0, -".rs".length);
+  return folders.has(own) ? `${own}/${own.split("/").pop()}.rs` : path;
+}
+
+/** Every folder that holds a module, at any depth. */
+function foldersOf(modules: MapModule[]): Set<string> {
+  const folders = new Set<string>();
+  for (const module of modules) {
+    const parts = module.path.split("/");
+    for (let depth = 1; depth < parts.length; depth++) folders.add(parts.slice(0, depth).join("/"));
+  }
+  return folders;
+}
+
 function labelFor(key: string, side: string, files: MapModule[]): string {
   const rest = key === side ? "" : key.slice(side.length + 1);
   if (rest !== "") return rest;
@@ -371,9 +392,10 @@ function communities(
 export function buildAtlas(modules: MapModule[], imports: MapImport[], unread: string[]): Atlas {
   const grouped = new Map<string, MapModule[]>();
   const blockOf = new Map<string, string>();
+  const folders = foldersOf(modules);
   for (const module of modules) {
     const side = `${module.path.split("/")[0]}\0${module.reader}`;
-    const key = `${side}\0${blockKey(module.path)}`;
+    const key = `${side}\0${blockKey(groupingPath(module.path, folders))}`;
     blockOf.set(module.path, key);
     grouped.set(key, [...(grouped.get(key) ?? []), module]);
   }
@@ -558,6 +580,9 @@ const NODE_H = 46;
 const ROW_GAP = 56;
 const NODE_GAP = 14;
 const PAD = 12;
+/** A layer with more blocks than this wraps onto stacked lines, a tighter gap apart. */
+const ROW_MAX = 6;
+const WRAP_GAP = 24;
 
 /** Wide enough for the label in a 13px face and the count under it. */
 function nodeWidth(block: Block): number {
@@ -607,16 +632,36 @@ export function drawColumn(column: Column, edges: Map<string, number>): GraphDra
     }
   }
 
-  const widths = rows.map(
-    (row) => row.reduce((sum, block) => sum + nodeWidth(block), 0) + NODE_GAP * (row.length - 1),
+  /*
+    A flat side cut by its imports puts a dozen groups on one layer, and drawn as one line that
+    layer was five times wider than the shell beside it — fitted, both sides shrank to unreadable.
+    Wrapped lines keep the crossing order the sweeps found and sit closer than layers do, so a
+    wrapped layer still reads as one tier.
+  */
+  const lines: { row: Block[]; wrapped: boolean }[] = rows.flatMap((row) => {
+    if (row.length <= ROW_MAX) return [{ row, wrapped: false }];
+    const per = Math.ceil(row.length / Math.ceil(row.length / ROW_MAX));
+    const out: { row: Block[]; wrapped: boolean }[] = [];
+    for (let i = 0; i < row.length; i += per)
+      out.push({ row: row.slice(i, i + per), wrapped: i > 0 });
+    return out;
+  });
+  const tops: number[] = [];
+  lines.forEach((line, i) => {
+    tops.push(i === 0 ? PAD : tops[i - 1] + NODE_H + (line.wrapped ? WRAP_GAP : ROW_GAP));
+  });
+
+  const widths = lines.map(
+    ({ row }) =>
+      row.reduce((sum, block) => sum + nodeWidth(block), 0) + NODE_GAP * (row.length - 1),
   );
   const width = Math.max(...widths, 160) + PAD * 2;
   const nodes = new Map<string, GraphNode>();
-  rows.forEach((row, r) => {
+  lines.forEach(({ row }, r) => {
     let x = (width - widths[r]) / 2;
     for (const block of row) {
       const w = nodeWidth(block);
-      nodes.set(block.key, { block, x, y: PAD + r * (NODE_H + ROW_GAP), w, h: NODE_H });
+      nodes.set(block.key, { block, x, y: tops[r], w, h: NODE_H });
       x += w + NODE_GAP;
     }
   });
@@ -645,7 +690,10 @@ export function drawColumn(column: Column, edges: Map<string, number>): GraphDra
       // Same row: an arc under the two, deeper the farther apart they are, so neighbours keep a
       // tight loop and a long jump clears it instead of tracing the same curve.
       const y = a.y + a.h;
-      const dip = Math.min(ROW_GAP - 8, 12 + Math.abs(bx - ax) * 0.18);
+      // Never into the line below, which a wrapped layer puts closer than the next layer.
+      const next = tops[tops.indexOf(a.y) + 1];
+      const room = next === undefined ? ROW_GAP : next - y;
+      const dip = Math.min(room - 8, 12 + Math.abs(bx - ax) * 0.18);
       const off = ax < bx ? 4 : -4;
       path = `M${ax + off},${y} C${ax + off},${y + dip} ${bx + off},${y + dip} ${bx + off},${y}`;
     }
@@ -653,6 +701,6 @@ export function drawColumn(column: Column, edges: Map<string, number>): GraphDra
   }
   // Heaviest last, so the lines that matter are drawn over the incidental ones.
   links.sort((a, b) => a.count - b.count);
-  const height = PAD * 2 + rows.length * NODE_H + (rows.length - 1) * ROW_GAP + 20;
+  const height = (tops[tops.length - 1] ?? PAD) + NODE_H + PAD + 20;
   return { width, height, nodes: [...nodes.values()], links };
 }
