@@ -142,7 +142,8 @@ describe("the boundary between the two sides", () => {
 
     const wrong = [...container.querySelectorAll(".ui-wrong")].map((one) => one.textContent);
     // The verdict counts them, and each is a row of its own in the colour that means look.
-    expect(wrong[0]).toBe("2 findings on this reading");
+    expect(wrong[0]).toBe("2");
+    expect(container.querySelector(".ui-wrong")?.parentElement?.textContent).toMatch(/^2 findings on this reading/);
     expect(wrong.some((text) => /cross(es)? between sides/.test(text ?? ""))).toBe(true);
     expect(wrong.some((text) => text?.includes("ask for a route this daemon does not serve"))).toBe(
       true,

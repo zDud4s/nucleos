@@ -733,8 +733,8 @@ function TooSmall({ reasons }: { reasons: string[] }) {
   */
   return (
     <p className="max-w-prose text-xs text-text-muted">
-      <span className="text-text">At this size only the shape reads</span>, so the marks carry no
-      numbers ({reasons.join("; ")}). Point at a mark to read it, or stand closer.
+      <span className="text-text">Numbers hidden at this size</span> ({reasons.join("; ")}). Point
+      at a mark to read it, or zoom in.
     </p>
   );
 }
@@ -1069,13 +1069,16 @@ function Matrix({
       <Stage
         full={full}
         onFull={onFull}
-        title={`${matrix.order.length} communities, every one of them a drawing of its own`}
+        title={`${matrix.order.length} communities`}
         natural={matrixWidth(matrix.order.length, longestRow)}
         note={(zoom) => (
           <>
             <TooSmall reasons={unreadableAt(zoom)} />
             <p className="m-0 h-4 truncate font-mono text-xs text-text-muted">
-              {pointed ?? "Point at a mark or a name to read it here."}
+              {/* Blank until something is pointed at: the note above already says how to read a
+                  mark when the size hides its number, and a standing instruction was one more line
+                  of prose between the reader and the drawing. The height is kept so nothing jumps. */}
+              {pointed ?? ""}
             </p>
           </>
         )}

@@ -1,16 +1,15 @@
 // §spec mapa-do-projeto
-import { useId, useMemo, useState } from "react";
+import { useId, useMemo, useState, type CSSProperties } from "react";
 import { useProjectMap, useProjectSpecs, type ProjectMap } from "../data/project-map";
-import { Boundary } from "../canvas/Boundary";
-import { MapCanvas } from "../canvas/MapCanvas";
-import { declaredCoverage } from "../canvas/map-model";
-import { buildCommunities, drawableLinks, type CommunityMatrix } from "../canvas/map-graphs";
+import { drawableLinks } from "../canvas/map-graphs";
+import { Atlas, NotRead } from "./Atlas";
+import { buildAtlas } from "./atlas-model";
 import { StampsPanel } from "./StampsPanel";
 import { ExtractSpec } from "./ExtractSpec";
 import { JunctionPanel } from "./JunctionPanel";
 import { DecisionsWaiting } from "./DecisionsWaiting";
 import { TriagePanel } from "./TriagePanel";
-import { Button, ErrorNote, StaleNote, relativeText } from "../ui";
+import { Button, ErrorNote, StaleNote, StatCard, relativeText } from "../ui";
 
 /**
  * "What is in here, what did nobody ask for, and what did this project actually decide?"
@@ -61,98 +60,206 @@ export interface ModeMapProps {
   projectId: string;
 }
 
-/** The five doors, in the order they read. */
-const VIEWS = ["picture", "junction", "stamps", "triage", "specs"] as const;
+/** The tabs of the map, in the order they read: the drawing, then the decision layer, then the rest. */
+const VIEWS = ["architecture", "specs", "junction", "stamps", "triage", "unread"] as const;
 type MapView = (typeof VIEWS)[number];
 
 const VIEW_LABEL: Record<MapView, string> = {
-  picture: "Picture",
+  architecture: "Architecture",
+  specs: "Specs",
   junction: "Junction",
   stamps: "Stamps",
   triage: "Triage",
-  specs: "Specs",
+  unread: "Not read",
 };
 
 export function ModeMap({ projectId }: ModeMapProps) {
   const map = useProjectMap(projectId);
   /*
-    Read here for the number on one door, and by `ExtractSpec` for the picker behind it. Two
+    Read here for the number on one tab, and by `ExtractSpec` for the picker behind it. Two
     readers of one query and not two queries: React Query answers both out of the same cache entry,
-    so the number on the door and the list behind it cannot disagree.
+    so the number on the tab and the list behind it cannot disagree.
   */
   const specs = useProjectSpecs(projectId);
-  const [view, setView] = useState<MapView>("picture");
-  /*
-    Built once, here, for two readers: the header's row counting what points backwards and the
-    matrix that draws it below its diagonal. One build is one number — and the seriation is the
-    dearest thing this mode computes, so it is not paid twice per open either.
-  */
-  const matrix = useMemo(
-    () => (map.data === undefined ? null : buildCommunities(map.data.modules, map.data.imports)),
+  const [view, setView] = useState<MapView>("architecture");
+  const readAgain = () => void map.refetch();
+  const atlas = useMemo(
+    () =>
+      map.data === undefined
+        ? undefined
+        : buildAtlas(map.data.modules, map.data.imports, map.data.unread),
     [map.data],
   );
-  const readAgain = () => void map.refetch();
 
+  /*
+    One tab at a time, and the drawing first. Stacked, the drawing, the decision layer and the
+    unread pile competed down one long column; as tabs the drawing gets the whole screen and each
+    other question gets a page of its own.
+  */
   return (
-    <div className="flex flex-col gap-6">
-      {/*
-        The verdict and the seam, above every door. Absent until there is an answer to draw them
-        from — a header of dashes over a map still loading is a measurement nobody took.
-      */}
-      {map.data === undefined ? null : (
-        <Boundary
-          modules={map.data.modules}
-          imports={map.data.imports}
-          unread={map.data.unread}
-          foreign={map.data.foreign}
-          seam={map.data.seam}
-          direction={matrix ?? undefined}
-          onMatrix={() => setView("picture")}
-          meta={
-            <Reading
-              data={map.data}
-              updatedAt={map.dataUpdatedAt}
-              reading={map.isFetching}
-              failed={map.isError}
-              onRead={readAgain}
-            />
-          }
-        />
-      )}
+    <div className="ws-page ws-map">
+      <header className="ws-map-head">
+        <Lead data={map.data} failed={map.isError} />
+        {map.data === undefined ? null : (
+          <Reading
+            data={map.data}
+            updatedAt={map.dataUpdatedAt}
+            reading={map.isFetching}
+            failed={map.isError}
+            onRead={readAgain}
+          />
+        )}
+      </header>
 
-      <Views view={view} onView={setView} data={map.data} specs={specs.data?.length ?? null} />
+      <Views
+        view={view}
+        onView={setView}
+        data={map.data}
+        specs={specs.data?.length ?? null}
+        unread={atlas?.unreadFiles ?? null}
+      />
 
       {view === "specs" ? (
         /*
-          Two panels behind one door, because they are the two ends of one loop: choosing what gets
-          read, and answering what came back. Neither reads the map, which is why this door still
+          Two panels behind one tab, because they are the two ends of one loop: choosing what gets
+          read, and answering what came back. Neither reads the map, which is why this tab still
           works on a project whose folder has moved.
         */
-        <div className="flex flex-col gap-8">
+        <div className="flex flex-col gap-6">
+          {map.data !== undefined && map.data.junction.counts.decisions === 0 ? (
+            // One quiet line: the empty state is not the news here, the spec to read is.
+            <p className="m-0 text-sm text-text-muted">
+              Nothing decided yet — only what you approve from a spec enters the map.
+            </p>
+          ) : null}
           <ExtractSpec projectId={projectId} />
           <DecisionsWaiting projectId={projectId} />
         </div>
-      ) : map.isError ? (
+      ) : map.isError && map.data === undefined ? (
         <ErrorNote>
           The núcleo could not read this project&rsquo;s map — its folder may have moved.{" "}
           <Button variant="quiet" onClick={readAgain} disabled={map.isFetching}>
             {map.isFetching ? "reading…" : "read it again"}
           </Button>
         </ErrorNote>
-      ) : map.data === undefined || matrix === null ? (
+      ) : map.data === undefined || atlas === undefined ? (
         <p className="text-sm text-text-faint">Reading the project&rsquo;s tree…</p>
+      ) : view === "architecture" ? (
+        <Atlas data={map.data} atlas={atlas} />
+      ) : view === "unread" ? (
+        <NotRead atlas={atlas} />
       ) : (
-        <Derived projectId={projectId} view={view} data={map.data} matrix={matrix} />
+        <div className="flex flex-col gap-4">
+          <Decisions data={map.data} onOpen={setView} />
+          <Derived projectId={projectId} view={view} data={map.data} />
+        </div>
       )}
 
       {/*
-        One line, and it was four sentences at the foot of every door: every visit ended on an
-        absence. The absence is still said — a map that implies a layer it has not got is the
-        false confidence this mode exists to cure — but once, and quietly.
+        The absence is still said — a map that implies a layer it has not got is the false
+        confidence this mode exists to cure — but once, quietly, and not under the canvas, which
+        runs to the bottom of the window.
       */}
-      <p className="m-0 text-xs text-text-faint">
-        Not on this map yet: evidence — nothing here reads a test or a gate.
+      {view === "architecture" ? null : (
+        <p className="ws-foot">
+          Not on this map yet: evidence — nothing here reads a test run or a gate.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The one sentence the map leads with: how big the ground is, and how it holds together.
+ */
+function Lead({ data, failed }: { data: ProjectMap | undefined; failed: boolean }) {
+  if (data === undefined) {
+    return (
+      <p className="font-display text-lg leading-snug text-text-muted">
+        {failed ? "This map could not be read." : "Reading this project’s map…"}
       </p>
+    );
+  }
+  const files = data.modules.length;
+  const sides = new Set(data.modules.map((m) => `${m.path.split("/")[0]}\0${m.reader}`)).size;
+  const routes = data.seam?.served.length ?? 0;
+  const broken = data.seam?.unmatched.length ?? 0;
+  const tone =
+    files === 0
+      ? "var(--text-muted)"
+      : broken > 0
+        ? "var(--tone-danger-fg)"
+        : "var(--tone-active-fg)";
+
+  return (
+    <section
+      aria-label="This project"
+      className="ws-lead"
+      style={{ "--ws-lead-tone": tone } as CSSProperties}
+    >
+      <p className="ws-lead-line">
+        {files === 0
+          ? "Nothing here is code this map can read."
+          : `${files} files in ${sides} ${sides === 1 ? "side" : "sides"}${
+              routes > 0 && sides > 1 ? `, joined by ${routes} routes` : ""
+            }.`}
+        {broken > 0 ? ` ${broken} ${broken === 1 ? "call reaches" : "calls reach"} nothing.` : ""}
+      </p>
+    </section>
+  );
+}
+
+/**
+ * §5.3's header as four figures: stamped, part-way, never looked at, on your desk.
+ *
+ * Four cards and not one sentence because they are four different claims — only the first is the
+ * owner's green (§5.2), the third is debt and is meant to bother, the last is what asks for a hand
+ * — and a line of `0 · 0 · 0 · 0` read them all at one weight. The numbers are the núcleo's own
+ * tallies, never recounted here.
+ *
+ * With nothing approved there is nothing to count, and four noughts would read as a measurement
+ * (§10, §11): the block says what it would take instead, and where to start.
+ */
+function Decisions({ data, onOpen }: { data: ProjectMap; onOpen: (view: MapView) => void }) {
+  if (data.junction.counts.decisions === 0) {
+    // One quiet line: the empty state is not the news here, the spec to read below it is.
+    return (
+      <p className="m-0 text-sm text-text-muted">
+        Nothing decided yet — only what you approve from a spec enters the map.
+      </p>
+    );
+  }
+  const { stamps, triage_counts: triage } = data;
+  return (
+    <div className="ws-metrics">
+      <StatCard
+        label="Stamped"
+        value={<span className="ws-verdict-settled">{stamps.settled}</span>}
+        detail="Still as you wanted."
+      />
+      <StatCard
+        label="Part-way"
+        value={<span className="ws-verdict-partial">{stamps.partial}</span>}
+        detail="Unfinished, and you said so."
+      />
+      <StatCard
+        label="Never looked at"
+        value={triage.unseen}
+        detail="Debt, and meant to bother. History is never stamped."
+      />
+      <StatCard
+        label="On your desk"
+        value={
+          triage.waiting > 0 ? (
+            <button type="button" className="ws-lead-door" onClick={() => onOpen("stamps")}>
+              {triage.waiting}
+            </button>
+          ) : (
+            triage.waiting
+          )
+        }
+        detail="Stamps that lapsed, and what the triager flagged."
+      />
     </div>
   );
 }
@@ -181,22 +288,30 @@ function Views({
   onView,
   data,
   specs,
+  unread,
 }: {
   view: MapView;
   onView: (view: MapView) => void;
   data: ProjectMap | undefined;
   /** How many documents there are to read, or `null` while that listing is unanswered. */
   specs: number | null;
+  /** Files the map could not follow, or `null` while the map is unread. */
+  unread: number | null;
 }) {
   const said = useId();
   const approved = data?.junction.counts.decisions ?? 0;
   /* Nothing has been read against the code yet, so nothing counted over it is a measurement. */
   const layered = data !== undefined && approved > 0;
 
+  const files = data?.modules.length ?? null;
   const counts: Record<MapView, { of: number | null; means: string }> = {
-    picture: {
-      of: null,
-      means: "The project as it is on disk, which is the one layer that is always true.",
+    architecture: {
+      of: files,
+      means: "The folders, and what leans on what.",
+    },
+    unread: {
+      of: unread,
+      means: "Source in languages the map cannot follow.",
     },
     junction: {
       of: layered ? approved : null,
@@ -225,9 +340,22 @@ function Views({
     },
   };
 
+  /*
+    A door with nothing behind it is not drawn: three chips reading "—" were most of the row on a
+    project with no decision, and said the same absence three times. The one you are behind stays.
+  */
+  const doors = VIEWS.filter(
+    (candidate) =>
+      candidate === "architecture" ||
+      candidate === "specs" ||
+      candidate === view ||
+      (counts[candidate].of ?? 0) > 0 ||
+      (candidate !== "unread" && counts[candidate].of !== null),
+  );
+
   return (
-    <nav aria-label="Views of this map" className="ui-switch">
-      {VIEWS.map((candidate) => {
+    <nav aria-label="Views of this map" className="ui-switch ws-map-tabs">
+      {doors.map((candidate) => {
         const { of, means } = counts[candidate];
         const current = candidate === view;
         return (
@@ -245,7 +373,7 @@ function Views({
             }
           >
             {VIEW_LABEL[candidate]}
-            {candidate === "picture" ? null : of === null ? (
+            {of === null ? (
               <>
                 <span aria-hidden="true" className="font-mono text-text-faint">
                   —
@@ -266,7 +394,7 @@ function Views({
 }
 
 /**
- * The line under the verdict: the size of what this reader could read, and when it read it.
+ * The line under the lead: what holds the files together, and when they were read.
  *
  * **The size used to be the page's hero** — `245` at display size, the largest thing on the
  * screen — and it answers nothing: a project's size is not whether it is fine. It is metadata,
@@ -295,14 +423,10 @@ function Reading({
   failed: boolean;
   onRead: () => void;
 }) {
-  const { modules, imports, foreign } = data;
+  const { modules, imports } = data;
   // Counted rather than taken from `imports.length`: this is the number of links the map would
   // actually draw, which drops any edge with an end it cannot find.
   const links = drawableLinks(modules, imports);
-  // §8 on screen: a bare `§7` names a section of *some* document, and the header says which.
-  // Counted over the files that name a section and not over `modules.length` — a file with no `§`
-  // has nothing to declare.
-  const declared = declaredCoverage(modules, foreign);
 
   return (
     <div className="flex flex-col gap-1">
@@ -313,12 +437,8 @@ function Reading({
         The exact time stays on hover and in `dateTime`.
       */}
       <p className="m-0 text-xs text-text-muted">
-        <span className="font-mono tabular-nums text-text">{modules.length}</span> module
-        {modules.length === 1 ? "" : "s"} this reader could read · {links} link
-        {links === 1 ? "" : "s"}
-        {declared.citing > 0
-          ? ` · ${declared.saying} of ${declared.citing} files naming a section say which document`
-          : ""}
+        {/* The file count is the lead's; repeating it here is what made the two disagree once. */}
+        <span className="tabular-nums">{links}</span> import{links === 1 ? "" : "s"} between them
         {updatedAt > 0 ? (
           <>
             {" · read "}
@@ -355,16 +475,13 @@ function Derived({
   projectId,
   view,
   data,
-  matrix,
 }: {
   projectId: string;
-  view: MapView;
+  view: Exclude<MapView, "specs" | "architecture" | "unread">;
   data: ProjectMap;
-  matrix: CommunityMatrix;
 }) {
   const {
     modules,
-    imports,
     junction,
     standings,
     stamps,
@@ -374,25 +491,6 @@ function Derived({
     recency,
     last_triaged_at,
   } = data;
-
-  if (view === "picture") {
-    /*
-      The structure layer as a picture: the whole project, one community, and one file's own
-      declarations. The file level is the one thing here that reads a route of its own — it reads
-      one file, which this answer does not carry and could not carry cheaply, and that route is
-      asked only once a reader opens something, so the cost lands on the click.
-    */
-    return (
-      <MapCanvas
-        projectId={projectId}
-        modules={modules}
-        imports={imports}
-        junction={junction}
-        standings={standings}
-        matrix={matrix}
-      />
-    );
-  }
 
   if (view === "junction") {
     // The modules ride along so the panel can check its own "nobody asked for" pile against the
