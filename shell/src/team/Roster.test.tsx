@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import {
   Outlet,
@@ -118,7 +118,7 @@ function run(overrides: Partial<TeamRunView> = {}): TeamRunView {
         round: 2,
         agent_id: "controller",
         description: "match them line by line",
-        state: "working",
+        state: "running",
         run_id: 13,
       }),
     ],
@@ -136,7 +136,12 @@ function listRow(overrides: Partial<TeamRun> = {}): TeamRun {
  * The tab over a fake daemon whose live run can be swapped mid-test, which is what the last test
  * needs: the layout must survive a state changing under it without moving a box.
  */
-async function renderRoster(view: TeamView, runs: TeamRun[], seed: TeamRunView = run()) {
+async function renderRoster(
+  view: TeamView,
+  runs: TeamRun[],
+  onOpenCharter?: () => void,
+  seed: TeamRunView = run(),
+) {
   const state = { detail: seed };
 
   daemon.apiFetch.mockImplementation(async (path: string) => {
@@ -157,7 +162,7 @@ async function renderRoster(view: TeamView, runs: TeamRun[], seed: TeamRunView =
     createRoute({
       getParentRoute: () => rootRoute,
       path: "/teams/$teamId",
-      component: () => <Roster team={view} runs={runs} />,
+      component: () => <Roster team={view} runs={runs} onOpenCharter={onOpenCharter} />,
     }),
   ];
   const router = createRouter({
@@ -195,13 +200,13 @@ describe("Roster", () => {
     expect(await screen.findByLabelText("Finanças — 2 on the roster")).toBeTruthy();
     expect(screen.getByLabelText("controller — directs")).toBeTruthy();
     expect(screen.getByLabelText("Auditor Sénior — checks the books")).toBeTruthy();
-    expect(screen.getByText("nothing in flight")).toBeTruthy();
+    expect(screen.getByText("Nothing in flight.")).toBeTruthy();
   });
 
   it("says nobody is in charge rather than drawing a nameless box", async () => {
     await renderRoster(team({ director_agent_id: "", members: ["auditor"] }), []);
 
-    expect(await screen.findByText(/nobody is in charge of this team yet/)).toBeTruthy();
+    expect(await screen.findByText(/Nobody is in charge of this team yet/)).toBeTruthy();
     expect(screen.getByLabelText("Auditor Sénior — checks the books")).toBeTruthy();
   });
 
@@ -227,10 +232,37 @@ describe("Roster", () => {
     expect(within(work).getByText("done")).toBeTruthy();
   });
 
+  it("draws the glyph the daemon's own state names map to", async () => {
+    await renderRoster(team(), [listRow()]);
+
+    const running = await screen.findByLabelText("match them line by line — running");
+    expect(running.querySelector(".teams-org-mark")?.textContent).toBe("⋯");
+    const done = await screen.findByLabelText("pull the bank export — done");
+    expect(done.querySelector(".teams-org-mark")?.textContent).toBe("✓");
+  });
+
+  it("offers the way out of an unstaffed team when the bench can open the Charter", async () => {
+    const onOpenCharter = vi.fn();
+    await renderRoster(team({ director_agent_id: "", members: ["auditor"] }), [], onOpenCharter);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Choose a Director" }));
+    expect(onOpenCharter).toHaveBeenCalledTimes(1);
+  });
+
+  it("makes the chart's scroll area a focusable, named region", async () => {
+    const { container } = await renderRoster(team(), []);
+    await screen.findByLabelText("Finanças — 2 on the roster");
+
+    const scroll = container.querySelector(".teams-org-scroll");
+    expect(scroll?.getAttribute("role")).toBe("region");
+    expect(scroll?.getAttribute("tabindex")).toBe("0");
+    expect(scroll?.getAttribute("aria-label")).toBe("Finanças org chart");
+  });
+
   it("says nothing is in flight when no run is alive", async () => {
     await renderRoster(team(), []);
 
-    expect(await screen.findByText("nothing in flight")).toBeTruthy();
+    expect(await screen.findByText("Nothing in flight.")).toBeTruthy();
     expect(screen.queryByLabelText(/pull the bank export/)).toBeNull();
     expect(daemon.apiFetch).not.toHaveBeenCalledWith(expect.stringContaining("/team-runs/"));
   });
@@ -243,7 +275,7 @@ describe("Roster", () => {
 
   it("routes the director's own edge around the roster rather than through it", async () => {
     const { container } = await renderRoster(team(), [listRow()]);
-    await screen.findByLabelText("match them line by line — working");
+    await screen.findByLabelText("match them line by line — running");
 
     const crossing = container.querySelector(".teams-org-edge-far");
     // Orthogonal, not a curve. A bezier from rank 0 to rank 2 passes under a specialist's box and

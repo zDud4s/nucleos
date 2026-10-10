@@ -1,5 +1,5 @@
 // §spec alcada-por-equipa
-import { useEffect, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useAgents } from "../data/agents";
 import { ContextRefs } from "../context/ContextRefs";
@@ -18,17 +18,7 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
-import {
-  Button,
-  ErrorNote,
-  LimitChip,
-  Meter,
-  Panel,
-  Quiet,
-  RefusalNote,
-  Who,
-  usd,
-} from "../ui";
+import { Button, ErrorNote, Field, Meter, Panel, Quiet, RefusalNote } from "../ui";
 import { detectDrift, snapshotFromView, type Drift, type DriftField } from "./drift";
 import { daemonProse } from "./prose";
 
@@ -44,8 +34,8 @@ import { daemonProse } from "./prose";
  * Five sections rather than eleven boxes in a column, because the eleven are not
  * one list: identity, leadership, staff, powers and limits are five different
  * questions, and the limits split again into the two kinds §2.2 of the design
- * separates — a ceiling something occupies gets a bar, a rule applied to each
- * task gets a chip.
+ * separates: what the whole team does at once, and what each single task may
+ * use. The one ceiling something occupies right now carries its live reading.
  *
  * ## The guard
  *
@@ -124,6 +114,77 @@ export function parseCeiling(raw: string): number | null {
   if (trimmed === "") return null;
   const value = Number(trimmed);
   return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * The numeric ceilings a person can get wrong, with the range each accepts.
+ *
+ * `Number("")` is `0`, which is a legal-looking ceiling nobody typed, so the range is checked on
+ * the raw string and a blank is a problem for every field except the budget, where blank means
+ * "no ceiling".
+ */
+interface LimitSpec {
+  field: "maxLiveRuns" | "maxOpenActions" | "maxRounds" | "maxParallel" | "budgetUsd";
+  min: number;
+  max: number | null;
+  integer: boolean;
+  blankOk: boolean;
+}
+
+const LIMITS: Record<LimitSpec["field"], LimitSpec> = {
+  maxLiveRuns: { field: "maxLiveRuns", min: 1, max: 4, integer: true, blankOk: false },
+  maxOpenActions: { field: "maxOpenActions", min: 0, max: 20, integer: true, blankOk: false },
+  maxRounds: { field: "maxRounds", min: 1, max: 6, integer: true, blankOk: false },
+  maxParallel: { field: "maxParallel", min: 1, max: 8, integer: true, blankOk: false },
+  budgetUsd: { field: "budgetUsd", min: 0, max: null, integer: false, blankOk: true },
+};
+
+/** What to tell the person when a ceiling is out of range, or `null` when it is fine. */
+export function limitProblem(field: LimitSpec["field"], raw: string): string | null {
+  const spec = LIMITS[field];
+  const trimmed = raw.trim();
+  if (trimmed === "") return spec.blankOk ? null : rangeSaid(spec);
+  const value = Number(trimmed);
+  const inRange = Number.isFinite(value) && value >= spec.min && (spec.max === null || value <= spec.max);
+  if (!inRange || (spec.integer && !Number.isInteger(value))) return rangeSaid(spec);
+  return null;
+}
+
+function rangeSaid(spec: LimitSpec): string {
+  return spec.max === null ? `Use ${spec.min} or more` : `Use ${spec.min} to ${spec.max}`;
+}
+
+/** The limit fields whose current text is not acceptable. */
+function limitProblems(form: TeamFormState): LimitSpec["field"][] {
+  return (Object.keys(LIMITS) as LimitSpec["field"][]).filter((field) => limitProblem(field, form[field]) !== null);
+}
+
+/** The three required words, named as the sentence under a disabled Save needs them. */
+function missingPieces(form: TeamFormState): string[] {
+  const missing: string[] = [];
+  if (form.name.trim() === "") missing.push("a name");
+  if (form.mission.trim() === "") missing.push("a mission");
+  if (form.directorAgentId.trim() === "") missing.push("a director");
+  return missing;
+}
+
+/** Which section of the form owns each field, so the save bar can count sections and not fields. */
+const SECTION_OF: Record<DriftField, string> = {
+  name: "Identity",
+  mission: "Identity",
+  directorAgentId: "Leadership",
+  members: "Staff",
+  grants: "Powers",
+  maxRounds: "Limits",
+  maxParallel: "Limits",
+  budgetUsd: "Limits",
+  maxOpenActions: "Limits",
+  maxLiveRuns: "Limits",
+};
+
+function joinWords(words: string[]): string {
+  if (words.length <= 1) return words.join("");
+  return `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
 }
 
 export function teamRequestFromForm(form: TeamFormState): TeamRequest {
@@ -238,6 +299,8 @@ function TeamForm({
   const [guard, setGuard] = useState<Guard | null>(null);
   const [checking, setChecking] = useState(false);
   const [unreadable, setUnreadable] = useState(false);
+  // "Saved" is shown for a moment where the save bar was, then goes — see the effect below.
+  const [saved, setSaved] = useState(false);
 
   useEffect(() => {
     if (existing !== null && form === null) {
@@ -247,26 +310,43 @@ function TeamForm({
   }, [existing, form]);
 
   const reportState = dialog?.onState;
-  const canSubmit =
-    form !== null &&
-    form.name.trim() !== "" &&
-    form.mission.trim() !== "" &&
-    form.directorAgentId.trim() !== "";
+  const canSubmit = form !== null && missingPieces(form).length === 0 && limitProblems(form).length === 0;
   const busy = create.isPending || update.isPending || checking;
   useEffect(() => {
     reportState?.({ canSubmit, busy });
   }, [reportState, canSubmit, busy]);
 
+  useEffect(() => {
+    if (!saved) return;
+    const timer = setTimeout(() => setSaved(false), 2500);
+    return () => clearTimeout(timer);
+  }, [saved]);
+
   if (form === null) return <Quiet says="reading the team…" />;
 
   const mutation = existing === null ? create : update;
-  const valid = form.name.trim() !== "" && form.mission.trim() !== "" && form.directorAgentId.trim() !== "";
+  const missing = missingPieces(form);
+  const badLimits = limitProblems(form);
+  const valid = missing.length === 0 && badLimits.length === 0;
   const dirty = existing === null || touched.size > 0;
+  const sectionsChanged = new Set([...touched].map((field) => SECTION_OF[field])).size;
+  const whyNot: "create" | "save" = existing === null ? "create" : "save";
 
   /** Every edit marks its field, which is what makes the guard able to stay quiet. */
   function edit(field: DriftField, next: Partial<TeamFormState>) {
     setForm((current) => (current === null ? current : { ...current, ...next }));
     setTouched((current) => new Set(current).add(field));
+    setSaved(false);
+  }
+
+  /*
+    A required box says nothing until somebody empties it. A standing "Required" under every
+    filled field was noise the eye learned to skip, so the words now appear only when they are
+    true, and only once the person has touched the field — a fresh create form is not an error.
+  */
+  function emptied(field: DriftField, value: string, said: string): React.ReactNode {
+    if (!touched.has(field) || value.trim() !== "") return undefined;
+    return <span className="teams-limit-error">{said}</span>;
   }
 
   function send(body: TeamRequest) {
@@ -290,13 +370,14 @@ function TeamForm({
           setSeed(view);
           setForm(teamFormFromView(view));
           setTouched(new Set());
+          setSaved(true);
         },
       },
     );
   }
 
   async function submit() {
-    if (form === null || !valid || mutation.isPending || checking) return;
+    if (form === null || !valid || !dirty || mutation.isPending || checking) return;
     setUnreadable(false);
 
     if (existing === null || seed === null) {
@@ -350,13 +431,20 @@ function TeamForm({
         event.preventDefault();
         void submit();
       }}
+      onKeyDown={(event) => {
+        // Ctrl/Cmd+S saves by the same road as the button, drift check included.
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+          event.preventDefault();
+          void submit();
+        }
+      }}
     >
       <Section
         flat={dialog !== undefined}
         title="Identity"
         note="Renaming a team later is safe: it keeps its link and its history."
       >
-        <Field label="Name" required>
+        <Field label="Name" helper={emptied("name", form.name, "Add a name")}>
           <input
             className="teams-input"
             aria-required="true"
@@ -364,7 +452,7 @@ function TeamForm({
             onChange={(event) => edit("name", { name: event.target.value })}
           />
         </Field>
-        <Field label="Mission" required>
+        <Field label="Mission" helper={emptied("mission", form.mission, "Add a mission")}>
           <textarea
             className="teams-textarea"
             rows={2}
@@ -380,14 +468,14 @@ function TeamForm({
         title="Leadership"
         note="The director plans each task and hands out the work. Without one, this team cannot start a task."
       >
-        <Field label="Director" required>
+        <Field label="Director" helper={emptied("directorAgentId", form.directorAgentId, "Choose a director")}>
           <select
             className="teams-select"
             aria-required="true"
             value={form.directorAgentId}
             onChange={(event) => edit("directorAgentId", { directorAgentId: event.target.value })}
           >
-            <option value="">choose an agent</option>
+            <option value="">Choose an agent</option>
             {(agents.data ?? []).map((agent) => (
               <option key={agent.id} value={agent.id}>
                 {agent.name}
@@ -400,7 +488,7 @@ function TeamForm({
       <Section
         flat={dialog !== undefined}
         title="Staff"
-        note="Who this team can give work to. A specialist can serve several teams — where else they work is shown below. Saving replaces the whole roster with what is ticked."
+        note="Who this team can give work to. A specialist can serve several teams; where else they work is shown beside their name. Saving replaces the whole roster with what is ticked."
       >
         <fieldset className="teams-members">
           <legend className="teams-label">Members</legend>
@@ -408,48 +496,47 @@ function TeamForm({
             <p className="teams-note">No specialists exist yet — hire one on the Agents page first.</p>
           ) : (
             <ul className="teams-check-list">
-              {members.map((agent) => (
-                <li key={agent.id}>
-                  <label className="teams-check">
-                    <input
-                      type="checkbox"
-                      checked={form.members.includes(agent.id)}
-                      onChange={(event) =>
-                        edit("members", {
-                          members: event.target.checked
-                            ? [...form.members, agent.id]
-                            : form.members.filter((id) => id !== agent.id),
-                        })
-                      }
-                    />
-                    <span className="teams-check-name">{agent.name}</span>
-                    {agent.speciality !== "" && (
-                      <span className="teams-check-note">{agent.speciality}</span>
-                    )}
-                  </label>
-                </li>
-              ))}
+              {members.map((agent) => {
+                // Said in the row it is about. A second row of chips under the list repeated
+                // every ticked name only to hang this one fact on it.
+                const elsewhere = shared.filter(
+                  (other) => other.members.includes(agent.id) || other.director_agent_id === agent.id,
+                );
+                return (
+                  <li key={agent.id}>
+                    <label className="teams-check">
+                      <input
+                        type="checkbox"
+                        checked={form.members.includes(agent.id)}
+                        onChange={(event) =>
+                          edit("members", {
+                            members: event.target.checked
+                              ? [...form.members, agent.id]
+                              : form.members.filter((id) => id !== agent.id),
+                          })
+                        }
+                      />
+                      {/* One text block beside the box: name and speciality run on as a
+                          sentence, and "also in" takes its own line under them rather than a
+                          right-hand column that broke into ragged fragments. */}
+                      <span className="teams-check-body">
+                        <span className="teams-check-name">{agent.name}</span>
+                        {agent.speciality !== "" && (
+                          <span className="teams-check-note">{agent.speciality}</span>
+                        )}
+                        {elsewhere.length > 0 && (
+                          <span className="teams-check-also">
+                            also in {elsewhere.map((other) => other.name).join(", ")}
+                          </span>
+                        )}
+                      </span>
+                    </label>
+                  </li>
+                );
+              })}
             </ul>
           )}
         </fieldset>
-        {form.members.length > 0 && (
-          <div className="teams-charter-people">
-            {form.members.map((id) => {
-              const elsewhere = shared.filter(
-                (other) => other.members.includes(id) || other.director_agent_id === id,
-              );
-              return (
-                <Who
-                  key={id}
-                  id={id}
-                  leads={id === form.directorAgentId}
-                  shared={elsewhere.length > 0}
-                  note={elsewhere.length === 0 ? undefined : `also ${elsewhere.map((o) => o.name).join(", ")}`}
-                />
-              );
-            })}
-          </div>
-        )}
       </Section>
 
       <Section
@@ -463,82 +550,63 @@ function TeamForm({
       <Section
         flat={dialog !== undefined}
         title="Limits"
-        note="Some limits cap how much the team does at once; the others cap what each single task may use, counting from zero every time."
+        note="Two of these cap how much the team does at once. The rest cap what each single task may use, counting from zero every time."
       >
-        <p className="teams-charter-label">At once</p>
-        <div className="teams-charter-limits">
-          <Field label="Max live runs (1-4)">
-            <input
-              className="teams-input"
-              type="number"
-              min={1}
-              max={4}
-              value={form.maxLiveRuns}
-              onChange={(event) => edit("maxLiveRuns", { maxLiveRuns: event.target.value })}
-            />
-          </Field>
-          {/* Live runs occupy this ceiling right now: the reading Acting Green is for. */}
-          <Meter
-            label="at work"
-            value={runs.filter((run) => run.team_id === existing?.id && LIVE.has(run.state)).length}
-            ceiling={parseCeiling(form.maxLiveRuns)}
-            tone="active"
+        <LimitGroup title="The whole team, at once">
+          <StepperRow
+            field="maxLiveRuns"
+            label="Tasks running at the same time"
+            explain="How many tasks this team may work on at once."
+            fewer="Fewer tasks at once"
+            more="More tasks at once"
+            value={form.maxLiveRuns}
+            onChange={(value) => edit("maxLiveRuns", { maxLiveRuns: value })}
+          >
+            {existing !== null && (
+              <LiveNow
+                value={runs.filter((run) => run.team_id === existing.id && LIVE.has(run.state)).length}
+                ceiling={parseCeiling(form.maxLiveRuns)}
+              />
+            )}
+          </StepperRow>
+          <StepperRow
+            field="maxOpenActions"
+            label="Actions waiting for your OK"
+            explain="How many drafted actions may wait for your decision at once."
+            fewer="Fewer actions waiting"
+            more="More actions waiting"
+            value={form.maxOpenActions}
+            onChange={(value) => edit("maxOpenActions", { maxOpenActions: value })}
           />
-          <Field label="Max open actions (0-20)">
-            <input
-              className="teams-input"
-              type="number"
-              min={0}
-              max={20}
-              value={form.maxOpenActions}
-              onChange={(event) => edit("maxOpenActions", { maxOpenActions: event.target.value })}
-            />
-          </Field>
-        </div>
+        </LimitGroup>
 
-        <p className="teams-charter-label">Per task</p>
-        <div className="teams-charter-limits">
-          <Field label="Max rounds (1-6)">
-            <input
-              className="teams-input"
-              type="number"
-              min={1}
-              max={6}
-              value={form.maxRounds}
-              onChange={(event) => edit("maxRounds", { maxRounds: event.target.value })}
-            />
-          </Field>
-          <Field label="Max parallel (1-8)">
-            <input
-              className="teams-input"
-              type="number"
-              min={1}
-              max={8}
-              value={form.maxParallel}
-              onChange={(event) => edit("maxParallel", { maxParallel: event.target.value })}
-            />
-          </Field>
-          <Field label="Budget ceiling (USD, blank = no ceiling)">
-            <input
-              className="teams-input"
-              type="text"
-              inputMode="decimal"
-              placeholder="no ceiling"
-              value={form.budgetUsd}
-              onChange={(event) => edit("budgetUsd", { budgetUsd: event.target.value })}
-            />
-          </Field>
-        </div>
-        <div className="teams-charter-limits">
-          <LimitChip name="rounds" ceiling={parseCeiling(form.maxRounds)} />
-          <LimitChip name="parallel" ceiling={parseCeiling(form.maxParallel)} />
-          <LimitChip name="spend" ceiling={parseCeiling(form.budgetUsd)} format={usd} />
-        </div>
+        <LimitGroup title="Each task">
+          <StepperRow
+            field="maxRounds"
+            label="Rounds per task"
+            explain="How many times the director may plan, hand out work and review before the task ends."
+            fewer="Fewer rounds"
+            more="More rounds"
+            value={form.maxRounds}
+            onChange={(value) => edit("maxRounds", { maxRounds: value })}
+          />
+          <StepperRow
+            field="maxParallel"
+            label="Specialists working in parallel"
+            explain="How many specialists may work on one task at the same time."
+            fewer="Fewer specialists in parallel"
+            more="More specialists in parallel"
+            value={form.maxParallel}
+            onChange={(value) => edit("maxParallel", { maxParallel: value })}
+          />
+          <CeilingRow value={form.budgetUsd} onChange={(value) => edit("budgetUsd", { budgetUsd: value })} />
+        </LimitGroup>
       </Section>
 
       {guard !== null && (
         <DriftGuard
           guard={guard}
+          onKeep={() => setGuard(null)}
           onTake={() => {
             const merged = takeTheirs(form, guard.fresh, guard.drifted);
             setForm(merged);
@@ -562,8 +630,8 @@ function TeamForm({
 
       {unreadable && (
         <ErrorNote>
-          the núcleo did not answer when this form asked what the team looks like now — nothing
-          was saved, so nothing of theirs could be overwritten by mistake
+          NucleOS didn&apos;t answer when the form asked what the team looks like now, so nothing was
+          saved. Try {whyNot === "create" ? "again" : "Save again"}.
         </ErrorNote>
       )}
 
@@ -572,17 +640,33 @@ function TeamForm({
       {dirty && dialog === undefined && (
         <div className="teams-savebar">
           <p className="teams-savebar-said">
-            {existing === null
-              ? "Creating sends the roster and the powers as they are here."
-              : `${touched.size} ${touched.size === 1 ? "section" : "sections"} changed — the roster and the powers are sent whole, so what is here replaces what is there.`}
+            {!valid
+              ? whyCannot(missing, badLimits.length > 0, whyNot)
+              : existing === null
+                ? "Creating sends the roster and the powers as they are here."
+                : `${sectionsChanged} ${sectionsChanged === 1 ? "section" : "sections"} changed — the roster and the powers are sent whole, so what is here replaces what is there.`}
           </p>
           <Button type="submit" intent="go" disabled={!valid || mutation.isPending || checking}>
-            {checking ? "Checking…" : existing === null ? "Create team" : "Save"}
+            {checking
+              ? "Checking…"
+              : mutation.isPending
+                ? existing === null
+                  ? "Creating…"
+                  : "Saving…"
+                : existing === null
+                  ? "Create team"
+                  : "Save"}
           </Button>
         </div>
       )}
 
-      {mutation.isError && <SaveRefusal error={mutation.error} />}
+      {!dirty && saved && dialog === undefined && (
+        <p className="teams-savebar-saved" role="status">
+          Saved
+        </p>
+      )}
+
+      {mutation.isError && <SaveRefusal error={mutation.error} creating={existing === null} />}
     </form>
   );
 }
@@ -602,15 +686,34 @@ function DriftGuard({
   guard,
   onTake,
   onReload,
+  onKeep,
   onAnyway,
 }: {
   guard: Guard;
   onTake: () => void;
   onReload: () => void;
+  onKeep: () => void;
   onAnyway: () => void;
 }) {
+  // The question appears below the sections, which can be off-screen on a tall form: bring it
+  // into view and give it focus, so neither a sighted nor a keyboard user is left looking at a
+  // Save that did nothing.
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const node = ref.current;
+    if (node === null) return;
+    node.scrollIntoView?.({ block: "nearest" });
+    node.focus();
+  }, []);
+
   return (
-    <div className="teams-drift" role="alert" aria-label="Changed while you were editing">
+    <div
+      ref={ref}
+      tabIndex={-1}
+      className="teams-drift"
+      role="alert"
+      aria-label="Changed while you were editing"
+    >
       <p className="teams-drift-said">
         This team changed while you had the form open, in{" "}
         {guard.drifted.length === 1 ? "a field" : "fields"} you were not editing. Saving as-is would
@@ -629,7 +732,10 @@ function DriftGuard({
         <Button variant="approve" onClick={onTake}>
           Take theirs and save
         </Button>
-        <Button onClick={onReload}>Reload the form</Button>
+        <Button variant="danger" onClick={onReload}>
+          Discard my edits and reload
+        </Button>
+        <Button onClick={onKeep}>Keep editing</Button>
         <Button variant="danger" onClick={onAnyway}>
           Save mine anyway
         </Button>
@@ -671,23 +777,229 @@ function Section({
   );
 }
 
-function Field({
+/**
+ * One group of ceilings, drawn as the Powers rows are: a bordered row per setting, its name on the
+ * left and its control on the right. The limits used to be a grid of bare boxes under uppercase
+ * eyebrows, and read as a spreadsheet nobody had explained; a list of sentences with a control
+ * each reads as the settings they are.
+ */
+function LimitGroup({ title, children }: { title: string; children: React.ReactNode }) {
+  const titleId = useId();
+  return (
+    <div className="teams-limit-group" role="group" aria-labelledby={titleId}>
+      <p className="teams-limit-group-title" id={titleId}>
+        {title}
+      </p>
+      <ul className="teams-grants teams-limits">{children}</ul>
+    </div>
+  );
+}
+
+/** The range a count accepts, written the way the explanation line says it: "1–4". */
+function rangeShort(spec: LimitSpec): string {
+  return spec.max === null ? `${spec.min} or more` : `${spec.min}–${spec.max}`;
+}
+
+/**
+ * A count with a stepper. The number stays an input (somebody who knows they want 6 types 6),
+ * but the buttons and the arrow keys only ever land inside the range, so the common change is a
+ * click that cannot be wrong. A typed value outside it is still possible, and still answered by
+ * `limitProblem`, which is what keeps Save honest.
+ */
+function StepperRow({
+  field,
   label,
-  required = false,
+  explain,
+  fewer,
+  more,
+  value,
+  onChange,
   children,
 }: {
+  field: Exclude<LimitSpec["field"], "budgetUsd">;
   label: string;
-  required?: boolean;
-  children: React.ReactNode;
+  explain: string;
+  /** The buttons' accessible names: "−" and "+" alone say nothing about what they change. */
+  fewer: string;
+  more: string;
+  value: string;
+  onChange: (value: string) => void;
+  /** A reading that belongs to this ceiling, drawn under its explanation. */
+  children?: React.ReactNode;
 }) {
+  const inputId = useId();
+  const explainId = useId();
+  const problemId = useId();
+  const spec = LIMITS[field];
+  const max = spec.max ?? Number.POSITIVE_INFINITY;
+  const problem = limitProblem(field, value);
+  const typed = Number(value.trim());
+  const readable = value.trim() !== "" && Number.isFinite(typed);
+
+  function step(by: number) {
+    // From an unreadable box the first step lands on the nearest bound, never on NaN.
+    const from = readable ? Math.round(typed) : by > 0 ? spec.min - 1 : max + 1;
+    onChange(String(Math.min(max, Math.max(spec.min, from + by))));
+  }
+
   return (
-    <label className="teams-field">
-      <span className="teams-label" data-required={required ? "true" : undefined}>
-        {label}
-      </span>
-      {children}
-    </label>
+    <li className="teams-grant teams-limit">
+      <div className="teams-limit-text">
+        <label className="teams-limit-label" htmlFor={inputId}>
+          {label}
+        </label>
+        <span className="teams-limit-explain" id={explainId}>
+          {explain} {rangeShort(spec)}.
+        </span>
+        {problem !== null && (
+          <span className="teams-limit-error" id={problemId}>
+            {problem}
+          </span>
+        )}
+        {children}
+      </div>
+      <div className="teams-stepper">
+        <button
+          type="button"
+          className="teams-stepper-button"
+          aria-label={fewer}
+          disabled={readable && typed <= spec.min}
+          onClick={() => step(-1)}
+        >
+          −
+        </button>
+        <input
+          id={inputId}
+          className="teams-stepper-input"
+          type="text"
+          inputMode="numeric"
+          aria-describedby={problem === null ? explainId : `${explainId} ${problemId}`}
+          aria-invalid={problem === null ? undefined : true}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+              event.preventDefault();
+              step(event.key === "ArrowUp" ? 1 : -1);
+            }
+          }}
+        />
+        <button
+          type="button"
+          className="teams-stepper-button"
+          aria-label={more}
+          disabled={readable && typed >= max}
+          onClick={() => step(1)}
+        >
+          +
+        </button>
+      </div>
+    </li>
   );
+}
+
+/**
+ * The live reading under "Tasks running at the same time": the ceiling a person is setting, with
+ * what is occupying it right now. It sat in the limits grid as a cell of its own, between two
+ * inputs, where it read as a third setting.
+ */
+function LiveNow({ value, ceiling }: { value: number; ceiling: number | null }) {
+  return (
+    <span className="teams-limit-live">
+      <span className="teams-limit-live-said">{value} running now</span>
+      <Meter label="running now" value={value} ceiling={ceiling} tone="active" head={false} />
+    </span>
+  );
+}
+
+/**
+ * The spending ceiling: an amount, or none at all. "None" is a box to tick rather than a blank
+ * to leave, because a blank box reads as something not yet filled in. What is saved is the same
+ * as before: no ceiling is a blank, sent as `null` and never as `0`, which is a real ceiling.
+ */
+function CeilingRow({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const inputId = useId();
+  const explainId = useId();
+  const problemId = useId();
+  const amount = useRef<HTMLInputElement>(null);
+  // The last amount typed, so ticking "No ceiling" and unticking it again gives it back.
+  const remembered = useRef(value);
+  const [none, setNone] = useState(value.trim() === "");
+  const problem = limitProblem("budgetUsd", value);
+
+  useEffect(() => {
+    if (value.trim() !== "") {
+      remembered.current = value;
+      setNone(false);
+    }
+  }, [value]);
+
+  return (
+    <li className="teams-grant teams-limit">
+      <div className="teams-limit-text">
+        <label className="teams-limit-label" htmlFor={inputId}>
+          Spending ceiling per task
+        </label>
+        <span className="teams-limit-explain" id={explainId}>
+          What one task may spend, in US dollars, before it stops.
+        </span>
+        {problem !== null && (
+          <span className="teams-limit-error" id={problemId}>
+            {problem}
+          </span>
+        )}
+      </div>
+      <div className="teams-ceiling">
+        <span className="teams-money" data-off={none ? "true" : undefined}>
+          <span className="teams-money-sign" aria-hidden="true">
+            $
+          </span>
+          <input
+            id={inputId}
+            ref={amount}
+            className="teams-money-input"
+            type="text"
+            inputMode="decimal"
+            placeholder={none ? "" : "0.00"}
+            disabled={none}
+            aria-describedby={problem === null ? explainId : `${explainId} ${problemId}`}
+            aria-invalid={problem === null ? undefined : true}
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            onBlur={() => {
+              // Emptied and left: that is no ceiling, so the box says so instead of a blank
+              // that quietly means the same thing.
+              if (value.trim() === "") setNone(true);
+            }}
+          />
+        </span>
+        <label className="teams-check teams-ceiling-none">
+          <input
+            type="checkbox"
+            checked={none}
+            onChange={(event) => {
+              const ticked = event.target.checked;
+              setNone(ticked);
+              if (ticked) {
+                onChange("");
+              } else {
+                onChange(remembered.current);
+                // Focus waits for the box to be enabled, which is the next render.
+                setTimeout(() => amount.current?.focus(), 0);
+              }
+            }}
+          />
+          <span className="teams-check-name">No ceiling</span>
+        </label>
+      </div>
+    </li>
+  );
+}
+
+/** The sentence under a disabled Save: what is actually missing, not a generic refusal. */
+function whyCannot(missing: string[], limitsOff: boolean, verb: "save" | "create"): string {
+  if (missing.length > 0) return `Add ${joinWords(missing)} to ${verb}`;
+  return limitsOff ? `Fix the limits marked above to ${verb}` : `Fill in the form to ${verb}`;
 }
 
 /**
@@ -716,9 +1028,8 @@ function Grants({ grants, onChange }: { grants: TeamGrant[]; onChange: (grants: 
         const current = grants.find((grant) => grant.kind === kind)?.mode ?? "";
         return (
           <li className="teams-grant" key={kind}>
-            <span className="teams-grant-label">
+            <span className="teams-grant-label" title={kind}>
               {POWER_LABEL[kind]}
-              <span className="teams-grant-ident">{kind}</span>
             </span>
             <select
               className="teams-select teams-grant-modes"
@@ -730,10 +1041,10 @@ function Grants({ grants, onChange }: { grants: TeamGrant[]; onChange: (grants: 
                 onChange(value === "" ? rest : [...rest, { kind, mode: value }]);
               }}
             >
-              <option value="">asks you</option>
+              <option value="">Asks you</option>
               {GRANT_MODES.map((mode) => (
                 <option key={mode} value={mode}>
-                  {mode === "propose" ? "asks first" : "does it"}
+                  {mode === "propose" ? "Asks first" : "Does it"}
                 </option>
               ))}
             </select>
@@ -744,7 +1055,11 @@ function Grants({ grants, onChange }: { grants: TeamGrant[]; onChange: (grants: 
   );
 }
 
-function SaveRefusal({ error }: { error: unknown }) {
+function SaveRefusal({ error, creating }: { error: unknown; creating: boolean }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — this team was not saved</ErrorNote>;
+  return (
+    <ErrorNote>
+      NucleOS didn&apos;t answer, so nothing was saved. Try {creating ? "again" : "Save again"}.
+    </ErrorNote>
+  );
 }

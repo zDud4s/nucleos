@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
+  TEAM_RUN_LIST_LIMIT,
   teamRunIsAlive,
   useDeleteTeam,
   useOpenTeamActions,
@@ -58,6 +60,8 @@ import "../pages/teams.css";
 export function Bench() {
   const params = useParams({ strict: false }) as { teamId?: string };
   const teamId = params.teamId ?? "";
+  // Controlled so that a tab can send the reader to another one (Roster -> Charter).
+  const [tab, setTab] = useState("work");
 
   const team = useTeam(teamId);
   const runs = useTeamRuns();
@@ -92,7 +96,7 @@ export function Bench() {
       <Crumb to="/teams">Teams</Crumb>
       <BenchHead team={detail} live={live.length} waiting={waiting} />
 
-      <Tabs defaultValue="work" className="teams-bench-tabs">
+      <Tabs value={tab} onValueChange={setTab} className="teams-bench-tabs">
         <TabsList aria-label={`${detail.name} — what to do about it`}>
           <TabsTrigger value="work">Work</TabsTrigger>
           <TabsTrigger value="decisions">
@@ -102,7 +106,14 @@ export function Bench() {
                 and not a `Badge`: how many decisions are held is a reading, and the
                 project tab strip already says that kind of thing this way. The
                 filled capsule stays reserved for a state. */}
-            {waiting > 0 && <Count n={waiting} />}
+            {waiting > 0 && (
+              <>
+                {" "}
+                <Count n={waiting} />
+                {" "}
+                <span className="sr-only">waiting</span>
+              </>
+            )}
           </TabsTrigger>
           <TabsTrigger value="roster">Roster</TabsTrigger>
           <TabsTrigger value="routines">Routines</TabsTrigger>
@@ -110,7 +121,7 @@ export function Bench() {
         </TabsList>
 
         <TabsContent value="work">
-          <Work team={detail} runs={teamRuns} />
+          <Work team={detail} runs={teamRuns} capped={allRuns.length >= TEAM_RUN_LIST_LIMIT} />
         </TabsContent>
         <TabsContent value="decisions">
           {/* Every run in the window, not this department's: the tab needs the
@@ -120,7 +131,7 @@ export function Bench() {
         {/* No `forceMount`: Radix unmounting the inactive tab is what keeps the chart from
             polling every live run of this department while nobody is looking at it. */}
         <TabsContent value="roster">
-          <Roster team={detail} runs={teamRuns} />
+          <Roster team={detail} runs={teamRuns} onOpenCharter={() => setTab("charter")} />
         </TabsContent>
         <TabsContent value="routines">
           <Routines team={detail} rules={teamTriggers} />

@@ -20,10 +20,10 @@ import {
   RelativeTime,
   Row,
   Rows,
-  Section,
   StateBadge,
   usd,
 } from "../ui";
+import { MARK } from "./mark";
 import { daemonProse } from "./prose";
 
 /**
@@ -52,18 +52,29 @@ export interface WorkProps {
   team: TeamView;
   /** Already filtered to this department by the bench. */
   runs: TeamRun[];
+  /**
+   * Whether the list the bench was handed hit the daemon's cut. The cap line is a
+   * fact about a truncated list, so it is said only when the list was truncated.
+   */
+  capped: boolean;
 }
 
-export function Work({ team, runs }: WorkProps) {
+export function Work({ team, runs, capped }: WorkProps) {
   const live = runs.filter((run) => teamRunIsAlive(run.state));
   const done = runs.filter((run) => !teamRunIsAlive(run.state));
 
   return (
     <div className="teams-work">
-      <Composer teamId={team.id} />
+      <Composer teamId={team.id} runs={runs} />
 
       {live.length > 0 && (
-        <Section label="In flight">
+        <Panel title="In flight">
+          <p className="teams-rounds-key">
+            <span>{MARK.done} done</span>
+            <span>{MARK.running} running</span>
+            <span>{MARK.pending} not started</span>
+            <span>{MARK.failed} failed</span>
+          </p>
           <Rows label="In flight">
             {live.map((run) => (
               <Row key={run.id}>
@@ -71,17 +82,27 @@ export function Work({ team, runs }: WorkProps) {
               </Row>
             ))}
           </Rows>
-        </Section>
+        </Panel>
       )}
 
-      <Panel title="Tasks">
-        {runs.length === 0 && <Quiet says="no task yet for this team." />}
+      <Panel title="Finished">
+        {done.length === 0 && (
+          <Quiet
+            says={
+              live.length > 0
+                ? "Nothing finished yet — the tasks above are still running."
+                : "No tasks yet — ask this team for something above."
+            }
+          />
+        )}
         {done.length > 0 && (
-          <Rows label="Tasks">
+          <Rows label="Finished">
             {done.map((run) => (
               <Row key={run.id}>
                 <div className="teams-run-head">
-                  <Link to={`/team-runs/${run.id}`}>{run.request}</Link>
+                  <Link className="teams-task-what" to={`/team-runs/${run.id}`}>
+                    {run.request}
+                  </Link>
                   <StateBadge domain="team_run" state={run.state} />
                   <RelativeTime at={run.created_at} />
                 </div>
@@ -91,15 +112,17 @@ export function Work({ team, runs }: WorkProps) {
           </Rows>
         )}
         {/*
-          The honest footer. `GET /team-runs` is a hard LIMIT 100 across EVERY
-          department with no paging, so this department's list is whatever
-          survived that cut — not its history, and not even necessarily its
-          hundred.
+          The honest footer, shown only when it applies. `GET /team-runs` is a hard
+          LIMIT 100 across EVERY department with no paging, so once the list hits
+          that cut this department's tasks are whatever survived it — not its
+          history, and not even necessarily its hundred.
         */}
-        <p className="teams-cap">
-          showing this team&apos;s tasks from the newest {TEAM_RUN_LIST_LIMIT} runs across all teams
-          — there is no paging past that cap.
-        </p>
+        {capped && (
+          <p className="teams-cap">
+            Showing this team&apos;s tasks among the newest {TEAM_RUN_LIST_LIMIT} tasks across all
+            teams. Older ones aren&apos;t listed.
+          </p>
+        )}
       </Panel>
     </div>
   );
@@ -113,11 +136,12 @@ export function Work({ team, runs }: WorkProps) {
  * box gets bigger the moment it has focus or anything typed in it — so the
  * common case costs one line of the page and the uncommon one loses nothing.
  */
-function Composer({ teamId }: { teamId: string }) {
+function Composer({ teamId, runs }: { teamId: string; runs: TeamRun[] }) {
   const [request, setRequest] = useState("");
   const [open, setOpen] = useState(false);
   const start = useStartTeamRun();
   const grown = open || request !== "";
+  const started = start.data;
 
   return (
     <form
@@ -138,18 +162,26 @@ function Composer({ teamId }: { teamId: string }) {
           onFocus={() => setOpen(true)}
           onBlur={() => setOpen(false)}
           onChange={(event) => setRequest(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+              event.preventDefault();
+              event.currentTarget.form?.requestSubmit();
+            }
+          }}
         />
       </label>
       <div className="teams-actions">
         <Button type="submit" intent="go" disabled={request.trim() === "" || start.isPending}>
-          Start
+          {start.isPending ? "Starting…" : "Start task"}
         </Button>
+        <span className="ui-count">Ctrl+Enter</span>
       </div>
       {start.isError && <StartRefusal error={start.error} />}
-      {start.data !== undefined && (
+      {/* Only until the task shows up in the lists below; after that the note is stale. */}
+      {started !== undefined && !runs.some((run) => run.id === started.id) && (
         <p className="teams-note">
-          Started — <Link to={`/team-runs/${start.data.id}`}>this task</Link> has nothing in it yet;
-          the núcleo has not picked it up.
+          Started — <Link to={`/team-runs/${started.id}`}>{start.variables?.request ?? "this task"}</Link>{" "}
+          has nothing in it yet; the núcleo has not picked it up.
         </p>
       )}
     </form>
@@ -165,13 +197,13 @@ function Composer({ teamId }: { teamId: string }) {
  * as a failure.
  */
 function StartRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — no task was started</ErrorNote>;
+  if (!isApiRefusal(error)) return <ErrorNote>The núcleo did not answer — no task was started</ErrorNote>;
   if (error.status === 429) {
     return (
       <RefusalNote
         refusal={error}
         sentences={{
-          too_many_requests: "the budget window is exhausted for now — it reopens",
+          too_many_requests: "The budget window is exhausted for now — it reopens",
           ...daemonProse(error),
         }}
       />
@@ -192,14 +224,18 @@ function LiveTask({ run, ceiling }: { run: TeamRun; ceiling: number | null }) {
   return (
     <article className="teams-task" aria-label={run.request}>
       <div className="teams-task-head">
-        <Link to={`/team-runs/${run.id}`}>{run.request}</Link>
+        <Link className="teams-task-what" to={`/team-runs/${run.id}`}>
+          {run.request}
+        </Link>
         <StateBadge domain="team_run" state={run.state} />
       </div>
       <p className="teams-task-when">
         started <RelativeTime at={run.created_at} />
       </p>
 
-      {detail.data === undefined ? (
+      {detail.isError ? (
+        <ErrorNote>Couldn&apos;t read this task&apos;s rounds.</ErrorNote>
+      ) : detail.data === undefined ? (
         <Quiet says="reading the rounds…" />
       ) : (
         <>
@@ -228,14 +264,13 @@ function LiveTask({ run, ceiling }: { run: TeamRun; ceiling: number | null }) {
  */
 function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
   if (items.length === 0) {
-    return <Quiet says="nothing planned yet — the núcleo has not picked this up." />;
+    return <Quiet says="Nothing planned yet — the núcleo has not picked this up." />;
   }
 
   const rounds = [...new Set(items.map((item) => item.round))].sort((a, b) => a - b);
 
   return (
     <>
-      <p className="teams-rounds-key"><span>✓ done</span><span>⋯ running</span><span>· not started</span><span>✗ failed</span></p>
       <ol className="teams-rounds" aria-label="Rounds">
       {rounds.map((number) => (
         <li className="teams-round-line" key={number}>
@@ -247,13 +282,13 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
                 <span
                   className={`teams-round-item teams-round-${item.state}`}
                   key={item.ordinal}
-                  title={item.description}
+                  title={`${item.state} — ${item.description}`}
                 >
                   {item.agent_id}
                   <span className="teams-round-mark" aria-hidden="true">
                     {MARK[item.state] ?? "·"}
                   </span>
-                  <span className="sr-only">{item.state}</span>
+                  <span className="sr-only">{`${item.state} — ${item.description}`}</span>
                 </span>
               ))}
           </span>
@@ -269,11 +304,3 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
     </>
   );
 }
-
-/** A glyph per item state. The word travels beside it for anything that does not render. */
-const MARK: Record<string, string> = {
-  done: "✓",
-  running: "⋯",
-  pending: "·",
-  failed: "✗",
-};
