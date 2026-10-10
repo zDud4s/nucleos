@@ -157,7 +157,7 @@ describe("the process line", () => {
 
   it("leaves the verdict unreachable on a council that failed before the synthesis", () => {
     const v = view({ status: "error", error: "boom", current_round: 1, current_phase: "critique" });
-    expect(court.processLine(v).at(-1)).toMatchObject({ label: "Verdict", reachable: false });
+    expect(court.processLine(v).slice(-1)[0]).toMatchObject({ label: "Verdict", reachable: false });
   });
 
   it("marks the live moment as current", () => {

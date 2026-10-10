@@ -349,7 +349,7 @@ const PHASE_WORDS: Record<PhaseName, string> = {
 };
 
 function stepAt(seat: SeatView, m: Moment): StepView | undefined {
-  if (m.phase === "synthesis") return seat.steps.at(-1);
+  if (m.phase === "synthesis") return seat.steps[seat.steps.length - 1];
   return seat.steps.find((s) => s.round === m.round && s.phase === m.phase);
 }
 
