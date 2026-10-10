@@ -542,6 +542,65 @@ async fn main() {
         return;
     }
 
+    // `nucleos-core --verify`, run from inside a worktree: "verify this, with cover."
+    //
+    // A subcommand for the reason `--land` is one: the token lives in Credential Manager and the
+    // session should run one word. Unlike `--land` it WAITS, because a verdict is the whole point;
+    // the wait is bounded (`--verify-wait`, `NUCLEOS_VERIFY_WAIT`, an hour by default) and a ticket
+    // that outlives it exits 3 with its id. All the logic lives in `verify_cli`, tested against an
+    // in-process server; this block gathers the token, the cwd and the arguments, prints, exits.
+    // It never starts a daemon. The guard matches `--verify` and every `--verify-*` spelling, the
+    // same bug class as the `--land=` note above: `--verify-wait 30` without `--verify` used to
+    // fall past this block and every other one, and start a daemon. Without `--verify` itself
+    // the arguments are a usage error, answered with the usage and exit 4, contacting nothing.
+    if std::env::args().any(|a| a == "--verify" || a.starts_with("--verify-")) {
+        use std::io::Write;
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--help") {
+            println!("{}", verify_cli::USAGE);
+            return;
+        }
+        if !args.iter().any(|a| a == "--verify") {
+            eprintln!(
+                "not verified: --verify-* needs --verify\n\n{}",
+                verify_cli::USAGE
+            );
+            std::process::exit(verify_cli::EXIT_NOT_VERIFIED);
+        }
+        let env_wait = std::env::var("NUCLEOS_VERIFY_WAIT").ok();
+        let limit = match verify_cli::wait_limit(&args, env_wait.as_deref()) {
+            Ok(limit) => limit,
+            Err(reason) => {
+                eprintln!("not verified: {reason}\n\n{}", verify_cli::USAGE);
+                std::process::exit(verify_cli::EXIT_NOT_VERIFIED);
+            }
+        };
+        let token = match secrets::load_secret(TOKEN_KEY) {
+            Ok(Some(token)) => token,
+            _ => {
+                eprintln!(
+                    "not verified: no daemon token stored yet — start the daemon once to generate one"
+                );
+                std::process::exit(verify_cli::EXIT_NOT_VERIFIED);
+            }
+        };
+        let worktree = match std::env::current_dir() {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(error) => {
+                eprintln!("not verified: the current directory is unreadable: {error}");
+                std::process::exit(verify_cli::EXIT_NOT_VERIFIED);
+            }
+        };
+        let client = daemon_client::DaemonClient::new(daemon_client::daemon_url(), token);
+        let outcome = verify_cli::run(&client, &worktree, limit).await;
+        print!("{}", outcome.stdout);
+        eprint!("{}", outcome.stderr);
+        // `process::exit` does not flush a buffered stdout, and a pipe is block-buffered.
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        std::process::exit(outcome.code);
+    }
+
     // `nucleos-core --pressao --equipa NucleOS`: quanta janela custou a cada agente da equipa.
     //
     // Cliente fino pelo molde do `--land` acima, e pela mesma razao: a pool esta aberta no daemon,
