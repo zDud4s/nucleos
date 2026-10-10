@@ -14,7 +14,7 @@ src/execution/git_exec.rs 2190
 src/mcp_tools.rs 2067
 src/knowledge.rs 2023
 src/council.rs 2006
-src/execution/vcs.rs 1674
+src/execution/vcs.rs 1730
 src/governance/classifier.rs 1549
 src/main.rs 1532
 src/config.rs 1422
