@@ -861,6 +861,70 @@ export function ToolInput({ raw }: { raw: string | null }) {
   );
 }
 
+/* ---------------------------------------------------------------- the provenance -- */
+
+/** One thing a turn read before it reached for an action. */
+interface ReadEntry {
+  tool?: unknown;
+  arguments?: unknown;
+}
+
+/**
+ * Where the idea came from, under the record of what it was.
+ *
+ * `ToolInput` answers what was going to happen; this answers who put it in
+ * the turn's head, and only the second one decides. "Email accounts and ask them
+ * to change the bank details" reads identically whether the owner asked for it
+ * or a page did, so a card carrying only the first question gets answered by
+ * guessing.
+ *
+ * **Absent renders as nothing, never as "read nothing".** `null` covers two
+ * cases the row cannot tell apart — a refusal that fired on whose work it is
+ * rather than on what was read, and a recording that failed — and a card that
+ * printed "this turn read nothing" would be wrong in the second one, in the
+ * direction that makes a contaminated action look clean.
+ */
+export function ReadFrom({ raw }: { raw: string | null }) {
+  if (raw === null || raw.trim() === "") return null;
+  let entries: ReadEntry[];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    entries = parsed as ReadEntry[];
+  } catch {
+    return null;
+  }
+  return (
+    <div className="waiting-provenance">
+      <p className="waiting-provenance-head">this turn had read</p>
+      <ul className="waiting-provenance-list">
+        {entries.map((entry, index) => {
+          const tool =
+            typeof entry.tool === "string" ? entry.tool : "something unnamed";
+          // The arguments are stored as the daemon received them, so the url that
+          // decides the question is in there and nowhere else. Flattened through
+          // the same reader the action's own input uses, for the same reason:
+          // braces are characters between a person and a decision.
+          const detail =
+            typeof entry.arguments === "string"
+              ? (readToolInput(entry.arguments) ?? [])
+                  .map((field) => field.value)
+                  .join(", ")
+              : "";
+          return (
+            <li className="waiting-provenance-line" key={`${tool}-${index}`}>
+              <span className="waiting-provenance-tool">{tool}</span>
+              {detail !== "" && (
+                <span className="waiting-provenance-detail">{detail}</span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 /* ------------------------------------------------------- 1. wheel requests -- */
 
 function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
@@ -909,6 +973,15 @@ function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
               <span className="waiting-meta">
                 {session.profile_kind} {session.profile_id}
               </span>
+              {session.run_id !== null && (
+                <Link
+                  className="waiting-row-link"
+                  to="/runs/$runId"
+                  params={{ runId: String(session.run_id) }}
+                >
+                  run {session.run_id}
+                </Link>
+              )}
               <RelativeTime at={session.opened_at} />
             </div>
             <dl className="waiting-facts">
@@ -1176,12 +1249,7 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
                 </span>
                 <RelativeTime at={proposal.created_at} />
               </div>
-              <Reasoning>
-                {proposal.reasoning.trim() === ""
-                  ? "nothing was recorded about why this was asked for"
-                  : proposal.reasoning}
-              </Reasoning>
-              <ToolInput raw={proposal.tool_input} />
+              <ApprovalContext proposal={proposal} />
               <div className="waiting-actions-split">
                 <ConfirmButton
                   label="Approve"
@@ -1216,6 +1284,109 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
         </Rows>
       </>
     </Queue>
+  );
+}
+
+/** One step a run took, as `run_recent` carries it. */
+interface RecentStep {
+  name: string | null;
+  detail: string | null;
+}
+
+/** The run's last steps, or none when the text is absent or not the array it should be. */
+export function readRecentSteps(raw: string | null | undefined): RecentStep[] {
+  if (raw === null || raw === undefined || raw.trim() === "") return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (step): step is RecentStep => typeof step === "object" && step !== null,
+    );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * How a run's prompt opens, as the one paragraph that says what the run is for.
+ *
+ * The daemon cuts the prompt at 600 characters; the first paragraph is where a task, a chat
+ * message or a resolver's brief says what it is, and the rest is instructions about how.
+ */
+export function taskLine(prompt: string | null | undefined): string | null {
+  if (prompt === null || prompt === undefined) return null;
+  const first = prompt.trim().split(/\n\s*\n/)[0]?.trim() ?? "";
+  return first === "" ? null : first;
+}
+
+/**
+ * What a person needs beside the command to answer an approval.
+ *
+ * The command alone says what would happen, and the classifier's reason says only why it was
+ * stopped — "unrecognized shell commands require approval" is true of every second line an agent
+ * writes. Whether it SHOULD happen turns on what the run is for, where it is standing, what it
+ * was doing just before, and what it had read; so the card says those, in that order, under the
+ * command it is asking to run.
+ */
+function ApprovalContext({ proposal }: { proposal: Proposal }) {
+  const task = taskLine(proposal.run_prompt);
+  const steps = readRecentSteps(proposal.run_recent);
+  const status = proposal.run_status ?? null;
+  return (
+    <>
+      <div>
+        <p className="waiting-approval-label">held because</p>
+        <Reasoning>
+          {proposal.reasoning.trim() === ""
+            ? "nothing was recorded about why this was stopped"
+            : proposal.reasoning}
+        </Reasoning>
+      </div>
+      <ToolInput raw={proposal.tool_input} />
+      {proposal.run_cwd && (
+        <p className="waiting-meta" title={proposal.run_cwd}>
+          runs in <code>{proposal.run_cwd}</code>
+        </p>
+      )}
+      {status !== null && status !== "awaiting_approval" && (
+        <p className="waiting-hint waiting-hint-yours">
+          The run is {status.replace(/_/g, " ")}, not waiting on this — approving resumes nothing.
+        </p>
+      )}
+      {(task !== null || steps.length > 0) && (
+        <div className="waiting-provenance">
+          {task !== null && (
+            <>
+              <p className="waiting-provenance-head">the run was asked to</p>
+              <Reasoning>{task}</Reasoning>
+            </>
+          )}
+          {steps.length > 0 && (
+            <>
+              <p className="waiting-provenance-head">just before, it ran</p>
+              <ul
+                className="waiting-provenance-list"
+                aria-label={`Steps before approval #${proposal.id}`}
+              >
+                {steps.map((step, index) => (
+                  <li className="waiting-provenance-line" key={index}>
+                    <span className="waiting-provenance-tool">
+                      {step.name ?? "a step"}
+                    </span>
+                    {step.detail && (
+                      <span className="waiting-provenance-detail">
+                        {step.detail}
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
+      )}
+      <ReadFrom raw={proposal.read_from} />
+    </>
   );
 }
 
@@ -1331,6 +1502,46 @@ function TeamActionPayload({
   );
 }
 
+/**
+ * Which department asked, who in it, and what it was working on.
+ *
+ * A team action or a recruit names what would happen and why the asker wants it, but not who the
+ * asker is or what job it is doing — and "send this email" is a different decision coming from
+ * the director of a reconciliation than from a specialist halfway through one item of it.
+ */
+function DepartmentContext({ proposal }: { proposal: Proposal }) {
+  const team = proposal.team_name ?? null;
+  const runId = proposal.team_run_id ?? null;
+  const task = taskLine(proposal.team_request);
+  if (team === null && runId === null) return null;
+  return (
+    <>
+      <p className="waiting-meta">
+        asked by {proposal.asked_by ?? "an agent the daemon no longer names"}
+        {proposal.asked_for ? (
+          <>
+            , working on <q>{proposal.asked_for}</q>
+          </>
+        ) : null}
+        {" — "}
+        {runId !== null ? (
+          <Link className="waiting-row-link" to="/team-runs/$runId" params={{ runId }}>
+            {team ?? "a department"}
+          </Link>
+        ) : (
+          team
+        )}
+      </p>
+      {task !== null && (
+        <div className="waiting-provenance">
+          <p className="waiting-provenance-head">the department was asked to</p>
+          <Reasoning>{task}</Reasoning>
+        </div>
+      )}
+    </>
+  );
+}
+
 function TeamActionCard({
   proposal,
   count,
@@ -1361,6 +1572,7 @@ function TeamActionCard({
         </span>
         <RelativeTime at={proposal.created_at} />
       </div>
+      <DepartmentContext proposal={proposal} />
       <dl className="waiting-facts">
         <div className="waiting-fact">
           <dt>execution</dt>
@@ -1534,6 +1746,7 @@ function RecruitmentCard({
         <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>recruit #{proposal.id}</span>
         <RelativeTime at={proposal.created_at} />
       </div>
+      <DepartmentContext proposal={proposal} />
       <Reasoning>
         {proposal.reasoning.trim() === ""
           ? "nothing was recorded about why"
@@ -1875,6 +2088,21 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                   ? "nothing was recorded about why"
                   : proposal.reasoning}
               </Reasoning>
+              {(proposal.job_low_task || proposal.job_high_task) && (
+                <dl className="waiting-input" aria-label={`Jobs in request #${proposal.id}`}>
+                  {[
+                    [pair.low, proposal.job_low_task],
+                    [pair.high, proposal.job_high_task],
+                  ].map(([job, task]) => (
+                    <div className="waiting-input-line" key={String(job)}>
+                      <dt className="waiting-input-name">job {job ?? "?"}</dt>
+                      <dd className="waiting-input-value">
+                        {taskLine(task as string | null) ?? "the daemon no longer has this job"}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
+              )}
               {pair.paths.length > 0 && (
                 <ul className="waiting-paths">
                   {pair.paths.map((path) => (
@@ -2077,6 +2305,11 @@ function VcsRow({
   decision?: boolean;
   children?: ReactNode;
 }) {
+  const conflicts = conflictedFiles(row.output_tail);
+  const next = gitNextStep(row);
+  // The queue's own reason, when nothing more specific says why. A conflict's reason is written
+  // for the agent that asked ("not yours to fix from here") and the files say it better.
+  const reason = conflicts.length === 0 ? row.failure_reason : null;
   return (
     <Row className={decision === true ? "waiting-card" : undefined} dense={dense(count)}>
       <div className="waiting-card-head">
@@ -2087,22 +2320,127 @@ function VcsRow({
         >
           {row.op} #{row.id}
         </span>
-        <StateBadge domain="vcs" state={row.status} />
+        <StateBadge
+          domain="vcs"
+          state={row.status === "escalated" && next !== null && !next.yours ? "resolving" : row.status}
+        />
         <span className="waiting-meta">{row.project_id}</span>
         <RelativeTime at={row.created_at} />
       </div>
-      {/* The badge says the state in one word; the metadata says which repository and where
-          the request came from. */}
-      <p className="waiting-meta">
-        {row.repo_key} — {row.origin}
+      {/* Which branches, first: "merge #573" alone does not say what would be merged. */}
+      {row.source != null && row.target != null && (
+        <p className="waiting-git-branches">
+          <code>{row.source}</code> into <code>{row.target}</code>
+        </p>
+      )}
+      <p className="waiting-meta" title={row.repo_key}>
+        {repoLabel(row.repo_key)} — asked from {row.origin}
       </p>
+      {conflicts.length > 0 && (
+        <div className="waiting-git-conflicts">
+          <span className="waiting-meta">conflicts in</span>
+          <ul aria-label={`Conflicts in ${row.op} #${row.id}`}>
+            {conflicts.map((file) => (
+              <li key={file}>
+                <code>{file}</code>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {reason != null && reason !== "" && <Reasoning>{reason}</Reasoning>}
       {/* And what to do about it is its own line, not a third clause on the faint mono one. */}
-      {row.status === "blocked" ? (
-        <p className="waiting-hint">submit it again</p>
-      ) : row.status === "awaiting_owner" ? (
-        <p className="waiting-hint">changes the test map — approve to let it land</p>
-      ) : null}
+      {next !== null && (
+        <p className={next.yours ? "waiting-hint waiting-hint-yours" : "waiting-hint"}>
+          {next.before}
+          {next.run !== undefined && (
+            <Link to="/runs/$runId" params={{ runId: String(next.run) }}>
+              run #{next.run}
+            </Link>
+          )}
+          {next.after}
+        </p>
+      )}
       {children}
     </Row>
   );
+}
+
+/** The repository key without Windows' `\\?\` verbatim prefix, which only git needs. */
+function repoLabel(key: string): string {
+  return key.replace(/^\\\\\?\\/, "");
+}
+
+/**
+ * The files git named in a conflict, read from its own output.
+ *
+ * `CONFLICT (content): Merge conflict in a.rs` gives `a.rs`; the other kinds
+ * (`modify/delete`, `rename/rename`, …) have no fixed shape, so their whole message is kept rather
+ * than guessed at.
+ */
+export function conflictedFiles(tail: string | null | undefined): string[] {
+  if (tail == null) return [];
+  const found: string[] = [];
+  for (const match of tail.matchAll(/^CONFLICT \([^)]*\): (.+)$/gm)) {
+    const file = match[1].replace(/^Merge conflict in /, "").trim();
+    if (!found.includes(file)) found.push(file);
+  }
+  return found;
+}
+
+/**
+ * What happens next on a git request, and whether that is the reader's to do.
+ *
+ * Split around the run it names so the run can be a link. `yours` is the line that asks the
+ * person to act; every other line says who is acting instead, which is what lets somebody leave an
+ * escalation alone without wondering whether it is stuck.
+ */
+export function gitNextStep(
+  row: VcsRequestSummary,
+): { before: string; run?: number; after: string; yours: boolean } | null {
+  if (row.status === "blocked") return { before: "submit it again", after: "", yours: true };
+  if (row.status === "awaiting_owner")
+    return { before: "changes the test map — approve to let it land", after: "", yours: true };
+  if (row.status !== "escalated" || row.op !== "merge") return null;
+  if (row.from_resolution === true)
+    return {
+      before:
+        "this merge was itself a resolution landing and conflicted again, so no agent is given it — resolve it by hand, or put it away if the merge no longer matters",
+      after: "",
+      yours: true,
+    };
+  const run = row.resolution_run_id;
+  if (run == null)
+    return {
+      before: "an agent is given this conflict within a minute — nothing to do yet",
+      after: "",
+      yours: false,
+    };
+  switch (row.resolution_status) {
+    case "running":
+      return { before: "", run, after: " is resolving it — nothing to do yet", yours: false };
+    case "awaiting_approval":
+      return { before: "", run, after: " is resolving it and waits on your approval", yours: true };
+    case "completed":
+      return {
+        before: "",
+        run,
+        after:
+          " finished its resolution; the queue lands it and this clears on its own — if it stays, open the run to see why",
+        yours: false,
+      };
+    case "failed":
+    case "cancelled":
+    case "interrupted":
+    case "timed_out":
+    case "superseded":
+      return {
+        before: "",
+        run,
+        after: ` ended (${row.resolution_status}) without resolving it — resolve it by hand, or put it away if the merge no longer matters`,
+        yours: true,
+      };
+    default:
+      return { before: "an agent was given it as ", run, after: "", yours: false };
+  }
 }

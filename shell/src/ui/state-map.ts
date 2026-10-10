@@ -561,6 +561,10 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     failed: { tone: "danger", label: "failed" },
     blocked: { tone: "paused", label: "blocked" },
     escalated: { tone: "pending", label: "escalated to you" },
+    // Not a daemon state: `escalated` as the shell reads it while a resolution run, and not the
+    // person, has the next move (`Waiting.tsx`'s `gitNextStep`). "Escalated to you" beside
+    // "nothing to do yet" was the badge contradicting its own row.
+    resolving: { tone: "active", label: "with an agent" },
     awaiting_owner: { tone: "pending", label: "waiting for your approval" },
     rejected: { tone: "off", label: "rejected" },
     cancelled: { tone: "off", label: "cancelled" },

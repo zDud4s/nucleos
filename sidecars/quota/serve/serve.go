@@ -19,6 +19,7 @@ import (
 	"nucleosquota/claude"
 	"nucleosquota/codex"
 	"nucleosquota/config"
+	"nucleosquota/gemini"
 	"nucleosquota/reading"
 )
 
@@ -40,13 +41,17 @@ type Response struct {
 type Readers struct {
 	Claude func(ctx context.Context, now time.Time) reading.Provider
 	Codex  func(now time.Time) reading.Provider
+	// Gemini answers false when there is no subscription to report on, and the provider is left
+	// out of the answer rather than drawn dashed (package gemini). Nil reads as never present.
+	Gemini func(ctx context.Context, now time.Time) (reading.Provider, bool)
 }
 
 // Live builds the real readers from config.
 func Live(cfg config.Config, home string) Readers {
 	c := claude.New(cfg.FetchTimeout, home)
 	x := codex.New(home)
-	return Readers{Claude: c.Read, Codex: x.Read}
+	g := gemini.New(cfg.FetchTimeout, home)
+	return Readers{Claude: c.Read, Codex: x.Read, Gemini: g.Read}
 }
 
 type cache struct {
@@ -94,10 +99,13 @@ func quotaHandler(
 			return
 		}
 
-		providers := onTheWire([]reading.Provider{
-			readers.Claude(r.Context(), at),
-			readers.Codex(at),
-		})
+		read := []reading.Provider{readers.Claude(r.Context(), at), readers.Codex(at)}
+		if readers.Gemini != nil {
+			if p, present := readers.Gemini(r.Context(), at); present {
+				read = append(read, p)
+			}
+		}
+		providers := onTheWire(read)
 
 		// The shorter TTL wins whenever anything failed: a provider that is down should be retried
 		// on the error cadence even while the other one is happily cached. Holding a bad answer for

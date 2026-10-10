@@ -411,6 +411,14 @@
   gap: var(--space-2);
 }
 
+/* On the top and bottom the figure goes beside its ring rather than under it, so it keeps lying
+   along the rail as it does on a side edge. Under it, the figure stacked across the rail instead,
+   and the notch came out a figure's height thicker than the 62px it is on the left and right. */
+.quota-notch[data-edge="top"] .quota-notch-slot,
+.quota-notch[data-edge="bottom"] .quota-notch-slot {
+  flex-direction: row;
+}
+
 /*
   The one reading the notch prints at rest: how much of the tightest window is gone, and which
   window that is, on one line so a slot stays two lines tall.

@@ -4,6 +4,7 @@ import { useQuota, type QuotaProvider, type QuotaWindow } from "../data/quota";
 import { IconButton, ProviderMark, Ring, readState, relativeText, type RingTrack } from "../ui";
 import type { NotchMode } from "./notch-mode";
 import { EDGES, isVertical, MIDDLE, type NotchEdge, type NotchPlace } from "./notch-place";
+import { useHiddenProviders } from "./notch-providers";
 
 /**
  * The two windows every provider is drawn with, outermost first.
@@ -219,6 +220,10 @@ export interface QuotaNotchProps {
  */
 export function QuotaNotch({ host = "contained", onMove, line, place, onPlace }: QuotaNotchProps) {
   const quota = useQuota();
+  // The providers the owner took off the notch in this machine's settings (`notch-providers.ts`).
+  // Left out of the drawing only; the reading itself, and the brake, still have them.
+  const [hidden] = useHiddenProviders();
+  const visible = (quota.data?.providers ?? []).filter((item) => !hidden.includes(item.provider));
   const edge = place?.edge ?? "right";
   const vertical = isVertical(edge);
   const [phase, setPhase] = useState<Phase>("folded");
@@ -235,7 +240,7 @@ export function QuotaNotch({ host = "contained", onMove, line, place, onPlace }:
   // Where the bubble sits and where its tail points, both measured along the edge from the drawing's
   // start — its top on a side edge, its left on the top or bottom.
   const [aim, setAim] = useState({ at: 0, tail: TAIL_AT });
-  const count = quota.data?.providers.length ?? 0;
+  const count = visible.length;
   const reached = phase !== "folded";
   // A drag of the rail under way: where it started, and whether it has moved far enough to be one.
   const drag = useRef<Drag | null>(null);
@@ -280,9 +285,11 @@ export function QuotaNotch({ host = "contained", onMove, line, place, onPlace }:
   // Nothing until the first answer. A notch drawn empty would say "nothing is burned", which is the
   // most misleading thing this feature could claim — and it would say it at exactly the moment
   // nobody has measured anything yet.
-  if (quota.data === undefined || quota.data.providers.length === 0) return null;
+  // The same holds when every provider there is has been hidden: the owner asked for no notch.
+  if (quota.data === undefined || visible.length === 0) return null;
 
-  const { providers, source, unreachable } = quota.data;
+  const { source, unreachable } = quota.data;
+  const providers = visible;
   // One instant for the whole drawing. Read once rather than per line, so two windows in the same
   // notch cannot be counted against two different nows — a difference of milliseconds that shows
   // up as "resets in 1h" beside "resets in 59min".
