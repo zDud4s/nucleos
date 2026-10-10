@@ -88,6 +88,7 @@ import {
 } from "../lib/mode";
 import { OnboardPanel } from "../project/Onboard";
 import { JudgeOpinionLine, JudgePanel, JudgeReviewPanel } from "./AutopilotJudge";
+import { RefusedActionsPanel, SkippedItemsPanel } from "./AutopilotRecords";
 import { ResolvePanel } from "./AutopilotResolve";
 import "./autopilot.css";
 
@@ -116,6 +117,11 @@ const PERIOD_NOUN: Record<string, string> = {
  * frame, on every page. Repeating the control would be a second thing to keep
  * in step; repeating the *fact* is the point of a governance page, because
  * everything below it is suspended while it is engaged.
+ *
+ * **The last two panels before the feed are records, not controls**: what a job put down
+ * overnight and what the injection barrier refused. Nothing in them is waiting on a
+ * decision, so they live here with the rest of what governance reads back, and not in the
+ * Waiting queue.
  */
 export function Autopilot() {
   const projects = useProjects();
@@ -197,6 +203,10 @@ export function Autopilot() {
         <ResolvePanel projectId={selected} project={focused} />
         <TriggerKills />
         <JobsPanel rows={rows} selected={selected} />
+        {/* Records of what the night and the barrier already settled. They were on the Waiting
+            page, which now holds only what asks for a decision. */}
+        <SkippedItemsPanel />
+        <RefusedActionsPanel />
         <FeedEmbed />
       </div>
     </>

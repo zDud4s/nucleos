@@ -1,6 +1,7 @@
 /**
- * The Waiting slice: one queue, ten sections, `waiting-` throughout — as
- * `runs-` is for the runs and `fleet-` for the fleet.
+ * The Waiting slice: one queue of decisions, `waiting-` throughout — as
+ * `runs-` is for the runs and `fleet-` for the fleet. The Autopilot page's two record
+ * panels (`AutopilotRecords.tsx`) wear the same cards and import this sheet for them.
  *
  * The rule this file lives under: **no `waiting-` class appears in
  * `Waiting.tsx` that is not defined below.** `tsc` and vitest both pass happily
@@ -45,6 +46,83 @@
   gap: var(--space-4);
 }
 
+/**
+ * The wrapper every section sits in, which exists so focus can be moved and has no box.
+ *
+ * `display: contents`: the section inside is still the flex item, so the gap above works as it
+ * did, and a section that renders nothing (an empty queue) leaves no gap behind it either.
+ */
+.waiting-queue {
+  display: contents;
+}
+
+/**
+ * The sections with nothing in them, as one line.
+ *
+ * Muted and small like every other caption on the page: an absence is the normal state, and it
+ * must not out-shout the decision above it. Each name carries its reasoning on hover, marked by
+ * a dotted underline, the web's usual sign for "there is more on this word".
+ */
+.waiting-quiet-line {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.waiting-quiet-name {
+  position: relative;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: help;
+}
+
+.waiting-quiet-name:focus-visible {
+  outline: none;
+  color: var(--text);
+}
+
+/**
+ * The reasoning behind a name, drawn under it on hover and on focus. Hidden with `visibility`
+ * rather than `display` so it stays in the accessibility tree as the name's description.
+ */
+.waiting-quiet-tip {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  left: 0;
+  z-index: 20;
+  width: max-content;
+  max-width: min(24rem, 80vw);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 0.25);
+  color: var(--text);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  text-decoration: none;
+  white-space: normal;
+  cursor: auto;
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 120ms ease, visibility 0s linear 120ms;
+}
+
+.waiting-quiet-name:hover > .waiting-quiet-tip,
+.waiting-quiet-name:focus-visible > .waiting-quiet-tip {
+  visibility: visible;
+  opacity: 1;
+  transition: opacity 120ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .waiting-quiet-tip,
+  .waiting-quiet-name:hover > .waiting-quiet-tip,
+  .waiting-quiet-name:focus-visible > .waiting-quiet-tip {
+    transition: none;
+  }
+}
+
 /* =================================================================== lists == */
 
 /**
@@ -61,6 +139,42 @@
   -webkit-line-clamp: 3;
   line-clamp: 3;
   overflow: hidden;
+}
+
+/**
+ * The way out of the clamp: "Show all" lifts it on that one card.
+ *
+ * Three classes against the clamp's two, so it wins without a cascade fight. The button itself
+ * is the quiet text-link rank — it is help for reading, not a decision — and it exists only when
+ * the text really is cut (`Reasoning` measures), so a short reason never grows a control.
+ */
+.waiting-dense .waiting-reasoning[data-expanded="true"] {
+  display: block;
+  -webkit-line-clamp: unset;
+  line-clamp: unset;
+  overflow: visible;
+}
+
+.waiting-reasoning-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+}
+
+.waiting-more {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.waiting-more:hover {
+  color: var(--text);
 }
 
 /* =================================================================== cards == */
@@ -247,13 +361,18 @@
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
-  color: var(--text-faint);
+  /* Muted and not faint: on the sunken well, light mode's faint measures 4.56:1 — close enough
+     to the floor that a rounding or a theme tweak takes it under, and a label is read. */
+  color: var(--text-muted);
 }
 
+/* What the action is about to do is the part of the card the decision turns on, so the value
+   is the largest and brightest thing in the well and the label is the quiet one. It was the
+   other way round: 11px values under 11px labels. */
 .waiting-input-value {
   margin: 0;
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   line-height: var(--leading-snug);
   color: var(--text);
   white-space: pre-wrap;
@@ -394,10 +513,12 @@
   overflow-wrap: anywhere;
 }
 
+/* A standing decision decides whether the merge is refused, so it is read at the body rank
+   and not the caption one. */
 .waiting-verdict {
   margin: 0;
-  font-size: var(--text-xs);
-  color: var(--text-faint);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
 /* =============================================================== decisions == */
@@ -406,7 +527,93 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-3);
+}
+
+/**
+ * An approval's decisions, sharing the row in equal columns: Approve first on the left, the
+ * declines after it.
+ *
+ * Equal tracks, so no button is sized by its own label and none moves when another's label
+ * changes. `auto-fit` collapses the empty tracks and stretches the real ones across the row; below
+ * 12rem a column wraps onto the next line instead of clipping its label.
+ */
+.waiting-actions-split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  gap: var(--space-3);
+}
+
+.waiting-actions-split > .ui-confirm,
+.waiting-actions-split > .ui-confirm > .ui-button {
+  width: 100%;
+}
+
+/**
+ * Approve, as a neutral filled button on this page only.
+ *
+ * Green says "this is fine" on the receipt below (`.waiting-outcome`), and a page whose every
+ * card carries a green button says it forty times — the colour stops meaning anything and the
+ * button that does the damage looks like the safe one. Here the decision is the highest-contrast
+ * thing on the card and nothing else: `--text` filled, `--bg` ink, in either theme.
+ *
+ * Scoped to the cards and the batch bar, written here and not in `ui.css`, which every other
+ * page's approve button reads from. Armed, the fill flips to an outline: the interlock's own
+ * ring is `--text` too, and a ring around a `--text` fill would be invisible.
+ */
+.waiting-card .ui-button-approve,
+.waiting-bulk .ui-button-approve {
+  background: var(--text);
+  border-color: var(--text);
+  color: var(--bg);
+}
+
+.waiting-card .ui-button-approve:hover:not(:disabled),
+.waiting-bulk .ui-button-approve:hover:not(:disabled) {
+  background: var(--text-muted);
+  border-color: var(--text-muted);
+}
+
+.waiting-card .ui-button-approve:focus-visible,
+.waiting-bulk .ui-button-approve:focus-visible {
+  outline-offset: 2px;
+}
+
+.waiting-card .ui-confirm-armed > .ui-button-approve,
+.waiting-bulk .ui-confirm-armed > .ui-button-approve {
+  background: var(--bg);
+  color: var(--text);
+}
+
+/**
+ * Held: the neutral filled approve keeps its fill and the sweep is drawn over it in `--bg`.
+ *
+ * The primitive's fill is the button's own text colour at low alpha, and here that is `--bg` ink
+ * on a `--text` ground, so it would sweep a barely-different shade. `--ui-confirm-fill` is the
+ * hook the primitive leaves for exactly this: `--bg` at 38% reads as a clear darker (light theme)
+ * or lighter (dark theme) band moving across the face, in either theme. The ground is pinned to
+ * `--text` through hover and press (the extra class doubles the specificity past both), because
+ * the hover step to `--text-muted` and the press step to `--surface` would otherwise change the
+ * ground the fill is measured against while it is sweeping.
+ */
+.waiting-card .ui-confirm-holding > .ui-button-approve,
+.waiting-bulk .ui-confirm-holding > .ui-button-approve {
+  --ui-confirm-fill: color-mix(in srgb, var(--bg) 38%, transparent);
+}
+
+.waiting-card .ui-confirm-holding > .ui-button-approve.ui-button-approve:not(:disabled),
+.waiting-bulk .ui-confirm-holding > .ui-button-approve.ui-button-approve:not(:disabled) {
+  background: var(--text);
+  border-color: var(--text);
+}
+
+.waiting-card .ui-button-approve:disabled,
+.waiting-card .ui-button-approve[aria-disabled="true"],
+.waiting-bulk .ui-button-approve:disabled,
+.waiting-bulk .ui-button-approve[aria-disabled="true"] {
+  background: none;
+  border-color: var(--border);
+  color: var(--text-faint);
 }
 
 /* =================================================================== batch == */
@@ -421,11 +628,19 @@
  * read the whole bar aloud every time one of them said a word.
  */
 .waiting-bulk {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
+  display: grid;
   gap: var(--space-2);
   margin-bottom: var(--space-3);
+}
+
+.waiting-bulk-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.waiting-bulk-head > .ui-button {
+  flex-shrink: 0;
 }
 
 /**
@@ -434,8 +649,14 @@
  * before anybody arms anything.
  */
 .waiting-bulk-said {
+  flex: 1 1 0;
+  min-width: 0;
   margin: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
 }
 
@@ -448,6 +669,25 @@
 .waiting-select {
   accent-color: var(--text);
   align-self: center;
+}
+
+/**
+ * The target around that box: 28 by 28, because the box alone is about 13px.
+ *
+ * A label, so a click anywhere in the square toggles the box, and centred so the box does not
+ * move. The negative block margin takes back most of the height the square adds, which keeps
+ * the card head as tall as it was — the hit area grows over the head's own padding, not into
+ * the line below it.
+ */
+.waiting-select-hit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  min-width: 28px;
+  min-height: 28px;
+  margin-block: calc(-1 * var(--space-1));
+  cursor: pointer;
 }
 
 /* What the last decision did. Green-ish and quiet: it is a receipt, not a state
@@ -463,6 +703,40 @@
 /* The one card in this queue that is a form, because the recruitment approval is
    editable at the moment of decision — the corrections travel with it. Its box is
    an `Inset`, which already stacks the fields at this gap. */
+
+/**
+ * The fields on a three-column grid, grouped by what they are: who (name, then the wider
+ * speciality), what they are told (the prompt, full width), and what they run on (engine, model
+ * and tool policy side by side). Six full-width rows made a one-line name as tall as a sentence
+ * and put the three settings that belong together three rows apart. Under 36rem it is one column.
+ */
+.waiting-recruit {
+  container-type: inline-size;
+}
+
+.waiting-recruit-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.waiting-recruit-span-2 {
+  grid-column: span 2;
+}
+
+.waiting-recruit-span-all {
+  grid-column: 1 / -1;
+}
+
+@container (max-width: 36rem) {
+  .waiting-recruit-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .waiting-recruit-span-2 {
+    grid-column: auto;
+  }
+}
 
 .waiting-recruit-field {
   display: flex;
@@ -480,10 +754,8 @@
  */
 .waiting-recruit-label {
   font-family: var(--font-body);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
 .waiting-recruit-input,
@@ -502,12 +774,12 @@
   resize: vertical;
 }
 
-/* The two fields a director gets wrong most often — said once, above them. */
-.waiting-recruit-hint {
-  margin: 0;
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
-  color: var(--text-faint);
+/* The two fields a director gets wrong most often. The caution is their description
+   (`aria-describedby` and `title`), not a paragraph between the fields; what marks them on the
+   screen is a firmer edge. Declared after the shared input rule so it wins at equal
+   specificity. */
+.waiting-recruit-input-careful {
+  border-color: var(--border-strong);
 }
 
 /* ==================================================================== rows == */
