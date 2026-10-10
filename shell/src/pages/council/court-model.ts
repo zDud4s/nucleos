@@ -100,6 +100,11 @@ export interface ProcessPhase extends Moment {
   label: string;
   /** The council has steps for it (or, for the verdict, a synthesis or a synthesis under way). */
   reachable: boolean;
+  /**
+   * It will never happen: no steps and the council is over. A future phase of a running
+   * council is plain; it only is not offered yet.
+   */
+  struck: boolean;
   /** The live moment. */
   current: boolean;
   /** `stopped_early`: the last phase that ran. */
@@ -153,15 +158,19 @@ function hasSteps(view: CouncilView, m: Moment): boolean {
 
 export function processLine(view: CouncilView): ProcessPhase[] {
   const live = liveMoment(view);
-  const phases = processPhases(view.rounds).map((m) => ({
-    ...m,
-    key: momentKey(m),
-    label: phaseLabel(m),
+  const phases = processPhases(view.rounds).map((m) => {
     // The live phase stays clickable even before its first step row lands: it is the way back to live.
-    reachable: hasSteps(view, m) || (view.status === "running" && sameMoment(m, live)),
-    current: view.status === "running" && sameMoment(m, live),
-    stoppedHere: false,
-  }));
+    const reachable = hasSteps(view, m) || (view.status === "running" && sameMoment(m, live));
+    return {
+      ...m,
+      key: momentKey(m),
+      label: phaseLabel(m),
+      reachable,
+      struck: !reachable && view.status !== "running",
+      current: view.status === "running" && sameMoment(m, live),
+      stoppedHere: false,
+    };
+  });
   if (view.stopped_early) {
     const lastRun = [...phases].reverse().find((p) => p.reachable && p.phase !== "synthesis");
     if (lastRun !== undefined) lastRun.stoppedHere = true;
@@ -227,6 +236,36 @@ export function tallyAt(view: CouncilView, m: Moment): { board: BordaRow[] | nul
   const i = view.ballot_rounds.indexOf(m.round);
   if (i < 0) return { board: null, agreement: INSUFFICIENT };
   return { board: view.leaderboard_by_round[i] ?? null, agreement: view.agreement_by_round[i] ?? INSUFFICIENT };
+}
+
+/** Mean glyph width of a seat name, in em: measured at 9px, "claude-op…" runs about 50px. */
+export const LABEL_EM = 0.58;
+export const LABEL_FONT_MAX = 9;
+export const LABEL_FONT_MIN = 6.5;
+
+/** A model ref without its vendor prefix: `claude-opus-4` is `opus-4`. A name that is only the prefix stays. */
+export function shortModelName(name: string): string {
+  const short = name.replace(/^claude-/i, "");
+  return short === "" ? name : short;
+}
+
+/**
+ * What a seat's name looks like INSIDE its circle: the short name, set as large as the
+ * circle allows (9px down to 6.5px) and, only when even 6.5px does not fit, cut in the middle
+ * (head and tail, `gem…pro`) so that refs sharing a prefix or a suffix stay apart.
+ * The full name stays on the seat's accessible name and title.
+ */
+export function fitSeatLabel(name: string, r: number): { text: string; fontSize: number } {
+  const short = shortModelName(name);
+  const room = 2 * r - 4;
+  const fontFor = (chars: number) => room / (chars * LABEL_EM);
+  if (fontFor(short.length) >= LABEL_FONT_MIN) {
+    return { text: short, fontSize: Math.min(LABEL_FONT_MAX, fontFor(short.length)) };
+  }
+  const keep = Math.max(3, Math.floor(room / (LABEL_FONT_MIN * LABEL_EM))); // characters, ellipsis included
+  const tail = Math.floor((keep - 1) / 2);
+  const head = keep - 1 - tail;
+  return { text: `${short.slice(0, head)}…${short.slice(short.length - tail)}`, fontSize: LABEL_FONT_MIN };
 }
 
 export function radiusFor(board: BordaRow[] | null, seatIdx: number): number {

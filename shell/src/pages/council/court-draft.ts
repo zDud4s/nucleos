@@ -168,5 +168,5 @@ export function requestFrom(question: string, d: CourtDraft, picked: number | nu
 
 export function ceilingLine(d: CourtDraft, rounds: number): string {
   // The same sentence the old composer printed (Council.tsx ~400), as one string a test finds whole.
-  return `≤ ${ceilingCalls(occupiedCount(d), rounds)} calls · ${stepsInSequence(rounds)} steps in sequence`;
+  return `up to ${ceilingCalls(occupiedCount(d), rounds)} calls · ${stepsInSequence(rounds)} steps in sequence`;
 }

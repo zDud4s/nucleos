@@ -33,6 +33,8 @@ export interface PanelProps {
 export function Panel({ title, aside, variant, children }: PanelProps) {
   const classes = variant === undefined ? "ui-panel" : `ui-panel ui-panel-${variant}`;
   const hasHead = title !== undefined || aside !== undefined;
+  // A shut panel (`{open && …}`) has no body at all, rather than an empty padded box under its heading.
+  const hasBody = children !== undefined && children !== null && children !== false;
   return (
     <section className={classes}>
       {hasHead ? (
@@ -41,7 +43,7 @@ export function Panel({ title, aside, variant, children }: PanelProps) {
           {aside === undefined ? null : <div className="ui-panel-aside">{aside}</div>}
         </div>
       ) : null}
-      <div className="ui-panel-body">{children}</div>
+      {hasBody ? <div className="ui-panel-body">{children}</div> : null}
     </section>
   );
 }

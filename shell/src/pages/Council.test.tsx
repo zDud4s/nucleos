@@ -952,7 +952,7 @@ describe("Council - convening with a chosen panel", () => {
     await chooseChair(1);
     fireEvent.click(await within(dossier()).findByRole("button", { name: "Release" }));
     // N=2, R=2: 2 answers + 4 critiques + 2 revisions + 2 chairman = 10.
-    expect(await screen.findByText("≤ 10 calls")).toBeDefined();
+    expect(await screen.findByText("up to 10 calls")).toBeDefined();
 
     // Seat 3 is now the second member, so a role given there is keyed "1".
     await chooseChair(3);
@@ -1103,12 +1103,12 @@ describe("Council - convening with rounds, roles and an estimate", () => {
 
     await renderCouncil("/council");
     // N=3, R=2: 3 answers + 6 critiques + 3 revisions + 2 chairman = 14.
-    expect(await screen.findByText("≤ 14 calls")).toBeDefined();
+    expect(await screen.findByText("up to 14 calls")).toBeDefined();
     expect(screen.getByText("5 steps in sequence")).toBeDefined();
 
     // N=3, R=3: 3 + 9 + 6 + 2 = 20.
     fireEvent.click(screen.getByRole("button", { name: "Add a round" }));
-    expect(await screen.findByText("≤ 20 calls")).toBeDefined();
+    expect(await screen.findByText("up to 20 calls")).toBeDefined();
     expect(screen.getByText("7 steps in sequence")).toBeDefined();
   });
 });
@@ -2038,6 +2038,8 @@ describe("Council - the detail, redesigned", () => {
     const record = await panelFor("Case record");
     const toggle = within(record).getByRole("button", { name: "Show" });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    // Shut, the panel is its heading alone: no empty padded box underneath.
+    expect(record.querySelector(".ui-panel-body")).toBeNull();
     expect(screen.queryByRole("heading", { level: 2, name: "Deliberation" })).toBeNull();
     // The leaderboard panel is gone: the room's chairs carry the ranking.
     expect(screen.queryByRole("heading", { level: 2, name: "Leaderboard" })).toBeNull();

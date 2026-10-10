@@ -112,6 +112,37 @@ const agreement = (tau: number | null, level: string, ballots = 3): Agreement =>
   tau, level, ballots, comparisons: 6,
 });
 
+describe("a chair's name inside its circle", () => {
+  const widest = (fit: { text: string; fontSize: number }) => fit.text.length * fit.fontSize * court.LABEL_EM;
+
+  it("drops the vendor prefix, so two Claude models read apart", () => {
+    expect(court.shortModelName("claude-opus-4")).toBe("opus-4");
+    expect(court.shortModelName("claude-sonnet-4")).toBe("sonnet-4");
+    expect(court.shortModelName("gpt-5-codex")).toBe("gpt-5-codex");
+    expect(court.shortModelName("claude-")).toBe("claude-");
+  });
+
+  it("never lets a label run past its circle, at any radius", () => {
+    for (const name of ["claude-opus-4", "claude-sonnet-4", "gpt-5-codex", "gemini-2.5-pro-preview-0605", "Marketing Strategist"]) {
+      for (const r of [court.R_MIN, court.R_EVEN, court.R_MAX]) {
+        expect(widest(court.fitSeatLabel(name, r))).toBeLessThanOrEqual(2 * r - 4 + 1e-9);
+      }
+    }
+  });
+
+  it("keeps a name whole when it fits, at the house size", () => {
+    expect(court.fitSeatLabel("claude-opus-4", court.R_MAX)).toEqual({ text: "opus-4", fontSize: court.LABEL_FONT_MAX });
+  });
+
+  it("keeps distinct refs distinct once it has to cut", () => {
+    const names = ["claude-opus-4-1", "claude-opus-4-5", "claude-sonnet-4", "gemini-2.5-pro", "gemini-2.5-flash"];
+    for (const r of [court.R_MIN, court.R_EVEN, court.R_MAX]) {
+      const texts = names.map((n) => court.fitSeatLabel(n, r).text);
+      expect(new Set(texts).size).toBe(names.length);
+    }
+  });
+});
+
 describe("the scales", () => {
   it("is level at τ = 1 and tips 22° at τ ≤ 0, linearly between", () => {
     expect(court.balanceAngle(1)).toBe(0);
@@ -168,6 +199,25 @@ describe("the process line", () => {
   it("leaves the verdict unreachable on a council that failed before the synthesis", () => {
     const v = view({ status: "error", error: "boom", current_round: 1, current_phase: "critique" });
     expect(court.processLine(v).slice(-1)[0]).toMatchObject({ label: "Verdict", reachable: false });
+  });
+
+  it("strikes only the phases that will never happen", () => {
+    // Running: everything after the live phase is still to come, and a future phase is not struck.
+    const running = view({ rounds: 2, current_round: 1, current_phase: "critique", seats: [seat({ steps: [step(), step({ round: 1, phase: "critique", status: "pending", run_id: 4 })] })] });
+    expect(court.processLine(running).map((p) => [p.label, p.struck])).toEqual([
+      ["Opening", false], ["Deliberation I", false], ["Rebuttal I", false], ["Deliberation II", false], ["Verdict", false],
+    ]);
+    // Stopped early: what never ran is struck, what ran is not.
+    const stopped = view({
+      rounds: 2, rounds_run: 1, stopped_early: true, status: "done", current_round: 1, current_phase: "synthesis",
+      synthesis: "done", seats: [seat({ steps: [step(), step({ round: 1, phase: "critique" })] })],
+    });
+    expect(court.processLine(stopped).map((p) => [p.label, p.struck])).toEqual([
+      ["Opening", false], ["Deliberation I", false], ["Rebuttal I", true], ["Deliberation II", true], ["Verdict", false],
+    ]);
+    // Failed: the verdict that never came is struck.
+    const failed = view({ status: "error", error: "boom", current_round: 1, current_phase: "critique" });
+    expect(court.processLine(failed).slice(-1)[0]).toMatchObject({ label: "Verdict", struck: true });
   });
 
   it("marks the live moment as current", () => {
@@ -417,7 +467,7 @@ describe("the setup court", () => {
     expect(court.buildSetupCourt(cfg, draftFromConfig(cfg), "", 2).balance.tone).toBe("empty");
   });
   it("shows rounds and the call ceiling on the right wing", () => {
-    expect(court.buildSetupCourt(cfg, draftFromConfig(cfg), "", 2).wing).toEqual({ title: "ROUNDS 2", sub: "≤ 14 calls · 5 steps in sequence" });
+    expect(court.buildSetupCourt(cfg, draftFromConfig(cfg), "", 2).wing).toEqual({ title: "ROUNDS 2", sub: "up to 14 calls · 5 steps in sequence" });
   });
   it("truncates the question on the lectern and keeps it whole for the dossier", () => {
     const long = "x".repeat(60);

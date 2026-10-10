@@ -1,5 +1,6 @@
 import { useRef, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import {
+  fitSeatLabel,
   VIEW_H,
   VIEW_W,
   type Balance,
@@ -38,7 +39,6 @@ const BALLOT = { w: 5.5, h: 8, gap: 1.5 };
 /** The wing's text is centred here. */
 const WING_X = 482;
 
-const SEAT_LABEL_CHARS = 10;
 const JUDGE_LABEL_CHARS = 16;
 
 const clip = (text: string, room: number) => (text.length > room ? `${text.slice(0, room - 1)}…` : text);
@@ -428,7 +428,9 @@ function Seat({
   const style = settle
     ? ({ "--from-x": `${seat.from.x - x}px`, "--from-y": `${seat.from.y - y}px` } as CSSProperties)
     : undefined;
-  const label = clip(seat.label, SEAT_LABEL_CHARS);
+  // Inside the circle: the short name, sized to the disc. The full one stays on the accessible name and title.
+  const fit = fitSeatLabel(seat.label, r);
+  const reveal = fitSeatLabel(seat.name, r);
   const tagY = y + r + (seat.sublabel === null ? 10 : 20);
   return (
     <g
@@ -449,15 +451,15 @@ function Seat({
       {seat.masked ? (
         <>
           <text className="council-court-letter" x={x} y={y + 4} textAnchor="middle">
-            {label}
+            {seat.label}
           </text>
-          <text className="council-court-reveal" x={x} y={y + 3} textAnchor="middle">
-            {clip(seat.name, SEAT_LABEL_CHARS)}
+          <text className="council-court-reveal" x={x} y={y + 3} textAnchor="middle" style={{ fontSize: reveal.fontSize }}>
+            {reveal.text}
           </text>
         </>
       ) : (
-        <text className="council-court-seat-name" x={x} y={y + 3.5} textAnchor="middle">
-          {label}
+        <text className="council-court-seat-name" x={x} y={y + 3.5} textAnchor="middle" style={{ fontSize: fit.fontSize }}>
+          {fit.text}
         </text>
       )}
       {seat.state === "ok" && (

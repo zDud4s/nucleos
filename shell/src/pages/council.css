@@ -656,6 +656,8 @@
   grid-template-columns: minmax(0, 1.6fr) minmax(220px, 1fr);
   gap: var(--space-4);
   align-items: start;
+  /* Room between the line of phases and whatever comes under the page. */
+  margin-bottom: var(--space-5);
 }
 
 .council-court-page > .council-process {
@@ -1219,6 +1221,7 @@
   justify-content: space-between;
   gap: var(--space-3);
   min-width: 0;
+  padding-top: var(--space-2);
 }
 
 .council-process-phases {
@@ -1266,7 +1269,12 @@
   outline-offset: 2px;
 }
 
-/* A phase that has not happened, or never will: shown so the line reads whole, and not offered. */
+/* A phase still to come: shown so the line reads whole, plain, and not offered yet. */
+.council-process-phase-ahead {
+  color: var(--text-faint);
+}
+
+/* A phase that will never happen (the council ended without it): struck through. */
 .council-process-phase-unreachable {
   text-decoration: line-through;
   color: var(--text-faint);
@@ -1284,6 +1292,13 @@
 @media (min-width: 901px) {
   .council-dossier-summary {
     display: none;
+  }
+
+  /* The room stays in view while a tall dossier scrolls beside it. */
+  .council-court {
+    position: sticky;
+    top: var(--space-4);
+    align-self: start;
   }
 }
 

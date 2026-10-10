@@ -115,6 +115,6 @@ describe("convening from the court", () => {
 
   it("estimates the ceiling from the occupied chairs", () => {
     // ceilingCalls(3, 2) = 3 answers + 6 critiques + 3 revisions + 2 chairman calls; stepsInSequence(2) = 5.
-    expect(draft.ceilingLine(draft.draftFromConfig(c), 2)).toBe("≤ 14 calls · 5 steps in sequence");
+    expect(draft.ceilingLine(draft.draftFromConfig(c), 2)).toBe("up to 14 calls · 5 steps in sequence");
   });
 });

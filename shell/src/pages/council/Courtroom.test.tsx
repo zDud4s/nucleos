@@ -352,11 +352,12 @@ describe("ProcessLine", () => {
       seats: [seat({ steps: [step(), step({ round: 1, phase: "critique", status: "pending", run_id: 4 })] })],
     });
 
-    it("keeps phases that did not happen out of reach and the viewed one current", () => {
+    it("keeps phases still to come out of reach, plain and not struck, and the viewed one current", () => {
       render(<ProcessLine mode="session" phases={processLine(live)} liveKey={momentKey(liveMoment(live))} viewing="live" onView={noop} />);
       const rebuttal = screen.getByText("Rebuttal I");
       expect(rebuttal.tagName).toBe("SPAN");
-      expect(rebuttal.className).toContain("council-process-phase-unreachable");
+      expect(rebuttal.className).toContain("council-process-phase-ahead");
+      expect(rebuttal.className).not.toContain("council-process-phase-unreachable");
       expect(screen.queryByRole("button", { name: "Rebuttal I" })).toBeNull();
       expect(screen.getByRole("button", { name: "Deliberation I" }).getAttribute("aria-current")).toBe("step");
       expect(screen.getByRole("button", { name: "Opening" }).getAttribute("aria-current")).toBeNull();
@@ -400,6 +401,8 @@ describe("ProcessLine", () => {
       });
       render(<ProcessLine mode="session" phases={processLine(stopped)} liveKey={momentKey(liveMoment(stopped))} viewing="live" onView={noop} />);
       expect(screen.getByRole("button", { name: "Deliberation I · stopped early" })).toBeDefined();
+      // What will never happen now is struck.
+      expect(screen.getByText("Rebuttal I").className).toContain("council-process-phase-unreachable");
       // A finished council is at its verdict, and that is the live view.
       expect(screen.getByRole("button", { name: "Verdict" }).getAttribute("aria-current")).toBe("step");
     });

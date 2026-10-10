@@ -109,7 +109,7 @@ function SessionLine({ phases, liveKey, viewing, onView }: Extract<ProcessLinePr
                   {label}
                 </button>
               ) : (
-                <span className="council-process-phase-unreachable">{label}</span>
+                <span className={p.struck ? "council-process-phase-unreachable" : "council-process-phase-ahead"}>{label}</span>
               )}
             </li>
           );
