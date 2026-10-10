@@ -40,8 +40,10 @@ type panelSub struct {
 //
 // Lock order: mu before the driver's mu, never the reverse.
 type panelState struct {
-	mu        sync.Mutex
-	history   []json.RawMessage
+	mu      sync.Mutex
+	history []json.RawMessage
+	// asks is the latest unanswered ask of each kind, replayed after the history into a world born later.
+	asks      map[string]json.RawMessage
 	collapsed bool
 	// live are the panel worlds that have been told the conversation so far. A push only goes to
 	// these: a world that is registered but not yet replayed gets the message through the replay, and
@@ -138,6 +140,13 @@ func (d *Driver) PanelPush(ctx context.Context, id browser.SessionID, msg json.R
 			p.history = append([]json.RawMessage(nil), p.history[over:]...)
 		}
 	}
+	if head.Kind == "ask_wheel" || head.Kind == "ask_keep" {
+		// The latest of each kind stays pending until the panel answers it (see panelCalled).
+		if p.asks == nil {
+			p.asks = map[string]json.RawMessage{}
+		}
+		p.asks[head.Kind] = msg
+	}
 	keys := d.pruneLive(p)
 	p.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -209,12 +218,22 @@ func (d *Driver) replayPanel(on cdp.SessionID, contextID int64) {
 	}
 	d.mu.Lock()
 	_, there := d.contexts[key]
+	human := entry.mode == browser.ModeHuman
 	d.mu.Unlock()
 	if !there {
 		p.mu.Unlock()
 		return
 	}
 	history := append([]json.RawMessage(nil), p.history...)
+	// A pending ask comes after the history it follows. A wheel ask is moot once the person holds the
+	// wheel, which is how the panel itself drops it on a state in "human" mode.
+	for _, kind := range []string{"ask_wheel", "ask_keep"} {
+		ask, pending := p.asks[kind]
+		if !pending || (kind == "ask_wheel" && human) {
+			continue
+		}
+		history = append(history, ask)
+	}
 	state := d.stateMessage(owner, p)
 	// Marked before the lock is released, so a concurrent replay of the same world is not doubled and
 	// a push that arrives meanwhile goes straight to it. The round trips run outside the lock.
@@ -280,6 +299,13 @@ func (d *Driver) panelCalled(on cdp.SessionID, contextID int64, payload string) 
 	msg := json.RawMessage(payload)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// The panel closes an ask by answering it: keep answers ask_keep, taking the wheel answers ask_wheel.
+	switch head.Kind {
+	case "keep":
+		delete(p.asks, "ask_keep")
+	case "take_wheel":
+		delete(p.asks, "ask_wheel")
+	}
 	for sub := range p.subs {
 		select {
 		case sub.ch <- msg:

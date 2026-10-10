@@ -70,7 +70,7 @@ func pressableNames() string {
 }
 
 // press sends one key, to the focused element or to a named one.
-func (d *Driver) press(ctx context.Context, on cdp.SessionID, objectID, name string) (*browser.Refusal, error) {
+func (d *Driver) press(ctx context.Context, entry *session, on cdp.SessionID, objectID, name string) (*browser.Refusal, error) {
 	stroke, ok := pressable[strings.ToLower(strings.TrimSpace(name))]
 	if !ok {
 		return &browser.Refusal{
@@ -83,6 +83,11 @@ func (d *Driver) press(ctx context.Context, on cdp.SessionID, objectID, name str
 		if err := d.callOn(ctx, on, objectID, "function() { this.focus(); }"); err != nil {
 			return nil, err
 		}
+	}
+
+	// After the focus step and before any key: the keys go to whatever has focus now.
+	if refusal := d.panelFocusGuard(ctx, entry, browser.ActionPress, on); refusal != nil {
+		return refusal, nil
 	}
 
 	down := map[string]any{
