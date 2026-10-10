@@ -201,3 +201,42 @@ export function stepState(
     default: return { state: "failed", reason: step.status };
   }
 }
+
+/* ------------------------------------------------------------ tally -- */
+
+export const R_MIN = 14;
+export const R_MAX = 24;
+export const R_EVEN = 18;
+
+const INSUFFICIENT: Agreement = { tau: null, level: "insufficient", ballots: 0, comparisons: 0 };
+
+/**
+ * The tally a moment shows. `*_by_round` are dense — only rounds with a
+ * readable ballot (`council.rs:2671`) — so round r is found through
+ * `ballot_rounds`, never by index. A round with no entry is even sizes and
+ * insufficient; the opening has no votes; the verdict is the last of each.
+ */
+export function tallyAt(view: CouncilView, m: Moment): { board: BordaRow[] | null; agreement: Agreement | null } {
+  if (m.phase === "answer") return { board: null, agreement: null };
+  if (m.phase === "synthesis") {
+    return { board: view.leaderboard.length > 0 ? view.leaderboard : null, agreement: view.agreement };
+  }
+  const i = view.ballot_rounds.indexOf(m.round);
+  if (i < 0) return { board: null, agreement: INSUFFICIENT };
+  return { board: view.leaderboard_by_round[i] ?? null, agreement: view.agreement_by_round[i] ?? INSUFFICIENT };
+}
+
+export function radiusFor(board: BordaRow[] | null, seatIdx: number): number {
+  if (board === null || board.length === 0) return R_EVEN;
+  const top = Math.max(1, ...board.map((row) => row.score));
+  const row = board.find((candidate) => candidate.seat_idx === seatIdx);
+  if (row === undefined) return R_MIN;
+  return R_MIN + (R_MAX - R_MIN) * Math.min(1, Math.max(0, row.score / top));
+}
+
+/** Competition ranking: ties share a place and the next place skips. `null` for a seat not on the board. */
+export function rankIn(board: BordaRow[], seatIdx: number): number | null {
+  const row = board.find((candidate) => candidate.seat_idx === seatIdx);
+  if (row === undefined) return null;
+  return 1 + board.filter((other) => other.score > row.score + 1e-9).length;
+}

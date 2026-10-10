@@ -195,3 +195,48 @@ describe("a chair's state", () => {
     expect(court.stepState(undefined, "error", true)).toEqual({ state: "cancelled", reason: null });
   });
 });
+
+describe("the tally at a moment", () => {
+  const a1 = agreement(0.7, "strong");
+  const a3 = agreement(0.1, "none");
+  const b1 = [{ seat_idx: 0, score: 1, n: 2 }, { seat_idx: 1, score: 0.5, n: 2 }];
+  const b3 = [{ seat_idx: 1, score: 1, n: 2 }, { seat_idx: 0, score: 0, n: 2 }];
+  const v = view({
+    rounds: 3, status: "done", current_phase: "synthesis",
+    leaderboard_by_round: [b1, b3], agreement_by_round: [a1, a3], ballot_rounds: [1, 3],
+    leaderboard: b3, agreement: a3,
+  });
+
+  it("has no votes at the opening", () => {
+    expect(court.tallyAt(v, { round: 0, phase: "answer" })).toEqual({ board: null, agreement: null });
+  });
+  it("reads round r through ballot_rounds, not by index", () => {
+    expect(court.tallyAt(v, { round: 3, phase: "critique" })).toEqual({ board: b3, agreement: a3 });
+    expect(court.tallyAt(v, { round: 1, phase: "revise" })).toEqual({ board: b1, agreement: a1 });
+  });
+  it("reads a round with no ballots as even sizes and insufficient", () => {
+    const t = court.tallyAt(v, { round: 2, phase: "critique" });
+    expect(t.board).toBeNull();
+    expect(t.agreement?.level).toBe("insufficient");
+  });
+  it("reads the verdict as the last tally and the last agreement", () => {
+    expect(court.tallyAt(v, { round: 3, phase: "synthesis" })).toEqual({ board: b3, agreement: a3 });
+  });
+});
+
+describe("a chair's size", () => {
+  it("is even with no tally", () => {
+    expect(court.radiusFor(null, 0)).toBe(court.R_EVEN);
+  });
+  it("runs 14 to 24 over the score against max(1, best)", () => {
+    const board = [{ seat_idx: 0, score: 1, n: 3 }, { seat_idx: 1, score: 0.5, n: 3 }, { seat_idx: 2, score: 0, n: 3 }];
+    expect(court.radiusFor(board, 0)).toBe(24);
+    expect(court.radiusFor(board, 1)).toBe(19);
+    expect(court.radiusFor(board, 2)).toBe(14);
+    expect(court.radiusFor(board, 9)).toBe(14);
+  });
+  it("ranks ties together", () => {
+    const board = [{ seat_idx: 0, score: 1, n: 3 }, { seat_idx: 1, score: 1, n: 3 }, { seat_idx: 2, score: 0.2, n: 3 }];
+    expect([0, 1, 2].map((s) => court.rankIn(board, s))).toEqual([1, 1, 3]);
+  });
+});
