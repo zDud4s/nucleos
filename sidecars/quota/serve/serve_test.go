@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,4 +196,30 @@ func TestServe(t *testing.T) {
 	t.Run("a second call within TTL returns cached", a_second_call_within_ttl_returns_cached)
 	t.Run("an unmeasured reading uses the shorter error TTL", an_unmeasured_reading_uses_the_shorter_error_ttl)
 	t.Run("an unreadable provider goes out with an empty window list", an_unreadable_provider_goes_out_with_an_empty_window_list)
+	t.Run("gemini is sent only when it has something to report", gemini_is_sent_only_when_it_has_something_to_report)
+}
+
+// An owner with no Gemini subscription gets the two providers they always had, not a third dashed
+// one; an owner with one gets it after the other two.
+func gemini_is_sent_only_when_it_has_something_to_report(t *testing.T) {
+	for _, present := range []bool{false, true} {
+		var claudeCalls, codexCalls int
+		readers := stubReaders(&claudeCalls, &codexCalls, official("claude", time.Now()), official("codex", time.Now()))
+		readers.Gemini = func(ctx context.Context, now time.Time) (reading.Provider, bool) {
+			return official("gemini", now), present
+		}
+		handler := authorized("t", quotaHandler(config.Config{SuccessTTL: time.Minute, ErrorTTL: time.Second}, readers, &cache{}, time.Now))
+		_, body := doGet(t, handler, "t")
+		names := []string{}
+		for _, p := range body.Providers {
+			names = append(names, p.Name)
+		}
+		want := "claude,codex"
+		if present {
+			want += ",gemini"
+		}
+		if got := strings.Join(names, ","); got != want {
+			t.Errorf("present=%v: providers = %s, want %s", present, got, want)
+		}
+	}
 }

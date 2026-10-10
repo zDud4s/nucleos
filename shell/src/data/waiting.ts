@@ -51,6 +51,19 @@ export interface VcsRequestSummary {
   origin: string;
   status: string;
   created_at: string;
+  /**
+   * What a decision needs, filled only by `GET /waiting/git` (the history leaves them null):
+   * the merge's branches, git's own output (where a conflict names its files), the reason the
+   * queue recorded, and the resolution run minted for a conflict and where it got to.
+   */
+  source?: string | null;
+  target?: string | null;
+  output_tail?: string | null;
+  failure_reason?: string | null;
+  resolution_run_id?: number | null;
+  resolution_status?: string | null;
+  /** This merge was itself a resolution's landing, so no agent will be minted for it. */
+  from_resolution?: boolean;
 }
 
 /**
