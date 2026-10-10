@@ -6,8 +6,6 @@
 # over this file), and drop the line once a file is at the limit or under; the test fails on a
 # line whose file no longer exists, or that sits at or under the limit. Nothing new is ever added
 # here: a new file past the limit is split by what it does, not given a line.
-src/execution/job.rs 3987
-src/execution/runs.rs 3554
 src/team.rs 3368
 src/execution/runner.rs 2812
 src/hooks.rs 2614

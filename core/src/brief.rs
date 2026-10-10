@@ -811,9 +811,9 @@ mod tests {
         "assistant.rs",
         "council.rs",
         "http/agents.rs",
-        "execution/job.rs",
+        "execution/job/spawn.rs",
         "loadout.rs",
-        "execution/runs.rs",
+        "execution/runs/create.rs",
         "team.rs",
     ];
     const UNBRIEFED_LAUNCHERS: &[(&str, &str)] = &[(
