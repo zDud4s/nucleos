@@ -1,10 +1,21 @@
-import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { createAppQueryClient } from "../../app/queryClient";
 import type { Agreement, CouncilConfig, CouncilView, SeatView, StepView, Synthesis } from "../../data/council";
 import { Courtroom, type CourtSelection } from "./Courtroom";
+import { Dossier } from "./Dossier";
 import { ProcessLine } from "./ProcessLine";
-import { buildSessionCourt, buildSetupCourt, processLine } from "./court-model";
+import { buildSessionCourt, buildSetupCourt, liveMoment, processLine } from "./court-model";
 import { draftFromConfig, type CourtDraft } from "./court-draft";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
+const daemon = vi.hoisted(() => ({ apiFetch: vi.fn() }));
+vi.mock("../../data/client", async (original) => ({
+  ...(await original<typeof import("../../data/client")>()),
+  ...daemon,
+}));
 
 /* ------------------------------------------------------------ fixtures -- */
 
@@ -381,5 +392,208 @@ describe("ProcessLine", () => {
       // A finished council is at its verdict, and that is the live view.
       expect(screen.getByRole("button", { name: "Verdict" }).getAttribute("aria-current")).toBe("step");
     });
+  });
+});
+
+/* --------------------------------------------------------------- Dossier -- */
+
+describe("Dossier", () => {
+  beforeEach(() => {
+    daemon.apiFetch.mockReset();
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/agents") {
+        return [
+          { id: "ag-1", name: "the sceptic", speciality: "", prompt: "", engine: "claude", model: "claude-opus-5", tool_policy: "mcp_only", created_at: "", updated_at: "" },
+          { id: "ag-2", name: "the mute", speciality: "", prompt: "", engine: "claude", model: null, tool_policy: "mcp_only", created_at: "", updated_at: "" },
+        ];
+      }
+      if (path === "/assistant/models") {
+        return {
+          choices: [
+            { id: "claude-opus-5", label: "Opus 5", brain: "cloud", efforts: [] },
+            { id: "qwen3.5:4b", label: "Qwen 4b", brain: "local", efforts: [] },
+          ],
+          configured: "claude-opus-5",
+          efforts: [],
+        };
+      }
+      return undefined;
+    });
+  });
+
+  function renderDossier(ui: React.ReactElement) {
+    return render(<QueryClientProvider client={createAppQueryClient()}>{ui}</QueryClientProvider>);
+  }
+
+  function setupDossier(over: { selection?: CourtSelection; onDraft?: (d: CourtDraft) => void } = {}) {
+    const draft = setupDraft();
+    return renderDossier(
+      <Dossier
+        mode="setup"
+        selection={over.selection ?? null}
+        draft={draft}
+        question=""
+        court={buildSetupCourt(config(), draft, "", 2)}
+        config={config()}
+        refusal={null}
+        onDraft={over.onDraft ?? noop}
+        onClear={noop}
+      />,
+    );
+  }
+
+  function sessionDossier(v: CouncilView, selection: CourtSelection, following = true, onFollowLive = noop) {
+    return renderDossier(
+      <Dossier
+        mode="session"
+        view={v}
+        court={buildSessionCourt(v, "live")}
+        moment={liveMoment(v)}
+        selection={selection}
+        following={following}
+        onFollowLive={onFollowLive}
+      />,
+    );
+  }
+
+  it("asks for neither catalogue while nothing is chosen", () => {
+    setupDossier();
+    expect(screen.getByRole("heading", { name: "The case" })).toBeDefined();
+    expect(screen.getByText("Write the question on the lectern.")).toBeDefined();
+    expect(daemon.apiFetch).not.toHaveBeenCalled();
+  });
+
+  it("calls a model or an agent to an empty chair, never an agent without a model", async () => {
+    const onDraft = vi.fn();
+    setupDossier({ selection: { kind: "seat", index: 3 }, onDraft });
+    expect(screen.getByRole("heading", { name: "Call to seat 4" })).toBeDefined();
+    const agents = await screen.findByRole("group", { name: "Agents" });
+    expect(within(agents).getByRole("button", { name: "the sceptic" })).toBeDefined();
+    expect(within(agents).queryByRole("button", { name: "the mute" })).toBeNull();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Qwen 4b" }));
+    const next = onDraft.mock.calls[0][0] as CourtDraft;
+    expect(next.chairs[3]).toEqual({ seat: { kind: "local", ref: "qwen3.5:4b" }, name: "Qwen 4b" });
+    expect(next.touched).toBe(true);
+  });
+
+  it("hands out a role badge", () => {
+    const onDraft = vi.fn();
+    setupDossier({ selection: { kind: "seat", index: 3 }, onDraft });
+    fireEvent.click(screen.getByRole("button", { name: "skeptic" }));
+    expect((onDraft.mock.calls[0][0] as CourtDraft).roles[3]).toBe("skeptic");
+  });
+
+  it("releases an occupied chair", () => {
+    const onDraft = vi.fn();
+    setupDossier({ selection: { kind: "seat", index: 0 }, onDraft });
+    expect(screen.getByRole("heading", { name: "Seat 1" })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Release" }));
+    expect((onDraft.mock.calls[0][0] as CourtDraft).chairs[0]).toBeNull();
+  });
+
+  it("calls someone to the bench", async () => {
+    const onDraft = vi.fn();
+    setupDossier({ selection: { kind: "judge" }, onDraft });
+    expect(screen.getByRole("heading", { name: "Chairman" })).toBeDefined();
+    fireEvent.click(await screen.findByRole("button", { name: "Opus 5" }));
+    expect((onDraft.mock.calls[0][0] as CourtDraft).chairman).toEqual({
+      seat: { kind: "cloud", ref: "claude-opus-5" },
+      name: "Opus 5",
+    });
+  });
+
+  it("tails a seat that is speaking", async () => {
+    const v = view({
+      seats: [seat({ ref: "gpt-5", steps: [step({ status: "pending", run_id: 5, answer: null })] })],
+    });
+    sessionDossier(v, { kind: "seat", index: 0 });
+    expect(await screen.findByRole("log", { name: "Live tail of gpt-5" })).toBeDefined();
+  });
+
+  it("reads a settled answer, a failure and an expired transcript", () => {
+    const v = view({
+      seats: [
+        seat({ ref: "a", steps: [step({ answer: "**ship it**" })] }),
+        seat({ seat_idx: 1, ref: "b", steps: [step({ status: "error", error: "timed out", answer: null })] }),
+        seat({ seat_idx: 2, ref: "c", steps: [step({ answer: null })] }),
+      ],
+    });
+    const first = sessionDossier(v, { kind: "seat", index: 0 });
+    expect(screen.getByText("ship it").tagName).toBe("STRONG");
+    first.unmount();
+    const second = sessionDossier(v, { kind: "seat", index: 1 });
+    expect(screen.getAllByText("timed out").length).toBeGreaterThan(0);
+    second.unmount();
+    sessionDossier(v, { kind: "seat", index: 2 });
+    expect(screen.getByText("transcript expired")).toBeDefined();
+  });
+
+  it("deanonymises a ballot", () => {
+    const v = view({
+      current_round: 1,
+      current_phase: "critique",
+      seats: [
+        seat({
+          ref: "a",
+          steps: [step(), step({ round: 1, phase: "critique", answer: null, critique: { reviews: [], ranking: ["B", "A"] } })],
+        }),
+        seat({ seat_idx: 1, ref: "b" }),
+      ],
+    });
+    sessionDossier(v, { kind: "seat", index: 0 });
+    const ballot = screen.getByRole("list", { name: "Ballot of a" });
+    expect(within(ballot).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["b", "a"]);
+    // The masked chair is titled by its letter in the dossier too.
+    expect(screen.getByRole("heading", { name: "A" })).toBeDefined();
+  });
+
+  it("tails the chairman while the verdict is written, once its run is known", async () => {
+    const writing = view({ current_round: 1, current_phase: "synthesis", synthesis_run_id: 77 });
+    sessionDossier(writing, { kind: "judge" });
+    expect(await screen.findByRole("log", { name: "Live tail of claude-opus-4" })).toBeDefined();
+    await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/runs/77/tail?since=0"));
+  });
+
+  it("says the chair is writing while the synthesis run is not open yet", () => {
+    sessionDossier(view({ current_round: 1, current_phase: "synthesis", synthesis_run_id: null }), { kind: "judge" });
+    expect(screen.getByText("The chair is writing the verdict…")).toBeDefined();
+    expect(screen.queryByRole("log")).toBeNull();
+  });
+
+  it("says when a finished council has no transcript left", () => {
+    sessionDossier(view({ status: "done", rounds_run: 1, current_phase: "synthesis" }), { kind: "judge" });
+    expect(screen.getByText("transcript expired")).toBeDefined();
+    expect(screen.getByText("chaired by claude-opus-4")).toBeDefined();
+  });
+
+  it("offers Follow live only when the reader is not following", () => {
+    const onFollowLive = vi.fn();
+    const v = view();
+    const first = sessionDossier(v, null, true, onFollowLive);
+    expect(screen.queryByRole("button", { name: "Follow live" })).toBeNull();
+    first.unmount();
+    sessionDossier(v, null, false, onFollowLive);
+    fireEvent.click(screen.getByRole("button", { name: "Follow live" }));
+    expect(onFollowLive).toHaveBeenCalledTimes(1);
+  });
+
+  it("repeats the room's readings, which a narrow screen hides from the room", () => {
+    const v = view({
+      current_round: 1,
+      current_phase: "critique",
+      ballot_rounds: [1],
+      agreement_by_round: [agreement(0.21, "split")],
+      leaderboard_by_round: [[]],
+      seats: [
+        seat({ steps: [step(), step({ round: 1, phase: "critique", answer: null, critique: { reviews: [], ranking: ["B"] } })] }),
+        seat({ seat_idx: 1 }),
+      ],
+    });
+    sessionDossier(v, null);
+    const summary = document.querySelector("dl.council-dossier-summary") as HTMLElement;
+    expect(summary.textContent).toContain("split · τ 0.21");
+    expect(summary.textContent).toContain("ROUND I");
+    expect(summary.textContent).toContain("ballots 1/2");
   });
 });
