@@ -44,3 +44,45 @@ export function pointAt(deg: number): { x: number; y: number } {
   const rad = (deg * Math.PI) / 180;
   return { x: ARC.cx + ARC.rx * Math.cos(rad), y: ARC.cy + ARC.ry * Math.sin(rad) };
 }
+
+/* ------------------------------------------------------------ scales -- */
+
+/** Mirrors `tally::STRONG_AT` and `tally::SPLIT_AT` (`core/src/council/tally.rs:17-19`). */
+export const STRONG_AT = 0.6;
+export const SPLIT_AT = 0.2;
+/** `tally::MIN_BALLOTS`: below this the daemon does not measure agreement. */
+export const MIN_BALLOTS = 3;
+/** The tilt at τ ≤ 0, in degrees. Always to the same side: τ is concordance, not direction. */
+export const MAX_TILT = 22;
+
+export type Tone = "strong" | "split" | "none" | "insufficient" | "empty";
+
+export interface Balance {
+  angle: number;
+  tone: Tone;
+  label: string;
+  sub: string | null;
+}
+
+export function balanceAngle(tau: number | null): number {
+  if (tau === null) return 0;
+  const t = Math.min(1, Math.max(0, tau));
+  return MAX_TILT * (1 - t);
+}
+
+export function balanceTone(agreement: Agreement): Tone {
+  if (agreement.level === "insufficient" || agreement.tau === null) return "insufficient";
+  if (agreement.tau >= STRONG_AT) return "strong";
+  if (agreement.tau >= SPLIT_AT) return "split";
+  return "none";
+}
+
+export function balanceOf(agreement: Agreement | null): Balance {
+  if (agreement === null) return { angle: 0, tone: "empty", label: "no votes yet", sub: null };
+  const tone = balanceTone(agreement);
+  if (tone === "insufficient") {
+    return { angle: 0, tone, label: AGREEMENT_WORDS.insufficient, sub: `fewer than ${MIN_BALLOTS} ballots` };
+  }
+  const words = AGREEMENT_WORDS[agreement.level] ?? agreement.level;
+  return { angle: balanceAngle(agreement.tau), tone, label: `${words} · τ ${agreement.tau!.toFixed(2)}`, sub: null };
+}

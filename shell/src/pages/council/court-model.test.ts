@@ -97,3 +97,38 @@ describe("seat geometry", () => {
     close(left.y, 118 + 150 * Math.sin((168 * Math.PI) / 180));
   });
 });
+
+const agreement = (tau: number | null, level: string, ballots = 3): Agreement => ({
+  tau, level, ballots, comparisons: 6,
+});
+
+describe("the scales", () => {
+  it("is level at τ = 1 and tips 22° at τ ≤ 0, linearly between", () => {
+    expect(court.balanceAngle(1)).toBe(0);
+    expect(court.balanceAngle(0)).toBe(22);
+    expect(court.balanceAngle(-0.5)).toBe(22);
+    expect(court.balanceAngle(0.5)).toBeCloseTo(11);
+    expect(court.balanceAngle(1.2)).toBe(0);
+  });
+
+  it("changes colour exactly at tally.rs's thresholds", () => {
+    expect(court.balanceTone(agreement(0.6, "strong"))).toBe("strong");
+    expect(court.balanceTone(agreement(0.5999, "split"))).toBe("split");
+    expect(court.balanceTone(agreement(0.2, "split"))).toBe("split");
+    expect(court.balanceTone(agreement(0.1999, "none"))).toBe("none");
+    expect(court.balanceTone(agreement(-1, "none"))).toBe("none");
+  });
+
+  it("is level, grey and dashed when the ballots are insufficient", () => {
+    const b = court.balanceOf(agreement(null, "insufficient", 2));
+    expect(b).toEqual({ angle: 0, tone: "insufficient", label: "too few votes", sub: "fewer than 3 ballots" });
+  });
+
+  it("reads 'split · τ 0.21' under the scales", () => {
+    expect(court.balanceOf(agreement(0.21, "split")).label).toBe("split · τ 0.21");
+  });
+
+  it("says there are no votes yet when there is no agreement at all", () => {
+    expect(court.balanceOf(null)).toEqual({ angle: 0, tone: "empty", label: "no votes yet", sub: null });
+  });
+});
