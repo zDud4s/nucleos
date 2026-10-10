@@ -165,3 +165,39 @@ export function processLine(view: CouncilView): ProcessPhase[] {
   }
   return phases;
 }
+
+/* ------------------------------------------------------------ chair state -- */
+
+export type SeatState =
+  | "empty" | "seated"                       // setup
+  | "waiting" | "thinking" | "speaking"      // session, not settled
+  | "ok" | "failed" | "cancelled" | "skipped";
+
+/**
+ * One step as a chair reads it (`council.rs:59-65`, `store::STEP_INVALID`).
+ * In progress is `pending` WITH a run in a council still running
+ * (`council.rs:1628-1634`); the same row in a council that ended is cancelled.
+ * `stalledHere` is true when the moment asked for is where a dead council stopped,
+ * so a seat that never got a row there reads as cancelled rather than waiting.
+ */
+export function stepState(
+  step: StepView | undefined,
+  councilStatus: string,
+  stalledHere = false,
+): { state: SeatState; reason: string | null } {
+  if (step === undefined) {
+    return { state: stalledHere && councilStatus !== "running" ? "cancelled" : "waiting", reason: null };
+  }
+  switch (step.status) {
+    case "pending":
+      if (councilStatus !== "running") return { state: "cancelled", reason: null };
+      return { state: step.run_id === null ? "thinking" : "speaking", reason: null };
+    case "ok": return { state: "ok", reason: null };
+    case "invalid": return { state: "failed", reason: "unreadable answer" };
+    case "error":
+    case "timeout": return { state: "failed", reason: step.error ?? step.status };
+    case "cancelled": return { state: "cancelled", reason: null };
+    case "skipped": return { state: "skipped", reason: null };
+    default: return { state: "failed", reason: step.status };
+  }
+}

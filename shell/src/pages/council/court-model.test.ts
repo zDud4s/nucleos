@@ -170,3 +170,28 @@ describe("the process line", () => {
     expect(court.processLine(v).find((p) => p.current)).toMatchObject({ label: "Deliberation I", reachable: true });
   });
 });
+
+describe("a chair's state", () => {
+  const at = (overrides: Partial<StepView>) => step({ round: 1, phase: "critique", ...overrides });
+  it("is thinking while pending with no run", () => {
+    expect(court.stepState(at({ status: "pending", run_id: null }), "running")).toEqual({ state: "thinking", reason: null });
+  });
+  it("is speaking only while pending, with a run, in a running council", () => {
+    expect(court.stepState(at({ status: "pending", run_id: 7 }), "running").state).toBe("speaking");
+    expect(court.stepState(at({ status: "pending", run_id: 7 }), "error").state).toBe("cancelled");
+    expect(court.stepState(at({ status: "pending", run_id: 7 }), "cancelled").state).toBe("cancelled");
+    expect(court.stepState(at({ status: "pending", run_id: null }), "error").state).toBe("cancelled");
+  });
+  it("reads ok, error, timeout, invalid, cancelled and skipped", () => {
+    expect(court.stepState(at({ status: "ok" }), "running").state).toBe("ok");
+    expect(court.stepState(at({ status: "error", error: "it broke" }), "running")).toEqual({ state: "failed", reason: "it broke" });
+    expect(court.stepState(at({ status: "timeout", error: null }), "running")).toEqual({ state: "failed", reason: "timeout" });
+    expect(court.stepState(at({ status: "invalid", error: "x" }), "running")).toEqual({ state: "failed", reason: "unreadable answer" });
+    expect(court.stepState(at({ status: "cancelled" }), "done").state).toBe("cancelled");
+    expect(court.stepState(at({ status: "skipped" }), "done").state).toBe("skipped");
+  });
+  it("is waiting with no step, and cancelled with no step at the moment a dead council stopped", () => {
+    expect(court.stepState(undefined, "running")).toEqual({ state: "waiting", reason: null });
+    expect(court.stepState(undefined, "error", true)).toEqual({ state: "cancelled", reason: null });
+  });
+});
