@@ -3782,6 +3782,8 @@ async fn item_provisioning(
         item_id,
         stage,
         base,
+        // Filled by `spawn_node` once the loadout is resolved.
+        loadout: None,
     })
 }
 
@@ -3994,11 +3996,23 @@ async fn spawn_node(
             task_text: &task_text,
             node: crate::loadout::node_kind(stage),
             files: &files,
+            // The tools and the context come out of the same resolution as the memory. The job-node
+            // box owns the built-ins and a job node has never read its agent's `tool_policy`, so the
+            // policy is `mcp_only` for every node; and every node works in a checkout, so a folder
+            // ref can be handed over as a directory to add.
+            equipment: Some(crate::loadout::Equipment {
+                tool_policy: "mcp_only",
+                base: crate::mcp_tools::JOB_NODE_BASE,
+                extras: crate::mcp_tools::JOB_NODE_EXTRAS,
+                managed_root: state.files_root.as_deref(),
+                has_cwd: true,
+            }),
         },
     )
     .await;
     prompt.push_str(&loadout.block);
     let briefing = loadout.brief;
+    let run_tools = loadout.run.clone();
 
     // An item of a job a team directs gets a checkout of its own; everything else — every node of
     // every job without a team, and this job's own plan, replan and review nodes — works in the
@@ -4013,7 +4027,8 @@ async fn spawn_node(
         None => None,
     };
     let created = match own_tree {
-        Some(item) => {
+        Some(mut item) => {
+            item.loadout = run_tools.clone();
             crate::runs::create_job_item_run(
                 state,
                 prompt,
@@ -4035,6 +4050,7 @@ async fn spawn_node(
                     worktree_path: path.to_string_lossy().into_owned(),
                     branch,
                     item_ordinal: item.as_ref().map(|claim| claim.ordinal),
+                    loadout: run_tools.clone(),
                 },
             )
             .await
@@ -4579,6 +4595,25 @@ async fn gate_item_with(
             crate::verify::ScopeVerdict::Measured(outcome) => {
                 return record_gate(state, job, ordinal, outcome).await;
             }
+            // On the LAST item a trusted map's "no group covers this diff" is a verdict: the map
+            // was re-checked after the ticket came back, so the same bytes that answered are still
+            // the root's, and the item takes a footing like a green one. Anywhere else, and on a
+            // map that stopped being trusted meanwhile, nothing is minted.
+            crate::verify::ScopeVerdict::NothingRan if last => {
+                let tree = worktree.clone();
+                let root = PathBuf::from(&job.project_root);
+                let still_trusted =
+                    tokio::task::spawn_blocking(move || map_is_trusted(&tree, &root))
+                        .await
+                        .unwrap_or(false);
+                if !still_trusted {
+                    return pass_without_measuring(
+                        "the test map selects no group for the job's diff",
+                    )
+                    .await;
+                }
+                return pass_unmeasured_with_checkpoint(pool, job, ordinal, &worktree).await;
+            }
             crate::verify::ScopeVerdict::NothingRan => {
                 return pass_without_measuring("the test map selects no group for the job's diff")
                     .await;
@@ -4824,6 +4859,53 @@ async fn queue_the_verdict(conn: &mut sqlx::SqliteConnection, job_id: i64, ordin
     if let Err(error) = crate::distill::enqueue_item_verdict_in(conn, job_id, ordinal).await {
         tracing::warn!(job_id, ordinal, %error, "distill: could not queue an item verdict");
     }
+}
+
+/// Pass the last item whose scoped gate ran nothing over a trusted map, taking a checkpoint.
+///
+/// Unlike `gate_after_each_item` off, where no gate was even asked, here a trusted test map
+/// answered "no test covers this diff" for the whole job, and that answer is a verdict: the work
+/// is on the branch and nothing the map vouches for disagrees with it, so the tree is committed
+/// the way a green item's is and `checkpoint_sha` records it.
+///
+/// Deliberately not `record_gate(Passed)`: nothing was measured, so `gate_status` stays NULL and
+/// `route_advice` is not told a pass. The status and the checkpoint are ONE statement, for the
+/// reason `record_gate` gives (an item that reads `passed` with no checkpoint, for a moment, can
+/// revert past work that was agreed with). A checkpoint that cannot be taken warns and writes
+/// NULL; it never fails the item. It does not `queue_the_verdict` (distill) because nothing was
+/// measured, same as `pass_without_measuring`.
+async fn pass_unmeasured_with_checkpoint(
+    pool: &SqlitePool,
+    job: &JobRow,
+    ordinal: usize,
+    worktree: &Path,
+) -> Step {
+    let checkpoint_sha = match crate::worktree::checkpoint(worktree).await {
+        Ok(sha) => Some(sha),
+        Err(error) => {
+            tracing::warn!(job_id = job.id, ordinal, %error, "could not checkpoint an unmeasured last item");
+            None
+        }
+    };
+    let written = sqlx::query(
+        "UPDATE job_items SET status = 'passed', checkpoint_sha = ? WHERE job_id = ? AND ordinal = ?",
+    )
+    .bind(checkpoint_sha)
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .execute(pool)
+    .await;
+    if let Err(error) = written {
+        tracing::warn!(job_id = job.id, ordinal, %error, "could not record an unmeasured last item");
+        return Step::Stopped;
+    }
+    credit_the_briefing(pool, job, ordinal).await;
+    tracing::debug!(
+        job_id = job.id,
+        ordinal,
+        "last item not measured; checkpointed"
+    );
+    Step::Continued
 }
 
 async fn record_gate(
@@ -13790,6 +13872,262 @@ mod tests {
         }
     }
 
+    /// A team job in `repo` with its worktree recorded: the setup the loadout tests below share.
+    async fn loadout_team_job(pool: &sqlx::SqlitePool, repo: &std::path::Path) -> i64 {
+        let job_id = seed_job_in(
+            pool,
+            "project-a",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let owner = crate::worktree::Owner::Job(job_id);
+        let info = crate::worktree::create(repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::worktree::record(
+            pool,
+            owner,
+            "project-a",
+            &repo.to_string_lossy(),
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job's worktree");
+        job_id
+    }
+
+    /// One pending item of `job_id`, owned by `agent`, touching `files`.
+    async fn loadout_pending_item(
+        pool: &sqlx::SqlitePool,
+        job_id: i64,
+        ordinal: i64,
+        agent: &str,
+        files: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO job_items (job_id, ordinal, description, status, files, depends_on,
+                                    agent_id)
+             VALUES (?, ?, 'a loadout item', 'pending', ?, '[]', ?)",
+        )
+        .bind(job_id)
+        .bind(ordinal)
+        .bind(files)
+        .bind(agent)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The run the item at `ordinal` started, once the pass that claims it has been made.
+    async fn loadout_item_run(pool: &sqlx::SqlitePool, job_id: i64, ordinal: i64) -> i64 {
+        let run_id: Option<i64> =
+            sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = ? AND ordinal = ?")
+                .bind(job_id)
+                .bind(ordinal)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        run_id.expect("the item's node started, so it has a run to read")
+    }
+
+    /// The tools a run's `run_loadout` row froze, and the owners it names.
+    async fn loadout_row_of(
+        pool: &sqlx::SqlitePool,
+        run_id: i64,
+    ) -> (Option<String>, Option<String>, Vec<String>) {
+        let (agent, team, tools): (Option<String>, Option<String>, String) =
+            sqlx::query_as("SELECT agent_id, team_id, tools FROM run_loadout WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(pool)
+                .await
+                .expect("the node recorded a run_loadout row before it started");
+        let mut tools: Vec<String> = serde_json::from_str(&tools).expect("tools is a JSON array");
+        tools.sort();
+        (agent, team, tools)
+    }
+
+    /// An item's node records the loadout it was launched with, and launches with exactly that.
+    ///
+    /// Ana owns a folder ref and bob owns a file ref. Ana's node sees her folder in the prompt
+    /// and as `--add-dir`, never bob's file, and the row, the allow-list the runner was handed and
+    /// the prompt all come out of the one resolution.
+    #[tokio::test(flavor = "current_thread")]
+    async fn loadout_a_team_items_node_records_its_loadout_and_launches_with_it() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-loadout-run-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let files = tempfile::tempdir().expect("managed files root");
+        let files_root = std::fs::canonicalize(files.path()).unwrap();
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        let mut state = with_home(state, &_container);
+        state.files_root = Some(files_root.clone());
+
+        seed_agent(&pool, "ana", "migrations", "careful").await;
+        seed_crew(&pool, "crew", "ana", &[]).await;
+        seed_agent(&pool, "bob", "frontend", "bold").await;
+        seed_crew(&pool, "other-crew", "bob", &[]).await;
+
+        let ana_dir = files_root.join("ana-docs");
+        std::fs::create_dir_all(&ana_dir).unwrap();
+        std::fs::write(ana_dir.join("guide.md"), "ana's guide").unwrap();
+        let bob_file = files_root.join("bob-secrets.txt");
+        std::fs::write(&bob_file, "bob's file").unwrap();
+        for (owner, path, kind) in [("ana", &ana_dir, "dir"), ("bob", &bob_file, "file")] {
+            sqlx::query(
+                "INSERT INTO context_refs (owner_kind, owner_id, path, kind, note, created_at)
+                 VALUES ('agent', ?, ?, ?, NULL, '2026-10-09T00:00:00Z')",
+            )
+            .bind(owner)
+            .bind(path.to_string_lossy().into_owned())
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let job_id = loadout_team_job(&pool, &repo).await;
+        loadout_pending_item(&pool, job_id, 0, "ana", r#"["src/a.rs"]"#).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+        let run_id = loadout_item_run(&pool, job_id, 0).await;
+
+        // The row: the full effective set (the box's base, nothing approved), and the owners it was
+        // resolved for.
+        let mut base: Vec<String> = crate::mcp_tools::JOB_NODE_BASE
+            .iter()
+            .map(|tool| (*tool).to_owned())
+            .collect();
+        base.sort();
+        let (agent, team, tools) = loadout_row_of(&pool, run_id).await;
+        assert_eq!(agent.as_deref(), Some("ana"));
+        assert_eq!(team.as_deref(), Some("crew"));
+        assert_eq!(tools, base, "no approvals: exactly the job-node base");
+
+        // The prompt: ana's ref is in the index, bob's is nowhere.
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            prompt.contains("Context files you were given"),
+            "the index heading is missing: {prompt}"
+        );
+        assert!(
+            prompt.contains(&ana_dir.to_string_lossy().into_owned()),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("bob-secrets"), "{prompt}");
+
+        // The launch: the runner is handed the same set the row froze, and ana's folder as a
+        // directory to add. The launch happens on a task, so wait for it as `runs.rs` does.
+        let mut launch = None;
+        for _ in 0..200 {
+            if let Some(seen) = runner.last_job_mcp.lock().unwrap().clone() {
+                launch = Some(seen);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (_config, _job, allowed) = launch.expect("the runner never received an MCP launch");
+        let mut allowed = allowed.expect("a job node launches with an allow-list");
+        allowed.sort();
+        assert_eq!(allowed, base, "the launch must carry the loadout's tools");
+
+        let refs = crate::context_refs::spawn_refs(&pool, &files_root, Some("ana"), Some("crew"))
+            .await
+            .unwrap();
+        let expected_dirs = crate::context_refs::add_dirs(&refs);
+        assert_eq!(expected_dirs.len(), 1, "only ana's folder is a dir ref");
+        let dirs = runner
+            .last_add_dirs
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the launch recorded its add_dirs");
+        assert_eq!(dirs, expected_dirs);
+    }
+
+    /// An extra an owner approved reaches that agent's node and no other: two agents' items start
+    /// in one pass, and only the approved one's row lists `web_read`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn loadout_an_approved_extra_reaches_only_its_agents_node() {
+        let _lock = crate::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-loadout-extra-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, _runner) = test_state_with_runner(pool.clone()).await;
+        let state = with_home(state, &_container);
+
+        seed_agent(&pool, "ana", "migrations", "careful").await;
+        seed_agent(&pool, "bob", "frontend", "bold").await;
+        seed_crew(&pool, "crew", "ana", &["bob"]).await;
+        sqlx::query("UPDATE teams SET max_parallel = 2 WHERE id = 'crew'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Bob's `web_read` is approved. Ana's is only proposed, which must grant nothing.
+        for (agent, status) in [("bob", "active"), ("ana", "proposed")] {
+            sqlx::query(
+                "INSERT INTO loadout_tools
+                     (owner_kind, owner_id, tool, status, source, reason, run_id, created_at)
+                 VALUES ('agent', ?, 'web_read', ?, 'request', 'why', NULL,
+                         '2026-10-09T00:00:00Z')",
+            )
+            .bind(agent)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let job_id = loadout_team_job(&pool, &repo).await;
+        // Disjoint files, so one pass starts both items.
+        loadout_pending_item(&pool, job_id, 0, "ana", r#"["a.rs"]"#).await;
+        loadout_pending_item(&pool, job_id, 1, "bob", r#"["b.rs"]"#).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        advance(&state, &job, Utc::now()).await;
+        let ana_run = loadout_item_run(&pool, job_id, 0).await;
+        let bob_run = loadout_item_run(&pool, job_id, 1).await;
+
+        let (_, _, ana_tools) = loadout_row_of(&pool, ana_run).await;
+        let (_, _, bob_tools) = loadout_row_of(&pool, bob_run).await;
+        assert!(
+            !ana_tools.iter().any(|tool| tool == "web_read"),
+            "a proposed extra reached ana's node, or bob's approval did: {ana_tools:?}"
+        );
+        assert!(
+            bob_tools.iter().any(|tool| tool == "web_read"),
+            "bob's approved extra is missing from his node: {bob_tools:?}"
+        );
+        // Everything else is the base on both sides, so the extra is the only difference.
+        let without_extra: Vec<&String> = bob_tools
+            .iter()
+            .filter(|tool| *tool != "web_read")
+            .collect();
+        assert_eq!(without_extra.len(), ana_tools.len());
+        let bob_lists = crate::tool_loadout::run_lists_tool(&pool, bob_run, "web_read").await;
+        let ana_lists = crate::tool_loadout::run_lists_tool(&pool, ana_run, "web_read").await;
+        assert!(bob_lists.unwrap());
+        assert!(!ana_lists.unwrap());
+    }
+
     /// A real repository and a real worktree, because a node that cannot be provisioned would leave
     /// the item back where it started for a reason that has nothing to do with the claim — and would
     /// look exactly like the defect this pins.
@@ -15759,5 +16097,64 @@ tests:
         let said = scoped_feed(&f.pool).await;
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("full gate"), "{}", said[0]);
+    }
+
+    /// The last item's scope ran nothing over a map the project root still vouches for: "no test
+    /// covers this diff" is a verdict there, so the item is committed like a green one (status
+    /// `passed` and `checkpoint_sha` set in one write) while `gate_status` stays empty and no full
+    /// gate runs. The recorded base is moved to HEAD so the cumulative diff is empty.
+    #[tokio::test]
+    async fn gate_item_records_a_checkpoint_when_the_last_item_scope_ran_nothing() {
+        let f = scope_job_with(true, SCOPED_FINAL_RULES).await;
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&f.job.project_root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        sqlx::query("UPDATE worktrees SET base_sha = ? WHERE owner_kind = 'job' AND owner_id = ?")
+            .bind(&head)
+            .bind(f.job.id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        gate_item_with(&f.state, &f.job, 1, 2, Some(f.executor.clone())).await;
+
+        assert_eq!(
+            scope_requests(&f.pool).await,
+            vec![format!("job:{}", f.job.id)]
+        );
+        assert_eq!(full_gate_rows(&f.pool).await, 0);
+        assert_eq!(item_statuses(&f.pool, f.job.id).await[1], "passed");
+        let checkpoint: Option<String> = sqlx::query_scalar(
+            "SELECT checkpoint_sha FROM job_items WHERE job_id = ? AND ordinal = 1",
+        )
+        .bind(f.job.id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            checkpoint,
+            Some(head),
+            "a trusted nothing-ran last item checkpoints the tree"
+        );
+        let gate_status: Option<String> = sqlx::query_scalar(
+            "SELECT gate_status FROM job_items WHERE job_id = ? AND ordinal = 1",
+        )
+        .bind(f.job.id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            gate_status, None,
+            "nothing was measured, so no gate verdict is recorded"
+        );
     }
 }

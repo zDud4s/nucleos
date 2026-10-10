@@ -36,6 +36,10 @@ pub fn postgate_worktree(project_root: &Path) -> PathBuf {
 /// The feed kind of the owner-facing report of a confirmed red (spec 2026-10-05 §6.2 step 4).
 pub const POSTGATE_RED_KIND: &str = "postgate_red";
 
+/// The feed kind of a post-merge gate that did not start a full gate (F3-12): a tip whose tree a
+/// daemon verification already passed, or a start held for the interval or a busy machine.
+pub const POSTGATE_HELD_KIND: &str = "postgate_held";
+
 /// Which step of handling a red the project is in. `None` in `State::red_phase` means no red is
 /// being handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +122,11 @@ pub struct State {
     /// The correction run of `fix_branch`: `None` until one is claimed, `Some(0)` while a claim has
     /// no run yet, the run's id afterwards.
     pub fix_run_id: Option<i64>,
+    /// The newest tip proven by a daemon verification over a green-or-covered base (F3-12). It
+    /// never replaces `last_green_sha`.
+    pub covered_sha: Option<String>,
+    /// Why a gate start is being held right now (`"interval"` / `"busy"`), until a gate starts.
+    pub held_note: Option<String>,
 }
 
 impl State {
@@ -184,6 +193,8 @@ struct Row {
     revert_sha: Option<String>,
     fix_branch: Option<String>,
     fix_run_id: Option<i64>,
+    covered_sha: Option<String>,
+    held_note: Option<String>,
 }
 
 /// A JSON column that cannot be decoded reads as empty, with a warning, like `red_groups`.
@@ -250,6 +261,8 @@ impl From<Row> for State {
             revert_sha: row.revert_sha,
             fix_branch: row.fix_branch,
             fix_run_id: row.fix_run_id,
+            covered_sha: row.covered_sha,
+            held_note: row.held_note,
         }
     }
 }
@@ -261,7 +274,7 @@ pub async fn load(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<St
                 running_request_id, red_groups, red_since_sha, red_phase, red_sha, red_base_sha, \
                 probe_sha, probe_request_id, probes, reported_sha, culprit_sha, candidates, \
                 also_suspect, revert_merge_sha, revert_request_id, revert_sha, fix_branch, \
-                fix_run_id \
+                fix_run_id, covered_sha, held_note \
          FROM postgate_state WHERE project_id = ?",
     )
     .bind(project_id)
@@ -283,14 +296,16 @@ pub async fn start(
     let done = sqlx::query(
         "INSERT INTO postgate_state \
              (project_id, target, last_attempted_sha, running_sha, running_request_id, \
-              running_started_at) \
-         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
+              running_started_at, last_started_at) \
+         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
          ON CONFLICT(project_id) DO UPDATE SET \
              target = excluded.target, \
              last_attempted_sha = excluded.last_attempted_sha, \
              running_sha = excluded.running_sha, \
              running_request_id = excluded.running_request_id, \
              running_started_at = CURRENT_TIMESTAMP, \
+             last_started_at = CURRENT_TIMESTAMP, \
+             held_note = NULL, \
              updated_at = CURRENT_TIMESTAMP \
          WHERE postgate_state.running_sha IS NULL AND postgate_state.red_phase IS NULL",
     )
@@ -343,6 +358,7 @@ pub async fn finish_red(
              red_since_sha = COALESCE(red_since_sha, ?), \
              red_phase = 'flake_check', red_sha = ?, red_base_sha = last_green_sha, \
              probe_sha = NULL, probe_request_id = NULL, probes = '[]', \
+             covered_sha = NULL, \
              updated_at = CURRENT_TIMESTAMP \
          WHERE project_id = ? AND running_sha = ?",
     )
@@ -419,6 +435,107 @@ pub async fn mark_covered(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Records that `sha`, a new tip of the target, is covered by a daemon verification of its exact
+/// tree that passed over `base` (F3-12, decisions 4 and 5), and tells the feed once. `base` must be
+/// the last full green or the previous covered tip (a compare-and-set in SQL, so a stale proof
+/// covers nothing); a cover chains by induction. It never moves `last_green_sha`: a later red is
+/// bisected from the last COMPLETE green, so a wrong cover costs a longer bisection and never a
+/// lost red. Never inserts a row, and refuses (`false`, nothing written) while a gate runs, while a
+/// red is being handled, or when `sha` was already attempted or covered.
+pub async fn settle_covered(
+    pool: &SqlitePool,
+    project_id: &str,
+    target: &str,
+    sha: &str,
+    base: &str,
+    summary: &str,
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let done = sqlx::query(
+        "UPDATE postgate_state SET \
+             covered_sha = ?1, last_attempted_sha = ?1, held_note = NULL, \
+             updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ?2 AND target = ?3 \
+           AND running_sha IS NULL AND red_phase IS NULL \
+           AND (last_green_sha = ?4 OR covered_sha = ?4) \
+           AND (last_attempted_sha IS NULL OR last_attempted_sha != ?1)",
+    )
+    .bind(sha)
+    .bind(project_id)
+    .bind(target)
+    .bind(base)
+    .execute(&mut *tx)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Ok(false);
+    }
+    crate::feed::append_on(
+        &mut tx,
+        Some(project_id),
+        POSTGATE_HELD_KIND,
+        summary,
+        None,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Records that the start of a gate for `target` is being held for `reason` (`"interval"` or
+/// `"busy"`) and tells the feed: one line per reason and episode. `start` clears the note, so the
+/// next hold after a gate speaks again. Returns `true` when the reason changed (a line was written).
+pub async fn hold(
+    pool: &SqlitePool,
+    project_id: &str,
+    target: &str,
+    reason: &str,
+    summary: &str,
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let done = sqlx::query(
+        "INSERT INTO postgate_state (project_id, target, held_note) VALUES (?, ?, ?) \
+         ON CONFLICT(project_id) DO UPDATE SET \
+             held_note = excluded.held_note, \
+             updated_at = CURRENT_TIMESTAMP \
+         WHERE postgate_state.held_note IS NOT excluded.held_note",
+    )
+    .bind(project_id)
+    .bind(target)
+    .bind(reason)
+    .execute(&mut *tx)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Ok(false);
+    }
+    crate::feed::append_on(
+        &mut tx,
+        Some(project_id),
+        POSTGATE_HELD_KIND,
+        summary,
+        None,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Seconds since the latest gate of `project_id` started, or `None` when none ever did (a row
+/// written only by a hold has no start).
+pub async fn seconds_since_last_start(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar(
+        "SELECT CAST((julianday('now') - julianday(last_started_at)) * 86400 AS INTEGER) \
+         FROM postgate_state WHERE project_id = ? AND last_started_at IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// The recheck on `red_sha` passed: the red was not the target's, so `red_sha` counts as green and
@@ -1217,6 +1334,8 @@ mod tests {
             revert_sha: None,
             fix_branch: None,
             fix_run_id: None,
+            covered_sha: None,
+            held_note: None,
         };
         assert_eq!(
             state.already_failing("core").as_deref(),
@@ -1237,5 +1356,249 @@ mod tests {
 
         assert_eq!(RedPhase::FlakeCheck.as_str(), "flake_check");
         assert_eq!(RedPhase::Bisect.as_str(), "bisect");
+    }
+
+    /// F3-12: how many `postgate_held` lines the feed holds.
+    async fn held_lines(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'postgate_held'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cover_is_recorded_only_on_a_green_or_covered_base_and_never_moves_the_green() {
+        let pool = crate::testdb::fresh_pool().await;
+        mark_covered(&pool, "p", "main", "g").await.unwrap();
+
+        // A base that is neither the last green nor the covered sha covers nothing.
+        assert!(
+            !settle_covered(&pool, "p", "main", "c1", "x", "no")
+                .await
+                .unwrap()
+        );
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.covered_sha, None);
+        assert_eq!(
+            s.last_attempted_sha, None,
+            "a refused cover attempts nothing"
+        );
+
+        // On the last green it does, and the green stays where it was.
+        assert!(
+            settle_covered(&pool, "p", "main", "c1", "g", "covered c1")
+                .await
+                .unwrap()
+        );
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.covered_sha.as_deref(), Some("c1"));
+        assert_eq!(s.last_green_sha.as_deref(), Some("g"));
+        assert_eq!(s.last_attempted_sha.as_deref(), Some("c1"));
+
+        // A chain: the next cover sits on the previous covered sha, the green still stays.
+        assert!(
+            settle_covered(&pool, "p", "main", "c2", "c1", "covered c2")
+                .await
+                .unwrap()
+        );
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.covered_sha.as_deref(), Some("c2"));
+        assert_eq!(s.last_green_sha.as_deref(), Some("g"));
+
+        // Only the most recent covered sha chains: c1 is no longer a base, the green is.
+        assert!(
+            !settle_covered(&pool, "p", "main", "c3", "c1", "covered c3")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            load(&pool, "p")
+                .await
+                .unwrap()
+                .unwrap()
+                .covered_sha
+                .as_deref(),
+            Some("c2")
+        );
+
+        // It never inserts a row for a project the gate has not seen.
+        assert!(
+            !settle_covered(&pool, "other", "main", "c1", "g", "no")
+                .await
+                .unwrap()
+        );
+        assert_eq!(load(&pool, "other").await.unwrap(), None);
+
+        // And never while a gate is running.
+        assert!(start(&pool, "p", "main", "r1", Some(1)).await.unwrap());
+        assert!(
+            !settle_covered(&pool, "p", "main", "c4", "g", "no")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            load(&pool, "p")
+                .await
+                .unwrap()
+                .unwrap()
+                .covered_sha
+                .as_deref(),
+            Some("c2")
+        );
+    }
+
+    #[tokio::test]
+    async fn settling_a_covered_tip_tells_the_feed_once() {
+        let pool = crate::testdb::fresh_pool().await;
+        mark_covered(&pool, "p", "main", "g").await.unwrap();
+        assert_eq!(held_lines(&pool).await, 0);
+
+        assert!(
+            settle_covered(&pool, "p", "main", "c1", "g", "tip c1 was not gated")
+                .await
+                .unwrap()
+        );
+        assert_eq!(held_lines(&pool).await, 1);
+        let lines = feed_lines(&pool).await;
+        assert_eq!(
+            lines,
+            vec![(
+                Some("p".to_owned()),
+                POSTGATE_HELD_KIND.to_owned(),
+                "tip c1 was not gated".to_owned()
+            )]
+        );
+
+        // The same tip again changes nothing and writes nothing.
+        assert!(
+            !settle_covered(&pool, "p", "main", "c1", "g", "tip c1 was not gated")
+                .await
+                .unwrap()
+        );
+        assert_eq!(held_lines(&pool).await, 1);
+        assert_eq!(POSTGATE_HELD_KIND, "postgate_held");
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_red_forgets_the_covered_sha() {
+        let pool = crate::testdb::fresh_pool().await;
+        mark_covered(&pool, "p", "main", "g").await.unwrap();
+        assert!(
+            settle_covered(&pool, "p", "main", "c1", "g", "covered c1")
+                .await
+                .unwrap()
+        );
+        assert!(start(&pool, "p", "main", "r1", Some(1)).await.unwrap());
+        // The cover survives the start of a gate; only a confirmed red drops it.
+        assert_eq!(
+            load(&pool, "p")
+                .await
+                .unwrap()
+                .unwrap()
+                .covered_sha
+                .as_deref(),
+            Some("c1")
+        );
+
+        assert!(
+            finish_red(&pool, "p", "r1", &["gate_command".to_owned()])
+                .await
+                .unwrap()
+        );
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.covered_sha, None);
+        assert_eq!(s.last_green_sha.as_deref(), Some("g"));
+        assert_eq!(s.red_base_sha.as_deref(), Some("g"));
+    }
+
+    #[tokio::test]
+    async fn a_hold_writes_one_feed_line_per_reason_until_a_gate_starts() {
+        let pool = crate::testdb::fresh_pool().await;
+
+        assert!(
+            hold(&pool, "p", "main", "interval", "waiting for the interval")
+                .await
+                .unwrap()
+        );
+        assert_eq!(held_lines(&pool).await, 1);
+        assert_eq!(
+            load(&pool, "p")
+                .await
+                .unwrap()
+                .unwrap()
+                .held_note
+                .as_deref(),
+            Some("interval")
+        );
+
+        // The same reason again is the same episode: no new line.
+        assert!(
+            !hold(&pool, "p", "main", "interval", "waiting for the interval")
+                .await
+                .unwrap()
+        );
+        assert_eq!(held_lines(&pool).await, 1);
+
+        // A different reason is news.
+        assert!(
+            hold(&pool, "p", "main", "busy", "waiting for an idle machine")
+                .await
+                .unwrap()
+        );
+        assert_eq!(held_lines(&pool).await, 2);
+        assert!(
+            !hold(&pool, "p", "main", "busy", "waiting for an idle machine")
+                .await
+                .unwrap()
+        );
+        assert_eq!(held_lines(&pool).await, 2);
+
+        // A gate starting ends the episode: the note is cleared, and a later hold speaks again.
+        assert!(start(&pool, "p", "main", "a1", None).await.unwrap());
+        assert_eq!(load(&pool, "p").await.unwrap().unwrap().held_note, None);
+        assert!(finish_green(&pool, "p", "a1").await.unwrap());
+        assert!(
+            hold(&pool, "p", "main", "busy", "waiting for an idle machine")
+                .await
+                .unwrap()
+        );
+        assert_eq!(held_lines(&pool).await, 3);
+    }
+
+    #[tokio::test]
+    async fn start_records_when_the_last_gate_started() {
+        let pool = crate::testdb::fresh_pool().await;
+        // No row, and a row written by a hold alone, both have no start to measure from.
+        assert_eq!(seconds_since_last_start(&pool, "p").await.unwrap(), None);
+        hold(&pool, "p", "main", "interval", "waiting")
+            .await
+            .unwrap();
+        assert_eq!(seconds_since_last_start(&pool, "p").await.unwrap(), None);
+
+        assert!(start(&pool, "p", "main", "a1", None).await.unwrap());
+        let fresh = seconds_since_last_start(&pool, "p")
+            .await
+            .unwrap()
+            .expect("a start records its time");
+        assert!((0..30).contains(&fresh), "just started, got {fresh}s");
+
+        sqlx::query(
+            "UPDATE postgate_state SET last_started_at = datetime('now','-2 hours') \
+             WHERE project_id = 'p'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let aged = seconds_since_last_start(&pool, "p")
+            .await
+            .unwrap()
+            .expect("an aged start still reads");
+        assert!((7190..7300).contains(&aged), "two hours ago, got {aged}s");
+
+        // Another project's start is not this one's.
+        assert_eq!(
+            seconds_since_last_start(&pool, "other").await.unwrap(),
+            None
+        );
     }
 }

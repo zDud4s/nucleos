@@ -455,3 +455,161 @@ func TestAnOpenAfterBeginPersonIsRefusedBeforeItNavigates(t *testing.T) {
 		t.Errorf("Page.navigate was called %d times after BeginPerson, want none: %v", got-before, fake.Methods())
 	}
 }
+
+// switchLog records every call to the person switch together with how many CDP calls the fake had
+// seen at that moment, so a test can say where in the sequence the switch moved.
+type switchLog struct {
+	mu      sync.Mutex
+	fake    *cdptest.Browser
+	changes []bool
+	at      []int
+}
+
+func (l *switchLog) record(on bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.changes = append(l.changes, on)
+	l.at = append(l.at, len(l.fake.Methods()))
+}
+
+func (l *switchLog) snapshot() ([]bool, []int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.changes), slices.Clone(l.at)
+}
+
+// visiblePersonDriver is a connected driver in the visible (panel) shape, its person switch recorded.
+func visiblePersonDriver(t *testing.T) (*cdptest.Browser, *Driver, *switchLog) {
+	t.Helper()
+	fake, driver := personDriver(t)
+	log := &switchLog{fake: fake}
+	driver.MakeVisible(log.record)
+	return fake, driver, log
+}
+
+// TestPanelBeginPersonDoesNotReloadOrInterceptTheFileChooser. In a visible window the person sees the
+// native file dialog and the page they were looking at is theirs as it stands: both the interception
+// and the reload belong to the shell-seat path only.
+func TestPanelBeginPersonDoesNotReloadOrInterceptTheFileChooser(t *testing.T) {
+	fake, driver, _ := visiblePersonDriver(t)
+	id := opened(t, driver).ID
+
+	beginPerson(t, driver, id)
+
+	if got := countCalls(fake, "Page.reload"); got != 0 {
+		t.Errorf("a panel BeginPerson reloaded %d page(s): %v", got, fake.Methods())
+	}
+	if got := countCalls(fake, "Page.setInterceptFileChooserDialog"); got != 0 {
+		t.Errorf("a panel BeginPerson intercepted the file chooser %d time(s): %v", got, fake.Methods())
+	}
+}
+
+// TestPanelPersonSwitchIsOnOnlyBetweenBeginAndTheStartOfEndPerson. The switch comes on last, once
+// BeginPerson has succeeded, and goes off in the same step the person state is cleared: before a
+// single reload or the service-worker sweep, so the fence is back for everything those fetch.
+func TestPanelPersonSwitchIsOnOnlyBetweenBeginAndTheStartOfEndPerson(t *testing.T) {
+	fake, driver, log := visiblePersonDriver(t)
+	id := opened(t, driver).ID
+	if changes, _ := log.snapshot(); len(changes) != 0 {
+		t.Fatalf("the switch moved before any person arrived: %v", changes)
+	}
+
+	beginPerson(t, driver, id)
+	afterBegin := len(fake.Methods())
+	changes, at := log.snapshot()
+	if len(changes) != 1 || !changes[0] {
+		t.Fatalf("after BeginPerson the switch changes are %v, want exactly [true]", changes)
+	}
+	if at[0] != afterBegin {
+		t.Errorf("the switch came on after %d calls but BeginPerson made %d: it was not the last step", at[0], afterBegin)
+	}
+
+	endPerson(t, driver, id)
+	changes, at = log.snapshot()
+	if len(changes) != 2 || changes[1] {
+		t.Fatalf("after EndPerson the switch changes are %v, want [true false]", changes)
+	}
+	reloads := callsTo(fake, "Page.reload")
+	if len(reloads) == 0 {
+		t.Fatalf("EndPerson reloaded nothing: %v", fake.Methods())
+	}
+	firstReload := slices.Index(fake.Methods(), "Page.reload")
+	if at[1] > firstReload {
+		t.Errorf("the switch went off after %d calls, after the first reload at %d: the reloads ran unfenced", at[1], firstReload)
+	}
+	if at[1] < afterBegin {
+		t.Errorf("the switch went off at %d, before BeginPerson even finished at %d", at[1], afterBegin)
+	}
+}
+
+// TestPanelBeginPersonThatFailsLeavesTheSwitchOff. A refused BeginPerson (here a second session) must
+// not have lifted anything, for a fence lifted by a call that reported failure is lifted for nobody.
+func TestPanelBeginPersonThatFailsLeavesTheSwitchOff(t *testing.T) {
+	_, driver, log := visiblePersonDriver(t)
+	first := opened(t, driver).ID
+	opened(t, driver)
+
+	if err := driver.BeginPerson(context.Background(), first); !errors.Is(err, browser.ErrNotSoleSession) {
+		t.Fatalf("got %v, want ErrNotSoleSession", err)
+	}
+	if err := driver.BeginPerson(context.Background(), browser.SessionID("nobody")); !errors.Is(err, browser.ErrNoSuchSession) {
+		t.Fatalf("got %v, want ErrNoSuchSession", err)
+	}
+
+	if changes, _ := log.snapshot(); len(changes) != 0 {
+		t.Errorf("a failed BeginPerson moved the person switch: %v", changes)
+	}
+}
+
+// TestVisiblePersonModePopupIsResumedAndClosedByEndPerson. A popup the person's own click opened in a
+// visible window is let through and resumed; EndPerson closes it before the reloads and the sweep.
+func TestVisiblePersonModePopupIsResumedAndClosedByEndPerson(t *testing.T) {
+	fake, driver, _ := visiblePersonDriver(t)
+	id := opened(t, driver).ID
+	beginPerson(t, driver, id)
+
+	fake.Emit(string(cdpOf(driver, id)), "Target.attachedToTarget", map[string]any{
+		"sessionId": "SPOP",
+		"targetInfo": map[string]any{
+			"targetId": "TPOP",
+			"type":     "page",
+			"openerId": "T2",
+			"url":      "",
+		},
+		"waitingForDebugger": true,
+	})
+
+	deadline := time.Now().Add(3 * time.Second)
+	resumed := false
+	for time.Now().Before(deadline) && !resumed {
+		for _, call := range callsTo(fake, "Runtime.runIfWaitingForDebugger") {
+			if call.Session == "SPOP" {
+				resumed = true
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !resumed {
+		t.Fatalf("the person's popup was never resumed: %v", fake.Methods())
+	}
+	for _, call := range fake.Calls() {
+		if call.Method == "Target.closeTarget" && paramsMap(t, call)["targetId"] == "TPOP" {
+			t.Fatalf("the person's popup was closed while the person still drives: %v", fake.Methods())
+		}
+	}
+
+	endPerson(t, driver, id)
+
+	var closedAt = -1
+	for i, call := range fake.Calls() {
+		if call.Method == "Target.closeTarget" && paramsMap(t, call)["targetId"] == "TPOP" {
+			closedAt = i
+		}
+	}
+	if closedAt < 0 {
+		t.Fatalf("EndPerson never closed the popup: %v", fake.Methods())
+	}
+	if firstReload := slices.Index(fake.Methods(), "Page.reload"); firstReload >= 0 && closedAt > firstReload {
+		t.Errorf("the popup was closed at %d, after the first reload at %d", closedAt, firstReload)
+	}
+}

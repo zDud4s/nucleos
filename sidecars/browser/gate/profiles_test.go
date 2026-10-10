@@ -52,6 +52,12 @@ func (l localLauncher) LaunchHuman(ctx context.Context, dir string) (pool.Instan
 	return l.inner.LaunchHuman(ctx, dir)
 }
 
+// LaunchVisible is the fenced launch with a window, so it gets the same loopback amendment as Launch.
+func (l localLauncher) LaunchVisible(ctx context.Context, dir string, policy fence.Policy) (pool.Instance, error) {
+	policy.Loopback = []string{l.site.origin()}
+	return l.inner.LaunchVisible(ctx, dir, policy)
+}
+
 func pooled(t *testing.T, s *site) (*pool.Pool, profile.Store) {
 	t.Helper()
 	store := profile.Store{Root: filepath.Join(t.TempDir(), "profiles")}

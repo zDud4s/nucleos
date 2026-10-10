@@ -457,6 +457,7 @@ pub async fn ask_once(
         resume_session_id: None,
         mcp_config: None,
         mcp_job: None,
+        mcp_team_run: None,
         // The box that server would announce, and there is no server. Beside its pair for the
         // same reason `allowed_mcp_tools` below carries the sentence it does: this is only ever
         // read next to an `mcp_config`.

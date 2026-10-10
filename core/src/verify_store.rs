@@ -152,6 +152,52 @@ pub(crate) async fn get_request(pool: &SqlitePool, id: i64) -> sqlx::Result<Opti
     }))
 }
 
+/// Records the tree a request measured. Write-once: a request that already holds one keeps it,
+/// and the caller learns that by `false`.
+pub(crate) async fn set_measured_tree(
+    pool: &SqlitePool,
+    id: i64,
+    tree: &str,
+) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE verify_requests SET measured_tree = ? WHERE id = ? AND measured_tree IS NULL",
+    )
+    .bind(tree)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The tree request `id` recorded, or `None` when it never did (or the request does not exist).
+/// Only tests read it back one request at a time; production asks `requests_measuring` by tree.
+#[cfg(test)]
+pub(crate) async fn measured_tree(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<String>> {
+    let tree: Option<Option<String>> =
+        sqlx::query_scalar("SELECT measured_tree FROM verify_requests WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(tree.flatten())
+}
+
+/// The `test`/`scope` requests of `project_id` that recorded exactly `tree`, newest first, with the
+/// base each diffed from. Capped, because only the newest passed one is ever wanted.
+pub(crate) async fn requests_measuring(
+    pool: &SqlitePool,
+    project_id: &str,
+    tree: &str,
+) -> sqlx::Result<Vec<(i64, String)>> {
+    sqlx::query_as(
+        "SELECT id, base FROM verify_requests WHERE project_id = ? AND measured_tree = ? \
+         AND kind = 'test' AND scope = 'scope' AND base IS NOT NULL ORDER BY id DESC LIMIT 20",
+    )
+    .bind(project_id)
+    .bind(tree)
+    .fetch_all(pool)
+    .await
+}
+
 pub(crate) async fn cache_lookup(
     pool: &SqlitePool,
     key: &CacheKey<'_>,

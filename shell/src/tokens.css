@@ -252,8 +252,8 @@
 
     --border: #dcdfe6;
     --border-strong: #b4bbc7;
-    /* 3.3:1 on --surface. */
-    --border-field: #868f9d;
+    /* 3.3:1 on --surface, and >=3:1 on --surface-sunken (#eceef3), where a field sits. */
+    --border-field: #7a8391;
 
     --text: #12151b;
     --text-muted: #545d6c;

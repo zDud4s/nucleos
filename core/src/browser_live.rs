@@ -91,7 +91,7 @@ impl RecordReader {
         records
     }
 
-    fn is_broken(&self) -> bool {
+    pub(crate) fn is_broken(&self) -> bool {
         self.broken
     }
 }

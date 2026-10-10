@@ -470,6 +470,22 @@ pub fn build_router(state: AppState) -> Router {
                 .put(crate::team::update_team)
                 .delete(crate::team::delete_team),
         )
+        // Owner-only: in no scope table.
+        // `read_context` is the run-side door onto the same refs: it sits in no scope table either
+        // and is gated per run by `auth::LOADOUT_ROUTES` (the run's `run_loadout` must list it).
+        .route(
+            "/context/read",
+            post(crate::context_refs::post_read_context),
+        )
+        .route(
+            "/context-refs/{owner_kind}/{owner_id}",
+            get(crate::context_refs::list_refs).post(crate::context_refs::create_ref),
+        )
+        .route(
+            "/context-refs/{owner_kind}/{owner_id}/{id}",
+            axum::routing::put(crate::context_refs::update_ref_note)
+                .delete(crate::context_refs::delete_ref),
+        )
         .route("/teams/{id}/runs", post(crate::team::post_team_run))
         .route("/team-runs", get(crate::team::list_team_runs))
         .route(
@@ -574,6 +590,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/knowledge/findings", post(post_finding))
         .route("/knowledge/{id}", get(get_knowledge))
         .route("/knowledge/{id}/revert", post(revert_knowledge))
+        // The owner routes below are Control-only and in no `auth.rs` table. The request route is
+        // the run's own door and is gated by its frozen loadout in `auth::LOADOUT_ROUTES`.
+        .route("/loadout/tool-requests", post(post_tool_request))
+        .route("/loadout/tools", get(list_loadout_tools))
+        .route("/loadout/tools/{id}/approve", post(approve_loadout_tool))
+        .route("/loadout/tools/{id}/reject", post(reject_loadout_tool))
+        .route("/loadout/tools/{id}/revoke", post(revoke_loadout_tool))
+        // Read-only: resolves what an agent would receive and records nothing. Owner-only too.
+        .route("/loadout/preview", post(preview_loadout))
         // Where each distilled row came from. In no `auth.rs` table on purpose: Control and Admin
         // only, like `/knowledge` above.
         .route(
@@ -10504,6 +10529,380 @@ async fn delete_agent(
             tracing::warn!(agent_id = %id, %error, "deleting agent failed");
             agent_status(&error)
         })
+}
+
+#[derive(Deserialize)]
+struct ToolRequestBody {
+    tool: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// `POST /loadout/tool-requests`: a run asks for one more tool. The run is the key's own, or the
+/// node named by `RUN_ID_HEADER` for a team key; `auth::loadout_admits` already checked it.
+async fn post_tool_request(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ToolRequestBody>,
+) -> axum::response::Response {
+    let run_id = match scope {
+        Scope::Run(id) => Some(id),
+        _ => headers
+            .get(crate::daemon_client::RUN_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<i64>().ok()),
+    };
+    let Some(run_id) = run_id else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match crate::tool_loadout::request(&state.pool, run_id, &body.tool, &body.reason).await {
+        Ok(requested) => {
+            let status = if requested.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "id": requested.id,
+                    "status": requested.status,
+                    "created": requested.created,
+                })),
+            )
+                .into_response()
+        }
+        Err(crate::tool_loadout::RequestError::Db(error)) => {
+            tracing::warn!(run_id, %error, "recording a tool request failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct LoadoutToolsQuery {
+    owner_kind: Option<String>,
+    owner_id: Option<String>,
+    status: Option<String>,
+}
+
+async fn list_loadout_tools(
+    State(state): State<AppState>,
+    Query(query): Query<LoadoutToolsQuery>,
+) -> Result<Json<Vec<crate::tool_loadout::ToolRow>>, StatusCode> {
+    crate::tool_loadout::list(
+        &state.pool,
+        query.owner_kind.as_deref(),
+        query.owner_id.as_deref(),
+        query.status.as_deref(),
+    )
+    .await
+    .map(Json)
+    .map_err(|error| {
+        tracing::warn!(%error, "listing loadout tools failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct ApproveLoadoutBody {
+    owner: Option<String>,
+    team_id: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct LoadoutNoteBody {
+    note: Option<String>,
+}
+
+/// An empty body is the same as `{}`; anything else must parse.
+fn optional_json_body<T: serde::de::DeserializeOwned + Default>(
+    bytes: &axum::body::Bytes,
+) -> Result<T, StatusCode> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(bytes).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn decision_response(
+    result: Result<crate::tool_loadout::ToolRow, crate::tool_loadout::DecisionError>,
+) -> axum::response::Response {
+    use crate::tool_loadout::DecisionError;
+    match result {
+        Ok(row) => Json(row).into_response(),
+        Err(DecisionError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(DecisionError::WrongState) => StatusCode::CONFLICT.into_response(),
+        Err(DecisionError::UnknownTeam) => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        Err(DecisionError::Db(error)) => {
+            tracing::warn!(%error, "deciding a loadout tool failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn approve_loadout_tool(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let body: ApproveLoadoutBody = match optional_json_body(&body) {
+        Ok(body) => body,
+        Err(status) => return status.into_response(),
+    };
+    let target = match (body.owner.as_deref(), body.team_id) {
+        (None | Some("agent"), _) => crate::tool_loadout::Target::Agent,
+        (Some("team"), Some(team)) if !team.is_empty() => crate::tool_loadout::Target::Team(team),
+        _ => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    };
+    decision_response(crate::tool_loadout::approve(&state.pool, id, target).await)
+}
+
+async fn reject_loadout_tool(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let body: LoadoutNoteBody = match optional_json_body(&body) {
+        Ok(body) => body,
+        Err(status) => return status.into_response(),
+    };
+    decision_response(crate::tool_loadout::reject(&state.pool, id, body.note.as_deref()).await)
+}
+
+async fn revoke_loadout_tool(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let body: LoadoutNoteBody = match optional_json_body(&body) {
+        Ok(body) => body,
+        Err(status) => return status.into_response(),
+    };
+    decision_response(crate::tool_loadout::revoke(&state.pool, id, body.note.as_deref()).await)
+}
+
+/// The box a preview resolves in: the same lists and policy the spawn site of that box hands over.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PreviewBox {
+    Team,
+    JobNode,
+}
+
+#[derive(Deserialize)]
+struct PreviewLoadoutBody {
+    agent_id: String,
+    #[serde(rename = "box")]
+    equipment_box: PreviewBox,
+    team_id: Option<String>,
+    project_id: Option<String>,
+    #[serde(default)]
+    task: String,
+}
+
+#[derive(Serialize)]
+struct PreviewTool {
+    name: String,
+    /// `base` (the box serves it to every run), `agent` or `team` (an approval of that owner).
+    origin: &'static str,
+}
+
+#[derive(Serialize)]
+struct PreviewRef {
+    owner_kind: &'static str,
+    path: String,
+    kind: String,
+    note: Option<String>,
+    /// `active`, `missing` (listed, marked "(em falta)") or `refused` (left out of the index).
+    state: &'static str,
+}
+
+#[derive(Serialize)]
+struct PreviewLoadout {
+    agent_id: String,
+    team_id: Option<String>,
+    #[serde(rename = "box")]
+    equipment_box: &'static str,
+    /// The memory half only: the brief's block, `None` when nothing was selected or readable.
+    memory: Option<String>,
+    /// Exactly what would be appended to the prompt: memory plus the context index.
+    block: String,
+    tools: Vec<PreviewTool>,
+    refs: Vec<PreviewRef>,
+    add_dirs: Vec<String>,
+}
+
+/// The tools one owner holds an active approval for; no owner holds none.
+async fn active_tools_of(
+    pool: &sqlx::SqlitePool,
+    owner_kind: &str,
+    owner_id: Option<&str>,
+) -> sqlx::Result<Vec<String>> {
+    let Some(owner_id) = owner_id else {
+        return Ok(Vec::new());
+    };
+    let rows =
+        crate::tool_loadout::list(pool, Some(owner_kind), Some(owner_id), Some("active")).await?;
+    Ok(rows.into_iter().map(|row| row.tool).collect())
+}
+
+/// `POST /loadout/preview`: what an agent would receive at spawn in the named box, for a sample
+/// task. It goes through `loadout::resolve` like every spawn site and never calls `record`, so it
+/// writes no `run_loadout` row.
+async fn preview_loadout(
+    State(state): State<AppState>,
+    Json(body): Json<PreviewLoadoutBody>,
+) -> axum::response::Response {
+    let internal = |error: sqlx::Error| {
+        tracing::warn!(%error, "previewing a loadout failed");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    };
+    let tool_policy =
+        match sqlx::query_scalar::<_, String>("SELECT tool_policy FROM agents WHERE id = ?")
+            .bind(&body.agent_id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(Some(policy)) => policy,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(error) => return internal(error),
+        };
+    let team = body.team_id.as_deref().filter(|team| !team.is_empty());
+    if let Some(team) = team {
+        match sqlx::query_scalar::<_, i64>("SELECT 1 FROM teams WHERE id = ?")
+            .bind(team)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+            Err(error) => return internal(error),
+        }
+    }
+
+    // The same equipment `team.rs` and `job.rs` hand the resolver for these boxes.
+    let (equipment, node, label) = match body.equipment_box {
+        PreviewBox::Team => (
+            crate::loadout::Equipment {
+                tool_policy: if tool_policy == "mcp_only" {
+                    "mcp_only"
+                } else {
+                    "none"
+                },
+                base: crate::mcp_tools::TEAM_BASE,
+                extras: crate::mcp_tools::TEAM_EXTRAS,
+                managed_root: state.files_root.as_deref(),
+                has_cwd: false,
+            },
+            None,
+            "team",
+        ),
+        PreviewBox::JobNode => (
+            crate::loadout::Equipment {
+                tool_policy: "mcp_only",
+                base: crate::mcp_tools::JOB_NODE_BASE,
+                extras: crate::mcp_tools::JOB_NODE_EXTRAS,
+                managed_root: state.files_root.as_deref(),
+                has_cwd: true,
+            },
+            // An agent's job item runs as an implement node.
+            crate::loadout::node_kind("implement"),
+            "job_node",
+        ),
+    };
+    let base = equipment.base;
+    let loadout = crate::loadout::resolve(
+        &state.pool,
+        &crate::loadout::LoadoutInput {
+            agent: Some(&body.agent_id),
+            team,
+            project: body
+                .project_id
+                .as_deref()
+                .filter(|project| !project.is_empty()),
+            job: None,
+            task_text: &body.task,
+            node,
+            files: &[],
+            equipment: Some(equipment),
+        },
+    )
+    .await;
+    let run = loadout.run.unwrap_or_default();
+
+    // Where each extra came from: an active approval of the agent first, then of the team.
+    let by_agent = match active_tools_of(&state.pool, "agent", run.agent.as_deref()).await {
+        Ok(tools) => tools,
+        Err(error) => return internal(error),
+    };
+    let by_team = match active_tools_of(&state.pool, "team", run.team.as_deref()).await {
+        Ok(tools) => tools,
+        Err(error) => return internal(error),
+    };
+    let tools = run
+        .tools
+        .iter()
+        .map(|name| PreviewTool {
+            name: name.clone(),
+            origin: if base.contains(&name.as_str()) {
+                "base"
+            } else if by_team.contains(name) && !by_agent.contains(name) {
+                "team"
+            } else {
+                "agent"
+            },
+        })
+        .collect();
+
+    // The refs as the resolver saw them: it offers them only to a run that holds `read_context`.
+    let mut refs = Vec::new();
+    if let Some(root) = state.files_root.as_deref()
+        && run.tools.iter().any(|tool| tool == "read_context")
+    {
+        let spawned = match crate::context_refs::spawn_refs(
+            &state.pool,
+            root,
+            run.agent.as_deref(),
+            run.team.as_deref(),
+        )
+        .await
+        {
+            Ok(spawned) => spawned,
+            Err(error) => return internal(error),
+        };
+        for spawned_ref in spawned {
+            refs.push(PreviewRef {
+                owner_kind: spawned_ref.owner_kind.as_str(),
+                path: spawned_ref.path,
+                kind: spawned_ref.kind,
+                note: spawned_ref.note,
+                state: match spawned_ref.state {
+                    crate::context_refs::SpawnState::Active => "active",
+                    crate::context_refs::SpawnState::Missing => "missing",
+                    crate::context_refs::SpawnState::Refused => "refused",
+                },
+            });
+        }
+    }
+
+    Json(PreviewLoadout {
+        agent_id: body.agent_id,
+        team_id: run.team,
+        equipment_box: label,
+        memory: loadout.brief.and_then(|brief| brief.block),
+        block: loadout.block,
+        tools,
+        refs,
+        add_dirs: run
+            .add_dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect(),
+    })
+    .into_response()
 }
 
 fn preset_status(error: &presets::PresetError) -> StatusCode {
@@ -39584,6 +39983,505 @@ mod tests {
         }
         let (_, body) = call(state, "GET", "/config/capture-wait", None).await;
         assert_eq!(body["minutes"], 30);
+    }
+
+    async fn loadout_seed_agent_and_team(pool: &sqlx::SqlitePool) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO agents
+                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
+             VALUES ('scout', 'Scout', 'reads', 'p', 'claude', NULL, 'mcp_only',
+                     '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT OR IGNORE INTO teams
+                 (id, name, mission, director_agent_id, max_rounds, max_parallel, budget_usd,
+                  created_at, updated_at)
+             VALUES ('crew', 'Crew', 'ship it', 'scout', 3, 2, NULL,
+                     '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn loadout_request_tool_over_http_files_a_row_for_the_runs_agent() {
+        let state = test_state().await;
+        loadout_seed_agent_and_team(&state.pool).await;
+        let job_id = add_job(&state.pool, "loadout-project").await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, job_id, created_at)
+             VALUES ('x', 'running', 'worktree', ?, '2026-10-08T00:00:00Z')",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let (key, secret) = crate::auth::mint_run_token(run_id);
+        sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
+            .bind(&secret)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO run_loadout (run_id, agent_id, team_id, tools, resolved_at)
+             VALUES (?, 'scout', NULL, ?, '2026-10-08T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(r#"["request_tool"]"#)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let post = |body: serde_json::Value| {
+            let state = state.clone();
+            let key = key.clone();
+            async move {
+                let response = build_router(state)
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/loadout/tool-requests")
+                            .header("Authorization", format!("Bearer {key}"))
+                            .header("Content-Type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                response.status()
+            }
+        };
+
+        assert_eq!(
+            post(serde_json::json!({ "tool": "web_read", "reason": "need docs" })).await,
+            StatusCode::CREATED
+        );
+        let rows = crate::tool_loadout::list(&state.pool, Some("agent"), Some("scout"), None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "web_read");
+        assert_eq!(rows[0].status, "proposed");
+
+        assert_eq!(
+            post(serde_json::json!({ "tool": "Bash", "reason": "x" })).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// `POST /context/read` hands a run one file its agent carries a ref to, and nothing else:
+    /// a sibling that is no ref is refused (422), and a run whose `run_loadout` row does not list
+    /// `read_context` never reaches the handler (403).
+    #[tokio::test]
+    async fn loadout_read_context_over_http_reads_a_ref_and_refuses_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let carried = root.join("carried.txt");
+        let sibling = root.join("sibling.txt");
+        std::fs::write(&carried, "the carried text").unwrap();
+        std::fs::write(&sibling, "not given to anyone").unwrap();
+
+        let state = with_files_root(test_state().await, root.clone());
+        loadout_seed_agent_and_team(&state.pool).await;
+        sqlx::query(
+            "INSERT INTO context_refs (owner_kind, owner_id, path, kind, note, created_at)
+             VALUES ('agent', 'scout', ?, 'file', NULL, '2026-10-08T00:00:00Z')",
+        )
+        .bind(carried.to_str().unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let job_id = add_job(&state.pool, "loadout-project").await;
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            let run_id = sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, job_id, created_at)
+                 VALUES ('x', 'running', 'worktree', ?, '2026-10-08T00:00:00Z')",
+            )
+            .bind(job_id)
+            .execute(&state.pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            let (key, secret) = crate::auth::mint_run_token(run_id);
+            sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
+                .bind(&secret)
+                .bind(run_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            keys.push((run_id, key));
+        }
+        // Only the first run lists the tool; the second has no row at all.
+        sqlx::query(
+            "INSERT INTO run_loadout (run_id, agent_id, team_id, tools, resolved_at)
+             VALUES (?, 'scout', NULL, ?, '2026-10-08T00:00:00Z')",
+        )
+        .bind(keys[0].0)
+        .bind(r#"["read_context"]"#)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let post = |key: String, path: String| {
+            let state = state.clone();
+            async move {
+                let response = build_router(state)
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/context/read")
+                            .header("Authorization", format!("Bearer {key}"))
+                            .header("Content-Type", "application/json")
+                            .body(Body::from(serde_json::json!({ "path": path }).to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+                )
+            }
+        };
+
+        let (status, body) = post(keys[0].1.clone(), carried.to_str().unwrap().to_owned()).await;
+        assert_eq!(status, StatusCode::OK, "a ref the run was given: {body}");
+        assert_eq!(body["content"], "the carried text");
+
+        let (status, body) = post(keys[0].1.clone(), sibling.to_str().unwrap().to_owned()).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a sibling that is no ref: {body}"
+        );
+        assert!(
+            !body.to_string().contains("not given to anyone"),
+            "a refusal must not carry the file: {body}"
+        );
+
+        let (status, _) = post(keys[1].1.clone(), carried.to_str().unwrap().to_owned()).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a run with no row listing the tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn loadout_owner_endpoints_list_approve_reject_revoke() {
+        let state = test_state().await;
+        loadout_seed_agent_and_team(&state.pool).await;
+        for (tool, status) in [
+            ("web_read", "proposed"),
+            ("web_search", "proposed"),
+            ("email_queue", "proposed"),
+            ("team_note", "active"),
+            ("team_report", "proposed"),
+            ("team_action", "proposed"),
+        ] {
+            sqlx::query(
+                "INSERT INTO loadout_tools
+                     (owner_kind, owner_id, tool, status, source, reason, run_id, created_at)
+                 VALUES ('agent', 'scout', ?, ?, 'request', 'why', NULL, '2026-10-08T00:00:00Z')",
+            )
+            .bind(tool)
+            .bind(status)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let id_of = |tool: &'static str| {
+            let pool = state.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT id FROM loadout_tools WHERE tool = ?")
+                    .bind(tool)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let (status, listed) =
+            call(state.clone(), "GET", "/loadout/tools?status=proposed", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed.as_array().unwrap().len(), 5);
+
+        let approve_agent = id_of("web_read").await;
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/loadout/tools/{approve_agent}/approve"),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "active");
+        assert_eq!(body["owner_kind"], "agent");
+
+        let approve_team = id_of("web_search").await;
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/loadout/tools/{approve_team}/approve"),
+            Some(serde_json::json!({ "owner": "team", "team_id": "crew" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["owner_kind"], "team");
+        assert_eq!(body["status"], "active");
+
+        let reject = id_of("email_queue").await;
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/loadout/tools/{reject}/reject"),
+            Some(serde_json::json!({ "note": "not now" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "rejected");
+
+        let revoke = id_of("team_note").await;
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/loadout/tools/{revoke}/revoke"),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "revoked");
+
+        let still_proposed = id_of("team_report").await;
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/loadout/tools/{still_proposed}/revoke"),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/loadout/tools/999999/approve",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let unknown_team = id_of("team_action").await;
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/loadout/tools/{unknown_team}/approve"),
+            Some(serde_json::json!({ "owner": "team", "team_id": "nobody" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// `POST /loadout/preview` answers the owner what the agent would receive — memory, tools
+    /// with their origin, refs with the missing one marked — and writes no `run_loadout` row.
+    #[tokio::test]
+    async fn loadout_preview_shows_memory_tools_and_refs_and_records_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let present = root.join("present.txt");
+        std::fs::write(&present, "here").unwrap();
+        let gone = root.join("gone.txt");
+
+        let state = with_files_root(test_state().await, root.clone());
+        loadout_seed_agent_and_team(&state.pool).await;
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'agent', 'scout', 'owner', 'memory', 'zanzibar scout-note',
+                     'body', 'active', '2026-08-19T00:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO loadout_tools
+                 (owner_kind, owner_id, tool, status, source, reason, run_id, created_at)
+             VALUES ('agent', 'scout', 'web_read', 'active', 'request', 'why', NULL,
+                     '2026-10-08T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        for path in [&present, &gone] {
+            sqlx::query(
+                "INSERT INTO context_refs (owner_kind, owner_id, path, kind, note, created_at)
+                 VALUES ('agent', 'scout', ?, 'file', NULL, '2026-10-08T00:00:00Z')",
+            )
+            .bind(path.to_str().unwrap())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/loadout/preview",
+            Some(serde_json::json!({
+                "agent_id": "scout",
+                "box": "job_node",
+                "team_id": "crew",
+                "task": "zanzibar",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["box"], "job_node");
+        assert_eq!(body["team_id"], "crew");
+        assert!(
+            body["memory"]
+                .as_str()
+                .is_some_and(|memory| memory.contains("scout-note")),
+            "{body}"
+        );
+        let tools = body["tools"].as_array().unwrap();
+        let origin_of = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .map(|tool| tool["origin"].as_str().unwrap().to_owned())
+        };
+        assert_eq!(origin_of("web_read").as_deref(), Some("agent"), "{body}");
+        assert_eq!(origin_of("read_context").as_deref(), Some("base"), "{body}");
+        let refs = body["refs"].as_array().unwrap();
+        let state_of = |path: &std::path::Path| {
+            refs.iter()
+                .find(|r| r["path"] == path.to_str().unwrap())
+                .map(|r| r["state"].as_str().unwrap().to_owned())
+        };
+        assert_eq!(state_of(&present).as_deref(), Some("active"), "{body}");
+        assert_eq!(state_of(&gone).as_deref(), Some("missing"), "{body}");
+        assert!(
+            body["block"]
+                .as_str()
+                .is_some_and(|block| block.contains("(em falta)")),
+            "{body}"
+        );
+
+        let (status, body) = call(
+            state.clone(),
+            "POST",
+            "/loadout/preview",
+            Some(serde_json::json!({ "agent_id": "scout", "box": "team", "task": "zanzibar" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // TEAM_EXTRAS is empty: an approval of a job-node extra never reaches the team box.
+        assert!(
+            body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool["origin"] == "base"),
+            "{body}"
+        );
+
+        let rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM run_loadout")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a preview records nothing");
+    }
+
+    #[tokio::test]
+    async fn loadout_preview_refuses_unknowns_and_non_owner_keys() {
+        let state = test_state().await;
+        loadout_seed_agent_and_team(&state.pool).await;
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/loadout/preview",
+            Some(serde_json::json!({ "agent_id": "nobody", "box": "team", "task": "x" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/loadout/preview",
+            Some(serde_json::json!({
+                "agent_id": "scout", "box": "team", "team_id": "nobody", "task": "x",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _) = call(
+            state.clone(),
+            "POST",
+            "/loadout/preview",
+            Some(serde_json::json!({ "agent_id": "scout", "box": "elsewhere", "task": "x" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // A run's own key is refused even when its loadout lists every tool there is.
+        let job_id = add_job(&state.pool, "loadout-project").await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, job_id, created_at)
+             VALUES ('x', 'running', 'worktree', ?, '2026-10-08T00:00:00Z')",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let (key, secret) = crate::auth::mint_run_token(run_id);
+        sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
+            .bind(&secret)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO run_loadout (run_id, agent_id, team_id, tools, resolved_at)
+             VALUES (?, 'scout', NULL, ?, '2026-10-08T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(r#"["request_tool","read_context","web_read"]"#)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/loadout/preview")
+                    .header("Authorization", format!("Bearer {key}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "agent_id": "scout", "box": "team", "task": "x" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
 

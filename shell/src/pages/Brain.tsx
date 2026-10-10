@@ -5,6 +5,7 @@ import { BrainPanel } from "../brain/BrainPanel";
 import { CapturePanel } from "../brain/CapturePanel";
 import { CapturesWaiting } from "../brain/CapturesWaiting";
 import { KnowledgePanel } from "../brain/knowledge/KnowledgePanel";
+import { ToolRequests } from "../brain/knowledge/ToolRequests";
 import { WaitingPanel } from "../brain/knowledge/WaitingPanel";
 import { UnifiedList } from "../brain/UnifiedList";
 import { ForceGraph } from "../brain/ForceGraph";
@@ -15,6 +16,7 @@ import { formatItem, itemOfNode, nodeIdOf, parseItem, parseView, type BrainView,
 import { Segments } from "../brain/Segments";
 import { useOpenCaptures } from "../data/captures";
 import { useKnowledge, type Known } from "../data/knowledge";
+import { useLoadoutTools } from "../data/loadout-tools";
 import { useNotesGraph, useCreateNote, useOwnerNotes } from "../data/owner-notes";
 import { useProjects } from "../data/system";
 import { Button, ErrorNote, PageHeader, Quiet } from "../ui";
@@ -87,7 +89,10 @@ function Tally() {
   const asked = useOpenCaptures();
   const count = <T,>(rows: T[] | undefined, keep: (row: T) => boolean) =>
     rows === undefined ? "—" : String(rows.filter(keep).length);
-  const proposed = knowledge.data?.filter((row) => row.status === "proposed").length ?? 0;
+  const tools = useLoadoutTools("proposed");
+  const proposed =
+    (knowledge.data?.filter((row) => row.status === "proposed").length ?? 0) +
+    (Array.isArray(tools.data) ? tools.data.length : 0);
   const open = asked.data?.length ?? 0;
   return (
     <p className="brain-tally">
@@ -335,7 +340,9 @@ export function BrainListView({
   const asked = useOpenCaptures();
   const knowledge = useKnowledge();
   const proposed = (knowledge.data ?? EMPTY_KNOWLEDGE).filter((row) => row.status === "proposed");
-  const hasAsks = (asked.data?.length ?? 0) > 0 || proposed.length > 0;
+  const tools = useLoadoutTools("proposed");
+  const toolsWaiting = Array.isArray(tools.data) ? tools.data.length : 0;
+  const hasAsks = (asked.data?.length ?? 0) > 0 || proposed.length > 0 || toolsWaiting > 0;
 
   useEffect(() => {
     if (!isOpen || onClose === undefined) return;
@@ -371,6 +378,7 @@ export function BrainListView({
           <>
             <CapturesWaiting onSelect={onItem} selected={selected} />
             <WaitingPanel rows={proposed} />
+            <ToolRequests />
           </>
         ) : (
           <div className="brain-aside-empty">

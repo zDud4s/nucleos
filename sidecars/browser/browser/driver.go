@@ -74,6 +74,9 @@ type Placement struct {
 	// Empty for an ephemeral profile, and it must be, for a reason narrower than Origins': a
 	// throwaway has no login in it, so there is nobody for a form to be submitted AS.
 	Writable []string `json:"writable,omitempty"`
+	// Visible runs the session's browser headful but still fenced (spec §4.1). The núcleo decides
+	// it, from the panel's choice; never the agent.
+	Visible bool `json:"visible,omitempty"`
 }
 
 // OpenRequest asks for a session on a URL, in the profile the núcleo chose.
@@ -602,6 +605,10 @@ var ErrUnsupported = errors.New("browser: unsupported by this driver")
 // Wrapped with the counts by whoever returns it, because "you are at the ceiling" and "the ceiling
 // is two" are different sentences and only the second tells a person what to change.
 var ErrTooManySessions = errors.New("browser: too many sessions open")
+
+// ErrVisibilityConflict is returned when a profile's browser is running in the other visibility
+// (headless vs visible) and still has sessions: a visible browser is exclusive on its profile.
+var ErrVisibilityConflict = errors.New("browser: this profile's browser is in use in the other visibility")
 
 // LookResult is one annotated picture of the page: what a person would see, with the agent's own
 // refs drawn on top of it.

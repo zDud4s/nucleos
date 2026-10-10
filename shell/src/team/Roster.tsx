@@ -8,7 +8,8 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
-import { Quiet } from "../ui";
+import { Button, Quiet } from "../ui";
+import { MARK } from "./mark";
 import {
   ROW_GAP,
   buildRoster,
@@ -41,13 +42,21 @@ import {
  * arithmetic tested through a renderer is arithmetic tested badly.
  */
 
+/**
+ * The chart is laid out in 13px units and drawn a little larger. It is the tab's only content, and
+ * at 1:1 a small department sat in the top-left corner of an empty page.
+ */
+const SCALE = 1.2;
+
 export interface RosterProps {
   team: TeamView;
   /** Already filtered to this department by the bench. */
   runs: TeamRun[];
+  /** Opens the Charter, where a director is chosen. Without it the empty state is only a sentence. */
+  onOpenCharter?: () => void;
 }
 
-export function Roster({ team, runs }: RosterProps) {
+export function Roster({ team, runs, onOpenCharter }: RosterProps) {
   /*
     Only the live ones, and only their ids. A finished run is history — the Work tab owns that —
     and the daemon caps the live ones at four (`core/src/team_trigger.rs:48`), so this fan-out is
@@ -87,7 +96,7 @@ export function Roster({ team, runs }: RosterProps) {
   const at = new Map(view.boxes.map((box) => [box.id, box]));
 
   if (catalogue === undefined) {
-    return <Quiet says="reading the catalogue…" />;
+    return <Quiet says="Reading the catalogue…" />;
   }
 
   const headless = !model.nodes.some((node) => node.layer === 1);
@@ -97,7 +106,12 @@ export function Roster({ team, runs }: RosterProps) {
 
   return (
     <div className="teams-org">
-      <div className="teams-org-scroll">
+      <div
+        className="teams-org-scroll"
+        tabIndex={0}
+        role="region"
+        aria-label={`${team.name} org chart`}
+      >
         {/*
           `role="group"` and not the `role="img"` the fleet's graph carries. An image's children are
           presentational, and the work boxes are links — calling this a picture would take the work
@@ -108,8 +122,8 @@ export function Roster({ team, runs }: RosterProps) {
           role="group"
           aria-label={`${team.name} — how this team is put together`}
           viewBox={`0 0 ${view.width} ${view.height}`}
-          width={view.width}
-          height={view.height}
+          width={Math.round(view.width * SCALE)}
+          height={Math.round(view.height * SCALE)}
         >
           <g className="teams-org-edges">
             {view.edges.map((edge) => {
@@ -150,7 +164,6 @@ export function Roster({ team, runs }: RosterProps) {
             })}
           </g>
         </svg>
-      </div>
 
       {/*
         One sentence, not three. A department nobody has staffed is missing a director, a roster
@@ -160,15 +173,21 @@ export function Roster({ team, runs }: RosterProps) {
       */}
       {headless ? (
         <Quiet
-          says="nobody is in charge of this team yet — it will refuse every task until somebody is."
+          says="Nobody is in charge of this team yet — it will refuse every task until somebody is."
+          action={
+            onOpenCharter === undefined ? undefined : (
+              <Button onClick={onOpenCharter}>Choose a Director</Button>
+            )
+          }
         />
       ) : alone ? (
-        <Quiet says="nobody on the roster yet" />
+        <Quiet says="Nobody on the roster yet." />
       ) : waiting ? (
-        <Quiet says="reading the work…" />
+        <Quiet says="Reading the work…" />
       ) : (
-        !inFlight && <Quiet says="nothing in flight" />
+        !inFlight && <Quiet says="Nothing in flight." />
       )}
+      </div>
     </div>
   );
 }
@@ -263,12 +282,3 @@ function Box({ node, box }: { node: RosterNode; box: RosterBox }) {
     </g>
   );
 }
-
-/** The alphabet `Work.tsx:253` already uses. Two tabs of one bench do not get two of these. */
-const MARK: Record<string, string> = {
-  done: "✓",
-  working: "⋯",
-  planned: "·",
-  failed: "✗",
-  skipped: "–",
-};

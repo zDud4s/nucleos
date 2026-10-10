@@ -777,6 +777,44 @@ pub async fn escalated_request_id(
     }
 }
 
+/// The target of the escalated merge a resolution's landing answers, if `branch` is one.
+///
+/// What `land::resolve_target` admits a resolution's landing onto when the project's landing-target
+/// table does not name it. The authority is the escalated row, not the caller: that merge was queued,
+/// admitted and run before it conflicted, so its target was chosen then. A caller cannot widen it by
+/// asking — a resolution naming any other branch gets the ordinary answer.
+///
+/// `None` on anything `escalated_request_id` answers `None` for, and on a row that is not a merge.
+/// Fails toward refusing the landing, never toward admitting a target nobody recorded.
+pub async fn escalated_target(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    branch: &str,
+) -> Option<String> {
+    let id = escalated_request_id(pool, project_id, branch).await?;
+    let stored: sqlx::Result<(String, String)> =
+        sqlx::query_as("SELECT op, args FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await;
+    let (op, args) = match stored {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(
+                project_id,
+                branch,
+                %error,
+                "could not read the escalation a resolution answers; refusing its target"
+            );
+            return None;
+        }
+    };
+    match crate::vcs::Op::from_stored(&op, &args) {
+        Ok(crate::vcs::Op::Merge { target, .. }) => Some(target.as_str().to_owned()),
+        _ => None,
+    }
+}
+
 /// One finished resolution, as `land_finished` reads it.
 #[derive(sqlx::FromRow)]
 struct Finished {
@@ -801,7 +839,9 @@ const HANDOFF_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 /// The agent resolves and commits and stops; `nucleos-core --land` is held by the classifier on every
 /// call and is not on its PATH anyway. This pass does what that command would have: `land::submit`
 /// with the escalation's own target, which still routes the branch through `verify_resolution`
-/// (`landing_is_a_resolution`) and links the escalation to the new row.
+/// (`landing_is_a_resolution`) and links the escalation to the new row. That target is admitted even
+/// when the project's landing-target table does not list it (`escalated_target`): before that, every
+/// conflict on a merge between two feature branches was refused here and left for a person.
 ///
 /// A resolution run that `failed`, or `completed` without a committed merge, is announced once per
 /// request (`RESOLUTION_FAILED_KIND`) and never handed over.
@@ -1086,10 +1126,20 @@ mod tests {
         source: &str,
         from_resolution: bool,
     ) -> i64 {
+        escalated_merge_into(pool, source, "master", from_resolution).await
+    }
+
+    /// `escalated_merge_of`, into a target other than `master`.
+    async fn escalated_merge_into(
+        pool: &sqlx::SqlitePool,
+        source: &str,
+        target: &str,
+        from_resolution: bool,
+    ) -> i64 {
         let repo = crate::vcs::ResolvedRepo::synthetic("proj", "C:/repo", "proj");
         let op = crate::vcs::Op::Merge {
             source: source.into(),
-            target: "master".into(),
+            target: target.into(),
         };
         let id = if from_resolution {
             crate::vcs::submit_resolution(pool, &repo, &op, crate::vcs::Origin::Shell).await
@@ -1580,6 +1630,19 @@ mod tests {
         run_status: &str,
         progress: Progress,
     ) -> Scenario {
+        resolution_scenario_into(pool, prefix, run_status, progress, "master").await
+    }
+
+    /// `resolution_scenario`, for a conflict whose escalated merge named `target` — a branch cut from
+    /// `master`, so it conflicts with `feat/x` exactly as `master` does, and the one the worktree is
+    /// opened on.
+    async fn resolution_scenario_into(
+        pool: &sqlx::SqlitePool,
+        prefix: &str,
+        run_status: &str,
+        progress: Progress,
+        target: &str,
+    ) -> Scenario {
         let container = crate::git_exec::testkit::space_free_tempdir(prefix);
         let repo = container.path().join("repo");
         crate::git_exec::testkit::initialize_repo(&repo);
@@ -1590,7 +1653,10 @@ mod tests {
         assert!(git_at(&repo, &["checkout", "-q", "master"]));
         std::fs::write(repo.join("seed.txt"), "ours\n").unwrap();
         assert!(git_at(&repo, &["commit", "-am", "ours"]));
-        let base = crate::git_exec::tests::sha_of(&repo, "master");
+        if target != "master" {
+            assert!(git_at(&repo, &["branch", target, "master"]));
+        }
+        let base = crate::git_exec::tests::sha_of(&repo, target);
 
         let branch = crate::worktree::Owner::Run(7).branch_name();
         let tree = container.path().join("run-7");
@@ -1603,7 +1669,7 @@ mod tests {
                 "-b",
                 &branch,
                 &tree.to_string_lossy(),
-                "master"
+                target
             ]
         ));
         if progress != Progress::Untouched {
@@ -1625,7 +1691,7 @@ mod tests {
         .await
         .expect("seed the project's roster row");
 
-        let request = escalated_merge_of(pool, "feat/x", false).await;
+        let request = escalated_merge_into(pool, "feat/x", target, false).await;
         sqlx::query("UPDATE vcs_requests SET project_root = ? WHERE id = ?")
             .bind(repo.to_string_lossy().into_owned())
             .bind(request)
@@ -1924,6 +1990,71 @@ mod tests {
 
         let admitted = admitted_resolutions(&pool, &scenario).await;
         assert_eq!(admitted.len(), 1, "a passed gate is handed over");
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
+                .bind(scenario.request)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, Some(admitted[0]));
+    }
+
+    /// **The escalation's own target is admitted, whatever the landing-target table says.** Measured
+    /// in production on 2026-10-09: run 900615 resolved `feat/agent-loadout-tools` into
+    /// `feat/agent-loadout-wave-b`, committed a two-parent merge and passed its gate, and the handoff
+    /// was refused because `project_land_targets` held only `master` — so every conflict on a merge
+    /// between two feature branches ended in "needs a person", and the session that queued the
+    /// original merge had to land the resolution by hand. That table guards where a `--land` may
+    /// publish; this target was chosen and admitted when the original merge was queued.
+    ///
+    /// What the exemption must not become: a resolution branch naming any OTHER unlisted branch is
+    /// still refused, because the escalation chose one target and only that one.
+    #[tokio::test]
+    async fn a_resolution_lands_on_its_escalations_target_even_when_that_is_not_a_landing_target() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario_into(
+            &pool,
+            "nucleos-resolver-feature-target-",
+            "completed",
+            Progress::Committed,
+            "feat/wave",
+        )
+        .await;
+        gate(&pool, "passed").await;
+
+        let repo = crate::vcs::resolve_repo(&pool, "proj").await.unwrap();
+        let root = std::path::PathBuf::from(repo.root());
+        let elsewhere = crate::land::submit(
+            &pool,
+            &repo,
+            &root,
+            &scenario.branch,
+            Some("feat/x"),
+            std::time::Instant::now() + crate::git_exec::OPERATION_TIMEOUT,
+        )
+        .await;
+        assert!(
+            matches!(elsewhere, Err(crate::land::LandRefusal::Refused(_))),
+            "a resolution may name its escalation's target and no other unlisted branch"
+        );
+
+        let mut refused = Default::default();
+        land_finished(&pool, &mut refused).await;
+
+        let admitted = admitted_resolutions(&pool, &scenario).await;
+        assert_eq!(admitted.len(), 1, "the finished resolution is handed over");
+        let args: String = sqlx::query_scalar("SELECT args FROM vcs_requests WHERE id = ?")
+            .bind(admitted[0])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                crate::vcs::Op::from_stored("merge", &args),
+                Ok(crate::vcs::Op::Merge { target, .. }) if target.as_str() == "feat/wave"
+            ),
+            "it lands on the branch the escalated merge named: {args}"
+        );
         let linked: Option<i64> =
             sqlx::query_scalar("SELECT resolved_by FROM vcs_requests WHERE id = ?")
                 .bind(scenario.request)

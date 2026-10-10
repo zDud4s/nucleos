@@ -271,6 +271,11 @@ pub struct RunRequest {
     ///
     /// `None` names the unboxed server. This is only `Some` together with `mcp_config`.
     pub mcp_job: Option<i64>,
+    /// The team agent's node run id the server named by `mcp_config` is boxed to (`--box team
+    /// --run <id>`). `None` for every run that is not a team node; only `Some` together with
+    /// `mcp_config`, and never together with `mcp_job`. Read only by [`authored_prompt`], to price
+    /// the Team box instead of the unboxed server.
+    pub mcp_team_run: Option<i64>,
     pub tool_policy: ToolPolicy,
     pub progress_timeout: Option<Duration>,
     /// How many model responses this run may take before the daemon stops it. `None` is no ceiling.
@@ -435,7 +440,7 @@ pub struct RunRequest {
     /// Only read when `mcp_config` is `Some`, because that is the only branch that writes
     /// `--allowedTools` at all. A narrowing passed without an MCP config narrows nothing, which is
     /// the harmless direction.
-    pub allowed_mcp_tools: Option<&'static [&'static str]>,
+    pub allowed_mcp_tools: Option<Vec<String>>,
     /// Keep background tasks even though nothing can wake this run once its turn ends.
     ///
     /// Set by chat turns only: a person is watching, and a task that dies with the turn is still
@@ -855,7 +860,7 @@ pub fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
         args.push("--mcp-config".to_string());
         args.push(path.to_string_lossy().into_owned());
         args.push("--allowedTools".to_string());
-        args.push(match request.allowed_mcp_tools {
+        args.push(match &request.allowed_mcp_tools {
             None => "mcp__nucleos__*".to_string(),
             Some(names) => names
                 .iter()
@@ -2514,7 +2519,16 @@ pub fn authored_prompt(request: &RunRequest) -> crate::prompt_budget::AuthoredPr
             // different fact from the one above it, and `AuthoredPrompt::schema_chars` is where the
             // two are told apart for whoever reads the stored number.
             Some(_) if schemas_are_deferred(request) => 0,
-            Some(_) => crate::mcp_tools::NucleosTools::advertised_schema_chars(request.mcp_job),
+            // The box the server was launched in, as `--box` names it: a team node's, a job
+            // node's, or the unboxed server's.
+            Some(_) => crate::mcp_tools::NucleosTools::advertised_box_schema_chars(&match (
+                request.mcp_team_run,
+                request.mcp_job,
+            ) {
+                (Some(node), _) => crate::mcp_tools::McpBox::Team(node),
+                (None, Some(job)) => crate::mcp_tools::McpBox::JobNode(job),
+                (None, None) => crate::mcp_tools::McpBox::All,
+            }),
         },
         // Only counted when the flag is actually written. `Some("")` is not a state any caller
         // builds, but counting an absent value as zero and a present one by its length is what keeps
@@ -4148,11 +4162,7 @@ pub struct Launch {
 /// The test double for `CommandRunner`. `#[cfg(test)]` because every user of it is a test — building
 /// it into the daemon would ship a runner that can fake a run's outcome.
 #[cfg(any(test, feature = "testkit"))]
-pub type JobMcpLaunch = (
-    Option<std::path::PathBuf>,
-    Option<i64>,
-    Option<&'static [&'static str]>,
-);
+pub type JobMcpLaunch = (Option<std::path::PathBuf>, Option<i64>, Option<Vec<String>>);
 
 #[cfg(any(test, feature = "testkit"))]
 #[derive(Default)]
@@ -4483,7 +4493,7 @@ impl CommandRunner for FakeCommandRunner {
         *self.last_job_mcp.lock().unwrap() = Some((
             request.mcp_config.clone(),
             request.mcp_job,
-            request.allowed_mcp_tools,
+            request.allowed_mcp_tools.clone(),
         ));
         *self.last_tool_policy.lock().unwrap() = Some(request.tool_policy);
         *self.last_session_id.lock().unwrap() = request.session_id.clone();
@@ -5289,7 +5299,8 @@ mod tests {
         let flag = wide.windows(2).find(|w| w[0] == "--allowedTools").unwrap();
         assert_eq!(flag[1], "mcp__nucleos__*");
 
-        request.allowed_mcp_tools = Some(&["list_files", "read_team_file"]);
+        request.allowed_mcp_tools =
+            Some(vec!["list_files".to_owned(), "read_team_file".to_owned()]);
         let narrow = cli_args(&request, "claude-sonnet-5");
         let flag = narrow
             .windows(2)
@@ -5311,7 +5322,7 @@ mod tests {
     #[test]
     fn narrowing_a_request_with_no_mcp_server_adds_no_flag() {
         let mut request = baseline_run_request();
-        request.allowed_mcp_tools = Some(&["list_files"]);
+        request.allowed_mcp_tools = Some(vec!["list_files".to_owned()]);
         assert!(
             !cli_args(&request, "claude-sonnet-5")
                 .iter()
@@ -5418,6 +5429,7 @@ mod tests {
             resume_session_id: None,
             mcp_config: None,
             mcp_job: None,
+            mcp_team_run: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
@@ -5618,6 +5630,7 @@ mod tests {
             resume_session_id: None,
             mcp_config: None,
             mcp_job: None,
+            mcp_team_run: None,
             tool_policy: ToolPolicy::Unrestricted,
             progress_timeout: None,
             max_turns: None,
@@ -7795,7 +7808,12 @@ mod tests {
     fn a_job_node_request_allows_exactly_the_finding_and_verify_tools() {
         let mut request = baseline_run_request();
         request.mcp_config = Some(PathBuf::from("C:/tmp/job-node.json"));
-        request.allowed_mcp_tools = Some(crate::mcp_tools::JOB_NODE_TOOLS);
+        request.allowed_mcp_tools = Some(
+            crate::mcp_tools::JOB_NODE_TOOLS
+                .iter()
+                .map(|tool| (*tool).to_owned())
+                .collect(),
+        );
 
         let args = cli_args(&request, "claude-sonnet-5");
         let allowed = args
@@ -7822,6 +7840,24 @@ mod tests {
         assert_eq!(authored_prompt(&request).schema_chars, job_price);
         assert_ne!(
             job_price,
+            crate::mcp_tools::NucleosTools::advertised_schema_chars(None)
+        );
+    }
+
+    #[test]
+    fn a_team_node_server_is_priced_by_its_box() {
+        let mut request = baseline_run_request();
+        request.tool_policy = ToolPolicy::McpOnly;
+        request.mcp_config = Some(PathBuf::from("C:/tmp/team-node.json"));
+        request.mcp_team_run = Some(7);
+
+        let team_price = crate::mcp_tools::NucleosTools::advertised_box_schema_chars(
+            &crate::mcp_tools::McpBox::Team(7),
+        );
+        assert!(team_price > 0);
+        assert_eq!(authored_prompt(&request).schema_chars, team_price);
+        assert_ne!(
+            team_price,
             crate::mcp_tools::NucleosTools::advertised_schema_chars(None)
         );
     }

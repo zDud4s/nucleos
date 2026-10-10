@@ -46,6 +46,7 @@ export const FEED_LANES: readonly FeedLaneInfo[] = [
  *   about configuration, so the machine lane, and not runs.
  * - `land_resolution_failed` is git: what failed was landing a resolution on the branch.
  * - `postgate_red` is git: what went red is what reached the repository.
+ * - `postgate_held` is git: the gate that watches the repository chose not to run, and says why.
  * - `schedule_rule_invalid` sits in the mail lane, with the other lines about the outside world.
  * - `promotion_ready` is a project earning the next autopilot mode — the machine lane.
  */
@@ -99,6 +100,7 @@ const LANE_OF: Record<string, FeedLane> = {
   vcs_resolution_discarded: "git",
   land_resolution_failed: "git",
   postgate_red: "git",
+  postgate_held: "git",
 
   team_run_started: "teams",
   team_run_finished: "teams",

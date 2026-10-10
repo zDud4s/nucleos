@@ -1,0 +1,67 @@
+:host {
+  all: initial;
+}
+.panel-root {
+  font-family: var(--font-sans, system-ui, sans-serif);
+  color: var(--text, #111);
+}
+.panel-pellicle {
+  position: fixed;
+  inset: 0 360px 0 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.18);
+  color: #fff;
+  font-size: 15px;
+  cursor: pointer;
+}
+.panel-strip {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 360px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface, #fff);
+  border-left: 1px solid var(--border, #ddd);
+  box-sizing: border-box;
+}
+.panel-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border, #ddd);
+}
+.panel-host {
+  flex: 1;
+  opacity: 0.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.panel-messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.panel-band,
+.panel-keep {
+  padding: 8px 10px;
+  border-top: 1px solid var(--border, #ddd);
+}
+.panel-keep-actions {
+  display: flex;
+  gap: 8px;
+}
+.panel-tab {
+  position: fixed;
+  top: 40%;
+  right: 0;
+  width: 28px;
+  padding: 8px 0;
+  writing-mode: vertical-rl;
+  cursor: pointer;
+}

@@ -115,6 +115,17 @@ func (d *Driver) BeginPerson(ctx context.Context, id browser.SessionID) error {
 		unsubscribe: unsubscribe,
 	})
 
+	if d.visible {
+		// A visible window: the person sees the native file dialog and the page as it stands, so
+		// neither the interception nor the reload applies. The proxy switch comes on LAST, once
+		// nothing can fail any more.
+		if d.personSwitch != nil {
+			d.personSwitch(true)
+		}
+		d.pushState(ctx, id)
+		return nil
+	}
+
 	// A native file dialog is invisible in a screencast, so the page's choosers are intercepted for the
 	// turn and come back as prompts. A page that cannot be made to do that is not one a person can use.
 	if _, err := d.conn.Call(ctx, page, "Page.setInterceptFileChooserDialog", map[string]any{"enabled": true}); err != nil {
@@ -130,6 +141,16 @@ func (d *Driver) BeginPerson(ctx context.Context, id browser.SessionID) error {
 		return err
 	}
 	return nil
+}
+
+// MakeVisible marks the driver as the one of a visible (panel) browser. personSwitch is the proxy's
+// person switch. Call it before any Open.
+func (d *Driver) MakeVisible(personSwitch func(bool)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.visible = true
+	d.personSwitch = personSwitch
+	d.personTargets = map[string]cdp.SessionID{}
 }
 
 // clearPersonBegun lets Open insert sessions again.
@@ -158,9 +179,25 @@ func (d *Driver) EndPerson(ctx context.Context, id browser.SessionID) (browser.R
 	// Every question still open is declined while the person still holds the session: the page it
 	// froze is unfrozen before the fence is back, and the viewers are told each one is over.
 	d.cancelAllPrompts(state)
-	// Best effort: the page may be gone, and the fence's reloads below are what matter.
-	_, _ = d.conn.Call(ctx, state.page, "Page.setInterceptFileChooserDialog", map[string]any{"enabled": false})
+	if !d.visible {
+		// Best effort: the page may be gone, and the fence's reloads below are what matter.
+		_, _ = d.conn.Call(ctx, state.page, "Page.setInterceptFileChooserDialog", map[string]any{"enabled": false})
+	}
 	d.person.Store(nil)
+	if d.visible {
+		// The proxy's switch goes off in the same step as the person state, before any reload or the
+		// sweep, so everything those fetch is judged again.
+		if d.personSwitch != nil {
+			d.personSwitch(false)
+		}
+		d.mu.Lock()
+		popups := d.personTargets
+		d.personTargets = map[string]cdp.SessionID{}
+		d.mu.Unlock()
+		for target := range popups {
+			_, _ = d.conn.Call(ctx, cdp.BrowserSession, "Target.closeTarget", map[string]any{"targetId": target})
+		}
+	}
 	d.clearPersonBegun()
 	// The recording ends here: the reloads below are the fence coming back, not somewhere the person
 	// went, and they must not reach the chain a grant is read from.
@@ -192,5 +229,8 @@ func (d *Driver) EndPerson(ctx context.Context, id browser.SessionID) (browser.R
 		entry.mode = browser.ModeAgent
 	}
 	d.mu.Unlock()
+	if d.visible {
+		d.pushState(ctx, id)
+	}
 	return browser.Returned{Chain: state.recorder.Chain()}, nil
 }

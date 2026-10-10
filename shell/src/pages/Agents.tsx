@@ -18,7 +18,9 @@ import {
   type Employment,
 } from "../data/agents";
 import { useTeams } from "../data/teams";
+import { ContextRefs } from "../context/ContextRefs";
 import { ScopedMemory } from "../brain/knowledge/ScopedMemory";
+import { ScopedTools } from "../brain/knowledge/ScopedTools";
 import {
   Button,
   ConfirmButton,
@@ -32,6 +34,7 @@ import {
   Teach,
 } from "../ui";
 import "./agents.css";
+import { LoadoutPreview } from "./LoadoutPreview";
 
 /**
  * Agents — the house catalogue.
@@ -827,7 +830,10 @@ function AgentEditor({
       </form>
       {update.isError && <SaveRefusal error={update.error} />}
 
+      <ContextRefs ownerKind="agent" ownerId={agent.id} />
       <ScopedMemory scopeKind="agent" scopeId={agent.id} />
+      <ScopedTools ownerKind="agent" ownerId={agent.id} />
+      <LoadoutPreview agentId={agent.id} />
 
       {/*
         The delete, and what this page can see standing on it — before the

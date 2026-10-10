@@ -186,8 +186,8 @@ describe("Decisions - recruitment", () => {
     await renderDecisions(teamView(), [], { recruits: [mine, theirs] });
 
     const panel = await panelFor("Specialists it asked for");
-    expect(await within(panel).findByText("recruit #21")).toBeDefined();
-    expect(within(panel).queryByText("recruit #22")).toBeNull();
+    expect(await within(panel).findByTitle("Recruitment #21")).toBeDefined();
+    expect(within(panel).queryByTitle("Recruitment #22")).toBeNull();
     expect(within(panel).getByText("nobody here can read a VAT return")).toBeDefined();
   });
 
@@ -198,12 +198,12 @@ describe("Decisions - recruitment", () => {
 
     // The one editable approval in the house — a director gets the engine
     // wrong more often than anything else, and it is what costs money.
-    fireEvent.change(await within(panel).findByLabelText("engine"), { target: { value: "codex" } });
+    fireEvent.change(await within(panel).findByLabelText("Engine"), { target: { value: "codex" } });
 
     // "Hire", not "Approve": approving an action means do that once; hiring
     // means keep this person, and it lasts forever.
     expect(within(panel).queryByRole("button", { name: /^Approve/ })).toBeNull();
-    fireEvent.click(within(panel).getByRole("button", { name: "Hire #21" }));
+    fireEvent.click(within(panel).getByRole("button", { name: "Hire tax analyst" }));
     const confirm = await within(panel).findByRole("button", {
       name: "Write the specialist and add them to the roster",
     });
@@ -222,6 +222,46 @@ describe("Decisions - recruitment", () => {
     const body = JSON.parse(call[1].body as string) as { hire: { engine: string; name: string } };
     expect(body.hire.engine).toBe("codex");
     expect(body.hire.name).toBe("tax analyst");
+  });
+
+  it("keeps a proposed value the catalogue refuses visible, marked, instead of swapping it", async () => {
+    await renderDecisions(teamView(), [], { recruits: [recruit("financas")] });
+
+    const panel = await panelFor("Specialists it asked for");
+    const policy = (await within(panel).findByLabelText("Tool policy")) as HTMLSelectElement;
+    // `read_only` is the value a director proposes and the daemon refuses.
+    expect(policy.value).toBe("read_only");
+    expect(within(policy).getByRole("option", { name: "read_only (not accepted)" })).toBeDefined();
+    expect(within(policy).getByRole("option", { name: "mcp_only" })).toBeDefined();
+  });
+
+  it("says so when the requested specialists cannot be loaded", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/proposals/recruits") throw new Error("down");
+      return [];
+    });
+    const queryClient = createAppQueryClient();
+    queryClient.setDefaultOptions({ queries: { retry: false } });
+    const rootRoute = createRootRoute({ component: () => <Outlet /> });
+    const router = createRouter({
+      routeTree: rootRoute.addChildren([
+        createRoute({
+          getParentRoute: () => rootRoute,
+          path: "/teams/$teamId",
+          component: () => <Decisions team={teamView()} runs={[]} />,
+        }),
+      ]),
+      history: createMemoryHistory({ initialEntries: ["/teams/financas"] }),
+      defaultPreload: false,
+    });
+    await router.load();
+    render(
+      <QueryClientProvider client={queryClient}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText(/Couldn't load the requested specialists/)).toBeDefined();
   });
 
   it("reads no team out of a payload that has none, rather than guessing one", () => {
@@ -266,7 +306,7 @@ describe("Decisions - actions", () => {
   });
 
   it("offers no decision on an action nobody decides", async () => {
-    // A null `proposal_id` means the grant was `allow`: the núcleo carries it
+    // A null `proposal_id` means the grant was `allow`: the daemon carries it
     // out on the next tick and there is nothing to answer.
     await renderDecisions(teamView(), [teamRun({ id: "run-1" })], {
       actions: [teamAction({ proposal_id: null })],

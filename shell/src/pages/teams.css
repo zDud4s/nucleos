@@ -435,31 +435,6 @@
   color: var(--text-muted);
 }
 
-/* ========================================================= charter bits == */
-
-/*
-  Three rules the console used to share, kept because the Charter still lays out
-  a roster, a section label and a row of ceilings. Renamed off `teams-card-*`
-  when the cards went: a class naming a component that no longer exists is how
-  the next person goes looking for one.
-*/
-.teams-charter-label {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-2);
-  margin: 0 0 var(--space-2);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.teams-charter-people {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-}
-
 /* ============================================================== live task == */
 
 .teams-task {
@@ -710,14 +685,20 @@
 .teams-textarea {
   width: 100%;
   padding: var(--space-2);
-  border: 1px solid var(--border);
+  /* `--border-field`, not `--border`: a hairline at 1.26:1 does not mark where a field is. */
+  border: 1px solid var(--border-field);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
   color: var(--text);
-  font-family: var(--font-mono);
+  /* Human text is body text; numbers and machine strings opt in with `.teams-input-num`. */
+  font-family: inherit;
   font-size: var(--text-sm);
   text-transform: none;
   letter-spacing: normal;
+}
+
+.teams-input-num {
+  font-family: var(--font-mono);
 }
 
 .teams-textarea {
@@ -975,6 +956,7 @@
 /* A planned item has no tone of its own: not started is the resting state. */
 .teams-round-pending {
   border-style: dashed;
+  border-color: var(--border-strong);
 }
 
 .teams-rounds-key {
@@ -999,9 +981,8 @@
 
 .teams-rule-source,
 .teams-rule-zone {
-  font-family: var(--font-mono);
   font-size: var(--text-xs);
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 
 .teams-rule-cron {
@@ -1057,7 +1038,6 @@
   padding: var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  background: var(--surface-sunken);
 }
 
 /* =============================================================== charter == */
@@ -1094,12 +1074,181 @@
   min-width: 0;
 }
 
-/* The per-task ceilings. Text now, not chips — the run reads as a sentence. */
-.teams-charter-limits {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+/* The limits: two groups, each a list in the Powers row dress (`.teams-grants`/`.teams-grant`). */
+.teams-limit-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.teams-limit-group + .teams-limit-group {
+  margin-top: var(--space-2);
+}
+
+.teams-limit-group-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Label and explanation take the free width; the control keeps its own and never wraps under. */
+.teams-limit {
+  flex-wrap: nowrap;
+  align-items: center;
+}
+
+.teams-limit-text {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.teams-limit-label {
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.teams-limit-explain {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-muted);
+}
+
+/* "1 running now", with the occupancy bar under it, kept short so it reads as a footnote. */
+.teams-limit-live {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-width: 12rem;
+  margin-top: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.teams-limit-live .ui-gauge {
+  margin: 0;
+}
+
+/* A stepper: one bordered control, the number between its two buttons. */
+.teams-stepper {
+  display: inline-flex;
+  flex: none;
+  align-items: stretch;
+  margin-left: auto;
+  border: 1px solid var(--border-field);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.teams-stepper-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.teams-stepper-button:hover:not(:disabled) {
+  background: var(--border);
+}
+
+.teams-stepper-button:disabled {
+  color: var(--text-faint);
+  cursor: default;
+}
+
+.teams-stepper-button:focus-visible,
+.teams-stepper-input:focus-visible,
+.teams-money-input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  position: relative;
+}
+
+.teams-stepper-input {
+  width: 3rem;
+  min-width: 0;
+  padding: var(--space-1) 0;
+  border: 0;
+  border-left: 1px solid var(--border-field);
+  border-right: 1px solid var(--border-field);
+  background: transparent;
+  font: inherit;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: var(--text);
+}
+
+.teams-stepper-input[aria-invalid="true"],
+.teams-money-input[aria-invalid="true"] {
+  color: var(--tone-danger-fg);
+}
+
+.teams-stepper:has([aria-invalid="true"]),
+.teams-money:has([aria-invalid="true"]) {
+  border-color: var(--tone-danger-fg);
+}
+
+/* The spending ceiling: a dollar amount, and the box that says there is none. */
+.teams-ceiling {
+  display: flex;
+  flex: none;
+  align-items: center;
   gap: var(--space-3);
-  align-items: end;
+  margin-left: auto;
+}
+
+.teams-money {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border-field);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.teams-money[data-off="true"] {
+  border-color: var(--border);
+}
+
+.teams-money-sign {
+  padding-left: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.teams-money-input {
+  width: 5.5rem;
+  min-width: 0;
+  padding: var(--space-1) var(--space-2) var(--space-1) var(--space-1);
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.teams-money-input:disabled {
+  cursor: not-allowed;
+}
+
+.teams-ceiling-none {
+  padding: 0;
+  white-space: nowrap;
+}
+
+.teams-ceiling-none:hover {
+  background: none;
 }
 
 /**
@@ -1130,6 +1279,37 @@
   color: var(--text-muted);
 }
 
+/* The "Saved" confirmation that takes the bar's place for a couple of seconds. */
+.teams-savebar-saved {
+  align-self: flex-end;
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--tone-active-fg);
+}
+
+/* The ui `Field` brings its own control dress (14rem minimum); inside the Charter a control fills
+   its column instead, so the limits grid can pack three to a row. */
+.teams-charter .ui-field input,
+.teams-charter .ui-field textarea,
+.teams-charter .ui-field select {
+  width: 100%;
+  min-width: 0;
+}
+
+/* Numeric ceilings read as figures; `ui-field` resets the family, so this is scoped to beat it. */
+.teams-charter .ui-field input.teams-input-num {
+  font-family: var(--font-mono);
+}
+
+.teams-charter .ui-field input[aria-invalid="true"] {
+  border-color: var(--tone-danger-fg);
+}
+
+/* The range, as the complaint, when a ceiling is out of it. */
+.teams-limit-error {
+  color: var(--tone-danger-fg);
+}
+
 /* ================================================================ drift == */
 
 /**
@@ -1156,6 +1336,11 @@
   color: var(--text);
 }
 
+.teams-drift:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
 .teams-drift-list {
   display: flex;
   flex-direction: column;
@@ -1177,7 +1362,7 @@
   width: 8rem;
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 
 .teams-drift-was,
@@ -1258,7 +1443,7 @@
 }
 
 .teams-select {
-  font-family: var(--font-mono);
+  font-family: inherit;
 }
 
 /* A single-choice select dressed like `.teams-input` beside it. Without this it kept the
@@ -1266,7 +1451,7 @@
    grant row. `color-scheme` themes the popup list and the arrow the browser draws. */
 .teams-select:not([multiple]) {
   padding: var(--space-2);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-field);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
   color: var(--text);
@@ -1298,9 +1483,8 @@
 .teams-act-field {
   display: flex;
   gap: var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-muted);
+  font-size: var(--text-sm);
+  color: var(--text);
   overflow-wrap: anywhere;
 }
 
@@ -1425,14 +1609,47 @@
   margin: 0;
 }
 
-/* The chart is as wide as the department needs. It scrolls in here so the PAGE never does. */
+/*
+  The chart sits on a panel as wide as the tab, centred on a faint dot grid, so a small department
+  reads as a drawing placed on a canvas rather than three boxes left in the corner of a page. It
+  scrolls in here so the PAGE never does; `margin-inline: auto` centres a chart narrower than the
+  panel and resolves to 0 for one wider, so nothing is cut off on the left.
+*/
 .teams-org-scroll {
   overflow-x: auto;
-  padding: var(--space-3) 0;
+  min-height: 360px;
+  padding: var(--space-6) var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background-color: var(--surface-sunken);
+  background-image: radial-gradient(var(--border) 1px, transparent 1px);
+  background-size: 20px 20px;
+  background-position: 10px 10px;
 }
 
+/* One unit for the text and the box geometry: the chart sizes itself in em, off this. */
+/* A chart wider than the panel shrinks to fit it; `height: auto` keeps the aspect, or the fixed
+   height attribute would leave empty bands above and below the shrunken drawing. */
 .teams-org-svg {
   display: block;
+  max-width: 100%;
+  height: auto;
+  margin-inline: auto;
+  font-size: 13px;
+}
+
+/* The one sentence under the chart belongs to it, so it sits on the panel, centred beneath it. */
+.teams-org-scroll .ui-quiet {
+  justify-content: center;
+  align-items: center;
+  margin-top: var(--space-5);
+  text-align: center;
+}
+
+/* The scroll area is focusable so a keyboard can pan a chart wider than the page. */
+.teams-org-scroll:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 /* An edge is a relationship, not a target: clicks belong to the boxes it joins. */
@@ -1442,7 +1659,7 @@
 
 .teams-org-edge {
   fill: none;
-  stroke: var(--border);
+  stroke: var(--border-strong);
   stroke-width: 1.5;
 }
 
@@ -1467,19 +1684,19 @@
 
 .teams-org-name {
   fill: var(--text);
-  font-size: var(--text-sm);
+  font-size: 1em;
   font-weight: 600;
 }
 
 .teams-org-said {
-  fill: var(--text-faint);
-  font-size: var(--text-xs);
+  fill: var(--text-muted);
+  font-size: 0.846em;
 }
 
 .teams-org-state {
   fill: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-size: 0.846em;
 }
 
 .teams-org-mark {
@@ -1501,6 +1718,12 @@
 
 .teams-org-link {
   cursor: pointer;
+}
+
+/* The box answers the pointer: a stronger, heavier outline says it is a way in. */
+.teams-org-link:hover .teams-org-box {
+  stroke: var(--border-strong);
+  stroke-width: 1.5;
 }
 
 .teams-org-link:focus-visible {
@@ -1549,8 +1772,7 @@
 
 .teams-org-fact {
   fill: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-size: 0.846em;
 }
 
 /* ====================================================== charter in a dialog == */
@@ -1622,7 +1844,8 @@
 .teams-check-list {
   display: flex;
   flex-direction: column;
-  max-height: 12rem;
+  /* About nine rows before it scrolls: a roster that fits should not hide its tail. */
+  max-height: 18rem;
   overflow-y: auto;
   margin: 0;
   padding: var(--space-1);
@@ -1666,6 +1889,24 @@
   overflow-wrap: anywhere;
 }
 
+/* The text beside the box: name and speciality inline, "also in" on a line of its own. */
+.teams-check-body {
+  min-width: 0;
+}
+
+.teams-check-body .teams-check-name {
+  margin-right: var(--space-2);
+}
+
+/* "also in Marketing, Vendas": under the speciality, muted, in the body face. */
+.teams-check-also {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
 /* A power's human name, with the daemon's identifier muted beside it. */
 .teams-grant-label {
   display: flex;
@@ -1673,9 +1914,4 @@
   gap: var(--space-2);
   font-size: var(--text-sm);
   color: var(--text);
-}
-
-.teams-grant-ident {
-  font-family: var(--font-mono);
-  color: var(--text-faint);
 }

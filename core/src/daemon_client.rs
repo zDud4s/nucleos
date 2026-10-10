@@ -636,6 +636,53 @@ impl DaemonClient {
             .map_err(|e| e.to_string())
     }
 
+    /// Ask the owner for one NucleOS tool this box can serve but was not given.
+    ///
+    /// The run is not an argument: `request` sets the run header, so a run can only ask for itself.
+    /// A refusal is read back as the error text, the way `declare_refinement` does, because it says
+    /// why.
+    pub async fn request_tool(&self, tool: &str, reason: &str) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/loadout/tool-requests")
+            .json(&serde_json::json!({ "tool": tool, "reason": reason }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+
+    /// Read one context file the calling run was given.
+    ///
+    /// The run is not an argument: `request` sets the run header, so a run can only read the refs
+    /// of its own loadout. A refusal is read back as the error text because it says why.
+    pub async fn read_context(&self, path: &str) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::POST, "/context/read")
+            .json(&serde_json::json!({ "path": path }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let said = response.text().await.unwrap_or_default();
+            return Err(if said.trim().is_empty() {
+                format!("the core refused: {status}")
+            } else {
+                said
+            });
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+
     // The browser pillar's five agent verbs (spec §6.1).
     //
     // # What is NOT here, and why each absence is load-bearing
@@ -663,9 +710,14 @@ impl DaemonClient {
     // finishes a login and keeps the chain, and by no other means (spec §5.2).
 
     /// Open a browsing session. The profile is chosen by the daemon, never named here.
-    pub async fn browser_open(&self, project_id: &str, url: &str) -> Result<Value, String> {
+    pub async fn browser_open(
+        &self,
+        project_id: &str,
+        url: &str,
+        visible: bool,
+    ) -> Result<Value, String> {
         self.request(reqwest::Method::POST, "/browser/open")
-            .json(&serde_json::json!({ "project_id": project_id, "url": url }))
+            .json(&serde_json::json!({ "project_id": project_id, "url": url, "visible": visible }))
             .send()
             .await
             .map_err(|e| e.to_string())?
@@ -1215,6 +1267,28 @@ impl DaemonClient {
                 "files": files,
                 "base": base,
                 "wait": true,
+            }),
+        )
+        .await
+    }
+
+    /// Ask the daemon for a covered verification of a worktree (F3-13): `cover` makes the daemon
+    /// pick the base, so the request carries neither `files` nor `base`. The answer is a ticket, as
+    /// with `verify`.
+    ///
+    /// It submits with `wait: false`: the daemon then answers with the ticket id at once and the
+    /// caller follows it through `verify_status`. With `wait: true` the daemon holds this POST for
+    /// up to its own ceiling, so a caller whose limit is shorter times out with the id never read,
+    /// and a ticket that exists cannot be joined.
+    pub async fn verify_cover(&self, worktree: &str) -> Result<Value, String> {
+        self.verify_request(
+            "/verify",
+            &serde_json::json!({
+                "kind": "test",
+                "scope": "scope",
+                "worktree": worktree,
+                "cover": true,
+                "wait": false,
             }),
         )
         .await

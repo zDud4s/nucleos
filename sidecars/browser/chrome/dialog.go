@@ -82,6 +82,11 @@ func (d *Driver) onDialog(event cdp.Event) {
 	// answer, or for the prompt's timeout. No CDP call is made here, so this goroutine goes on
 	// answering the fence.
 	if state := d.person.Load(); state != nil && state.page == event.Session {
+		if d.visible {
+			// A visible window: the person answers the native dialog there. Nothing to raise, and
+			// nothing to answer on their behalf.
+			return
+		}
 		on := event.Session
 		raised := d.raisePrompt(state, on, browser.Prompt{
 			Kind:          "dialog",

@@ -449,6 +449,7 @@ mod tests {
             resume_session_id: None,
             mcp_config: None,
             mcp_job: None,
+            mcp_team_run: None,
             tool_policy: crate::runner::ToolPolicy::McpOnly,
             progress_timeout: None,
             max_turns: None,

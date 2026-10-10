@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"nucleosbrowser/cdp/cdptest"
 )
@@ -101,4 +102,67 @@ func erased(fake *cdptest.Browser) bool {
 		}
 	}
 	return false
+}
+
+// TestLookHidesThePanelDuringTheCapture. The picture is the agent's, and the panel is the person's:
+// each panel world is told to hide before the capture and to show again after it, in that order.
+func TestLookHidesThePanelDuringTheCapture(t *testing.T) {
+	fake, driver, _ := visiblePersonDriver(t)
+	session := opened(t, driver)
+	const panelContext = 70
+	panelWorldCreated(fake, cdpOf(driver, session.ID), panelContext)
+	key := contextKey{session: cdpOf(driver, session.ID), id: panelContext}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		driver.mu.Lock()
+		_, known := driver.contexts[key]
+		driver.mu.Unlock()
+		if known {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the driver never registered the panel world")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	fake.Handle("Page.captureScreenshot", func(cdptest.Call) (any, error) {
+		return map[string]any{"data": ""}, nil
+	})
+
+	if _, err := driver.Look(context.Background(), session.ID); err != nil {
+		t.Fatalf("look: %v", err)
+	}
+
+	hideAt, showAt, captureAt := -1, -1, -1
+	for i, call := range fake.Calls() {
+		switch call.Method {
+		case "Page.captureScreenshot":
+			captureAt = i
+		case "Runtime.evaluate":
+			var params struct {
+				Expression string `json:"expression"`
+				ContextID  int64  `json:"contextId"`
+			}
+			if json.Unmarshal(call.Params, &params) != nil || params.ContextID != panelContext {
+				continue
+			}
+			if !strings.Contains(params.Expression, "__nucleosHide") {
+				continue
+			}
+			if strings.Contains(params.Expression, "(true)") {
+				hideAt = i
+			} else if strings.Contains(params.Expression, "(false)") {
+				showAt = i
+			}
+		}
+	}
+	if captureAt < 0 {
+		t.Fatal("no capture was taken")
+	}
+	if hideAt < 0 || hideAt > captureAt {
+		t.Errorf("the panel was not hidden before the capture (hide %d, capture %d)", hideAt, captureAt)
+	}
+	if showAt < 0 || showAt < captureAt {
+		t.Errorf("the panel was not shown again after the capture (show %d, capture %d)", showAt, captureAt)
+	}
 }

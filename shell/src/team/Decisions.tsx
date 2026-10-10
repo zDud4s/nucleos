@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { AgentRequest } from "../data/agents";
+import type { AgentEngine, AgentRequest, AgentToolPolicy } from "../data/agents";
 import { isApiRefusal } from "../data/client";
 import type { Proposal } from "../data/system";
 import { useRejectProposal } from "../data/waiting";
@@ -18,7 +18,9 @@ import {
   Badge,
   Button,
   ConfirmButton,
+  Count,
   ErrorNote,
+  Field,
   Inset,
   Panel,
   Quiet,
@@ -74,21 +76,22 @@ export function Decisions({ team, runs }: DecisionsProps) {
 
   return (
     <div className="teams-decisions">
-      <Teach title="What this tab is a ceiling on">
+      <Teach title="Why only some actions appear here">
         <p>
-          The ceiling here is <strong>your attention</strong>, not the team&apos;s capacity:
+          The limit here is <strong>your attention</strong>, not the team&apos;s capacity:
           only the actions it has been granted as <em>asks first</em> ever queue. Anything granted
-          as <em>does it</em> happens on the next tick and never appears — change that on the
-          Charter tab, under Powers.
+          as <em>does it</em> happens within about ten seconds and never appears — change that on
+          the Charter tab, under Powers.
         </p>
       </Teach>
 
       <Panel title="Actions it wants to take" aside={<Count n={actions.data === undefined ? undefined : theirs.length} />}>
         {actions.isError && actions.data === undefined && (
-          <ErrorNote>the núcleo did not answer — nothing is known about what is waiting</ErrorNote>
+          <ErrorNote>NucleOS did not answer, so nothing is known about what is waiting.</ErrorNote>
         )}
+        {actions.isLoading && <Quiet says="Asking NucleOS…" />}
         {actions.data !== undefined && theirs.length === 0 && (
-          <Quiet says="nothing is waiting on you for this team." />
+          <Quiet says="Nothing is waiting on you for this team." />
         )}
         {theirs.length > 0 && (
           <ul className="teams-acts" aria-label="Actions">
@@ -100,12 +103,20 @@ export function Decisions({ team, runs }: DecisionsProps) {
       </Panel>
 
       <Panel title="Specialists it asked for" aside={<Count n={recruits.data === undefined ? undefined : asked.length} />}>
-        <p className="teams-note">
-          A director found a gap in its roster. The request is editable here before it is granted;
-          saying not now leaves nothing behind — the team may ask again.
-        </p>
+        {asked.length > 0 && (
+          <p className="teams-note">
+            A director found a gap in its roster. The request is editable here before it is
+            granted; saying not now leaves nothing behind, and the team may ask again.
+          </p>
+        )}
+        {recruits.isError && recruits.data === undefined && (
+          <ErrorNote>
+            Couldn&apos;t load the requested specialists. They&apos;ll show up when NucleOS answers.
+          </ErrorNote>
+        )}
+        {recruits.isLoading && <Quiet says="Asking NucleOS…" />}
         {recruits.data !== undefined && asked.length === 0 && (
-          <Quiet says="this team has not asked for anybody." />
+          <Quiet says="This team hasn't asked for anybody." />
         )}
         {asked.length > 0 && (
           <ul className="teams-acts" aria-label="Recruitment">
@@ -117,11 +128,6 @@ export function Decisions({ team, runs }: DecisionsProps) {
       </Panel>
     </div>
   );
-}
-
-/** A figure, or an em dash while nothing has answered — absent is not zero. */
-function Count({ n }: { n: number | undefined }) {
-  return <span className="teams-count">{n === undefined ? "—" : n}</span>;
 }
 
 /**
@@ -170,7 +176,7 @@ function ActionCard({ action }: { action: TeamAction }) {
         <StateBadge domain="team_action" state={teamActionState(action)} />
         <RelativeTime at={action.created_at} />
         {/* `null` means the grant was `allow`: nobody decides and it happens on
-            the next tick. It is here to be seen, not to be answered. */}
+            the next tick (ten seconds). It is here to be seen, not to be answered. */}
         {action.proposal_id === null && <Badge tone="info">granted — nobody decides</Badge>}
       </div>
 
@@ -197,9 +203,14 @@ function ActionCard({ action }: { action: TeamAction }) {
 
       {approve.isSuccess && (
         <p className="teams-act-outcome" role="status">
-          {/* Approving says yes and nothing else — the núcleo carries it out on
+          {/* Approving says yes and nothing else — the daemon carries it out on
               its next tick, which is why the answer is `queued`, not a result. */}
-          said yes — the núcleo carries it out on its next tick
+          Said yes. NucleOS carries it out within about ten seconds.
+        </p>
+      )}
+      {reject.isSuccess && (
+        <p className="teams-act-outcome" role="status">
+          Refused — it won&apos;t happen.
         </p>
       )}
       {approve.isError && <DecisionRefusal error={approve.error} what="this was not approved" />}
@@ -315,34 +326,36 @@ function RecruitCard({ proposal }: { proposal: Proposal }) {
   return (
     <Inset as="li">
       <div className="teams-act-head">
-        <span className="teams-act-kind">recruit #{proposal.id}</span>
+        <span className="teams-act-kind" title={`Recruitment #${proposal.id}`}>
+          specialist requested
+        </span>
         <RelativeTime at={proposal.created_at} />
       </div>
       <blockquote className="teams-act-why">
-        {proposal.reasoning.trim() === "" ? "nothing was recorded about why" : proposal.reasoning}
+        {proposal.reasoning.trim() === "" ? "Nothing was recorded about why." : proposal.reasoning}
       </blockquote>
 
       {form === null ? (
-        <pre className="teams-act-raw">{proposal.tool_input ?? "nothing was proposed"}</pre>
+        <pre className="teams-act-raw">{proposal.tool_input ?? "Nothing was proposed."}</pre>
       ) : (
         <div className="teams-hire">
-          <RecruitField id={idFor("name")} label="name">
+          <Field label="Name">
             <input
               className="teams-input"
               id={idFor("name")}
               value={form.name}
               onChange={(event) => field("name", event.target.value)}
             />
-          </RecruitField>
-          <RecruitField id={idFor("speciality")} label="speciality">
+          </Field>
+          <Field label="Speciality">
             <input
               className="teams-input"
               id={idFor("speciality")}
               value={form.speciality}
               onChange={(event) => field("speciality", event.target.value)}
             />
-          </RecruitField>
-          <RecruitField id={idFor("prompt")} label="prompt">
+          </Field>
+          <Field label="Prompt">
             <textarea
               className="teams-textarea"
               id={idFor("prompt")}
@@ -350,35 +363,39 @@ function RecruitCard({ proposal }: { proposal: Proposal }) {
               value={form.prompt}
               onChange={(event) => field("prompt", event.target.value)}
             />
-          </RecruitField>
-          <p className="teams-note">
-            Engine and tool policy are the two fields a director gets wrong most often — they are
-            also what costs money per turn and what widens what this specialist can reach.
-          </p>
-          <RecruitField id={idFor("engine")} label="engine">
-            <input
-              className="teams-input"
+          </Field>
+          <Field
+            label="Engine"
+            helper="Directors most often get the engine and tool policy wrong: the engine sets what each turn costs, and the tool policy sets what this specialist can reach."
+          >
+            <select
+              className="teams-select"
               id={idFor("engine")}
               value={form.engine}
               onChange={(event) => field("engine", event.target.value)}
-            />
-          </RecruitField>
-          <RecruitField id={idFor("model")} label="model">
+            >
+              <OptionsWith current={form.engine} known={RECRUIT_ENGINES} />
+            </select>
+          </Field>
+          <Field label="Model">
             <input
-              className="teams-input"
+              className="teams-input teams-input-num"
               id={idFor("model")}
+              placeholder="engine default"
               value={form.model ?? ""}
               onChange={(event) => field("model", event.target.value === "" ? null : event.target.value)}
             />
-          </RecruitField>
-          <RecruitField id={idFor("tool_policy")} label="tool policy">
-            <input
-              className="teams-input"
+          </Field>
+          <Field label="Tool policy">
+            <select
+              className="teams-select"
               id={idFor("tool_policy")}
               value={form.tool_policy}
               onChange={(event) => field("tool_policy", event.target.value)}
-            />
-          </RecruitField>
+            >
+              <OptionsWith current={form.tool_policy} known={RECRUIT_TOOL_POLICIES} />
+            </select>
+          </Field>
         </div>
       )}
 
@@ -387,7 +404,7 @@ function RecruitCard({ proposal }: { proposal: Proposal }) {
             hiring means keep this person, and it is written over whatever was
             edited above. */}
         <ConfirmButton
-          label={`Hire #${proposal.id}`}
+          label={`Hire ${form?.name || "specialist"}`}
           confirmLabel="Write the specialist and add them to the roster"
           variant="approve"
           disabled={hire.isPending || form === null}
@@ -402,7 +419,12 @@ function RecruitCard({ proposal }: { proposal: Proposal }) {
 
       {hire.isSuccess && hire.data !== undefined && (
         <p className="teams-act-outcome" role="status">
-          {hire.data.agent_id} is hired and on this team&apos;s roster
+          {hire.data.agent_id} is hired and on this team&apos;s roster.
+        </p>
+      )}
+      {reject.isSuccess && (
+        <p className="teams-act-outcome" role="status">
+          Refused — it won&apos;t happen.
         </p>
       )}
       {hire.isError && <DecisionRefusal error={hire.error} what="nobody was hired" />}
@@ -411,14 +433,31 @@ function RecruitCard({ proposal }: { proposal: Proposal }) {
   );
 }
 
-function RecruitField({ id, label, children }: { id: string; label: string; children: React.ReactNode }) {
+/** What the catalogue accepts for `engine` and `tool_policy` — the same lists `Agents.tsx` offers. */
+const RECRUIT_ENGINES: AgentEngine[] = ["claude", "codex", "local"];
+const RECRUIT_TOOL_POLICIES: AgentToolPolicy[] = ["mcp_only", "none"];
+
+/**
+ * A select's options, keeping whatever the director proposed even when it is not one of them.
+ *
+ * A director can propose a value the daemon refuses (`read_only` is the usual one). Dropping it
+ * would show the first option as if it had been proposed; keeping it, marked, shows what was
+ * asked for and lets the hire's refusal say why. (Same treatment as `Waiting.tsx`.)
+ */
+function OptionsWith({ current, known }: { current: string; known: string[] }) {
   return (
-    <div className="teams-field">
-      <label className="teams-label" htmlFor={id}>
-        {label}
-      </label>
-      {children}
-    </div>
+    <>
+      {!known.includes(current) && (
+        <option value={current}>
+          {current === "" ? "none proposed" : `${current} (not accepted)`}
+        </option>
+      )}
+      {known.map((value) => (
+        <option key={value} value={value}>
+          {value}
+        </option>
+      ))}
+    </>
   );
 }
 
@@ -431,5 +470,5 @@ function RecruitField({ id, label, children }: { id: string; label: string; chil
  */
 function DecisionRefusal({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
+  return <ErrorNote>NucleOS did not answer, so {what}.</ErrorNote>;
 }

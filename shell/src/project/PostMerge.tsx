@@ -25,10 +25,20 @@ function ShaList({ values }: { values: string[] }) {
  *
  * It draws what the rules read reported and nothing else: no control, no request. A project whose
  * gate has never run on its target (`postgate` null, or absent from an older daemon) draws nothing.
+ * When the daemon could not read the state (`postgate` null with `postgate_error` set) it says so
+ * and shows the error, rather than looking the same as "never run".
  */
 export function PostMergePanel({ rules }: { rules: ProjectRules }) {
   const state = rules.postgate;
-  if (state == null) return null;
+  if (state == null) {
+    if (rules.postgate_error == null) return null;
+    return (
+      <Panel title="Post-merge gate">
+        <p className="pj-wip-state">The post-merge state could not be read.</p>
+        <p className="pj-note">{rules.postgate_error}</p>
+      </Panel>
+    );
+  }
 
   const red = state.red_groups.length > 0;
 
