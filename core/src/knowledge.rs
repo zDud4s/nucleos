@@ -1379,6 +1379,45 @@ async fn for_columns(
         .await
 }
 
+/// The `active` rows of `scope`'s chain, outside the working layer, that match the FTS
+/// `expression`, best match first and at most [`MAX_READ`] of them.
+///
+/// For `brief::recall`, which used to filter [`for_scope`]'s rows: those are the OLDEST
+/// `MAX_READ` by id, so in a scope holding more, every newer row was never searched at all. Here
+/// the match comes first and the ceiling cuts the weakest matches instead.
+pub async fn matching_for_scope(
+    pool: &SqlitePool,
+    scope: &Scope,
+    expression: &str,
+) -> sqlx::Result<Vec<Known>> {
+    let chain = scope.chain();
+    let terms: Vec<&str> = chain
+        .iter()
+        .map(|_| "(scope_kind = ? AND scope_id IS ?)")
+        .collect();
+    let sql = format!(
+        "WITH hits AS (
+             SELECT rowid AS id, bm25(knowledge_fts) AS rank
+               FROM knowledge_fts
+              WHERE knowledge_fts MATCH ?
+         )
+         SELECT {COLUMNS}
+           FROM knowledge JOIN hits USING (id)
+          WHERE status = 'active' AND layer <> 'working'
+            AND ({})
+          ORDER BY hits.rank, id
+          LIMIT ?",
+        terms.join(" OR ")
+    );
+    // SAFETY: as in `for_columns` — the interpolated parts are `COLUMNS` and one literal term per
+    // link of the chain; every value is bound.
+    let mut query = sqlx::query_as::<_, Known>(sqlx::AssertSqlSafe(sql)).bind(expression);
+    for (kind, id) in &chain {
+        query = query.bind(*kind).bind(id.clone());
+    }
+    query.bind(MAX_READ as i64).fetch_all(pool).await
+}
+
 /// How many approved rows are read before rendering ever begins.
 pub const MAX_READ: usize = 200;
 
@@ -3333,6 +3372,44 @@ mod tests {
         .await
         .unwrap();
         assert!(recalled.is_empty(), "recall answered a live row");
+    }
+
+    /// Recall used to search only the oldest `MAX_READ` rows of a scope, so a row past them was
+    /// never found however well it matched.
+    #[tokio::test]
+    async fn recall_finds_a_row_newer_than_the_first_max_read() {
+        let pool = test_pool().await;
+        for n in 0..=MAX_READ {
+            sqlx::query(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES ('semantic', 'project', 'p', 'owner', 'memory', ?, 'filler', 'active',
+                         '2026-09-20T00:00:00+00:00')",
+            )
+            .bind(format!("row {n}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let newest: i64 = sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'project', 'p', 'owner', 'memory', 'the needle',
+                     'zanzibarword', 'active', '2026-09-20T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let recalled =
+            crate::brief::recall(&pool, &Scope::Project("p".into()), "zanzibarword", None)
+                .await
+                .unwrap();
+        assert_eq!(
+            recalled.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![newest]
+        );
     }
 
     /// No run behind the request means the owner made it, and both the row and its first event say

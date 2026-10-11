@@ -165,7 +165,7 @@ pub async fn recall(
     let Some(expression) = match_expression(query) else {
         return Ok(Vec::new());
     };
-    let mut known = knowledge::for_scope(pool, scope).await?;
+    let mut known = knowledge::matching_for_scope(pool, scope, &expression).await?;
     known.retain(|row| {
         row.layer != knowledge::Layer::Working.as_str()
             && layer.is_none_or(|layer| row.layer == layer.as_str())

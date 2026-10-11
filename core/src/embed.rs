@@ -234,8 +234,17 @@ pub async fn nearest_in(
     Ok(best)
 }
 
-/// Embeds up to `limit` live rows that lack a vector from this embedder's model, oldest first.
-/// Stops at the first embed error (Ollama down) and returns the count done so far.
+/// Consecutive embed errors after which a backfill pass takes the embedder for down and stops.
+const DOWN_AFTER: usize = 3;
+
+/// Embeds up to `limit` live rows that lack a vector from this embedder's model, oldest first,
+/// and returns how many it embedded.
+///
+/// One error does not end the pass: the row is passed over and the next one tried. An error is
+/// the ROW's fault once another row embeds after it, and that row is then marked in
+/// `knowledge_embed_failures` and skipped until its text or the model changes — oldest first, a row
+/// that always fails would otherwise keep every row behind it from being reached. `DOWN_AFTER`
+/// errors in a row end the pass instead, without blaming any of those rows: that is Ollama down.
 pub async fn backfill(
     pool: &SqlitePool,
     embedder: &dyn Embedder,
@@ -245,24 +254,46 @@ pub async fn backfill(
         "SELECT k.id, k.title, k.body
            FROM knowledge k
            LEFT JOIN knowledge_embeddings e ON e.knowledge_id = k.id
+           LEFT JOIN knowledge_embed_failures f ON f.knowledge_id = k.id AND f.model = ?
           WHERE k.status IN ('active', 'proposed')
             AND (e.knowledge_id IS NULL OR e.model <> ?)
+            AND f.knowledge_id IS NULL
           ORDER BY k.id
           LIMIT ?",
     )
+    .bind(embedder.model())
     .bind(embedder.model())
     .bind(limit)
     .fetch_all(pool)
     .await?;
     let mut done = 0;
+    let mut failing: Vec<i64> = Vec::new();
     for row in rows {
         let id: i64 = row.get("id");
         let title: String = row.get("title");
         let body: String = row.get("body");
         let Ok(vector) = embedder.embed(&text_of(&title, &body)).await else {
-            break;
+            failing.push(id);
+            if failing.len() >= DOWN_AFTER {
+                break;
+            }
+            continue;
         };
         let mut conn = pool.acquire().await?;
+        for failed in failing.drain(..) {
+            sqlx::query(
+                "INSERT INTO knowledge_embed_failures (knowledge_id, model, failed_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(knowledge_id) DO UPDATE SET
+                   model = excluded.model,
+                   failed_at = excluded.failed_at",
+            )
+            .bind(failed)
+            .bind(embedder.model())
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&mut *conn)
+            .await?;
+        }
         store_in(&mut conn, id, embedder.model(), &vector).await?;
         done += 1;
     }
@@ -563,6 +594,95 @@ mod tests {
         );
         assert_eq!(stored_model(&pool, rejected).await, None);
         assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 0);
+    }
+
+    /// Fails every text containing "poison", or every text at all once `down` is set.
+    struct Picky {
+        down: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for Picky {
+        fn model(&self) -> &str {
+            "m"
+        }
+
+        async fn embed(&self, text: &str) -> std::io::Result<Vec<f32>> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) || text.contains("poison") {
+                return Err(std::io::Error::other("no"));
+            }
+            Ok(vec![1.0, 0.0])
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_that_always_fails_stops_holding_the_head_of_the_queue() {
+        let pool = test_pool().await;
+        let poison = seed(&pool, "alpha", "active", "poison").await;
+        let behind = seed(&pool, "alpha", "active", "fine").await;
+        let embedder = Picky { down: false.into() };
+
+        assert_eq!(backfill(&pool, &embedder, 1).await.unwrap(), 0);
+        assert_eq!(backfill(&pool, &embedder, 2).await.unwrap(), 1);
+        assert_eq!(stored_model(&pool, behind).await.as_deref(), Some("m"));
+
+        // Marked now, so a pass of one reaches past it rather than trying it again.
+        let next = seed(&pool, "alpha", "active", "also fine").await;
+        assert_eq!(backfill(&pool, &embedder, 1).await.unwrap(), 1);
+        assert_eq!(stored_model(&pool, next).await.as_deref(), Some("m"));
+
+        // New text is tried again.
+        sqlx::query("UPDATE knowledge SET title = 'cured' WHERE id = ?")
+            .bind(poison)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(backfill(&pool, &embedder, 5).await.unwrap(), 1);
+        assert_eq!(stored_model(&pool, poison).await.as_deref(), Some("m"));
+    }
+
+    #[tokio::test]
+    async fn an_embedder_that_is_down_blames_no_row() {
+        let pool = test_pool().await;
+        for title in ["a", "b", "c", "d"] {
+            seed(&pool, "alpha", "active", title).await;
+        }
+        let embedder = Picky { down: true.into() };
+
+        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 0);
+
+        let marked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_embed_failures")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(marked, 0);
+        embedder
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn rewriting_a_rows_text_drops_its_vector_and_keeps_others() {
+        let pool = test_pool().await;
+        let rewritten = seed(&pool, "alpha", "active", "old title").await;
+        let touched = seed(&pool, "alpha", "active", "same title").await;
+        store(&pool, rewritten, "m", &[1.0, 0.0]).await;
+        store(&pool, touched, "m", &[1.0, 0.0]).await;
+
+        sqlx::query("UPDATE knowledge SET title = 'new title' WHERE id = ?")
+            .bind(rewritten)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE knowledge SET title = title, last_confirmed_at = 'x' WHERE id = ?")
+            .bind(touched)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(stored_model(&pool, rewritten).await, None);
+        assert_eq!(stored_model(&pool, touched).await.as_deref(), Some("m"));
     }
 
     #[tokio::test]

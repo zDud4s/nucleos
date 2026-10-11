@@ -343,6 +343,21 @@ pub async fn remove(
         .await?
         .rows_affected();
 
+        // `knowledge_embed_failures` with it and for the same reason: a failure mark names a row's
+        // text, and a forgotten row's id must not stay marked when the id is reused.
+        forgotten += sqlx::query(
+            "DELETE FROM knowledge_embed_failures
+              WHERE knowledge_id IN (
+                    SELECT id FROM knowledge
+                     WHERE (scope_kind = 'project' AND scope_id = ?1)
+                        OR (scope_kind = 'job'
+                            AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1)))",
+        )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
         forgotten += sqlx::query(
             "DELETE FROM knowledge_events
               WHERE knowledge_id IN (
