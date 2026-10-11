@@ -7,14 +7,9 @@
 # line whose file no longer exists, or that sits at or under the limit. Nothing new is ever added
 # here: a new file past the limit is split by what it does, not given a line.
 src/team.rs 3368
-src/assistant.rs 2385
-src/knowledge.rs 2023
 src/council.rs 2006
-src/execution/vcs.rs 1730
-src/governance/classifier.rs 1549
 src/main.rs 1532
 src/execution/worktree.rs 1396
-src/integrations/github.rs 1330
 src/verify.rs 1309
 src/verify/postgate_worker.rs 1216
 src/devtime/rules.rs 1141
