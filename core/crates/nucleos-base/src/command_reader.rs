@@ -200,6 +200,53 @@ pub fn without_quoted_text(command: &str) -> Option<String> {
     (!single && !double).then_some(masked)
 }
 
+/// Blanks the character a POSIX backslash escapes inside double quotes, keeping the backslash.
+///
+/// Why: in `"route(\"/p/{id}/w"` the `\"` is a literal quote to every POSIX shell, but
+/// `without_quoted_text` toggles on every `"`, so a `\"` closed the quote for every guard that reads
+/// the masked line and the rest of the argument was read as live text. Run through this first, the
+/// pair becomes `\x`: the quote is gone, the backslash stays, and the token structure is unchanged.
+/// Only `\"`, `\\`, `` \` `` and `\$` are escapes inside double quotes (POSIX 2.2.3), and only
+/// inside them — in single quotes and in unquoted text the walk leaves the backslash alone.
+///
+/// PowerShell is handed back untouched, deliberately: its escape character is the backtick, and a
+/// backslash is an ordinary character there, so `"a\"` really does close the quote. Masking it would
+/// hide a quote the shell sees and turn a live redirect into text.
+///
+/// Idempotent, and `Cow::Borrowed` when there was nothing to mask.
+pub fn escapes_masked(segment: &str, shell: Shell) -> std::borrow::Cow<'_, str> {
+    if shell == Shell::PowerShell {
+        return std::borrow::Cow::Borrowed(segment);
+    }
+    let mut masked = String::with_capacity(segment.len());
+    let mut changed = false;
+    let mut single = false;
+    let mut double = false;
+    let mut chars = segment.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '\\' if double => {
+                masked.push(c);
+                if matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) {
+                    chars.next();
+                    changed = true;
+                    masked.push('x');
+                }
+                continue;
+            }
+            _ => {}
+        }
+        masked.push(c);
+    }
+    if changed {
+        std::borrow::Cow::Owned(masked)
+    } else {
+        std::borrow::Cow::Borrowed(segment)
+    }
+}
+
 /// The quote-aware walk, lifted from `vcs::shell_segments` where it was already trusted with the
 /// question of whether a line publishes to a branch.
 fn walk(command: &str, policy: Policy) -> Result<Vec<&str>, &'static str> {
@@ -239,6 +286,17 @@ fn walk(command: &str, policy: Policy) -> Result<Vec<&str>, &'static str> {
         while let Some((at, c)) = chars.next() {
             match c {
                 '\'' if !double => single = !single,
+                // Inside double quotes a backslash escapes `"`, `\`, `$` and a backtick, so the
+                // character after it cannot close the quote. Single quotes and unquoted text keep
+                // their old reading.
+                '\\' if double => {
+                    if chars
+                        .peek()
+                        .is_some_and(|(_, next)| matches!(next, '"' | '\\' | '$' | '`'))
+                    {
+                        chars.next();
+                    }
+                }
                 '"' if !single => double = !double,
                 '<' if !single && !double => {
                     let rest = &body[at..];
@@ -768,5 +826,57 @@ mod tests {
         assert!(without_quoted_text("echo 'unclosed ; whoami").is_none());
         // A quote closed by the OTHER kind is still open.
         assert!(without_quoted_text(r#"echo "a' "#).is_none());
+    }
+
+    /// 2026-10-11, the owner's `grep` parked in a chat. The `\"` inside the pattern is an escaped
+    /// quote to every POSIX shell, but the walk toggled on it, so the quote never closed, the pipe
+    /// to `head` looked quoted, and the whole line read as one unterminated piece.
+    #[test]
+    fn a_backslash_escaped_quote_does_not_close_a_double_quoted_argument() {
+        let command = r#"grep -n "route(\"/p/{id}/w" src/http.rs src/http/*.rs | head"#;
+        let segments = pieces(command);
+        assert_eq!(segments.len(), 2, "the pipe was swallowed: {segments:?}");
+        assert_eq!(segments[1], "head");
+
+        // The mask the classifier's guards read must close the quote too, or they refuse the line.
+        let masked = escapes_masked(segments[0], Shell::Posix);
+        assert!(
+            without_quoted_text(&masked).is_some(),
+            "the escaped quote still left the quote open: {masked}"
+        );
+    }
+
+    /// A backslash is an escape only inside double quotes (single quotes keep it literal) and only
+    /// for POSIX — PowerShell's escape is the backtick, so there `\"` really does close the quote.
+    #[test]
+    fn escapes_count_only_inside_double_quotes_and_only_for_posix() {
+        // Inside single quotes the backslash is a character like any other.
+        let single = r#"echo 'a\' b"#;
+        let masked = escapes_masked(single, Shell::Posix);
+        assert!(
+            matches!(masked, std::borrow::Cow::Borrowed(_)),
+            "text with no escape was copied"
+        );
+        assert_eq!(masked, single);
+
+        // `\\` is one escaped backslash, so it closes nothing and the next `"` does.
+        let doubled = r#"grep "x\\" ; touch y"#;
+        let masked = escapes_masked(doubled, Shell::Posix);
+        assert_eq!(pieces(&masked), vec![r#"grep "x\x""#, "touch y"]);
+
+        // Idempotent: a masked segment has nothing left to mask.
+        assert!(matches!(
+            escapes_masked(&masked, Shell::Posix),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        // PowerShell is handed back untouched.
+        let powershell = r#"echo "a\" > o""#;
+        let masked = escapes_masked(powershell, Shell::PowerShell);
+        assert!(
+            matches!(masked, std::borrow::Cow::Borrowed(_)),
+            "a PowerShell line was rewritten"
+        );
+        assert_eq!(masked, powershell);
     }
 }

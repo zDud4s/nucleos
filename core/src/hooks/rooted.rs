@@ -18,16 +18,45 @@ pub(super) async fn chat_of_run(pool: &sqlx::SqlitePool, run_id: i64) -> Option<
 /// Read from the CHAT and not from the run, because it is a property of the conversation: every
 /// turn of a continued conversation runs in the same place, and a run column would be a second copy
 /// free to disagree with the one `assistant.rs` launches from.
-pub(super) async fn rooted_turn(state: &AppState, run_id: i64) -> Option<String> {
-    sqlx::query_scalar::<_, Option<String>>(
-        "SELECT c.cwd FROM runs r JOIN chats c ON c.chat_id = r.chat_id WHERE r.id = ?",
+///
+/// Returns the conversation's CURRENT permission mode beside it, read in the same query so the hook
+/// path pays no extra read: the selector is the live rung, and the run's own column is only the
+/// turn's snapshot (see `effective_permission`). A NULL or unreadable mode reads as `Auto`.
+pub(super) async fn rooted_turn(
+    state: &AppState,
+    run_id: i64,
+) -> Option<(String, crate::chats::PermissionMode)> {
+    let (cwd, mode) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT c.cwd, c.permission_mode FROM runs r JOIN chats c ON c.chat_id = r.chat_id \
+         WHERE r.id = ?",
     )
     .bind(run_id)
     .fetch_optional(&state.pool)
     .await
     .ok()
-    .flatten()
-    .flatten()
+    .flatten()?;
+    let mode = mode.as_deref().map_or(
+        crate::chats::PermissionMode::Auto,
+        crate::chats::PermissionMode::from_wire,
+    );
+    Some((cwd?, mode))
+}
+
+/// The rung that governs a rooted turn's tool call: the conversation's current one, except for `plan`.
+///
+/// `plan` is the CLI's own `--permission-mode`, fixed when the process was spawned, so a turn that
+/// started on it keeps it and a turn that did not cannot be put on it halfway. Every other rung
+/// lives only in this hook, so moving the selector takes effect on the very next call.
+pub(super) fn effective_permission(
+    snapshot: crate::chats::PermissionMode,
+    current: crate::chats::PermissionMode,
+) -> crate::chats::PermissionMode {
+    use crate::chats::PermissionMode::Plan;
+    if snapshot == Plan || current == Plan {
+        snapshot
+    } else {
+        current
+    }
 }
 
 /// What `bypass` says when it lowers a refusal to a question.
@@ -97,13 +126,32 @@ pub(super) fn allowed_at(
     }
 }
 
-pub(super) async fn rooted_decision(
+/// What the ladder says about one tool call, short of putting a question to anybody.
+pub(super) enum Rung {
+    /// The ladder has an answer: an allow, or a refusal no rung can lower.
+    Decided(Decision),
+    /// Nothing refused it and no rung allowed it: the call a person is asked about, or, on
+    /// `dont_ask`, refused. `reason` is the classifier's own sentence, and `action_class` is its
+    /// class for the call: a judge that is sure still may not approve some classes (`push-merge-deploy`).
+    Unallowed {
+        reason: String,
+        action_class: &'static str,
+    },
+}
+
+/// The ladder from the NucleOS-only path through the classifier, `bypass`, the read-untrusted
+/// barrier and `allowed_at`.
+///
+/// Split out of `rooted_decision` so that a standing question can be decided again by exactly the
+/// code that asked it (`reconsider_asks`): one definition of "this would be allowed", rather than a
+/// second copy to drift from the first. Nothing here registers a question or spawns a judge.
+pub(super) async fn rooted_verdict(
     state: &AppState,
     payload: &PreToolUsePayload,
     root: &str,
     project_id: Option<&str>,
     permission: crate::chats::PermissionMode,
-) -> Json<Decision> {
+) -> Rung {
     // Corrected in the handler before this is called, so it is the turn that is actually running
     // rather than the one a living process was spawned for.
     let run_id = payload.run_id;
@@ -114,7 +162,7 @@ pub(super) async fn rooted_decision(
         let ambient = !payload.tool_name.starts_with("mcp__nucleos__")
             && crate::chats::ambient_mcp_for_run(&state.pool, run_id).await;
         if !ambient {
-            return assistant_decision(state, payload).await;
+            return Rung::Decided(assistant_decision(state, payload).await.0);
         }
     }
 
@@ -199,7 +247,7 @@ pub(super) async fn rooted_decision(
     let classification = rules.downgrade_if_unreadable(classification);
 
     if classification.decision.decision == "deny" {
-        return Json(Decision {
+        return Rung::Decided(Decision {
             decision: "deny".to_owned(),
             reason: classification.reason,
         });
@@ -228,7 +276,7 @@ pub(super) async fn rooted_decision(
                     tool = %payload.tool_name,
                     "pretooluse-decision: refused a rooted turn's action after it read third-party content"
                 );
-                return Json(Decision {
+                return Rung::Decided(Decision {
                     decision: "deny".to_owned(),
                     reason: UNTRUSTED_CONTEXT_DENY_REASON.to_owned(),
                 });
@@ -240,7 +288,7 @@ pub(super) async fn rooted_decision(
                     %error,
                     "pretooluse-decision: could not tell whether the rooted turn has read third-party content — failing closed"
                 );
-                return Json(Decision {
+                return Rung::Decided(Decision {
                     decision: "deny".to_owned(),
                     reason: "could not tell whether this turn has read third-party content"
                         .to_owned(),
@@ -253,11 +301,37 @@ pub(super) async fn rooted_decision(
     if classification.decision.decision == "allow"
         && allowed_at(permission, classification.action_class, &payload.tool_name)
     {
-        return Json(Decision {
+        return Rung::Decided(Decision {
             decision: "allow".to_owned(),
             reason: classification.reason,
         });
     }
+
+    Rung::Unallowed {
+        action_class: classification.action_class,
+        reason: classification.reason,
+    }
+}
+
+/// `rooted_verdict` and what only a live hook call does with a call the rung did not allow: the
+/// verdict already given this turn, the refusal on `dont_ask`, the question, and the judge.
+pub(super) async fn rooted_decision(
+    state: &AppState,
+    payload: &PreToolUsePayload,
+    root: &str,
+    project_id: Option<&str>,
+    permission: crate::chats::PermissionMode,
+    snapshot: crate::chats::PermissionMode,
+) -> Json<Decision> {
+    let (reason, action_class) =
+        match rooted_verdict(state, payload, root, project_id, permission).await {
+            Rung::Decided(decision) => return Json(decision),
+            Rung::Unallowed {
+                reason,
+                action_class,
+            } => (reason, action_class),
+        };
+    let run_id = payload.run_id;
 
     // Asked about, rather than refused. `ROOTED_APPROVAL_DENY_REASON` said "do it in the window" and
     // there was nowhere in the window to do it — which made a coding conversation stop at the first
@@ -314,16 +388,26 @@ pub(super) async fn rooted_decision(
     if permission == crate::chats::PermissionMode::DontAsk {
         return Json(Decision {
             decision: "deny".to_owned(),
-            reason: format!("{}{DONT_ASK_CLAUSE}", classification.reason),
+            reason: format!("{reason}{DONT_ASK_CLAUSE}"),
         });
     }
 
     if let Some(chat_id) = chat_of_run(&state.pool, run_id).await {
-        let ask_id = crate::hooks::ask_about(
+        // The call rides with the question so that moving the selector can decide it again
+        // (`reconsider_asks`) through the very ladder that asked it. `snapshot` and not
+        // `permission`: `effective_permission` is applied to the turn's own column, and the
+        // effective rung of the moment is not that.
+        let ask_id = crate::hooks::ask_about_call(
             &chat_id,
             run_id,
             &payload.tool_name,
             crate::execution::runner::detail_of(&payload.tool_input),
+            crate::hooks::AskedCall {
+                tool_input: payload.tool_input.clone(),
+                root: root.to_owned(),
+                project_id: project_id.map(str::to_owned),
+                snapshot,
+            },
         );
         // **`auto` only.** Not `manual`, where a rung called Manual whose answer comes from a model
         // is a rung that lies; not `accept_edits`, one line above for the same reason; not `bypass`,
@@ -342,11 +426,12 @@ pub(super) async fn rooted_decision(
                 payload.tool_name.clone(),
                 payload.tool_input.clone(),
                 key,
+                action_class,
             );
         }
         return Json(Decision {
             decision: "asking".to_owned(),
-            reason: classification.reason,
+            reason,
         });
     }
 
@@ -356,4 +441,51 @@ pub(super) async fn rooted_decision(
         decision: "deny".to_owned(),
         reason: ROOTED_APPROVAL_DENY_REASON.to_owned(),
     })
+}
+
+/// Answers `allow` to every standing question of a conversation that `chosen` would not have asked.
+///
+/// Called when the person moves the selector: a question put while the conversation was on a
+/// stricter rung is still blocking a hook call, and leaving it for the 45-second window to refuse
+/// would make a move up the ladder take effect only from the next tool call.
+///
+/// It runs `rooted_verdict` again, over the call the question remembered, rather than comparing
+/// rungs. That is the point: what "would allow" means has one definition, so the classifier, the
+/// project's declared rules and the read-untrusted barrier (re-read NOW, so a turn that has read a
+/// stranger's words since it asked is not let through) all apply exactly as they do to a new call.
+///
+/// One direction only. It never answers `false` — a refusal is the hook's to give, and a person's
+/// to give by hand — never registers a question and never spawns a judge, so a rung that merely
+/// declines to allow (`dont_ask` over an install) leaves the question standing.
+///
+/// Returns how many it answered.
+pub async fn reconsider_asks(
+    state: &AppState,
+    chat_id: &str,
+    chosen: crate::chats::PermissionMode,
+) -> usize {
+    let mut answered = 0;
+    for (id, run_id, tool_name, call) in crate::hooks::asks::open_calls(chat_id) {
+        let payload = PreToolUsePayload {
+            run_id,
+            tool_name,
+            tool_input: call.tool_input,
+        };
+        let permission = effective_permission(call.snapshot, chosen);
+        let verdict = rooted_verdict(
+            state,
+            &payload,
+            &call.root,
+            call.project_id.as_deref(),
+            permission,
+        )
+        .await;
+        if let Rung::Decided(decision) = verdict
+            && decision.decision == "allow"
+            && crate::hooks::answer_ask(&id, true)
+        {
+            answered += 1;
+        }
+    }
+    answered
 }
