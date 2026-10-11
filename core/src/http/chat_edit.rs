@@ -877,6 +877,8 @@ pub(super) async fn patch_chat(
                 tracing::warn!(%error, "changing what a conversation may do without asking failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+        // The running turn now decides with this rung; asks it allows are answered here.
+        crate::hooks::reconsider_asks(&state, &chat_id, permission_mode).await;
     }
 
     if let Some(on) = body.ambient_mcp {

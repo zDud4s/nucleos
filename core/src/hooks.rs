@@ -4476,9 +4476,10 @@ mod tests {
     /// The same turn, started on a named rung, and renumbered so the process-wide registers cannot
     /// confuse it with another test's.
     ///
-    /// The run's own column and not the chat's, which is the whole point of there being two: the
-    /// hook reads what this turn STARTED with, so that moving the selector mid-turn cannot change
-    /// the rules underneath a turn already running.
+    /// BOTH columns are set to `permission`: the run's (the turn's snapshot, which only `plan`
+    /// still obeys mid-turn) and the chat's (the conversation's live rung, which the hook reads on
+    /// every call). A test that wants them to differ moves the chat's afterwards with
+    /// `set_permission_mode`, which is exactly what a person moving the selector mid-turn does.
     async fn rooted_turn_on(
         state: &AppState,
         root: &str,
@@ -4499,6 +4500,10 @@ mod tests {
         if let Some(handle) = handle {
             state.run_handles.lock().unwrap().insert(run_id, handle);
         }
+        let chat_id = chat_of_run(&state.pool, run_id).await.unwrap();
+        crate::chats::set_permission_mode(&state.pool, &chat_id, permission)
+            .await
+            .unwrap();
         run_id
     }
 
@@ -5581,13 +5586,14 @@ mod tests {
         }
     }
 
-    /// The reason the run carries a column of its own.
+    /// The conversation's CURRENT rung governs the turn, read on every tool call.
     ///
-    /// The hook reads the turn's SNAPSHOT, not the conversation's current setting. Without that,
-    /// moving the selector while a turn is running would change the rules underneath a turn already
-    /// running — and the hook reads this once per tool call, minutes after the turn began.
+    /// The turn's snapshot used to win, which made the selector a lie for as long as an answer
+    /// took: a person who moved it to `bypass` while the turn was working was asked about the very
+    /// next write all the same. The snapshot stays a column on the run for the one rung that really
+    /// is fixed at spawn (see the next test) and for callers that are not a chat.
     #[tokio::test]
-    async fn the_hook_reads_the_turns_snapshot_and_not_the_conversations_current_setting() {
+    async fn the_hook_reads_the_conversations_current_mode_mid_turn() {
         let state = test_state().await;
         let app = test_router(state.clone());
         let run_id = rooted_turn_on(
@@ -5598,11 +5604,7 @@ mod tests {
         .await;
 
         // Somebody moves the selector to the widest rung while the turn is mid-answer.
-        let chat_id: String = sqlx::query_scalar("SELECT chat_id FROM runs WHERE id = ?")
-            .bind(run_id)
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        let chat_id = chat_of_run(&state.pool, run_id).await.unwrap();
         crate::chats::set_permission_mode(
             &state.pool,
             &chat_id,
@@ -5622,8 +5624,236 @@ mod tests {
             )
             .await
             .decision,
+            "allow",
+            "this turn started on `manual`, and the conversation has since moved to `bypass`"
+        );
+    }
+
+    /// `plan` is the one rung the hook cannot move: it is the CLI's own `--permission-mode`, fixed
+    /// when the process was spawned, so a turn that started on it keeps it and a turn that did not
+    /// cannot be put on it halfway. Both directions are asserted, because either alone passes for
+    /// a hook that simply ignores the chat again.
+    #[tokio::test]
+    async fn a_move_into_or_out_of_plan_waits_for_the_next_turn() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let write = |run_id: i64| {
+            probe(
+                run_id,
+                "Write",
+                serde_json::json!({"file_path": "C:/Projects/nucleos/a.rs", "content": "x"}),
+            )
+        };
+
+        // Out of plan: started on it, the conversation is now on `manual`, which would ask.
+        let planning = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Plan,
+        )
+        .await;
+        let chat_id = chat_of_run(&state.pool, planning).await.unwrap();
+        crate::chats::set_permission_mode(
+            &state.pool,
+            &chat_id,
+            crate::chats::PermissionMode::Manual,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            decide(&app, &write(planning)).await.decision,
+            "allow",
+            "a turn that started in plan is still governed as plan, which allows what `auto` does"
+        );
+
+        // Into plan: started on `manual`, the conversation is now on `plan`.
+        let working = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Manual,
+        )
+        .await;
+        let chat_id = chat_of_run(&state.pool, working).await.unwrap();
+        crate::chats::set_permission_mode(
+            &state.pool,
+            &chat_id,
+            crate::chats::PermissionMode::Plan,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            decide(&app, &write(working)).await.decision,
             "asking",
-            "this turn started on `manual` and finishes on it"
+            "the CLI was not launched in plan, so this turn stays on the rung it started with"
+        );
+    }
+
+    /// Moving the selector up answers what is already waiting, instead of leaving a question open
+    /// that the new rung would never have asked.
+    ///
+    /// The count is half the claim: `1` for the call the new rung allows and `0` for the one it
+    /// does not, so a `reconsider_asks` that answered everything it found could not pass.
+    #[tokio::test]
+    async fn a_rung_change_answers_every_open_ask_the_new_rung_allows() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+
+        // An in-workspace write, asked about on `manual` and allowed by `accept_edits`.
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Manual,
+        )
+        .await;
+        let chat_id = chat_of_run(&state.pool, run_id).await.unwrap();
+        assert_eq!(
+            decide(
+                &app,
+                &probe(
+                    run_id,
+                    "Write",
+                    serde_json::json!({"file_path": "C:/Projects/nucleos/a.rs", "content": "x"})
+                )
+            )
+            .await
+            .decision,
+            "asking"
+        );
+        assert_eq!(asks_for(&chat_id).len(), 1);
+
+        assert_eq!(
+            reconsider_asks(&state, &chat_id, crate::chats::PermissionMode::AcceptEdits).await,
+            1,
+            "`accept_edits` allows the write the person was being asked about"
+        );
+        assert_eq!(
+            wait_for_run(run_id, std::time::Duration::from_millis(500)).await,
+            Some(true),
+            "and the waiting hook hears it as an allow"
+        );
+
+        // A command no rule recognises: asked about on `manual`, still asked about on `accept_edits`.
+        let other = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Manual,
+        )
+        .await;
+        let other_chat = chat_of_run(&state.pool, other).await.unwrap();
+        assert_eq!(
+            decide(
+                &app,
+                &probe(other, "Bash", serde_json::json!({"command": "npm install"}))
+            )
+            .await
+            .decision,
+            "asking"
+        );
+        assert_eq!(
+            reconsider_asks(
+                &state,
+                &other_chat,
+                crate::chats::PermissionMode::AcceptEdits
+            )
+            .await,
+            0,
+            "`accept_edits` does not allow an install, so the question stands"
+        );
+        let standing = asks_for(&other_chat);
+        assert_eq!(standing.len(), 1, "and it is still open for the person");
+
+        // Clean up: the register is process-wide.
+        assert!(answer_ask(&standing[0].id, false));
+        assert_eq!(
+            wait_for_run(other, std::time::Duration::from_millis(500)).await,
+            Some(false)
+        );
+    }
+
+    /// A rung change is only ever a way to say yes to something the rules already allow — never a
+    /// way around them.
+    ///
+    /// Two different refusals, each one the ladder's own: a call from a turn that has since read a
+    /// stranger's words stays unanswered even on `bypass`, and a call `auto` would only have asked
+    /// about stays unanswered on `dont_ask`, which allows no more than `auto` does. A
+    /// `reconsider_asks` that answered `true` for the rung alone would pass the first by ignoring
+    /// the barrier and the second by ignoring the classifier.
+    #[tokio::test]
+    async fn a_rung_change_never_answers_what_the_rules_refuse() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+
+        // The barrier: the write was asked about, and THEN the turn read third-party content.
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Manual,
+        )
+        .await;
+        let chat_id = chat_of_run(&state.pool, run_id).await.unwrap();
+        assert_eq!(
+            decide(
+                &app,
+                &probe(
+                    run_id,
+                    "Write",
+                    serde_json::json!({"file_path": "C:/Projects/nucleos/a.rs", "content": "x"})
+                )
+            )
+            .await
+            .decision,
+            "asking"
+        );
+        sqlx::query("UPDATE runs SET read_untrusted = 1 WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            reconsider_asks(&state, &chat_id, crate::chats::PermissionMode::Bypass).await,
+            0,
+            "the barrier is above every rung, `bypass` included"
+        );
+        let standing = asks_for(&chat_id);
+        assert_eq!(
+            standing.len(),
+            1,
+            "and the question is left open, not refused"
+        );
+        assert!(answer_ask(&standing[0].id, false));
+        assert_eq!(
+            wait_for_run(run_id, std::time::Duration::from_millis(500)).await,
+            Some(false)
+        );
+
+        // The classifier: `auto` asks about an install, and `dont_ask` allows no more than `auto`.
+        let other = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Auto,
+        )
+        .await;
+        let other_chat = chat_of_run(&state.pool, other).await.unwrap();
+        assert_eq!(
+            decide(
+                &app,
+                &probe(other, "Bash", serde_json::json!({"command": "npm install"}))
+            )
+            .await
+            .decision,
+            "asking"
+        );
+        assert_eq!(
+            reconsider_asks(&state, &other_chat, crate::chats::PermissionMode::DontAsk).await,
+            0,
+            "`dont_ask` refuses what it does not allow, and a refusal is not this function's to give"
+        );
+        let standing = asks_for(&other_chat);
+        assert_eq!(standing.len(), 1, "so the question is still open");
+        assert!(answer_ask(&standing[0].id, false));
+        assert_eq!(
+            wait_for_run(other, std::time::Duration::from_millis(500)).await,
+            Some(false)
         );
     }
 

@@ -5,7 +5,9 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
-pub const CLASSIFIER_VERSION: u32 = 19;
+mod grammar;
+
+pub const CLASSIFIER_VERSION: u32 = 20;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -887,8 +889,11 @@ fn classify_shell_command(
     let mut touches_github = false;
     let mut confined = false;
     let mut declared = false;
-    for segment in segments {
-        match classify_segment(segment, cwd, policy, rules, shell, unrecognized) {
+    for segment in segments
+        .into_iter()
+        .map(|s| crate::command_reader::escapes_masked(s, shell))
+    {
+        match classify_segment(&segment, cwd, policy, rules, shell, unrecognized) {
             Segment::Unrecognized => {
                 return classification(
                     "pending_approval",
@@ -1627,7 +1632,7 @@ fn is_safe_command(command: &str) -> bool {
         && (SAFE_EXACT_COMMANDS.contains(&command)
             || matches_command_prefix(command, SAFE_COMMAND_PREFIXES)
             || checks_formatting_without_writing(command)
-            || prints_lines_by_address(command))
+            || grammar::reads_by_grammar(command))
 }
 
 /// PowerShell's output shapers — `Select-Object -First 100`, `Sort-Object CPU`, `Format-Table` —
@@ -1660,68 +1665,6 @@ fn shapes_output_only(command: &str) -> bool {
             .next()
             .is_some_and(|program| SHAPERS.contains(&program))
         && !command.contains(['{', '(', '$', '@'])
-}
-
-/// `sed -n` whose script only prints lines by their address — `'1,40p'`, `'5p'`, `'$p'`,
-/// `'10,$p'` — which is `head` and `tail` in another spelling.
-///
-/// Measured on job 27, 2026-09-14: an implement node was refused
-/// `cd "<worktree>/core" && sed -n '1,40p' Cargo.toml`, a read of the first forty lines of a
-/// manifest. `sed` stays off the prefix list for the reasons written there — `-i` edits in place,
-/// `w` writes, `e` executes — and this admits the one spelling that can do none of them. It is a
-/// grammar rather than a blocklist: `-n`, one script of one or two addresses and a `p`, then files.
-/// No other flag in any position (GNU takes options after operands, so `sed -n 1p f -i` edits in
-/// place), so no `-e`, no `-f` and no `--in-place`; no second command; no regex address.
-///
-/// `$` is an address only inside single quotes. Anywhere else the shell expands `$p` before sed
-/// ever sees it, and the script becomes whatever that variable holds.
-///
-/// Read off the normalized command, as the lists are: lowercasing folds `P` into `p`, and `P`
-/// only prints as well.
-fn prints_lines_by_address(command: &str) -> bool {
-    let mut tokens = command.split_whitespace();
-    if tokens.next() != Some("sed") {
-        return false;
-    }
-    let mut quiet = false;
-    let mut script = None;
-    for token in tokens {
-        match token {
-            "-n" | "--quiet" | "--silent" => quiet = true,
-            _ if token.starts_with('-') => return false,
-            _ if script.is_none() => script = Some(token),
-            _ => {}
-        }
-    }
-    quiet && script.is_some_and(prints_by_address)
-}
-
-/// PURE: whether one `sed` script is a single `p` by one or two line addresses.
-fn prints_by_address(script: &str) -> bool {
-    let (body, dollar_is_literal) = match script
-        .strip_prefix('\'')
-        .and_then(|inner| inner.strip_suffix('\''))
-    {
-        Some(inner) => (inner, true),
-        None => (
-            script
-                .strip_prefix('"')
-                .and_then(|inner| inner.strip_suffix('"'))
-                .unwrap_or(script),
-            false,
-        ),
-    };
-    let address = |value: &str| {
-        (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-            || (value == "$" && dollar_is_literal)
-    };
-    let Some(range) = body.strip_suffix('p') else {
-        return false;
-    };
-    match range.split_once(',') {
-        Some((from, to)) => address(from) && address(to),
-        None => address(range),
-    }
 }
 
 /// `cargo fmt` with `--check` anywhere in it: rustfmt reports what it would change and writes
@@ -6194,7 +6137,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 19);
+        assert_eq!(CLASSIFIER_VERSION, 20);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the
@@ -7426,5 +7369,91 @@ mod tests {
         assert_eq!(ours.decision.decision, bare.decision.decision);
         assert_eq!(ours.action_class, bare.action_class);
         assert_ne!(other.action_class, bare.action_class);
+    }
+
+    /// The decision the chat's real cwd would get for `command`, as the word the wire carries.
+    fn decision_in_workspace(command: &str) -> String {
+        classify(
+            "Bash",
+            &json!({ "command": command }),
+            Some(Path::new("C:/Projects/nucleos")),
+        )
+        .decision
+        .decision
+    }
+
+    /// 2026-10-11, the owner's own line, parked in a chat: a `grep` over two files with a `\"` inside
+    /// a double-quoted pattern. The reader counted that `\"` as a closing quote, saw an unterminated
+    /// quote, and every guard downstream gave up. Each label isolates one suspect — the owner's
+    /// string carries a brace, a glob and the escape at once — so a red run names which one it was.
+    #[test]
+    fn the_owners_grep_is_a_read_and_the_escaped_quote_was_the_culprit() {
+        for (label, command) in [
+            (
+                "the owner's string",
+                r#"grep -n "route(\"/projects/{id}/workflows" src/http.rs src/http/*.rs | head"#,
+            ),
+            (
+                "brace only",
+                r#"grep -n "route(/projects/{id}/workflows" src/http.rs | head"#,
+            ),
+            ("glob only", "grep -n route src/http/*.rs | head"),
+            ("escape only", r#"grep -n "a\"b" src/http.rs | head"#),
+        ] {
+            assert_eq!(
+                decision_in_workspace(command),
+                "allow",
+                "{label} was not allowed: {command}"
+            );
+        }
+    }
+
+    /// `python <script> --help` runs the script's import-time code and nothing else is said about
+    /// python: every other spelling keeps asking, because the `python foo.py` shape is the one this
+    /// file's prefix list refuses on purpose.
+    #[test]
+    fn python_script_help_is_a_read_and_nothing_else_about_python_is() {
+        let composed =
+            "python .ai/scripts/spec_loop.py --help 2>&1 | head -30; ls .ai/specs | tail -5";
+        assert_eq!(
+            decision_in_workspace(composed),
+            "allow",
+            "the composed help line was not allowed: {composed}"
+        );
+
+        for command in [
+            "python x.py",
+            "python x.py --help --x",
+            r#"python -c "print(1)" --help"#,
+            "python ../x.py --help",
+            "python /tmp/x.py --help",
+            "python x.py --help > out.txt",
+            "python -m x --help",
+        ] {
+            assert_ne!(
+                decision_in_workspace(command),
+                "allow",
+                "{command} was allowed"
+            );
+        }
+    }
+
+    /// Reading `\"` as an escape must not hand a shell expansion or a second command to the allow
+    /// list: brace expansion, command substitution, a `\\` that really does close its quote, and a
+    /// redirect after an escaped quote all still change what runs.
+    #[test]
+    fn expansions_that_change_what_runs_still_ask() {
+        for command in [
+            "{rm,-rf,target}",
+            "grep x $(ls)",
+            r#"grep "x\\" ; touch y"#,
+            r#"grep "a\"b" f.rs > out.txt"#,
+        ] {
+            assert_ne!(
+                decision_in_workspace(command),
+                "allow",
+                "{command} was allowed"
+            );
+        }
     }
 }

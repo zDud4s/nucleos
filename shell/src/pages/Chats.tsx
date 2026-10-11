@@ -1747,6 +1747,11 @@ function PermissionPicker({
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="chats-meta-menu">
         <DropdownMenuLabel>What it may do without asking</DropdownMenuLabel>
+        {/* Says when a pick lands: a rung is re-read on the running turn, Plan is fixed when the
+            turn starts. Without the line, picking Plan mid-turn looks like it did nothing. */}
+        <DropdownMenuLabel className="chats-permission-why pt-0 font-normal">
+          Applies to the running turn at once — Plan only from the next message.
+        </DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={mode}
           onValueChange={(picked) => onPick(picked as PermissionMode)}

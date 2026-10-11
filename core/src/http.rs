@@ -12600,6 +12600,69 @@ mod tests {
         );
     }
 
+    /// Moving the rung while a call waits to be allowed answers that call under the new rung.
+    ///
+    /// The turn that asked is still running and its hook is blocked on the question, so a person who
+    /// widens the rung to `accept_edits` has just said yes to a `Write` they are looking at. Without
+    /// the re-read the ask sits there until `ASK_WINDOW` runs out and refuses the call the person
+    /// had already permitted, which reads as the new rung not having taken.
+    ///
+    /// The call is parked under `manual`, where a `Write` asks, and the PATCH moves it to a rung that
+    /// allows edits inside the workspace. `wait_for_run` is the observation: it returns the answer
+    /// the hook call would have got, and `Some(true)` inside half a second means the PATCH answered
+    /// it — an unanswered ask would run out the window and come back `None`.
+    #[tokio::test]
+    async fn changing_the_rung_answers_an_open_ask_the_new_rung_allows() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(
+            &state.pool,
+            crate::chats::Brain::Cloud,
+            Some(&crate::sessions::had_in("C:/Projects/nucleos", "x")),
+        )
+        .await
+        .unwrap();
+        // An explicit id so the ask can be keyed to it without reading the row back.
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, chat_id, created_at)
+             VALUES (7000001, 'a turn', 'running', 'assistant', ?, '2026-10-11T10:00:00+00:00')",
+        )
+        .bind(&chat_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        crate::hooks::ask_about_call(
+            &chat_id,
+            7_000_001,
+            "Write",
+            None,
+            crate::hooks::AskedCall {
+                tool_input: serde_json::json!({
+                    "file_path": "C:/Projects/nucleos/a.rs",
+                    "content": "x"
+                }),
+                root: "C:/Projects/nucleos".into(),
+                project_id: None,
+                snapshot: crate::chats::PermissionMode::Manual,
+            },
+        );
+
+        assert_eq!(
+            patch_chat_request(
+                state.clone(),
+                &chat_id,
+                r#"{"permission_mode":"accept_edits"}"#
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        assert_eq!(
+            crate::hooks::wait_for_run(7_000_001, std::time::Duration::from_millis(500)).await,
+            Some(true),
+            "the open ask was left standing after the rung moved to one that allows it"
+        );
+    }
+
     /// A chat opened with no `brain` at all is a cloud chat, matching the column default and every
     /// caller written before the field existed.
     #[tokio::test]

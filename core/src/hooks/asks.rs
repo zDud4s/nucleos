@@ -32,8 +32,28 @@ pub struct Ask {
     pub detail: Option<String>,
 }
 
+/// What the ladder needs to decide an open question again: the call itself and where it ran.
+///
+/// Kept beside the `Ask` and never inside it. `Ask` is what the window is shown and what goes over
+/// the wire, and its `detail` is deliberately one argument for the reason given there; this carries
+/// the WHOLE input (a `Write`'s content included) and so must never be serialised. It exists so that
+/// moving the permission selector can re-run the same ladder over a question already standing,
+/// instead of leaving it open until the 45-second window refuses it.
+#[derive(Clone, Debug)]
+pub struct AskedCall {
+    pub tool_input: serde_json::Value,
+    pub root: String,
+    pub project_id: Option<String>,
+    /// The rung the turn was SPAWNED on. `effective_permission` needs it to tell a turn that is on
+    /// `plan` (fixed by the CLI's own flag) from one that merely was asked on another rung.
+    pub snapshot: crate::chats::PermissionMode,
+}
+
 pub(super) struct Pending {
     pub(super) ask: Ask,
+    /// `None` for a question opened without a call to re-decide (`ask_about`), which a rung change
+    /// then leaves for a person.
+    pub(super) call: Option<AskedCall>,
     /// Handed to whoever answers, and taken when they do — so a second answer finds nothing rather
     /// than overwriting the first.
     pub(super) answer: Option<tokio::sync::oneshot::Sender<bool>>,
@@ -47,6 +67,27 @@ pub(super) static ASKS: std::sync::LazyLock<
 
 /// Records that this turn is waiting to be allowed something, and returns the question's name.
 pub fn ask_about(chat_id: &str, run_id: i64, tool: &str, detail: Option<String>) -> String {
+    register_ask(chat_id, run_id, tool, detail, None)
+}
+
+/// `ask_about` for a question that remembers its call, so a change of rung can decide it again.
+pub fn ask_about_call(
+    chat_id: &str,
+    run_id: i64,
+    tool: &str,
+    detail: Option<String>,
+    call: AskedCall,
+) -> String {
+    register_ask(chat_id, run_id, tool, detail, Some(call))
+}
+
+fn register_ask(
+    chat_id: &str,
+    run_id: i64,
+    tool: &str,
+    detail: Option<String>,
+    call: Option<AskedCall>,
+) -> String {
     let id = crate::auth::generate_uuid_v4();
     let (answer, heard) = tokio::sync::oneshot::channel();
     ASKS.lock().unwrap().insert(
@@ -59,6 +100,7 @@ pub fn ask_about(chat_id: &str, run_id: i64, tool: &str, detail: Option<String>)
                 tool: tool.to_owned(),
                 detail,
             },
+            call,
             answer: Some(answer),
             heard: Some(heard),
         },
@@ -73,6 +115,27 @@ pub fn asks_for(chat_id: &str) -> Vec<Ask> {
         .values()
         .filter(|pending| pending.ask.chat_id == chat_id)
         .map(|pending| pending.ask.clone())
+        .collect()
+}
+
+/// The standing questions of one conversation that can be decided again: id, run, tool and call.
+///
+/// Only those still unanswered (`answer` not yet taken) and only those that kept their call, so a
+/// question somebody just answered, or one opened without a call, is never handed back.
+pub(super) fn open_calls(chat_id: &str) -> Vec<(String, i64, String, AskedCall)> {
+    ASKS.lock()
+        .unwrap()
+        .values()
+        .filter(|pending| pending.ask.chat_id == chat_id && pending.answer.is_some())
+        .filter_map(|pending| {
+            let call = pending.call.clone()?;
+            Some((
+                pending.ask.id.clone(),
+                pending.ask.run_id,
+                pending.ask.tool.clone(),
+                call,
+            ))
+        })
         .collect()
 }
 
