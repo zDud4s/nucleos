@@ -6,6 +6,8 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::execution::runner::extract_reply;
 
+mod chat_key;
+
 static BUSY_CHATS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Owns a chat's one turn slot for as long as it is held, releasing it on every way out.
@@ -1034,15 +1036,7 @@ async fn serve_turn(
     // A process is about to be spawned, so this is where its key is minted. The kept-process branch
     // above never reaches here with a turn it answered, and so never rotates the key.
     if let Some(pool) = fresh_key {
-        let key = fresh_chat_key(pool, chat_id).await;
-        match request
-            .env
-            .iter_mut()
-            .find(|(name, _)| name == "NUCLEOS_DAEMON_TOKEN")
-        {
-            Some(entry) => entry.1 = key,
-            None => request.env.push(("NUCLEOS_DAEMON_TOKEN".to_string(), key)),
-        }
+        chat_key::rekey(&mut request.env, pool, chat_id).await;
     }
 
     start_live_chat(runner, request, session_tx, transcript, chat_id, deadlines).await
@@ -3183,36 +3177,6 @@ pub fn may_keep_process(policy: crate::execution::runner::ToolPolicy, cli: &str)
     matches!(policy, crate::execution::runner::ToolPolicy::Unrestricted) && cli == "claude"
 }
 
-/// A conversation-scoped key that was never stored, so nothing can match it.
-///
-/// Fails closed: a request presenting it is refused rather than ungoverned.
-fn unstored_chat_key(chat_id: &str) -> String {
-    format!("chat:{chat_id}.{}", crate::auth::mint_secret("chat"))
-}
-
-/// Mints the conversation's key, rotating the one stored for it.
-///
-/// Called exactly when a CLI process is about to be spawned with that key in its environment — the
-/// previous key is retired, so it must never be minted for a turn written down a process that is
-/// already holding the old one.
-async fn fresh_chat_key(pool: &sqlx::SqlitePool, chat_id: &str) -> String {
-    match crate::auth::mint_chat_token(pool, chat_id).await {
-        Ok(key) => key,
-        Err(error) => {
-            tracing::warn!(
-                chat_id = %chat_id,
-                %error,
-                "could not store the conversation's key — this turn's tool calls will be refused"
-            );
-            // Nothing was stored, so nothing can match, so the turn is refused rather
-            // than ungoverned. `runs::mint_run_token` fails in the same direction, and
-            // for the same reason: of the two ways to be wrong here, only one of them
-            // leaves a run acting with nobody watching.
-            unstored_chat_key(chat_id)
-        }
-    }
-}
-
 /// How long a chat turn may run: `silence` is how long without a new stream event, `ceiling` the
 /// total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3462,51 +3426,15 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         // Codex turn has no stdin a later turn can arrive on.
         let may_live = may_keep_process(tool_policy, cli);
 
-        // WHICH key this turn carries follows from what it can read, and the two must be decided
-        // together or not at all.
-        //
-        // An orchestrator turn carries the daemon's control token — the key that approves proposals
-        // and disengages the kill switch — and the only reason that is safe is that `McpOnly` leaves
-        // it no Bash, no Read and no Write to look at its own environment with. A rooted turn has
-        // all three. Handing it the same key would rebuild, exactly, the hole `runs.rs` records
-        // having already closed once: a run with Bash whose classifier calls `echo
-        // $NUCLEOS_DAEMON_TOKEN` a `read-local` action.
-        //
-        // So it gets a scoped key of its own instead, and loses the power to approve proposals and
-        // to disengage the brake. That is the right thing to lose: it is `Origin::Shell` that earned
-        // it the tools, which means the person asking is sitting at this machine, in front of the
-        // window where both of those are one click away.
-        //
-        // Scoped to the CONVERSATION and not to this turn, which is the one difference from a
-        // `worktree` run and the reason `chat_tokens` exists. A CLI is handed its environment once,
-        // at spawn; a key naming this turn is therefore a key the process still presents on turn
-        // five, and a process that cannot outlive its turn pays the whole cost of starting again —
-        // measured at 5.8s to `init` and 26.4s to a first shell command, against 1.5s and 6.7s down
-        // a stdin that is already open. `auth::resolve` reads a `chat:` key against whatever turn of
-        // the conversation is running, so the key stays true as the turns change under it, and names
-        // nothing at all in between.
-        //
-        // A process is keyed when it is SPAWNED, not when a turn is written to it: minting rotates
-        // `chat_tokens`, so a key minted for a turn that goes down a kept process would retire the
-        // very key that process still holds. A turn that may keep a process therefore carries an
-        // unstored placeholder here, and `serve_turn` mints the real key at the moment it spawns
-        // one. If any path skipped that, the placeholder matches nothing and the turn is refused.
-        let env = match tool_policy {
-            crate::execution::runner::ToolPolicy::Unrestricted => {
-                let key = if may_live {
-                    unstored_chat_key(&turn.slot.chat_id)
-                } else {
-                    fresh_chat_key(&pool, &turn.slot.chat_id).await
-                };
-                crate::execution::runs::run_env(&key, id, None, crate::speed::Capacity::solo())
-            }
-            _ => crate::execution::runs::run_env(
-                &control_token,
-                id,
-                None,
-                crate::speed::Capacity::solo(),
-            ),
-        };
+        let env = chat_key::turn_env(
+            tool_policy,
+            may_live,
+            &pool,
+            &turn.slot.chat_id,
+            id,
+            &control_token,
+        )
+        .await;
 
         // A turn with no `resume` is a conversation that was deliberately let go of — it read
         // third-party text, or somebody asked for a fresh context — so a process still holding the
