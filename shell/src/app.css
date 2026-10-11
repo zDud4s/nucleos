@@ -1626,18 +1626,6 @@
 }
 
 /**
- * Present, and plainly not ready.
- *
- * Dimmed rather than removed, and still a link: the page it leads to explains
- * itself. `Disabled` is not `Down` and neither is `absent` — a rail that hides
- * what is not configured makes the app look smaller than it is and gives
- * nobody a way to find out how to switch the thing on.
- */
-.nav-item-disabled {
-  opacity: var(--opacity-disabled);
-}
-
-/**
  * The mark, for every row that comes from the nav table.
  *
  * 16px and `stroke-width: 1.5` are the pasted design's, and the icons are
