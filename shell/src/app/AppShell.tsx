@@ -236,12 +236,6 @@ function Destinations() {
            anybody types, and `nav.ts` carries the only human-readable name this
            shell has for a route — `router.tsx` has no titles. */
         match: item.label,
-        /* Listed, disabled, with the reason as the hint. `nav.ts` already rules
-           that hiding such an item "would be the shell pretending the feature
-           was never designed", and the palette does not get to overturn the
-           rail on the rail's own list. */
-        hint: item.disabled,
-        disabled: item.disabled !== undefined,
         run: () => void navigate({ to: item.path }),
       })),
     }),

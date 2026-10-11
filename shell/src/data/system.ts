@@ -452,12 +452,19 @@ export function useSystemHealth(refetchInterval: number = POLL.fast) {
   });
 }
 
-/** Every sidecar's own liveness row — `GET /sidecars`, a bare array. */
-export function useSidecars() {
+/**
+ * Every sidecar's own liveness row — `GET /sidecars`, a bare array.
+ *
+ * `enabled: false` lets a caller that only wants the rows in some states (the
+ * browser's health, while its subsystem is failing) stop polling the rest of
+ * the time; another observer of the same key keeps it fresh regardless.
+ */
+export function useSidecars({ enabled = true }: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: keys.system.sidecars,
     queryFn: () => apiFetch<SidecarState[]>("/sidecars"),
     refetchInterval: POLL.fast,
+    enabled,
   });
 }
 

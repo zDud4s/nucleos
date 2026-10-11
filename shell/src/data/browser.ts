@@ -200,13 +200,12 @@ export function useBrowserSites(projectId: string | undefined) {
  */
 export function useBrowserHealth(): { data: BrowserHealth | undefined; isError: boolean; error: unknown } {
   const health = useSystemHealth();
-  const sidecars = useSidecars();
-
   const subsystem = health.data?.subsystems.find((row) => row.name === "browser_sidecar") ?? null;
-  const sidecar =
-    subsystem !== null && subsystem.status !== "ok"
-      ? (sidecars.data?.find((row) => row.name === "browser") ?? null)
-      : null;
+  const failing = subsystem !== null && subsystem.status !== "ok";
+  // Only a failing subsystem reads the sidecar's row, so only then is it polled.
+  const sidecars = useSidecars({ enabled: failing });
+
+  const sidecar = failing ? (sidecars.data?.find((row) => row.name === "browser") ?? null) : null;
 
   return {
     data: health.data === undefined ? undefined : { subsystem, sidecar },

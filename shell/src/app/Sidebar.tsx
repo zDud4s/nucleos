@@ -734,10 +734,6 @@ export function Sidebar({ badges, projects, systemAlert, besideSystem, children 
     const counted = count !== undefined && count > 0;
     const classes = ["nav-item"];
     if (active) classes.push("nav-item-active");
-    // Dimmed, never removed. A pillar nobody configured and a feature the núcleo
-    // cannot serve yet are both still part of the design, and hiding them would
-    // be the shell pretending they were never drawn.
-    if (entry.disabled !== undefined) classes.push("nav-item-disabled");
 
     const Icon = entry.icon;
 
@@ -754,7 +750,7 @@ export function Sidebar({ badges, projects, systemAlert, besideSystem, children 
           and not in the accessible name is a summons only some people get.
         */
         aria-label={spokenName(entry.label, counted ? count : undefined, noun, alert)}
-        title={entry.disabled ?? (iconsOnly || markOnly ? entry.label : undefined)}
+        title={iconsOnly || markOnly ? entry.label : undefined}
       >
         <Icon className="nav-icon" strokeWidth={1.5} aria-hidden="true" />
         <span className="nav-label">{entry.label}</span>

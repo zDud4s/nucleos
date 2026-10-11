@@ -1,7 +1,7 @@
 // @vitest-environment node
 // §spec novo-frontend
 import { describe, expect, it } from "vitest";
-import { NAV, NAV_ITEMS, NAV_PATHS, SYSTEM_ITEM, navItemForPath, sliceOf } from "./nav";
+import { NAV, NAV_ITEMS, NAV_PATHS, SYSTEM_ITEM, navItemForPath } from "./nav";
 
 /**
  * The sidebar, checked as a table.
@@ -29,7 +29,7 @@ describe("the nav table", () => {
   it("keeps Projects a plain Operate item, with no project rows in the table", () => {
     const projects = navItemForPath("/projects");
     expect(projects?.label).toBe("Projects");
-    expect(sliceOf(projects!)).toBe("Operate");
+    expect(NAV.find((group) => group.items.includes(projects!))?.label).toBe("Operate");
     expect(NAV[0].items.map((item) => item.id).slice(0, 3)).toEqual(["home", "fleet", "projects"]);
   });
 
@@ -98,14 +98,6 @@ describe("the nav table", () => {
     expect(NAV_ITEMS.find((item) => item.id === "mail")?.badge).toBeUndefined();
   });
 
-  it("keeps Teams in the sidebar with nothing left holding it back", () => {
-    // It carried `disabled: "the núcleo has no team routes yet"` from the
-    // foundation until the núcleo mounted them. It has, so the entry is an
-    // ordinary one now.
-    const teams = navItemForPath("/teams");
-    expect(teams).toBeDefined();
-    expect(teams?.disabled).toBeUndefined();
-  });
 
   it("gives every item a unique, rooted path", () => {
     for (const path of NAV_PATHS) expect(path.startsWith("/")).toBe(true);
@@ -123,13 +115,6 @@ describe("the nav table", () => {
     expect(new Set(icons).size).toBe(icons.length);
   });
 
-  it("names the slice that brings each page", () => {
-    expect(sliceOf(NAV[0].items[1])).toBe("Operate");
-    expect(sliceOf(NAV[1].items[0])).toBe("Work");
-    expect(sliceOf(NAV[2].items[0])).toBe("Pillars");
-    // System belongs to no group and must still answer.
-    expect(sliceOf(SYSTEM_ITEM)).toBe("System");
-  });
 
   it("answers with nothing for a path it does not own", () => {
     expect(navItemForPath("/runs/412")).toBeUndefined();
