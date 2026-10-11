@@ -166,7 +166,7 @@ impl Scope {
     ///
     /// `machine` → `project` → `job` inherits downwards, and the most specific wins where they
     /// contradict.
-    fn chain(&self) -> Vec<(&'static str, Option<String>)> {
+    pub(crate) fn chain(&self) -> Vec<(&'static str, Option<String>)> {
         let mut chain = vec![("machine", None)];
         match self {
             Scope::Machine => {}
@@ -948,7 +948,8 @@ pub fn select(known: &[Known], context: &Context, budget: &Budget) -> Brief {
 /// One constant and not five copies: [`FromRow`] matches by name, so a query that forgets a column
 /// fails at runtime on the row rather than at the call site, and the five readers below would each
 /// have to be corrected separately every time the table grows.
-const COLUMNS: &str = "id, layer, scope_kind, scope_id, source, generator, evidence, observations,
+pub(crate) const COLUMNS: &str =
+    "id, layer, scope_kind, scope_id, source, generator, evidence, observations,
                        fingerprint, points_at, expires_after_runs, last_confirmed_at, shown_count,
                        outcome_count, green_count, last_shown_at, kind, title, body, status,
                        proposal_id, supersedes, origin_run_id, created_at, activated_at, ended_at";
@@ -3333,6 +3334,44 @@ mod tests {
         .await
         .unwrap();
         assert!(recalled.is_empty(), "recall answered a live row");
+    }
+
+    /// Recall used to search only the oldest `MAX_READ` rows of a scope, so a row past them was
+    /// never found however well it matched.
+    #[tokio::test]
+    async fn recall_finds_a_row_newer_than_the_first_max_read() {
+        let pool = test_pool().await;
+        for n in 0..=MAX_READ {
+            sqlx::query(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES ('semantic', 'project', 'p', 'owner', 'memory', ?, 'filler', 'active',
+                         '2026-09-20T00:00:00+00:00')",
+            )
+            .bind(format!("row {n}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let newest: i64 = sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'project', 'p', 'owner', 'memory', 'the needle',
+                     'zanzibarword', 'active', '2026-09-20T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let recalled =
+            crate::brief::recall(&pool, &Scope::Project("p".into()), "zanzibarword", None)
+                .await
+                .unwrap();
+        assert_eq!(
+            recalled.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![newest]
+        );
     }
 
     /// No run behind the request means the owner made it, and both the row and its first event say
