@@ -6,6 +6,7 @@ mod boxes;
 mod effects;
 mod fence;
 mod local_box;
+mod ops_tools;
 mod params;
 mod server;
 mod tools;

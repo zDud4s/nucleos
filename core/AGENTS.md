@@ -201,7 +201,8 @@ the contract, not a snapshot.
 | `mcp_tools.rs` | Parent of `mcp_tools/`. The `rmcp` stdio MCP server (`--mcp-tools`) exposing NucleOS's daemon operations (list/create/cancel runs, proposals, budget, kill switch, plus `vcs_request`/`vcs_ticket` — the door an agent asks the git queue for a merge through, and the one it reads the answer back from) as tools the assistant CLI itself can call. `ToolEffect` classes them: `vcs_request` is the sharpest `Acts` on the list, `vcs_ticket` a `ReadsOwn`. Talks to the daemon only through `daemon_client.rs` over HTTP — never touches the pool or `AppState` directly. |
 | `mcp_tools/server.rs` | The MCP server itself: `McpBox`, `NucleosTools`, its `ServerHandler` and `run_stdio` with its arguments. |
 | `mcp_tools/params.rs` | The parameter structs each tool deserialises its arguments into. |
-| `mcp_tools/tools.rs` | Every `#[tool]` the daemon serves, in the one `#[tool_router]` impl that builds the router. |
+| `mcp_tools/tools.rs` | The `#[tool]`s for work, knowledge and the team (`work_tools` router): projects, council, runs and jobs, email, the web, team notes, models and chats. |
+| `mcp_tools/ops_tools.rs` | The `#[tool]`s that act on the browser, the owner's controls and the repository (`ops_tools` router): browser sessions, proposals, budget and kill switch, the VCS queue, GitHub and verification. `server.rs`'s `tool_router()` adds the two routers together. |
 | `mcp_tools/fence.rs` | What leaves the server: outgoing filtering, the untrusted-content fence and its nonce, and redaction of rendered text. |
 | `mcp_tools/boxes.rs` | Which tools each box serves, the admission rule, and the worktree, ticket and client a box's calls are held to. |
 | `mcp_tools/effects.rs` | What each tool does to the world: `ToolEffect`, the effects table and the effect of one call. |

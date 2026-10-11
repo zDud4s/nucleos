@@ -47,6 +47,13 @@ impl NucleosTools {
         }
     }
 
+    /// The whole router: the two `#[tool_router]` impls, `tools.rs` and `ops_tools.rs`, added
+    /// together. Split in two only to keep each file under the size ceiling; every caller asks
+    /// for this one.
+    pub(super) fn tool_router() -> ToolRouter<Self> {
+        Self::work_tools() + Self::ops_tools()
+    }
+
     /// Whether this instance will announce and dispatch one name.
     pub(super) fn serves(&self, tool: &str) -> bool {
         served_in_box(&self.served, tool)
