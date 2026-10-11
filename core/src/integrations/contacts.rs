@@ -24,12 +24,9 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 /// scoped to the non-test build: under `cfg(test)` there is none, so a field that stopped being
 /// read THERE — losing the coverage above — warns rather than going quiet.
 pub struct Profile {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub display_name: Option<String>,
     pub messages_in: i64,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub first_seen: String,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub last_seen: String,
     pub outbound_ever: bool,
 }

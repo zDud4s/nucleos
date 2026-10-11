@@ -67,10 +67,6 @@ pub enum Refusal {
     /// Deliberately its own variant and not folded into `RouteNotConfigured`: that one means the
     /// ROUTE has no model at all, this one means a model was named and this machine cannot run it —
     /// two different problems an operator would act on differently.
-    ///
-    /// No production caller constructs this yet — `can_serve`'s real body is GREEN's job — but
-    /// `http.rs`'s own `RefusingAssistants` test double already does, in the meantime.
-    #[cfg_attr(not(test), allow(dead_code))]
     CannotServe(String),
 }
 
@@ -181,11 +177,6 @@ pub trait Assistants: Send + Sync {
     /// ASYNC where `serves` and `assistant_for` above are sync: this one may do discovery (an
     /// `/api/show` probe through `capabilities::DiscoveryCache`), which is the whole reason it is a
     /// third method rather than a widening of either.
-    ///
-    /// No production caller until `http.rs`'s `patch_chat` wires the picker's door onto it — GREEN's
-    /// job, not this phase's; `assistants.rs`'s own tests exercise `ConfiguredAssistants::can_serve`
-    /// directly in the meantime.
-    #[cfg_attr(not(test), allow(dead_code))]
     async fn can_serve(&self, brain: crate::chats::Brain, model: &str) -> Result<(), Refusal>;
 
     /// What each of `models` declares, as far as this machine can tell — the question the model
@@ -200,7 +191,6 @@ pub trait Assistants: Send + Sync {
     /// BATCH rather than one call per model: the misses run CONCURRENTLY, through the same
     /// `DiscoveryCache` `can_serve` uses, so a menu that opens on N unseen models costs one round
     /// trip's time, not N, and a menu that opens warm costs nothing at all.
-    #[cfg_attr(not(test), allow(dead_code))]
     async fn declared_for(
         &self,
         brain: crate::chats::Brain,

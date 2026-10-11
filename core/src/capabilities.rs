@@ -204,11 +204,6 @@ fn missing_reason(missing: &[MissingCapability]) -> String {
 /// the model has and what the role needs, because "too small" alone tells nobody what to act on —
 /// `runner::ModelError` already carries that wording via `runner::local_triage_decision`, and this
 /// reuses it rather than writing a second copy, exactly as `triage_posture` above reuses it.
-///
-/// No production caller until the model picker's door wires onto this — GREEN's job, not this
-/// phase's; `um_modelo_que_serve_nao_da_recusa_nenhuma_no_picker` and its siblings below exercise it
-/// in the meantime.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn picker_refusal(missing: &[MissingCapability]) -> Option<String> {
     if missing.is_empty() {
         return None;
@@ -257,7 +252,6 @@ pub fn picker_refusal(missing: &[MissingCapability]) -> Option<String> {
 /// probe label, which leaves this four-argument wrapper with no caller but its own tests —
 /// `a_descoberta_le_a_janela_de_uma_resposta_do_api_show` and its siblings below exercise it, and
 /// the frozen 22 keep it from being deleted.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn discover_ollama(
     client: &reqwest::Client,
     base_url: &str,
@@ -999,7 +993,6 @@ pub async fn pull_local_model(
 /// Scoped to the non-test build, for the same reason `discover_openai_compatible` above is: no production
 /// caller until the model picker packet, exercised under `cfg(test)` by
 /// `uma_cli_declara_as_suas_capacidades_sem_tocar_na_rede` in the meantime.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn declared_for_cli() -> Declared {
     Declared {
         context: Ok(()),
@@ -1019,7 +1012,6 @@ pub fn declared_for_cli() -> Declared {
 /// `main.rs` wires up today probes once per startup, so none of them needs this cache yet — the
 /// model picker packet is the production caller, and this module's own tests already exercise both
 /// the single-model and the two-model cases in the meantime.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct DiscoveryCache {
     entries: std::sync::Mutex<std::collections::HashMap<String, Declared>>,
 }
@@ -1031,7 +1023,6 @@ impl Default for DiscoveryCache {
 }
 
 impl DiscoveryCache {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Self {
         Self {
             entries: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1041,7 +1032,6 @@ impl DiscoveryCache {
     /// Returns the cached declaration for `model`, running `discover` only the first time this
     /// model is asked for. Two models never share an entry: a miss for one model must not read or
     /// write another model's row.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn get_or_discover<F, Fut>(&self, model: &str, discover: F) -> Declared
     where
         F: FnOnce() -> Fut,

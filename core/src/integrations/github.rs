@@ -379,7 +379,6 @@ impl ActOp {
     /// `github_act` is `Acts` in `TOOL_EFFECTS` by NAME, which is what the barrier reads. It exists
     /// so `every_operation_declares_an_effect` can hold the enum to that claim instead of the claim
     /// living only in a table.
-    #[allow(dead_code)]
     pub fn effect(&self) -> ToolEffect {
         ToolEffect::Acts
     }
@@ -1805,12 +1804,10 @@ impl Policy {
 
     /// The effective lists, for the tests that assert what the ceilings let through. Production
     /// asks the two questions below instead, which is why these carry the allow.
-    #[allow(dead_code)]
     pub fn autonomous_reads(&self) -> &[String] {
         &self.reads
     }
 
-    #[allow(dead_code)]
     pub fn autonomous_actions(&self) -> &[String] {
         &self.actions
     }

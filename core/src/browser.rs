@@ -217,10 +217,6 @@ pub async fn list_sites(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
 /// `chain` is the navigation the headful window recorded. `browser_policy::granted_origins`
 /// normalises it and drops anything that is not an https origin, so what reaches the table has
 /// already been through the same rules the decision uses.
-// Unreachable until the handoff lands (spec §4.4): the wheel coming back is the one act that calls
-// this. Named on the function rather than on the module, so it is the only thing here that may be
-// unreached — and so this line has to be deleted by the phase that adds the caller.
-#[allow(dead_code)]
 pub async fn grant(
     pool: &SqlitePool,
     project_id: &str,

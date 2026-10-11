@@ -148,19 +148,6 @@
 //! runner. The fourth is that a file was never asked about at all ([`Skipped`]). A single
 //! *not annotated* total would be a number nobody could act on.
 
-// This is a bin-only crate, so dead-code reachability starts at `main`, and nothing in this module
-// is reached yet: it is the proposal half of §8's disambiguation, and the task that gives it a
-// caller is the NEXT one — Task 3 of the slice-6 plan, which runs it over this repository and
-// writes the proposal down. One line rather than an attribute on each of a dozen public items and
-// their fields, which is the argument a since-removed module made about the same suppression and the
-// reason this is spelled the same way. The instruction, not a description: DELETE THIS LINE with the
-// change that gives this module a production caller.
-//
-// Scoped to the non-test build, so it silences only the absence of that caller. Under `cfg(test)`
-// the lint stays live — every item below is exercised by this module's tests, and one that stops
-// being exercised has to say so.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;

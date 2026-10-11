@@ -5,9 +5,6 @@
 //! executor will — and nothing writes the file: `detect::propose_tests_map` proposes one, and the
 //! owner commits it like any other change (spec `.ai/specs/2026-10-05-selecao-de-testes-design.md`
 //! §3.1, §3.3).
-// The matcher and the map's queries are called by `test_select`, whose caller is the F2a
-// executor; until it lands only the tests reach them, and core is a binary crate.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeMap;
 use std::path::Path;

@@ -86,7 +86,6 @@ impl OpenAiCompatibleChat {
     /// never by calling this and letting it decide that no key was fine after all; so "no key
     /// reached `new`" still means a hosted chat was asked for with nothing to authenticate it, and
     /// still refuses before a request leaves the machine.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(base_url: String, model: String, key: Option<String>) -> std::io::Result<Self> {
         let key = key.ok_or_else(|| {
             std::io::Error::other(
@@ -120,7 +119,6 @@ impl OpenAiCompatibleChat {
     /// so by the time a `ConfiguredAssistants` reaches for this constructor a key is already in
     /// hand. `None` is a local OpenAI-compatible server that asks for no key — the case `new`
     /// cannot express, because `new` refuses it. `new` above stays as it is for every other caller.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_client(
         client: reqwest::Client,
         base_url: String,

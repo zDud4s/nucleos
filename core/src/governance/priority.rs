@@ -80,7 +80,6 @@ pub fn adjust(
 }
 
 // Consumed by the `o_derivado_nunca_promove` policy invariant test.
-#[allow(dead_code)]
 fn rank(class: &str) -> u8 {
     match class {
         "urgent" => 3,
