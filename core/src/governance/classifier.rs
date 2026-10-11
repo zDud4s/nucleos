@@ -1489,7 +1489,16 @@ mod tests {
         // The needles are assembled at run time: written as one literal, this test's own text
         // would be counted by the scan of the file it lives in.
         let definition = |name: &str| format!("fn {name}(");
-        let source = include_str!("classifier.rs");
+        // The parent and its children, as one text: the split moved these definitions out of
+        // `classifier.rs` without changing how many there are.
+        let source = [
+            include_str!("classifier.rs"),
+            include_str!("classifier/paths.rs"),
+            include_str!("classifier/shell_shape.rs"),
+            include_str!("classifier/write_guards.rs"),
+            include_str!("classifier/judge_guard.rs"),
+        ]
+        .concat();
         assert_eq!(source.matches(&definition("normalize_path")).count(), 1);
         assert_eq!(
             source.matches(&definition("fold_for_containment")).count(),

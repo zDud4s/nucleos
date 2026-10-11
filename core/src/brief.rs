@@ -849,7 +849,7 @@ mod tests {
     use crate::knowledge::{Context, Scope, Scored};
 
     const BRIEFED_CONTEXTS: &[&str] = &[
-        "assistant.rs",
+        "assistant/turn.rs",
         "council.rs",
         "http/agents.rs",
         "execution/job/spawn.rs",
