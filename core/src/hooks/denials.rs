@@ -92,7 +92,12 @@ pub(super) async fn count_denial_and_stop_a_prober(
 /// a task of its own and awaited, for `count_denial_and_stop_a_prober`'s reason, and the caller
 /// then answers `deny`. The terminal write of `spawn_run` loses its CAS, so no E4 is born. A
 /// proven pattern; a new run status would have to be taught to the worktree GC and its test.
-pub(super) async fn stop_by_judge(state: &AppState, run_id: i64, project_id: Option<&str>, phrase: String) {
+pub(super) async fn stop_by_judge(
+    state: &AppState,
+    run_id: i64,
+    project_id: Option<&str>,
+    phrase: String,
+) {
     let state = state.clone();
     let project_id = project_id.map(str::to_owned);
     let _ = tokio::spawn(async move {

@@ -18,7 +18,8 @@ pub(super) const PROPOSAL_ADVICE_POLL: std::time::Duration = std::time::Duration
 /// council at the next daemon startup, so the usual end of a stuck council is a terminal status
 /// arriving late, not this ceiling — but a daemon that never restarts would otherwise leave this
 /// task alive for the process's whole life.
-pub(super) const PROPOSAL_ADVICE_CEILING: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+pub(super) const PROPOSAL_ADVICE_CEILING: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60 * 60);
 
 /// The question the council is asked about a refused action.
 ///

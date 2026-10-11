@@ -123,11 +123,12 @@ pub(super) enum ProjectRules {
 /// It is also why `ShellRules::deny_writes` is a `Vec` of pairs and not a map keyed by tool: a
 /// `HashMap::new()` is not a `const fn`, so a shape chosen for the read side would have taken this
 /// `static` away and the `E0515` above with it.
-pub(super) static NO_SHELL_RULES: crate::project::policy::ShellRules = crate::project::policy::ShellRules {
-    allow: Vec::new(),
-    deny: Vec::new(),
-    deny_writes: Vec::new(),
-};
+pub(super) static NO_SHELL_RULES: crate::project::policy::ShellRules =
+    crate::project::policy::ShellRules {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        deny_writes: Vec::new(),
+    };
 
 impl ProjectRules {
     /// Nothing declared and nothing failed: a run with no project, or a tool call whose verdict the

@@ -2,7 +2,10 @@
 
 use super::*;
 
-pub(super) async fn assistant_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<Decision> {
+pub(super) async fn assistant_decision(
+    state: &AppState,
+    payload: &PreToolUsePayload,
+) -> Json<Decision> {
     // Whole segment, not a prefix. MCP tool names are `mcp__<server>__<tool>`, so a server called
     // `nucleos__x` produced `mcp__nucleos__x__...`, which passed a prefix test and inherited the
     // orchestrator's unconditional allow — in the one mode that skips the classifier, the proposals
@@ -194,7 +197,10 @@ pub(super) async fn record_refused_action(
 ///
 /// Almost pure. The list is a membership test that cannot fail; the one stateful question is which
 /// run a `get_run` names, and that one fails closed.
-pub(super) async fn council_decision(state: &AppState, payload: &PreToolUsePayload) -> Json<Decision> {
+pub(super) async fn council_decision(
+    state: &AppState,
+    payload: &PreToolUsePayload,
+) -> Json<Decision> {
     // Whole segment, not a prefix, for the reason `assistant_decision` records: an MCP server named
     // `nucleos__x` produces `mcp__nucleos__x__…`, which passes a prefix test.
     let tool = payload

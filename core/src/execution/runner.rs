@@ -11,33 +11,33 @@ use tokio::sync::mpsc::UnboundedSender;
 // `taskkill` with no `cfg` at all — a silent no-op on every other platform.
 use crate::process_tree::TreeKiller;
 
-mod request;
-mod wire;
-mod claude_args;
-mod live;
-mod stream;
-mod turns;
-mod local_triage;
-mod command;
-mod ollama;
 mod claude;
+mod claude_args;
 mod codex;
+mod command;
 #[cfg(any(test, feature = "testkit"))]
 mod fake;
+mod live;
+mod local_triage;
+mod ollama;
+mod request;
+mod stream;
+mod turns;
+mod wire;
 
-pub use self::request::*;
-pub use self::wire::*;
-pub use self::claude_args::*;
-pub use self::live::*;
-pub use self::stream::*;
-pub use self::turns::*;
-pub use self::local_triage::*;
-pub use self::command::*;
-pub use self::ollama::*;
 pub use self::claude::*;
+pub use self::claude_args::*;
 pub use self::codex::*;
+pub use self::command::*;
 #[cfg(any(test, feature = "testkit"))]
 pub use self::fake::*;
+pub use self::live::*;
+pub use self::local_triage::*;
+pub use self::ollama::*;
+pub use self::request::*;
+pub use self::stream::*;
+pub use self::turns::*;
+pub use self::wire::*;
 
 #[cfg(test)]
 mod tests {

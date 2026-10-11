@@ -154,7 +154,11 @@ pub const A_PARK_HERE_WOULD_END_THE_ITEM: &str = "this is unattended work you we
 ///
 /// Fails closed everywhere: any error, any missing row, anything not a job node answers `false` and
 /// the run parks exactly as it did before this existed.
-pub(super) async fn a_park_here_would_only_destroy(pool: &sqlx::SqlitePool, run_id: i64, mode: &str) -> bool {
+pub(super) async fn a_park_here_would_only_destroy(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    mode: &str,
+) -> bool {
     if !crate::execution::runs::runs_unattended(mode) {
         return false;
     }

@@ -41,8 +41,9 @@ pub(super) struct Pending {
     pub(super) heard: Option<tokio::sync::oneshot::Receiver<bool>>,
 }
 
-pub(super) static ASKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Pending>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+pub(super) static ASKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Pending>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Records that this turn is waiting to be allowed something, and returns the question's name.
 pub fn ask_about(chat_id: &str, run_id: i64, tool: &str, detail: Option<String>) -> String {

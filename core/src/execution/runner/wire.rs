@@ -90,7 +90,10 @@ pub(super) fn advertised_tools_from_init(init: &serde_json::Value) -> Option<Vec
         .collect()
 }
 
-pub(super) fn advertised_tools_violate(policy: ToolPolicy, advertised: Option<&[String]>) -> Option<String> {
+pub(super) fn advertised_tools_violate(
+    policy: ToolPolicy,
+    advertised: Option<&[String]>,
+) -> Option<String> {
     if policy == ToolPolicy::Unrestricted {
         return None;
     }
@@ -133,7 +136,10 @@ pub(super) fn advertised_tools_violate(policy: ToolPolicy, advertised: Option<&[
 /// This does not make the run unsafe on its own. `ToolPolicy::None` is enforced by the CLI's own
 /// refusal (see the variant's doc comment), not by this check; what would be lost without it is the
 /// evidence that the refusal took effect, which is the whole point of measuring it.
-pub(super) fn policy_unverified_after_stream(policy: ToolPolicy, init_seen: bool) -> Option<String> {
+pub(super) fn policy_unverified_after_stream(
+    policy: ToolPolicy,
+    init_seen: bool,
+) -> Option<String> {
     if policy == ToolPolicy::Unrestricted || init_seen {
         return None;
     }

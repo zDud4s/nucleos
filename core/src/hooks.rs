@@ -12,31 +12,31 @@ use crate::governance::classifier;
 use crate::governance::shadow;
 use crate::state::AppState;
 
-mod rules;
-mod session_git;
-mod verification;
-mod pretool;
-mod posttool;
-mod rooted;
 mod asks;
-mod judge;
 mod contexts;
 mod denials;
+mod judge;
+mod posttool;
+mod pretool;
 mod proposals;
+mod rooted;
+mod rules;
+mod session_git;
 mod skip;
+mod verification;
 
-pub use self::rules::*;
-pub use self::session_git::*;
-use self::verification::*;
-pub use self::pretool::*;
-pub use self::posttool::*;
-pub use self::rooted::*;
 pub use self::asks::*;
-pub use self::judge::*;
 use self::contexts::*;
 pub use self::denials::*;
+pub use self::judge::*;
+pub use self::posttool::*;
+pub use self::pretool::*;
 use self::proposals::*;
+pub use self::rooted::*;
+pub use self::rules::*;
+pub use self::session_git::*;
 use self::skip::*;
+use self::verification::*;
 
 #[cfg(test)]
 mod tests {

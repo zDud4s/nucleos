@@ -50,8 +50,9 @@ pub(super) const JUDGE_WINDOW: std::time::Duration = std::time::Duration::from_s
 /// In memory and nowhere else, for `ASKS`' reason: a verdict outliving the turn it was about is a
 /// verdict about nothing. Pruned against the runs actually in flight whenever something is written,
 /// which is exactly when the map could otherwise grow.
-pub(super) static JUDGED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(i64, String)>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+pub(super) static JUDGED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(i64, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 /// The cache key: this tool, with these arguments.
 ///

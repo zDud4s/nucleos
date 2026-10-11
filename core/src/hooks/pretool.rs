@@ -33,7 +33,10 @@ pub(super) fn job_node_extra(tool_name: &str) -> Option<&str> {
 }
 
 /// The job a run belongs to, `None` for a run that is not a job's node (or whose row is gone).
-pub(super) async fn job_id_of(pool: &sqlx::SqlitePool, run_id: i64) -> Result<Option<i64>, sqlx::Error> {
+pub(super) async fn job_id_of(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
     Ok(
         sqlx::query_scalar::<_, Option<i64>>("SELECT job_id FROM runs WHERE id = ?")
             .bind(run_id)
