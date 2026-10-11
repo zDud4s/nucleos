@@ -149,6 +149,47 @@ async fn fts_ranks(
     Ok(rows.into_iter().collect())
 }
 
+/// The `active` rows of `scope`'s chain, outside the working layer, that match the FTS
+/// `expression`, best match first and at most [`knowledge::MAX_READ`] of them.
+///
+/// For [`recall`], which used to filter [`knowledge::for_scope`]'s rows: those are the OLDEST
+/// `knowledge::MAX_READ` by id, so in a scope holding more, every newer row was never searched at all. Here
+/// the match comes first and the ceiling cuts the weakest matches instead.
+async fn matching_for_scope(
+    pool: &SqlitePool,
+    scope: &Scope,
+    expression: &str,
+) -> sqlx::Result<Vec<knowledge::Known>> {
+    let chain = scope.chain();
+    let terms: Vec<&str> = chain
+        .iter()
+        .map(|_| "(scope_kind = ? AND scope_id IS ?)")
+        .collect();
+    let sql = format!(
+        "WITH hits AS (
+             SELECT rowid AS id, bm25(knowledge_fts) AS rank
+               FROM knowledge_fts
+              WHERE knowledge_fts MATCH ?
+         )
+         SELECT {columns}
+           FROM knowledge JOIN hits USING (id)
+          WHERE status = 'active' AND layer <> 'working'
+            AND ({})
+          ORDER BY hits.rank, id
+          LIMIT ?",
+        terms.join(" OR "),
+        columns = knowledge::COLUMNS,
+    );
+    // SAFETY: as in `for_columns` — the interpolated parts are `COLUMNS` and one literal term per
+    // link of the chain; every value is bound.
+    let mut query =
+        sqlx::query_as::<_, knowledge::Known>(sqlx::AssertSqlSafe(sql)).bind(expression);
+    for (kind, id) in &chain {
+        query = query.bind(*kind).bind(id.clone());
+    }
+    query.bind(knowledge::MAX_READ as i64).fetch_all(pool).await
+}
+
 /// Recall only D12-approved (`active`) knowledge in the daemon-selected scope.
 ///
 /// `live` rows arrive ONLY through the automatic briefing. Like every other candidate, a `live`
@@ -165,7 +206,7 @@ pub async fn recall(
     let Some(expression) = match_expression(query) else {
         return Ok(Vec::new());
     };
-    let mut known = knowledge::matching_for_scope(pool, scope, &expression).await?;
+    let mut known = matching_for_scope(pool, scope, &expression).await?;
     known.retain(|row| {
         row.layer != knowledge::Layer::Working.as_str()
             && layer.is_none_or(|layer| row.layer == layer.as_str())

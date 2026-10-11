@@ -166,7 +166,7 @@ impl Scope {
     ///
     /// `machine` → `project` → `job` inherits downwards, and the most specific wins where they
     /// contradict.
-    fn chain(&self) -> Vec<(&'static str, Option<String>)> {
+    pub(crate) fn chain(&self) -> Vec<(&'static str, Option<String>)> {
         let mut chain = vec![("machine", None)];
         match self {
             Scope::Machine => {}
@@ -948,7 +948,8 @@ pub fn select(known: &[Known], context: &Context, budget: &Budget) -> Brief {
 /// One constant and not five copies: [`FromRow`] matches by name, so a query that forgets a column
 /// fails at runtime on the row rather than at the call site, and the five readers below would each
 /// have to be corrected separately every time the table grows.
-const COLUMNS: &str = "id, layer, scope_kind, scope_id, source, generator, evidence, observations,
+pub(crate) const COLUMNS: &str =
+    "id, layer, scope_kind, scope_id, source, generator, evidence, observations,
                        fingerprint, points_at, expires_after_runs, last_confirmed_at, shown_count,
                        outcome_count, green_count, last_shown_at, kind, title, body, status,
                        proposal_id, supersedes, origin_run_id, created_at, activated_at, ended_at";
@@ -1377,45 +1378,6 @@ async fn for_columns(
         .bind(MAX_READ as i64)
         .fetch_all(pool)
         .await
-}
-
-/// The `active` rows of `scope`'s chain, outside the working layer, that match the FTS
-/// `expression`, best match first and at most [`MAX_READ`] of them.
-///
-/// For `brief::recall`, which used to filter [`for_scope`]'s rows: those are the OLDEST
-/// `MAX_READ` by id, so in a scope holding more, every newer row was never searched at all. Here
-/// the match comes first and the ceiling cuts the weakest matches instead.
-pub async fn matching_for_scope(
-    pool: &SqlitePool,
-    scope: &Scope,
-    expression: &str,
-) -> sqlx::Result<Vec<Known>> {
-    let chain = scope.chain();
-    let terms: Vec<&str> = chain
-        .iter()
-        .map(|_| "(scope_kind = ? AND scope_id IS ?)")
-        .collect();
-    let sql = format!(
-        "WITH hits AS (
-             SELECT rowid AS id, bm25(knowledge_fts) AS rank
-               FROM knowledge_fts
-              WHERE knowledge_fts MATCH ?
-         )
-         SELECT {COLUMNS}
-           FROM knowledge JOIN hits USING (id)
-          WHERE status = 'active' AND layer <> 'working'
-            AND ({})
-          ORDER BY hits.rank, id
-          LIMIT ?",
-        terms.join(" OR ")
-    );
-    // SAFETY: as in `for_columns` — the interpolated parts are `COLUMNS` and one literal term per
-    // link of the chain; every value is bound.
-    let mut query = sqlx::query_as::<_, Known>(sqlx::AssertSqlSafe(sql)).bind(expression);
-    for (kind, id) in &chain {
-        query = query.bind(*kind).bind(id.clone());
-    }
-    query.bind(MAX_READ as i64).fetch_all(pool).await
 }
 
 /// How many approved rows are read before rendering ever begins.
