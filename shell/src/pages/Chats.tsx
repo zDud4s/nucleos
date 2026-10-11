@@ -4333,7 +4333,12 @@ const TurnBlock = memo(function TurnBlock({
       {marks.map((mark, index) => (
         <MarkNote key={index} mark={mark} />
       ))}
-      <WhoAsked relayedFrom={turn.relayedFrom} chatId={chatId} turnId={turn.id} />
+      <WhoAsked
+        relayedFrom={turn.relayedFrom}
+        unprompted={turn.unprompted}
+        chatId={chatId}
+        turnId={turn.id}
+      />
       {/* Verbatim, and not through `Rich`: their half is not markdown and is not read as any.
           Somebody who types two asterisks meant two asterisks, and a message redrawn as bold is a
           message they did not send. */}
@@ -4947,13 +4952,19 @@ function ToolAnswer({ call, loading }: { call: ToolCall; loading: boolean }) {
  */
 function WhoAsked({
   relayedFrom,
+  unprompted,
   chatId,
   turnId,
 }: {
   relayedFrom: RelayedFrom | null;
+  unprompted: boolean;
   chatId: string;
   turnId: number;
 }) {
+  // The words under this label are the daemon's note that a background task ended, not anything a
+  // person typed, so the label says who really started the turn.
+  if (unprompted)
+    return <p className="chats-turn-who chats-turn-who-relayed">the assistant continued on its own</p>;
   if (relayedFrom === null)
     return <p className="chats-turn-who chats-turn-who-you">you</p>;
   return (

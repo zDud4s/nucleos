@@ -183,6 +183,13 @@ export interface AssistantTurnRow {
   /** What that conversation is called, or null when nobody has named it. */
   relayed_from_title?: string | null;
   /**
+   * Who started the turn. `"task"` is the assistant waking on its own because a background task
+   * ended; its `asked` is the daemon's note about that, not something a person said.
+   *
+   * Optional on the wire for the reason the keys above are.
+   */
+  origin?: string | null;
+  /**
    * The relays this turn SENT. Empty on almost every turn.
    *
    * Optional on the wire for the reason the two above are: a daemon older than
@@ -292,6 +299,12 @@ export interface Turn {
    */
   relayedFrom: RelayedFrom | null;
   /**
+   * Whether the assistant started this turn itself, after a background task ended. `asked` then
+   * holds the daemon's note about the task, and drawing it under "you" would put those words in the
+   * person's mouth.
+   */
+  unprompted: boolean;
+  /**
    * The relays this turn sent, oldest first.
    *
    * The mirror of `relayedFrom`, and it exists because that side shipped alone:
@@ -369,6 +382,7 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
         : { chatId: row.relayed_from_chat_id, title: row.relayed_from_title ?? null },
     // Defaulted for the reason `did` and `images` are: a daemon older than the column sends no
     // such key, and a turn drawn without the note beats a page that refuses to draw the turn.
+    unprompted: row.origin === "task",
     relayedTo: row.relayed_to ?? [],
     saidNow: row.said_now ?? [],
   };

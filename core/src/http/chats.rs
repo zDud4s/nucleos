@@ -145,6 +145,12 @@ pub(super) struct AssistantTurn {
     pub(super) relayed_from_chat_id: Option<String>,
     /// What that conversation is called, or null when it has no title yet. See above.
     pub(super) relayed_from_title: Option<String>,
+    /// Who started this turn: `task` when the assistant woke on its own because a background task
+    /// ended, null for everything a person or another conversation said.
+    ///
+    /// Without it the window draws the daemon's own `[background task … completed]` note under
+    /// "you", which is the same false attribution a relayed turn would suffer.
+    pub(super) origin: Option<String>,
 }
 
 /// One turn as the window receives it: the row, plus what the turn did.
@@ -775,7 +781,8 @@ pub(super) async fn get_assistant_chat(
                 r.model, r.cache_ttl, r.context_fill,
                 r.tools_used, r.thought, r.thought_tokens, r.prompt_images, r.compacted,
                 rel.from_chat_id AS relayed_from_chat_id,
-                src.title        AS relayed_from_title
+                src.title        AS relayed_from_title,
+                r.origin
            FROM runs r
            LEFT JOIN chat_relays rel ON rel.id = r.from_relay_id
            LEFT JOIN chats src ON src.chat_id = rel.from_chat_id

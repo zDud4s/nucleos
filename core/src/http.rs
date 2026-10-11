@@ -16024,6 +16024,50 @@ mod tests {
         assert_eq!(turns[1]["relayed_from_title"], "the other conversation");
     }
 
+    /// A turn the assistant started on its own says so, and a person's turn does not.
+    ///
+    /// The daemon writes `[background task … completed]` into that turn's `prompt` so the row has
+    /// something to show; without `origin` on the wire the window drew it under "you".
+    #[tokio::test]
+    async fn a_transcript_marks_a_turn_the_assistant_started_on_its_own() {
+        let state = test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        for (prompt, origin) in [
+            ("typed here by a person", "shell"),
+            ("[background task bg1 completed]: done", "task"),
+        ] {
+            sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+                 VALUES (?, 'completed', 'assistant', ?, ?, ?)",
+            )
+            .bind(prompt)
+            .bind(&chat_id)
+            .bind(origin)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/assistant/chats/{chat_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let turns = body["turns"].as_array().expect("a transcript of turns");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["origin"], "shell");
+        assert_eq!(turns[1]["origin"], "task");
+    }
+
     /// The conversation that SENT a relay records where it went and what it said.
     ///
     /// The receiving half of this shipped first and left the sender blind: its transcript showed a
