@@ -32,19 +32,15 @@ pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_ERRORED: &str = "errored";
 /// A unit that did not run because a green with the same fingerprint is still fresh (spec section 5.3).
 pub const STATUS_SKIPPED_CACHED: &str = "skipped_cached";
-#[cfg_attr(not(test), allow(dead_code))]
 pub const STATUS_QUEUED: &str = "queued";
-#[cfg_attr(not(test), allow(dead_code))]
 pub const STATUS_RUNNING: &str = "running";
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub const PRIORITY_INTERACTIVE: i64 = 0;
 pub const PRIORITY_AUTONOMOUS: i64 = 1;
 pub const PRIORITY_POSTGATE: i64 = 2;
 
 /// A row interrupted by this many daemon restarts is given up on, so a request that brings the
 /// daemon down does not loop forever.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const MAX_INTERRUPTIONS: i64 = 3;
 
 /// The gate's output is already capped at 1 MiB (`gate::GATE_OUTPUT_CAP`); a row keeps only what a
@@ -203,7 +199,6 @@ fn tail(text: &str) -> String {
 }
 
 /// A unit of verification a caller asks the executor to run.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Request {
     pub project_id: Option<String>,
     pub worktree: String,
@@ -221,14 +216,12 @@ pub struct Request {
 }
 
 /// What `enqueue` answers: the row's id, and whether it joined one already in flight.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Submitted {
     pub id: i64,
     pub joined: bool,
 }
 
 /// A queued row as the scheduler needs it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Queued {
     pub id: i64,
     pub project_id: Option<String>,
@@ -238,7 +231,6 @@ pub struct Queued {
 }
 
 /// A row the executor claimed and must now run.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Claimed {
     pub id: i64,
     pub project_id: Option<String>,
@@ -249,10 +241,8 @@ pub struct Claimed {
 }
 
 /// What a reader sees of one row.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct State {
     // Read from F2a-2 (verify); until then nothing reads it.
-    #[allow(dead_code)]
     pub id: i64,
     pub status: String,
     pub exit_code: Option<i64>,
@@ -266,7 +256,6 @@ pub struct State {
 /// Joining needs a `fingerprint`: without one two requests are never known to be the same. A join
 /// creates no row and raises the queued row's priority if the new request is more urgent. The
 /// origin of the joined request is not recorded (v1 limitation).
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn enqueue(pool: &SqlitePool, request: &Request, now_ms: i64) -> sqlx::Result<Submitted> {
     let argv = serde_json::to_string(&request.argv).unwrap_or_else(|_| "[]".to_owned());
     // IMMEDIATE takes the write lock up front: in a deferred transaction two equal submits could
@@ -326,7 +315,6 @@ pub async fn enqueue(pool: &SqlitePool, request: &Request, now_ms: i64) -> sqlx:
 }
 
 /// Every queued row, oldest first, for the scheduler to choose from.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn queued(pool: &SqlitePool) -> sqlx::Result<Vec<Queued>> {
     // The tuple is the `SELECT`'s own shape and lives only until the `map` below builds `Queued`;
     // a named struct would repeat the column order in two places.
@@ -350,7 +338,6 @@ pub async fn queued(pool: &SqlitePool) -> sqlx::Result<Vec<Queued>> {
 }
 
 /// Takes a queued row for running. `None` when it is no longer queued.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn claim(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Claimed>> {
     let started_at = chrono::Utc::now().to_rfc3339();
     // The tuple is the `RETURNING` clause's own shape and lives only until the `map` below builds
@@ -378,7 +365,6 @@ pub async fn claim(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Claimed>> 
 }
 
 /// Records how a running row ended.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn finish(
     pool: &SqlitePool,
     id: i64,
@@ -429,7 +415,6 @@ pub async fn cancel_queued(
 }
 
 /// One row as a reader sees it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<State>> {
     // The tuple is the `SELECT`'s own shape and lives only until the `map` below builds `State`;
     // a named struct would repeat the column order in two places.
@@ -456,7 +441,6 @@ pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<State>> {
 /// At daemon start, rows still `running` were cut off by the restart: they go back to the queue,
 /// or are given up on once they have been interrupted `MAX_INTERRUPTIONS` times. Returns
 /// `(requeued, given_up)`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn requeue_interrupted(pool: &SqlitePool) -> sqlx::Result<(u64, u64)> {
     let now = chrono::Utc::now().to_rfc3339();
     let given_up = sqlx::query(

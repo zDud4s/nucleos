@@ -9,8 +9,6 @@
 //! cache in v1. Variables written as `NAME=val` in the command travel with the group's entry,
 //! which is hashed whole.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::time::Duration;

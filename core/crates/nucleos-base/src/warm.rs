@@ -4,9 +4,6 @@
 //! `<root>/warm/<project>/shared/<dir>` for state a project shares. Every function takes `root`
 //! (the resolved `~/.nucleos`) so tests can point it at a temp dir. Nothing here ever touches a
 //! path outside `<root>/warm/`.
-// Nothing outside the tests calls this until the F2a-2 executor does; core is a binary crate, so
-// clippy's `dead_code` would otherwise fail the gate.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;

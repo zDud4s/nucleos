@@ -21452,13 +21452,11 @@ mod tests {
         }
     }
 
-    /// Today `patch_chat` returns a bare `StatusCode` with no body on every path. Picking a model
-    /// this machine cannot serve must instead refuse with a BODY carrying why —
+    /// Picking a model this machine cannot serve refuses with a BODY carrying why —
     /// `refusal(status, name)` (`:2080`) plus a `detail` field is the shape this crate already uses
     /// elsewhere for a refusal with a reason (see the `"detail"` sites around invalid ownership
     /// claims and unreadable pins), the same shape `post_assistant_message` returns for its own
-    /// refusals. `patch_chat` is untouched here — this test is what makes it fail until GREEN wires
-    /// the door onto `can_serve`.
+    /// refusals. The picker's door (`http/common.rs`) asks `can_serve` before the pick is stored.
     #[tokio::test]
     async fn o_patch_recusa_um_modelo_que_a_maquina_nao_serve_e_diz_porque() {
         let mut state = test_state().await;

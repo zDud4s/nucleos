@@ -1,0 +1,104 @@
+//! Which key a rooted turn's CLI carries, and when that key is minted.
+//!
+//! A key is minted only when a CLI process is SPAWNED. A kept process keeps the key it was spawned
+//! with — its environment is handed over once — so minting rotates `chat_tokens` and a key minted
+//! for a turn that goes down a kept process would retire the very key that process still holds.
+//! That was the 401 on turn two: every hook call refused, the hook failing closed, and the
+//! conversation unable to use a tool.
+
+/// The environment a turn's CLI is spawned with.
+///
+/// A turn that may keep a process carries an unstored placeholder key here, and [`rekey`] replaces
+/// it at the moment `serve_turn` spawns one; a turn that cannot keep a process is keyed now, since
+/// the process it starts is the one that holds the key.
+pub(super) async fn turn_env(
+    tool_policy: crate::execution::runner::ToolPolicy,
+    may_live: bool,
+    pool: &sqlx::SqlitePool,
+    chat_id: &str,
+    run_id: i64,
+    control_token: &str,
+) -> Vec<(String, String)> {
+    // WHICH key this turn carries follows from what it can read, and the two must be decided
+    // together or not at all.
+    //
+    // An orchestrator turn carries the daemon's control token — the key that approves proposals
+    // and disengages the kill switch — and the only reason that is safe is that `McpOnly` leaves
+    // it no Bash, no Read and no Write to look at its own environment with. A rooted turn has
+    // all three. Handing it the same key would rebuild, exactly, the hole `runs.rs` records
+    // having already closed once: a run with Bash whose classifier calls `echo
+    // $NUCLEOS_DAEMON_TOKEN` a `read-local` action.
+    //
+    // So it gets a scoped key of its own instead, and loses the power to approve proposals and
+    // to disengage the brake. That is the right thing to lose: it is `Origin::Shell` that earned
+    // it the tools, which means the person asking is sitting at this machine, in front of the
+    // window where both of those are one click away.
+    //
+    // Scoped to the CONVERSATION and not to this turn, which is the one difference from a
+    // `worktree` run and the reason `chat_tokens` exists. A CLI is handed its environment once,
+    // at spawn; a key naming this turn is therefore a key the process still presents on turn
+    // five, and a process that cannot outlive its turn pays the whole cost of starting again —
+    // measured at 5.8s to `init` and 26.4s to a first shell command, against 1.5s and 6.7s down
+    // a stdin that is already open. `auth::resolve` reads a `chat:` key against whatever turn of
+    // the conversation is running, so the key stays true as the turns change under it, and names
+    // nothing at all in between.
+    //
+    // A process is keyed when it is SPAWNED, not when a turn is written to it: minting rotates
+    // `chat_tokens`, so a key minted for a turn that goes down a kept process would retire the
+    // very key that process still holds. A turn that may keep a process therefore carries an
+    // unstored placeholder here, and `serve_turn` mints the real key (see [`rekey`]) at the
+    // moment it spawns one. If any path skipped that, the placeholder matches nothing and the
+    // turn is refused.
+    let key = match tool_policy {
+        crate::execution::runner::ToolPolicy::Unrestricted if may_live => {
+            unstored_chat_key(chat_id)
+        }
+        crate::execution::runner::ToolPolicy::Unrestricted => fresh_chat_key(pool, chat_id).await,
+        _ => control_token.to_string(),
+    };
+    crate::execution::runs::run_env(&key, run_id, None, crate::speed::Capacity::solo())
+}
+
+/// Puts a freshly minted key for the conversation into `env`, replacing the one it carries.
+///
+/// Called by `serve_turn` on the path that starts a process, and only there.
+pub(super) async fn rekey(env: &mut Vec<(String, String)>, pool: &sqlx::SqlitePool, chat_id: &str) {
+    let key = fresh_chat_key(pool, chat_id).await;
+    match env
+        .iter_mut()
+        .find(|(name, _)| name == "NUCLEOS_DAEMON_TOKEN")
+    {
+        Some(entry) => entry.1 = key,
+        None => env.push(("NUCLEOS_DAEMON_TOKEN".to_string(), key)),
+    }
+}
+
+/// A conversation-scoped key that was never stored, so nothing can match it.
+///
+/// Fails closed: a request presenting it is refused rather than ungoverned.
+pub(super) fn unstored_chat_key(chat_id: &str) -> String {
+    format!("chat:{chat_id}.{}", crate::auth::mint_secret("chat"))
+}
+
+/// Mints the conversation's key, rotating the one stored for it.
+///
+/// Called exactly when a CLI process is about to be spawned with that key in its environment — the
+/// previous key is retired, so it must never be minted for a turn written down a process that is
+/// already holding the old one.
+pub(super) async fn fresh_chat_key(pool: &sqlx::SqlitePool, chat_id: &str) -> String {
+    match crate::auth::mint_chat_token(pool, chat_id).await {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(
+                chat_id = %chat_id,
+                %error,
+                "could not store the conversation's key — this turn's tool calls will be refused"
+            );
+            // Nothing was stored, so nothing can match, so the turn is refused rather
+            // than ungoverned. `runs::mint_run_token` fails in the same direction, and
+            // for the same reason: of the two ways to be wrong here, only one of them
+            // leaves a run acting with nobody watching.
+            unstored_chat_key(chat_id)
+        }
+    }
+}

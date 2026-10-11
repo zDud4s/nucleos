@@ -799,7 +799,6 @@ pub fn structure(root: &Path) -> std::io::Result<Structure> {
 // `map_anchor`'s own crate-level suppression is, so the lint stays live under `cfg(test)`,
 // where the test below exercises every branch of it. The instruction, not a description:
 // DELETE THESE TWO LINES with the change that gives this a production caller.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn citing_files(root: &Path) -> std::io::Result<Vec<String>> {
     let mut files: Vec<String> = Vec::new();
     collect(root, root, &mut files)?;

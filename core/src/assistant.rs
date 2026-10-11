@@ -6,6 +6,8 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::execution::runner::extract_reply;
 
+mod chat_key;
+
 static BUSY_CHATS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Owns a chat's one turn slot for as long as it is held, releasing it on every way out.
@@ -931,6 +933,11 @@ fn worth_keeping(
 /// The answer shape is unchanged, so everything downstream reads one thing whichever door the turn
 /// took; the deadlines are the turn's own: `ceiling` bounds the whole turn, `silence` how long it may
 /// go without a new stream event.
+///
+/// `fresh_key` is the pool to mint the conversation's key from, when the turn is a rooted one. A
+/// process is keyed when it is SPAWNED and a kept process keeps the key it was spawned with, so a
+/// turn written down a kept process must not rotate `chat_tokens` (that rotation was the 401 on
+/// turn two): the key is minted only on the path that starts a process.
 #[allow(clippy::too_many_arguments)]
 async fn serve_turn(
     runner: &std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
@@ -940,6 +947,7 @@ async fn serve_turn(
     chat_id: &str,
     deadlines: TurnDeadlines,
     may_live: bool,
+    fresh_key: Option<&sqlx::SqlitePool>,
 ) -> Result<std::io::Result<crate::execution::runner::RunOutcome>, tokio::time::error::Elapsed> {
     if !may_live {
         request.progress_timeout = deadlines.silence;
@@ -1023,6 +1031,12 @@ async fn serve_turn(
                 Err(elapsed) => return Err(elapsed),
             }
         }
+    }
+
+    // A process is about to be spawned, so this is where its key is minted. The kept-process branch
+    // above never reaches here with a turn it answered, and so never rotates the key.
+    if let Some(pool) = fresh_key {
+        chat_key::rekey(&mut request.env, pool, chat_id).await;
     }
 
     start_live_chat(runner, request, session_tx, transcript, chat_id, deadlines).await
@@ -3288,59 +3302,6 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         .insert(id, std::sync::Arc::clone(&transcript));
 
     crate::execution::runs::spawn_registered(state, id, async move {
-        // WHICH key this turn carries follows from what it can read, and the two must be decided
-        // together or not at all.
-        //
-        // An orchestrator turn carries the daemon's control token — the key that approves proposals
-        // and disengages the kill switch — and the only reason that is safe is that `McpOnly` leaves
-        // it no Bash, no Read and no Write to look at its own environment with. A rooted turn has
-        // all three. Handing it the same key would rebuild, exactly, the hole `runs.rs` records
-        // having already closed once: a run with Bash whose classifier calls `echo
-        // $NUCLEOS_DAEMON_TOKEN` a `read-local` action.
-        //
-        // So it gets a scoped key of its own instead, and loses the power to approve proposals and
-        // to disengage the brake. That is the right thing to lose: it is `Origin::Shell` that earned
-        // it the tools, which means the person asking is sitting at this machine, in front of the
-        // window where both of those are one click away.
-        //
-        // Scoped to the CONVERSATION and not to this turn, which is the one difference from a
-        // `worktree` run and the reason `chat_tokens` exists. A CLI is handed its environment once,
-        // at spawn; a key naming this turn is therefore a key the process still presents on turn
-        // five, and a process that cannot outlive its turn pays the whole cost of starting again —
-        // measured at 5.8s to `init` and 26.4s to a first shell command, against 1.5s and 6.7s down
-        // a stdin that is already open. `auth::resolve` reads a `chat:` key against whatever turn of
-        // the conversation is running, so the key stays true as the turns change under it, and names
-        // nothing at all in between.
-        let env = match tool_policy {
-            crate::execution::runner::ToolPolicy::Unrestricted => {
-                let key = match crate::auth::mint_chat_token(&pool, &turn.slot.chat_id).await {
-                    Ok(key) => key,
-                    Err(error) => {
-                        tracing::warn!(
-                            chat_id = %turn.slot.chat_id,
-                            %error,
-                            "could not store the conversation's key — this turn's tool calls will be refused"
-                        );
-                        // Nothing was stored, so nothing can match, so the turn is refused rather
-                        // than ungoverned. `runs::mint_run_token` fails in the same direction, and
-                        // for the same reason: of the two ways to be wrong here, only one of them
-                        // leaves a run acting with nobody watching.
-                        format!(
-                            "chat:{}.{}",
-                            turn.slot.chat_id,
-                            crate::auth::mint_secret("chat")
-                        )
-                    }
-                };
-                crate::execution::runs::run_env(&key, id, None, crate::speed::Capacity::solo())
-            }
-            _ => crate::execution::runs::run_env(
-                &control_token,
-                id,
-                None,
-                crate::speed::Capacity::solo(),
-            ),
-        };
         let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         {
             let pool = pool.clone();
@@ -3404,7 +3365,7 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         //
         // **A failed write refuses the turn.** It does not fall back to `auto`: somebody who chose
         // `manual` would silently be handed something WIDER than they asked for, and "unknown reads
-        // as auto" is only safe downward. `mint_chat_token` above fails in the same direction and
+        // as auto" is only safe downward. `fresh_chat_key` fails in the same direction and
         // for the same reason — of the two ways to be wrong here, only one leaves a run acting with
         // nobody watching.
         if let Err(error) = sqlx::query("UPDATE runs SET permission_mode = ? WHERE id = ?")
@@ -3456,14 +3417,24 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
         // Which door this turn goes through. Decided once and named, because the two are not
         // interchangeable and the reason is a security one before it is a speed one.
         //
-        // A rooted turn carries a key scoped to its CONVERSATION, minted just above, which stays
-        // true as the turns change under it. An `McpOnly` turn carries the daemon's control token —
+        // A rooted turn carries a key scoped to its CONVERSATION, minted for the process that
+        // carries it (below), which stays true as the turns change under it. An `McpOnly` turn carries the daemon's control token —
         // safe only because that policy leaves it no Bash, no Read and no Write to look at its own
         // environment with — and a process holding THAT key, kept alive and idle between turns, is
         // a different and much worse proposition. So only rooted Claude conversations keep a
         // process, and the barrier that makes it safe is the same one that earned it the tools. A
         // Codex turn has no stdin a later turn can arrive on.
         let may_live = may_keep_process(tool_policy, cli);
+
+        let env = chat_key::turn_env(
+            tool_policy,
+            may_live,
+            &pool,
+            &turn.slot.chat_id,
+            id,
+            &control_token,
+        )
+        .await;
 
         // A turn with no `resume` is a conversation that was deliberately let go of — it read
         // third-party text, or somebody asked for a fresh context — so a process still holding the
@@ -3644,6 +3615,8 @@ fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
             &turn.slot.chat_id,
             deadlines,
             may_live,
+            // A rooted turn that may keep a process is re-keyed by `serve_turn` when it spawns one.
+            may_live.then_some(&pool),
         )
         .await;
         // The process this turn kept (if any) learns what it has now served, before anything can
@@ -7777,6 +7750,7 @@ mod tests {
                     ceiling: Duration::from_secs(10),
                 },
                 true,
+                None,
             )
             .await;
             let kept_for = LIVE_CHATS.lock().unwrap().get(&chat).map(|l| l.idle_for);
@@ -8325,6 +8299,7 @@ mod tests {
                 ceiling: std::time::Duration::from_secs(180),
             },
             true,
+            None,
         )
         .await
         .expect("the turn should not have timed out")
@@ -8355,6 +8330,7 @@ mod tests {
                 ceiling: std::time::Duration::from_secs(180),
             },
             true,
+            None,
         )
         .await
         .expect("the second turn should not have timed out")
@@ -9638,7 +9614,7 @@ mod tests {
     ///
     /// The degrade is only safe downward. Falling back to `auto` here would hand somebody who chose
     /// `manual` a turn that edits without asking — and it would do it silently, on the one path
-    /// where nothing else would say so. `mint_chat_token` thirty lines above fails in the same
+    /// where nothing else would say so. `mint_chat_token`, which keys the process, fails in the same
     /// direction, and this is the same argument.
     ///
     /// The write is broken with a trigger because that is the only honest way to fail exactly this
@@ -9784,6 +9760,105 @@ mod tests {
         // The thing this key exists to not be. A rooted turn has Bash, Read and Write, so it can
         // read its own environment — which is exactly why it must not find the control token there.
         assert_ne!(key, state.token.0);
+    }
+
+    /// A kept CLI process still holds a key that resolves on its second turn.
+    ///
+    /// The process was given its environment once, at spawn, so the key it presents on turn two
+    /// is the one turn one handed it. If turn two rotated the stored secret, that key would be
+    /// answered 401 — the 401 on turn two of a kept process.
+    #[tokio::test]
+    async fn a_kept_process_still_holds_a_key_that_resolves_on_the_second_turn() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "kept-key").await;
+
+        let first = send_message(&state, "kept-key", "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        let env = fake.last_env.lock().unwrap().clone().unwrap_or_default();
+        let key1 = env
+            .iter()
+            .find(|(name, _)| name == "NUCLEOS_DAEMON_TOKEN")
+            .map(|(_, value)| value.clone())
+            .expect("a rooted turn is given a key");
+
+        let second = send_message(&state, "kept-key", "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            1,
+            "the second turn started a second process instead of speaking to the first"
+        );
+        let stored: String =
+            sqlx::query_scalar("SELECT token FROM chat_tokens WHERE chat_id = 'kept-key'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            key1,
+            format!("chat:kept-key.{stored}"),
+            "the key the kept process holds no longer matches the stored secret"
+        );
+    }
+
+    /// A fresh process is given a fresh key, and the old one is retired.
+    ///
+    /// Rotation belongs to a fresh spawn: the process that held the old key is gone, so the stored
+    /// secret may change, and the new process must hold the new one.
+    #[tokio::test]
+    async fn a_fresh_process_is_given_a_fresh_key_that_retires_the_old_one() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "rekeyed").await;
+
+        let first = send_message(&state, "rekeyed", "faz isso", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        let env = fake.last_env.lock().unwrap().clone().unwrap_or_default();
+        let key1 = env
+            .iter()
+            .find(|(name, _)| name == "NUCLEOS_DAEMON_TOKEN")
+            .map(|(_, value)| value.clone())
+            .expect("a rooted turn is given a key");
+
+        crate::chats::set_permission_mode(
+            &state.pool,
+            "rekeyed",
+            crate::chats::PermissionMode::Plan,
+        )
+        .await
+        .unwrap();
+        let second = send_message(&state, "rekeyed", "afinal planeia", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            2,
+            "the turn was answered by a process started in the other mode"
+        );
+        let env = fake.last_env.lock().unwrap().clone().unwrap_or_default();
+        let key2 = env
+            .iter()
+            .find(|(name, _)| name == "NUCLEOS_DAEMON_TOKEN")
+            .map(|(_, value)| value.clone())
+            .expect("a fresh process is given a key");
+        let stored: String =
+            sqlx::query_scalar("SELECT token FROM chat_tokens WHERE chat_id = 'rekeyed'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_ne!(key1, key2, "a fresh process was handed the old key");
+        assert_eq!(key2, format!("chat:rekeyed.{stored}"));
     }
 
     /// A turn carrying nothing keeps the argument vector it has always used.
@@ -10152,6 +10227,7 @@ mod tests {
             chat_id,
             deadlines,
             true,
+            None,
         )
         .await;
         let elapsed = started.elapsed();
@@ -10198,6 +10274,7 @@ mod tests {
             chat_id,
             deadlines,
             true,
+            None,
         )
         .await;
         let elapsed = started.elapsed();
@@ -10250,6 +10327,7 @@ mod tests {
             chat_id,
             deadlines,
             true,
+            None,
         )
         .await;
         let elapsed = started.elapsed();
@@ -10283,6 +10361,7 @@ mod tests {
             "chat-silence-one-shot-streaming",
             deadlines,
             false,
+            None,
         )
         .await
         .expect("a turn that keeps streaming is not past any deadline")
@@ -10309,6 +10388,7 @@ mod tests {
             "chat-silence-one-shot-silent",
             deadlines,
             false,
+            None,
         )
         .await
         .expect("silence is the runner's outcome, not the ceiling elapsing")
@@ -10339,6 +10419,7 @@ mod tests {
             "chat-silence-one-shot-ceiling",
             deadlines,
             false,
+            None,
         )
         .await;
 
@@ -10369,6 +10450,7 @@ mod tests {
             "chat-silence-mcp-only",
             deadlines,
             false,
+            None,
         )
         .await;
 

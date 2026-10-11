@@ -515,8 +515,7 @@ mod tests {
     //
     // Every test below sets up every OTHER brake to be one `admit` would clear, and varies only
     // the one under test — so a refusal in a test proves that specific brake caught it, not that
-    // some brake or other did. `admit`'s body is `todo!()` until GREEN, so every one of these
-    // fails on that panic; the assertions after the call exist for GREEN to make true, not RED.
+    // some brake or other did.
 
     fn timestamp(value: &str) -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339(value)

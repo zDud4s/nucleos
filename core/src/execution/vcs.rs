@@ -614,7 +614,6 @@ pub enum Origin {
     Daemon,
     Run(i64),
     // Constructed by Chunk 4, when jobs submit requests of their own.
-    #[allow(dead_code)]
     Job(i64),
 }
 
