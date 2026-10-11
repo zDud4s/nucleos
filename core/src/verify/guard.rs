@@ -247,11 +247,57 @@ fn tail(words: &[String], from: usize) -> Vec<String> {
 
 /// The words after any leading `-x` flags.
 fn after_flags(words: &[String]) -> Vec<String> {
-    let flags = words
-        .iter()
-        .take_while(|word| word.starts_with('-'))
-        .count();
-    tail(words, flags)
+    after_options(words, &[])
+}
+
+/// The words after any leading options, where an option in `valued` takes the next word as its
+/// value (`env -u NAME`, `xargs -n 1`) and a `--` ends them. Without `valued`, that value would be
+/// read as the program and the real one behind it never tested.
+fn after_options(words: &[String], valued: &[&str]) -> Vec<String> {
+    let mut at = 0;
+    while let Some(word) = words.get(at) {
+        if word == "--" {
+            at += 1;
+            break;
+        }
+        if !word.starts_with('-') {
+            break;
+        }
+        at += if valued.contains(&word.as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    tail(words, at)
+}
+
+/// `env`'s options that take the next word as their value.
+const ENV_VALUED: &[&str] = &["-u", "--unset", "-C", "--chdir"];
+
+/// `xargs`'s options that take the next word as their value.
+const XARGS_VALUED: &[&str] = &[
+    "-n",
+    "-L",
+    "-P",
+    "-I",
+    "-d",
+    "-E",
+    "-a",
+    "-s",
+    "--max-args",
+    "--max-procs",
+    "--delimiter",
+    "--arg-file",
+    "--max-chars",
+];
+
+/// Whether a POSIX shell's leading flags include `-n`, alone or in a short bundle (`-nv`): it
+/// only reads the script for syntax and runs nothing.
+fn syntax_check_only(rest: &[String]) -> bool {
+    rest.iter()
+        .take_while(|word| word.starts_with('-') && word.as_str() != "--")
+        .any(|word| !word.starts_with("--") && word.contains('n'))
 }
 
 fn is_python(program: &str) -> bool {
@@ -273,7 +319,21 @@ fn peel(words: &[String], ctx: &Ctx<'_>) -> Peel {
     match program.as_str() {
         // PowerShell's call operator.
         "&" | "time" => Peel::Argv(rest.to_vec()),
-        "env" | "xargs" | "npx" => Peel::Argv(after_flags(rest)),
+        "env" => {
+            // `-S` hands env one string to split into the command line.
+            if let Some(at) = rest
+                .iter()
+                .position(|word| word == "-S" || word == "--split-string")
+            {
+                return match rest.get(at + 1) {
+                    Some(line) => Peel::Line(line.clone(), Shell::Posix),
+                    None => Peel::Done,
+                };
+            }
+            Peel::Argv(after_options(rest, ENV_VALUED))
+        }
+        "xargs" => Peel::Argv(after_options(rest, XARGS_VALUED)),
+        "npx" => Peel::Argv(after_flags(rest)),
         "nice" => {
             let mut at = 0;
             while let Some(word) = rest.get(at) {
@@ -421,7 +481,11 @@ fn test_argv(words: &[String], ctx: &Ctx<'_>) -> Option<Hit> {
 /// The path a line could be launching as a gate script: its program, or — behind an interpreter —
 /// the script the interpreter runs.
 fn entry_candidate(words: &[String]) -> &str {
-    if is_interpreter(&program_of(&words[0])) {
+    let program = program_of(&words[0]);
+    if matches!(program.as_str(), "bash" | "sh" | "zsh") && syntax_check_only(&words[1..]) {
+        return words[0].as_str();
+    }
+    if is_interpreter(&program) {
         words[1..]
             .iter()
             .find(|word| !word.starts_with('-'))
@@ -592,6 +656,35 @@ tests:
         assert_eq!(found(posix(r#"pwsh -Command "cargo test""#)), tool("cargo"));
         assert_eq!(found(posix("cmd /c cargo test")), tool("cargo"));
         assert_eq!(found(powershell("& cargo test")), tool("cargo"));
+    }
+
+    #[test]
+    fn an_option_value_is_not_taken_for_the_program() {
+        assert_eq!(
+            found(posix("env -u CARGO_TARGET_DIR cargo test")),
+            tool("cargo")
+        );
+        assert_eq!(found(posix("env --chdir core cargo test")), tool("cargo"));
+        assert_eq!(found(posix("env -i A=b cargo test")), tool("cargo"));
+        assert_eq!(found(posix(r#"env -S "cargo test -p x""#)), tool("cargo"));
+        assert_eq!(found(posix("xargs -n 1 cargo test")), tool("cargo"));
+        assert_eq!(
+            found(posix("xargs -P 4 -I {} cargo test {}")),
+            tool("cargo")
+        );
+        assert_eq!(found(posix("xargs -0 -- cargo test")), tool("cargo"));
+        assert_eq!(posix("xargs -n 1 cargo fmt"), None);
+    }
+
+    #[test]
+    fn a_shells_syntax_check_of_a_gate_script_is_not_an_entrypoint() {
+        assert_eq!(posix("bash -n scripts/gates.sh"), None);
+        assert_eq!(posix("sh -nv scripts/gates.sh all"), None);
+        // `--norc` is no `-n`: the script still runs.
+        assert_eq!(
+            found(posix("bash --norc scripts/gates.sh all")),
+            Some(("entrypoint", "scripts/gates.sh".to_string()))
+        );
     }
 
     #[test]
