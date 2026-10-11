@@ -4,9 +4,6 @@
 //! [`select`] is pure: the map and the paths in, the units out. The one question that needs the
 //! filesystem — which paths are safe to hand a test runner as arguments — is [`vet`], which the
 //! caller asks first and passes in.
-// Nothing outside the tests calls this until the F2a executor does; core is a binary crate, so
-// clippy's `dead_code` would otherwise fail the gate.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::BTreeSet;
 use std::path::Path;

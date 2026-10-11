@@ -144,7 +144,6 @@ impl ShellRules {
     /// question this type should be able to answer when a caller finally asks it. `not(test)` rather
     /// than blanket, for the reason the file-level one gave: the lint stays live under the test
     /// build, so the day this stops being exercised it has to say so.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.allow.is_empty() && self.deny.is_empty() && self.deny_writes.is_empty()
     }

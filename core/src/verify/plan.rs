@@ -5,9 +5,6 @@
 //! stored request plus the live state of its `verify_runs` rows into the ticket a caller sees.
 //! Keeping both pure is what lets the whole decision table be tested without a daemon.
 
-// Wired in by `verify.rs`; until every caller exists the build sees these as unused.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};

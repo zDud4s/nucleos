@@ -569,7 +569,6 @@ pub enum LocalEngine {
 ///
 /// The resolved address travels WITH the engine rather than being re-derived by each caller,
 /// because deriving it twice is how a turn ends up posted somewhere the menu never approved.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLocalEngine {
     pub engine: LocalEngine,
@@ -658,11 +657,7 @@ pub fn is_loopback_url(raw: &str) -> bool {
 /// PURE: the menu, with each local choice marked by what its model was found to declare.
 ///
 /// A model absent from `declared` stays `None` — nothing is ever marked `Some(false)` on a guess;
-/// `AssistantChoice::tools`'s own doc is the reason why. No production caller until the model
-/// picker's door wires `capabilities::DiscoveryCache`'s findings onto the menu — GREEN's job, not
-/// this phase's; `o_catalogo_marca_quem_nao_declara_ferramentas` and its sibling below exercise it
-/// in the meantime.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `AssistantChoice::tools`'s own doc is the reason why.
 pub fn marked_with(
     choices: Vec<AssistantChoice>,
     declared: &std::collections::HashMap<String, crate::capabilities::Declared>,
@@ -1653,7 +1648,6 @@ pub fn load_devtime_config(path: &Path) -> DevtimeConfig {
 /// The verification executor's machine settings, `~/.nucleos/verify.yaml`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct VerifyConfig {
     /// Weight units that may run at once across the whole machine.
     pub capacity: u32,
@@ -1685,7 +1679,6 @@ impl Default for VerifyConfig {
 /// `~/.nucleos/verify.yaml`'s grammar, and the only place that decides what a valid one is.
 /// Refuses unknown keys, malformed YAML and a zero capacity, aging or timeout;
 /// [`load_verify_config`] turns that refusal into defaults.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_verify_config(contents: &str) -> Result<VerifyConfig, String> {
     // An empty file (or only comments) is "say nothing", which is the defaults.
     if contents.trim().is_empty() {
@@ -1711,7 +1704,6 @@ pub fn parse_verify_config(contents: &str) -> Result<VerifyConfig, String> {
     Ok(config)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn load_verify_config(path: &Path) -> VerifyConfig {
     if !path.exists() {
         return VerifyConfig::default();

@@ -140,7 +140,6 @@ pub enum Scope {
     /// One agent's own memory. Read by that agent, and by nobody else.
     Agent(String),
     /// A job, and the project it belongs to when the caller knows it.
-    #[cfg_attr(not(test), allow(dead_code))]
     Job {
         id: i64,
         project: Option<String>,
@@ -265,7 +264,6 @@ pub struct Known {
 }
 
 /// The kind of node whose work is being briefed, in the order the job graph uses them.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     Plan,
@@ -284,10 +282,8 @@ pub struct Context {
     /// The communities and modules of the project map those files inhabit — the signal this project
     /// has for free because it already builds the map.
     pub communities: Vec<String>,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub node: Option<NodeKind>,
     /// The normalised signature of the red gate, when there is one.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub gate: Option<String>,
     /// Whether this briefing has a query vector (spec 5.2): absence is per briefing, not per row.
     /// Set only by `brief`.

@@ -1,8 +1,5 @@
 //! Picks the next verification unit to start. Pure: the executor feeds it the queue,
 //! the free capacity and when each project last started something.
-// Nothing outside the tests calls this until the F2a executor does; core is a binary crate, so
-// clippy's `dead_code` would otherwise fail the gate.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashMap;
 

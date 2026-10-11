@@ -6,7 +6,6 @@
 //! [`Executor::submit`] queues (or joins) a unit and wakes the worker; [`run_executor`] is the
 //! worker loop; [`Executor::start_ready`] is one scheduling pass. Weight and in-use warm dirs are
 //! released by a drop guard, so every way a unit ends gives its capacity back.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

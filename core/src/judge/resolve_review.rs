@@ -104,7 +104,6 @@ pub enum PersonsDecision {
     Decline,
     /// No door constructs this one: a reject labels nothing (see [`label_of`]), so its handler
     /// does not call in. The variant keeps that rule written down and tested.
-    #[cfg_attr(not(test), allow(dead_code))]
     Reject,
 }
 
