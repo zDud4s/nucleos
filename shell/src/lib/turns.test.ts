@@ -56,12 +56,21 @@ function turn(overrides: Partial<Turn> = {}): Turn {
     window: 140000,
     compacted: false,
     relayedFrom: null,
+    unprompted: false,
     relayedTo: [],
     ...overrides,
   };
 }
 
 describe("turnFromRow, on where a turn came from", () => {
+  // The daemon's note that a background task ended is stored as the turn's prompt. Read as a
+  // person's words it would be drawn under "you".
+  it("marks a turn the assistant started on its own", () => {
+    expect(turnFromRow(row({ origin: "task" })).unprompted).toBe(true);
+    expect(turnFromRow(row({ origin: "shell" })).unprompted).toBe(false);
+    expect(turnFromRow(row()).unprompted).toBe(false);
+  });
+
   // A relayed turn is not something the person reading it said. Drawn without this the transcript
   // attributes another conversation's words to them, under their own name — the transcript getting
   // the speaker wrong, in the one place somebody goes to find out who said what.

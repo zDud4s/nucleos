@@ -1301,6 +1301,7 @@ export function useSendMessage(chatId: string) {
         // this window just sent the message. A relayed turn is never drawn this way — it is born in
         // another conversation and reaches this one through the daemon's own read.
         relayedFrom: null,
+        unprompted: false,
       };
       // A `Transcript`, because that is what this key holds. It used to hold a bare array, and
       // writing the old shape here does not fail a type check — `setQueryData` is TOLD the type —
