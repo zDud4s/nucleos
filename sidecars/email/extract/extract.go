@@ -176,6 +176,8 @@ type collector struct {
 	// is how a description and its content start pointing at different files.
 	want     int
 	contents map[int][]byte
+	// corrupt marks the positions whose content failed to decode; their `contents` entry is empty.
+	corrupt map[int]bool
 }
 
 // bodyAndAttachments prefers `text/plain`, falls back to stripped HTML, and describes every
@@ -233,6 +235,9 @@ func Attachment(raw []byte, position int) (daemon.Attachment, []byte, error) {
 		return daemon.Attachment{}, nil, ErrNoSuchAttachment
 	}
 	described, content := found.attachments[position], found.contents[position]
+	if found.corrupt[position] {
+		return described, nil, ErrAttachmentCorrupt
+	}
 	if described.SizeBytes > int64(len(content)) {
 		return described, content, ErrAttachmentTruncated
 	}
@@ -262,6 +267,11 @@ func AllAttachments(raw []byte) ([]daemon.Attachment, map[int][]byte, error) {
 
 	found := collector{want: wantEvery}
 	found.walk(parsed.Body, params["boundary"], 0)
+	// One corrupt file refuses the whole set rather than travelling as a smaller file that looks
+	// whole: the bulk caller files everything together, and has no partial-success state to report.
+	if len(found.corrupt) > 0 {
+		return nil, nil, ErrAttachmentCorrupt
+	}
 	if found.contents == nil {
 		found.contents = map[int][]byte{}
 	}
@@ -273,24 +283,35 @@ func AllAttachments(raw []byte) ([]daemon.Attachment, map[int][]byte, error) {
 //
 // `size` is the part's TRUE decoded size: past the cap the rest is counted and discarded rather than
 // kept, so a truncated read shows itself as `size > len(content)` instead of passing for a whole
-// file.
-func readDecoded(part *multipart.Part) (content []byte, size int64) {
+// file. A read that fails — base64 that stops decoding halfway — returns the error and no bytes: the
+// bytes before the failure would carry a size matching their length, and so pass for the whole file.
+func readDecoded(part *multipart.Part) (content []byte, size int64, err error) {
 	var reader io.Reader = part
 	if strings.EqualFold(part.Header.Get("Content-Transfer-Encoding"), "base64") {
 		reader = base64.NewDecoder(base64.StdEncoding, part)
 	}
-	content, _ = io.ReadAll(io.LimitReader(reader, MaxAttachmentBytes))
+	content, err = io.ReadAll(io.LimitReader(reader, MaxAttachmentBytes))
+	if err != nil {
+		return nil, 0, err
+	}
 	size = int64(len(content))
 	if size == MaxAttachmentBytes {
-		rest, _ := io.Copy(io.Discard, reader)
+		rest, err := io.Copy(io.Discard, reader)
+		if err != nil {
+			return nil, 0, err
+		}
 		size += rest
 	}
-	return content, size
+	return content, size, nil
 }
 
 // ErrAttachmentTruncated means the attachment is larger than MaxAttachmentBytes, so the bytes
 // returned beside it are only its beginning. A half file that looks whole is worse than none.
 var ErrAttachmentTruncated = errors.New("attachment exceeds the size cap and was truncated")
+
+// ErrAttachmentCorrupt means the attachment's encoded content could not be decoded to the end, so
+// no bytes are returned for it — for the same reason as ErrAttachmentTruncated.
+var ErrAttachmentCorrupt = errors.New("attachment content could not be decoded")
 
 // walk reads one multipart level, descending into nested multiparts and stopping at MaxMIMEDepth.
 func (c *collector) walk(body io.Reader, boundary string, depth int) {
@@ -315,7 +336,13 @@ func (c *collector) walk(body io.Reader, boundary string, depth int) {
 			position := len(c.attachments)
 			size := int64(0)
 			if c.want == wantEvery || position == c.want {
-				content, trueSize := readDecoded(part)
+				content, trueSize, err := readDecoded(part)
+				if err != nil {
+					if c.corrupt == nil {
+						c.corrupt = map[int]bool{}
+					}
+					c.corrupt[position] = true
+				}
 				if c.contents == nil {
 					c.contents = map[int][]byte{}
 				}

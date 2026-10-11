@@ -84,6 +84,18 @@ func TestATruncatedAttachmentIsA413NamingTheTrueSize(t *testing.T) {
 	}
 }
 
+func TestACorruptAttachmentIsA422AndNoBytes(t *testing.T) {
+	w := httptest.NewRecorder()
+	serveAttachment(w, 1, 0, attachment{Filename: "bad.pdf", SizeBytes: 5}, nil, extract.ErrAttachmentCorrupt)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "attachment_corrupt") {
+		t.Errorf("body = %q, want it to name attachment_corrupt", w.Body.String())
+	}
+}
+
 func TestOtherAttachmentOutcomesAreUnchanged(t *testing.T) {
 	w := httptest.NewRecorder()
 	serveAttachment(w, 1, 0, attachment{Filename: "a.txt", SizeBytes: 3}, []byte("abc"), nil)

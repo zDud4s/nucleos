@@ -64,6 +64,27 @@ func TestOversizedAttachmentIsReportedTruncated(t *testing.T) {
 	}
 }
 
+// A base64 part that stops decoding halfway must not come back as a smaller file that looks whole:
+// its size would match its bytes, so nothing downstream could tell it was cut.
+func TestAnUndecodableAttachmentIsReportedCorrupt(t *testing.T) {
+	raw := []byte("From: a@example.test\r\nContent-Type: multipart/mixed; boundary=XX\r\n\r\n" +
+		"--XX\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=bad.pdf\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\n" +
+		"c2VndW5k!!!bw==\r\n--XX--\r\n")
+
+	_, content, err := Attachment(raw, 0)
+	if !errors.Is(err, ErrAttachmentCorrupt) {
+		t.Fatalf("Attachment err = %v, want ErrAttachmentCorrupt", err)
+	}
+	if len(content) != 0 {
+		t.Errorf("the partial bytes %q leaked out beside the error", content)
+	}
+
+	if _, _, err := AllAttachments(raw); !errors.Is(err, ErrAttachmentCorrupt) {
+		t.Fatalf("AllAttachments err = %v, want ErrAttachmentCorrupt", err)
+	}
+}
+
 func TestSentMessageForwardsRecipients(t *testing.T) {
 	raw := []byte("From: Ana <ana@example.test>\r\n" +
 		"To: Maria <maria@example.test>, oncall@example.test\r\n" +
