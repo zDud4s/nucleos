@@ -91,6 +91,14 @@ func serveAttachment(w http.ResponseWriter, uid imapv2.UID, position int, attach
 		})
 		return
 	}
+	if errors.Is(err, extract.ErrAttachmentCorrupt) {
+		// The message is there and so is the part, but its bytes do not decode: neither "not
+		// found" nor sidecar trouble. No bytes, for the same reason as the 413.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "attachment_corrupt"})
+		return
+	}
 	if errors.Is(err, extract.ErrNoSuchAttachment) {
 		// The stored description and the live message disagree — the message was replaced or
 		// removed. A 404 rather than an empty file, which a caller would happily save.
@@ -160,6 +168,12 @@ func allHandler(cfg config.Config) http.HandlerFunc {
 		}
 
 		described, contents, err := readAll(cfg, uid)
+		if errors.Is(err, extract.ErrAttachmentCorrupt) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "attachment_corrupt"})
+			return
+		}
 		if err != nil {
 			log.Printf("attachments of uid %d: %v", uid, err)
 			http.Error(w, "could not read the attachments", http.StatusBadGateway)
