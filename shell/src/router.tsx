@@ -22,7 +22,6 @@ import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
 import { Mail } from "./pages/Mail";
 import { MailDetail } from "./pages/MailDetail";
-import { Placeholder } from "./pages/Placeholder";
 import { Projects } from "./pages/Projects";
 import { Roster } from "./pages/Roster";
 import { NewProject } from "./pages/NewProject";
@@ -53,11 +52,11 @@ import { BrowserRedirect, WebTabs } from "./pages/WebTabs";
  *
  * A table rather than a chain of ternaries in the map below: this list grows by
  * one entry per slice, and a conditional expression that grows to fourteen
- * branches is a conditional expression nobody reads. A path that is not here
- * gets the placeholder, which is what makes an unbuilt page a *stated* absence
- * rather than a missing route.
+ * branches is a conditional expression nobody reads. Every nav path must be
+ * here: a path that is not fails `createAppRouter` loudly rather than mounting
+ * a route with nothing in it.
  *
- * `export`ed so the "no placeholder left" invariant can be asserted directly
+ * `export`ed so the "every item has a page" invariant can be asserted directly
  * against this table, rather than by walking the rendered tree.
  */
 export const PAGES: Record<string, () => ReactNode> = {
@@ -279,7 +278,7 @@ export function createAppRouter(initialPath = "/") {
     return createRoute({
       getParentRoute: () => rootRoute,
       path: item.path,
-      component: PAGES[item.path] ?? placeholderFor(item),
+      component: pageFor(item),
       // Declared per route rather than only on the router, so the boundary sits
       // as deep as it can: inside `AppShell`'s outlet, where the page that threw
       // is the only thing replaced.
@@ -337,17 +336,11 @@ export function createAppRouter(initialPath = "/") {
   });
 }
 
-/**
- * A component per item rather than one component reading the route.
- *
- * The item is closed over, so the placeholder knows which page it stands in for
- * without a route-parameter dance — and when a real page replaces it, the
- * change is one line in the map above.
- */
-function placeholderFor(item: NavItem) {
-  return function PlaceholderRoute() {
-    return <Placeholder item={item} />;
-  };
+/** The page for a nav item. Every item has one, so a missing entry is a bug in `PAGES`. */
+function pageFor(item: NavItem): () => ReactNode {
+  const page = PAGES[item.path];
+  if (page === undefined) throw new Error(`no page for nav path ${item.path}`);
+  return page;
 }
 
 export type AppRouter = ReturnType<typeof createAppRouter>;

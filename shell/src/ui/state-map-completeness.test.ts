@@ -7,10 +7,10 @@ import { readState, statesOf } from "./state-map";
 
 const moduleUrl = import.meta.url.startsWith("file:") ? import.meta.url : `file://${import.meta.url}`;
 const repoRoot = fileURLToPath(new URL("../../../", moduleUrl));
-const jobRs = readFileSync(`${repoRoot}core/src/execution/job.rs`, "utf8");
+const jobRs = moduleSource("core/src/execution/job");
 const teamRs = readFileSync(`${repoRoot}core/src/team.rs`, "utf8");
 const concurrencyRs = readFileSync(`${repoRoot}core/src/execution/concurrency.rs`, "utf8");
-const runsRs = readFileSync(`${repoRoot}core/src/execution/runs.rs`, "utf8");
+const runsRs = moduleSource("core/src/execution/runs");
 const quotaRs = readFileSync(`${repoRoot}core/src/quota.rs`, "utf8");
 
 /**
@@ -26,6 +26,22 @@ function coreFiles(): { name: string; source: string }[] {
       return [{ name: `${prefix}${entry.name}`, source: readFileSync(`${dir}/${entry.name}`, "utf8") }];
     });
   return walk(`${repoRoot}core/src`, "");
+}
+
+/**
+ * A module split into a folder (`job.rs` beside `job/*.rs`), read as one text: the declarations
+ * this test parses move between the files as the module is reorganised, and the test is about
+ * what the module says, not which file says it. Each file is cut at its test module first.
+ */
+function moduleSource(path: string): string {
+  const files = [`${repoRoot}${path}.rs`];
+  for (const entry of readdirSync(`${repoRoot}${path}`, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith(".rs")) files.push(`${repoRoot}${path}/${entry.name}`);
+  }
+  return files
+    .map((file) => readFileSync(file, "utf8"))
+    .map((source) => source.slice(0, cutAtTestModule(source)))
+    .join("\n");
 }
 
 function cutAtTestModule(source: string): number {
@@ -64,16 +80,16 @@ const WRITERS: { name: string; position: number }[] = [
   { name: "append", position: 3 },
   { name: "append_on", position: 3 },
   { name: "say", position: 3 },
-  // `execution/job.rs::say_once` forwards to `say` only when the same line is not already written.
+  // `execution/job/spawn.rs::say_once` forwards to `say` only when the same line is not already written.
   { name: "say_once", position: 3 },
   { name: "deliver_or_defer", position: 2 },
 ];
 
 const FORWARDED: Record<string, Record<string, string[]>> = {
   "feed.rs": { kind: [] },
-  "execution/job.rs": { kind: [] },
+  "execution/job/spawn.rs": { kind: [] },
   "integrations/notify.rs": { kind: [] },
-  "execution/runs.rs": { kind: ["shadow_run_completed", "worktree_run_completed"] },
+  "execution/runs/spawn.rs": { kind: ["shadow_run_completed", "worktree_run_completed"] },
   "governance/triage.rs": { 'format!("email_{}",verdict.class)': [] },
 };
 

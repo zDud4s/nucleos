@@ -63,7 +63,7 @@ export type NavGroupId = "operate" | "work" | "pillars";
 export type NavBadge = "proposals" | "chats" | "captures";
 
 export interface NavItem {
-  /** Stable id — used for badge lookup, disabled sets, and test selectors. */
+  /** Stable id — used for badge lookup and test selectors. */
   id: string;
   label: string;
   /** The route path. Exactly one route is built per item. */
@@ -87,16 +87,6 @@ export interface NavItem {
    */
   icon: LucideIcon;
   badge?: NavBadge;
-  /**
-   * Why this item cannot do anything yet, when that is a fact about the
-   * *núcleo* rather than about this machine's configuration.
-   *
-   * An item with this set is still in the list and still navigable — it goes to
-   * a page that explains itself. Hiding it would be the shell pretending the
-   * feature was never designed, which is a worse lie than admitting it is not
-   * wired.
-   */
-  disabled?: string;
 }
 
 export interface NavGroup {
@@ -196,15 +186,3 @@ export function navItemForPath(path: string): NavItem | undefined {
   return NAV_ITEMS.find((item) => item.path === path);
 }
 
-/**
- * Which slice of the build brings an item's page.
- *
- * The groups double as the delivery slices — Operate, Work and Pillars are the
- * order this app is being built in, not only the order it is read in — so a
- * placeholder page can name the slice that will replace it without a second
- * table to keep in step with this one.
- */
-export function sliceOf(item: NavItem): string {
-  const group = NAV.find((candidate) => candidate.items.some((member) => member.id === item.id));
-  return group === undefined ? SYSTEM_ITEM.label : group.label;
-}
