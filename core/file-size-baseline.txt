@@ -7,8 +7,6 @@
 # line whose file no longer exists, or that sits at or under the limit. Nothing new is ever added
 # here: a new file past the limit is split by what it does, not given a line.
 src/team.rs 3368
-src/execution/runner.rs 2812
-src/hooks.rs 2614
 src/assistant.rs 2374
 src/execution/git_exec.rs 2190
 src/mcp_tools.rs 2067
