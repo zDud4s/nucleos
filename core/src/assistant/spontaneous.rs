@@ -167,6 +167,7 @@ pub(super) async fn start_spontaneous_turn(
             return;
         }
     };
+    crate::chats::stamp_project(&state.pool, id, chat_id).await;
 
     // Published before the body is spawned, for the reason `spawn_assistant_turn` gives.
     let transcript = std::sync::Arc::new(Mutex::new(String::new()));

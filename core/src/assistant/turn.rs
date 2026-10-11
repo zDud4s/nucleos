@@ -99,6 +99,7 @@ pub(super) async fn spawn_local_turn(
     .await
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
+    crate::chats::stamp_project(&state.pool, id, &slot.chat_id).await;
 
     // The relay learns which turn answered it, now that the turn has an id to learn.
     //

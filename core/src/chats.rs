@@ -881,6 +881,47 @@ pub async fn cwd_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<Str
     opened_in(pool, chat_id).await.map(Option::flatten)
 }
 
+/// Stamp a freshly inserted chat turn with the project its chat's directory belongs to.
+///
+/// Resolved here, once per turn, because the permission hook must never spawn git to find a project
+/// at call time (`hooks/rooted.rs`): the lookup shells out to `git rev-parse`, so it runs when the
+/// run is created and the hook only reads the column. Best effort and never an error: a chat with no
+/// directory, or whose repository is on no roster row, simply has no project and the run stays
+/// unstamped. `project_id IS NULL` keeps a stamp that something else already wrote.
+pub async fn stamp_project(pool: &SqlitePool, run_id: i64, chat_id: &str) {
+    let cwd = match cwd_of(pool, chat_id).await {
+        Ok(Some(cwd)) => cwd,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::debug!(chat_id = %chat_id, %error, "could not read the chat's directory to stamp its turn");
+            return;
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let project_id = match crate::execution::vcs::project_for_worktree(
+        pool,
+        std::path::Path::new(&cwd),
+        deadline,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::debug!(chat_id = %chat_id, %error, "chat directory is on no project roster; turn left unstamped");
+            return;
+        }
+    };
+    if let Err(error) =
+        sqlx::query("UPDATE runs SET project_id = ? WHERE id = ? AND project_id IS NULL")
+            .bind(&project_id)
+            .bind(run_id)
+            .execute(pool)
+            .await
+    {
+        tracing::debug!(run_id, %error, "could not stamp the chat turn with its project");
+    }
+}
+
 /// One message waiting to be said, and the name it can be taken back by.
 ///
 /// An id and not a position: the drain removes the front of the queue while a person is looking at
@@ -2047,5 +2088,112 @@ mod tests {
 
         // A run that belongs to no conversation reads as off, which is the fail-closed answer.
         assert!(!ambient_mcp_for_run(&pool, 999_999).await);
+    }
+
+    /// A throwaway repository with one empty commit, the way `devtime::map`'s tests build theirs.
+    fn repo_with_a_commit(dir: &std::path::Path) {
+        for args in [
+            &["init", "-q"][..],
+            &["commit", "-q", "--allow-empty", "-m", "init"][..],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t.invalid"])
+                .args(args)
+                .output()
+                .expect("git on PATH");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    async fn project_of_run(pool: &SqlitePool, run_id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT project_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The run row a chat turn inserts binds no project, and the permission hook must never spawn git
+    /// to find one at call time -- so the turn resolves it once, when it is created.
+    #[tokio::test]
+    async fn a_chat_turn_is_stamped_with_the_project_of_its_directory() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_a_commit(dir.path());
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p1', 'shadow', ?)",
+        )
+        .bind(dir.path().to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let chat = create(&pool, Brain::Cloud, None).await.unwrap();
+        set_cwd(&pool, &chat, &dir.path().to_string_lossy())
+            .await
+            .unwrap();
+        let run_id = turn_in(&pool, &chat, "running").await;
+        assert_eq!(
+            project_of_run(&pool, run_id).await,
+            None,
+            "unstamped to begin with"
+        );
+
+        stamp_project(&pool, run_id, &chat).await;
+
+        assert_eq!(
+            project_of_run(&pool, run_id).await.as_deref(),
+            Some("p1"),
+            "the chat's directory is the root of project p1"
+        );
+    }
+
+    /// Outside the roster a chat simply has no project: the stamp is best effort and never an error,
+    /// and it must not invent one for a directory the daemon does not know.
+    #[tokio::test]
+    async fn a_chat_with_no_project_leaves_the_run_unstamped() {
+        let pool = test_pool().await;
+
+        // No directory at all.
+        let homeless = create(&pool, Brain::Cloud, None).await.unwrap();
+        let run_id = turn_in(&pool, &homeless, "running").await;
+        stamp_project(&pool, run_id, &homeless).await;
+        assert_eq!(
+            project_of_run(&pool, run_id).await,
+            None,
+            "no cwd, no project"
+        );
+
+        // A directory that is a repository, but whose repository is on nobody's roster. A different
+        // project IS rostered, so a lookup that matched loosely would find the wrong one here.
+        let rostered = tempfile::tempdir().unwrap();
+        repo_with_a_commit(rostered.path());
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('other', 'shadow', ?)",
+        )
+        .bind(rostered.path().to_string_lossy().as_ref())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let stranger = tempfile::tempdir().unwrap();
+        repo_with_a_commit(stranger.path());
+        let chat = create(&pool, Brain::Cloud, None).await.unwrap();
+        set_cwd(&pool, &chat, &stranger.path().to_string_lossy())
+            .await
+            .unwrap();
+        let run_id = turn_in(&pool, &chat, "running").await;
+        stamp_project(&pool, run_id, &chat).await;
+        assert_eq!(
+            project_of_run(&pool, run_id).await,
+            None,
+            "a repository on no roster row stays unstamped"
+        );
     }
 }

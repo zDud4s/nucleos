@@ -103,12 +103,13 @@ pub(super) async fn pretooluse_decision_from(
     // `run_handles` is precisely when losing that project's `deny` would cost the most. One more
     // column on a query that already ran, so the reach costs nothing.
     //
-    // `permission_mode` rides along for the same sentence, and it is the SNAPSHOT the turn started
-    // with rather than what the conversation's selector says now: moving the menu while a turn is
-    // running must not change the rules underneath it. NULL means no CLI turn wrote one — every
-    // autopilot run, and every turn the local brain answered — and reads as `Auto`, which is what a
-    // rooted conversation did before the column existed. One more column on a query that already
-    // ran, so the reach costs nothing.
+    // `permission_mode` rides along for the same sentence, and it is the turn's SNAPSHOT: what
+    // governs `plan` (the CLI's own flag, fixed at spawn) and what non-chat callers are held to. A
+    // rooted conversation's live rung comes from `rooted_turn` instead, so moving the selector
+    // mid-turn takes effect on the next call. NULL means no CLI turn wrote one — every autopilot
+    // run, and every turn the local brain answered — and reads as `Auto`, which is what a rooted
+    // conversation did before the column existed. One more column on a query that already ran, so
+    // the reach costs nothing.
     // `judge` rides along for the sentence `permission_mode` gives above: it is the SNAPSHOT the
     // run was launched with (spec A D2), so changing a project's judge while a run is working
     // does not change the rules underneath it. `off` when the row is gone.
@@ -232,9 +233,16 @@ pub(super) async fn pretooluse_decision_from(
         // `ToolPolicy::Unrestricted` precisely so it can touch the code the conversation is about,
         // and the branch below would deny every one of those calls — leaving it holding tools it can
         // never use, which is worse than not having them.
-        if let Some(root) = rooted_turn(&state, run_id).await {
-            return rooted_decision(&state, &payload, &root, project_id.as_deref(), permission)
-                .await;
+        if let Some((root, current)) = rooted_turn(&state, run_id).await {
+            return rooted_decision(
+                &state,
+                &payload,
+                &root,
+                project_id.as_deref(),
+                effective_permission(permission, current),
+                permission,
+            )
+            .await;
         }
         return assistant_decision(&state, &payload).await;
     }

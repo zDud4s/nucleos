@@ -280,7 +280,7 @@ pub(super) fn is_safe_command(command: &str) -> bool {
         && (SAFE_EXACT_COMMANDS.contains(&command)
             || matches_command_prefix(command, SAFE_COMMAND_PREFIXES)
             || checks_formatting_without_writing(command)
-            || prints_lines_by_address(command))
+            || super::grammar::reads_by_grammar(command))
 }
 
 /// PowerShell's output shapers — `Select-Object -First 100`, `Sort-Object CPU`, `Format-Table` —
@@ -313,68 +313,6 @@ pub(super) fn shapes_output_only(command: &str) -> bool {
             .next()
             .is_some_and(|program| SHAPERS.contains(&program))
         && !command.contains(['{', '(', '$', '@'])
-}
-
-/// `sed -n` whose script only prints lines by their address — `'1,40p'`, `'5p'`, `'$p'`,
-/// `'10,$p'` — which is `head` and `tail` in another spelling.
-///
-/// Measured on job 27, 2026-09-14: an implement node was refused
-/// `cd "<worktree>/core" && sed -n '1,40p' Cargo.toml`, a read of the first forty lines of a
-/// manifest. `sed` stays off the prefix list for the reasons written there — `-i` edits in place,
-/// `w` writes, `e` executes — and this admits the one spelling that can do none of them. It is a
-/// grammar rather than a blocklist: `-n`, one script of one or two addresses and a `p`, then files.
-/// No other flag in any position (GNU takes options after operands, so `sed -n 1p f -i` edits in
-/// place), so no `-e`, no `-f` and no `--in-place`; no second command; no regex address.
-///
-/// `$` is an address only inside single quotes. Anywhere else the shell expands `$p` before sed
-/// ever sees it, and the script becomes whatever that variable holds.
-///
-/// Read off the normalized command, as the lists are: lowercasing folds `P` into `p`, and `P`
-/// only prints as well.
-pub(super) fn prints_lines_by_address(command: &str) -> bool {
-    let mut tokens = command.split_whitespace();
-    if tokens.next() != Some("sed") {
-        return false;
-    }
-    let mut quiet = false;
-    let mut script = None;
-    for token in tokens {
-        match token {
-            "-n" | "--quiet" | "--silent" => quiet = true,
-            _ if token.starts_with('-') => return false,
-            _ if script.is_none() => script = Some(token),
-            _ => {}
-        }
-    }
-    quiet && script.is_some_and(prints_by_address)
-}
-
-/// PURE: whether one `sed` script is a single `p` by one or two line addresses.
-pub(super) fn prints_by_address(script: &str) -> bool {
-    let (body, dollar_is_literal) = match script
-        .strip_prefix('\'')
-        .and_then(|inner| inner.strip_suffix('\''))
-    {
-        Some(inner) => (inner, true),
-        None => (
-            script
-                .strip_prefix('"')
-                .and_then(|inner| inner.strip_suffix('"'))
-                .unwrap_or(script),
-            false,
-        ),
-    };
-    let address = |value: &str| {
-        (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-            || (value == "$" && dollar_is_literal)
-    };
-    let Some(range) = body.strip_suffix('p') else {
-        return false;
-    };
-    match range.split_once(',') {
-        Some((from, to)) => address(from) && address(to),
-        None => address(range),
-    }
 }
 
 /// `cargo fmt` with `--check` anywhere in it: rustfmt reports what it would change and writes

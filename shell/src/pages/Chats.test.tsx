@@ -1607,6 +1607,18 @@ describe("Chats - choosing a model", () => {
     expect(reachable(/Edit automatically/)).toBe(false);
     expect(reachable(/Bypass permissions/)).toBe(false);
   });
+
+  // The rungs a hook decides take effect on the running turn, but `Plan` is a flag the CLI is
+  // launched with, so it only bites on the next spawn. The menu has to say which is which, or a
+  // pick of `Plan` mid-turn reads as having done nothing.
+  it("the permission menu says plan applies from the next message", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}));
+
+    await renderChats("/chats");
+    await openPermissionMenu();
+
+    expect(screen.getByText(/Plan only from the next message/)).toBeDefined();
+  });
 });
 
 describe("Chats - a model that cannot work tools", () => {

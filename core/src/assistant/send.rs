@@ -689,6 +689,7 @@ pub(super) async fn send_message_inner(
     .await
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
+    crate::chats::stamp_project(&state.pool, id, chat_id).await;
 
     // The relay learns which turn answered it, now that the turn has an id to learn.
     //
