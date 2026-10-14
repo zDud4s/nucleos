@@ -521,14 +521,14 @@ pub(super) async fn read_chat_project(
     // Asked of the same function the turn path asks, rather than restated here. A second copy of
     // this rule would be a second thing to keep true, and the one that answers the window is the
     // one that must agree with the one that launches the run.
-    // `false`: this answers what the person's OWN next message would get, which is the only thing
+    // `Typed`: this answers what the person's OWN next message would get, which is the only thing
     // the window can offer them. A relayed turn's policy is not a property of the conversation and
     // is not previewable here — it is decided per turn, by the turn that carries a relay id.
     let tools = crate::assistant::tool_policy_for(
         Some(cwd.as_str()),
         crate::assistant::Origin::Shell,
         wired,
-        false,
+        crate::relay::Handover::Typed,
     ) == crate::execution::runner::ToolPolicy::Unrestricted;
 
     Ok(Json(ChatProjectOut {
