@@ -501,6 +501,14 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     qfile = queue_dir / f"{rec['prio']}-{arrival_ns or time.time_ns()}-{me}"
     queued = False
     last_report = t0
+    shadow = None
+    try:
+        hc = _cost_mod()
+        if hc is not None and hc.admission_mode() == "shadow":
+            shadow = hc.Shadow(rec, directory)
+    except Exception:
+        shadow = None
+    admitted = False
     try:
         with Mutex(directory):
             queue_dir.mkdir(parents=True, exist_ok=True)
@@ -509,9 +517,12 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
             queued = True
         while True:
             position = 0
+            if shadow is not None:
+                shadow.tick()
             with Mutex(directory):
                 order = _queue_order(_entries(queue_dir), directory)
-                held = sum(int(r.get("weight") or 1) for _, r in _entries(held_dir))
+                held_recs = [r for _, r in _entries(held_dir)]
+                held = sum(int(r.get("weight") or 1) for r in held_recs)
                 names = [f.name for f, _ in order]
                 position = names.index(qfile.name) + 1 if qfile.name in names else 0
                 if position == 0:
@@ -519,11 +530,16 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                     qfile.parent.mkdir(parents=True, exist_ok=True)
                     held_dir.mkdir(parents=True, exist_ok=True)
                     qfile.write_text(json.dumps(rec), encoding="utf-8")
-                elif position == 1 and held + rec["weight"] <= capacity():
-                    (held_dir / str(me)).write_text(json.dumps(rec), encoding="utf-8")
-                    qfile.unlink()
-                    queued = False
-                    return True, time.time() - t0
+                elif position == 1:
+                    static_fit = held + rec["weight"] <= capacity()
+                    if shadow is not None:
+                        shadow.observe(held_recs, static_fit)
+                    if static_fit:
+                        (held_dir / str(me)).write_text(json.dumps(rec), encoding="utf-8")
+                        qfile.unlink()
+                        queued = False
+                        admitted = True
+                        return True, time.time() - t0
             now = time.time()
             if now - t0 >= wait_cap:
                 sys.stderr.write(
@@ -541,6 +557,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                 qfile.unlink()
             except OSError:
                 pass
+        if shadow is not None:
+            shadow.finish(admitted)
 
 
 def release_token(directory: Path) -> None:
@@ -942,6 +960,7 @@ def _write_progress(path: Path, stats: dict, stop: threading.Event, cpu=None) ->
             used = cpu() if cpu is not None else None
             if used is not None:
                 snap["cpu_s"] = round(used, 1)
+                stats.setdefault("cpu_trace", []).append((time.monotonic(), used))
                 if "prep_cpu_s" not in stats and any(
                         snap.get(k) for k in ("units_total", "binary", "runner")):
                     stats["prep_cpu_s"] = round(used, 1)
@@ -1681,6 +1700,19 @@ def _holder_estimate(directory: Path, holder: dict) -> float | None:
         return None
 
 
+def _cost_mod():
+    """The cost model (scripts/heavy_cost.py), or None: it must never stop a run."""
+    try:
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import heavy_cost  # type: ignore
+
+        return heavy_cost
+    except Exception:
+        return None
+
+
 def append_log(row: dict, directory: Path) -> None:
     """Append one row in ONE write that lands whole: with several brokers finishing at once,
     buffered text-mode writes (split at the buffer size) interleaved their rows."""
@@ -1874,6 +1906,13 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
         session = os.environ.get("CLAUDE_CODE_SESSION_ID")
         if session:
             rec["session"] = session
+        try:
+            hc = _cost_mod()
+            rec["cls"] = hc.class_key(argv, bool(verdict and verdict.filtered), True)
+            rec["pred_cores"], rec["pred_mem_mb"] = hc.predict(
+                hc.load_costs(directory), rec["cls"], weight)
+        except Exception:
+            pass
         # Fixed order: worktree lock -> token. A cargo run takes the lock of its worktree
         # (waiting without holding a token); a session already inside a held worktree or
         # under a token holder does not retake it.
@@ -2134,12 +2173,25 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     })
     if preempted:
         row["preempted"] = True
+    try:
+        hc = _cost_mod()
+        row.update(hc.measure_fields(stats, row["run_s"], job))
+        row["cls"] = hc.class_key(
+            argv, bool(verdict and verdict.filtered), bool(stats.get("compiled")))
+        row["pred_cores"] = rec.get("pred_cores")
+        row["pred_mem_mb"] = rec.get("pred_mem_mb")
+    except Exception:
+        pass
     # Register and log BEFORE releasing: the lock's next owner reads the registry the moment
     # it holds the lock, and must see what this run just built.
     if fp is not None:
         _record_fingerprint(directory, fp, root, code, stats)
     append_log(row, directory)
     _release_all(directory, lock_hash, holding, lease)
+    try:
+        _cost_mod().rebuild_costs(directory)
+    except Exception:
+        pass
     return _PREEMPTED if preempted else code
 
 
@@ -2433,6 +2485,13 @@ def cmd_report(args: list[str]) -> int:
     print("median")
     for field in ("wait_lock_s", "wait_token_s", "run_s"):
         print(f"  {field}: {_median([_num(r.get(field)) for r in rows]):.1f}")
+    try:
+        hc = _cost_mod()
+        if hc is not None:
+            for line in hc.report_lines(rows, hc.read_jsonl(state_dir() / "admission.jsonl", since)):
+                print(line)
+    except Exception as exc:
+        print(f"admission: unavailable ({exc})")
     return 0
 
 
