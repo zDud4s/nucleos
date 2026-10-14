@@ -11,6 +11,7 @@ import { JunctionPanel } from "./JunctionPanel";
 import { DecisionsWaiting } from "./DecisionsWaiting";
 import { TriagePanel } from "./TriagePanel";
 import { SequenceView } from "./SequenceView";
+import { StatesView } from "./StatesView";
 import { Button, ErrorNote, StaleNote, StatCard, relativeText } from "../ui";
 
 /**
@@ -71,6 +72,7 @@ const VIEWS = [
   "triage",
   "sequence",
   "unread",
+  "states",
 ] as const;
 type MapView = (typeof VIEWS)[number];
 
@@ -82,6 +84,7 @@ const VIEW_LABEL: Record<MapView, string> = {
   triage: "Triage",
   sequence: "Sequence",
   unread: "Not read",
+  states: "States",
 };
 
 export function ModeMap({ projectId }: ModeMapProps) {
@@ -151,6 +154,8 @@ export function ModeMap({ projectId }: ModeMapProps) {
           <ExtractSpec projectId={projectId} />
           <DecisionsWaiting projectId={projectId} />
         </div>
+      ) : view === "states" ? (
+        <StatesView projectId={projectId} />
       ) : map.isError && map.data === undefined ? (
         <ErrorNote>
           The núcleo could not read this project&rsquo;s map — its folder may have moved.{" "}
@@ -364,6 +369,10 @@ function Views({
           ? "Still looking for this project's documents."
           : `${specs} document${specs === 1 ? "" : "s"} a model could read decisions out of.`,
     },
+    states: {
+      of: null,
+      means: "Lifecycles the code's UPDATE … SET status statements draw.",
+    },
   };
 
   /*
@@ -374,6 +383,7 @@ function Views({
     (candidate) =>
       candidate === "architecture" ||
       candidate === "specs" ||
+      candidate === "states" ||
       candidate === view ||
       (counts[candidate].of ?? 0) > 0 ||
       (candidate !== "unread" && counts[candidate].of !== null),
@@ -503,7 +513,7 @@ function Derived({
   data,
 }: {
   projectId: string;
-  view: Exclude<MapView, "specs" | "architecture" | "unread">;
+  view: Exclude<MapView, "specs" | "architecture" | "unread" | "states">;
   data: ProjectMap;
 }) {
   const {
