@@ -268,10 +268,14 @@ pub(super) async fn spawn_local_turn(
 /// sixty-nine directories and most were never NucleOS projects at all, so this is the common case
 /// and not the edge one.
 ///
-/// **A turn of this conversation's own.** A relayed turn is one another conversation handed over,
-/// and it arrives carrying that conversation's `origin` — so without this the message would inherit
-/// a policy earned by somebody sitting at a keyboard somewhere else. Presence is not transferable,
-/// and the whole point of the relay's design is that trust does not travel with the words.
+/// **A turn of this conversation's own, or the first clean hop out of one.** A relayed turn is one
+/// another conversation handed over, and it arrives carrying that conversation's `origin`. The
+/// owner chose (2026-10-11, the relay design's §13) to let it keep the tools, so a conversation can
+/// delegate real work to another — but only as `Handover::FirstHop`: one hop from a turn a person
+/// wrote, sent by a conversation that read no third-party text. Every other relayed turn is
+/// `Handover::Withheld`, because past one hop the words were written by a turn nobody typed, and
+/// after an untrusted read they may be somebody else's words altogether. The third brake, a spend
+/// ceiling per chain, refuses the relay itself (`relay::chain_has_room`).
 ///
 /// Every failing arm falls to `McpOnly`, which is what every chat turn has always used: the
 /// conversation still continues and still resumes its session, and what it loses is the ability to
@@ -280,12 +284,16 @@ pub fn tool_policy_for(
     cwd: Option<&str>,
     origin: Origin,
     hook_is_wired: bool,
-    relayed: bool,
+    handover: crate::relay::Handover,
 ) -> crate::execution::runner::ToolPolicy {
-    match (cwd, origin, hook_is_wired, relayed) {
-        (Some(_), Origin::Shell | Origin::Voice | Origin::BrowserPanel, true, false) => {
-            crate::execution::runner::ToolPolicy::Unrestricted
-        }
+    use crate::relay::Handover;
+    match (cwd, origin, hook_is_wired, handover) {
+        (
+            Some(_),
+            Origin::Shell | Origin::Voice | Origin::BrowserPanel,
+            true,
+            Handover::Typed | Handover::FirstHop,
+        ) => crate::execution::runner::ToolPolicy::Unrestricted,
         _ => crate::execution::runner::ToolPolicy::McpOnly,
     }
 }
@@ -677,7 +685,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             messages: None,
             // The owner opts in per conversation (decision 2026-10-05), and only a turn that
             // is not `McpOnly` can use it: `McpOnly` pushes the strict flag unconditionally,
-            // so an unrooted, Telegram or relayed turn never gets the ambient servers.
+            // so an unrooted, Telegram or withheld relayed turn never gets the ambient servers.
             ambient_mcp: ambient_mcp_for(tool_policy, answering.ambient_mcp),
             // What the conversation was pinned to, or `None` for the runner's configured model.
             //

@@ -109,6 +109,8 @@ pub(super) struct BudgetResponse {
     pub(super) hourly_spend_usd: f64,
     pub(super) paused: bool,
     pub(super) reason: Option<String>,
+    /// The spend ceiling of one relay chain (0194) — beside the house budget, not part of it.
+    pub(super) relay_chain_limit_usd: f64,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +120,10 @@ pub(super) struct BudgetRequest {
     pub(super) hourly_limit_usd: Option<f64>,
     pub(super) per_run_reserve_usd: f64,
     pub(super) time_cost_per_hour_usd: f64,
+    /// Absent leaves the relay chain ceiling as it is, so a client written before it existed
+    /// keeps saving the house budget without resetting a field it never saw.
+    #[serde(default)]
+    pub(super) relay_chain_limit_usd: Option<f64>,
 }
 
 #[derive(serde::Serialize)]
@@ -396,6 +402,14 @@ pub(super) async fn post_autopilot_budget(
     Json(body): Json<BudgetRequest>,
 ) -> Result<Json<BudgetResponse>, StatusCode> {
     let period = budget::BudgetPeriod::from_db_str(&body.period).ok_or(StatusCode::BAD_REQUEST)?;
+    // Refused before anything is written, so a bad ceiling never lands half a request. Zero is a
+    // valid answer — it refuses every relay — and a negative or non-finite one is not a ceiling.
+    if body
+        .relay_chain_limit_usd
+        .is_some_and(|limit| !limit.is_finite() || limit < 0.0)
+    {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
     let config = budget::BudgetConfig {
         limit_usd: body.limit_usd,
         period,
@@ -406,6 +420,11 @@ pub(super) async fn post_autopilot_budget(
     budget::set_budget_config(&state.pool, &config)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(limit) = body.relay_chain_limit_usd {
+        budget::set_relay_chain_limit(&state.pool, limit)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
     budget_response(&state).await.map(Json)
 }
 
@@ -477,6 +496,9 @@ pub(super) async fn budget_response(state: &AppState) -> Result<BudgetResponse, 
     let hourly_spend_usd = budget::hourly_spend(&state.pool, now)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let relay_chain_limit_usd = budget::load_relay_chain_limit(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let (paused, reason) = match budget::budget_permits_new_run(&state.pool, now).await {
         budget::BudgetDecision::Allow => (false, None),
         budget::BudgetDecision::Pause { reason, .. } => (true, Some(reason)),
@@ -491,6 +513,7 @@ pub(super) async fn budget_response(state: &AppState) -> Result<BudgetResponse, 
         hourly_spend_usd,
         paused,
         reason,
+        relay_chain_limit_usd,
     })
 }
 

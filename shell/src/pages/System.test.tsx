@@ -807,7 +807,7 @@ describe("System - project brakes", () => {
 /* ------------------------------------------------------------------ budget -- */
 
 describe("System - budget", () => {
-  it("sends all five budget fields and keeps no ceiling apart from a ceiling of zero", async () => {
+  it("sends all six budget fields and keeps no ceiling apart from a ceiling of zero", async () => {
     const world = systemWorld({
       budget: {
         limit_usd: 5,
@@ -819,6 +819,7 @@ describe("System - budget", () => {
         hourly_spend_usd: 0.05,
         paused: false,
         reason: null,
+        relay_chain_limit_usd: 5,
       },
     });
     daemon.apiFetch.mockImplementation(systemFetch(world));
@@ -830,7 +831,7 @@ describe("System - budget", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
     await afterDwell();
-    fireEvent.click(screen.getByRole("button", { name: "Send these five fields to the daemon" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send these six fields to the daemon" }));
 
     await waitFor(() => {
       const calls = daemon.apiFetch.mock.calls.filter(
@@ -849,19 +850,27 @@ describe("System - budget", () => {
       unknown
     >;
     expect(Object.keys(firstBody).sort()).toEqual(
-      ["hourly_limit_usd", "limit_usd", "per_run_reserve_usd", "period", "time_cost_per_hour_usd"].sort(),
+      [
+        "hourly_limit_usd",
+        "limit_usd",
+        "per_run_reserve_usd",
+        "period",
+        "relay_chain_limit_usd",
+        "time_cost_per_hour_usd",
+      ].sort(),
     );
     expect(firstBody.limit_usd).toBeNull();
     expect(firstBody.period).toBe("daily");
     expect(firstBody.hourly_limit_usd).toBeNull();
     expect(firstBody.per_run_reserve_usd).toBe(0.25);
     expect(firstBody.time_cost_per_hour_usd).toBe(0.1);
+    expect(firstBody.relay_chain_limit_usd).toBe(5);
 
     // Typing an actual zero is a different fact from leaving the box blank.
     fireEvent.change(windowInput, { target: { value: "0" } });
     fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
     await afterDwell();
-    fireEvent.click(screen.getByRole("button", { name: "Send these five fields to the daemon" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send these six fields to the daemon" }));
 
     await waitFor(() => {
       expect(budgetCalls()).toHaveLength(2);
@@ -888,6 +897,7 @@ describe("System - budget", () => {
           hourly_spend_usd: 0.05,
           paused: false,
           reason: null,
+          relay_chain_limit_usd: 5,
         },
       });
       daemon.apiFetch.mockImplementation(systemFetch(world));
@@ -899,7 +909,7 @@ describe("System - budget", () => {
 
       fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
       await afterDwell();
-      fireEvent.click(screen.getByRole("button", { name: "Send these five fields to the daemon" }));
+      fireEvent.click(screen.getByRole("button", { name: "Send these six fields to the daemon" }));
 
       const alert = await screen.findByRole("alert");
       expect(alert.textContent).toMatch(/the window limit/);
@@ -923,6 +933,7 @@ describe("System - budget", () => {
         hourly_spend_usd: 0.05,
         paused: false,
         reason: null,
+        relay_chain_limit_usd: 5,
       },
     });
     daemon.apiFetch.mockImplementation(systemFetch(world));
@@ -934,7 +945,7 @@ describe("System - budget", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
     await afterDwell();
-    fireEvent.click(screen.getByRole("button", { name: "Send these five fields to the daemon" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send these six fields to the daemon" }));
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/the hourly limit/);

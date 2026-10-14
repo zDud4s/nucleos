@@ -234,10 +234,10 @@ pub(super) async fn sending_turn_of(
     Some((chat_id?, origin))
 }
 
-/// `relay::admit`'s five refusals, turned into a status and a body that names which one fired —
-/// see `Refusal`'s own doc for what each means. 409 for the four the gate actually DECIDED (the
-/// destination is gone or archived, the sender is Telegram, the chain refuses the hop, the owner is
-/// away): a caller can read the slug and know why, the same way `post_assistant_message` already
+/// `relay::admit`'s six refusals, turned into a status and a body that names which one fired —
+/// see `Refusal`'s own doc for what each means. 409 for the five the gate actually DECIDED (the
+/// destination is gone or archived, the sender is Telegram, the chain refuses the hop, the chain has
+/// spent its ceiling, the owner is away): a caller can read the slug and know why, the same way `post_assistant_message` already
 /// answers 409 for a chat mid-turn. 500 for `Unreadable` alone, because that
 /// variant is not a decision about the relay — the gate could not read enough to make one — and
 /// there is nothing about THIS relay for a caller to act on differently next time.
@@ -265,6 +265,17 @@ pub(super) fn relay_refusal_response(
         // is ever broken elsewhere, and 500 is the honest answer to a refusal that cannot say what
         // it is refusing.
         Refusal::Chain(Verdict::Ok) => refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        Refusal::ChainOverBudget {
+            spent_usd,
+            limit_usd,
+        } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "refusal": "relay_chain_over_budget",
+                "spent_usd": spent_usd,
+                "limit_usd": limit_usd,
+            })),
+        ),
         Refusal::OwnerAway => refusal(StatusCode::CONFLICT, "owner_away"),
         Refusal::Unreadable { step, error } => {
             tracing::warn!(step, %error, "a relay could not be decided");

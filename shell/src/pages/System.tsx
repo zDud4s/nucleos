@@ -615,6 +615,7 @@ interface BudgetFormState {
   hourlyLimit: string;
   perRunReserve: string;
   timeCost: string;
+  relayChainLimit: string;
 }
 
 function formFromBudget(budget: BudgetView): BudgetFormState {
@@ -625,6 +626,7 @@ function formFromBudget(budget: BudgetView): BudgetFormState {
       budget.hourly_limit_usd === null ? "" : String(budget.hourly_limit_usd),
     perRunReserve: String(budget.per_run_reserve_usd),
     timeCost: String(budget.time_cost_per_hour_usd),
+    relayChainLimit: String(budget.relay_chain_limit_usd),
   };
 }
 
@@ -671,8 +673,8 @@ function parseQuotaPercent(raw: string): number | null {
 /**
  * The budget, editable.
  *
- * `BudgetRequest` is a full replace of five fields (C5) — there is no partial
- * update, so every submit sends all five, pre-filled from the last value the
+ * `BudgetRequest` is a full replace of six fields (C5) — there is no partial
+ * update, so every submit sends all six, pre-filled from the last value the
  * daemon confirmed. The form seeds itself from `useBudget()` exactly once
  * (`form === null` guard): the query polls at `POLL.fast`, and re-seeding on
  * every tick would erase whatever a person is in the middle of typing.
@@ -805,10 +807,24 @@ function BudgetPanel() {
                   }
                 />
               </div>
+              <div className="sy-field">
+                <label htmlFor="sy-budget-relay-chain-limit">Relay chain limit (USD)</label>
+                <input
+                  id="sy-budget-relay-chain-limit"
+                  className="sy-field-input"
+                  type="text"
+                  inputMode="decimal"
+                  title="What one chain of conversations handing work to each other may spend before the next handover is refused"
+                  value={form.relayChainLimit}
+                  onChange={(event) =>
+                    setForm({ ...form, relayChainLimit: event.target.value })
+                  }
+                />
+              </div>
             </div>
             <ConfirmButton
               label="Save budget"
-              confirmLabel="Send these five fields to the daemon"
+              confirmLabel="Send these six fields to the daemon"
               variant="ghost"
               onConfirm={() => {
                 const windowLimit = parseCeiling(form.windowLimit);
@@ -827,6 +843,7 @@ function BudgetPanel() {
                   hourly_limit_usd: hourlyLimit.value,
                   per_run_reserve_usd: parseAmount(form.perRunReserve),
                   time_cost_per_hour_usd: parseAmount(form.timeCost),
+                  relay_chain_limit_usd: parseAmount(form.relayChainLimit),
                 };
                 setBudget.mutate(change);
               }}

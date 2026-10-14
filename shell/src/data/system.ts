@@ -25,6 +25,8 @@ export interface BudgetView {
   /** Whether autonomous work is currently held. `reason` is why, and is non-null exactly when this is true. */
   paused: boolean;
   reason: string | null;
+  /** The spend ceiling of one relay chain — conversations handing work to each other — beside the house budget, not part of it. */
+  relay_chain_limit_usd: number;
 }
 
 /** The quota brake's three owner settings, returned by GET/POST /autopilot/quota-brake, plus the active runner's read-only provider (only its windows count). */
@@ -227,13 +229,14 @@ export function useBudget() {
   });
 }
 
-/** What `POST /autopilot/budget` accepts — `http.rs:697-704`. FIVE fields, all of them, every time. */
+/** What `POST /autopilot/budget` accepts (`http/fleet.rs`, `BudgetRequest`). SIX fields, all of them, every time. */
 export interface BudgetChange {
   limit_usd: number | null;
   period: "daily" | "weekly" | "monthly";
   hourly_limit_usd: number | null;
   per_run_reserve_usd: number;
   time_cost_per_hour_usd: number;
+  relay_chain_limit_usd: number;
 }
 
 /**
