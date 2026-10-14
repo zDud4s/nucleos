@@ -323,6 +323,14 @@ pub(super) async fn rooted_decision(
     permission: crate::chats::PermissionMode,
     snapshot: crate::chats::PermissionMode,
 ) -> Json<Decision> {
+    // Every call of the turn is noted, the allowed ones included: a judge asked about `cargo test`
+    // should see the edits before it, and those were allowed without a question.
+    let recent = note_call(
+        state,
+        payload.run_id,
+        &payload.tool_name,
+        &payload.tool_input,
+    );
     let (reason, action_class) =
         match rooted_verdict(state, payload, root, project_id, permission).await {
             Rung::Decided(decision) => return Json(decision),
@@ -427,6 +435,7 @@ pub(super) async fn rooted_decision(
                 payload.tool_input.clone(),
                 key,
                 action_class,
+                recent,
             );
         }
         return Json(Decision {
