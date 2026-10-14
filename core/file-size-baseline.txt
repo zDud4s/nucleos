@@ -8,11 +8,7 @@
 # here: a new file past the limit is split by what it does, not given a line.
 src/team.rs 3368
 src/council.rs 2006
-src/main.rs 1532
 src/execution/worktree.rs 1396
-src/verify.rs 1309
-src/verify/postgate_worker.rs 1216
-src/devtime/rules.rs 1141
 src/daemon_client.rs 1002
 src/governance/triage.rs 1030
 src/devtime/parse.rs 1008
