@@ -1,5 +1,6 @@
 pub mod groups;
 pub mod notices;
+pub mod seed;
 pub mod tasks;
 
 use sqlx::SqlitePool;
