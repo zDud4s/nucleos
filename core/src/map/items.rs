@@ -541,7 +541,9 @@ fn impl_target(header: &str) -> Option<String> {
 /// Stops at a `;` outside every bracket, which is what a `struct Foo;`, a `const X: u8 = 1;` and a
 /// trait method with no default all end with. Brackets are counted so that a `{` inside a
 /// parameter's default or a `where` clause's bound is not mistaken for the body.
-fn body_of(masked: &[char], from: usize) -> Option<(usize, usize)> {
+///
+/// Public for [`crate::map::flows`], which needs the same body this scanner finds.
+pub fn body_of(masked: &[char], from: usize) -> Option<(usize, usize)> {
     let mut i = from;
     let (mut paren, mut angle, mut square) = (0i32, 0i32, 0i32);
     while i < masked.len() {

@@ -332,6 +332,9 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/map/specs"),
     (Method::GET, "/projects/{id}/map/silenced"),
     (Method::GET, "/projects/{id}/map/orphan"),
+    // Names, paths and line numbers of files this key can already `cat`, plus the root
+    // `worktree` already hands it.
+    (Method::GET, "/projects/{id}/map/flows"),
     (Method::GET, "/feed"),
     // The same lines `/feed?scope=all` already hands this key, read as a window instead of the newest
     // fifty — so refusing it would protect nothing. Where the owner stopped reading is a number

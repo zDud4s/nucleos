@@ -46,6 +46,7 @@ mod hooks;
 mod judging;
 mod knowledge;
 mod map;
+mod map_flows;
 mod projects;
 mod proposals;
 mod relay;
@@ -122,6 +123,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(judging::routes())
         .merge(knowledge::routes())
         .merge(map::routes())
+        .merge(map_flows::routes())
         .merge(projects::routes())
         .merge(proposals::routes())
         .merge(relay::routes())
@@ -7700,6 +7702,23 @@ mod tests {
             get_status(&state, "/projects/alpha/map/items?path=core/src/absent.rs").await,
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_key_reads_the_declared_flows() {
+        let (state, db) = file_test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+
+        let response =
+            api_token_request(state, "GET", "/projects/alpha/map/flows", &token, None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["declared"], false);
+        assert_eq!(body["flows"], serde_json::json!([]));
+        assert!(body["error"].is_null());
+        db.close().await;
     }
 
     /* --------------------------------------------------------------- workflows -- */

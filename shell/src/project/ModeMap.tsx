@@ -1,6 +1,7 @@
 // §spec mapa-do-projeto
 import { useId, useMemo, useState, type CSSProperties } from "react";
 import { useProjectMap, useProjectSpecs, type ProjectMap } from "../data/project-map";
+import { useMapFlows } from "../data/map-flows";
 import { drawableLinks } from "../canvas/map-graphs";
 import { Atlas, NotRead } from "./Atlas";
 import { buildAtlas } from "./atlas-model";
@@ -9,6 +10,7 @@ import { ExtractSpec } from "./ExtractSpec";
 import { JunctionPanel } from "./JunctionPanel";
 import { DecisionsWaiting } from "./DecisionsWaiting";
 import { TriagePanel } from "./TriagePanel";
+import { SequenceView } from "./SequenceView";
 import { Button, ErrorNote, StaleNote, StatCard, relativeText } from "../ui";
 
 /**
@@ -61,7 +63,15 @@ export interface ModeMapProps {
 }
 
 /** The tabs of the map, in the order they read: the drawing, then the decision layer, then the rest. */
-const VIEWS = ["architecture", "specs", "junction", "stamps", "triage", "unread"] as const;
+const VIEWS = [
+  "architecture",
+  "specs",
+  "junction",
+  "stamps",
+  "triage",
+  "sequence",
+  "unread",
+] as const;
 type MapView = (typeof VIEWS)[number];
 
 const VIEW_LABEL: Record<MapView, string> = {
@@ -70,6 +80,7 @@ const VIEW_LABEL: Record<MapView, string> = {
   junction: "Junction",
   stamps: "Stamps",
   triage: "Triage",
+  sequence: "Sequence",
   unread: "Not read",
 };
 
@@ -81,6 +92,7 @@ export function ModeMap({ projectId }: ModeMapProps) {
     so the number on the tab and the list behind it cannot disagree.
   */
   const specs = useProjectSpecs(projectId);
+  const flows = useMapFlows(projectId);
   const [view, setView] = useState<MapView>("architecture");
   const readAgain = () => void map.refetch();
   const atlas = useMemo(
@@ -116,10 +128,14 @@ export function ModeMap({ projectId }: ModeMapProps) {
         onView={setView}
         data={map.data}
         specs={specs.data?.length ?? null}
+        flows={flows.data?.flows.length ?? null}
         unread={atlas?.unreadFiles ?? null}
       />
 
-      {view === "specs" ? (
+      {view === "sequence" ? (
+        // Needs no map data, so it still works when the map could not be read.
+        <SequenceView projectId={projectId} />
+      ) : view === "specs" ? (
         /*
           Two panels behind one tab, because they are the two ends of one loop: choosing what gets
           read, and answering what came back. Neither reads the map, which is why this tab still
@@ -288,6 +304,7 @@ function Views({
   onView,
   data,
   specs,
+  flows,
   unread,
 }: {
   view: MapView;
@@ -295,6 +312,8 @@ function Views({
   data: ProjectMap | undefined;
   /** How many documents there are to read, or `null` while that listing is unanswered. */
   specs: number | null;
+  /** How many flows the project declares, or `null` while that answer is unread. */
+  flows: number | null;
   /** Files the map could not follow, or `null` while the map is unread. */
   unread: number | null;
 }) {
@@ -330,6 +349,13 @@ function Views({
       means: layered
         ? "Decisions a model looked at and asked for your eyes on."
         : "Nothing has been approved yet, so the triager has nothing to look at.",
+    },
+    sequence: {
+      of: flows,
+      means:
+        flows === null
+          ? "Still reading the declared flows."
+          : `${flows} declared flow${flows === 1 ? "" : "s"}, each checked against the code.`,
     },
     specs: {
       of: specs,

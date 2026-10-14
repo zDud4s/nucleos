@@ -315,3 +315,48 @@ describe("a map that could not be read", () => {
     expect(await screen.findByRole("region", { name: "Read a spec" })).toBeTruthy();
   });
 });
+
+describe("the sequence door", () => {
+  it("the Sequence door opens the declared flows", async () => {
+    const step = (participant: string, fn: string) => ({
+      participant,
+      path: `core/src/${participant}.rs`,
+      fn,
+      via: null,
+      from: null,
+      line: 7,
+      ok: true,
+      reason: null,
+    });
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path.endsWith("/map")) return dayOne();
+      if (path.endsWith("/map/specs")) return [];
+      if (path.endsWith("/map/silenced")) return { rows: [], total: 0 };
+      if (path.endsWith("/map/flows")) {
+        return {
+          file: ".nucleos/flows.yaml",
+          declared: true,
+          root: "C:/repo",
+          flows: [
+            {
+              name: "land",
+              stale: false,
+              broken_step: null,
+              steps: [step("cli", "land"), step("vcs", "submit")],
+            },
+          ],
+          error: null,
+        };
+      }
+      return [];
+    });
+    render(
+      <QueryClientProvider client={createAppQueryClient()}>
+        <ModeMap projectId="alpha" />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /^Sequence/ }));
+    expect(await screen.findByRole("region", { name: "Flow land" })).toBeTruthy();
+  });
+});
