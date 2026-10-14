@@ -628,6 +628,33 @@ pub(super) async fn send_message_inner(
     let cwd = crate::chats::cwd_of(&state.pool, chat_id)
         .await
         .map_err(|e| e.to_string())?;
+    // A conversation rooted in a git worktree with no workflow of its own gets one before the
+    // policy below reads the hook — otherwise it would answer `McpOnly` with nothing saying why
+    // (decision of 2026-10-11; `chats::seed` has the rule). A failure is logged and the turn goes
+    // on as it would have: the seed is a convenience, and the policy still reads what is on disk.
+    if let Some(dir) = cwd.clone() {
+        let seeded = tokio::task::spawn_blocking(move || {
+            crate::chats::seed::seed_if_empty(std::path::Path::new(&dir))
+        })
+        .await;
+        match seeded {
+            Ok(Ok(crate::chats::seed::Seeded::Done { copied, hook })) => {
+                tracing::info!(
+                    chat_id,
+                    ?copied,
+                    hook,
+                    "seeded the workflow into the conversation's worktree"
+                );
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(chat_id, %error, "could not seed the workflow into the conversation's worktree");
+            }
+            Err(error) => {
+                tracing::warn!(chat_id, %error, "the workflow seed did not finish");
+            }
+        }
+    }
     let tool_policy = tool_policy_for(
         cwd.as_deref(),
         origin,
