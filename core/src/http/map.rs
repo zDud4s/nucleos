@@ -63,6 +63,9 @@ pub(super) fn routes() -> Router<AppState> {
         // anchors to, so a key that could write one could point every decision at whatever it
         // liked and the map would report it as the owner's own choice.
         .route("/projects/{id}/map/anchors", post(post_project_map_anchors))
+        // The owner moving a module to another layer. In NO table in `auth.rs`, like `anchors`:
+        // a read-only key must not rearrange the owner's architecture.
+        .route("/projects/{id}/map/layers", post(post_project_map_layer))
         // The model's second entrance (§6), and in no table in `auth.rs` for `extract`'s reason
         // doubled: it spends a model per decision. No id anywhere on it, and that is §10 rather
         // than an omission — the triager's scope is everything nobody has stamped, and a caller
@@ -125,6 +128,11 @@ pub(super) struct MapAnswer {
     /// exactly those modules for the same reason: one definition of *which files are this
     /// project*.
     pub(super) seam: crate::map::seam::Seam,
+    /// Every module's layer, derived from the same `structure` and frozen on the first read.
+    ///
+    /// A read-only key's first read may freeze it — harmless, because the freeze is a pure
+    /// function of the tree and anybody's first read would have produced the same rows.
+    pub(super) layers: crate::map::layers::Layering,
     pub(super) junction: crate::map::join::Junction,
     /// Where each decision stands, by `decision_id`.
     ///
@@ -268,6 +276,7 @@ pub(super) async fn get_project_map(
 ) -> Result<Json<MapAnswer>, StatusCode> {
     let root = resolve_read_root(&state, &id, None).await?;
     let (structure, mut junction) = project_junction(&state, &id, root.clone()).await?;
+    let layers = project_layers(&state, &id, &structure).await?;
 
     // Re-reads the sources `structure` already opened, and that is the cheaper of the two options
     // rather than an oversight: holding every file of a thousand-file project in memory to save one
@@ -415,6 +424,7 @@ pub(super) async fn get_project_map(
     Ok(Json(MapAnswer {
         structure,
         seam,
+        layers,
         junction,
         standings,
         stamps,
@@ -1728,4 +1738,94 @@ pub(super) async fn post_project_map_triage(
     }
 
     Ok(Json(report))
+}
+
+/// The project's layers: the frozen baseline judged against the tree as it is now, with the
+/// owner's moves on top. The first read freezes the baseline.
+pub(super) async fn project_layers(
+    state: &AppState,
+    id: &str,
+    structure: &crate::map::Structure,
+) -> Result<crate::map::layers::Layering, StatusCode> {
+    let fail = |error: sqlx::Error| {
+        tracing::warn!(%error, project_id = %id, "reading the project's layers failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let paths: Vec<String> = structure.modules.iter().map(|m| m.path.clone()).collect();
+    let mut baseline = crate::map::store::layer_baseline(&state.pool, id)
+        .await
+        .map_err(fail)?;
+    if baseline.layers.is_empty() && !paths.is_empty() {
+        let derived = crate::map::layers::assign(
+            &paths,
+            &structure.imports,
+            &std::collections::BTreeMap::new(),
+        );
+        crate::map::store::freeze_layers(&state.pool, id, &derived, &structure.imports)
+            .await
+            .map_err(fail)?;
+        // Read it back: a concurrent first read may have frozen before this one did.
+        baseline = crate::map::store::layer_baseline(&state.pool, id)
+            .await
+            .map_err(fail)?;
+    }
+    let overrides = crate::map::store::layer_overrides(&state.pool, id)
+        .await
+        .map_err(fail)?;
+    Ok(crate::map::layers::layering(
+        &paths,
+        &structure.imports,
+        &baseline,
+        &overrides,
+    ))
+}
+
+/// Which module the owner moves, and where. `null` or absent takes the move back.
+#[derive(Deserialize)]
+pub(super) struct MapLayerBody {
+    pub(super) path: String,
+    pub(super) layer: Option<u32>,
+}
+
+/// `POST /projects/{id}/map/layers`: `204` when the move (or its removal) was written, `422` for
+/// a path outside the project or not a file, or a layer past the ceiling, `404` for an unknown
+/// project.
+pub(super) async fn post_project_map_layer(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MapLayerBody>,
+) -> Result<StatusCode, StatusCode> {
+    let root = resolve_read_root(&state, &id, None).await?;
+
+    if body
+        .layer
+        .is_some_and(|layer| layer > crate::map::layers::MAX_LAYER)
+    {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let cleaned = body.path.trim().replace('\\', "/");
+    if cleaned.is_empty() {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let checked = {
+        let cleaned = cleaned.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::inspect::resolved_within(&root, &cleaned)
+                .map(|resolved| resolved.is_file())
+                .unwrap_or(false)
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+    if !checked {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    crate::map::store::set_layer_override(&state.pool, &id, &cleaned, body.layer)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "writing a layer override failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }

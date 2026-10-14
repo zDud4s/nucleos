@@ -1075,6 +1075,128 @@ type SilencingRow = (
     i64,
 );
 
+/// The frozen layering of one project: every module's layer and every import edge at the moment
+/// of the freeze. Empty when [`freeze_layers`] has not run yet.
+pub async fn layer_baseline(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<crate::map::layers::Baseline> {
+    let modules: Vec<(String, i64)> =
+        sqlx::query_as("SELECT path, layer FROM map_layer_modules WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_all(pool)
+            .await?;
+    let edges: Vec<(String, String)> =
+        sqlx::query_as("SELECT from_path, to_path FROM map_layer_imports WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_all(pool)
+            .await?;
+
+    Ok(crate::map::layers::Baseline {
+        layers: modules
+            .into_iter()
+            .map(|(path, layer)| (path, layer.max(0) as u32))
+            .collect(),
+        imports: edges.into_iter().collect(),
+    })
+}
+
+/// Freezes a project's baseline, once. `false` — and nothing written — when any module row exists:
+/// the baseline is a portrait of the moment it was taken. Rows and the existence check share one
+/// transaction, so two first reads cannot both freeze.
+pub async fn freeze_layers(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    layers: &std::collections::BTreeMap<String, u32>,
+    imports: &[crate::map::Import],
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let (held,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM map_layer_modules WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if held > 0 {
+        return Ok(false);
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    for (path, layer) in layers {
+        sqlx::query(
+            "INSERT OR IGNORE INTO map_layer_modules (project_id, path, layer, frozen_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(project_id)
+        .bind(path)
+        .bind(i64::from(*layer))
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for import in imports {
+        sqlx::query(
+            "INSERT OR IGNORE INTO map_layer_imports (project_id, from_path, to_path)
+             VALUES (?, ?, ?)",
+        )
+        .bind(project_id)
+        .bind(&import.from)
+        .bind(&import.to)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// The owner's layer moves for one project, by path.
+pub async fn layer_overrides(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> sqlx::Result<std::collections::BTreeMap<String, u32>> {
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT path, layer FROM map_layer_overrides WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(path, layer)| (path, layer.max(0) as u32))
+        .collect())
+}
+
+/// Moves a module to a layer (`Some`, replacing an earlier move) or takes the move back (`None`).
+pub async fn set_layer_override(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    path: &str,
+    layer: Option<u32>,
+) -> sqlx::Result<()> {
+    match layer {
+        Some(layer) => {
+            sqlx::query(
+                "INSERT INTO map_layer_overrides (project_id, path, layer, set_at)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(project_id, path) DO UPDATE SET layer = excluded.layer,
+                                                              set_at = excluded.set_at",
+            )
+            .bind(project_id)
+            .bind(path)
+            .bind(i64::from(layer))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(pool)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM map_layer_overrides WHERE project_id = ? AND path = ?")
+                .bind(project_id)
+                .bind(path)
+                .execute(pool)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2653,5 +2775,79 @@ mod tests {
         // And the map's own reader drops it, which is the asymmetry stated from the other side: a
         // retired decision is not in the map, so it has no standing there to be counted against.
         assert!(judgements(&pool, "alpha").await.unwrap().is_empty());
+    }
+
+    /// The baseline freezes once per project; the second freeze is a no-op that says so.
+    #[tokio::test]
+    async fn layers_freeze_once_and_a_second_freeze_changes_nothing() {
+        let pool = test_pool().await;
+        let layers = std::collections::BTreeMap::from([
+            ("a.rs".to_string(), 1u32),
+            ("b.rs".to_string(), 0u32),
+        ]);
+        let imports = vec![crate::map::Import {
+            from: "a.rs".to_string(),
+            to: "b.rs".to_string(),
+        }];
+
+        assert!(
+            layer_baseline(&pool, "alpha")
+                .await
+                .unwrap()
+                .layers
+                .is_empty()
+        );
+        assert!(
+            freeze_layers(&pool, "alpha", &layers, &imports)
+                .await
+                .unwrap()
+        );
+
+        let frozen = layer_baseline(&pool, "alpha").await.unwrap();
+        assert_eq!(frozen.layers, layers);
+        assert!(
+            frozen
+                .imports
+                .contains(&("a.rs".to_string(), "b.rs".to_string()))
+        );
+
+        // A second freeze with a different tree writes nothing: the baseline is a portrait of
+        // the moment it was taken.
+        let other = std::collections::BTreeMap::from([("z.rs".to_string(), 5u32)]);
+        assert!(!freeze_layers(&pool, "alpha", &other, &[]).await.unwrap());
+        assert_eq!(layer_baseline(&pool, "alpha").await.unwrap(), frozen);
+
+        // Another project is untouched by the first one's freeze.
+        assert!(
+            layer_baseline(&pool, "beta")
+                .await
+                .unwrap()
+                .layers
+                .is_empty()
+        );
+    }
+
+    /// An override is stored, a second set replaces it, and a clear removes it.
+    #[tokio::test]
+    async fn a_layer_override_is_stored_replaced_and_cleared() {
+        let pool = test_pool().await;
+        assert!(layer_overrides(&pool, "alpha").await.unwrap().is_empty());
+
+        set_layer_override(&pool, "alpha", "a.rs", Some(3))
+            .await
+            .unwrap();
+        assert_eq!(layer_overrides(&pool, "alpha").await.unwrap()["a.rs"], 3);
+
+        set_layer_override(&pool, "alpha", "a.rs", Some(8))
+            .await
+            .unwrap();
+        let held = layer_overrides(&pool, "alpha").await.unwrap();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held["a.rs"], 8);
+
+        set_layer_override(&pool, "alpha", "a.rs", None)
+            .await
+            .unwrap();
+        assert!(layer_overrides(&pool, "alpha").await.unwrap().is_empty());
     }
 }
