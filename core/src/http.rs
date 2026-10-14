@@ -46,6 +46,7 @@ mod hooks;
 mod judging;
 mod knowledge;
 mod map;
+mod map_states;
 mod projects;
 mod proposals;
 mod relay;
@@ -122,6 +123,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(judging::routes())
         .merge(knowledge::routes())
         .merge(map::routes())
+        .merge(map_states::routes())
         .merge(projects::routes())
         .merge(proposals::routes())
         .merge(relay::routes())
@@ -1660,6 +1662,55 @@ mod tests {
         let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
 
         let response = api_token_request(state, "GET", "/concurrency", &token, None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        db.close().await;
+    }
+
+    /// The state machines come back grouped by (table, column), with the absolute folder the shell
+    /// opens VS Code from. An unknown project is a 404, not an empty answer.
+    #[tokio::test]
+    async fn map_states_come_back_grouped_by_machine_with_the_root() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(
+            dir.path().join("core/src/orders.rs"),
+            "fn close() { q(\"UPDATE orders SET status = 'closed' WHERE status = 'open'\"); }\n",
+        )
+        .unwrap();
+
+        let body = get_json(&state, "/projects/alpha/map/states").await;
+
+        let machine = &body["machines"][0];
+        assert_eq!(machine["table"], "orders", "{body}");
+        assert_eq!(machine["column"], "status", "{body}");
+        let transition = &machine["transitions"][0];
+        assert_eq!(transition["from"], "open", "{body}");
+        assert_eq!(transition["to"], "closed", "{body}");
+        assert_eq!(transition["function"], "close", "{body}");
+        assert_eq!(transition["line"], 1, "{body}");
+        assert_eq!(
+            body["root"],
+            dir.path().to_string_lossy().as_ref(),
+            "{body}"
+        );
+        assert_eq!(
+            get_status(&state, "/projects/nobody/map/states").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Through the production router, not through the table: the only thing linking `build_router`
+    /// to `READ_ONLY_ROUTES` for this route.
+    #[tokio::test]
+    async fn map_states_are_readable_with_a_read_only_key() {
+        let (state, db) = file_test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+
+        let response =
+            api_token_request(state, "GET", "/projects/alpha/map/states", &token, None).await;
 
         assert_eq!(response.status(), StatusCode::OK);
         db.close().await;
