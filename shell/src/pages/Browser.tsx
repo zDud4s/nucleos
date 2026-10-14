@@ -542,7 +542,7 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
           ? subsystem.status === "disabled"
             ? "The browser is not configured on this machine, so no window can open."
             : "The browser is not running, so no window can open until it restarts."
-          : "Open a window: a real window on the project's profile, driven by you; when you give it back, you choose which sites it keeps. Open with agent: the same profile, with the agent's chat on the right — it drives until you take the wheel."}
+          : "Open a window: a real window on the project's profile, driven by you; when you give it back, you choose which sites it keeps. Open with agent: the project's profile for a site you logged into there, a throwaway otherwise, with the agent's chat on the right — it drives until you take the wheel."}
       </p>
       {unavailable && <SidecarTrouble health={health} />}
 
@@ -555,7 +555,11 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
       {open.isError && <MutationNote error={open.error} what="the window could not be opened" />}
       {withAgent.data !== undefined && (
         <p className="browser-outcome" role="status">
-          opened session #{withAgent.data.session.id} with the agent —{" "}
+          opened session #{withAgent.data.session.id} with the agent
+          {withAgent.data.session.profile_kind === "ephemeral"
+            ? " in a throwaway profile, with none of the project's logins — to use your login here, log in with Open a window and keep the site first"
+            : ""}{" "}
+          —{" "}
           <Link to="/chats/$chatId" params={{ chatId: withAgent.data.chat_id }}>
             open its conversation
           </Link>
