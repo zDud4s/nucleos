@@ -13,6 +13,7 @@ import {
   useMakeReadonly,
   useOpenRealWindow,
   useOpenWindow,
+  useOpenWithAgent,
   useTakeWheel,
   useRevokeSite,
   useReturnWheel,
@@ -272,7 +273,12 @@ function SessionRow({
         {session.mode === "human" && !shellSeat && (
           <ConfirmButton
             label="Give the wheel back"
-            confirmLabel="Close the window and bring the chain back"
+            confirmLabel={
+              // A visible window stays open: its wheel goes back to the agent, who drives on.
+              session.visible
+                ? "Hand it back to the agent in its window"
+                : "Close the window and bring the chain back"
+            }
             variant="approve"
             disabled={returnPending}
             onConfirm={() => onReturn()}
@@ -460,12 +466,15 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
   const [chosen, setChosen] = useState<string | undefined>(undefined);
   const [url, setUrl] = useState("");
   const open = useOpenWindow();
+  const withAgent = useOpenWithAgent();
   const hintId = useId();
   const options = projects.data ?? [];
   const projectId = chosen ?? options[0]?.project_id;
   const subsystem = health.data?.subsystem ?? null;
   const unavailable = subsystem !== null && (subsystem.status === "down" || subsystem.status === "disabled");
-  const ready = projectId !== undefined && !open.isPending;
+  const ready = projectId !== undefined && !open.isPending && !withAgent.isPending;
+  // The agent's browser opens `https` pages only, so there is no blank start with the agent.
+  const readyWithAgent = ready && url.trim() !== "";
 
   if (projects.data !== undefined && options.length === 0) {
     return (
@@ -516,13 +525,24 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
         <Button type="submit" variant="approve" disabled={!ready}>
           {open.isPending ? "Opening…" : "Open a window"}
         </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          disabled={!readyWithAgent}
+          onClick={() => {
+            if (projectId === undefined || !readyWithAgent) return;
+            withAgent.mutate({ projectId, url: url.trim() });
+          }}
+        >
+          {withAgent.isPending ? "Opening…" : "Open with agent"}
+        </Button>
       </form>
       <p id={hintId} className="browser-bar-hint">
         {unavailable
           ? subsystem.status === "disabled"
             ? "The browser is not configured on this machine, so no window can open."
             : "The browser is not running, so no window can open until it restarts."
-          : "A real window on the project's profile, driven by you. When you give it back, you choose which sites it keeps."}
+          : "Open a window: a real window on the project's profile, driven by you; when you give it back, you choose which sites it keeps. Open with agent: the same profile, with the agent's chat on the right — it drives until you take the wheel."}
       </p>
       {unavailable && <SidecarTrouble health={health} />}
 
@@ -533,6 +553,17 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
         </p>
       )}
       {open.isError && <MutationNote error={open.error} what="the window could not be opened" />}
+      {withAgent.data !== undefined && (
+        <p className="browser-outcome" role="status">
+          opened session #{withAgent.data.session.id} with the agent —{" "}
+          <Link to="/chats/$chatId" params={{ chatId: withAgent.data.chat_id }}>
+            open its conversation
+          </Link>
+        </p>
+      )}
+      {withAgent.isError && (
+        <MutationNote error={withAgent.error} what="the window with the agent could not be opened" />
+      )}
     </div>
   );
 }

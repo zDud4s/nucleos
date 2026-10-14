@@ -121,6 +121,10 @@ pub struct SessionRow {
     /// Opened as a window the person can see, with a chat panel on the right (spec
     /// browser-com-painel). Headless sessions are `false`.
     pub visible: bool,
+    /// The conversation this session answers to when no run opened it: a window opened from the
+    /// shell's Web page "with agent" (spec browser-com-painel-pela-pagina-web §3.2). Wins over
+    /// `run_id` when both are set.
+    pub owner_chat_id: Option<String>,
     /// Whether the shell could take the seat: a lone open project-profile session. A second open
     /// session on the same profile would share its cookies, so neither qualifies.
     pub shell_eligible: bool,
@@ -593,6 +597,16 @@ pub async fn open_with(
     Ok(Opened::Session(Box::new(row)))
 }
 
+/// Name the conversation a session answers to (spec browser-com-painel-pela-pagina-web §3.2).
+pub async fn set_owner_chat(pool: &SqlitePool, id: i64, chat_id: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE browser_sessions SET owner_chat_id = ? WHERE id = ?")
+        .bind(chat_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Mark a session row as visible (or not).
 pub async fn set_visible(pool: &SqlitePool, id: i64, visible: bool) -> sqlx::Result<()> {
     sqlx::query("UPDATE browser_sessions SET visible = ? WHERE id = ?")
@@ -743,7 +757,7 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
     let row = sqlx::query(
         "SELECT id, sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
                 final_url, rule, mode, refusal, proposal_id, chain, chain_decided_at, \
-                seat, visible, \
+                seat, visible, owner_chat_id, \
                 (profile_kind = 'project' AND closed_at IS NULL AND \
                  (SELECT COUNT(*) FROM browser_sessions o \
                   WHERE o.profile_id = browser_sessions.profile_id \
@@ -772,6 +786,7 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
         chain_decided_at: row.get("chain_decided_at"),
         seat: row.get("seat"),
         visible: row.get::<i64, _>("visible") != 0,
+        owner_chat_id: row.get("owner_chat_id"),
         shell_eligible: row.get::<i64, _>("shell_eligible") != 0,
         opened_at: row.get("opened_at"),
         closed_at: row.get("closed_at"),

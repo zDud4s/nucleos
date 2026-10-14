@@ -911,6 +911,16 @@ pub async fn rostered_roots(pool: &SqlitePool) -> sqlx::Result<Vec<std::path::Pa
     Ok(roots.into_iter().map(std::path::PathBuf::from).collect())
 }
 
+/// One project's recorded root, if the roster has one for it.
+pub async fn root_of(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<String>> {
+    let root: Option<Option<String>> =
+        sqlx::query_scalar("SELECT project_root FROM autopilot_state WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(root.flatten())
+}
+
 /// Whether `main` is the root of a rostered project, compared lexically after the same folding
 /// `main_checkout_of` applies (case-insensitively on Windows). A worktree's `.git` file is
 /// attacker-controllable text, so the main checkout it names is trusted only when the daemon
