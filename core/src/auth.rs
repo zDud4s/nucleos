@@ -330,6 +330,9 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/tests-map"),
     (Method::GET, "/projects/{id}/map/decisions"),
     (Method::GET, "/projects/{id}/map/specs"),
+    // The transitions are text of source files `cat` and `grep` already return whole, plus a path
+    // and a line, and `root` is the path `worktree` already hands this key.
+    (Method::GET, "/projects/{id}/map/states"),
     (Method::GET, "/projects/{id}/map/silenced"),
     (Method::GET, "/projects/{id}/map/orphan"),
     // Names, paths and line numbers of files this key can already `cat`, plus the root
