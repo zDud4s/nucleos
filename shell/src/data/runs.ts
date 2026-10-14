@@ -206,6 +206,8 @@ export interface RunFilters {
   q?: string;
   chat?: string;
   group?: "chat";
+  /** `hide` leaves conversation turns out of the list; the runs a chat started stay. */
+  chatTurns?: "hide";
 }
 
 /** A filter set as a plain record, which is what the query key is built from. */
@@ -217,6 +219,7 @@ export function runFilterFields(filters: RunFilters): Record<string, string | un
     q: blankToUndefined(filters.q),
     chat: blankToUndefined(filters.chat),
     group: filters.group,
+    chatTurns: filters.chatTurns,
   };
 }
 
@@ -242,6 +245,7 @@ function runsQuery(filters: RunFilters): string {
   if (fields.q !== undefined) params.set("q", fields.q);
   if (fields.chat !== undefined) params.set("chat_id", fields.chat);
   if (fields.group !== undefined) params.set("group", fields.group);
+  if (fields.chatTurns !== undefined) params.set("chat_turns", fields.chatTurns);
   params.set("limit", String(RUN_LIST_LIMIT));
   return `?${params.toString()}`;
 }

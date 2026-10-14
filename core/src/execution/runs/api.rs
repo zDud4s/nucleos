@@ -91,6 +91,11 @@ pub struct RunSearchResult {
     pub route_failed: Option<String>,
     /// The conversation this run is a turn of; `None` for every non-chat run.
     pub chat_id: Option<String>,
+    /// The conversation whose turn asked for this run through `POST /runs` (0195); `None` for a run
+    /// nobody started from a chat. Distinct from `chat_id`: this run is not a turn of it.
+    pub launched_by_chat_id: Option<String>,
+    /// That conversation's title, read at listing time so a rename shows at once.
+    pub launched_by_chat_title: Option<String>,
     /// The conversation's title. Only on a row `group_by_chat` folded; null elsewhere.
     pub chat_title: Option<String>,
     /// How many matching turns the folded conversation has. Only on a folded row; null elsewhere.
@@ -116,6 +121,9 @@ pub struct SearchFilter {
     pub chat_id: Option<String>,
     /// Fold every chat turn into one row per conversation (`GET /runs?group=chat`).
     pub group_by_chat: bool,
+    /// Leave chat turns out entirely (`GET /runs?chat_turns=hide`). The runs a chat LAUNCHED stay:
+    /// they are not turns (decision of 2026-10-11).
+    pub hide_chat_turns: bool,
 }
 
 /// Keep search results useful without turning the index into a prompt or output retrieval endpoint.
@@ -131,8 +139,8 @@ pub async fn list_awaiting_approval(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec
 }
 
 /// The tail of the grouped shape: folds every chat turn of the filtered set into one row per
-/// conversation, and passes every other run through as it is. Both arms carry the same 21 columns.
-pub(super) const GROUPED_BY_CHAT: &str = "), g AS (SELECT chat_id AS g_chat_id, COUNT(*) AS g_turns,      SUM(status = 'running') AS g_running, SUM(cost_usd) AS g_cost, MAX(id) AS g_last      FROM f WHERE mode = 'assistant' AND chat_id IS NOT NULL GROUP BY chat_id)      SELECT * FROM (      SELECT f.*, NULL AS chat_title, NULL AS turns, NULL AS running_turns FROM f      WHERE NOT (f.mode = 'assistant' AND f.chat_id IS NOT NULL)      UNION ALL      SELECT f.id, f.project_id, f.status, f.mode, f.created_at, f.completed_at,      g.g_cost AS cost_usd, f.prompt_excerpt, f.model, f.effort, f.runner, f.route_mode,      f.route_decision_id, f.advised_runner, f.advised_model, f.advised_effort,      f.route_failed, f.chat_id,      (SELECT title FROM chats WHERE chats.chat_id = g.g_chat_id) AS chat_title,      g.g_turns AS turns, g.g_running AS running_turns      FROM g JOIN f ON f.id = g.g_last)";
+/// conversation, and passes every other run through as it is. Both arms carry the same 23 columns.
+pub(super) const GROUPED_BY_CHAT: &str = "), g AS (SELECT chat_id AS g_chat_id, COUNT(*) AS g_turns,      SUM(status = 'running') AS g_running, SUM(cost_usd) AS g_cost, MAX(id) AS g_last      FROM f WHERE mode = 'assistant' AND chat_id IS NOT NULL GROUP BY chat_id)      SELECT * FROM (      SELECT f.*, NULL AS chat_title, NULL AS turns, NULL AS running_turns FROM f      WHERE NOT (f.mode = 'assistant' AND f.chat_id IS NOT NULL)      UNION ALL      SELECT f.id, f.project_id, f.status, f.mode, f.created_at, f.completed_at,      g.g_cost AS cost_usd, f.prompt_excerpt, f.model, f.effort, f.runner, f.route_mode,      f.route_decision_id, f.advised_runner, f.advised_model, f.advised_effort,      f.route_failed, f.chat_id, f.launched_by_chat_id, f.launched_by_chat_title,      (SELECT title FROM chats WHERE chats.chat_id = g.g_chat_id) AS chat_title,      g.g_turns AS turns, g.g_running AS running_turns      FROM g JOIN f ON f.id = g.g_last)";
 
 /// Searches run metadata newest-first. The result is an index, so it never returns stdout or stderr.
 /// With `group_by_chat`, every chat turn folds into one row per conversation.
@@ -141,7 +149,7 @@ pub async fn search(
     filter: &SearchFilter,
 ) -> sqlx::Result<Vec<RunSearchResult>> {
     let columns = format!(
-        "id, project_id, status, mode, created_at, completed_at, cost_usd,          substr(prompt, 1, {PROMPT_EXCERPT_CHARS}) AS prompt_excerpt,          model, effort, runner, route_mode, route_decision_id,          advised_runner, advised_model, advised_effort, route_failed, chat_id"
+        "id, project_id, status, mode, created_at, completed_at, cost_usd,          substr(prompt, 1, {PROMPT_EXCERPT_CHARS}) AS prompt_excerpt,          model, effort, runner, route_mode, route_decision_id,          advised_runner, advised_model, advised_effort, route_failed, chat_id,          launched_by_chat_id,          (SELECT title FROM chats WHERE chats.chat_id = runs.launched_by_chat_id)          AS launched_by_chat_title"
     );
     let mut query = if filter.group_by_chat {
         sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
@@ -220,6 +228,11 @@ pub(super) fn push_search_filters(
     }
     if let Some(chat_id) = &filter.chat_id {
         query.push(" AND chat_id = ").push_bind(chat_id);
+    }
+    // Every `assistant` row is a conversation turn, Telegram's and the pre-0045 ones with no
+    // `chat_id` included, so the mode alone is the test.
+    if filter.hide_chat_turns {
+        query.push(" AND mode <> 'assistant'");
     }
 }
 
@@ -459,6 +472,18 @@ impl RunStatusResponse {
     }
 }
 
+/// `POST /runs` as the router mounts it: `create_run`, then the tag naming the chat that asked.
+pub async fn create_run_route(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CreateRunRequest>,
+) -> Result<Json<CreateRunResponse>, (StatusCode, String)> {
+    let pool = state.pool.clone();
+    let created = create_run(State(state), Json(req)).await?;
+    tag_launching_chat(&pool, created.0.id, &headers).await;
+    Ok(created)
+}
+
 pub async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
@@ -590,6 +615,39 @@ pub async fn create_run(
     })?;
 
     Ok(Json(CreateRunResponse { id }))
+}
+
+/// Tags run `id` with the conversation that asked for it, when the request came from a chat turn.
+///
+/// The speaking run is `RUN_ID_HEADER`, which the MCP server of every chat turn sends from the
+/// `NUCLEOS_RUN_ID` the daemon gave it; a header naming a run that is not a conversation turn tags
+/// nothing. Written after the INSERT and best effort, because it is a label for the Runs list and
+/// decides nothing: a run created and left untagged is a run, and refusing one over its label
+/// would be the wrong trade.
+pub(super) async fn tag_launching_chat(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    headers: &axum::http::HeaderMap,
+) {
+    let Some(speaking) = headers
+        .get(crate::daemon_client::RUN_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        return;
+    };
+    let tagged = sqlx::query(
+        "UPDATE runs SET launched_by_chat_id =
+                (SELECT chat_id FROM runs WHERE id = ? AND mode = 'assistant')
+          WHERE id = ?",
+    )
+    .bind(speaking)
+    .bind(id)
+    .execute(pool)
+    .await;
+    if let Err(error) = tagged {
+        tracing::warn!(%error, id, speaking, "the run was created but not tagged with the chat that asked for it");
+    }
 }
 
 /// Where a tail read should resume from. Absent is the start.
