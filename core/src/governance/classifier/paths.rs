@@ -91,20 +91,33 @@ pub(super) fn lands_inside_the_workspace(
         return false;
     }
 
+    targets
+        .iter()
+        .all(|target| target_lands_inside(target, cwd, shell))
+}
+
+/// PURE: whether one destination named on a command line resolves inside the workspace `cwd`.
+///
+/// The containment half of `lands_inside_the_workspace`, on its own so that `git -C <dir>`
+/// (`reads::reads_from_inside_the_workspace`) asks exactly the question a `cd` is asked rather than
+/// a second spelling of it.
+pub(super) fn target_lands_inside(
+    target: &str,
+    cwd: &Path,
+    shell: crate::command_reader::Shell,
+) -> bool {
+    // A destination the shell rewrites before the command ever sees it is not a destination this
+    // can check. `~`, `$HOME` and `%USERPROFILE%` are all the home directory, and all three
+    // arrive here as ordinary-looking names that `normalize_path` happily glues onto the
+    // workspace — so `cd ~ && …` read as landing in `<workspace>/~` and was allowed. Caught by
+    // the test that walks the ways out; the `%VAR%` form had no test and would have shipped.
+    if target.starts_with('~') || target.contains('$') || target.contains('%') {
+        return false;
+    }
     let workspace = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
-    targets.iter().all(|target| {
-        // A destination the shell rewrites before the command ever sees it is not a destination this
-        // can check. `~`, `$HOME` and `%USERPROFILE%` are all the home directory, and all three
-        // arrive here as ordinary-looking names that `normalize_path` happily glues onto the
-        // workspace — so `cd ~ && …` read as landing in `<workspace>/~` and was allowed. Caught by
-        // the test that walks the ways out; the `%VAR%` form had no test and would have shipped.
-        if target.starts_with('~') || target.contains('$') || target.contains('%') {
-            return false;
-        }
-        let target = with_git_bash_drive(target, shell, &workspace);
-        let target = fold_for_containment(&normalize_path(&target, Some(cwd)));
-        target == workspace || target.starts_with(&format!("{workspace}/"))
-    })
+    let target = with_git_bash_drive(target, shell, &workspace);
+    let target = fold_for_containment(&normalize_path(&target, Some(cwd)));
+    target == workspace || target.starts_with(&format!("{workspace}/"))
 }
 
 /// PURE: whether `cargo fmt`'s arguments leave it formatting the crate it stands in, and nothing
