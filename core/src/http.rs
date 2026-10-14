@@ -16,7 +16,7 @@ use crate::door::{
     files_root, post_finding, post_knowledge, recall_knowledge, refusal, sending_run_id_of,
     uncancellable,
 };
-use crate::execution::runs::{self, AwaitingRun, cancel_run, create_run, get_run};
+use crate::execution::runs::{self, AwaitingRun, cancel_run, get_run};
 use crate::execution::vcs;
 use crate::execution::worktree::{self, ReleaseOutcome};
 use crate::feed::{self, FeedEntry};
