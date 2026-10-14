@@ -104,6 +104,15 @@ function modulePath(name: string): string {
   return `crate::${name.replace(/\.rs$/, "").replace(/\/mod$/, "").replace(/\//g, "::")}`;
 }
 
+/**
+ * `main.rs` and the top-level files of the modules it declares (`mod startup;`): the binary's side,
+ * where the lib is in scope by glob and a bare module path names the lib's module.
+ */
+const BINARY_FILES = new Set([
+  "main.rs",
+  ...[...readFileSync(`${repoRoot}core/src/main.rs`, "utf8").matchAll(/^mod (\w+);/gm)].map(([, m]) => `${m}.rs`),
+]);
+
 function writtenFeedKinds(): { kinds: Set<string>; files: number; unresolved: string[] } {
   const kinds = new Set<string>();
   const unresolved: string[] = [];
@@ -133,10 +142,11 @@ function writtenFeedKinds(): { kinds: Set<string>; files: number; unresolved: st
           else kinds.add(value);
           continue;
         }
-        // `main.rs` is the binary over the lib (`use nucleos_core::*`), so a bare `onboarding::X`
-        // there, or a `nucleos_core::onboarding::X` anywhere, is the lib's `crate::onboarding::X`.
+        // `main.rs` is the binary over the lib (`use nucleos_core::*`), and so is every module it
+        // declares (`startup.rs` reads `use super::*`): a bare `onboarding::X` there, or a
+        // `nucleos_core::onboarding::X` anywhere, is the lib's `crate::onboarding::X`.
         let path = argument.replace(/\s+/g, "").replace(/^nucleos_core::/, "crate::");
-        if (name === "main.rs" && !path.startsWith("crate::")) path = `crate::${path}`;
+        if (BINARY_FILES.has(name) && !path.startsWith("crate::")) path = `crate::${path}`;
         const qualified = /^(crate(?:::\w+)+)::([A-Z][A-Z0-9_]*)$/.exec(path);
         if (qualified) {
           const value = byModule.get(qualified[1])?.get(qualified[2]);
