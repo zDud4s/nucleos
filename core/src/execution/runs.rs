@@ -10069,6 +10069,7 @@ tests:
                 live: false,
                 chat_id: None,
                 group_by_chat: false,
+                hide_chat_turns: false,
             },
         )
         .await
@@ -10124,6 +10125,7 @@ tests:
                 live: false,
                 chat_id: None,
                 group_by_chat: false,
+                hide_chat_turns: false,
             },
         )
         .await
@@ -10169,6 +10171,7 @@ tests:
                 live: false,
                 chat_id: None,
                 group_by_chat: false,
+                hide_chat_turns: false,
             },
         )
         .await
@@ -10183,8 +10186,9 @@ tests:
         let object = json.as_object().unwrap();
         // Eight run fields and the nine route fields: what launched and what the router advised
         // are model names and ids, never transcript text. Four conversation fields join them: the
-        // chat's id and title and two counts (turns, running_turns), never transcript text.
-        assert_eq!(object.len(), 21);
+        // chat's id and title and two counts (turns, running_turns), never transcript text. Two more
+        // name the conversation that launched the run (0195), an id and a title.
+        assert_eq!(object.len(), 23);
         for field in [
             "id",
             "project_id",
@@ -10207,6 +10211,8 @@ tests:
             "chat_title",
             "turns",
             "running_turns",
+            "launched_by_chat_id",
+            "launched_by_chat_title",
         ] {
             assert!(object.contains_key(field), "missing metadata field {field}");
         }
@@ -10253,6 +10259,7 @@ tests:
                 live: false,
                 chat_id: None,
                 group_by_chat: false,
+                hide_chat_turns: false,
             },
         )
         .await
@@ -10308,6 +10315,7 @@ tests:
                 live: false,
                 chat_id: None,
                 group_by_chat: false,
+                hide_chat_turns: false,
             },
         )
         .await
@@ -10345,6 +10353,7 @@ tests:
                 live: false,
                 chat_id: None,
                 group_by_chat: false,
+                hide_chat_turns: false,
             },
         )
         .await
@@ -10368,6 +10377,7 @@ tests:
             live: false,
             chat_id: None,
             group_by_chat: false,
+            hide_chat_turns: false,
         }
     }
 
@@ -10547,6 +10557,89 @@ tests:
             group_by_chat: true,
             ..base_filter()
         }
+    }
+
+    /// Chat turns leave the list; the run a chat LAUNCHED stays, carrying the conversation it came
+    /// from — tagged by `tag_launching_chat` from the speaking turn's `RUN_ID_HEADER`. A header that
+    /// names a run which is not a turn tags nothing (decision of 2026-10-11).
+    #[tokio::test]
+    async fn hiding_chat_turns_keeps_the_runs_a_chat_launched_with_their_origin() {
+        let pool = search_test_pool().await;
+        sqlx::query(
+            "INSERT INTO chats (chat_id, title, created_at)
+             VALUES ('c-1', 'Refactor the gate', '2026-10-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let turn = insert_chat_turn(
+            &pool,
+            Some("c-1"),
+            "completed",
+            None,
+            "2026-10-01T00:00:01Z",
+        )
+        .await;
+        let launched = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('launched', 'completed', 'worktree', '2026-10-01T00:00:02Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let unrelated = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('typed', 'completed', 'worktree', '2026-10-01T00:00:03Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let mut from_turn = axum::http::HeaderMap::new();
+        from_turn.insert(
+            crate::daemon_client::RUN_ID_HEADER,
+            turn.to_string().parse().unwrap(),
+        );
+        api::tag_launching_chat(&pool, launched, &from_turn).await;
+        let mut from_a_run = axum::http::HeaderMap::new();
+        from_a_run.insert(
+            crate::daemon_client::RUN_ID_HEADER,
+            launched.to_string().parse().unwrap(),
+        );
+        api::tag_launching_chat(&pool, unrelated, &from_a_run).await;
+
+        for group_by_chat in [false, true] {
+            let rows = search(
+                &pool,
+                &SearchFilter {
+                    hide_chat_turns: true,
+                    group_by_chat,
+                    ..base_filter()
+                },
+            )
+            .await
+            .unwrap();
+            let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+            assert_eq!(
+                ids,
+                vec![unrelated, launched],
+                "group_by_chat={group_by_chat}"
+            );
+            assert_eq!(rows[1].launched_by_chat_id.as_deref(), Some("c-1"));
+            assert_eq!(
+                rows[1].launched_by_chat_title.as_deref(),
+                Some("Refactor the gate")
+            );
+            assert_eq!(rows[0].launched_by_chat_id, None);
+        }
+
+        let shown = search(&pool, &base_filter()).await.unwrap();
+        assert!(
+            shown.iter().any(|row| row.id == turn),
+            "the default listing keeps the turns"
+        );
     }
 
     #[tokio::test]

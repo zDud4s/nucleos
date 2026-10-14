@@ -184,7 +184,7 @@ describe("Runs - the filters live in the route", () => {
     await screen.findByRole("heading", { level: 1, name: "Runs" });
     // Nothing is filtered to begin with, and the ceiling is asked for out loud
     // rather than left to the daemon's default.
-    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?group=chat&limit=50");
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?group=chat&chat_turns=hide&limit=50");
 
     fireEvent.click(screen.getByRole("button", { name: "More filters" }));
     fireEvent.change(await screen.findByLabelText("Filter by status"), {
@@ -204,10 +204,10 @@ describe("Runs - the filters live in the route", () => {
     await waitFor(() => {
       const entry = queryClient
         .getQueryCache()
-        .find({ queryKey: keys.runs.search({ status: "timed_out", group: "chat" }), exact: true });
+        .find({ queryKey: keys.runs.search({ status: "timed_out", group: "chat", chatTurns: "hide" }), exact: true });
       expect(entry).toBeDefined();
     });
-    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?status=timed_out&group=chat&limit=50");
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?status=timed_out&group=chat&chat_turns=hide&limit=50");
   });
 
   it("drops a filter that was cleared instead of asking for the empty string", async () => {
@@ -243,7 +243,7 @@ describe("Runs - the filters live in the route", () => {
     // The same route model as every other filter — a scope is a status, not a
     // second piece of state beside it.
     await waitFor(() => expect(searchOf(router)).toEqual({ status: "failed" }));
-    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?status=failed&group=chat&limit=50");
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?status=failed&group=chat&chat_turns=hide&limit=50");
     await waitFor(() => {
       expect(within(scopes).getByRole("button", { name: "Failed" }).getAttribute("aria-pressed")).toBe(
         "true",
@@ -895,6 +895,40 @@ describe("Runs - presets", () => {
       expect(document.querySelector(".runs-row-route")).toBeNull();
       expect(screen.queryByText(/Router \(last/)).toBeNull();
       expect(daemon.apiFetch).not.toHaveBeenCalledWith(expect.stringContaining("/route/report"));
+    });
+  });
+});
+
+/* ---------------------------------------------------------- chat turns -- */
+
+describe("Runs - chat turns", () => {
+  it("hides chat turns by default, shows them on request, and tags a run a chat started", async () => {
+    daemon.apiFetch.mockImplementation(
+      runsFetch(
+        world({
+          rows: [
+            row({ id: 9, launched_by_chat_id: "c-1", launched_by_chat_title: "Refactor the gate" }),
+          ],
+        }),
+      ),
+    );
+
+    const { router } = await renderRuns();
+    await screen.findByRole("heading", { level: 1, name: "Runs" });
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?group=chat&chat_turns=hide&limit=50");
+
+    const origin = await screen.findByRole("link", { name: "from chat Refactor the gate" });
+    expect(origin.getAttribute("href")).toBe("/chats/c-1");
+
+    // The default is not a filter: nothing offers to clear it.
+    expect(screen.queryByRole("button", { name: "Clear filters" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Show chat turns" }));
+    await waitFor(() => {
+      expect(searchOf(router)).toEqual({ chats: "show" });
+    });
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?group=chat&limit=50");
     });
   });
 });

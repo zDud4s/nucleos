@@ -257,6 +257,10 @@ export interface RunSearchResult {
   chat_id?: string | null;
   /** Only on a row `GET /runs?group=chat` folded: the conversation's title. */
   chat_title?: string | null;
+  /** The conversation whose turn started this run; it is not a turn of it. */
+  launched_by_chat_id?: string | null;
+  /** That conversation's title, when it has one. */
+  launched_by_chat_title?: string | null;
   /** Only on a folded row: how many turns the conversation has. */
   turns?: number | null;
   /** Only on a folded row: how many of those turns are running now. */

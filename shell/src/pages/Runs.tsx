@@ -59,12 +59,18 @@ import "./runs.css";
  * thing on a screen whose job is to say what has happened.
  */
 
-/** The four filters, as the route spells them. */
+/** The four filters, as the route spells them, and whether chat turns are shown. */
 export interface RunSearch {
   project?: string;
   status?: string;
   mode?: string;
   q?: string;
+  /**
+   * `show` puts conversation turns back in the list. Absent hides them — the
+   * owner's decision of 2026-10-11: a turn per message would drown the work
+   * that runs on its own, while the runs a chat starts stay, tagged with it.
+   */
+  chats?: "show";
 }
 
 /**
@@ -82,6 +88,7 @@ export function validateRunSearch(search: Record<string, unknown>): RunSearch {
     status: searchText(search.status),
     mode: searchText(search.mode),
     q: searchText(search.q),
+    chats: search.chats === "show" ? "show" : undefined,
   };
 }
 
@@ -101,7 +108,15 @@ export function Runs() {
     q: search.q,
   };
 
-  const runs = useRuns({ ...filters, group: "chat" });
+  // Kept out of `filters`, which is what "Clear filters" and the empty state
+  // read: hiding the turns is the page's default, not a filter somebody set.
+  // Asking for the `assistant` mode is asking for turns, so it shows them.
+  const showChats = search.chats === "show" || search.mode === "assistant";
+  const runs = useRuns({
+    ...filters,
+    group: "chat",
+    chatTurns: showChats ? undefined : "hide",
+  });
   const projects = useProjects();
   const [composing, setComposing] = useState(false);
   const panelId = useId();
@@ -120,7 +135,7 @@ export function Runs() {
   function applyFilters(patch: Partial<RunSearch>) {
     void navigate({
       to: "/runs",
-      search: validateRunSearch({ ...filters, ...patch }),
+      search: validateRunSearch({ ...filters, chats: search.chats, ...patch }),
     });
   }
 
@@ -170,6 +185,7 @@ export function Runs() {
 
       <RunFilterBar
         filters={filters}
+        showChats={showChats}
         projects={projects.data}
         onChange={applyFilters}
       />
@@ -221,10 +237,12 @@ const SCOPE_STATUSES = new Set(
  */
 function RunFilterBar({
   filters,
+  showChats,
   projects,
   onChange,
 }: {
   filters: RunFilters;
+  showChats: boolean;
   projects: ProjectSummary[] | undefined;
   onChange: (patch: Partial<RunSearch>) => void;
 }) {
@@ -290,6 +308,18 @@ function RunFilterBar({
           ))}
         </select>
       </Field>
+
+      <label className="runs-check">
+        <input
+          type="checkbox"
+          checked={showChats}
+          disabled={filters.mode === "assistant"}
+          onChange={(event) =>
+            onChange({ chats: event.target.checked ? "show" : undefined })
+          }
+        />
+        Show chat turns
+      </label>
 
       <span className="runs-filters-aside">
         <Button
@@ -454,6 +484,11 @@ function RunRow({ row }: { row: RunSearchResult }) {
         {ran !== null && <span className="runs-row-ran">{ran}</span>}
         <span className="runs-row-cost">{costOf(row)}</span>
       </p>
+      {row.launched_by_chat_id != null && (
+        <Link to={`/chats/${row.launched_by_chat_id}`} className="runs-row-origin">
+          from chat {row.launched_by_chat_title ?? row.launched_by_chat_id}
+        </Link>
+      )}
       <RouteAdvice row={row} />
     </Row>
   );

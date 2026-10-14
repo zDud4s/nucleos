@@ -427,6 +427,14 @@
   text-align: right;
 }
 
+/* Which conversation started this run, under the name and in its column, as
+   quiet as the metadata: it says where the run came from, not what it did. */
+.runs-row-origin {
+  grid-column: 2;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
 /* A conversation row's toggle line sits under the name, in the text column. */
 .runs-row-turns {
   grid-column: 2;

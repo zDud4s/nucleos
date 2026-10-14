@@ -11,7 +11,7 @@ pub(super) fn routes() -> Router<AppState> {
         // answer.
         .route("/feed/timeline", get(get_feed_timeline))
         .route("/feed/seen", get(get_feed_seen).post(post_feed_seen))
-        .route("/runs", get(get_runs).post(create_run))
+        .route("/runs", get(get_runs).post(runs::create_run_route))
         // The literal path coexists with `/runs/{id}`; static segments win in matchit.
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
@@ -108,6 +108,8 @@ pub(super) struct RunsQuery {
     pub(super) chat_id: Option<String>,
     /// `chat` folds every chat turn into one row per conversation; anything else is a 400.
     pub(super) group: Option<String>,
+    /// `hide` leaves conversation turns out; `show`, or absent, keeps them. Anything else is a 400.
+    pub(super) chat_turns: Option<String>,
 }
 
 /// Every operation the shared git queue performs, and whether a project may declare it.
@@ -249,6 +251,11 @@ pub(super) async fn get_runs(
         Some("chat") => true,
         Some(_) => return Err(StatusCode::BAD_REQUEST),
     };
+    let hide_chat_turns = match query.chat_turns.as_deref() {
+        None | Some("show") => false,
+        Some("hide") => true,
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+    };
     // A live listing with no explicit limit inherits the ceiling of live listings, not search's 50.
     // Without this the daemon would promise a shared constant and hand back the search window — and
     // the client would be the only thing guaranteeing the number, which is no guarantee at all.
@@ -270,6 +277,7 @@ pub(super) async fn get_runs(
             live,
             chat_id: query.chat_id,
             group_by_chat,
+            hide_chat_turns,
         },
     )
     .await
