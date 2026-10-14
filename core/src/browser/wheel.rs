@@ -163,6 +163,82 @@ pub async fn open_window(
     live(&state.pool, row_id).await
 }
 
+/// What "Open with agent" hands back: the session, and the conversation that owns it.
+#[derive(Debug, serde::Serialize)]
+pub struct WithAgent {
+    pub session: SessionRow,
+    pub chat_id: String,
+}
+
+/// A person opens a window WITH the agent, from the shell's Web page (spec
+/// browser-com-painel-pela-pagina-web §3).
+///
+/// Not `open_window` with a flag: that one is the person's own unfenced window, and this one is the
+/// agent's visible session — fenced, on the project's profile with its write grants, the agent at
+/// the wheel — opened through the very `open_with` a `browser_open{visible: true}` uses. What
+/// differs is only the owner: a conversation made here, named by `owner_chat_id`, because it has no
+/// run yet. No turn is started; the person's first panel message is what wakes the agent, and
+/// `panel::deliver`'s prefix is what tells it the session id.
+///
+/// The conversation is made before the window and stays if the window fails: an empty conversation
+/// is harmless and visible, and undoing it would be one more step that can fail.
+pub async fn open_window_with_agent(
+    state: &AppState,
+    project_id: &str,
+    url: &str,
+) -> Result<WithAgent, WheelError> {
+    if !state.browser.enabled {
+        return Err(WheelError::Disabled);
+    }
+    let now = chrono::Utc::now();
+    if !crate::attention::owner_is_present(&state.pool, now).await {
+        return Err(WheelError::NoOnePresent);
+    }
+
+    let chat_id = crate::chats::create_on(
+        &state.pool,
+        crate::chats::Brain::Cloud,
+        None,
+        crate::chats::PermissionMode::Auto,
+    )
+    .await?;
+    // Only a folder that is there: `set_cwd` trusts its caller to have checked. Without one the
+    // conversation runs `McpOnly`, which still carries the browser tools.
+    if let Some(root) = crate::governance::autopilot::root_of(&state.pool, project_id).await?
+        && std::path::Path::new(&root).is_dir()
+    {
+        crate::chats::set_cwd(&state.pool, &chat_id, &root).await?;
+    }
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .unwrap_or_else(|| project_id.to_string());
+    crate::chats::rename(&state.pool, &chat_id, Some(&format!("Browser · {host}"))).await?;
+
+    let ask = browser::Ask {
+        project_id,
+        run_id: None,
+        url,
+        surface: browser_policy::Surface::Assistant,
+        requester: browser_policy::Requester::Owner,
+        now: &now.to_rfc3339(),
+    };
+    let row = match browser::open_with(&state.pool, &state.browser, ask, true).await {
+        Ok(browser::Opened::Session(row)) => row,
+        Ok(browser::Opened::Refused { rule, .. }) => {
+            return Err(WheelError::WrongState(format!(
+                "the browser refused to open this address: {rule}"
+            )));
+        }
+        Err(error) => return Err(WheelError::Sidecar(error)),
+    };
+    browser::set_owner_chat(&state.pool, row.id, &chat_id).await?;
+    let session = browser::session_row(&state.pool, row.id)
+        .await?
+        .ok_or(WheelError::NoSuchSession)?;
+    Ok(WithAgent { session, chat_id })
+}
+
 /// The agent asks for the wheel (spec §4.4 rule 3).
 ///
 /// The order is the whole of rule 1. The state moves here FIRST and the sidecar is told second,
@@ -817,17 +893,38 @@ pub struct KeepBody {
 pub struct WindowBody {
     pub project_id: String,
     pub url: String,
+    /// Open the agent's visible session with its panel, owned by a new conversation, instead of
+    /// the person's own window (spec browser-com-painel-pela-pagina-web). Off by default, so an
+    /// older caller gets exactly the window it always got.
+    #[serde(default)]
+    pub agent: bool,
 }
 
-/// `POST /browser/window` — a person opens one for themselves.
+/// `POST /browser/window` — a person opens one for themselves, or one with the agent.
 ///
-/// No `run_id` field, and its absence is the point: a run cannot ask for this. The refusal is
-/// `open_window`'s presence check rather than a missing field, but a field a run could fill would
-/// invite exactly the caller this must not have.
+/// No `run_id` field, and its absence is the point: a run cannot ask for this. A run's own key is
+/// refused by auth before the handler (the route is in no scope table); a control-token holder
+/// carrying a run id is refused here, as `post_window_seat` does. Past that, presence is the check.
 pub async fn post_window(
     State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<WindowBody>,
 ) -> axum::response::Response {
+    use crate::browser::seat::{SeatError, from_a_run, seat_error};
+
+    if from_a_run(&scope, &headers) {
+        return seat_error(SeatError::RunRequester);
+    }
+    if body.agent {
+        return match open_window_with_agent(&state, &body.project_id, &body.url).await {
+            Ok(opened) => {
+                crate::browser::panel::open_on(&state, &opened.session, &body.url).await;
+                axum::Json(opened).into_response()
+            }
+            Err(error) => wheel_error(error),
+        };
+    }
     match open_window(&state, &body.project_id, &body.url).await {
         Ok(row) => axum::Json(row).into_response(),
         Err(error) => wheel_error(error),
@@ -1520,6 +1617,186 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a refusal must not leave a row offering a handover"
+        );
+        db.close().await;
+    }
+
+    /// Spec browser-com-painel-pela-pagina-web §3.1: the Web page's "Open with agent" makes a new
+    /// conversation in the project and a visible session it owns, with the agent at the wheel.
+    ///
+    /// The run is `None` and stays `None` — no turn has happened yet, and none is started: the
+    /// person's first panel message is what wakes the agent. So the owner has to come from
+    /// `owner_chat_id`, and the conversation has to be pointed at the project's folder for its turns
+    /// to run there.
+    #[tokio::test]
+    async fn a_person_opens_a_window_with_the_agent_owned_by_a_new_chat() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root_text = root.path().to_string_lossy().to_string();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('nucleos', 'off', ?)",
+        )
+        .bind(&root_text)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let opened = open_window_with_agent(&state, "nucleos", "https://jira.example.org/login")
+            .await
+            .expect("the window opens with an agent");
+
+        let row = &opened.session;
+        assert_eq!(
+            row.mode,
+            mode::AGENT,
+            "the agent starts at the wheel (§3.1 step 2)"
+        );
+        assert!(row.visible, "a window the person can see, with the panel");
+        assert_eq!(row.profile_kind, "project");
+        assert_eq!(row.run_id, None, "no turn has run yet");
+        assert_eq!(row.owner_chat_id.as_deref(), Some(opened.chat_id.as_str()));
+        assert!(
+            !row.final_url.is_empty(),
+            "the panel prefix shows the final url, so it must be recorded"
+        );
+        assert!(
+            seen.lock().unwrap().iter().any(|verb| verb == "open"),
+            "opened through the agent's open, fenced: {:?}",
+            seen.lock().unwrap()
+        );
+        assert!(
+            !seen.lock().unwrap().iter().any(|verb| verb == "wheel/take"),
+            "not the person's unfenced window"
+        );
+
+        let (cwd, title): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT cwd, title FROM chats WHERE chat_id = ?")
+                .bind(&opened.chat_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(cwd.as_deref(), Some(root_text.as_str()));
+        assert_eq!(title.as_deref(), Some("Browser · jira.example.org"));
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ?")
+            .bind(&opened.chat_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            turns, 0,
+            "no seed turn: the person's first panel message starts one"
+        );
+        db.close().await;
+    }
+
+    /// A project with no folder on record still gets its window; the conversation simply has no
+    /// directory, and its turns run `McpOnly`, which still carries the browser tools.
+    #[tokio::test]
+    async fn a_project_without_a_folder_still_opens_with_an_agent() {
+        let (db, state, _seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let opened = open_window_with_agent(&state, "nucleos", "https://jira.example.org/login")
+            .await
+            .expect("the window opens");
+
+        let cwd: Option<String> = sqlx::query_scalar("SELECT cwd FROM chats WHERE chat_id = ?")
+            .bind(&opened.chat_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(cwd, None);
+        db.close().await;
+    }
+
+    /// Nobody at the machine: no conversation, no window, no row. Same security half as
+    /// `nobody_present_gets_no_window`, and the conversation is part of what must not be made.
+    #[tokio::test]
+    async fn nobody_present_gets_no_chat_and_no_window_with_the_agent() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        let count_chats = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chats")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap()
+        };
+        let before = count_chats().await;
+
+        assert!(matches!(
+            open_window_with_agent(&state, "nucleos", "https://jira.example.org/login").await,
+            Err(WheelError::NoOnePresent)
+        ));
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no browser asked for: {:?}",
+            seen.lock().unwrap()
+        );
+        assert_eq!(count_chats().await, before, "no conversation was made");
+        assert!(
+            browser::open_sessions(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db.close().await;
+    }
+
+    /// The route refuses a control-token holder that carries a run id — for the old window and the
+    /// new one alike (§3.2 "Portões"). A run's own key is already refused by auth before this.
+    #[tokio::test]
+    async fn the_window_route_refuses_a_run_with_or_without_the_agent() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(crate::daemon_client::RUN_ID_HEADER, "7".parse().unwrap());
+
+        for agent in [false, true] {
+            let response = post_window(
+                axum::extract::State(state.clone()),
+                axum::Extension(crate::auth::Scope::Control),
+                headers.clone(),
+                axum::Json(WindowBody {
+                    project_id: "nucleos".into(),
+                    url: "https://jira.example.org/login".into(),
+                    agent,
+                }),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::FORBIDDEN,
+                "agent: {agent}"
+            );
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        assert!(
+            browser::open_sessions(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
         );
         db.close().await;
     }
