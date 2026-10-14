@@ -1653,7 +1653,11 @@ mod tests {
             .expect("the window opens with an agent");
 
         let row = &opened.session;
-        assert_eq!(row.mode, mode::AGENT, "the agent starts at the wheel (§3.1 step 2)");
+        assert_eq!(
+            row.mode,
+            mode::AGENT,
+            "the agent starts at the wheel (§3.1 step 2)"
+        );
         assert!(row.visible, "a window the person can see, with the panel");
         assert_eq!(row.profile_kind, "project");
         assert_eq!(row.run_id, None, "no turn has run yet");
@@ -1685,7 +1689,10 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(turns, 0, "no seed turn: the person's first panel message starts one");
+        assert_eq!(
+            turns, 0,
+            "no seed turn: the person's first panel message starts one"
+        );
         db.close().await;
     }
 
@@ -1738,7 +1745,12 @@ mod tests {
             seen.lock().unwrap()
         );
         assert_eq!(count_chats().await, before, "no conversation was made");
-        assert!(browser::open_sessions(&state.pool).await.unwrap().is_empty());
+        assert!(
+            browser::open_sessions(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         db.close().await;
     }
 
@@ -1775,8 +1787,17 @@ mod tests {
                 "agent: {agent}"
             );
         }
-        assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
-        assert!(browser::open_sessions(&state.pool).await.unwrap().is_empty());
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        assert!(
+            browser::open_sessions(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         db.close().await;
     }
 
