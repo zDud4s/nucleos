@@ -3035,57 +3035,62 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                tool_policy_for(cwd, origin, wired, false),
+                tool_policy_for(cwd, origin, wired, crate::relay::Handover::Typed),
                 expected,
                 "{why}: cwd={cwd:?} origin={origin:?} wired={wired}"
             );
         }
     }
 
-    /// A turn another conversation handed over never gets the CLI's tools, however rooted the
-    /// conversation receiving it happens to be.
+    /// A turn another conversation handed over keeps the CLI's tools only as the first clean hop
+    /// out of a typed turn — the owner's answer to the relay design's §13 (2026-10-11).
     ///
-    /// **This was decided by accident before it was decided on purpose, and in the permissive
-    /// direction.** A relay is DELIVERED with `Origin::Shell` — correctly, because it arrives
-    /// through this daemon and not from Telegram, and because the destination routes its brain on
-    /// that value — and the same value was the one this function read to hand out a filesystem. So
-    /// a relay into a rooted conversation with a wired hook collected the whole tool surface, and
-    /// nobody chose that.
+    /// It used to be refused outright, and the history is worth keeping: a relay is DELIVERED with
+    /// the sender's origin, so before any rule existed a relay into a rooted conversation with a
+    /// wired hook collected the whole tool surface, and nobody had chosen that. The owner has now
+    /// chosen delegation — a conversation in repository X working there for another — behind three
+    /// brakes. Two of them live in `Handover`, asserted here; the third, the spend ceiling of a
+    /// chain, refuses the relay itself and is `relay::chain_has_room`'s test.
     ///
-    /// What makes it wrong is not that the tools are dangerous in themselves; it is who asked. A
-    /// person typing into a rooted conversation is pointing this machine at that repository, right
-    /// then. A relayed turn was composed by another conversation, for an owner who never saw the
-    /// words, in a repository they did not point anything at — and `MAX_RELAY_DEPTH` allows that
-    /// three times over from one thing somebody typed.
-    ///
-    /// Delegation is not lost, it is elsewhere: a team node has its own box (`TEAM_TOOLS`), chosen
-    /// deliberately and reviewed on its own terms. Granting it here as well would be a second,
-    /// weaker path to the same power, beside the one that already exists.
-    ///
-    /// Every row of the table above, re-run with the fourth condition true: the point is that NO
-    /// combination of the other three rescues it.
+    /// `Withheld` — deeper than one hop, or from a sender that read untrusted text — is refused on
+    /// every row: NO combination of the other three conditions rescues it.
     #[test]
-    fn a_relayed_turn_never_gets_the_tools_however_rooted_the_conversation_is() {
+    fn only_the_first_clean_hop_of_a_relay_keeps_the_tools() {
         for cwd in [None, Some("C:/repo")] {
             for origin in [Origin::Shell, Origin::Telegram] {
                 for wired in [true, false] {
                     assert_eq!(
-                        tool_policy_for(cwd, origin, wired, true),
+                        tool_policy_for(cwd, origin, wired, crate::relay::Handover::Withheld),
                         crate::execution::runner::ToolPolicy::McpOnly,
-                        "relayed: cwd={cwd:?} origin={origin:?} wired={wired}"
+                        "withheld: cwd={cwd:?} origin={origin:?} wired={wired}"
+                    );
+                    assert_eq!(
+                        tool_policy_for(cwd, origin, wired, crate::relay::Handover::FirstHop),
+                        tool_policy_for(cwd, origin, wired, crate::relay::Handover::Typed),
+                        "a first hop diverged from a typed turn: cwd={cwd:?} origin={origin:?} wired={wired}"
                     );
                 }
             }
         }
 
-        // The one row that would otherwise have been `Unrestricted`, stated on its own so the
-        // difference this test exists for is legible without reading the loop above.
+        // The one row where the difference shows, stated on its own so it is legible without the
+        // loop above.
         assert_eq!(
-            tool_policy_for(Some("C:/repo"), Origin::Shell, true, false),
+            tool_policy_for(
+                Some("C:/repo"),
+                Origin::Shell,
+                true,
+                crate::relay::Handover::FirstHop
+            ),
             crate::execution::runner::ToolPolicy::Unrestricted
         );
         assert_eq!(
-            tool_policy_for(Some("C:/repo"), Origin::Shell, true, true),
+            tool_policy_for(
+                Some("C:/repo"),
+                Origin::Shell,
+                true,
+                crate::relay::Handover::Withheld
+            ),
             crate::execution::runner::ToolPolicy::McpOnly
         );
     }
@@ -3097,7 +3102,7 @@ mod tests {
         for origin in [Origin::Shell, Origin::Telegram, Origin::Voice] {
             for wired in [true, false] {
                 assert_eq!(
-                    tool_policy_for(None, origin, wired, false),
+                    tool_policy_for(None, origin, wired, crate::relay::Handover::Typed),
                     crate::execution::runner::ToolPolicy::McpOnly
                 );
             }
@@ -3119,14 +3124,29 @@ mod tests {
     fn a_spoken_turn_is_trusted_exactly_as_much_as_a_typed_one() {
         for wired in [true, false] {
             assert_eq!(
-                tool_policy_for(Some("C:/Projects/nucleos"), Origin::Voice, wired, false),
-                tool_policy_for(Some("C:/Projects/nucleos"), Origin::Shell, wired, false),
+                tool_policy_for(
+                    Some("C:/Projects/nucleos"),
+                    Origin::Voice,
+                    wired,
+                    crate::relay::Handover::Typed
+                ),
+                tool_policy_for(
+                    Some("C:/Projects/nucleos"),
+                    Origin::Shell,
+                    wired,
+                    crate::relay::Handover::Typed
+                ),
                 "a spoken turn diverged from a typed one at wired={wired}"
             );
         }
         // And the direction is the permissive one, so this cannot pass by both being McpOnly.
         assert_eq!(
-            tool_policy_for(Some("C:/Projects/nucleos"), Origin::Voice, true, false),
+            tool_policy_for(
+                Some("C:/Projects/nucleos"),
+                Origin::Voice,
+                true,
+                crate::relay::Handover::Typed
+            ),
             crate::execution::runner::ToolPolicy::Unrestricted
         );
     }
@@ -3139,7 +3159,12 @@ mod tests {
     #[test]
     fn a_message_over_the_network_is_still_kept_off_the_machine() {
         assert_eq!(
-            tool_policy_for(Some("C:/Projects/nucleos"), Origin::Telegram, true, false),
+            tool_policy_for(
+                Some("C:/Projects/nucleos"),
+                Origin::Telegram,
+                true,
+                crate::relay::Handover::Typed
+            ),
             crate::execution::runner::ToolPolicy::McpOnly
         );
     }
@@ -3215,7 +3240,7 @@ mod tests {
                 Some(dir),
                 Origin::Shell,
                 crate::governance::autopilot::classifier_hook_is_wired(root.path()),
-                false
+                crate::relay::Handover::Typed
             ),
             crate::execution::runner::ToolPolicy::McpOnly,
         );
@@ -3227,7 +3252,7 @@ mod tests {
                 Some(dir),
                 Origin::Shell,
                 crate::governance::autopilot::classifier_hook_is_wired(root.path()),
-                false
+                crate::relay::Handover::Typed
             ),
             crate::execution::runner::ToolPolicy::Unrestricted,
         );

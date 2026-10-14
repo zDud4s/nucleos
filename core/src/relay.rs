@@ -114,6 +114,16 @@ pub fn admits(chain: &[&str], to: &str) -> Verdict {
 /// `sending_run_id` pointer partway through — surfaces the same way, through `fetch_one`'s own
 /// `RowNotFound`, rather than a second bespoke error for the same fact.
 pub async fn chain_of(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<Vec<String>> {
+    Ok(links_of(pool, run_id)
+        .await?
+        .into_iter()
+        .map(|(_, chat_id)| chat_id)
+        .collect())
+}
+
+/// `chain_of` with each conversation's run beside it, root first — the walk itself. The root's run
+/// is the turn a person wrote, which is what a chain's spend is counted from.
+async fn links_of(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<Vec<(i64, String)>> {
     // The honest ceiling, not an arbitrary one: `MAX_RELAY_DEPTH + 1` conversations is the longest
     // chain `admits` could ever have let get written, so needing one more hop than that means the
     // data is wrong, not merely large — see the doc comment above.
@@ -136,7 +146,7 @@ pub async fn chain_of(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<Vec<
                 .bind(current_run_id)
                 .fetch_one(pool)
                 .await?;
-        chain.push(chat_id);
+        chain.push((current_run_id, chat_id));
 
         let Some(relay_id) = from_relay_id else {
             break;
@@ -156,7 +166,7 @@ pub async fn chain_of(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<Vec<
 /// One variant per cause, each carrying whatever it takes to name itself — the same rule
 /// `team_trigger::closes_a_cycle` already follows for its own cycle. A refusal that only says "no"
 /// sends its reader back through the whole gate by hand to work out which brake actually caught it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Refusal {
     /// `to_chat_id` names no live conversation — never created, or archived. The two are not told
     /// apart on purpose: `chats::brain_of`, and everything else that reads `chats`, already treats
@@ -172,6 +182,10 @@ pub enum Refusal {
     /// named, and repeating that shape here would be a second definition of the same fact, free to
     /// drift out of step with `admits`.
     Chain(Verdict),
+    /// The chain this hop would extend has already spent its ceiling
+    /// (`autopilot_global.relay_chain_limit_usd`, 0194). Both figures are carried so whoever reads
+    /// the refusal can tell a chain that ran away from a ceiling set too low.
+    ChainOverBudget { spent_usd: f64, limit_usd: f64 },
     /// `attention::owner_is_present` answered false for `now`.
     OwnerAway,
     /// A read or write this gate depends on failed outright — sqlx itself broke, not a verdict
@@ -202,17 +216,17 @@ pub enum Refusal {
 /// The gate: whether a message may travel from `from_chat_id`, sent by the turn `sending_run_id`,
 /// on into `to_chat_id` — and, if so, the id of the `chat_relays` row recording that it did.
 ///
-/// Four brakes, checked in the order below, each cheaper or more specific than the next: existence,
-/// then origin, then the chain, then attention. Only the first one that refuses is ever reported —
+/// Five brakes, checked in the order below, each cheaper or more specific than the next: existence,
+/// then origin, then the chain, then the chain's spend, then attention. Only the first one that refuses is ever reported —
 /// a caller is never told about a second reason a relay already impossible for a first, cheaper
 /// reason would also have failed.
 ///
-/// **No budget brake here, on purpose.** A relay that clears every check below can still be one the
-/// owner would not have paid for, and that ceiling belongs with the rest of spend accounting in
-/// `budget.rs` — see that module's own change. Bolting a budget check onto a module that otherwise
-/// never touches money would give `relay.rs` a second, narrower opinion about spend that
-/// `budget.rs` cannot see or reconcile with its own; leaving it out here is deliberate, not
-/// forgotten.
+/// **The house budget is not checked here; the chain's own ceiling is.** Every relay-born run
+/// already counts against the house ceiling in `budget.rs`, and a second opinion about that figure
+/// here would be free to disagree with it. The chain ceiling is a different fact — what ONE chain
+/// started from one typed turn may spend — and it exists because a relayed turn can hold a shell
+/// (decision of 2026-10-11). The arithmetic is still `budget.rs`'s (`relay_chain_spend`); only the
+/// question is asked here.
 ///
 /// **`depth`, on the row this writes, is `chain.len()` — the chain as it stood before this hop, not
 /// after.** 0122's worked example is the check: the first relay out of a person's turn (a chain of
@@ -279,17 +293,21 @@ pub async fn admit(
     // at all. The design states the rule for exactly this as a table: cannot read the chain →
     // Closed. `Unreadable` is that refusal — not a panic that takes the request handler down with
     // it, and not `Ok`, which would let a chain nobody could verify pass as one proven safe.
-    let chain = chain_of(pool, sending_run_id)
+    let links = links_of(pool, sending_run_id)
         .await
         .map_err(|error| Refusal::Unreadable {
             step: "chain walk",
             error: error.to_string(),
         })?;
-    let chain_refs: Vec<&str> = chain.iter().map(String::as_str).collect();
+    let chain_refs: Vec<&str> = links.iter().map(|(_, chat_id)| chat_id.as_str()).collect();
     let verdict = admits(&chain_refs, to_chat_id);
     if verdict != Verdict::Ok {
         return Err(Refusal::Chain(verdict));
     }
+
+    // After the chain, because it needs the chain's root — the first link, the turn a person wrote.
+    // `links_of` never returns an empty walk for a run that exists, so the root is always there.
+    chain_has_room(pool, links[0].0, now).await?;
 
     // `owner_is_present`, deliberately, and not `attention_permits_new_run`. The latter defers
     // whenever ANY project-less run is in flight — and the turn sending this very relay IS one — so
@@ -309,7 +327,7 @@ pub async fn admit(
     // row, so an admitted relay that was never written is precisely the dangling pointer
     // `chain_of` cannot see or walk through on some later hop. See `Refusal::Unreadable`'s own doc
     // comment for the same distinction spelled out in full.
-    let depth = chain.len() as i64;
+    let depth = links.len() as i64;
     let relay_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
          VALUES (?, ?, ?, ?, ?, ?)
@@ -358,6 +376,105 @@ pub async fn mark_delivered(
         .execute(pool)
         .await
         .map(|_| ())
+}
+
+/// Whether the chain started by the typed turn `root_run_id` may spend on one more hop.
+///
+/// Asked twice for every relay: by `admit` as the hop is written, and again by the queue's drain
+/// right before a relay that had to wait is spent — the same reason the drain re-asks presence. A
+/// read that fails refuses: the ceiling is a brake, and a brake that cannot be read is engaged.
+/// Spend at or over the ceiling refuses; a turn already running is never stopped by it, which is
+/// the rule of every other spend brake in this codebase.
+pub async fn chain_has_room(
+    pool: &sqlx::SqlitePool,
+    root_run_id: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Refusal> {
+    let unreadable = |error: sqlx::Error| Refusal::Unreadable {
+        step: "chain spend",
+        error: error.to_string(),
+    };
+    let limit_usd = crate::governance::budget::load_relay_chain_limit(pool)
+        .await
+        .map_err(unreadable)?;
+    let spent_usd = crate::governance::budget::relay_chain_spend(pool, root_run_id, now)
+        .await
+        .map_err(unreadable)?;
+    if spent_usd >= limit_usd {
+        return Err(Refusal::ChainOverBudget {
+            spent_usd,
+            limit_usd,
+        });
+    }
+    Ok(())
+}
+
+/// The root of the chain `relay_id` travelled on: the typed turn every hop descends from.
+pub async fn root_of_relay(pool: &sqlx::SqlitePool, relay_id: i64) -> sqlx::Result<i64> {
+    let sending_run_id: i64 =
+        sqlx::query_scalar("SELECT sending_run_id FROM chat_relays WHERE id = ?")
+            .bind(relay_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(links_of(pool, sending_run_id).await?[0].0)
+}
+
+/// How a turn came to be, as far as the tools it may hold are concerned — the fourth input of
+/// `assistant::tool_policy_for`.
+///
+/// Three values and not "relayed or not", because the owner's answer to the design's §13 (decision
+/// of 2026-10-11) gives a relayed turn the shell only behind two brakes this type carries: it is
+/// the FIRST hop out of a turn a person wrote, and the conversation that sent it read nothing
+/// untrusted. The third brake, the chain's spend, is `chain_has_room` and refuses the relay itself
+/// rather than shrinking its tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handover {
+    /// No relay: a person wrote this turn, or Telegram carried it in.
+    Typed,
+    /// One hop out of a typed turn, from a conversation that read no third-party text.
+    FirstHop,
+    /// Every other relayed turn — deeper than one hop, sent by a conversation that read untrusted
+    /// text, or one whose relay could not be read. It keeps `McpOnly`.
+    Withheld,
+}
+
+/// The `Handover` of a turn about to start, carrying `relay_id` (or none).
+///
+/// **One hop.** The sending run has no `from_relay_id` of its own exactly when a person wrote it,
+/// so the relay is the first of its chain. A deeper turn could pass on words that a relayed turn
+/// with a shell composed, which is the loop the brake exists to cut.
+///
+/// **Nothing untrusted behind the words.** The sender is tainted when its own run, or any run of the
+/// same session, read third-party text: a live process carries what earlier turns of its session
+/// read, and a session that read it is never resumed (`assistant::get_session`), so the session is
+/// the whole reach of the taint. The sending run's own flag is read as it stands NOW, which can
+/// include text read after the message was sent — over-refusing, the safe direction.
+///
+/// Fails closed: a relay, or a sending run, that cannot be read is `Withheld`.
+pub async fn handover_of(pool: &sqlx::SqlitePool, relay_id: Option<i64>) -> Handover {
+    let Some(relay_id) = relay_id else {
+        return Handover::Typed;
+    };
+    let row: sqlx::Result<Option<(Option<i64>, i64)>> = sqlx::query_as(
+        "SELECT s.from_relay_id,
+                (SELECT COALESCE(MAX(r.read_untrusted), 1) FROM runs r
+                  WHERE r.id = s.id
+                     OR (s.session_id IS NOT NULL AND r.session_id = s.session_id))
+           FROM chat_relays c
+           JOIN runs s ON s.id = c.sending_run_id
+          WHERE c.id = ?",
+    )
+    .bind(relay_id)
+    .fetch_optional(pool)
+    .await;
+    match row {
+        Ok(Some((None, 0))) => Handover::FirstHop,
+        Ok(_) => Handover::Withheld,
+        Err(error) => {
+            tracing::warn!(%error, relay_id, "a relayed turn's chain could not be read; it keeps McpOnly");
+            Handover::Withheld
+        }
+    }
 }
 
 #[cfg(test)]
@@ -795,5 +912,157 @@ mod tests {
         // `admit` decides and records the hop, and `relay::mark_delivered` stamps this from the
         // other side once a run exists to name. Pinned so the two never collapse into one write.
         assert_eq!(delivered, None);
+    }
+
+    /// The relay the run at `run_id` was delivered on — the id a turn carries into `handover_of`.
+    async fn relay_of(pool: &sqlx::SqlitePool, run_id: i64) -> i64 {
+        sqlx::query_scalar("SELECT from_relay_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn set_cost(pool: &sqlx::SqlitePool, run_id: i64, cost_usd: f64) {
+        sqlx::query("UPDATE runs SET cost_usd = ? WHERE id = ?")
+            .bind(cost_usd)
+            .bind(run_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// The first two brakes of the decision of 2026-10-11, one row each: a typed turn, the first
+    /// hop out of it, a second hop, a first hop whose sender read untrusted text, one whose sender's
+    /// SESSION did in an earlier turn, and a relay that names no row.
+    #[tokio::test]
+    async fn only_a_first_hop_from_a_clean_sender_is_handed_over_with_its_tools() {
+        let pool = test_pool().await;
+        assert_eq!(handover_of(&pool, None).await, Handover::Typed);
+
+        let first = seed_chain(&pool, &["A", "B"]).await;
+        assert_eq!(
+            handover_of(&pool, Some(relay_of(&pool, first).await)).await,
+            Handover::FirstHop
+        );
+
+        let second = seed_chain(&pool, &["C", "D", "E"]).await;
+        assert_eq!(
+            handover_of(&pool, Some(relay_of(&pool, second).await)).await,
+            Handover::Withheld,
+            "a turn a relayed turn composed is past the first hop"
+        );
+
+        let tainted = seed_chain(&pool, &["F", "G"]).await;
+        let relay = relay_of(&pool, tainted).await;
+        sqlx::query(
+            "UPDATE runs SET read_untrusted = 1
+              WHERE id = (SELECT sending_run_id FROM chat_relays WHERE id = ?)",
+        )
+        .bind(relay)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(handover_of(&pool, Some(relay)).await, Handover::Withheld);
+
+        // The sender's own row is clean; an earlier turn of the same session read a mail body.
+        let session = seed_chain(&pool, &["H", "I"]).await;
+        let relay = relay_of(&pool, session).await;
+        sqlx::query(
+            "UPDATE runs SET session_id = 'shared'
+              WHERE id = (SELECT sending_run_id FROM chat_relays WHERE id = ?)",
+        )
+        .bind(relay)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at, chat_id, session_id, read_untrusted)
+             VALUES ('read the mail', 'completed', '2026-08-22T00:00:00Z', 'H', 'shared', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(handover_of(&pool, Some(relay)).await, Handover::Withheld);
+
+        assert_eq!(handover_of(&pool, Some(9_999)).await, Handover::Withheld);
+    }
+
+    /// The third brake: a chain that has spent its ceiling is refused another hop, and both figures
+    /// travel with the refusal. Raising the ceiling lets the same hop through.
+    #[tokio::test]
+    async fn a_chain_that_has_spent_its_ceiling_is_refused_another_hop() {
+        let pool = test_pool().await;
+        let now = timestamp("2026-08-22T00:00:00Z");
+        for chat in ["A", "B", "C"] {
+            seed_chat(&pool, chat, false).await;
+        }
+        seed_owner_present(&pool, now).await;
+        let sending = seed_chain(&pool, &["A", "B"]).await;
+        set_cost(&pool, sending, 5.0).await;
+
+        assert_eq!(
+            admit(&pool, "B", "C", sending, Origin::Shell, "onward", now).await,
+            Err(Refusal::ChainOverBudget {
+                spent_usd: 5.0,
+                limit_usd: 5.0
+            })
+        );
+
+        crate::governance::budget::set_relay_chain_limit(&pool, 10.0)
+            .await
+            .unwrap();
+        assert!(
+            admit(&pool, "B", "C", sending, Origin::Shell, "onward", now)
+                .await
+                .is_ok()
+        );
+    }
+
+    /// What a chain spent is counted from its root DOWN, so a fan-out counts every branch — a walk
+    /// up from the sending run would see only its own line. The typed root itself is not counted.
+    #[tokio::test]
+    async fn a_chain_counts_every_branch_and_not_the_turn_a_person_typed() {
+        let pool = test_pool().await;
+        let now = timestamp("2026-08-22T00:00:00Z");
+        let to_b = seed_chain(&pool, &["A", "B"]).await;
+        let root: i64 = sqlx::query_scalar(
+            "SELECT sending_run_id FROM chat_relays WHERE id = (SELECT from_relay_id FROM runs WHERE id = ?)",
+        )
+        .bind(to_b)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let relay_c = sqlx::query(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES ('A', 'C', ?, 'onward', 1, '2026-08-22T00:00:00Z')",
+        )
+        .bind(root)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let to_c = sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at, chat_id, from_relay_id)
+             VALUES ('hello', 'completed', '2026-08-22T00:00:00Z', 'C', ?)",
+        )
+        .bind(relay_c)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        set_cost(&pool, root, 100.0).await;
+        set_cost(&pool, to_b, 3.0).await;
+        set_cost(&pool, to_c, 3.0).await;
+
+        let spent = crate::governance::budget::relay_chain_spend(&pool, root, now)
+            .await
+            .unwrap();
+        assert_eq!(spent, 6.0);
+        assert_eq!(root_of_relay(&pool, relay_c).await.unwrap(), root);
+        assert!(matches!(
+            chain_has_room(&pool, root, now).await,
+            Err(Refusal::ChainOverBudget { .. })
+        ));
     }
 }

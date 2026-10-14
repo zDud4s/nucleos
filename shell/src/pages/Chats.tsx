@@ -5212,6 +5212,8 @@ const MESSAGE_SENTENCES: Record<string, string> = {
   relay_cycle:
     "that conversation already handed this one a message — passing it back would go in circles",
   relay_too_deep: "this has already been handed on as far as it goes",
+  relay_chain_over_budget:
+    "this chain of handovers has spent its ceiling — raise it in the budget settings to go on",
   owner_away:
     "nothing is handed over while nobody is at the machine to see it arrive",
   telegram_origin:

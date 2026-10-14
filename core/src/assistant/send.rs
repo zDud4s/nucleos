@@ -259,10 +259,10 @@ pub(super) async fn drain_queued(state: &crate::state::AppState, chat_id: &str) 
             // it was admitted on ANOTHER conversation's say-so, for an owner who never typed it —
             // which is exactly the case the brake exists to catch.
             //
-            // Budget is deliberately left uncounted here, matching `relay::admit`'s own choice not
-            // to touch it (see that function's doc comment): `budget.rs` already counts every
-            // relay-born run on its own terms, and a second, narrower opinion about spend bolted
-            // onto this drain would be a gate free to disagree with the one that already exists.
+            // The house budget is deliberately left uncounted here, matching `relay::admit`'s own
+            // choice not to touch it (see that function's doc comment): `budget.rs` already counts
+            // every relay-born run on its own terms. The chain's OWN ceiling is asked again, below,
+            // for the reason presence is: turns of the same chain can have spent while this waited.
             //
             // A brake that catches something here drops the message rather than retrying it:
             // `take_queued` has already deleted its row, so there is nothing left to retry — the
@@ -274,6 +274,22 @@ pub(super) async fn drain_queued(state: &crate::state::AppState, chat_id: &str) 
                     chat_id,
                     relay_id,
                     "a relayed message that had been waiting was dropped: the owner is no longer present"
+                );
+                return;
+            }
+            let room = match crate::relay::root_of_relay(&state.pool, relay_id).await {
+                Ok(root) => crate::relay::chain_has_room(&state.pool, root, now).await,
+                Err(error) => Err(crate::relay::Refusal::Unreadable {
+                    step: "chain walk",
+                    error: error.to_string(),
+                }),
+            };
+            if let Err(refusal) = room {
+                tracing::warn!(
+                    chat_id,
+                    relay_id,
+                    ?refusal,
+                    "a relayed message that had been waiting was dropped: its chain has no room left"
                 );
                 return;
             }
@@ -618,10 +634,11 @@ pub(super) async fn send_message_inner(
         cwd.as_deref().is_some_and(|dir| {
             crate::governance::autopilot::classifier_hook_is_wired(std::path::Path::new(dir))
         }),
-        // Whether another conversation handed this turn over. `relay_id` is the fact, already in
-        // hand, and no walk is needed to read it — which is what makes this brake one line rather
-        // than the chain-depth rule the design weighed and did not take.
-        relay_id.is_some(),
+        // Whether another conversation handed this turn over, and if so whether it may keep the
+        // tools: the first hop out of a typed turn, from a sender that read nothing untrusted
+        // (decision of 2026-10-11). Read here, as the turn starts, so a relay that waited in the
+        // queue is judged by what its sender has read by now.
+        crate::relay::handover_of(&state.pool, relay_id).await,
     );
     // The configured Telegram doctrine, resolved HERE and not inside the spawned task below,
     // because `origin` is what decides it and `origin` does not survive to that task: the task

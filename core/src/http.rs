@@ -20947,7 +20947,8 @@ mod tests {
                 "window_spend_usd": 0.0,
                 "hourly_spend_usd": 0.0,
                 "paused": false,
-                "reason": null
+                "reason": null,
+                "relay_chain_limit_usd": 5.0
             })
         );
     }

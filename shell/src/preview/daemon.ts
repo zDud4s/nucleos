@@ -3518,6 +3518,7 @@ export function answer(path: string, init?: RequestInit): unknown {
       hourly_spend_usd: 0.42,
       paused: false,
       reason: null,
+      relay_chain_limit_usd: 5,
     } satisfies BudgetView;
   }
   if (path === "/autopilot/quota-brake") {

@@ -343,6 +343,7 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
       hourly_spend_usd: 0.1,
       paused: false,
       reason: null,
+      relay_chain_limit_usd: 5,
     },
     projects: [],
     proposals: [],

@@ -429,13 +429,13 @@ pub(super) async fn list_ide_sessions(
                 let wired = crate::governance::autopilot::classifier_hook_is_wired(
                     std::path::Path::new(&session.cwd),
                 );
-                // `false` for the reason the route above gives: an offered session is something
+                // `Typed` for the reason the route above gives: an offered session is something
                 // the person would type into themselves.
                 let policy = crate::assistant::tool_policy_for(
                     Some(session.cwd.as_str()),
                     crate::assistant::Origin::Shell,
                     wired,
-                    false,
+                    crate::relay::Handover::Typed,
                 );
                 OfferedSession {
                     session,

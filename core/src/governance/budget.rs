@@ -267,6 +267,61 @@ async fn job_rows(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Vec<SpendRow>>
     spend_rows(raw)
 }
 
+/// The relay-born runs downstream of `root_run_id`, the turn a person wrote that a relay chain
+/// started from.
+///
+/// Walked downward through `chat_relays.sending_run_id` → `runs.from_relay_id`, so a fan-out — one
+/// turn relaying to two conversations — counts both branches, which a walk up from the sending run
+/// would not. `UNION`, not `UNION ALL`: a row cycle left by a hand-edit ends the recursion instead
+/// of looping. The root itself is left out: it is the turn a person typed and was there for, the
+/// same reason `autonomous_rows` leaves it out of the house ceiling.
+async fn relay_chain_rows(pool: &SqlitePool, root_run_id: i64) -> sqlx::Result<Vec<SpendRow>> {
+    let raw: Vec<RawRow> = sqlx::query_as(
+        "WITH RECURSIVE chain(id) AS (
+             SELECT ?
+             UNION
+             SELECT r.id FROM runs r
+               JOIN chat_relays c ON r.from_relay_id = c.id
+               JOIN chain ON c.sending_run_id = chain.id
+         )
+         SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
+                created_at, completed_at
+         FROM runs
+         WHERE id IN chain AND from_relay_id IS NOT NULL",
+    )
+    .bind(root_run_id)
+    .fetch_all(pool)
+    .await?;
+    spend_rows(raw)
+}
+
+/// What the relay chain started by `root_run_id` has spent, with the arithmetic of the house
+/// ceiling: a known cost as reported, an unknown one (a turn still running) from elapsed time.
+pub async fn relay_chain_spend(
+    pool: &SqlitePool,
+    root_run_id: i64,
+    now: DateTime<Utc>,
+) -> sqlx::Result<f64> {
+    let cfg = load_budget_config(pool).await?;
+    let rows = relay_chain_rows(pool, root_run_id).await?;
+    Ok(compute_spend(&rows, now, &cfg))
+}
+
+/// The ceiling one relay chain may spend before it is refused another hop (0194).
+pub async fn load_relay_chain_limit(pool: &SqlitePool) -> sqlx::Result<f64> {
+    sqlx::query_scalar("SELECT relay_chain_limit_usd FROM autopilot_global LIMIT 1")
+        .fetch_one(pool)
+        .await
+}
+
+pub async fn set_relay_chain_limit(pool: &SqlitePool, limit_usd: f64) -> sqlx::Result<()> {
+    sqlx::query("UPDATE autopilot_global SET relay_chain_limit_usd = ?")
+        .bind(limit_usd)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
 /// What one project's runs cost over a window, for the workspace's cost reading.
 ///
 /// The third sibling of the two above, and here rather than in `project/readings.rs` for the reason
