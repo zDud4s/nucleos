@@ -94,4 +94,31 @@ describe("AtlasLayers", () => {
       ),
     );
   });
+
+  it("a block in a lower band opens its own files when the folder repeats across layers", () => {
+    const data = {
+      modules: [mod("core/src/same/hi.rs"), mod("core/src/same/lo.rs")],
+      imports: [{ from: "core/src/same/hi.rs", to: "core/src/same/lo.rs" }],
+      unread: [],
+      foreign: [],
+      layers: {
+        modules: { "core/src/same/hi.rs": 1, "core/src/same/lo.rs": 0 },
+        overridden: [],
+        violations: [],
+      },
+    } as unknown as ProjectMap;
+    render(
+      <QueryClientProvider client={createAppQueryClient()}>
+        <AtlasLayers projectId="p1" data={data} />
+      </QueryClientProvider>,
+    );
+    const blocks = screen.getAllByRole("button", { name: /same/ });
+    expect(blocks).toHaveLength(2);
+    fireEvent.click(blocks[1]);
+    expect(screen.getByLabelText("Layer of core/src/same/lo.rs")).toBeTruthy();
+    expect(screen.queryByLabelText("Layer of core/src/same/hi.rs")).toBeNull();
+    const after = screen.getAllByRole("button", { name: /same/ });
+    expect(after[0].getAttribute("aria-pressed")).toBe("false");
+    expect(after[1].getAttribute("aria-pressed")).toBe("true");
+  });
 });

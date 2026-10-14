@@ -1761,9 +1761,13 @@ pub(super) async fn project_layers(
             &structure.imports,
             &std::collections::BTreeMap::new(),
         );
-        crate::map::store::freeze_layers(&state.pool, id, &derived, &structure.imports)
-            .await
-            .map_err(fail)?;
+        // A concurrent first read can win the freeze and make this one fail (SQLITE_BUSY); that
+        // is not an error, the baseline is read back below either way.
+        if let Err(error) =
+            crate::map::store::freeze_layers(&state.pool, id, &derived, &structure.imports).await
+        {
+            tracing::warn!(%error, project_id = %id, "freezing the project's layers failed; re-reading the baseline");
+        }
         // Read it back: a concurrent first read may have frozen before this one did.
         baseline = crate::map::store::layer_baseline(&state.pool, id)
             .await

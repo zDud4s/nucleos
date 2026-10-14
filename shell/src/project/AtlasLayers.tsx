@@ -28,7 +28,7 @@ function Stack({
   layering: Layering;
 }) {
   const [isolated, setIsolated] = useState<number | null>(null);
-  const [chosen, setChosen] = useState<string | null>(null);
+  const [chosen, setChosen] = useState<{ layer: number; key: string } | null>(null);
   const bands = useMemo(() => buildBands(data.modules, layering), [data.modules, layering]);
 
   useEffect(() => {
@@ -46,7 +46,9 @@ function Stack({
   const block =
     chosen === null
       ? undefined
-      : shown.flatMap((band) => band.blocks).find((b) => b.key === chosen);
+      : shown
+          .flatMap((band) => band.blocks)
+          .find((b) => b.layer === chosen.layer && b.key === chosen.key);
 
   return (
     <div className="ws-layers">
@@ -71,8 +73,14 @@ function Stack({
                 key={b.key}
                 type="button"
                 className="ws-layer-block"
-                aria-pressed={chosen === b.key}
-                onClick={() => setChosen(chosen === b.key ? null : b.key)}
+                aria-pressed={chosen?.layer === b.layer && chosen.key === b.key}
+                onClick={() =>
+                  setChosen(
+                    chosen?.layer === b.layer && chosen.key === b.key
+                      ? null
+                      : { layer: b.layer, key: b.key },
+                  )
+                }
               >
                 <span>{b.label}</span>
                 <span>{b.files.length}</span>
