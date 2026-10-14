@@ -513,7 +513,7 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
             type="text"
             aria-label="Address to open"
             aria-describedby={hintId}
-            placeholder="Address to open — optional, leave empty for a blank window"
+            placeholder="Address to open — required with the agent, optional for a plain window"
             autoComplete="off"
             spellCheck={false}
             value={url}
