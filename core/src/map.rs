@@ -23,6 +23,7 @@
 //! the 77 Go files that name a section.
 
 pub mod anchor;
+pub mod flows;
 pub mod intent;
 pub mod items;
 pub mod join;

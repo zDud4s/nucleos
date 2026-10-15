@@ -1,0 +1,20 @@
+# Key flows of this repository, declared and verified by the core (spec 2026-10-10 §2c).
+# Each step names a function; the core checks it is defined in `path` and that its caller calls it.
+# via: absent = a direct call; "POST /path" = an HTTP hop (the caller names the path);
+#      "async ..." = a queue hop (existence only). from: index of the calling step when it is
+#      not the previous one. Rename a function and core test this_repositorys_declared_flows_verify fails.
+# The core checks this file on every read of the project map.
+flows:
+  - name: land
+    steps:
+      - { participant: cli, path: core/src/cli.rs, fn: land }
+      - { participant: http, path: core/src/http/run_queue.rs, fn: land_worktree, via: "POST /vcs/land" }
+      - { participant: land, path: core/src/execution/land.rs, fn: submit }
+      - { participant: vcs queue, path: core/src/execution/vcs/queue.rs, fn: submit }
+      - { participant: vcs queue, path: core/src/execution/vcs/queue.rs, fn: submit_on }
+      - { participant: vcs queue, path: core/src/execution/vcs/queue.rs, fn: admit }
+      - { participant: drain, path: core/src/execution/vcs/drain.rs, fn: drain_once, via: "async (queued row)" }
+      - { participant: vcs queue, path: core/src/execution/vcs/queue.rs, fn: claim_next }
+      - { participant: git_exec, path: core/src/execution/git_exec/executor.rs, fn: execute, from: 6 }
+      - { participant: git_exec, path: core/src/execution/git_exec/compute.rs, fn: compute_merge }
+      - { participant: git_exec, path: core/src/execution/git_exec/publish.rs, fn: publish, from: 8 }
