@@ -209,5 +209,14 @@ class Probe(unittest.TestCase):
         self.assertIn("busy_cores", real)
 
 
+    def test_the_first_shadow_tick_already_counts_cpu_used_elsewhere(self):
+        # busy_cores needs two samples; a fresh process has none before its first tick, so
+        # the first admission check counted no outside CPU at all.
+        c = load_cost()
+        s = c.Shadow({"cls": "x", "weight": 1}, ROOT / "no-such-state-dir")
+        s.tick()
+        self.assertIsNotNone(s.p)
+        self.assertIsNotNone(s.p["busy_cores"])
+
 if __name__ == "__main__":
     unittest.main()

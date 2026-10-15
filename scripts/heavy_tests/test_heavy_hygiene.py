@@ -233,6 +233,32 @@ class HygieneTests(unittest.TestCase):
         self.assertFalse(prog.exists())
         self.assertTrue((self.state / "sweep.stamp").exists())
 
+    # 9b
+    def test_gc_reports_a_busy_mutex_without_a_traceback(self) -> None:
+        import contextlib
+        import io
+        from unittest import mock
+
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        mutex = self.state / ".mutex"
+        mutex.mkdir()
+        (mutex / "owner").write_text(json.dumps(
+            {"pid": holder.pid, "ctime": self.heavy.proc_identity(holder.pid)[1]}))
+        heavy = self.heavy
+        orig = heavy.sweep
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_DIR": str(self.state)}), \
+                mock.patch.object(heavy, "sweep", lambda d: orig(d, 0.3)), \
+                contextlib.redirect_stderr(err):
+            code = heavy.cmd_gc()
+        self.assertEqual(code, heavy.EXIT_QUEUE_TIMEOUT)
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertIn("busy", err.getvalue())
+        self.assertIn(str(holder.pid), err.getvalue())
+        self.assertTrue(mutex.exists(), "a live holder's mutex must be left alone")
+
     # 10
     def test_a_broker_run_sweeps_once_per_stamp_period(self) -> None:
         def plant():

@@ -331,6 +331,8 @@ def admission_mode() -> str:
 
 _K32 = None
 _PREV_TIMES: tuple[float, int, int] | None = None  # (monotonic, idle, total)
+# Wait between a process's first two samples; the probes need >= 0.2 s between them.
+PRIME_S = 0.25
 
 
 def _win_probe(logical: int) -> dict:
@@ -524,6 +526,7 @@ class Shadow:
         self.first_disagreement = None
         self.shadow_fit_at: float | None = None
         self.static_fit_at: float | None = None
+        self.primed = False
         try:
             self.costs = load_costs(Path(directory))
         except Exception:
@@ -532,6 +535,12 @@ class Shadow:
     def tick(self) -> None:
         try:
             self.p = probe()
+            if self.p.get("busy_cores") is None and not self.primed:
+                # busy_cores is a difference of two samples, and a fresh process has only
+                # one: without a second, the first fits() counted no outside CPU at all.
+                self.primed = True
+                time.sleep(PRIME_S)
+                self.p = probe()
         except Exception:
             self.p = None
 
