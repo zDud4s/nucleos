@@ -65,14 +65,19 @@ pub struct ActBody {
 pub async fn post_open(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    chat: Option<axum::Extension<crate::auth::ChatBrowser>>,
     axum::Json(body): axum::Json<OpenBody>,
 ) -> axum::response::Response {
     let now = chrono::Utc::now();
     let ask = Ask {
         project_id: &body.project_id,
-        // The header only (spec §4.0): a `run_id` in the body is a permission the caller would grant
-        // itself, so the body field is deserialised for compatibility and never read.
-        run_id: crate::door::sending_run_id_of(&headers),
+        // The chat turn the auth door admitted, else the header only (spec §4.0): a `run_id` in the
+        // body is a permission the caller would grant itself, so the body field is deserialised for
+        // compatibility and never read.
+        run_id: chat
+            .as_ref()
+            .map(|chat| chat.run_id)
+            .or_else(|| crate::door::sending_run_id_of(&headers)),
         url: &body.url,
         // The assistant, always, in this version. Spec §6.0b: the autonomous path is a seam and not
         // a road, and the seam is `browser_policy`'s refusal rather than a branch here. When a
@@ -82,7 +87,16 @@ pub async fn post_open(
         now: &now.to_rfc3339(),
     };
     match open_with(&state.pool, &state.browser, ask, body.visible).await {
-        Ok(Opened::Session(row)) => {
+        Ok(Opened::Session(mut row)) => {
+            if let Some(chat) = chat.as_ref() {
+                // On failure `owner_of` still falls back to the run's own chat.
+                match crate::browser::set_owner_chat(&state.pool, row.id, &chat.chat_id).await {
+                    Ok(()) => row.owner_chat_id = Some(chat.chat_id.clone()),
+                    Err(error) => {
+                        tracing::warn!(%error, session = row.id, "could not record the chat that owns a browser session");
+                    }
+                }
+            }
             if row.visible {
                 crate::browser::panel::open_on(&state, &row, &body.url).await;
             }

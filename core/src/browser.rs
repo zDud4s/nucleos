@@ -1266,6 +1266,7 @@ mod tests {
         let response = post_open(
             State(state),
             headers,
+            None,
             axum::Json(OpenBody {
                 project_id: "acme".into(),
                 url: "https://news.example.net/".into(),
@@ -1288,6 +1289,58 @@ mod tests {
             .await
             .expect("the row");
         assert_eq!(stored, Some(7));
+        db.close().await;
+    }
+
+    /// Owner decision of 2026-10-15: a chat turn opens a browser under its chat's key. The door
+    /// hands the handler a `ChatBrowser` extension, and that — not the header, not the body — names
+    /// the run, and the session is stamped with the chat that owns it.
+    #[tokio::test]
+    async fn a_chat_turn_open_is_owned_by_its_chat_and_its_run() {
+        let db = TempDb::new().await;
+        crate::attention::record_heartbeat(
+            &db.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("owner present");
+        let (runtime, _seen) = stub_sidecar("https://news.example.net/").await;
+        let state = state_over(db.pool.clone(), runtime);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::daemon_client::RUN_ID_HEADER,
+            axum::http::HeaderValue::from_static("99"),
+        );
+        let response = post_open(
+            State(state),
+            headers,
+            Some(axum::Extension(crate::auth::ChatBrowser {
+                run_id: 7,
+                chat_id: "c-1".into(),
+            })),
+            axum::Json(OpenBody {
+                project_id: "acme".into(),
+                url: "https://news.example.net/".into(),
+                run_id: None,
+                visible: false,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored: Option<i64> = sqlx::query_scalar("SELECT run_id FROM browser_sessions")
+            .fetch_one(&db.pool)
+            .await
+            .expect("the row");
+        assert_eq!(stored, Some(7), "the chat turn's run owns the session");
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner_chat_id FROM browser_sessions")
+                .fetch_one(&db.pool)
+                .await
+                .expect("the row");
+        assert_eq!(owner.as_deref(), Some("c-1"));
         db.close().await;
     }
 

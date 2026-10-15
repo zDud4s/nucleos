@@ -1730,6 +1730,34 @@ mod tests {
         );
     }
 
+    /// A browser route the daemon refuses with a bare status (an EMPTY body) used to surface as a
+    /// JSON decoding error, which says nothing about what happened. It must name the status.
+    #[tokio::test]
+    async fn a_browser_call_refused_with_an_empty_body_names_the_status() {
+        let url = refusing_daemon(axum::http::StatusCode::FORBIDDEN, "").await;
+        let client = DaemonClient::new(url, "test-token".to_string());
+
+        let snapshot = client
+            .browser_snapshot(1, false, 0, 0, "")
+            .await
+            .expect_err("a 403 with an empty body must be an error");
+        assert!(snapshot.contains("403"), "snapshot refusal: {snapshot:?}");
+        assert!(
+            !snapshot.contains("decoding"),
+            "snapshot refusal must not be a decoding error: {snapshot:?}"
+        );
+
+        let act = client
+            .browser_act(1, "click", "e1", None, None)
+            .await
+            .expect_err("a 403 with an empty body must be an error");
+        assert!(act.contains("403"), "act refusal: {act:?}");
+        assert!(
+            !act.contains("decoding"),
+            "act refusal must not be a decoding error: {act:?}"
+        );
+    }
+
     /// A project id reaching the two shadow reads is a QUERY value, not a path segment, and that is
     /// the difference this pins. The four project reads put the id in the path, where a stray `&`
     /// is inert; here a raw one would start a second query parameter and the daemon would read a

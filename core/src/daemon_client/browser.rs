@@ -2,6 +2,21 @@
 
 use super::*;
 
+/// The answer to a browser call. A refusal whose body is JSON (open's 409 `{"refused": ..}`, the
+/// fence's shapes) stays an ordinary answer; one with an empty or non-JSON body is named by its
+/// status instead of surfacing as a decoding error.
+async fn browser_answer(response: reqwest::Response, context: &str) -> Result<Value, String> {
+    let status = response.status();
+    if status.is_success() {
+        return response.json().await.map_err(|e| e.to_string());
+    }
+    let text = response.text().await.map_err(|e| e.to_string())?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(value) => Ok(value),
+        Err(_) => Err(refusal_message(status, &text, context)),
+    }
+}
+
 impl DaemonClient {
     // The browser pillar's five agent verbs (spec §6.1).
     //
@@ -36,14 +51,13 @@ impl DaemonClient {
         url: &str,
         visible: bool,
     ) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/browser/open")
+        let response = self
+            .request(reqwest::Method::POST, "/browser/open")
             .json(&serde_json::json!({ "project_id": project_id, "url": url, "visible": visible }))
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        browser_answer(response, "the browser open").await
     }
 
     /// The accessibility view of a page: what is there and what it is called.
@@ -55,7 +69,8 @@ impl DaemonClient {
         controls_from: i64,
         find: &str,
     ) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/browser/snapshot")
+        let response = self
+            .request(reqwest::Method::POST, "/browser/snapshot")
             .json(&serde_json::json!({
                 "session_id": session_id,
                 "changes_only": changes_only,
@@ -65,10 +80,8 @@ impl DaemonClient {
             }))
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        browser_answer(response, "the browser snapshot").await
     }
 
     /// One action against a ref from the last snapshot.
@@ -84,7 +97,8 @@ impl DaemonClient {
         text: Option<String>,
         filename: Option<String>,
     ) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/browser/act")
+        let response = self
+            .request(reqwest::Method::POST, "/browser/act")
             .json(&serde_json::json!({
                 "session_id": session_id,
                 "kind": kind,
@@ -94,34 +108,30 @@ impl DaemonClient {
             }))
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        browser_answer(response, "the browser action").await
     }
 
     /// The annotated picture. Answers with `image`, `mime` and the `labels` drawn on it.
     pub async fn browser_look(&self, session_id: i64) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/browser/look")
+        let response = self
+            .request(reqwest::Method::POST, "/browser/look")
             .json(&serde_json::json!({ "session_id": session_id }))
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        browser_answer(response, "the browser look").await
     }
 
     /// Ask for the wheel. Raises a proposal; it hands nothing over (spec §4.4 rule 3).
     pub async fn browser_handoff(&self, session_id: i64, reason: &str) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/browser/handoff")
+        let response = self
+            .request(reqwest::Method::POST, "/browser/handoff")
             .json(&serde_json::json!({ "session_id": session_id, "reason": reason }))
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        browser_answer(response, "the browser handoff").await
     }
 
     /// Close a session. The only one of the five that reads nothing from the page.
