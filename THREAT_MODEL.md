@@ -171,6 +171,8 @@ Matching is on the whole origin: scheme, host and port, exactly. This is deliber
 
 While a person drives through the shell, input and prompt answers are accepted only with a `seat_nonce` issued by take or approval, and are refused to run requests (auth `Scope` plus the `x-nucleos-run-id` header). While the person drives the browser is unfenced, and the pool refuses other sessions on that profile. Residual: the same as `open_window`'s, plus any holder of the control token that omits the header, e.g. the Telegram sidecar.
 
+**`POST /browser/window` with `agent: true` makes a conversation and opens the agent's visible session, with its chat panel.** It goes through the same `open_with` as `browser_open{visible: true}`, and a visible session takes the profile the policy chose: the project's profile, with its read and write grants, for a site a person logged into there, and a throwaway for anything else — never the project's cookies for a site nobody granted. A throwaway records no chain, so nothing made in it can be kept. Fenced either way, the agent at the wheel; the person lifts the fence only by taking the wheel from the panel. The session is owned by the new conversation (`owner_chat_id`), and no turn runs until the person writes in the panel. The route — old window and new alike — refuses a control-token holder carrying a run id (a run's own key is refused by auth first, the route being in no scope table), and both doors refuse when nobody is present. Residual: the control-token-without-header case above.
+
 ### What this does not solve
 
 Prompt injection. The agent reads text a stranger wrote and can be talked into anything that text can express. Everything above is about what happens next; nothing in it makes the agent harder to persuade.

@@ -63,6 +63,10 @@ const PROJECT_SCOPED: &[&str] = &[
     // that no longer exist.
     "judge_corrections",
     "map_decisions",
+    // Derived baseline + owner moves: the history of how the project was layered.
+    "map_layer_imports",
+    "map_layer_modules",
+    "map_layer_overrides",
     // The post-merge gate's state (migration 0180): last green sha, the running gate, red groups.
     // Derived per-project state like `verify_cache`; a re-added folder must start with no gate
     // verdict inherited from a repository the user no longer has on record.

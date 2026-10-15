@@ -19,8 +19,12 @@ pub enum Owner {
     None,
 }
 
-/// The owner of a session: the chat of the run that opened it, else that run, else nobody.
+/// The owner of a session: the chat it was opened for, else the chat of the run that opened it,
+/// else that run, else nobody.
 pub async fn owner_of(pool: &SqlitePool, row: &SessionRow) -> Owner {
+    if let Some(chat) = row.owner_chat_id.as_ref().filter(|chat| !chat.is_empty()) {
+        return Owner::Chat(chat.clone());
+    }
     let Some(run_id) = row.run_id else {
         return Owner::None;
     };
@@ -343,6 +347,24 @@ pub async fn on_person_closed(state: &AppState, row: &SessionRow) -> Result<(), 
     Ok(())
 }
 
+/// A visible session has just opened on `url`: start its panel and show the opening as its first
+/// action line. Shared by the agent's `browser_open` and the Web page's "Open with agent".
+pub async fn open_on(state: &AppState, row: &SessionRow, url: &str) {
+    start(state.clone(), row.id);
+    panel_push(
+        state,
+        &row.sidecar_id,
+        serde_json::json!({
+            "v": 1,
+            "kind": "message",
+            "role": "action",
+            "text": format!("browser: open {url}"),
+            "ts": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+    .await;
+}
+
 /// Start reading the panel of a visible session, and mirroring its owning chat into it. One task per
 /// session: a second start while one is running does nothing.
 pub fn start(state: AppState, row_id: i64) {
@@ -655,6 +677,25 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert run");
+    }
+
+    /// A session opened from the Web page has no run, only `owner_chat_id` — and that chat is its
+    /// owner (spec browser-com-painel-pela-pagina-web §3.2 "Dono").
+    #[tokio::test]
+    async fn the_owner_of_a_session_with_an_owner_chat_is_that_chat_without_any_run() {
+        let db = crate::storage::TempDb::new().await;
+        let row = session_of(&db.pool, None).await;
+        crate::browser::set_owner_chat(&db.pool, row.id, "c-web")
+            .await
+            .expect("set owner");
+        let row = crate::browser::session_row(&db.pool, row.id)
+            .await
+            .expect("query")
+            .expect("the row");
+
+        assert_eq!(row.owner_chat_id.as_deref(), Some("c-web"));
+        assert_eq!(owner_of(&db.pool, &row).await, Owner::Chat("c-web".into()));
+        db.close().await;
     }
 
     /// One open session opened by run 7 (or by no run), as the row the panel code receives.

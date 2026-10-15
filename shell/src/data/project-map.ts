@@ -652,6 +652,23 @@ export interface Seam {
   uncalled: string[];
 }
 
+/** An import whose importer sits in a lower layer than the module it imports. */
+export interface LayerViolation {
+  from: string;
+  to: string;
+  from_layer: number;
+  to_layer: number;
+  /** True when the edge is absent from the frozen baseline imports. */
+  new: boolean;
+}
+
+/** Layer per module path, the paths the owner moved by hand, and the upward imports. */
+export interface Layering {
+  modules: Record<string, number>;
+  overridden: string[];
+  violations: LayerViolation[];
+}
+
 export interface ProjectMap {
   modules: MapModule[];
   imports: MapImport[];
@@ -671,6 +688,11 @@ export interface ProjectMap {
    * boundary* rather than showing a boundary of zero routes, which is a different and false claim.
    */
   seam?: Seam;
+  /**
+   * The layering of the modules and the imports that break it. Optional for `seam`'s reason: an
+   * older daemon sends no `layers`, and the view says so rather than drawing an empty stack.
+   */
+  layers?: Layering;
   /**
    * Files no reader here understands, kept rather than dropped.
    *
@@ -1195,6 +1217,34 @@ export function useRecordAnchor(projectId: string) {
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.projects.map(projectId) });
+    },
+  });
+}
+
+/** What {@link useSetLayer} sends: a module path and its layer, or `null` to clear the override. */
+export interface SetLayerInput {
+  path: string;
+  layer: number | null;
+}
+
+/**
+ * Move one module to a layer by hand, or clear the move with `layer: null`. Invalidates the map,
+ * which carries the layering. `422` for a path outside the project or not a file, `404` for an
+ * unknown project. Not retried, for {@link useTriage}'s reason.
+ */
+export function useSetLayer(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ path, layer }: SetLayerInput) =>
+      apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/map/layers`, {
+        method: "POST",
+        body: JSON.stringify({ path, layer }),
+      }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: keys.projects.map(projectId),
+      });
     },
   });
 }

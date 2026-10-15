@@ -65,3 +65,45 @@
   writing-mode: vertical-rl;
   cursor: pointer;
 }
+/* The app's base.css is not in the shadow root, so the panel resets its own controls: a bare
+   button here is the user agent's grey slab with a 2px outset border. Under `:where` so any class
+   (`.chats-send`, `.panel-main`) wins over this default. */
+:where(.panel-root) button,
+:where(.panel-root) textarea,
+:where(.panel-root) input {
+  font: inherit;
+  color: inherit;
+}
+:where(.panel-root) button {
+  background: transparent;
+  border: 1px solid var(--border, #ddd);
+  border-radius: var(--radius-md, 6px);
+  padding: 4px 10px;
+  cursor: pointer;
+}
+:where(.panel-root) button:where(:hover) {
+  background: var(--surface-raised, #f4f4f4);
+}
+.panel-root .panel-main {
+  background: var(--solid, #111);
+  color: var(--solid-ink, #fff);
+  border-color: transparent;
+}
+.panel-root .panel-main:hover {
+  background: var(--solid, #111);
+  opacity: 0.9;
+}
+.panel-top > button {
+  border: 0;
+  padding: 2px 8px;
+  color: var(--text-muted, #666);
+}
+.panel-state {
+  font-weight: var(--weight-medium, 500);
+}
+.panel-pellicle {
+  font-family: var(--font-body, system-ui, sans-serif);
+}
+.panel-strip > .chats-composer-box {
+  margin: var(--space-2, 8px);
+}
