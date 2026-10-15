@@ -8,6 +8,7 @@ use crate::hooks::Decision;
 mod grammar;
 mod judge_guard;
 mod paths;
+mod reads;
 mod shell_shape;
 mod write_guards;
 
@@ -16,7 +17,7 @@ pub use self::paths::*;
 pub use self::shell_shape::*;
 use self::write_guards::*;
 
-pub const CLASSIFIER_VERSION: u32 = 20;
+pub const CLASSIFIER_VERSION: u32 = 21;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -399,12 +400,13 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     //   `sed`  — `-i` edits in place, `w` writes and the `e` command executes. The one spelling
     //            that does none of that, a print by line address under `-n`, is let in by
     //            `prints_lines_by_address` rather than by a prefix here.
-    //   `awk`  — `system()` runs a command and `print > file` writes one.
+    //   `awk`  — `system()` runs a command and `print > file` writes one. A program that is only a
+    //            pattern, with no action to run, is let in by `prints_lines_by_pattern`.
     //   `tee`  — writing is the whole program.
     //   `xargs`— it exists to run the command it is given.
     //   `uniq` — reads like the rest, but a SECOND positional argument is an output file, and
-    //            counting operands means knowing which of its flags take values. Left out until
-    //            something measures that it is worth that guard.
+    //            counting operands means knowing which of its flags take values. The spelling with
+    //            value-less flags and one operand at most is let in by `folds_adjacent_lines`.
     "sort",
     "cut",
     "tr",
@@ -1082,6 +1084,10 @@ fn classify_segment(
     if lands_inside_the_workspace(segment, cwd, shell) {
         return Segment::ReadLocal;
     }
+    // Raw for the same reason: lowercasing folds `git -C <dir>` into `git -c <config>`.
+    if reads::reads_from_inside_the_workspace(segment, cwd, shell) {
+        return Segment::ReadLocal;
+    }
 
     let normalized = normalize_command(segment);
     if matches_command_prefix(&normalized, VCS_LOCAL_PREFIXES) {
@@ -1091,8 +1097,11 @@ fn classify_segment(
         return Segment::ReadLocal;
     }
     // Spec A D13: PowerShell's output shapers, and only under PowerShell — under Bash these names
-    // are unknown programs, and `ft`/`fl` are nothing at all.
-    if shell == crate::command_reader::Shell::PowerShell && shapes_output_only(&normalized) {
+    // are unknown programs, and `ft`/`fl` are nothing at all. Its literal-argument reads
+    // (`Test-Path`, `Get-ChildItem`, `Select-String`, a bare string) join them for the same reason.
+    if shell == crate::command_reader::Shell::PowerShell
+        && (shapes_output_only(&normalized) || reads::reads_in_powershell(&normalized))
+    {
         return Segment::ReadLocal;
     }
     // Everything below WIDENS — a project's declared prefix, the owner's GitHub list, confinement to
@@ -2116,7 +2125,8 @@ mod tests {
             "git stash apply 5540893b",
             "git stash list > stashes.txt",
             "tasklist /s other-host",
-            "awk 'NR==1450,NR==1600' core/src/runs.rs",
+            // `awk 'NR==1450,NR==1600'` stood here until version 21, when a pattern-only awk
+            // program became a read of its own (`grammar::prints_lines_by_pattern`).
             "cargo metadata --no-deps --format-version 1",
             "where npm",
             "git config user.email test@x",
@@ -4392,7 +4402,13 @@ mod tests {
     /// under PowerShell only, the output shapers `Select-Object`/`Sort-Object`/`Format-*`/`ft`/`fl`
     /// with no script block, subexpression, variable or splat in them; `git stash list` was pinned
     /// pending since the porcelain-not-spelling decision above and is reversed here, the one case in
-    /// this list that is a loosening on a name rather than a plain addition.
+    /// this list that is a loosening on a name rather than a plain addition. 21 (2026-10-14) admits
+    /// read-only spellings by grammar: `uniq` with one operand at most, `git branch` in list mode,
+    /// `git -C <dir>` reads where `<dir>` lands inside the workspace, `sed -n` print scripts with
+    /// several addresses and regex ranges, pattern-only `awk` programs, and under PowerShell only
+    /// `Test-Path`/`Get-ChildItem`/`Select-String` with literal arguments and a bare string. It
+    /// also stops reading a QUOTED `'-i'` after a `sed -n` script as a file name, which is a
+    /// tightening. (20 went unnarrated.)
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -4407,7 +4423,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 20);
+        assert_eq!(CLASSIFIER_VERSION, 21);
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the

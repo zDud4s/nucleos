@@ -50,7 +50,11 @@ AGENT_WAIT_MAX_S = 540.0
 CALLER_WAIT_MAX_S = 3600.0
 EXIT_QUEUE_TIMEOUT = 75
 
-SUBCOMMANDS = ("status", "report", "hold-worktree", "warm", "idle")
+SUBCOMMANDS = ("status", "report", "hold-worktree", "warm", "idle", "gc")
+SWEEP_EVERY_S = 3600.0
+PROGRESS_LEGACY_STALE_S = 86400.0
+TMP_STALE_S = 3600.0
+SWEEP_STAMP = "sweep.stamp"
 WARM_PRIO = 3
 WARM_ARGV = ["cargo", "test", "-p", "nucleos-core", "--no-run"]
 
@@ -501,6 +505,14 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     qfile = queue_dir / f"{rec['prio']}-{arrival_ns or time.time_ns()}-{me}"
     queued = False
     last_report = t0
+    shadow = None
+    try:
+        hc = _cost_mod()
+        if hc is not None and hc.admission_mode() == "shadow":
+            shadow = hc.Shadow(rec, directory)
+    except Exception:
+        shadow = None
+    admitted = False
     try:
         with Mutex(directory):
             queue_dir.mkdir(parents=True, exist_ok=True)
@@ -509,9 +521,12 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
             queued = True
         while True:
             position = 0
+            if shadow is not None:
+                shadow.tick()
             with Mutex(directory):
                 order = _queue_order(_entries(queue_dir), directory)
-                held = sum(int(r.get("weight") or 1) for _, r in _entries(held_dir))
+                held_recs = [r for _, r in _entries(held_dir)]
+                held = sum(int(r.get("weight") or 1) for r in held_recs)
                 names = [f.name for f, _ in order]
                 position = names.index(qfile.name) + 1 if qfile.name in names else 0
                 if position == 0:
@@ -519,11 +534,16 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                     qfile.parent.mkdir(parents=True, exist_ok=True)
                     held_dir.mkdir(parents=True, exist_ok=True)
                     qfile.write_text(json.dumps(rec), encoding="utf-8")
-                elif position == 1 and held + rec["weight"] <= capacity():
-                    (held_dir / str(me)).write_text(json.dumps(rec), encoding="utf-8")
-                    qfile.unlink()
-                    queued = False
-                    return True, time.time() - t0
+                elif position == 1:
+                    static_fit = held + rec["weight"] <= capacity()
+                    if shadow is not None:
+                        shadow.observe(held_recs, static_fit)
+                    if static_fit:
+                        (held_dir / str(me)).write_text(json.dumps(rec), encoding="utf-8")
+                        qfile.unlink()
+                        queued = False
+                        admitted = True
+                        return True, time.time() - t0
             now = time.time()
             if now - t0 >= wait_cap:
                 sys.stderr.write(
@@ -541,6 +561,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                 qfile.unlink()
             except OSError:
                 pass
+        if shadow is not None:
+            shadow.finish(admitted)
 
 
 def release_token(directory: Path) -> None:
@@ -606,13 +628,16 @@ def _read_lock(lock: Path) -> dict | None:
 
 
 def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
-                 fail_on_hold: bool = False) -> tuple[bool, float, int]:
+                 fail_on_hold: bool = False, *,
+                 why: dict | None = None) -> tuple[bool, float, int]:
     """Take the worktree lock, waiting in `<hash>.waiters` by (priority, arrival). Holds no
     token while it waits. Returns (acquired, waited_s, arrival_ns).
 
     `fail_on_hold` gives up at once when the holder is a `hold-worktree` session (a gate):
     it keeps the tree for its whole run, 30-50 min here, so an agent capped at 540 s can
-    only wait nine minutes and leave with nothing (52 such exits in four days, 2026-10-06)."""
+    only wait nine minutes and leave with nothing (52 such exits in four days, 2026-10-06).
+
+    `why`, when given, receives `waited_on` on a refusal: gate | estimate | lock."""
     lock, wdir = _lock_paths(directory, h)
     me = os.getpid()
     poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
@@ -664,6 +689,8 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                         "and run nothing heavy here meanwhile.\n")
                     _leave_waiters(wfile, wdir)
                     queued = False
+                    if why is not None:
+                        why["waited_on"] = "gate"
                     return False, time.time() - t0, arrival
                 remaining = wait_cap - (time.time() - t0)
                 if (fail_on_hold and holder is not None
@@ -677,6 +704,8 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                         "compiled. Wait for it to finish rather than retrying.\n")
                     _leave_waiters(wfile, wdir)
                     queued = False
+                    if why is not None:
+                        why["waited_on"] = "estimate"
                     return False, time.time() - t0, arrival
                 if holder is None:
                     ahead = [f for f, _ in _entries(wdir)
@@ -704,6 +733,8 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                     queued = False
                 except Exception:
                     pass
+                if why is not None:
+                    why["waited_on"] = "lock"
                 return False, now - t0, arrival
             if now - last_report >= 30:
                 last_report = now
@@ -767,6 +798,98 @@ def await_successor(directory: Path, succ, limit: float = 2.0) -> None:
         if (directory / "held" / str(pid)).exists() or not is_alive(pid, ctime):
             return
         time.sleep(0.02)
+
+
+def _sweep_progress(directory: Path) -> int:
+    pdir = directory / "progress"
+    try:
+        files = list(pdir.iterdir())
+    except OSError:
+        return 0
+    removed = 0
+    now = time.time()
+    for f in files:
+        try:
+            age = now - f.stat().st_mtime
+            if f.name.endswith(".tmp"):
+                drop = age > TMP_STALE_S
+            else:
+                try:
+                    rec = json.loads(f.read_text(encoding="utf-8"))
+                    if not isinstance(rec, dict):
+                        raise ValueError("not an object")
+                except (OSError, ValueError):
+                    drop = age > TMP_STALE_S
+                else:
+                    pid = rec.get("pid")
+                    if pid is None:
+                        try:
+                            pid = int(f.name)
+                        except ValueError:
+                            pid = None
+                    ctime = rec.get("ctime")
+                    if pid is None:
+                        drop = age > TMP_STALE_S
+                    else:
+                        drop = (not is_alive(pid, ctime)
+                                or (ctime is None and age > PROGRESS_LEGACY_STALE_S))
+            if drop:
+                f.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def sweep(directory: Path, timeout: float = MUTEX_WAIT_S) -> dict:
+    """Collect dead broker state under the Mutex: lock files of dead holders, empty or
+    all-dead waiter dirs, and progress files whose writer is gone. Returns the counts."""
+    directory = Path(directory)
+    counts = {"locks": 0, "waiters": 0, "progress": 0}
+    with Mutex(directory, timeout):
+        wt = directory / "wt"
+        try:
+            lock_files = sorted(wt.glob("*.lock"))
+            waiter_dirs = sorted(p for p in wt.glob("*.waiters") if p.is_dir())
+        except OSError:
+            lock_files, waiter_dirs = [], []
+        for lock in lock_files:
+            _read_lock(lock)
+            if not lock.exists():
+                counts["locks"] += 1
+        for wdir in waiter_dirs:
+            if _entries(wdir):
+                continue
+            try:
+                wdir.rmdir()
+                counts["waiters"] += 1
+            except OSError:
+                pass
+        counts["progress"] = _sweep_progress(directory)
+    return counts
+
+
+def maybe_sweep(directory: Path) -> None:
+    """Throttled sweep after a broker run: at most once per SWEEP_EVERY_S (the stamp), a
+    short Mutex wait, silent, and never when the broker is bypassed."""
+    try:
+        if os.environ.get("NUCLEOS_HEAVY") == "0":
+            return
+        directory = Path(directory)
+        stamp = directory / SWEEP_STAMP
+        try:
+            if time.time() - stamp.stat().st_mtime < SWEEP_EVERY_S:
+                return
+        except OSError:
+            pass
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+        try:
+            sweep(directory, 2.0)
+        except TimeoutError:
+            pass
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------------------ run
@@ -936,12 +1059,14 @@ def _write_progress(path: Path, stats: dict, stop: threading.Event, cpu=None) ->
     (seconds used so far by the child's tree) it goes along as `cpu_s`, and the value at the
     first sign of building or testing is kept as stats["prep_cpu_s"]: what preparing cost."""
     last = None
+    _, me_ctime = proc_identity(os.getpid())
     try:
         while True:
             snap = dict(stats.get("progress") or {})
             used = cpu() if cpu is not None else None
             if used is not None:
                 snap["cpu_s"] = round(used, 1)
+                stats.setdefault("cpu_trace", []).append((time.monotonic(), used))
                 if "prep_cpu_s" not in stats and any(
                         snap.get(k) for k in ("units_total", "binary", "runner")):
                     stats["prep_cpu_s"] = round(used, 1)
@@ -949,7 +1074,8 @@ def _write_progress(path: Path, stats: dict, stop: threading.Event, cpu=None) ->
                 try:
                     path.parent.mkdir(parents=True, exist_ok=True)
                     tmp = path.with_suffix(".tmp")
-                    tmp.write_text(json.dumps(dict(snap, pid=os.getpid())), encoding="utf-8")
+                    tmp.write_text(json.dumps(dict(snap, pid=os.getpid(), ctime=me_ctime)),
+                                   encoding="utf-8")
                     os.replace(tmp, path)
                     last = snap
                 except OSError:
@@ -970,7 +1096,9 @@ def _progress_step(directory: Path, step: str) -> None:
         path = directory / "progress" / str(os.getpid())
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"step": step, "pid": os.getpid()}), encoding="utf-8")
+        _, me_ctime = proc_identity(os.getpid())
+        tmp.write_text(json.dumps({"step": step, "pid": os.getpid(), "ctime": me_ctime}),
+                       encoding="utf-8")
         os.replace(tmp, path)
     except OSError:
         pass
@@ -1681,6 +1809,19 @@ def _holder_estimate(directory: Path, holder: dict) -> float | None:
         return None
 
 
+def _cost_mod():
+    """The cost model (scripts/heavy_cost.py), or None: it must never stop a run."""
+    try:
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import heavy_cost  # type: ignore
+
+        return heavy_cost
+    except Exception:
+        return None
+
+
 def append_log(row: dict, directory: Path) -> None:
     """Append one row in ONE write that lands whole: with several brokers finishing at once,
     buffered text-mode writes (split at the buffer size) interleaved their rows."""
@@ -1874,6 +2015,20 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
         session = os.environ.get("CLAUDE_CODE_SESSION_ID")
         if session:
             rec["session"] = session
+        try:
+            hc = _cost_mod()
+            filtered = bool(verdict and verdict.filtered)
+            costs = hc.load_costs(directory)
+            rec["cls"] = hc.class_key(argv, filtered, True)
+            rec["pred_cores"], rec["pred_mem_mb"] = hc.predict(costs, rec["cls"], weight)
+            # Whether a cargo run compiles is only known once it ends, and admission has to
+            # assume it will. Keep what the other class predicts, from the same table, so the
+            # row is scored against the class it lands in.
+            alt = hc.class_key(argv, filtered, False)
+            if alt != rec["cls"]:
+                rec["pred_alt"] = [alt, *hc.predict(costs, alt, weight)]
+        except Exception:
+            pass
         # Fixed order: worktree lock -> token. A cargo run takes the lock of its worktree
         # (waiting without holding a token); a session already inside a held worktree or
         # under a token holder does not retake it.
@@ -1917,11 +2072,14 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                         hold=held)
             if warm:
                 lrec["warm"] = True
+            why = {}
             got, wait_lock, arrival = acquire_lock(directory, lock_hash, lrec, cap,
-                                                   fail_on_hold=bool(opts["agent"]) and not held)
+                                                   fail_on_hold=bool(opts["agent"]) and not held,
+                                                   why=why)
             if not got:
                 lock_hash = None
-                _log_timeout(directory, agent, prio, kind, weight, wait_lock, argv)
+                _log_timeout(directory, agent, prio, kind, weight, wait_lock, argv,
+                             waited_on=why.get("waited_on", "lock"))
                 return EXIT_QUEUE_TIMEOUT
         cand = None
         if pool and crate is not None and not nested and not held:
@@ -1946,10 +2104,13 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                     lock_hash = worktree_hash(root)
                     lrec = dict(rec, worktree=root, hold=False,
                                 start=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
-                    got, wait_lock, arrival = acquire_lock(directory, lock_hash, lrec, cap)
+                    why = {}
+                    got, wait_lock, arrival = acquire_lock(directory, lock_hash, lrec, cap,
+                                                           why=why)
                     if not got:
                         lock_hash = None
-                        _log_timeout(directory, agent, prio, kind, weight, wait_lock, argv)
+                        _log_timeout(directory, agent, prio, kind, weight, wait_lock, argv,
+                                     waited_on=why.get("waited_on", "lock"))
                         return EXIT_QUEUE_TIMEOUT
                     hit = registry_hit(directory, tdir, fp[2], root)
             except Exception as exc:
@@ -2007,7 +2168,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                     _release_all(directory, lock_hash, False)
                     lock_hash = None
                     _log_timeout(directory, agent, prio, kind, weight,
-                                 wait_lock + time.time() - t_q, argv)
+                                 wait_lock, argv, waited_on="token",
+                                 wait_token=time.time() - t_q)
                     return EXIT_QUEUE_TIMEOUT
                 holding = True
                 if not pool:
@@ -2031,7 +2193,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                         _release_all(directory, lock_hash, False)
                         lock_hash = None
                         _log_timeout(directory, agent, prio, kind, weight,
-                                     wait_lock + time.time() - t_q, argv)
+                                     wait_lock, argv, waited_on="slot",
+                                     wait_token=time.time() - t_q)
                         return EXIT_QUEUE_TIMEOUT
                     time.sleep(poll)
             wait_token = time.time() - t_q
@@ -2039,6 +2202,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             env["NUCLEOS_HEAVY_TOKEN"] = str(os.getpid())
         if pool and lease is None and nested:
             # No token to give back here (nested runs under its parent's token).
+            t_s = time.time()
             try:
                 lease = lease_slot_wait(directory, wt, cap, held_session())
             except Exception as exc:
@@ -2049,7 +2213,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                 _release_all(directory, lock_hash, holding)
                 lock_hash = None
                 holding = False
-                _log_timeout(directory, agent, prio, kind, weight, wait_lock, argv)
+                _log_timeout(directory, agent, prio, kind, weight, wait_lock, argv,
+                             waited_on="slot", wait_token=time.time() - t_s)
                 return EXIT_QUEUE_TIMEOUT
         if lease is not None:
             try:
@@ -2134,12 +2299,28 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     })
     if preempted:
         row["preempted"] = True
+    try:
+        hc = _cost_mod()
+        row.update(hc.measure_fields(stats, row["run_s"], job))
+        row["cls"] = hc.class_key(
+            argv, bool(verdict and verdict.filtered), bool(stats.get("compiled")))
+        row["pred_cores"] = rec.get("pred_cores")
+        row["pred_mem_mb"] = rec.get("pred_mem_mb")
+        alt = rec.get("pred_alt")
+        if isinstance(alt, list) and len(alt) == 3 and alt[0] == row["cls"]:
+            row["pred_cores"], row["pred_mem_mb"] = alt[1], alt[2]
+    except Exception:
+        pass
     # Register and log BEFORE releasing: the lock's next owner reads the registry the moment
     # it holds the lock, and must see what this run just built.
     if fp is not None:
         _record_fingerprint(directory, fp, root, code, stats)
     append_log(row, directory)
     _release_all(directory, lock_hash, holding, lease)
+    try:
+        _cost_mod().rebuild_costs(directory)
+    except Exception:
+        pass
     return _PREEMPTED if preempted else code
 
 
@@ -2157,14 +2338,19 @@ def _record_fingerprint(directory: Path, fp, root: str, code: int, stats: dict) 
         sys.stderr.write(f"heavy: could not record the fingerprint: {exc}\n")
 
 
-def _log_timeout(directory, agent, prio, kind, weight, waited, argv) -> None:
-    """A run that gave up waiting still leaves a row, so `report` counts the exit 75."""
+def _log_timeout(directory, agent, prio, kind, weight, waited, argv, *,
+                 waited_on: str = "lock", wait_token: float = 0.0) -> None:
+    """A run that gave up waiting still leaves a row, so `report` counts the exit 75.
+
+    `waited` is the lock wait (`wait_lock_s`); `wait_token` is the token/slot wait
+    (`wait_token_s`). `waited_on` names the refusal: lock | gate | estimate | token | slot."""
     append_log({
         "v": LOG_VERSION, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "worktree": os.getcwd(), "agent": agent, "prio": prio, "eff_prio": prio,
-        "kind": kind, "weight": weight, "wait_lock_s": round(waited, 3), "wait_token_s": 0.0,
+        "kind": kind, "weight": weight, "wait_lock_s": round(waited, 3),
+        "wait_token_s": round(wait_token, 3),
         "run_s": 0.0, "compiled": False, "fp_hit": False, "fp_miss": False,
-        "exit": EXIT_QUEUE_TIMEOUT, "argv0": argv[0], "argv": _log_argv(argv),
+        "exit": EXIT_QUEUE_TIMEOUT, "waited_on": waited_on, "argv0": argv[0], "argv": _log_argv(argv),
     }, directory)
 
 
@@ -2238,18 +2424,25 @@ def cmd_status() -> int:
         print(_line(rec, f"age={_age(f)}"))
     wt = d / "wt"
     locks = sorted(wt.glob("*.lock")) if wt.is_dir() else []
-    print(f"worktree locks: {len(locks)}")
+    lock_lines: list[str] = []
+    dead = 0
     for lock in locks:
         try:
             rec = json.loads(lock.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        alive = is_alive(rec.get("pid"), rec.get("ctime"))
+        if not alive:
+            dead += 1
         wdir = wt / (lock.name[: -len(".lock")] + ".waiters")
         waiting = sorted(_entries(wdir, reap=False), key=lambda it: _wkey(it[0]))
-        print(_line(rec, f"lock={lock.name[: -len('.lock')]} age={_age(lock, rec)} "
-                         f"waiters={len(waiting)}"))
+        lock_lines.append(_line(rec, f"lock={lock.name[: -len('.lock')]} age={_age(lock, rec)} "
+                                     f"waiters={len(waiting)} state={'live' if alive else 'dead'}"))
         for f, wrec in waiting:
-            print(_line(wrec, f"  waiting prio={_wkey(f)[0]} age={_age(f)}"))
+            lock_lines.append(_line(wrec, f"  waiting prio={_wkey(f)[0]} age={_age(f)}"))
+    print(f"worktree locks: {len(locks)} (dead: {dead})")
+    for text in lock_lines:
+        print(text)
     try:
         n = target_slots()
         print(f"target slots: {n}  root: {_td_root()}")
@@ -2288,6 +2481,29 @@ def cmd_idle() -> int:
         print(line)
     print("idle" if not busy else f"busy ({len(busy)})")
     return 0 if not busy else 1
+
+
+def cmd_gc() -> int:
+    """Collect dead broker state now (the throttled sweep runs the same code)."""
+    d = state_dir()
+    try:
+        counts = sweep(d)
+    except TimeoutError:
+        try:
+            owner = json.loads((d / ".mutex" / "owner").read_text())
+            who = f"pid {owner.get('pid')}"
+        except (OSError, ValueError, AttributeError):
+            who = "another broker call"
+        sys.stderr.write(f"heavy gc: the broker mutex is busy (held by {who}); nothing was "
+                         "removed - try again\n")
+        return EXIT_QUEUE_TIMEOUT
+    try:
+        (d / SWEEP_STAMP).touch()
+    except OSError:
+        pass
+    print(f"removed: locks={counts['locks']} waiters={counts['waiters']} "
+          f"progress={counts['progress']}")
+    return 0
 
 
 def _warm_marker(directory: Path, root: str) -> Path:
@@ -2419,6 +2635,13 @@ def cmd_report(args: list[str]) -> int:
     counts("by kind", [str(r.get("kind")) for r in rows])
     print("outcomes")
     print(f"  exit 75: {sum(1 for r in rows if r.get('exit') == EXIT_QUEUE_TIMEOUT)}")
+    waited_tally: dict[str, int] = {}
+    for r in rows:
+        if r.get("exit") == EXIT_QUEUE_TIMEOUT:
+            k = str(r.get("waited_on") or "unknown")
+            waited_tally[k] = waited_tally.get(k, 0) + 1
+    for k in sorted(waited_tally):
+        print(f"    waited_on {k}: {waited_tally[k]}")
     print(f"  broker_error: {sum(1 for r in rows if r.get('broker_error'))}")
     print(f"  fp_hit: {sum(1 for r in rows if r.get('fp_hit'))}")
     print(f"  fp_miss: {sum(1 for r in rows if r.get('fp_miss'))}")
@@ -2433,6 +2656,13 @@ def cmd_report(args: list[str]) -> int:
     print("median")
     for field in ("wait_lock_s", "wait_token_s", "run_s"):
         print(f"  {field}: {_median([_num(r.get(field)) for r in rows]):.1f}")
+    try:
+        hc = _cost_mod()
+        if hc is not None:
+            for line in hc.report_lines(rows, hc.read_jsonl(state_dir() / "admission.jsonl", since)):
+                print(line)
+    except Exception as exc:
+        print(f"admission: unavailable ({exc})")
     return 0
 
 
@@ -2446,13 +2676,20 @@ def main(argv: list[str]) -> int:
             return cmd_warm(argv[1:])
         if argv and argv[0] == "idle":
             return cmd_idle()
+        if argv and argv[0] == "gc":
+            return cmd_gc()
         if argv and argv[0] == "hold-worktree":
             try:
                 return broker_run(argv[1:], held=True)
             finally:
                 if os.environ.get("NUCLEOS_HEAVY") != "0":
                     release_session_slots(state_dir(), os.getpid())
-        return broker_run(argv)
+                    maybe_sweep(state_dir())
+        try:
+            return broker_run(argv)
+        finally:
+            if os.environ.get("NUCLEOS_HEAVY") != "0":
+                maybe_sweep(state_dir())
     except KeyboardInterrupt:
         return 130
 

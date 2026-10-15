@@ -121,6 +121,10 @@ pub struct SessionRow {
     /// Opened as a window the person can see, with a chat panel on the right (spec
     /// browser-com-painel). Headless sessions are `false`.
     pub visible: bool,
+    /// The conversation this session answers to when no run opened it: a window opened from the
+    /// shell's Web page "with agent" (spec browser-com-painel-pela-pagina-web §3.2). Wins over
+    /// `run_id` when both are set.
+    pub owner_chat_id: Option<String>,
     /// Whether the shell could take the seat: a lone open project-profile session. A second open
     /// session on the same profile would share its cookies, so neither qualifies.
     pub shell_eligible: bool,
@@ -506,9 +510,11 @@ pub async fn open(
     open_with(pool, runtime, ask, false).await
 }
 
-/// `open`, optionally as a window the person can see. A visible session always runs in the
-/// project's profile (the person takes part, so it needs the project's logins), whatever the policy's
-/// Ephemeral choice; the policy's refusals still return.
+/// `open`, optionally as a window the person can see. A visible session runs in the profile the
+/// policy chose, like any other (spec browser-com-painel-pela-pagina-web §3.6): the project's
+/// profile for a site a person logged into there, a throwaway otherwise. Forcing the project's
+/// profile for every visible open admitted nothing the fence would load and, on a project with no
+/// site yet, left the fence with an empty list it refuses to start with.
 pub async fn open_with(
     pool: &SqlitePool,
     runtime: &BrowserRuntime,
@@ -547,7 +553,6 @@ pub async fn open_with(
             });
         }
     };
-    let profile = if visible { Profile::Project } else { profile };
 
     let row_id = insert_session(pool, run_id, project_id, url, decision.rule, profile, now)
         .await
@@ -591,6 +596,16 @@ pub async fn open_with(
         .await
         .map_err(|error| BrowserError::Failed(error.to_string()))?;
     Ok(Opened::Session(Box::new(row)))
+}
+
+/// Name the conversation a session answers to (spec browser-com-painel-pela-pagina-web §3.2).
+pub async fn set_owner_chat(pool: &SqlitePool, id: i64, chat_id: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE browser_sessions SET owner_chat_id = ? WHERE id = ?")
+        .bind(chat_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Mark a session row as visible (or not).
@@ -743,7 +758,7 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
     let row = sqlx::query(
         "SELECT id, sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
                 final_url, rule, mode, refusal, proposal_id, chain, chain_decided_at, \
-                seat, visible, \
+                seat, visible, owner_chat_id, \
                 (profile_kind = 'project' AND closed_at IS NULL AND \
                  (SELECT COUNT(*) FROM browser_sessions o \
                   WHERE o.profile_id = browser_sessions.profile_id \
@@ -772,6 +787,7 @@ pub async fn session_row(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Sess
         chain_decided_at: row.get("chain_decided_at"),
         seat: row.get("seat"),
         visible: row.get::<i64, _>("visible") != 0,
+        owner_chat_id: row.get("owner_chat_id"),
         shell_eligible: row.get::<i64, _>("shell_eligible") != 0,
         opened_at: row.get("opened_at"),
         closed_at: row.get("closed_at"),
@@ -921,10 +937,16 @@ pub async fn insert_person_window(
 }
 
 /// Store the navigation a person's window recorded, unanswered.
+///
+/// Only for a session in the project's profile. A throwaway is deleted with its session, so a login
+/// made there is one nobody keeps, and granting its hosts would list sites the project's profile
+/// was never logged into (spec §5.2).
 pub async fn record_chain(pool: &SqlitePool, id: i64, chain: &[String]) -> sqlx::Result<()> {
     // `chain_decided_at` goes back to NULL: a session can be returned twice, and without this the
     // second chain would find its keep question already answered.
-    sqlx::query("UPDATE browser_sessions SET chain = ?, chain_decided_at = NULL WHERE id = ?")
+    sqlx::query(
+        "UPDATE browser_sessions SET chain = ?, chain_decided_at = NULL          WHERE id = ? AND profile_kind = 'project'",
+    )
         .bind(serde_json::to_string(chain).unwrap_or_else(|_| "[]".to_string()))
         .bind(id)
         .execute(pool)
@@ -1269,10 +1291,11 @@ mod tests {
         db.close().await;
     }
 
-    /// A visible open is for a person who will take part, and what they do there belongs in the
-    /// project's own profile — even for a url the policy would have sent to a throwaway.
+    /// A visible open follows the policy's profile like any other (spec
+    /// browser-com-painel-pela-pagina-web §3.6): a url off the project's list goes to a throwaway,
+    /// because the fence of the project's profile admits only the sites a person logged into there.
     #[tokio::test]
-    async fn a_visible_open_lands_in_the_project_profile_and_is_marked_visible() {
+    async fn a_visible_open_off_the_list_lands_in_a_throwaway_and_is_marked_visible() {
         let db = TempDb::new().await;
         grant(
             &db.pool,
@@ -1305,15 +1328,113 @@ mod tests {
         };
 
         let sent = placements(&seen);
-        assert_eq!(sent[0]["profile"]["kind"], "project", "{:?}", sent[0]);
-        assert_eq!(sent[0]["profile"]["id"], "acme");
+        assert_eq!(sent[0]["profile"]["kind"], "ephemeral", "{:?}", sent[0]);
         assert_eq!(sent[0]["visible"], true, "{:?}", sent[0]);
-        assert_eq!(sent[0]["origins"][0], "https://jira.example.org:443");
+        assert!(
+            sent[0]["origins"]
+                .as_array()
+                .is_none_or(|list| list.is_empty()),
+            "a throwaway carries none of the project's sites: {:?}",
+            sent[0]
+        );
         let stored = session_row(&db.pool, row.id)
             .await
             .expect("query")
             .expect("row");
         assert!(stored.visible, "the row remembers the window is visible");
+        assert_eq!(stored.profile_kind, "ephemeral");
+        db.close().await;
+    }
+
+    /// The other half: a site the person logged into in this project opens visible in the
+    /// project's profile, with its list, so the agent and the person both have the login.
+    #[tokio::test]
+    async fn a_visible_open_of_a_listed_site_lands_in_the_project_profile() {
+        let db = TempDb::new().await;
+        grant(
+            &db.pool,
+            "acme",
+            &["https://jira.example.org/browse/X-1".into()],
+            false,
+            NOW,
+        )
+        .await
+        .expect("grant");
+        let (runtime, seen) = stub_sidecar("https://jira.example.org/browse/X-1").await;
+
+        let opened = open_with(
+            &db.pool,
+            &runtime,
+            Ask {
+                project_id: "acme",
+                run_id: None,
+                url: "https://jira.example.org/browse/X-1",
+                surface: Surface::Assistant,
+                requester: Requester::Owner,
+                now: NOW,
+            },
+            true,
+        )
+        .await
+        .expect("open");
+        let Opened::Session(row) = opened else {
+            panic!("a visible open of a listed site is a session");
+        };
+
+        let sent = placements(&seen);
+        assert_eq!(sent[0]["profile"]["kind"], "project", "{:?}", sent[0]);
+        assert_eq!(sent[0]["profile"]["id"], "acme");
+        assert_eq!(sent[0]["visible"], true, "{:?}", sent[0]);
+        assert_eq!(sent[0]["origins"][0], "https://jira.example.org:443");
+        assert_eq!(row.profile_kind, "project");
+        db.close().await;
+    }
+
+    /// A throwaway is deleted with its session, so a login made in one is a login nobody keeps:
+    /// its chain is never recorded, and there is no "keep these?" to answer (spec §5.2).
+    #[tokio::test]
+    async fn a_throwaway_session_records_no_chain_to_keep() {
+        let db = TempDb::new().await;
+        let throwaway = insert_session(
+            &db.pool,
+            None,
+            "acme",
+            "https://news.example.net/",
+            "off-list",
+            Profile::Ephemeral,
+            NOW,
+        )
+        .await
+        .expect("insert");
+        let project = insert_session(
+            &db.pool,
+            None,
+            "acme",
+            "https://jira.example.org/",
+            "project-site",
+            Profile::Project,
+            NOW,
+        )
+        .await
+        .expect("insert");
+        let chain = vec!["https://jira.example.org/login".to_string()];
+
+        record_chain(&db.pool, throwaway, &chain)
+            .await
+            .expect("record");
+        record_chain(&db.pool, project, &chain)
+            .await
+            .expect("record");
+
+        assert_eq!(
+            take_chain(&db.pool, throwaway, NOW).await.expect("take"),
+            None
+        );
+        assert_eq!(
+            take_chain(&db.pool, project, NOW).await.expect("take"),
+            Some(chain),
+            "the control: a project session's chain is there to answer"
+        );
         db.close().await;
     }
 

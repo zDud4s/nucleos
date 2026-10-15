@@ -39,6 +39,8 @@ function session(overrides: Partial<BrowserSession> = {}): BrowserSession {
     mode: "human",
     seat: null,
     shell_eligible: false,
+    visible: false,
+    owner_chat_id: null,
     refusal: null,
     proposal_id: null,
     chain: null,
@@ -440,6 +442,22 @@ describe("Browser - the write grant", () => {
    * receives is the permission, and a box wired to nothing would look identical
    * on screen.
    */
+  it("says a visible window's wheel goes back to the agent, not that the window closes", async () => {
+    // `give_back` routes a visible row to the panel's return: the window stays and the agent drives.
+    const world = withProject({
+      sessions: [session({ id: 4, mode: "human", seat: "window", visible: true, owner_chat_id: "c-web" })],
+    });
+    daemon.apiFetch.mockImplementation(browserFetch(world));
+
+    await renderBrowser();
+    fireEvent.click(await screen.findByRole("button", { name: "Give the wheel back" }));
+    await afterDwell();
+    expect(
+      await screen.findByRole("button", { name: "Hand it back to the agent in its window" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Close the window and bring the chain back" })).toBeNull();
+  });
+
   it("keeps the chain without granting writing until somebody ticks the box", async () => {
     const world = withProject({ sessions: [session({ id: 3, mode: "human" })] });
     daemon.apiFetch.mockImplementation(browserFetch(world));
@@ -600,6 +618,75 @@ describe("Browser - the write grant", () => {
 describe("Browser - opening a window yourself", () => {
   const withProject = (overrides: Partial<BrowserWorld> = {}) =>
     browserWorld({ projects: [project({ project_id: "alpha" })], ...overrides });
+
+  it("opens a window with the agent from a typed address and links to the conversation that owns it", async () => {
+    const bodies: string[] = [];
+    daemon.apiFetch.mockImplementation(
+      browserFetch(
+        withProject({
+          onWindow: (body) => {
+            bodies.push(body);
+            return {
+              session: session({ id: 12, visible: true, owner_chat_id: "c-web" }),
+              chat_id: "c-web",
+            };
+          },
+        }),
+      ),
+    );
+
+    await renderBrowser();
+
+    fireEvent.change(await screen.findByLabelText("Address to open"), {
+      target: { value: "https://jira.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open with agent" }));
+
+    expect(await screen.findByText(/opened session #12 with the agent/i)).toBeTruthy();
+    expect(JSON.parse(bodies[0])).toEqual({
+      project_id: "alpha",
+      url: "https://jira.example.com",
+      agent: true,
+    });
+    const link = screen.getByRole("link", { name: "open its conversation" }) as HTMLAnchorElement;
+    expect(link.getAttribute("href")).toBe("/chats/c-web");
+  });
+
+  it("says when the agent's window opened in a throwaway, and how to bring the project's login into it", async () => {
+    daemon.apiFetch.mockImplementation(
+      browserFetch(
+        withProject({
+          onWindow: () => ({
+            session: session({ id: 13, visible: true, owner_chat_id: "c-web", profile_kind: "ephemeral" }),
+            chat_id: "c-web",
+          }),
+        }),
+      ),
+    );
+
+    await renderBrowser();
+
+    fireEvent.change(await screen.findByLabelText("Address to open"), {
+      target: { value: "https://news.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open with agent" }));
+
+    expect(await screen.findByText(/opened session #13 with the agent in a throwaway profile/i)).toBeTruthy();
+    expect(screen.getByText(/log in with Open a window and keep the site first/i)).toBeTruthy();
+  });
+
+  it("asks for an address before opening with the agent, because the browser opens https pages only", async () => {
+    daemon.apiFetch.mockImplementation(browserFetch(withProject()));
+
+    await renderBrowser();
+
+    const withAgent = (await screen.findByRole("button", { name: "Open with agent" })) as HTMLButtonElement;
+    expect(withAgent.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Address to open"), {
+      target: { value: "https://jira.example.com" },
+    });
+    expect(withAgent.disabled).toBe(false);
+  });
 
   it("opens a window on the chosen project's profile from a typed address and names the session it opened", async () => {
     const bodies: string[] = [];

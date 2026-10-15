@@ -84,19 +84,7 @@ pub async fn post_open(
     match open_with(&state.pool, &state.browser, ask, body.visible).await {
         Ok(Opened::Session(row)) => {
             if row.visible {
-                crate::browser::panel::start(state.clone(), row.id);
-                crate::browser::panel::panel_push(
-                    &state,
-                    &row.sidecar_id,
-                    serde_json::json!({
-                        "v": 1,
-                        "kind": "message",
-                        "role": "action",
-                        "text": format!("browser: open {}", body.url),
-                        "ts": chrono::Utc::now().to_rfc3339(),
-                    }),
-                )
-                .await;
+                crate::browser::panel::open_on(&state, &row, &body.url).await;
             }
             axum::Json(row).into_response()
         }
