@@ -4,7 +4,7 @@ import tokensCss from "../tokens.css?inline";
 import chatsCss from "../pages/chats.css?inline";
 import panelCss from "./panel.css?inline";
 import { Panel } from "./Panel";
-import { shouldMount } from "./frame";
+import { hostScoped, shouldMount } from "./frame";
 import { dropUntrusted } from "./trust";
 import type { Incoming, Outgoing } from "./protocol";
 
@@ -46,7 +46,7 @@ function mount(): HTMLElement {
   const root = host.attachShadow({ mode: "closed" });
   root.adoptedStyleSheets = [tokensCss, chatsCss, panelCss].map((css) => {
     const sheet = new CSSStyleSheet();
-    sheet.replaceSync(css);
+    sheet.replaceSync(hostScoped(css));
     return sheet;
   });
   dropUntrusted(root);
