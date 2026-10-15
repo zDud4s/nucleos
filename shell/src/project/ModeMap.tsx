@@ -4,6 +4,7 @@ import { useProjectMap, useProjectSpecs, type ProjectMap } from "../data/project
 import { drawableLinks } from "../canvas/map-graphs";
 import { Atlas, NotRead } from "./Atlas";
 import { buildAtlas } from "./atlas-model";
+import { AtlasLayers } from "./AtlasLayers";
 import { StampsPanel } from "./StampsPanel";
 import { ExtractSpec } from "./ExtractSpec";
 import { JunctionPanel } from "./JunctionPanel";
@@ -62,11 +63,21 @@ export interface ModeMapProps {
 }
 
 /** The tabs of the map, in the order they read: the drawing, then the decision layer, then the rest. */
-const VIEWS = ["architecture", "specs", "junction", "stamps", "triage", "unread", "states"] as const;
+const VIEWS = [
+  "architecture",
+  "layers",
+  "specs",
+  "junction",
+  "stamps",
+  "triage",
+  "unread",
+  "states",
+] as const;
 type MapView = (typeof VIEWS)[number];
 
 const VIEW_LABEL: Record<MapView, string> = {
   architecture: "Architecture",
+  layers: "Layers",
   specs: "Specs",
   junction: "Junction",
   stamps: "Stamps",
@@ -150,6 +161,8 @@ export function ModeMap({ projectId }: ModeMapProps) {
         <p className="text-sm text-text-faint">Reading the project&rsquo;s tree…</p>
       ) : view === "architecture" ? (
         <Atlas data={map.data} atlas={atlas} />
+      ) : view === "layers" ? (
+        <AtlasLayers projectId={projectId} data={map.data} />
       ) : view === "unread" ? (
         <NotRead atlas={atlas} />
       ) : (
@@ -164,7 +177,7 @@ export function ModeMap({ projectId }: ModeMapProps) {
         confidence this mode exists to cure — but once, quietly, and not under the canvas, which
         runs to the bottom of the window.
       */}
-      {view === "architecture" ? null : (
+      {view === "architecture" || view === "layers" ? null : (
         <p className="ws-foot">
           Not on this map yet: evidence — nothing here reads a test run or a gate.
         </p>
@@ -313,6 +326,10 @@ function Views({
       of: files,
       means: "The folders, and what leans on what.",
     },
+    layers: {
+      of: data?.layers?.violations.length ?? null,
+      means: "The modules stacked by layer, and the imports that climb.",
+    },
     unread: {
       of: unread,
       means: "Source in languages the map cannot follow.",
@@ -355,6 +372,7 @@ function Views({
   const doors = VIEWS.filter(
     (candidate) =>
       candidate === "architecture" ||
+      candidate === "layers" ||
       candidate === "specs" ||
       candidate === "states" ||
       candidate === view ||
@@ -486,7 +504,7 @@ function Derived({
   data,
 }: {
   projectId: string;
-  view: Exclude<MapView, "specs" | "architecture" | "unread" | "states">;
+  view: Exclude<MapView, "specs" | "architecture" | "layers" | "unread" | "states">;
   data: ProjectMap;
 }) {
   const {

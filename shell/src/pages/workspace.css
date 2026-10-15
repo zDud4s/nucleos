@@ -1021,6 +1021,34 @@ button.ws-lead-door:hover {
   font-weight: var(--weight-medium);
 }
 
+.ws-layers {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.ws-layer-band {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.ws-layer-block {
+  display: inline-flex;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.ws-layer-up {
+  color: var(--tone-danger-fg);
+  font-weight: var(--weight-medium);
+}
+
 .ws-atlas-detail {
   display: flex;
   flex-direction: column;

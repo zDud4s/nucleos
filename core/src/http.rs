@@ -4731,6 +4731,115 @@ mod tests {
         assert_eq!(unread[0], "core/src/notes.go");
     }
 
+    /// A POST to the layers route, as the window makes it.
+    async fn post_layer(state: &AppState, project: &str, body: serde_json::Value) -> StatusCode {
+        build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project}/map/layers"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The first read of the map freezes its layers; a later import that climbs one is `new`.
+    #[tokio::test]
+    async fn the_map_freezes_its_layers_on_first_read_and_flags_a_new_upward_import_later() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "use crate::b;\n").unwrap();
+        std::fs::write(dir.path().join("core/src/b.rs"), "pub fn b() {}\n").unwrap();
+
+        let first = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(first["layers"]["modules"]["core/src/a.rs"], 1, "{first}");
+        assert_eq!(first["layers"]["modules"]["core/src/b.rs"], 0, "{first}");
+        assert!(first["layers"]["violations"].as_array().unwrap().is_empty());
+
+        // b now imports a: upward, against a baseline that froze b at 0 and a at 1.
+        std::fs::write(dir.path().join("core/src/b.rs"), "use crate::a;\n").unwrap();
+
+        let second = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(second["layers"]["modules"]["core/src/a.rs"], 1, "{second}");
+        assert_eq!(second["layers"]["modules"]["core/src/b.rs"], 0, "{second}");
+        let violations = second["layers"]["violations"].as_array().unwrap();
+        assert_eq!(violations.len(), 1, "{second}");
+        assert_eq!(violations[0]["from"], "core/src/b.rs");
+        assert_eq!(violations[0]["to"], "core/src/a.rs");
+        assert_eq!(violations[0]["from_layer"], 0);
+        assert_eq!(violations[0]["to_layer"], 1);
+        assert_eq!(violations[0]["new"], true);
+    }
+
+    /// The owner moves a module; the move survives a re-read, and `null` takes it back.
+    #[tokio::test]
+    async fn the_owner_moves_a_module_to_another_layer_and_it_survives_a_reread() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "use crate::b;\n").unwrap();
+        std::fs::write(dir.path().join("core/src/b.rs"), "pub fn b() {}\n").unwrap();
+        get_json(&state, "/projects/alpha/map").await;
+
+        let moved = post_layer(
+            &state,
+            "alpha",
+            serde_json::json!({"path": "core/src/b.rs", "layer": 5}),
+        )
+        .await;
+        assert_eq!(moved, StatusCode::NO_CONTENT);
+
+        let after = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(after["layers"]["modules"]["core/src/b.rs"], 5, "{after}");
+        assert_eq!(
+            after["layers"]["overridden"],
+            serde_json::json!(["core/src/b.rs"])
+        );
+
+        let cleared = post_layer(
+            &state,
+            "alpha",
+            serde_json::json!({"path": "core/src/b.rs", "layer": null}),
+        )
+        .await;
+        assert_eq!(cleared, StatusCode::NO_CONTENT);
+
+        let back = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(back["layers"]["modules"]["core/src/b.rs"], 0, "{back}");
+        assert!(back["layers"]["overridden"].as_array().unwrap().is_empty());
+    }
+
+    /// A path outside the project, or not a file, is refused; an unknown project is not found.
+    #[tokio::test]
+    async fn a_layer_override_outside_the_project_is_refused() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        for path in ["../outside.rs", "core/src/missing.rs"] {
+            let status = post_layer(
+                &state,
+                "alpha",
+                serde_json::json!({"path": path, "layer": 2}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+        }
+
+        let status = post_layer(
+            &state,
+            "nowhere",
+            serde_json::json!({"path": "core/src/a.rs", "layer": 2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn the_map_carries_the_seam_between_the_two_sides_of_the_product() {
         let state = test_state().await;
