@@ -766,6 +766,76 @@ async fn loadout_admits(
     }
 }
 
+/// The chat turn a browser request was admitted for. `require_token` inserts it as a request
+/// extension, and `post_open` reads it to record who owns the session it opens.
+#[derive(Debug, Clone)]
+pub struct ChatBrowser {
+    pub run_id: i64,
+    pub chat_id: String,
+}
+
+/// The session routes a chat turn's run key may drive (owner decision of 2026-10-15: a chat's key
+/// drives the browser). POST only. The fixed scope tables stay pure and know nothing of this: the
+/// door is decided in `require_token` by `chat_browser_admits`, which reads the database, because
+/// whether a turn may touch a session depends on who owns that session.
+const CHAT_BROWSER_ROUTES: &[&str] = &[
+    "/browser/open",
+    "/browser/snapshot",
+    "/browser/act",
+    "/browser/look",
+    "/browser/screenshot",
+    "/browser/handoff",
+    "/browser/close",
+];
+
+/// The most a browser request body may be to be read ahead of the handler.
+const CHAT_BROWSER_BODY_LIMIT: usize = 1024 * 1024;
+
+#[derive(serde::Deserialize)]
+struct SessionRef {
+    session_id: i64,
+}
+
+/// Whether a run key belongs to a chat turn that may use this browser route. `/browser/open` is
+/// open to any chat turn; every other route needs a session its own chat (or its own run) owns.
+/// None for every other scope and for every error.
+async fn chat_browser_admits(
+    pool: &sqlx::SqlitePool,
+    scope: &Scope,
+    route: &str,
+    body: &[u8],
+) -> Option<ChatBrowser> {
+    let Scope::Run(id) = scope else {
+        return None;
+    };
+    let chat_id: String =
+        sqlx::query_scalar::<_, Option<String>>("SELECT chat_id FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|chat| !chat.is_empty())?;
+    let turn = ChatBrowser {
+        run_id: *id,
+        chat_id,
+    };
+    if route == "/browser/open" {
+        return Some(turn);
+    }
+    let session: SessionRef = serde_json::from_slice(body).ok()?;
+    let row = match crate::browser::session_row(pool, session.session_id).await {
+        Ok(Some(row)) => row,
+        _ => return None,
+    };
+    match crate::browser::panel::owner_of(pool, &row).await {
+        crate::browser::panel::Owner::Chat(chat) if chat == turn.chat_id => Some(turn),
+        crate::browser::panel::Owner::Run(run) if run == *id => Some(turn),
+        _ => None,
+    }
+}
+
 /// A team run's key and the secret to store for it: `team:<team_run_id>.<secret>`.
 ///
 /// The prefix is not decoration. `resolve` picks the table by prefix — `api:` for durable keys, a
@@ -1016,16 +1086,42 @@ pub async fn require_token(
         Some(matched) => permits_route(&scope, req.method(), matched.as_str()),
         None => permits(&scope, req.method(), req.uri().path()),
     };
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_owned());
     // The loadout door: only for a matched route, and only when the fixed tables said no.
-    if !allowed && let Some(matched) = req.extensions().get::<MatchedPath>() {
-        allowed = loadout_admits(
+    if !allowed && let Some(matched) = route.as_deref() {
+        allowed = loadout_admits(&state.pool, &scope, req.method(), matched, req.headers()).await;
+    }
+    // The chat-browser door: a chat turn's run key on the session routes, for its own sessions.
+    if !allowed
+        && matches!(scope, Scope::Run(_))
+        && req.method() == Method::POST
+        && route
+            .as_deref()
+            .is_some_and(|r| CHAT_BROWSER_ROUTES.contains(&r))
+    {
+        let (parts, body) = req.into_parts();
+        let bytes = match axum::body::to_bytes(body, CHAT_BROWSER_BODY_LIMIT).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(?scope, %error, "refused a browser request whose body could not be read");
+                return Err(StatusCode::FORBIDDEN);
+            }
+        };
+        let turn = chat_browser_admits(
             &state.pool,
             &scope,
-            req.method(),
-            matched.as_str(),
-            req.headers(),
+            route.as_deref().unwrap_or_default(),
+            &bytes,
         )
         .await;
+        req = Request::from_parts(parts, axum::body::Body::from(bytes));
+        if let Some(turn) = turn {
+            allowed = true;
+            req.extensions_mut().insert(turn);
+        }
     }
     if !allowed {
         tracing::warn!(
@@ -3996,6 +4092,218 @@ mod tests {
             assert!(
                 !permits(&scope, &Method::POST, "/projects/7/ide-verify"),
                 "{scope:?} must not be able to switch IDE verify"
+            );
+        }
+    }
+
+    // ---- The chat-browser door (owner decision of 2026-10-15) -------------------------------
+
+    /// The browser routes, mounted with stand-ins and layered with `require_token` exactly like
+    /// `protected_router`. The session routes echo their body, so a 200 shows the body reached the
+    /// handler intact after the door read it; `/browser/open` echoes the chat the door admitted.
+    fn browser_door_router(state: AppState) -> Router {
+        let echo = || post(|b: String| async move { b });
+        Router::new()
+            .route(
+                "/browser/open",
+                post(|c: Option<axum::Extension<ChatBrowser>>| async move {
+                    c.map(|c| c.0.chat_id).unwrap_or_default()
+                }),
+            )
+            .route("/browser/snapshot", echo())
+            .route("/browser/act", echo())
+            .route("/browser/look", echo())
+            .route("/browser/screenshot", echo())
+            .route("/browser/handoff", echo())
+            .route("/browser/close", echo())
+            .route("/browser/keep", post(|| async {}))
+            .route("/browser/forget", post(|| async {}))
+            .route("/browser/revoke", post(|| async {}))
+            .route("/browser/readonly", post(|| async {}))
+            .route("/browser/window", post(|| async {}))
+            .route("/browser/return", post(|| async {}))
+            .route("/browser/sessions", get(|| async {}))
+            .route("/browser/sites/{project_id}", get(|| async {}))
+            .route("/browser/writes/{project_id}", get(|| async {}))
+            .route("/browser/sessions/{id}/live", get(|| async {}))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_token,
+            ))
+            .with_state(state)
+    }
+
+    /// A browser session row as `seat.rs::row` writes one, with the owner columns chosen by the
+    /// caller.
+    async fn browser_session_row(
+        state: &AppState,
+        run_id: Option<i64>,
+        owner_chat_id: Option<&str>,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO browser_sessions
+                (sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url,
+                 final_url, rule, mode, owner_chat_id, opened_at)
+             VALUES ('s1', ?, 'acme', 'project', 'acme', 'https://example.org/',
+                     'https://example.org/', 'project-site', 'agent', ?, '2026-08-16T10:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(owner_chat_id)
+        .execute(&state.pool)
+        .await
+        .expect("insert session")
+        .last_insert_rowid()
+    }
+
+    async fn post_body_status(
+        app: &Router,
+        uri: &str,
+        bearer: &str,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    const CHAT_SESSION_ROUTES: [&str; 6] = [
+        "/browser/snapshot",
+        "/browser/act",
+        "/browser/look",
+        "/browser/screenshot",
+        "/browser/handoff",
+        "/browser/close",
+    ];
+
+    /// A chat key reaches the session routes only for a session its own chat owns: by the stamped
+    /// `owner_chat_id`, or by the run that opened it. Another chat's session, a session that does
+    /// not exist and a body that names no session are all refused — and the body the handler
+    /// receives is the one the client sent.
+    #[tokio::test]
+    async fn chat_browser_door_admits_a_chat_turn_only_on_its_own_session() {
+        let state = test_state("control-token").await;
+        let key = mint_chat_token(&state.pool, "c-1").await.unwrap();
+        let turn = running_turn_of(&state, "c-1").await;
+        let by_run = browser_session_row(&state, Some(turn), None).await;
+        let by_stamp = browser_session_row(&state, None, Some("c-1")).await;
+        let others = browser_session_row(&state, None, Some("other")).await;
+        let app = browser_door_router(state);
+
+        for route in CHAT_SESSION_ROUTES {
+            for session in [by_run, by_stamp] {
+                let body = format!("{{\"session_id\":{session}}}");
+                let (status, echoed) = post_body_status(&app, route, &key, &body).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{route} on its own session {session}"
+                );
+                assert_eq!(echoed, body, "{route}: the handler must still get the body");
+            }
+            let theirs = format!("{{\"session_id\":{others}}}");
+            assert_eq!(
+                post_body_status(&app, route, &key, &theirs).await.0,
+                StatusCode::FORBIDDEN,
+                "{route} on another chat's session"
+            );
+            assert_eq!(
+                post_body_status(&app, route, &key, "{\"session_id\":987654}")
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN,
+                "{route} on a session that does not exist"
+            );
+            assert_eq!(
+                post_body_status(&app, route, &key, "{}").await.0,
+                StatusCode::FORBIDDEN,
+                "{route} with a body naming no session"
+            );
+            assert_eq!(
+                post_body_status(&app, route, &key, "not json").await.0,
+                StatusCode::FORBIDDEN,
+                "{route} with a body that is not JSON"
+            );
+        }
+    }
+
+    /// The door is for a chat's key. A plain run key — a run with no chat — gets nothing on the
+    /// browser routes, even for a session its own run opened.
+    #[tokio::test]
+    async fn chat_browser_door_refuses_a_run_key_with_no_chat() {
+        let state = test_state("control-token").await;
+        let (run, key) = running_run_with_token(&state).await;
+        let session = browser_session_row(&state, Some(run), None).await;
+        let app = browser_door_router(state);
+
+        let body = format!("{{\"session_id\":{session}}}");
+        for route in CHAT_SESSION_ROUTES {
+            assert_eq!(
+                post_body_status(&app, route, &key, &body).await.0,
+                StatusCode::FORBIDDEN,
+                "{route} must stay closed to a run with no chat"
+            );
+        }
+        assert_eq!(
+            post_body_status(&app, "/browser/open", &key, "{}").await.0,
+            StatusCode::FORBIDDEN,
+            "a run with no chat may not open a browser either"
+        );
+    }
+
+    /// A chat key may open a browser — the handler is handed who is asking — and nothing else on
+    /// the pillar: the human's controls and every listing stay Admin-only.
+    #[tokio::test]
+    async fn chat_browser_door_admits_open_and_keeps_admin_routes_closed() {
+        let state = test_state("control-token").await;
+        let key = mint_chat_token(&state.pool, "c-1").await.unwrap();
+        let turn = running_turn_of(&state, "c-1").await;
+        let session = browser_session_row(&state, Some(turn), None).await;
+        let app = browser_door_router(state);
+
+        let (status, chat) = post_body_status(&app, "/browser/open", &key, "{}").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(chat, "c-1", "the handler is told which chat opened it");
+
+        let body = format!("{{\"session_id\":{session}}}");
+        for route in [
+            "/browser/keep",
+            "/browser/forget",
+            "/browser/revoke",
+            "/browser/readonly",
+            "/browser/window",
+            "/browser/return",
+        ] {
+            assert_eq!(
+                post_body_status(&app, route, &key, &body).await.0,
+                StatusCode::FORBIDDEN,
+                "{route} is the human's control and stays closed to a chat key"
+            );
+        }
+        for uri in [
+            "/browser/sessions".to_string(),
+            "/browser/sites/acme".to_string(),
+            "/browser/writes/acme".to_string(),
+            format!("/browser/sessions/{session}/live"),
+        ] {
+            assert_eq!(
+                status_of(&app, "GET", &uri, &key).await,
+                StatusCode::FORBIDDEN,
+                "{uri} stays closed to a chat key"
             );
         }
     }

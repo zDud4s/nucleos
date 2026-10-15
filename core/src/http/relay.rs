@@ -38,7 +38,9 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/web/pages/{id}", get(crate::integrations::web::get_page))
         // The browser pillar. Every one of these needs Admin — none is in `auth.rs`'s read-only
         // table, including the two GETs, because the list of hosts a project has logged into is a
-        // map of where its owner has accounts.
+        // map of where its owner has accounts. The one exception is the chat-browser door in
+        // `auth.rs`: a chat turn's own key reaches the seven agent verbs (open, snapshot, act,
+        // look, screenshot, handoff, close) for the sessions its chat or run owns, and nothing else.
         //
         // There is no `/browser/grant`, and its absence is the pillar's central invariant rather
         // than an omission: the site list grows when a person finishes a login and hands the wheel
