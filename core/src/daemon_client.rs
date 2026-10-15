@@ -5,7 +5,11 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::governance::autopilot::{Mode, ProjectSummary};
-use crate::integrations::github;
+
+mod browser;
+mod delivery;
+
+pub use delivery::*;
 
 /// The header that says WHICH NODE is calling.
 ///
@@ -684,49 +688,6 @@ impl DaemonClient {
         response.json().await.map_err(|e| e.to_string())
     }
 
-    // The browser pillar's five agent verbs (spec §6.1).
-    //
-    // # What is NOT here, and why each absence is load-bearing
-    //
-    // **No profile argument on `browser_open`.** The agent chooses WHAT to look at; the núcleo
-    // chooses WHERE it happens (spec §5.3, §6.1). A parameter here would be that boundary escaping
-    // to the wrong side of the wire, and what it decides is whether a stranger's page runs inside the
-    // profile holding the owner's logins.
-    //
-    // **No run id either.** Letting a tool name one would let an agent join the browser of a run
-    // that is not its own. The cost is real and worth stating: a session opened through this tool
-    // gets a throwaway of its own rather than sharing its run's, so a run that opens three pages
-    // gets three browsers.
-    //
-    // **No `browser_screenshot`, and `browser_look` is not it.** The screenshot route answers the
-    // shell: a full-page PNG of whatever is there, for a person's window. What the agent gets is a
-    // LOOK — viewport only, labelled with its own refs, and refused outright once a person has the
-    // wheel. Two routes rather than one with a flag, because the audience decides everything else.
-    //
-    // The reason there was no picture at all still stands and is now a price paid on purpose:
-    // `filter_outgoing` in `mcp_tools.rs` redacts TEXT, so a key drawn on a canvas crosses it. The
-    // argument, and the containment, are written at the image branch itself.
-    //
-    // **No `browser_grant`, and no route to write one against.** The site list grows when a person
-    // finishes a login and keeps the chain, and by no other means (spec §5.2).
-
-    /// Open a browsing session. The profile is chosen by the daemon, never named here.
-    pub async fn browser_open(
-        &self,
-        project_id: &str,
-        url: &str,
-        visible: bool,
-    ) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/browser/open")
-            .json(&serde_json::json!({ "project_id": project_id, "url": url, "visible": visible }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
-    }
-
     /// Ask the core to do something on the calling department's behalf.
     ///
     /// **The run is not an argument**, for `read_team_file`'s reason one method up: the department
@@ -1017,96 +978,6 @@ impl DaemonClient {
         json_or_refusal(response, "relaying a message to another conversation").await
     }
 
-    /// The accessibility view of a page: what is there and what it is called.
-    pub async fn browser_snapshot(
-        &self,
-        session_id: i64,
-        changes_only: bool,
-        text_from: i64,
-        controls_from: i64,
-        find: &str,
-    ) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/browser/snapshot")
-            .json(&serde_json::json!({
-                "session_id": session_id,
-                "changes_only": changes_only,
-                "text_from": text_from,
-                "controls_from": controls_from,
-                "find": find,
-            }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    /// One action against a ref from the last snapshot.
-    ///
-    /// A refusal by the fence comes back as an ordinary answer carrying `outcome: "refused"`, and
-    /// stays one all the way to the agent (spec §6.2). Turning it into an error here would make it
-    /// indistinguishable from a crashed browser, and the response to a crash is a retry.
-    pub async fn browser_act(
-        &self,
-        session_id: i64,
-        kind: &str,
-        element_ref: &str,
-        text: Option<String>,
-        filename: Option<String>,
-    ) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/browser/act")
-            .json(&serde_json::json!({
-                "session_id": session_id,
-                "kind": kind,
-                "ref": element_ref,
-                "text": text.unwrap_or_default(),
-                "filename": filename.unwrap_or_default(),
-            }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    /// The annotated picture. Answers with `image`, `mime` and the `labels` drawn on it.
-    pub async fn browser_look(&self, session_id: i64) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/browser/look")
-            .json(&serde_json::json!({ "session_id": session_id }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    /// Ask for the wheel. Raises a proposal; it hands nothing over (spec §4.4 rule 3).
-    pub async fn browser_handoff(&self, session_id: i64, reason: &str) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, "/browser/handoff")
-            .json(&serde_json::json!({ "session_id": session_id, "reason": reason }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    /// Close a session. The only one of the five that reads nothing from the page.
-    pub async fn browser_close(&self, session_id: i64) -> Result<Value, String> {
-        let response = self
-            .request(reqwest::Method::POST, "/browser/close")
-            .json(&serde_json::json!({ "session_id": session_id }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = response.status();
-        Ok(serde_json::json!({ "closed": status.is_success(), "status": status.as_u16() }))
-    }
-
     /// What is in the files folder. Reading only — there is deliberately no client method here for
     /// creating, writing, moving, deleting or downloading, so an agent cannot reach those even by
     /// mistake. The folder grew a whole file manager on the shell side; this stayed one verb.
@@ -1141,198 +1012,6 @@ impl DaemonClient {
             .await
             .map_err(|e| e.to_string())?;
         json_or_null(response).await
-    }
-
-    /// Queues one operation and waits for it, up to the daemon's own ceiling.
-    ///
-    /// Two calls rather than one: the submit answers as soon as the row is committed, and the wait is
-    /// a separate route so a caller that only wants a ticket is not made to block for it. What this
-    /// method does is spend the wait on the caller's behalf, which is spec decision 3's hybrid —
-    /// block for a while, then hand back a ticket rather than a timeout.
-    pub async fn vcs_request(
-        &self,
-        project_id: &str,
-        operation: &str,
-        source: Option<&str>,
-        target: Option<&str>,
-    ) -> Result<Value, String> {
-        let body = vcs_submit_body(project_id, operation, source, target)?;
-        let response = self
-            .request(reqwest::Method::POST, "/vcs/requests")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        // A refusal is a bare status with an empty body (`submit_vcs_request` returns
-        // `Result<Json<Ticket>, StatusCode>`), so `.json()` on it would fail with a decoding error
-        // that names nothing useful. The status IS the message: 404 is an unknown project, 422 a
-        // project whose recorded root is not a repository or a body the queue will not accept, 403 a
-        // token that may not queue.
-        if !response.status().is_success() {
-            return Err(format!(
-                "the daemon refused the request: {}",
-                response.status()
-            ));
-        }
-        let submitted: Value = response.json().await.map_err(|e| e.to_string())?;
-
-        match submitted["id"].as_i64() {
-            Some(id) => self.vcs_ticket(id, true).await,
-            None => Ok(submitted),
-        }
-    }
-
-    /// Reads something from GitHub, through the daemon that holds the credential.
-    ///
-    /// The flat parameters become a typed `ReadOp` HERE, before anything is sent, so a bad
-    /// repository comes back as a sentence naming the field rather than as a bare 400. The route
-    /// validates again on the way in — the same check on every road, which is what
-    /// `github`'s validating `Deserialize` exists for.
-    pub async fn github_read(
-        &self,
-        operation: String,
-        repo: String,
-        id: Option<String>,
-    ) -> Result<Value, String> {
-        let op = github::ReadOp::from_request(github::ReadRequest {
-            operation,
-            repo,
-            id,
-        })?;
-        self.github_request(&github::Op::Read(op)).await
-    }
-
-    /// Asks GitHub for something that changes it.
-    ///
-    /// The answer says which of two things happened — `ran`, or `filed_for_approval` with the number
-    /// a person will see beside it. **Neither blocks**, and the caller is meant to read the status
-    /// rather than assume the first.
-    pub async fn github_act(&self, request: github::ActRequest) -> Result<Value, String> {
-        let op = github::ActOp::from_request(request)?;
-        self.github_request(&github::Op::Act(op)).await
-    }
-
-    /// The one request both halves make.
-    ///
-    /// A refusal here carries a message in its body (`submit_github_request` answers
-    /// `(StatusCode, String)`), unlike `/vcs/requests` where the status IS the message — so the body
-    /// is read first and the status is only the fallback. Told "no github token is stored", a caller
-    /// knows what to do; told "403", it guesses.
-    async fn github_request(&self, op: &github::Op) -> Result<Value, String> {
-        let response = self
-            .request(reqwest::Method::POST, "/github/requests")
-            .json(&serde_json::json!({ "op": op }))
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(if body.trim().is_empty() {
-                format!("the daemon refused the request: {status}")
-            } else {
-                body
-            });
-        }
-        serde_json::from_str(&body).map_err(|error| error.to_string())
-    }
-
-    /// One queued operation's ticket: what was asked for and how it ended. `wait` spends up to the
-    /// daemon's ceiling waiting for it to finish; without it the answer is whatever the row says now.
-    pub async fn vcs_ticket(&self, id: i64, wait: bool) -> Result<Value, String> {
-        self.request(reqwest::Method::GET, &ticket_path(id, wait))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    /// Ask the daemon to verify a worktree. The answer is a ticket: finished when the daemon's wait
-    /// ceiling allowed, otherwise with progress to be read back through `verify_status`.
-    pub async fn verify(
-        &self,
-        kind: &str,
-        scope: &str,
-        worktree: Option<&str>,
-        files: Option<&[String]>,
-        base: Option<&str>,
-    ) -> Result<Value, String> {
-        self.verify_request(
-            "/verify",
-            &serde_json::json!({
-                "kind": kind,
-                "scope": scope,
-                "worktree": worktree,
-                "files": files,
-                "base": base,
-                "wait": true,
-            }),
-        )
-        .await
-    }
-
-    /// Ask the daemon for a covered verification of a worktree (F3-13): `cover` makes the daemon
-    /// pick the base, so the request carries neither `files` nor `base`. The answer is a ticket, as
-    /// with `verify`.
-    ///
-    /// It submits with `wait: false`: the daemon then answers with the ticket id at once and the
-    /// caller follows it through `verify_status`. With `wait: true` the daemon holds this POST for
-    /// up to its own ceiling, so a caller whose limit is shorter times out with the id never read,
-    /// and a ticket that exists cannot be joined.
-    pub async fn verify_cover(&self, worktree: &str) -> Result<Value, String> {
-        self.verify_request(
-            "/verify",
-            &serde_json::json!({
-                "kind": "test",
-                "scope": "scope",
-                "worktree": worktree,
-                "cover": true,
-                "wait": false,
-            }),
-        )
-        .await
-    }
-
-    /// One verification ticket's state; `wait` holds the line up to the daemon's ceiling.
-    pub async fn verify_status(&self, ticket: i64, wait: bool) -> Result<Value, String> {
-        self.verify_request(
-            "/verify/status",
-            &serde_json::json!({ "ticket": ticket, "wait": wait }),
-        )
-        .await
-    }
-
-    /// Tells the daemon an IDE session's verify box is still there (`POST /verify/box/beat`).
-    pub async fn verify_box_beat(&self, worktree: &str) -> Result<Value, String> {
-        self.verify_request(
-            "/verify/box/beat",
-            &serde_json::json!({ "worktree": worktree }),
-        )
-        .await
-    }
-
-    /// The one request every verify call makes (`verify`, `verify_status`, `verify_box_beat`). A
-    /// refusal carries its reason in the body (the handlers answer `(StatusCode, String)`), so the
-    /// body is read first and the status is only the fallback, as in `github_request`.
-    async fn verify_request(&self, path: &str, body: &Value) -> Result<Value, String> {
-        let response = self
-            .request(reqwest::Method::POST, path)
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(if text.trim().is_empty() {
-                format!("the daemon refused the request: {status}")
-            } else {
-                text
-            });
-        }
-        serde_json::from_str(&text).map_err(|error| error.to_string())
     }
 }
 
@@ -1403,30 +1082,6 @@ fn refusal_message(status: reqwest::StatusCode, detail: &str, context: &str) -> 
 /// from something sitting between here and it cannot become the turn's context.
 const REFUSAL_DETAIL_LIMIT: usize = 300;
 
-/// The submit body, built and validated before anything is sent.
-///
-/// Named `VcsSubmitBody` and not `VcsRequestBody` on purpose: `http.rs` has a private type by that
-/// second name for the *receiving* side of the same wire shape, and two identically named structs at
-/// opposite ends of one request are a trap for whoever changes one of them.
-#[derive(Serialize)]
-pub struct VcsSubmitBody {
-    pub project_id: String,
-    pub operation: crate::execution::vcs::Op,
-}
-
-/// PURE: the body for one queue submission, or why the request is not one.
-pub fn vcs_submit_body(
-    project_id: &str,
-    operation: &str,
-    source: Option<&str>,
-    target: Option<&str>,
-) -> Result<VcsSubmitBody, String> {
-    Ok(VcsSubmitBody {
-        project_id: project_id.to_owned(),
-        operation: crate::execution::vcs::Op::from_request(operation, source, target)?,
-    })
-}
-
 /// PURE: the `POST /council` body for one question. `rounds` and `roles` become keys only when
 /// given. An absent key is the daemon's documented "use the file's default"; a `null` reads the same
 /// today only because of how serde treats an `Option`, and a wire contract should not lean on that.
@@ -1443,16 +1098,6 @@ pub fn council_ask_body(
         body["roles"] = serde_json::json!(roles);
     }
     body
-}
-
-/// PURE: which of the two ticket routes to call. Extracted so the choice is asserted somewhere —
-/// inline, the difference between blocking and not blocking is one path segment nothing reads.
-fn ticket_path(id: i64, wait: bool) -> String {
-    if wait {
-        format!("/vcs/requests/{id}/wait")
-    } else {
-        format!("/vcs/requests/{id}")
-    }
 }
 
 /// Percent-encodes a query value.
