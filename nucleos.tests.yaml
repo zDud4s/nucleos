@@ -40,6 +40,7 @@ tests:
         - scripts/heavy.py
         - scripts/heavy_classify.py
         - scripts/heavy_guard.py
+        - scripts/heavy_cost.py
         - scripts/heavy_tests/
       command: bash scripts/gates.sh broker
   gate_entrypoints: [scripts/gates.sh, scripts/gate-diff.sh]

@@ -64,6 +64,8 @@ function session(overrides: Partial<BrowserSession> = {}): BrowserSession {
     mode: "wheel-requested",
     seat: null,
     shell_eligible: false,
+    visible: false,
+    owner_chat_id: null,
     refusal: null,
     proposal_id: 91,
     chain: null,

@@ -50,8 +50,10 @@ use crate::{
     devtime::unexplained as devtime_unexplained,
 };
 
+pub(crate) use self::facts::format_ms;
+#[cfg(test)]
+pub(crate) use self::facts::parse_ms;
 pub use self::facts::*;
-pub(crate) use self::facts::{format_ms, parse_ms};
 pub use self::pass::*;
 pub use self::project::*;
 
