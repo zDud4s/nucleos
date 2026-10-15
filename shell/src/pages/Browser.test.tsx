@@ -652,6 +652,29 @@ describe("Browser - opening a window yourself", () => {
     expect(link.getAttribute("href")).toBe("/chats/c-web");
   });
 
+  it("says when the agent's window opened in a throwaway, and how to bring the project's login into it", async () => {
+    daemon.apiFetch.mockImplementation(
+      browserFetch(
+        withProject({
+          onWindow: () => ({
+            session: session({ id: 13, visible: true, owner_chat_id: "c-web", profile_kind: "ephemeral" }),
+            chat_id: "c-web",
+          }),
+        }),
+      ),
+    );
+
+    await renderBrowser();
+
+    fireEvent.change(await screen.findByLabelText("Address to open"), {
+      target: { value: "https://news.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open with agent" }));
+
+    expect(await screen.findByText(/opened session #13 with the agent in a throwaway profile/i)).toBeTruthy();
+    expect(screen.getByText(/log in with Open a window and keep the site first/i)).toBeTruthy();
+  });
+
   it("asks for an address before opening with the agent, because the browser opens https pages only", async () => {
     daemon.apiFetch.mockImplementation(browserFetch(withProject()));
 

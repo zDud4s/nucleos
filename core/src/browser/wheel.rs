@@ -365,6 +365,22 @@ pub async fn accept_with_seat(
         None => SeatChoice::Window,
     };
 
+    // A headless session is promoted into a fenced window in the project's profile, and that fence
+    // refuses to start on a project with no site at all. The person's own window is then the seat:
+    // it is where a first login is made and can be kept (spec browser-com-painel-pela-pagina-web
+    // §3.6).
+    let seat = if seat == SeatChoice::Panel && !row.visible {
+        let project = row.project_id.clone().unwrap_or_default();
+        let sites = browser::admitted_origins(&state.pool, &project).await?;
+        if sites.read.is_empty() {
+            SeatChoice::Window
+        } else {
+            seat
+        }
+    } else {
+        seat
+    };
+
     if seat == SeatChoice::Panel {
         return accept_for_panel(state, &row).await;
     }
@@ -1659,7 +1675,10 @@ mod tests {
             "the agent starts at the wheel (§3.1 step 2)"
         );
         assert!(row.visible, "a window the person can see, with the panel");
-        assert_eq!(row.profile_kind, "project");
+        assert_eq!(
+            row.profile_kind, "ephemeral",
+            "the project has no site yet, so the policy's throwaway (§3.6)"
+        );
         assert_eq!(row.run_id, None, "no turn has run yet");
         assert_eq!(row.owner_chat_id.as_deref(), Some(opened.chat_id.as_str()));
         assert!(
@@ -2552,6 +2571,15 @@ mod tests {
     #[tokio::test]
     async fn the_panel_seat_promotes_a_headless_session_into_the_project_profile() {
         let (db, state, seen) = wheeled(vec![], false).await;
+        crate::browser::grant(
+            &state.pool,
+            "acme",
+            &["https://jira.example.org/login".to_string()],
+            false,
+            "2026-08-16T09:00:00Z",
+        )
+        .await
+        .expect("grant");
         let id = panel_row(&state, "ephemeral", mode::WHEEL_REQUESTED, None, false).await;
 
         let (row, nonce) = accept_with_seat(&state, id, Some(SeatChoice::Panel))
@@ -2577,6 +2605,30 @@ mod tests {
             "the person begins on the promoted browser: {calls:?}"
         );
         assert!(!calls.iter().any(|call| call == "wheel/take"), "{calls:?}");
+        db.close().await;
+    }
+
+    /// A project with no site yet has no fenced browser to promote into: the fence of its profile
+    /// would admit nothing and refuse to start. The panel seat then hands over the person's own
+    /// window in the project's profile, which is where a first login is made and can be kept
+    /// (spec browser-com-painel-pela-pagina-web §3.6).
+    #[tokio::test]
+    async fn the_panel_seat_without_any_site_hands_over_the_persons_window() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        let id = panel_row(&state, "ephemeral", mode::WHEEL_REQUESTED, None, false).await;
+
+        let (row, nonce) = accept_with_seat(&state, id, Some(SeatChoice::Panel))
+            .await
+            .expect("accept");
+
+        assert_eq!(nonce, None);
+        assert_eq!(row.mode, mode::HUMAN);
+        assert_eq!(row.seat.as_deref(), Some("window"));
+        assert_eq!(row.profile_kind, "project");
+        assert!(!row.visible, "no fenced window was opened");
+        let calls = seen.lock().unwrap().clone();
+        assert!(calls.iter().any(|call| call == "wheel/take"), "{calls:?}");
+        assert!(!calls.iter().any(|call| call == "open"), "{calls:?}");
         db.close().await;
     }
 
