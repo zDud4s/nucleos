@@ -1,5 +1,6 @@
 //! What each tool does to the world: `ToolEffect`, the effects table and the effect of one call.
 
+#[cfg(any(test, feature = "testkit"))]
 use super::*;
 
 /// The tools a hosted turn may be offered — a third-party model reached over OpenRouter, not a

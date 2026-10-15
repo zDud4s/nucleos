@@ -54,6 +54,10 @@ export interface BrowserSession {
   seat: "shell" | "window" | null;
   /** Whether the session can be driven from the shell (as opposed to only a real window). */
   shell_eligible: boolean;
+  /** A window the person can see, with the agent's chat panel on the right. */
+  visible: boolean;
+  /** The conversation the session answers to when no run opened it ("Open with agent"). */
+  owner_chat_id: string | null;
   refusal: string | null;
   /** The proposal that asked for the wheel, once one exists. Null means nothing to decide yet. */
   proposal_id: number | null;
@@ -431,6 +435,33 @@ export function useOpenWindow() {
       apiFetch<BrowserSession>("/browser/window", {
         method: "POST",
         body: JSON.stringify({ project_id: input.projectId, url: input.url }),
+      }),
+    retry: false,
+    onSettled: () => {
+      for (const key of browserKeys()) void queryClient.invalidateQueries({ queryKey: key });
+    },
+  });
+}
+
+/** What "Open with agent" hands back: the session, and the new conversation that owns it. */
+export interface OpenedWithAgent {
+  session: BrowserSession;
+  chat_id: string;
+}
+
+/**
+ * A person opens a window WITH the agent: the agent's visible session, fenced, with its chat panel,
+ * owned by a conversation the daemon makes on the spot (spec browser-com-painel-pela-pagina-web).
+ * The address is required — the browser opens `https` pages only, so there is no blank start here.
+ * Same `onSettled` reason as `useOpenWindow`.
+ */
+export function useOpenWithAgent() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: OpenWindowInput) =>
+      apiFetch<OpenedWithAgent>("/browser/window", {
+        method: "POST",
+        body: JSON.stringify({ project_id: input.projectId, url: input.url, agent: true }),
       }),
     retry: false,
     onSettled: () => {
