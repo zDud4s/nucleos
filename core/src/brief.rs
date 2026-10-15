@@ -850,12 +850,12 @@ mod tests {
 
     const BRIEFED_CONTEXTS: &[&str] = &[
         "assistant/turn.rs",
-        "council.rs",
+        "council/seat_run.rs",
         "http/agents.rs",
         "execution/job/spawn.rs",
         "loadout.rs",
         "execution/runs/create.rs",
-        "team.rs",
+        "team/launch.rs",
     ];
     const UNBRIEFED_LAUNCHERS: &[(&str, &str)] = &[
         (
