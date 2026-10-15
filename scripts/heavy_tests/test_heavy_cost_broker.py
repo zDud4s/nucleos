@@ -89,6 +89,28 @@ class Measured(Base):
         self.assertEqual(costs["classes"]["x|y|-|a|c"]["cores"], 3)
 
 
+    def test_a_cargo_run_that_compiles_nothing_is_scored_against_its_own_class(self) -> None:
+        # The admission prediction is for the compiling class (nobody knows yet); the row ends
+        # up in the `n` class, and its error must be measured against that class's prediction.
+        if os.name == "nt":
+            cargo = Path(self.tmp) / "cargo.cmd"
+            cargo.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+        else:
+            cargo = Path(self.tmp) / "cargo"
+            cargo.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            cargo.chmod(0o755)
+        (self.state / "costs.json").write_text(json.dumps({"v": 1, "classes": {
+            "cargo|check|-|a|c": {"cores": 9, "mem_mb": 5000, "n": 5},
+            "cargo|check|-|a|n": {"cores": 1, "mem_mb": 300, "n": 5},
+        }}), encoding="utf-8")
+        cp = run_broker(["--", str(cargo), "check"],
+                        clean_env(str(self.state), NUCLEOS_HEAVY_TARGET="0"))
+        self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
+        rows = [r for r in read_jsonl(self.state / "log.jsonl") if r.get("cls")]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["cls"], "cargo|check|-|a|n")
+        self.assertEqual((rows[0]["pred_cores"], rows[0]["pred_mem_mb"]), (1, 300))
+
 class Shadow(Base):
     def setUp(self) -> None:
         super().setUp()

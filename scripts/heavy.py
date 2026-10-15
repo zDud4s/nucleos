@@ -2017,9 +2017,16 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             rec["session"] = session
         try:
             hc = _cost_mod()
-            rec["cls"] = hc.class_key(argv, bool(verdict and verdict.filtered), True)
-            rec["pred_cores"], rec["pred_mem_mb"] = hc.predict(
-                hc.load_costs(directory), rec["cls"], weight)
+            filtered = bool(verdict and verdict.filtered)
+            costs = hc.load_costs(directory)
+            rec["cls"] = hc.class_key(argv, filtered, True)
+            rec["pred_cores"], rec["pred_mem_mb"] = hc.predict(costs, rec["cls"], weight)
+            # Whether a cargo run compiles is only known once it ends, and admission has to
+            # assume it will. Keep what the other class predicts, from the same table, so the
+            # row is scored against the class it lands in.
+            alt = hc.class_key(argv, filtered, False)
+            if alt != rec["cls"]:
+                rec["pred_alt"] = [alt, *hc.predict(costs, alt, weight)]
         except Exception:
             pass
         # Fixed order: worktree lock -> token. A cargo run takes the lock of its worktree
@@ -2299,6 +2306,9 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             argv, bool(verdict and verdict.filtered), bool(stats.get("compiled")))
         row["pred_cores"] = rec.get("pred_cores")
         row["pred_mem_mb"] = rec.get("pred_mem_mb")
+        alt = rec.get("pred_alt")
+        if isinstance(alt, list) and len(alt) == 3 and alt[0] == row["cls"]:
+            row["pred_cores"], row["pred_mem_mb"] = alt[1], alt[2]
     except Exception:
         pass
     # Register and log BEFORE releasing: the lock's next owner reads the registry the moment
@@ -2476,7 +2486,17 @@ def cmd_idle() -> int:
 def cmd_gc() -> int:
     """Collect dead broker state now (the throttled sweep runs the same code)."""
     d = state_dir()
-    counts = sweep(d)
+    try:
+        counts = sweep(d)
+    except TimeoutError:
+        try:
+            owner = json.loads((d / ".mutex" / "owner").read_text())
+            who = f"pid {owner.get('pid')}"
+        except (OSError, ValueError, AttributeError):
+            who = "another broker call"
+        sys.stderr.write(f"heavy gc: the broker mutex is busy (held by {who}); nothing was "
+                         "removed - try again\n")
+        return EXIT_QUEUE_TIMEOUT
     try:
         (d / SWEEP_STAMP).touch()
     except OSError:
