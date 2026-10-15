@@ -63,9 +63,29 @@ function mount(): HTMLElement {
   return host;
 }
 
+/**
+ * The sidecar injects this bundle as the document is created, before the parser
+ * has made `<html>`: `document.documentElement` is still null then, and mounting
+ * onto it threw, so no window ever showed its panel.
+ */
+function whenRooted(fn: (root: HTMLElement) => void): void {
+  if (document.documentElement) {
+    fn(document.documentElement);
+    return;
+  }
+  const watcher = new MutationObserver(() => {
+    if (!document.documentElement) return;
+    watcher.disconnect();
+    fn(document.documentElement);
+  });
+  watcher.observe(document, { childList: true });
+}
+
 if (topFrame) {
-  const host = mount();
-  new MutationObserver(() => {
-    if (!host.isConnected) document.documentElement.appendChild(host);
-  }).observe(document.documentElement, { childList: true });
+  whenRooted((root) => {
+    const host = mount();
+    new MutationObserver(() => {
+      if (!host.isConnected) document.documentElement.appendChild(host);
+    }).observe(root, { childList: true });
+  });
 }
