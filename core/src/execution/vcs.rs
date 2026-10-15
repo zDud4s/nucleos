@@ -4159,7 +4159,7 @@ mod tests {
         // The deadline is two orders of magnitude past how long the operation actually takes: what
         // this proves is that `wait_for` returns once the row finishes, not that it merely survives
         // to a deadline that happens to still be far away.
-        let (ticket, drained) = tokio::join!(wait_for(&pool, id, Duration::from_secs(5)), async {
+        let (ticket, drained) = tokio::join!(wait_for(&pool, id, Duration::from_secs(30)), async {
             // A head start so `wait_for`'s first read sees "queued", not "running" — the loop, not
             // a lucky initial read, is what has to notice the finish.
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4170,11 +4170,13 @@ mod tests {
         let ticket = ticket.unwrap();
         assert_eq!(ticket.status, "succeeded");
         assert_eq!(ticket.result_sha.as_deref(), Some("abc123"));
-        // A 10x margin under the 5s deadline: the operation itself finishes around 25ms in and a
-        // 10ms poll interval should catch it shortly after, so 500ms is nowhere near a close race
-        // in either direction.
+        // A 6x margin under the 30s deadline: the operation itself finishes around 25ms in and the
+        // poll interval catches it shortly after. Seconds, not 500ms: under a full suite on a
+        // loaded machine this took 650ms and then 1.19s with nothing wrong (2026-10-15), the same
+        // lesson the `failed` test above learned on 2026-09-13. A wait held to its deadline would
+        // still take 30s, so 5s keeps the test's whole point.
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < Duration::from_secs(5),
             "wait_for must return once the request finishes, not hold the caller to the full \
              deadline: took {:?}",
             started.elapsed()
