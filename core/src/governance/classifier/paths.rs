@@ -111,13 +111,19 @@ pub(super) fn target_lands_inside(
     // arrive here as ordinary-looking names that `normalize_path` happily glues onto the
     // workspace — so `cd ~ && …` read as landing in `<workspace>/~` and was allowed. Caught by
     // the test that walks the ways out; the `%VAR%` form had no test and would have shipped.
+    let workspace = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
+    if let Some(temp) = super::area::expand_temp(target, Some(shell)) {
+        return super::area::inside(
+            &fold_for_containment(&normalize_path(&temp, None)),
+            &workspace,
+        );
+    }
     if target.starts_with('~') || target.contains('$') || target.contains('%') {
         return false;
     }
-    let workspace = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
     let target = with_git_bash_drive(target, shell, &workspace);
     let target = fold_for_containment(&normalize_path(&target, Some(cwd)));
-    target == workspace || target.starts_with(&format!("{workspace}/"))
+    super::area::inside(&target, &workspace)
 }
 
 /// PURE: whether `cargo fmt`'s arguments leave it formatting the crate it stands in, and nothing
@@ -389,6 +395,17 @@ pub(super) fn confined_to_workspace(
         if !(candidate.contains('/') || candidate.contains('\\') || candidate.starts_with('.')) {
             continue;
         }
+        // A conversation's `$TEMP` is a place it may name (`area::expand_temp`).
+        if let Some(temp) = super::area::expand_temp(candidate, Some(shell)) {
+            if !super::area::inside(
+                &fold_for_containment(&normalize_path(&temp, None)),
+                &workspace,
+            ) {
+                return false;
+            }
+            named_a_path = true;
+            continue;
+        }
         // Rewritten by the shell before the command ever sees them, so their destination is not
         // something this can check. The same three `lands_inside_the_workspace` refuses.
         if candidate.starts_with('~') || candidate.contains('$') || candidate.contains('%') {
@@ -401,7 +418,7 @@ pub(super) fn confined_to_workspace(
         }
         let resolved = with_git_bash_drive(candidate, shell, &workspace);
         let resolved = fold_for_containment(&normalize_path(&resolved, Some(cwd)));
-        if resolved != workspace && !resolved.starts_with(&format!("{workspace}/")) {
+        if !super::area::inside(&resolved, &workspace) {
             return false;
         }
         named_a_path = true;

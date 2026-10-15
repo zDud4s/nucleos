@@ -186,21 +186,26 @@ pub(super) async fn rooted_verdict(
     } else {
         std::borrow::Cow::Borrowed(&state.github.policy)
     };
-    let mut classification = crate::governance::classifier::classify(
-        &payload.tool_name,
-        &payload.tool_input,
-        Some(Path::new(root)),
-        // The project's declared operations reach a conversation too. A rooted turn is the owner
-        // working on the project the turn is about, and what that project may do on its own remote
-        // does not change because somebody is watching.
-        policy.as_ref(),
-        // A project's `deny` means "never run this here", and a conversation is not an exemption:
-        // the owner sitting in front of this turn is the person who wrote the list down.
-        rules.declared(),
-        // A rooted turn is a conversation. Somebody asked for it AND is sitting in front of it, so
-        // a park costs them ten seconds and buys the strict reading.
-        crate::governance::classifier::Unrecognized::AsksAPerson,
-    );
+    // A conversation works across its project's checkouts and writes its logs to `$TEMP`, so it is
+    // classified over that wider area (`classifier::area`). An unattended run never gets it.
+    let area = crate::governance::classifier::conversation_area(Path::new(root));
+    let mut classification = crate::governance::classifier::within(&area, || {
+        crate::governance::classifier::classify(
+            &payload.tool_name,
+            &payload.tool_input,
+            Some(Path::new(root)),
+            // The project's declared operations reach a conversation too. A rooted turn is the owner
+            // working on the project the turn is about, and what that project may do on its own remote
+            // does not change because somebody is watching.
+            policy.as_ref(),
+            // A project's `deny` means "never run this here", and a conversation is not an exemption:
+            // the owner sitting in front of this turn is the person who wrote the list down.
+            rules.declared(),
+            // A rooted turn is a conversation. Somebody asked for it AND is sitting in front of it, so
+            // a park costs them ten seconds and buys the strict reading.
+            crate::governance::classifier::Unrecognized::AsksAPerson,
+        )
+    });
 
     // **`bypass` moves the VERDICT. It does not move the path.**
     //

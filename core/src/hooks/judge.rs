@@ -441,10 +441,10 @@ impl ChatJudge {
                     return (false, None);
                 };
                 let yes = reads_as_yes(&reply)
-                    && crate::judge::judge_may_allow(
+                    && conversation_may_allow(
                         call.tool_name,
                         call.tool_input,
-                        Some(Path::new(call.root)),
+                        call.root,
                         call.action_class,
                     );
                 (yes, cost)
@@ -472,7 +472,22 @@ pub(super) fn jev_approves(
         crate::judge::combined(in_scope, safe),
         crate::judge::Thresholds::default(),
     ) == crate::judge::Band::Allow
-        && crate::judge::judge_may_allow(tool_name, tool_input, Some(Path::new(root)), action_class)
+        && conversation_may_allow(tool_name, tool_input, root, action_class)
+}
+
+/// `judge_may_allow` over the conversation's area (`classifier::area`): a chat's judge may approve a
+/// `cd` into another checkout of the project, or a log written to `$TEMP`, which an unattended
+/// run's may not.
+pub(super) fn conversation_may_allow(
+    tool_name: &str,
+    tool_input: &Value,
+    root: &str,
+    action_class: &str,
+) -> bool {
+    let area = crate::governance::classifier::conversation_area(Path::new(root));
+    crate::governance::classifier::within(&area, || {
+        crate::judge::judge_may_allow(tool_name, tool_input, Some(Path::new(root)), action_class)
+    })
 }
 
 /// How the Haiku judge is launched: a print-mode CLI with no tools to call, JSON out.
@@ -963,6 +978,8 @@ mod tests {
         /// The session's own working directory, which is what a chat is rooted in.
         root: String,
         action_class: &'static str,
+        /// Whether the classifier allows it outright over the conversation's area.
+        allowed_in_area: bool,
     }
 
     /// Every `*.jsonl` under `dir`, subagent transcripts included, newest first so that a cap keeps
@@ -1107,6 +1124,7 @@ mod tests {
                                 recent: before,
                                 root: root.clone(),
                                 action_class: classified.action_class,
+                                allowed_in_area: false,
                             });
                             if cases.len() >= cap {
                                 break 'files;
@@ -1205,25 +1223,88 @@ mod tests {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(80);
 
-        let asked = unrecognised_asks(&dir, cap);
+        let mut asked = unrecognised_asks(&dir, cap);
+        let total = asked.len();
+        // The worktrees these sessions worked in are mostly gone from the disk by now, so each
+        // case's area is its conversation's as read today plus every directory a session was
+        // rooted in, which is the set of checkouts that existed when the transcripts were written.
+        let mut known: Vec<std::path::PathBuf> = asked
+            .iter()
+            .map(|case| std::path::PathBuf::from(&case.root))
+            .collect();
+        // And every sibling checkout a command named, since a session usually `cd`s into one
+        // rather than being rooted in it.
+        for case in &asked {
+            let text = case
+                .input
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .replace('\\', "/");
+            for (at, _) in text.match_indices("Projects/nucleos-") {
+                let name: String = text[at + "Projects/".len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                    .collect();
+                known.push(std::path::PathBuf::from(format!("C:/Projects/{name}")));
+            }
+        }
+        known.sort();
+        known.dedup();
+        let area_of = |root: &str| {
+            crate::governance::classifier::conversation_area(Path::new(root)).with_roots(&known)
+        };
+        for case in &mut asked {
+            let in_area = crate::governance::classifier::within(&area_of(&case.root), || {
+                crate::governance::classifier::classify(
+                    &case.tool,
+                    &case.input,
+                    Some(Path::new(&case.root)),
+                    &crate::integrations::github::Policy::empty(),
+                    &crate::project::policy::ShellRules::default(),
+                    crate::governance::classifier::Unrecognized::AsksAPerson,
+                )
+            });
+            case.allowed_in_area = in_area.decision.decision == "allow";
+            case.action_class = in_area.action_class;
+        }
+        // What the conversation's area lets the classifier allow outright never reaches a judge.
+        let (allowed, asked): (Vec<ComparedCase>, Vec<ComparedCase>) =
+            asked.into_iter().partition(|case| case.allowed_in_area);
         // Only what a judge could approve is put to one: the guard refuses the rest whatever the
         // model says, so asking about them measures the guard and spends money doing it.
         let (cases, guarded): (Vec<ComparedCase>, Vec<ComparedCase>) =
             asked.into_iter().partition(|case| {
-                crate::judge::judge_may_allow(
-                    &case.tool,
-                    &case.input,
-                    Some(Path::new(&case.root)),
-                    case.action_class,
-                )
+                crate::governance::classifier::within(&area_of(&case.root), || {
+                    crate::judge::judge_may_allow(
+                        &case.tool,
+                        &case.input,
+                        Some(Path::new(&case.root)),
+                        case.action_class,
+                    )
+                })
             });
         println!(
-            "{} unrecognised asks from {}; the guard refuses {} whatever the judge says, {} go to the judges",
-            cases.len() + guarded.len(),
+            "{total} unrecognised asks from {}; {} now allowed outright, the guard refuses {} whatever the judge says, {} go to the judges",
             dir.display(),
+            allowed.len(),
             guarded.len(),
             cases.len()
         );
+        // `NUCLEOS_JUDGE_COMPARE_DRY=1` stops at the counts and spends nothing.
+        if std::env::var_os("NUCLEOS_JUDGE_COMPARE_DRY").is_some() {
+            for case in &guarded {
+                let guard = crate::governance::classifier::within(&area_of(&case.root), || {
+                    crate::governance::classifier::judge_guard(
+                        &case.tool,
+                        &case.input,
+                        Path::new(&case.root),
+                    )
+                });
+                println!("guarded {guard:?} | {}", detail_of(case));
+            }
+            return;
+        }
 
         let mut state = bare_state().await;
         state.judge = std::sync::Arc::new(crate::judge::JudgeRuntime::jev());

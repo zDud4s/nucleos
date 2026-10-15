@@ -130,6 +130,8 @@ pub fn judge_guard(tool_name: &str, tool_input: &Value, cwd: &Path) -> Option<Ju
         .and_then(Value::as_str)
         .unwrap_or("");
     let shell = shell_for(tool_name);
+    let spelled = super::area::spelled_out(command, shell);
+    let command = spelled.as_deref().unwrap_or(command);
     for segment in crate::command_reader::segments(command, shell) {
         let words = guard_words(segment, shell);
         if is_irreversible(segment, &words) {
@@ -281,6 +283,14 @@ pub(super) fn escapes_the_run(
     {
         return false;
     }
+    // A conversation's logs in `$TEMP` are inside its area (`area::expand_temp`); outside one, the
+    // temp directory keeps the reading below.
+    if let Some(temp) = super::area::expand_temp(candidate, shell) {
+        return !super::area::inside(
+            &fold_for_containment(&normalize_path(&temp, None)),
+            workspace,
+        );
+    }
     let path_shaped =
         candidate.contains('/') || candidate.contains('\\') || candidate.starts_with('.');
     if candidate.starts_with('~')
@@ -298,7 +308,7 @@ pub(super) fn escapes_the_run(
         None => candidate.to_owned(),
     };
     let resolved = fold_for_containment(&normalize_path(&resolved, Some(cwd)));
-    resolved != workspace && !resolved.starts_with(&format!("{workspace}/"))
+    !super::area::inside(&resolved, workspace)
 }
 
 /// G3. What is recoverable only through the reflog or not at all, and the git that destroys the

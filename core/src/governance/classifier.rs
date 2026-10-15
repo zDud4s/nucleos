@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::hooks::Decision;
 
+mod area;
 mod grammar;
 mod judge_guard;
 mod paths;
@@ -12,6 +13,7 @@ mod reads;
 mod shell_shape;
 mod write_guards;
 
+pub use self::area::{Area, conversation_area, within};
 pub use self::judge_guard::*;
 pub use self::paths::*;
 pub use self::shell_shape::*;
@@ -709,11 +711,15 @@ pub fn classify(
         );
     }
 
+    let command = tool_input
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    // Inside a conversation's area, the variables the line assigned itself are spelled out first
+    // (`area::spelled_out`); everywhere else this is the line as written.
+    let spelled = area::spelled_out(command, shell_for(tool_name));
     classify_shell_command(
-        tool_input
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
+        spelled.as_deref().unwrap_or(command),
         cwd,
         policy,
         rules,

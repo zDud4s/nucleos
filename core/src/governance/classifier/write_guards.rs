@@ -155,7 +155,7 @@ pub(super) fn writes_outside_cwd(tool_input: &Value, cwd: Option<&Path>) -> bool
 
     let target = fold_for_containment(&normalize_path(file_path, Some(cwd)));
     let cwd = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
-    target != cwd && !target.starts_with(&format!("{cwd}/"))
+    !super::area::inside(&target, &cwd)
 }
 
 /// PURE: splits the first whitespace-delimited token (quotes respected) off `raw`, returning the
