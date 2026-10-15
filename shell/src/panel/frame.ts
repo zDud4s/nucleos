@@ -7,3 +7,12 @@ export function shouldMount(win: Window): boolean {
     return false;
   }
 }
+
+/**
+ * The app declares every token on `:root`, which matches nothing inside a shadow
+ * root: left as it was, no variable reached the panel and it drew in the
+ * browser's bare defaults. On the shadow host they cascade into the panel.
+ */
+export function hostScoped(css: string): string {
+  return css.replace(/:root\b/g, ":host");
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { shouldMount } from "./frame";
+import { hostScoped, shouldMount } from "./frame";
 
 describe("panel frame guard", () => {
   it("panel frame guard mounts in the top frame only", () => {
@@ -18,5 +18,14 @@ describe("panel frame guard", () => {
       self: {},
     } as unknown as Window;
     expect(shouldMount(hostile)).toBe(false);
+  });
+});
+
+describe("panel shadow styles", () => {
+  it("panel shadow styles move the app's root tokens onto the shadow host", () => {
+    const css = ":root { --text: #eee; }\n@media (prefers-color-scheme: dark) { :root { --bg: #000; } }";
+    const scoped = hostScoped(css);
+    expect(scoped).not.toContain(":root");
+    expect(scoped).toBe(":host { --text: #eee; }\n@media (prefers-color-scheme: dark) { :host { --bg: #000; } }");
   });
 });
