@@ -15,9 +15,13 @@
 //! old rules. Selection, the five signals and the budget arrive next, and the pool-facing half of
 //! them lands in `brief.rs` rather than here.
 
-use self::history::{fetch, known_element};
+#[cfg(test)]
+use self::history::fetch;
+use self::history::known_element;
+use self::select::weights;
+#[cfg(test)]
 use self::select::{
-    NEUTRAL_UTILITY, WITH_SIM, WITHOUT_SIM, Weights, ordered_candidates, scored_candidates, weights,
+    NEUTRAL_UTILITY, WITH_SIM, WITHOUT_SIM, Weights, ordered_candidates, scored_candidates,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
