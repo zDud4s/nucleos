@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -232,6 +232,60 @@ pub async fn run_gate(
     }
 }
 
+/// Git's own `bash`/`sh` for a program named bare as one, or `None` to spawn it as written.
+///
+/// **Without this a bare `bash` on Windows is WSL.** The search for an unqualified program reaches
+/// `System32` before the `PATH` entries Git adds, and `System32\bash.exe` is the WSL launcher — a
+/// different OS with none of the toolchain in it. Every scoped gate on 2026-10-15 ran
+/// `bash scripts/gates.sh core` from `nucleos.tests.yaml` that way and failed on `cargo: command
+/// not found` under `/mnt/c/...`, which reads as a red suite and is not one. The full gate escaped
+/// only because its `gate_command` spells Git's bash out absolutely.
+///
+/// Only a bare name is replaced: a command that names a path chose its program and gets it.
+/// `git_bin` is a function so the rule is testable without a Git install.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn posix_shell(program: &str, git_bin: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
+    let lower = program.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    if stem != "bash" && stem != "sh" {
+        return None;
+    }
+    git_bin().map(|bin| bin.join(format!("{stem}.exe")))
+}
+
+/// The `bin` directory of this machine's Git for Windows, found once.
+///
+/// From the `git.exe` on `PATH` first — `<root>\cmd`, `<root>\bin` or `<root>\mingw64\bin` — so a
+/// Git installed somewhere unusual is the one used, then the usual install folders. Accepted only
+/// when `bash.exe` is actually there.
+#[cfg(windows)]
+fn git_bin() -> Option<PathBuf> {
+    static FOUND: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let from_path = std::env::var_os("PATH")
+                .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|dir| dir.join("git.exe").is_file())
+                .filter_map(|dir| {
+                    let mut root = dir.parent()?.to_path_buf();
+                    if root.ends_with("mingw64") {
+                        root = root.parent()?.to_path_buf();
+                    }
+                    Some(root.join("bin"))
+                });
+            let installed = ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
+                .into_iter()
+                .filter_map(std::env::var_os)
+                .map(|folder| PathBuf::from(folder).join("Git").join("bin"));
+            from_path
+                .chain(installed)
+                .find(|bin| bin.join("bash.exe").is_file())
+        })
+        .clone()
+}
+
 /// What a child run produced, before anyone decides what it means.
 #[derive(Debug)]
 pub struct ArgvOutcome {
@@ -267,7 +321,14 @@ pub async fn run_argv(
         return failed("empty command".to_owned());
     };
 
-    let mut command = Command::new(program);
+    #[cfg(windows)]
+    let shell = posix_shell(program, git_bin);
+    #[cfg(not(windows))]
+    let shell: Option<PathBuf> = None;
+    let mut command = match &shell {
+        Some(shell) => Command::new(shell),
+        None => Command::new(program),
+    };
     command
         .args(arguments)
         .envs(
@@ -455,11 +516,53 @@ where
 #[rustfmt::skip]
 #[cfg(test)]
 mod tests {
-    use super::{ExitVerdict, GateOutcome, classify_exit, run_argv, run_gate, split_environment};
+    use super::{
+        ExitVerdict, GateOutcome, classify_exit, posix_shell, run_argv, run_gate, split_environment,
+    };
+    use std::path::PathBuf;
     use std::time::Duration;
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_bare_bash_or_sh_is_taken_from_gits_bin_directory() {
+        let bin = PathBuf::from(r"C:\Program Files\Git\bin");
+        for (program, file) in [
+            ("bash", "bash.exe"),
+            ("sh", "sh.exe"),
+            ("bash.exe", "bash.exe"),
+            ("BASH", "bash.exe"),
+        ] {
+            assert_eq!(
+                posix_shell(program, || Some(bin.clone())),
+                Some(bin.join(file)),
+                "{program}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_path_another_program_or_no_git_is_left_alone() {
+        let bin = || Some(PathBuf::from(r"C:\Program Files\Git\bin"));
+        assert_eq!(posix_shell(r"C:\Windows\System32\bash.exe", bin), None);
+        assert_eq!(posix_shell("/usr/bin/bash", bin), None);
+        assert_eq!(posix_shell("cargo", bin), None);
+        assert_eq!(posix_shell("bashful", bin), None);
+        assert_eq!(posix_shell("bash", || None::<PathBuf>), None);
+    }
+
+    /// The defect this exists for: `bash scripts/gates.sh core` from `nucleos.tests.yaml` resolved
+    /// to `System32\bash.exe`, which is WSL, and every scoped gate failed on `cargo: command not
+    /// found` under `/mnt/c/...` (run 900667, 2026-10-15).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_bare_bash_on_windows_is_gits_and_never_wsl() {
+        let cwd = tempfile::tempdir().expect("create temporary directory");
+        let outcome = run_argv(&argv(&["bash", "-c", "uname -s"]), cwd.path(), &[], Duration::from_secs(30)).await;
+        assert_eq!(outcome.exit_code, Some(0), "tail was: {}", outcome.tail);
+        assert!(!outcome.tail.contains("Linux"), "ran under WSL: {}", outcome.tail);
     }
 
     #[tokio::test]
