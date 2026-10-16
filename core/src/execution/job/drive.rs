@@ -304,6 +304,11 @@ pub(super) async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) 
     if let Next::MergeItem { ordinal } = &next {
         return merge_item(state, job, *ordinal).await;
     }
+    // A git reset, no run and no quota: refusing it under a brake would leave the job's branch
+    // holding work a gate rejected for as long as the brake holds.
+    if let Next::SettleRevert { ordinal } = &next {
+        return settle_revert(state, job, *ordinal, None).await;
+    }
     // Past the brakes with the other two, and it is the cheapest of the three: one UPDATE, no
     // subprocess and no run. Parking a job rather than writing it would leave the item reading
     // `pending` — work a person is told is still coming — for as long as the brake holds.
@@ -505,12 +510,13 @@ pub(super) async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) 
             );
             spawn_node(state, job, "replan", prompt, None, worktree, NoRoom::Park).await
         }
-        // All four are answered above, before the brakes and before the worktree is resolved.
+        // All five are answered above, before the brakes and before the worktree is resolved.
         // Reaching one here means the dispatch above stopped covering something it used to.
         Next::Wait
         | Next::Finish(_)
         | Next::RunGate { .. }
         | Next::MergeItem { .. }
+        | Next::SettleRevert { .. }
         | Next::Orphan { .. } => Step::Stopped,
     }
 }
@@ -521,6 +527,9 @@ pub(super) async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) 
 /// a proposal waiting for a person, not work that went wrong, and listing it here would ask the
 /// replan to route around a decision that is not its to make. `gate_errored` is absent because it
 /// ends the job outright, so no replan ever runs to read it.
+///
+/// `reverted` is never seen here, because `next_step` settles it into `gate_failed` before any
+/// round can close.
 ///
 /// A read that fails costs the replan its context and nothing else, so it answers with an empty
 /// list rather than refusing: the round it is about to open is worth more than the paragraph.

@@ -69,7 +69,8 @@ export interface ProgressNode {
    * way, and only the attempt count beside the job's budget separates them. That count is not on
    * the wire, so the shell genuinely cannot tell. Drawing such an item as stopped would be a lie
    * in the direction that matters: a queue that still owes it a run, shown as work that will never
-   * happen.
+   * happen. `reverted` is the same question one step earlier: the gate said no and the branch was
+   * reset, and it leaves for another attempt or for `gate_failed`.
    */
   undecided: boolean;
 }
@@ -127,9 +128,12 @@ const LIFECYCLE: Record<string, Lifecycle> = {
   // Ran clean; the gate has not measured it yet. In flight, not done.
   implemented: "running",
   merging: "running",
-  // The merge landed, the gate went red, the job's branch was reset. It leaves for another
-  // attempt or for `gate_failed` -- either way the queue is still holding it.
-  reverted: "running",
+  // The gate said no and the branch was reset. It leaves for another attempt or for
+  // `gate_failed`, so it is the gate's verdict being answered, not work running.
+  reverted: "gated",
+  // The gate said no and the branch could not be put back, so the rejected work is still on it
+  // and the job stopped.
+  revert_failed: "stopped",
   passed: "done",
   // Put down rather than failed, and not waiting on anybody: `Conflicted` "leaves for `Running` —
   // the resolution node, in that same tree", and `next_step` finds it by the same search as pending
@@ -158,6 +162,7 @@ const READING: Record<string, string> = {
   implemented: "written, not yet measured",
   merging: "merging into the job's branch",
   reverted: "merged, gate went red, branch reset",
+  revert_failed: "the gate said no and the branch could not be put back — the job stopped",
   passed: "done",
   conflicted: "the merge hit a conflict — a run resolves it in the item's own tree",
   skipped: "put down: it asked for a decision",
@@ -227,7 +232,7 @@ export function itemNode(item: JobItem): ProgressNode {
     agentName: item.agent_name,
     gateStatus: item.gate_status,
     files: item.files,
-    undecided: status === "gate_failed",
+    undecided: status === "gate_failed" || status === "reverted",
   };
 }
 

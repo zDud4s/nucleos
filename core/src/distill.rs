@@ -75,8 +75,8 @@ pub async fn enqueue_job_ending_in(
 }
 
 /// Queue the item verdict just written for `(job_id, ordinal)`: a pass after at least one red
-/// gate is a recovery, and a `gate_failed` item whose reds exceed the job's retries is
-/// exhausted. Anything else queues nothing.
+/// gate is a recovery, and a `gate_failed` or `revert_failed` item whose reds exceed the job's
+/// retries is exhausted. Anything else queues nothing.
 pub async fn enqueue_item_verdict_in(
     conn: &mut SqliteConnection,
     job_id: i64,
@@ -102,7 +102,8 @@ pub async fn enqueue_item_verdict_in(
          SELECT ?, j.project_id, j.id, i.id, i.run_id, 'pending', 0, ?
            FROM job_items i JOIN jobs j ON j.id = i.job_id
           WHERE i.job_id = ? AND i.ordinal = ?
-            AND i.status = 'gate_failed' AND i.gate_attempts > j.gate_retries",
+            AND i.status IN ('gate_failed', 'revert_failed')
+            AND i.gate_attempts > j.gate_retries",
     )
     .bind(Cause::RunExhausted.as_str())
     .bind(now())
@@ -1456,6 +1457,27 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 0, "item {untouched} queued something it should not");
         }
+    }
+
+    /// An item whose branch could not be put back is `revert_failed`, and past its retries it is
+    /// exhausted all the same.
+    #[tokio::test]
+    async fn a_revert_failed_item_past_its_retries_is_queued_exhausted() {
+        let pool = test_pool().await;
+        seed_job(&pool, 3, "alpha", 1).await;
+        let exhausted = seed_item(&pool, 3, 1, "revert_failed", "failed", 2).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        enqueue_item_verdict_in(&mut conn, 3, 1).await.unwrap();
+        drop(conn);
+
+        let rows: Vec<(Option<i64>, String)> = sqlx::query_as(
+            "SELECT item_id, project_id FROM distill_queue WHERE cause = 'run_exhausted'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![(Some(exhausted), "alpha".to_string())]);
     }
 
     /// A land's success is a merge of the job's own branch into a branch a person owns; a merge

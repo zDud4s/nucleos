@@ -31,6 +31,7 @@ const EVERY_STORED_STATUS = [
   "merging",
   "conflicted",
   "reverted",
+  "revert_failed",
   "orphaned",
   "superseded",
 ];
@@ -125,10 +126,18 @@ describe("job-progress — the status table", () => {
     expect(lifecycleOf("passed")).toBe("done");
   });
 
-  it("treats a reverted item as still held by the queue", () => {
-    // It leaves for another attempt or for `gate_failed`; either way the job is not finished
-    // with it, and "stopped" would be wrong in the direction that hides live work.
-    expect(lifecycleOf("reverted")).toBe("running");
+  it("draws a reverted item as a gate verdict still being answered, not as running", () => {
+    // The gate said no and the branch was reset; the item leaves for another attempt or for
+    // `gate_failed`, so it is the gate's verdict being answered, not work in flight.
+    expect(lifecycleOf("reverted")).toBe("gated");
+    expect(lifecycleOf("reverted")).not.toBe("running");
+    expect(itemNode(item({ status: "reverted" })).undecided).toBe(true);
+  });
+
+  it("draws revert_failed as stopped and apart from gate_failed", () => {
+    // The branch could not be put back, so the rejected work is still on it and the job stopped.
+    expect(lifecycleOf("revert_failed")).toBe("stopped");
+    expect(readingOf("revert_failed")).not.toBe(readingOf("gate_failed"));
   });
 });
 
@@ -141,7 +150,7 @@ describe("job-progress — the gate's undecidable status", () => {
 
   it("marks nothing else as undecided", () => {
     const undecided = EVERY_STORED_STATUS.filter((status) => itemNode(item({ status })).undecided);
-    expect(undecided).toEqual(["gate_failed"]);
+    expect(undecided).toEqual(["gate_failed", "reverted"]);
   });
 });
 

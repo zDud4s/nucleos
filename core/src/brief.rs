@@ -41,9 +41,10 @@ const SWEEP_BATCH: i64 = 64;
 /// Item statuses that are final without consulting their job. This mirrors `item_verdict`; the
 /// `the_sweep_selects_exactly_the_items_item_verdict_calls_final` agreement test keeps the SQL
 /// prefilter and the Rust verdict rule aligned.
-const FINAL_ITEM_STATUSES: [&str; 7] = [
+const FINAL_ITEM_STATUSES: [&str; 8] = [
     "passed",
     "failed",
+    "revert_failed",
     crate::execution::job::STATUS_CANCELLED,
     "gate_errored",
     crate::execution::job::STATUS_SKIPPED,
@@ -532,7 +533,7 @@ pub fn item_verdict(
     match state {
         ItemState::Passed if gate_status == Some("passed") => Some(Verdict::Green),
         ItemState::Passed | ItemState::Failed => Some(run_without_gate()),
-        ItemState::GateFailed => Some(Verdict::NotGreen),
+        ItemState::GateFailed | ItemState::RevertFailed => Some(Verdict::NotGreen),
         // Owner decision: credit must not depend on which side of a replan the sweep runs.
         // Replans supersede only gate_failed/failed items, so NULL keeps the prior run verdict.
         ItemState::Superseded => Some(match gate_status {
@@ -1730,6 +1731,7 @@ mod tests {
             "conflicted",
             "reverted",
             "gate_failed",
+            "revert_failed",
             "passed",
             "failed",
             "cancelled",
@@ -2045,6 +2047,16 @@ mod tests {
             );
         }
         assert_eq!(item_verdict(ItemState::Conflicted, None, false, None), None);
+    }
+
+    /// A branch that could not be put back after a red gate is a gate that failed: it is
+    /// credited NotGreen, the same as `gate_failed`.
+    #[test]
+    fn a_revert_failed_item_is_credited_not_green() {
+        assert_eq!(
+            item_verdict(ItemState::RevertFailed, Some("failed"), false, None),
+            Some(Verdict::NotGreen)
+        );
     }
 
     /// `BRIEFED_CONTEXTS` is a constant: this test fails the day a new context appears outside
