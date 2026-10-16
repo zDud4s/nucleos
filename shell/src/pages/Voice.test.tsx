@@ -191,10 +191,9 @@ describe("Voice — hotkey registration", () => {
     await renderVoice();
 
     expect(await screen.findByText("armed, but the hotkeys did not register — use the buttons below")).toBeDefined();
-    const capture = screen.getByRole("heading", { level: 2, name: "Capture" }).closest("section");
-    expect(capture).not.toBeNull();
-    expect(within(capture as HTMLElement).getByText("hotkeys failed")).toBeDefined();
-    expect(within(capture as HTMLElement).queryByText("idle")).toBeNull();
+    const capture = screen.getByRole("group", { name: "Capture" });
+    expect(within(capture).getByText("hotkeys failed")).toBeDefined();
+    expect(within(capture).queryByText("idle")).toBeNull();
   });
 
   it("says there are no global hotkeys on Wayland instead of registering them", async () => {
@@ -267,6 +266,9 @@ describe("Voice — capture outcomes", () => {
 
     await renderVoice();
 
+    // The lists live in the archive drawer now, closed until somebody asks for it.
+    fireEvent.click(await screen.findByRole("button", { name: /^Archive/ }));
+
     expect(await screen.findByText("call the plumber")).toBeDefined();
   });
 });
@@ -287,6 +289,8 @@ function aConversation(overrides: Record<string, unknown> = {}) {
     assembling: null,
     silence: null,
     ignoredEcho: 0,
+    answer: null,
+    answerTap: null,
     toggle: conversation.toggle,
     ...overrides,
   };
@@ -485,5 +489,242 @@ describe("Voice — the conversation chord", () => {
 
     await waitFor(() => expect(conversation.toggle).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(router.state.location.search).toEqual({}));
+  });
+});
+
+/* ------------------------------------------------------------------ the room -- */
+
+/** The page with the conversation in whatever state a test needs, and a daemon that has no chats. */
+async function renderRoom(
+  view: Record<string, unknown>,
+  config: VoiceConfigView = voiceConfig(),
+  memos: Capture[] = [],
+  dictations: Capture[] = [],
+) {
+  const base = withChats(config, []);
+  daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+    if (path === "/voice/memos") return memos;
+    if (path === "/voice/dictations") return dictations;
+    return base(path, init);
+  });
+  conversation.useVoiceConversation.mockImplementation(() => aConversation(view));
+  return renderVoice();
+}
+
+/** The captions block, once the page has drawn it. */
+async function findCaptions(container: HTMLElement): Promise<HTMLElement> {
+  await screen.findByRole("button", { name: /^(Start|Stop) talking$/ });
+  const captions = container.querySelector<HTMLElement>(".voice-captions");
+  expect(captions).not.toBeNull();
+  return captions as HTMLElement;
+}
+
+describe("Voice — the room", () => {
+  /* What it says is read from the real view, in the order the person lived it: what they said first,
+     then what the núcleo answered. The label names WHOSE words these are, so the lines below are
+     told apart by it and not by position. */
+  it("captions show the answer's words while it is spoken", async () => {
+    let { container, unmount } = await renderRoom({
+      phase: "speaking",
+      heard: "when is the meeting",
+      answer: "The meeting is at three o'clock.",
+    });
+    let captions = await findCaptions(container);
+
+    // A live region, so the words are read out as they change rather than only found by a cursor.
+    expect(captions.getAttribute("aria-live")).toBe("polite");
+    expect(captions.querySelector(".voice-caption-label")?.textContent).toBe("nucleos");
+    expect(captions.querySelector(".voice-caption-words")?.textContent).toContain(
+      "The meeting is at three o'clock.",
+    );
+    unmount();
+
+    // Heard and still being answered: the person's own words, with what is happening to them.
+    ({ container, unmount } = await renderRoom({ phase: "thinking", heard: "what time is it" }));
+    captions = await findCaptions(container);
+    expect(captions.querySelector(".voice-caption-label")?.textContent).toBe("heard — sending");
+    expect(captions.querySelector(".voice-caption-words")?.textContent).toContain("“what time is it”");
+    unmount();
+
+    // Heard while listening: sent already, so no "sending".
+    ({ container, unmount } = await renderRoom({ phase: "listening", heard: "what time is it" }));
+    captions = await findCaptions(container);
+    expect(captions.querySelector(".voice-caption-label")?.textContent).toBe("heard");
+    expect(captions.querySelector(".voice-caption-words")?.textContent).toContain("“what time is it”");
+    unmount();
+
+    // Switched off, the last thing heard stays on the wall, named as old.
+    ({ container, unmount } = await renderRoom({ phase: "off", heard: "what time is it" }));
+    captions = await findCaptions(container);
+    expect(captions.querySelector(".voice-caption-label")?.textContent).toBe("last heard");
+    expect(captions.querySelector(".voice-caption-words")?.textContent).toContain("“what time is it”");
+    unmount();
+
+    // Armed, off, and nothing heard yet: the one line that says how to begin, hotkey included.
+    ({ container, unmount } = await renderRoom({ phase: "off", heard: null }));
+    captions = await findCaptions(container);
+    expect(captions.querySelector(".voice-caption-quiet")?.textContent).toBe(
+      "press Start talking, or Ctrl+Alt+C from anywhere, and speak",
+    );
+    unmount();
+
+    // A machine with no conversation hotkey must not be told to press one.
+    ({ container } = await renderRoom(
+      { phase: "off", heard: null },
+      voiceConfig({ conversation_hotkey: "" }),
+    ));
+    captions = await findCaptions(container);
+    const quiet = captions.querySelector(".voice-caption-quiet");
+    expect(quiet).not.toBeNull();
+    expect(quiet?.textContent).not.toContain("from anywhere");
+  });
+
+  it("captions show what is being assembled while hearing", async () => {
+    const { container } = await renderRoom({
+      phase: "hearing",
+      level: 0.9,
+      assembling: "buy some mi",
+    });
+    const captions = await findCaptions(container);
+
+    expect(captions.querySelector(".voice-caption-label")?.textContent).toBe("hearing");
+    const words = captions.querySelector(".voice-caption-words");
+    expect(words?.textContent).toContain("buy some mi");
+    // The cursor of a sentence still being written is decoration; a screen reader must not read it.
+    const caret = captions.querySelector(".voice-caption-caret");
+    expect(caret).not.toBeNull();
+    expect(caret?.getAttribute("aria-hidden")).toBe("true");
+    expect(words?.contains(caret as Element)).toBe(true);
+
+    // They live in the captions now; the dock's status must not say them a second time.
+    expect(screen.queryByText(/^hearing: /)).toBeNull();
+    expect(screen.queryByText(/^heard: /)).toBeNull();
+  });
+
+  it("the dock names each capture's hotkey without renaming its button", async () => {
+    const { container, unmount } = await renderRoom({ phase: "off" });
+
+    // The key is a hint for the eye; the button's accessible name is what it always was.
+    const dictate = await screen.findByRole("button", { name: "Start dictation" });
+    const memo = screen.getByRole("button", { name: "Start memo" });
+    const talk = screen.getByRole("button", { name: "Start talking" });
+    for (const [button, key] of [
+      [dictate, "Ctrl+Alt+D"],
+      [memo, "Ctrl+Alt+M"],
+      [talk, "Ctrl+Alt+C"],
+    ] as const) {
+      const kbd = button.querySelector("kbd.voice-kbd");
+      expect(kbd?.textContent).toBe(key);
+      expect(kbd?.getAttribute("aria-hidden")).toBe("true");
+    }
+
+    // The two captures sit together under one name; the conversation's button does not.
+    const group = screen.getByRole("group", { name: "Capture" });
+    expect(within(group).getByRole("button", { name: "Start dictation" })).toBe(dictate);
+    expect(within(group).getByRole("button", { name: "Start memo" })).toBe(memo);
+    expect(within(group).queryByRole("button", { name: "Start talking" })).toBeNull();
+    expect(container.querySelector(".voice-dock-talk")?.contains(talk)).toBe(true);
+
+    // The microphone being shut is said first, in the diagnostics slot.
+    expect(container.querySelector(".voice-dock-diag")?.textContent).toContain("microphone closed");
+    unmount();
+
+    // No hotkey configured, no key drawn: an empty chip beside a button is worse than none.
+    await renderRoom(
+      { phase: "off" },
+      voiceConfig({ hotkey: "", memo_hotkey: "", conversation_hotkey: "" }),
+    );
+    for (const name of ["Start dictation", "Start memo", "Start talking"]) {
+      const button = await screen.findByRole("button", { name });
+      expect(button.querySelector("kbd")).toBeNull();
+    }
+  });
+
+  it("the archive opens on memos, switches tabs, and closes on escape back to its button", async () => {
+    const { container } = await renderRoom(
+      { phase: "off" },
+      voiceConfig(),
+      [capture({ id: 7, raw_text: "call the plumber" }), capture({ id: 8, raw_text: "water the plants" })],
+      [capture({ id: 9, kind: "dictation", raw_text: "turn the heating down" })],
+    );
+
+    const opener = await screen.findByRole("button", { name: /^Archive/ });
+    await waitFor(() => expect(opener.getAttribute("aria-label")).toContain("2 memos"));
+    expect(opener.getAttribute("aria-label")).toContain("1 dictation");
+    expect(opener.getAttribute("aria-label")).not.toContain("1 dictations");
+    expect(opener.getAttribute("aria-expanded")).toBe("false");
+    expect(opener.getAttribute("aria-controls")).toBe("voice-archive");
+    // Closed, the drawer is not on the page at all, so nothing in it can be tabbed to.
+    expect(screen.queryByRole("complementary", { name: "Voice archive" })).toBeNull();
+    expect(container.querySelector("#voice-archive")).toBeNull();
+
+    fireEvent.click(opener);
+
+    const drawer = await screen.findByRole("complementary", { name: "Voice archive" });
+    expect(drawer.id).toBe("voice-archive");
+    expect(opener.getAttribute("aria-expanded")).toBe("true");
+    // Focus moves in, onto the way out.
+    const close = within(drawer).getByRole("button", { name: "Close" });
+    await waitFor(() => expect(document.activeElement).toBe(close));
+
+    // It opens on the memos, and the other lists are one tab away.
+    expect(within(drawer).getByRole("tablist", { name: "Archive sections" })).toBeDefined();
+    expect(within(drawer).getByRole("tab", { name: /Memos/ }).getAttribute("aria-selected")).toBe("true");
+    expect(await within(drawer).findByText("call the plumber")).toBeDefined();
+    expect(within(drawer).queryByText("turn the heating down")).toBeNull();
+
+    // Radix selects on mousedown, never on click.
+    fireEvent.mouseDown(within(drawer).getByRole("tab", { name: /Dictations/ }));
+    expect(await within(drawer).findByText("turn the heating down")).toBeDefined();
+    expect(within(drawer).queryByText("call the plumber")).toBeNull();
+    expect(within(drawer).getByRole("tab", { name: /Configuration/ })).toBeDefined();
+
+    // Escape anywhere closes it and hands focus back to the button that opened it.
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Voice archive" })).toBeNull());
+    expect(document.activeElement).toBe(opener);
+    expect(opener.getAttribute("aria-expanded")).toBe("false");
+
+    // And so does its own Close button, with the same hand-back.
+    fireEvent.click(opener);
+    fireEvent.click(
+      within(await screen.findByRole("complementary", { name: "Voice archive" })).getByRole("button", {
+        name: "Close",
+      }),
+    );
+    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Voice archive" })).toBeNull());
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it("the room is marked while the archive is open, so the dock can clear it", async () => {
+    const { container } = await renderRoom({ phase: "off" });
+    const opener = await screen.findByRole("button", { name: /^Archive/ });
+    const room = container.querySelector(".voice-room");
+    expect(room).not.toBeNull();
+    expect(room?.getAttribute("data-archive")).toBeNull();
+
+    fireEvent.click(opener);
+    await screen.findByRole("complementary", { name: "Voice archive" });
+    expect(room?.getAttribute("data-archive")).toBe("open");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Voice archive" })).toBeNull());
+    expect(room?.getAttribute("data-archive")).toBeNull();
+  });
+
+  it("the room is decoration", async () => {
+    const { container } = await renderRoom({ phase: "hearing", level: 0.9, threshold: 0.85 });
+    await screen.findByRole("meter", { name: "microphone level" });
+
+    // The room carries the phase for the stylesheet, and its canvas is hidden from assistive tech.
+    const room = container.querySelector(".voice-room");
+    expect(room).not.toBeNull();
+    expect(room?.getAttribute("data-phase")).toBe("hearing");
+    const canvas = container.querySelector("canvas.voice-room-canvas");
+    expect(canvas).not.toBeNull();
+    expect(canvas?.getAttribute("aria-hidden")).toBe("true");
+    expect(room?.contains(canvas as Element)).toBe(true);
+    // The orb stays where it was, inside the room.
+    expect(room?.contains(container.querySelector("canvas.voice-orb"))).toBe(true);
   });
 });

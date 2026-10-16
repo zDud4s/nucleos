@@ -246,13 +246,15 @@
 
 /* ------------------------------------------------------------ conversation -- */
 
+/* The dock's diagnostics: one fact to a line, in the mono face and the faint rung, because they are
+   readings off the machine and not prose. */
 .voice-conversation-status {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2) var(--space-3);
-  margin-top: var(--space-2);
-  color: var(--text-muted);
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  color: var(--text-faint);
+  font-family: var(--font-mono);
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
 }
@@ -294,18 +296,325 @@
 
 /* The conversation's orb. Its strokes take the canvas's own `color`, so the theme and the hearing
    colour are decided here, and the colour change between them is a transition the canvas reads back
-   every frame. */
+   every frame. It stands in the room's middle, at the size and the height `orbGeometry` gives the
+   sand under it. */
 .voice-orb {
   display: block;
-  width: min(16rem, 100%);
-  aspect-ratio: 1;
-  margin: 0 auto var(--space-3);
+  position: absolute;
+  z-index: 1;
+  left: 50%;
+  top: calc(50% + 8px);
+  width: var(--voice-orb-size);
+  height: var(--voice-orb-size);
+  transform: translate(-50%, -50%);
+  margin: 0;
   color: var(--text);
-  transition: color 300ms ease;
+  transition: color 300ms var(--ease);
 }
 
 /* The badge's own `pending` tone, so the orb and "hearing you" say it in one colour. Not cyan:
    DESIGN.md reserves that for links, and `reserved-cyan.test.ts` holds it. */
 .voice-orb[data-hearing] {
   color: var(--tone-pending-fg);
+}
+
+/* ------------------------------------------------------------------- room -- */
+
+/**
+ * The page as a room: the sand and the orb fill the window, and everything the person can read or press
+ * floats over them - the title and archive button above, the captions under the orb, the dock below.
+ *
+ * The takeover is the one `chats.css` does and for the same reason: the shell's page wrapper centres
+ * a 78rem measure with padding, which is right for a list and wrong for a stage. Reached with `:has()`
+ * from here so the other pages pay nothing for it.
+ */
+.app-main:has(> .app-page > .voice-room) {
+  overflow: hidden;
+}
+
+.app-page:has(> .voice-room) {
+  max-width: none;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+}
+
+/* No notch strip on this route either: the room runs to the window's edge. */
+.app-main-notched:has(> .app-page > .voice-room) {
+  padding-right: 0;
+}
+
+/* `--voice-orb-size` mirrors `orbGeometry` in VoiceRoom.tsx: the sand's plate is sized from the same
+   numbers in script, and the two have to agree or the orb floats off its plate. The free band is the
+   room less `ROOM_TOP` (112px) and `ROOM_BOTTOM` (96px), 208px in all. The `cqh`/`cqw` units resolve
+   where the property is used, against this element, which is the size container. */
+.voice-room {
+  position: relative;
+  height: 100%;
+  min-height: 30rem;
+  overflow: hidden;
+  isolation: isolate;
+  container-type: size;
+  background: var(--surface-sunken);
+  --voice-orb-size: max(140px, min(0.44 * (100cqh - 208px), 50cqw));
+}
+
+/* Without a size the canvas measures zero and draws nothing. */
+.voice-room-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* A soft veil of the ground behind the bars, so a title or a button never has to be read against
+   moving sand. */
+.voice-room-top {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: var(--space-4) var(--space-5);
+  background: linear-gradient(color-mix(in srgb, var(--bg) 78%, transparent), transparent);
+}
+
+.voice-room-top .ui-page-header {
+  align-items: center;
+  margin: 0;
+  padding: 0;
+  border-bottom: 0;
+}
+
+.voice-room-top .ui-page-title {
+  font-size: var(--text-lg);
+}
+
+.voice-room-top .ui-page-headline {
+  font-size: var(--text-sm);
+}
+
+.voice-archive-open {
+  white-space: nowrap;
+}
+
+.voice-archive-count {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The key a button answers to: a hint for the eye, drawn inside the button and hidden from assistive
+   technology, which has the button's own name. */
+.voice-kbd {
+  padding: 0 var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: normal;
+}
+
+/* ---------------------------------------------------------------- captions -- */
+
+/* Under the orb: 50% + 8px is the orb's centre (`ROOM_TOP` + half the free band) and 0.5655 of its size
+   reaches just past its lower edge. The `min` keeps the block clear of the dock when the window is short. */
+.voice-captions {
+  position: absolute;
+  z-index: 3;
+  left: 50%;
+  transform: translateX(-50%);
+  top: min(calc(50% + 8px + 0.5655 * var(--voice-orb-size)), calc(100% - 150px));
+  width: min(46rem, calc(100% - 2 * var(--space-5)));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  text-align: center;
+  pointer-events: none;
+}
+
+.voice-caption-label {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.voice-caption-words {
+  max-height: 9em;
+  margin: 0;
+  overflow-y: auto;
+  pointer-events: auto;
+  color: var(--text);
+  font-size: var(--text-lg);
+  line-height: 1.45;
+  text-wrap: balance;
+  overflow-wrap: anywhere;
+}
+
+.voice-caption-assembling {
+  color: var(--text-muted);
+}
+
+.voice-caption-quiet {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+/* The cursor of a sentence still being written. */
+.voice-caption-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 3px;
+  vertical-align: -0.15em;
+  background: var(--tone-pending-fg);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .voice-caption-caret {
+    animation: voice-caret-blink 1s steps(1) infinite;
+  }
+}
+
+@keyframes voice-caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* A machine that cannot transcribe: the explanation stands where the captions would, on a ground of
+   its own so it never has to be read over sand. */
+.voice-notarmed {
+  position: absolute;
+  z-index: 3;
+  left: 50%;
+  transform: translateX(-50%);
+  top: 5rem;
+  bottom: 9rem;
+  width: min(46rem, calc(100% - 2 * var(--space-5)));
+  overflow-y: auto;
+  padding: var(--space-4);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+}
+
+/* -------------------------------------------------------------------- dock -- */
+
+.voice-dock {
+  position: absolute;
+  z-index: 3;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: end;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  background: linear-gradient(transparent, color-mix(in srgb, var(--bg) 78%, transparent));
+}
+
+.voice-dock-diag {
+  min-width: 0;
+}
+
+.voice-dock-talk {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.voice-dock-capture {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.voice-dock-capture .voice-capture-buttons {
+  margin-bottom: 0;
+  justify-content: flex-end;
+}
+
+.voice-dock-capture .voice-hotkey-conflict,
+.voice-dock-capture .voice-outcome,
+.voice-dock-capture .voice-delivery {
+  margin: 0;
+}
+
+/* The archive drawer is non-modal and covers the right edge, so the dock steps clear of it. */
+.voice-room[data-archive="open"] .voice-dock {
+  right: min(25rem, 92%);
+}
+
+/* One centred column: three slots side by side do not fit a narrow window. */
+@media (max-width: 60rem) {
+  .voice-dock {
+    grid-template-columns: 1fr;
+    justify-items: center;
+  }
+
+  /* No room left beside the drawer: hide the dock so Tab cannot reach what the drawer covers. */
+  .voice-room[data-archive="open"] .voice-dock {
+    visibility: hidden;
+  }
+
+  .voice-dock-diag {
+    display: flex;
+    justify-content: center;
+  }
+
+  .voice-dock-capture {
+    align-items: center;
+  }
+
+  .voice-dock-capture .voice-capture-buttons {
+    justify-content: center;
+  }
+}
+
+/* ----------------------------------------------------------------- archive -- */
+
+.voice-archive {
+  position: absolute;
+  z-index: 5;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(25rem, 92%);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: var(--shadow-lg);
+}
+
+.voice-archive-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.voice-archive-head h2 {
+  flex: 1;
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+
+.voice-archive-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-4);
 }
