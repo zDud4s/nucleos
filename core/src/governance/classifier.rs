@@ -19,7 +19,7 @@ pub use self::paths::*;
 pub use self::shell_shape::*;
 use self::write_guards::*;
 
-pub const CLASSIFIER_VERSION: u32 = 21;
+pub const CLASSIFIER_VERSION: u32 = 22;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -715,17 +715,50 @@ pub fn classify(
         .get("command")
         .and_then(Value::as_str)
         .unwrap_or("");
-    // Inside a conversation's area, the variables the line assigned itself are spelled out first
-    // (`area::spelled_out`); everywhere else this is the line as written.
-    let spelled = area::spelled_out(command, shell_for(tool_name));
+    // Inside a conversation's area, a PowerShell line has the variables it assigned itself spelled
+    // out first (`area::spelled_out_powershell`); everywhere else this is the line as written. A
+    // POSIX line is handed over as written on purpose: `command_reader::parse` reads it, and it is
+    // the parser that knows which assignment is still in scope for which command, so the spelling
+    // happens per command inside `classify_shell_command` and not here, over the whole line.
+    let shell = shell_for(tool_name);
+    let spelled = (shell == crate::command_reader::Shell::PowerShell)
+        .then(|| area::spelled_out_powershell(command))
+        .flatten();
     classify_shell_command(
         spelled.as_deref().unwrap_or(command),
         cwd,
         policy,
         rules,
-        shell_for(tool_name),
+        shell,
         unrecognized,
     )
+}
+
+/// PURE but for the active area: the text each command of a parsed POSIX line is judged (and
+/// guarded) as. Inside a conversation's area it is the command with the literal variables in scope
+/// spelled out (`SimpleCommand::spelled`, when it has any); everywhere else, and for a command that
+/// names none, it is `text`, which is the command exactly as the old reader cut it with each
+/// substitution replaced by an unknown variable. One function for the classifier and the guards, so
+/// they cannot come to read the same line differently.
+///
+/// The values of a `for` (`Context::ForValues`) are not commands: a verdict passes
+/// `with_for_values = false` and never judges them, while the judge guards pass `true` and scan
+/// them like any other text, since a path in a value is what G1 and G2 look at.
+fn command_texts(
+    commands: Vec<crate::command_reader::SimpleCommand>,
+    with_for_values: bool,
+) -> Vec<String> {
+    let in_area = area::active();
+    commands
+        .into_iter()
+        .filter(|command| {
+            with_for_values || command.context != crate::command_reader::Context::ForValues
+        })
+        .map(|command| match command.spelled {
+            Some(spelled) if in_area => spelled,
+            _ => command.text,
+        })
+        .collect()
 }
 
 /// PURE: whether a project's declared rules can change this tool's verdict at all.
@@ -779,7 +812,25 @@ fn classify_shell_command(
     shell: crate::command_reader::Shell,
     unrecognized: Unrecognized,
 ) -> Classification {
-    let normalized = normalize_command(command);
+    // A POSIX line is read ONCE, by `command_reader::parse`, and the result is used twice: the
+    // spelled-out deletion check just below and the segment loop at the end. A PowerShell line is
+    // not parsed in phase one and keeps `read`.
+    let parsed = (shell == crate::command_reader::Shell::Posix)
+        .then(|| crate::command_reader::parse(command, shell));
+
+    // The texts every refusal below reads: the line as written, and inside an area the spelled-out
+    // form of each command that has one (`D=/etc; rm -r $D`, `C=cp; $C a b`). One list for all four
+    // refusals, so that none of them can come to read less than the others: a refusal must not
+    // depend on whether the text is spelled out or written. Outside an area `spelled` is never
+    // used and the list is the line alone.
+    let spelled_texts: Vec<&str> = match &parsed {
+        Some(crate::command_reader::Parsed::Commands(list)) if area::active() => list
+            .iter()
+            .filter_map(|command| command.spelled.as_deref())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let texts: Vec<&str> = std::iter::once(command).chain(spelled_texts).collect();
 
     // Two refusals where there was one disjunction, and **the target is asked before the shape**.
     //
@@ -794,7 +845,10 @@ fn classify_shell_command(
     // about the machine; `deletes_outside_cwd` folds the delete's targets against the workspace and
     // answers about a BOUNDARY, the way `outside-workspace` does one screen up. A caller may
     // reasonably decide the first is its own business and may never decide that about the second.
-    if deletes_outside_cwd(command, cwd) {
+    //
+    // Inside an area a deletion may name a variable the line assigned itself (`D=/etc; rm -r $D`):
+    // the raw line cannot show where it points, so each command's spelled-out form is asked too.
+    if texts.iter().any(|text| deletes_outside_cwd(text, cwd)) {
         return classification(
             "deny",
             "destructive-outside",
@@ -802,9 +856,11 @@ fn classify_shell_command(
         );
     }
 
-    if matches_any_phrase(&normalized, DESTRUCTIVE_COMMAND_PATTERNS)
-        || has_destructive_flags(&normalized)
-    {
+    if texts.iter().any(|text| {
+        let normalized = normalize_command(text);
+        matches_any_phrase(&normalized, DESTRUCTIVE_COMMAND_PATTERNS)
+            || has_destructive_flags(&normalized)
+    }) {
         return classification(
             "deny",
             "destructive",
@@ -861,15 +917,20 @@ fn classify_shell_command(
     // is what guarantees that for the prefix, and says why a prefix that skipped the fold was a
     // refusal that silently allowed.
     if !rules.deny.is_empty()
-        && (rules.denies(&normalized)
-            || crate::command_reader::segments(command, shell)
-                .iter()
-                .any(|piece| rules.denies(&normalize_command(&strip_fd_duplications(piece)))))
+        && texts.iter().any(|text| {
+            rules.denies(&normalize_command(text))
+                || crate::command_reader::segments(text, shell)
+                    .iter()
+                    .any(|piece| rules.denies(&normalize_command(&strip_fd_duplications(piece))))
+        })
     {
         return classification("deny", "project-denied", "this project denies this command");
     }
 
-    if matches_any_phrase(&normalized, APPROVAL_COMMAND_PATTERNS) {
+    if texts
+        .iter()
+        .any(|text| matches_any_phrase(&normalize_command(text), APPROVAL_COMMAND_PATTERNS))
+    {
         return classification(
             "pending_approval",
             "push-merge-deploy",
@@ -886,19 +947,36 @@ fn classify_shell_command(
     //
     // This sits AFTER the destructive checks on purpose: a hidden command the blocklist already
     // recognizes must keep its stronger `deny`, not be demoted to an approval prompt.
-    let segments = match crate::command_reader::read(command, shell) {
-        crate::command_reader::Reading::Sequence(segments) => segments,
-        // The reason is carried into the refusal rather than dropped. A run parked by this branch
-        // used to be told only that its command was "unrecognized", which is the sentence that cost
-        // three relaunches on 2026-08-27 — the reader knows WHICH form it could not read, and the
-        // person reading the proposal is the one who has to act on it.
-        crate::command_reader::Reading::Unreadable(reason) => {
+    //
+    // POSIX: `command_reader::parse`, one text per simple command wherever it sits (substitutions,
+    // loop and branch bodies, subshells), each judged below on its own by `classify_segment`; a
+    // line it does not model is `Unreadable` and asks, with the parser's reason. PowerShell keeps
+    // `read`.
+    let segments: Vec<String> = match parsed {
+        Some(crate::command_reader::Parsed::Commands(list)) => command_texts(list, false),
+        Some(crate::command_reader::Parsed::Unreadable(reason)) => {
             return classification(
                 "pending_approval",
                 "unrecognized",
                 &format!("this shell line cannot be read as a sequence of commands: {reason}"),
             );
         }
+        None => match crate::command_reader::read(command, shell) {
+            crate::command_reader::Reading::Sequence(segments) => {
+                segments.into_iter().map(str::to_owned).collect()
+            }
+            // The reason is carried into the refusal rather than dropped. A run parked by this
+            // branch used to be told only that its command was "unrecognized", which is the
+            // sentence that cost three relaunches on 2026-08-27 — the reader knows WHICH form it
+            // could not read, and the person reading the proposal is the one who has to act on it.
+            crate::command_reader::Reading::Unreadable(reason) => {
+                return classification(
+                    "pending_approval",
+                    "unrecognized",
+                    &format!("this shell line cannot be read as a sequence of commands: {reason}"),
+                );
+            }
+        },
     };
     if segments.is_empty() {
         return classification(
@@ -913,15 +991,33 @@ fn classify_shell_command(
     let mut confined = false;
     let mut declared = false;
     for segment in segments
-        .into_iter()
+        .iter()
         .map(|s| crate::command_reader::escapes_masked(s, shell))
     {
+        // ASYMMETRY, on purpose: a substitution inside double quotes (`"$(…)"`) is one argument, so
+        // it is read like an unknown variable and keeps today's verdict. An UNQUOTED one is split by
+        // the shell into several arguments whose number and content nobody here can know, so the
+        // command it feeds may never be `allow`: `grep x $(ls)` can become `grep x -r / ...`. The
+        // cap applies only to a segment `classify_segment` would otherwise allow. `None` (the text
+        // cannot be masked) counts as outside quotes, the fail-closed side.
+        let unquoted_substitution = segment
+            .contains(crate::command_reader::SUBSTITUTION_PLACEHOLDER)
+            && crate::command_reader::without_quoted_text(&segment).is_none_or(|outside| {
+                outside.contains(crate::command_reader::SUBSTITUTION_PLACEHOLDER)
+            });
         match classify_segment(&segment, cwd, policy, rules, shell, unrecognized) {
             Segment::Unrecognized => {
                 return classification(
                     "pending_approval",
                     "unrecognized",
                     "unrecognized shell commands and code execution require approval",
+                );
+            }
+            _ if unquoted_substitution => {
+                return classification(
+                    "pending_approval",
+                    "unrecognized",
+                    "a command substitution outside quotes becomes several arguments",
                 );
             }
             Segment::VcsLocal => touches_vcs = true,
@@ -2045,7 +2141,7 @@ mod tests {
             "git shortlog -sn",
             "git merge-base main HEAD",
             "git check-ignore -v target",
-            "git for-each-ref --format=%(refname)",
+            "git for-each-ref '--format=%(refname)'",
             "git name-rev HEAD",
             "git diff-tree --no-commit-id --name-only -r HEAD",
             "git count-objects -v",
@@ -4414,7 +4510,11 @@ mod tests {
     /// several addresses and regex ranges, pattern-only `awk` programs, and under PowerShell only
     /// `Test-Path`/`Get-ChildItem`/`Select-String` with literal arguments and a bare string. It
     /// also stops reading a QUOTED `'-i'` after a `sed -n` script as a file name, which is a
-    /// tightening. (20 went unnarrated.)
+    /// tightening. (20 went unnarrated.) 22 (2026-10-15) reads POSIX lines with brush-parser into
+    /// simple commands: substitutions, loop and branch bodies and subshells are judged command by
+    /// command where they used to ask whole, and an assigned literal is spelled out by scope inside
+    /// an area; eval, source, functions, case, process substitution and `[[ ]]` still ask. A
+    /// loosening on shape, not on any rule.
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -4429,7 +4529,205 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 21);
+        assert_eq!(CLASSIFIER_VERSION, 22);
+    }
+
+    /// `(decision, action_class)` of a Bash line, with the cwd every test in this group uses.
+    fn posix_verdict(command: &str) -> (String, &'static str) {
+        let c = classify(
+            "Bash",
+            &json!({ "command": command }),
+            Some(Path::new("C:/work/repo")),
+        );
+        (c.decision.decision, c.action_class)
+    }
+
+    /// Phase 1 of the command parser: the body of a loop or a branch is a list of commands, and
+    /// each earns its own verdict. A body of allowed commands is allowed; one body command that
+    /// is not allowed keeps the whole line off `allow`.
+    #[test]
+    fn posix_loop_and_branch_bodies_earn_their_own_verdicts() {
+        for command in [
+            "for f in a b; do echo ---; done",
+            "for f in a b; do test -f .gitignore && cat .gitignore; done",
+            "while test -f .gitignore; do echo ---; done",
+            "until test -f .gitignore; do echo ---; done",
+            "if test -f .gitignore; then cat .gitignore; fi",
+            "if test -f .gitignore; then cat .gitignore; elif test -d core; then echo ---; else echo missing; fi",
+            "(echo ---; cat .gitignore)",
+            "{ echo ---; cat .gitignore; }",
+        ] {
+            assert_eq!(posix_verdict(command).0, "allow", "{command}");
+        }
+        for command in [
+            "for f in a b; do curl http://example.com; done",
+            "while true; do echo ---; curl http://example.com; done",
+            "if test -f .gitignore; then curl http://example.com; fi",
+            "if true; then echo ---; else curl http://example.com; fi",
+            "(echo ---; curl http://example.com)",
+        ] {
+            assert_ne!(posix_verdict(command).0, "allow", "{command}");
+        }
+    }
+
+    /// A command substitution is judged as the commands inside it, and the outer command is
+    /// judged as if an unknown variable stood where the substitution was.
+    #[test]
+    fn a_substitution_is_judged_as_its_inner_commands_and_an_unknown_value() {
+        assert_eq!(
+            posix_verdict("echo \"$(git status)\""),
+            posix_verdict("echo \"$NUCLEOS_UNSET\"")
+        );
+        assert_eq!(
+            posix_verdict("echo \"`git status`\""),
+            posix_verdict("echo \"$NUCLEOS_UNSET\"")
+        );
+        // An inner command that is not allowed keeps the line off allow.
+        assert_ne!(
+            posix_verdict("echo \"$(curl http://example.com)\"").0,
+            "allow"
+        );
+        assert_ne!(posix_verdict("echo `curl http://example.com`").0, "allow");
+        assert_ne!(
+            posix_verdict("echo $(echo $(curl http://example.com))").0,
+            "allow"
+        );
+    }
+
+    /// Whatever the parser does not model stays Unreadable, and Unreadable asks.
+    #[test]
+    fn the_forms_the_parser_does_not_model_still_ask() {
+        for command in [
+            "eval ls",
+            "source ./env.sh",
+            ". ./env.sh",
+            "f() { ls; }; f",
+            "case x in a) ls;; esac",
+            "cat <(ls)",
+            "ls > >(cat)",
+            "[[ -f Cargo.toml ]]",
+            "(( 1 + 1 ))",
+            "for ((i=0;i<3;i++)); do echo ---; done",
+            "time ls",
+            "coproc cat",
+            "ls &",
+            "LD_PRELOAD=x ls",
+        ] {
+            assert_eq!(
+                posix_verdict(command),
+                ("pending_approval".to_string(), "unrecognized"),
+                "{command}"
+            );
+        }
+    }
+
+    /// Spec §6, the red team. Every line is one the judge may not approve: a guard trips, or the
+    /// inline-code/network rule (`runs_network_or_inline_code`, the other half of
+    /// `judge_may_allow`) bars it, whatever the classifier says. A line with nothing for the parser to open (`cat
+    /// $HOME/notes`) is judged by shape exactly as before, so no `allow` claim is made for it;
+    /// the lines the parser DOES open must never be more permissive than their literal twin.
+    #[test]
+    fn the_shapes_the_parser_opens_stay_refused() {
+        for command in [
+            "cd ~",
+            "cat $HOME/notes",
+            "cat %USERPROFILE%/x",
+            r#"bash -c "ls""#,
+            "git -C/abs status",
+            "echo $(cat .env)",
+            "for f in ~/.ssh/*; do cat $f; done",
+            "cat $(echo ~/.ssh/id_rsa)",
+        ] {
+            assert!(
+                guard("Bash", command).is_some()
+                    || runs_network_or_inline_code("Bash", &json!({ "command": command })),
+                "{command}"
+            );
+        }
+        fn rank(d: &str) -> u8 {
+            match d {
+                "allow" => 0,
+                "pending_approval" => 1,
+                _ => 2,
+            }
+        }
+        for (opened, twin) in [
+            ("echo $(cat .env)", "cat .env"),
+            ("for f in ~/.ssh/*; do cat $f; done", "cat ~/.ssh/x"),
+            ("cat $(echo ~/.ssh/id_rsa)", "cat ~/.ssh/id_rsa"),
+        ] {
+            assert!(
+                rank(&posix_verdict(opened).0) >= rank(&posix_verdict(twin).0),
+                "{opened} vs {twin}"
+            );
+        }
+    }
+
+    /// A refusal must not depend on whether the text is spelled out or written: inside an area,
+    /// an assigned variable meets every check its literal twin meets, project denies included.
+    #[test]
+    fn spelled_text_meets_every_refusal_inside_an_area() {
+        let area = Area::new(&[], Some(Path::new("C:/Temp")));
+        let verdict_of = |rules: &crate::project::policy::ShellRules, command: &str| {
+            let c = super::classify(
+                "Bash",
+                &json!({ "command": command }),
+                Some(Path::new("C:/Projects/repo")),
+                &crate::integrations::github::Policy::empty(),
+                rules,
+                Unrecognized::AsksAPerson,
+            );
+            (c.decision.decision, c.action_class)
+        };
+        let none = crate::project::policy::ShellRules::default();
+        let deny_cp = shell_rules(&[], &["cp"]);
+        within(&area, || {
+            for (rules, assigned, literal) in [
+                (&none, "F=-rf; rm $F target", "rm -rf target"),
+                (&none, "P=push; git $P", "git push"),
+                (&deny_cp, "C=cp; $C a b", "cp a b"),
+            ] {
+                assert_eq!(
+                    verdict_of(rules, assigned),
+                    verdict_of(rules, literal),
+                    "{assigned} vs {literal}"
+                );
+            }
+        });
+    }
+
+    /// The values of a `for` are not commands, yet the guard reads them: `cp b$f .` alone does
+    /// not look like a path escape.
+    #[test]
+    fn the_guard_reads_for_loop_values() {
+        assert_eq!(
+            guard("Bash", "for f in /../../x; do cp b$f .; done"),
+            Some(JudgeGuard::OutsideTheRun)
+        );
+    }
+
+    /// The judge guards read inside substitutions and bodies, where the old reader refused the
+    /// whole line before looking.
+    #[test]
+    fn the_guard_reads_inside_substitutions_and_bodies() {
+        assert_eq!(
+            guard("Bash", "echo $(cat .env)"),
+            Some(JudgeGuard::SensitiveSource)
+        );
+        assert_eq!(
+            guard("Bash", "if true; then git reset --hard; fi"),
+            Some(JudgeGuard::Irreversible)
+        );
+    }
+
+    /// A line the parser calls Unreadable is still scanned by the guard, command by command as
+    /// before, so refusing to read it never loosens a guard.
+    #[test]
+    fn an_unreadable_posix_line_is_still_scanned_by_the_guard() {
+        assert_eq!(
+            guard("Bash", "eval cat .env"),
+            Some(JudgeGuard::SensitiveSource)
+        );
     }
 
     /// The two commands the job-5 dogfood's review node still had to ask about, verbatim off the

@@ -4296,10 +4296,11 @@ mod tests {
             &serde_json::json!({
                 "run_id": run_id,
                 "tool_name": "Bash",
-                // A shell loop, which the classifier reads as a program rather than a line and so
-                // does not recognise. NOT `find`, which it allows — an allowed command never
-                // reaches this road, and the run would read terminal for the wrong reason.
-                "tool_input": {"command": "for f in *.py; do cat \"$f\"; done"}
+                // A command the classifier does not recognise (its own doc names `cargo fix`). NOT
+                // `find`, which it allows, and no longer a shell loop either: the parser reads a
+                // loop and allows it when its body is harmless — an allowed command never reaches
+                // this road, and the run would read terminal for the wrong reason.
+                "tool_input": {"command": "cargo fix"}
             })
             .to_string(),
         )
@@ -4352,7 +4353,8 @@ mod tests {
             &serde_json::json!({
                 "run_id": run_id,
                 "tool_name": "Bash",
-                "tool_input": {"command": "for f in *.py; do cat \"$f\"; done"}
+                // `cargo fix`, not a shell loop: a harmless loop is read and allowed now.
+                "tool_input": {"command": "cargo fix"}
             })
             .to_string(),
         )

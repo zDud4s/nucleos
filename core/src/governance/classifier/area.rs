@@ -124,32 +124,48 @@ pub(super) fn expand_temp(
     Some(format!("{temp}{}", rest.replace('\\', "/")))
 }
 
-/// A shell line with the variables it assigned itself spelled out, when an area is active and the
-/// line has any: `S="<scratchpad>"; cargo test > $S/gate.log` is read as the redirect it is, rather
-/// than as a `$` the shell rewrites into somewhere unknown. `None` leaves the line as it was.
+/// Whether an area is active on this thread, that is, whether the call runs inside `within`.
 ///
-/// Only a segment that is nothing but one literal assignment counts — `NAME=value` under a POSIX
-/// shell, `$NAME = value` under PowerShell — and only for the segments after it. A value holding a
-/// `$`, a backtick or a `(` is not literal and is not recorded, so the reference keeps its old
-/// reading. Lexical, like the rest: an assignment inside a branch that did not run is spelled out
-/// anyway, and what is spelled out is still checked like any other path.
-pub(super) fn spelled_out(command: &str, shell: crate::command_reader::Shell) -> Option<String> {
-    if ACTIVE.with(|active| active.borrow().is_none()) || !command.contains('$') {
+/// The POSIX reader (`command_reader::parse`) spells assigned literals out for every line it reads,
+/// because it cannot know who asks; whether that spelling may be USED is this question, and the
+/// answer is the same one `inside` gives: only for the length of a conversation's call.
+pub(super) fn active() -> bool {
+    ACTIVE.with(|active| active.borrow().is_some())
+}
+
+/// A PowerShell line with the variables it assigned itself spelled out, when an area is active and
+/// the line has any: `$S = "<scratchpad>"; Get-Content $S\gate.log` is read as the path it is,
+/// rather than as a `$` the shell rewrites into somewhere unknown. `None` leaves the line as it was.
+///
+/// POSIX lines are NOT spelled here. `command_reader::parse` reads them with a real grammar and
+/// remembers an assignment only for the commands of its own scope (not out of a subshell, a branch,
+/// a loop body or a pipeline), which is what this lexical pass could never tell; its answer is
+/// `SimpleCommand::spelled`. This pass stays for PowerShell, whose grammar the parser does not read
+/// until phase 2 of the command-parser design.
+///
+/// Only a segment that is nothing but one literal assignment counts (`$NAME = value`), and only for
+/// the segments after it. A value holding a `$`, a backtick or a `(` is not literal and is not
+/// recorded, so the reference keeps its old reading. Lexical, like the rest: an assignment inside a
+/// branch that did not run is spelled out anyway, and what is spelled out is still checked like any
+/// other path.
+pub(super) fn spelled_out_powershell(command: &str) -> Option<String> {
+    use crate::command_reader::Shell;
+    if !active() || !command.contains('$') {
         return None;
     }
     let base = command.as_ptr() as usize;
     let mut assigned: Vec<(String, String)> = Vec::new();
     let mut out = String::with_capacity(command.len());
     let mut copied = 0;
-    for segment in crate::command_reader::segments(command, shell) {
+    for segment in crate::command_reader::segments(command, Shell::PowerShell) {
         let start = (segment.as_ptr() as usize).wrapping_sub(base);
         if start < copied || start + segment.len() > command.len() {
             return None;
         }
         out.push_str(&command[copied..start]);
-        out.push_str(&substitute(segment, &assigned, shell));
+        out.push_str(&substitute(segment, &assigned));
         copied = start + segment.len();
-        if let Some((name, value)) = literal_assignment(segment, shell) {
+        if let Some((name, value)) = literal_assignment(segment) {
             assigned.retain(|(known, _)| !known.eq_ignore_ascii_case(&name));
             assigned.push((name, value));
         }
@@ -158,20 +174,14 @@ pub(super) fn spelled_out(command: &str, shell: crate::command_reader::Shell) ->
     (out != command).then_some(out)
 }
 
-fn literal_assignment(
-    segment: &str,
-    shell: crate::command_reader::Shell,
-) -> Option<(String, String)> {
+fn literal_assignment(segment: &str) -> Option<(String, String)> {
     let words = shell_words(segment);
-    let (name, value) = match (shell, words.as_slice()) {
-        (crate::command_reader::Shell::PowerShell, [name, equals, value]) if equals == "=" => {
-            (name.strip_prefix('$')?, value.as_str())
-        }
-        (crate::command_reader::Shell::PowerShell, [word]) => {
+    let (name, value) = match words.as_slice() {
+        [name, equals, value] if equals == "=" => (name.strip_prefix('$')?, value.as_str()),
+        [word] => {
             let (name, value) = word.split_once('=')?;
             (name.strip_prefix('$')?, value)
         }
-        (crate::command_reader::Shell::Posix, [word]) => word.split_once('=')?,
         _ => return None,
     };
     let identifier = name
@@ -185,11 +195,7 @@ fn literal_assignment(
 
 /// `$NAME` and `${NAME}` replaced by what the line assigned, the longest name first so `$SP` is not
 /// read as `$S` followed by `P`. PowerShell names ignore case.
-fn substitute(
-    segment: &str,
-    assigned: &[(String, String)],
-    shell: crate::command_reader::Shell,
-) -> String {
+fn substitute(segment: &str, assigned: &[(String, String)]) -> String {
     let mut text = segment.to_owned();
     let mut ordered: Vec<&(String, String)> = assigned.iter().collect();
     ordered.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
@@ -199,15 +205,7 @@ fn substitute(
         let bare = format!("${name}");
         let mut result = String::with_capacity(text.len());
         let mut rest = text.as_str();
-        loop {
-            let found = if shell == crate::command_reader::Shell::PowerShell {
-                rest.to_ascii_lowercase().find(&bare.to_ascii_lowercase())
-            } else {
-                rest.find(&bare)
-            };
-            let Some(at) = found else {
-                break;
-            };
+        while let Some(at) = rest.to_ascii_lowercase().find(&bare.to_ascii_lowercase()) {
             let after = &rest[at + bare.len()..];
             result.push_str(&rest[..at]);
             if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
@@ -417,30 +415,97 @@ mod tests {
 
     #[test]
     fn a_line_reads_the_variables_it_assigned_itself_inside_an_area() {
-        use crate::command_reader::Shell;
-        let line = r#"S="C:/Temp/pad"; C:/Users/PCMULT~1/AppData/Local/Programs/Python/PYTHON~3/python.exe "C:/Projects/nucleos/scripts/heavy.py" --prio 1 --agent main -- cargo test > "$S/gate.log" 2>&1; echo ${S}/x $SP"#;
-        assert_eq!(spelled_out(line, Shell::Posix), None);
+        // POSIX lines are spelled by `command_reader::parse`, so this goes through the two
+        // public doors a line can enter by, `judge_guard` and `classify`, and never calls the
+        // lexical spelling directly.
         let area = Area::new(&[], Some(Path::new("C:/Temp")));
-        within(&area, || {
-            let spelled = spelled_out(line, Shell::Posix).unwrap();
-            assert!(spelled.contains(r#""C:/Temp/pad/gate.log""#), "{spelled}");
-            assert!(spelled.contains("C:/Temp/pad/x $SP"), "{spelled}");
-            // Not literal, so not recorded.
-            assert_eq!(spelled_out("S=$(pwd); cat $S/x", Shell::Posix), None);
-            // Only after the assignment.
-            assert_eq!(spelled_out("cat $S/x; S=C:/Temp", Shell::Posix), None);
-            let ps =
-                spelled_out(r#"$L = "C:/Temp/a"; Get-Content $l"#, Shell::PowerShell).unwrap();
-            assert!(ps.contains(r"C:/Temp/a"), "{ps}");
-            assert_eq!(
-                judge_guard(
-                    "Bash",
-                    &serde_json::json!({ "command": r#"S="C:/Temp/pad"; cargo test > "$S/gate.log" 2>&1"# }),
-                    Path::new("C:/Projects/repo")
-                ),
-                None
+        let guard_of = |command: &str| {
+            judge_guard(
+                "Bash",
+                &serde_json::json!({ "command": command }),
+                Path::new("C:/Projects/repo"),
+            )
+        };
+        let verdict_of = |command: &str| {
+            let c = classify(
+                "Bash",
+                &serde_json::json!({ "command": command }),
+                Some(Path::new("C:/Projects/repo")),
+                &crate::integrations::github::Policy::empty(),
+                &crate::project::policy::ShellRules::default(),
+                Unrecognized::AsksAPerson,
             );
+            (c.decision.decision, c.action_class)
+        };
+        let assigned = r#"S="C:/Temp/pad"; cargo test > "$S/gate.log" 2>&1"#;
+        let spelled = r#"cargo test > "C:/Temp/pad/gate.log" 2>&1"#;
+        let braced = r#"S="C:/Temp/pad"; cargo test > "$S/gate.log" 2>&1; echo ${S}/x"#;
+        // `$SP` is never assigned, so it stays an unknown word.
+        let unassigned = r#"S="C:/Temp/pad"; cargo test > "$S/gate.log" 2>&1; echo ${S}/x $SP"#;
+        // Outside an area nothing is spelled out: the variable is unknown.
+        assert_eq!(guard_of(assigned), Some(JudgeGuard::OutsideTheRun));
+        within(&area, || {
+            assert_eq!(guard_of(assigned), None);
+            assert_eq!(guard_of(braced), None);
+            assert_eq!(guard_of(unassigned), Some(JudgeGuard::OutsideTheRun));
+            // Spelled out by the parser, the classifier sees what it would see for the
+            // literal path.
+            assert_eq!(verdict_of(assigned), verdict_of(spelled));
+            assert_ne!(verdict_of(assigned).0, "deny");
+            // Not literal, so not recorded: the variable stays unknown.
+            assert_eq!(
+                guard_of(r#"S=$(pwd); cat "$S/x" > "$S/y""#),
+                Some(JudgeGuard::OutsideTheRun)
+            );
+            // Only after the assignment.
+            assert_eq!(
+                guard_of(r#"cat "$S/x"; S=C:/Temp"#),
+                Some(JudgeGuard::OutsideTheRun)
+            );
+            // PowerShell keeps its lexical spelling, under its new one-argument name.
+            let ps = spelled_out_powershell(r#"$L = "C:/Temp/a"; Get-Content $l"#).unwrap();
+            assert!(ps.contains(r"C:/Temp/a"), "{ps}");
         });
+    }
+
+    /// A literal assignment is known only to the commands in its own scope, the way the shell
+    /// has it: a subshell's or a branch's assignment is gone when the construct ends.
+    #[test]
+    fn an_assignment_does_not_leave_its_subshell_or_branch() {
+        let area = Area::new(&[], Some(Path::new("C:/Temp")));
+        let guard_of = |command: &str| {
+            judge_guard(
+                "Bash",
+                &serde_json::json!({ "command": command }),
+                Path::new("C:/Projects/repo"),
+            )
+        };
+        within(&area, || {
+            for command in [
+                r#"(S=C:/Temp/pad); cargo test > "$S/gate.log""#,
+                r#"if true; then S=C:/Temp/pad; fi; cargo test > "$S/gate.log""#,
+            ] {
+                assert_eq!(
+                    guard_of(command),
+                    Some(JudgeGuard::OutsideTheRun),
+                    "{command}"
+                );
+            }
+        });
+    }
+
+    /// The area is what turns an assigned literal into the path it names; without one the
+    /// variable stays unknown, exactly as before.
+    #[test]
+    fn outside_an_area_an_assigned_variable_stays_unknown() {
+        assert_eq!(
+            judge_guard(
+                "Bash",
+                &serde_json::json!({ "command": r#"S=C:/Temp/pad; cargo test > "$S/gate.log""# }),
+                Path::new("C:/Projects/repo")
+            ),
+            Some(JudgeGuard::OutsideTheRun)
+        );
     }
 
     #[test]

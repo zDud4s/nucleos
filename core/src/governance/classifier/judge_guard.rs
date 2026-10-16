@@ -19,6 +19,12 @@ use super::*;
 /// contradicts it. What the predicate needs is to be able to enumerate the line's tokens, which
 /// `command_reader::read` answers (`Unreadable` for a command substitution, a heredoc it cannot
 /// bound, a lone `&`) together with an unterminated quote (`without_quoted_text` is `None`).
+///
+/// Under a POSIX shell "cannot be read" is `command_reader::parse` answering `Unreadable`: that
+/// reader follows substitutions, loop and branch bodies and subshells, so a line it reads is a line
+/// whose commands can all be listed. The token scan then runs over BOTH readings, the old segments
+/// and every command the parser found: a superset, which is the safe direction for a predicate
+/// that only ever refuses. PowerShell keeps `read`.
 pub fn runs_network_or_inline_code(tool_name: &str, tool_input: &Value) -> bool {
     if !reads_github_policy(tool_name) {
         return false;
@@ -32,17 +38,34 @@ pub fn runs_network_or_inline_code(tool_name: &str, tool_input: &Value) -> bool 
     // that cannot be enumerated, and a line that hands a SECOND program to an otherwise-known one
     // (`--pre`, `-exec`, `--ext-diff`, `--textconv` — the classifier's own two readings of that,
     // reused rather than listed again).
-    if matches!(
-        crate::command_reader::read(command, shell),
-        crate::command_reader::Reading::Unreadable(_)
-    ) || crate::command_reader::without_quoted_text(command).is_none()
+    let (unreadable, parsed_texts): (bool, Vec<String>) =
+        if shell == crate::command_reader::Shell::Posix {
+            match crate::command_reader::parse(command, shell) {
+                crate::command_reader::Parsed::Commands(list) => (
+                    false,
+                    list.into_iter().map(|command| command.text).collect(),
+                ),
+                crate::command_reader::Parsed::Unreadable(_) => (true, Vec::new()),
+            }
+        } else {
+            (
+                matches!(
+                    crate::command_reader::read(command, shell),
+                    crate::command_reader::Reading::Unreadable(_)
+                ),
+                Vec::new(),
+            )
+        };
+    if unreadable
+        || crate::command_reader::without_quoted_text(command).is_none()
         || runs_a_helper_command(&normalize_command(command))
         || forces_external_diff_or_textconv(&normalize_command(command))
     {
         return true;
     }
     crate::command_reader::segments(command, shell)
-        .iter()
+        .into_iter()
+        .chain(parsed_texts.iter().map(String::as_str))
         .any(|segment| {
             let words = shell_words(segment);
             words.iter().enumerate().any(|(index, word)| {
@@ -130,9 +153,28 @@ pub fn judge_guard(tool_name: &str, tool_input: &Value, cwd: &Path) -> Option<Ju
         .and_then(Value::as_str)
         .unwrap_or("");
     let shell = shell_for(tool_name);
-    let spelled = super::area::spelled_out(command, shell);
-    let command = spelled.as_deref().unwrap_or(command);
-    for segment in crate::command_reader::segments(command, shell) {
+    // One text per command to guard. POSIX: the commands `command_reader::parse` found, wherever
+    // they sit, spelled out by scope inside an area (`command_texts`); a line it calls Unreadable
+    // is scanned exactly as before, cut by `segments` and unspelled, so refusing to read a line
+    // never loosens a guard. PowerShell: the lexically spelled line, cut by `segments`.
+    let texts: Vec<String> = if shell == crate::command_reader::Shell::Posix {
+        match crate::command_reader::parse(command, shell) {
+            crate::command_reader::Parsed::Commands(list) => command_texts(list, true),
+            crate::command_reader::Parsed::Unreadable(_) => {
+                crate::command_reader::segments(command, shell)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            }
+        }
+    } else {
+        let spelled = super::area::spelled_out_powershell(command);
+        crate::command_reader::segments(spelled.as_deref().unwrap_or(command), shell)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    };
+    for segment in texts.iter().map(String::as_str) {
         let words = guard_words(segment, shell);
         if is_irreversible(segment, &words) {
             return Some(JudgeGuard::Irreversible);
