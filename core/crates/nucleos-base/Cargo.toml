@@ -17,6 +17,9 @@ testkit = ["dep:tempfile"]
 [dependencies]
 async-trait = "0.1.89"
 axum = "0.8.9"
+# `command_reader::parse` only: the POSIX grammar behind the classifier's reading of a shell line.
+# Pure Rust, MIT; chosen in the parser-de-comandos design (spec section 6b). No features.
+brush-parser = "0.4.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 chrono-tz = "0.10.4"
 directories = "6.0.0"

@@ -33,6 +33,20 @@
 //!    and nothing whatever about whether anything is permitted.
 //! 3. `has_shell_control` remains inside `is_safe_command` as a backstop, so a segment that still
 //!    holds a separator — which is what an unterminated quote produces — cannot be allowed.
+//!
+//! **`parse` is the reader for a POSIX caller that has to decide whether to ALLOW.** `read` only
+//! cuts a line where a separator is, so `$(…)` and backticks make a whole line unreadable and a
+//! `for`/`while`/`if` comes out as fragments (`do cargo test`) that no verdict can name. `parse`
+//! hands the same line to a real shell grammar (brush-parser) and returns the simple commands it
+//! runs — the ones inside substitutions, loop and branch bodies and subshells included — each with
+//! the context it runs in. It is fail-closed in the same way `read` is: a form it does not model
+//! is `Parsed::Unreadable`, never a guess. `read` and `segments` stay as they are until every caller
+//! has migrated (the git-queue scan wants a reader that never refuses, which `parse` is not).
+mod parse;
+pub use parse::{
+    Context, MAX_SUBSTITUTION_DEPTH, Parsed, Quoting, Redirect, SUBSTITUTION_PLACEHOLDER,
+    SimpleCommand, Word, parse,
+};
 
 /// Which shell is going to run the line.
 ///
@@ -436,7 +450,7 @@ fn blind_walk(command: &str, policy: Policy) -> Result<Vec<&str>, &'static str> 
 /// Variables that merely change behaviour — `CARGO_TARGET_DIR`, `RUST_LOG`, a project's own
 /// configuration — are deliberately NOT here. An autonomous run is told to set `CARGO_TARGET_DIR`
 /// by this repository's own instructions, and refusing it would close the door this work opened.
-fn assigns_a_loader_variable(command: &str) -> Option<&'static str> {
+pub(crate) fn assigns_a_loader_variable(command: &str) -> Option<&'static str> {
     const LOADER_VARIABLES: &[&str] = &[
         "path",
         "pathext",
@@ -505,6 +519,21 @@ fn assigns_a_loader_variable(command: &str) -> Option<&'static str> {
 /// `FOO=bar git merge x` — the assignments belong to the shell, not to the command, and leaving
 /// them in makes a reader take `FOO=bar` for the program and the whole segment parse as nothing.
 fn push_segment<'a>(segments: &mut Vec<&'a str>, raw: &'a str) {
+    let rest = without_leading_assignments(raw);
+    if !rest.is_empty() {
+        segments.push(rest);
+    }
+}
+
+/// PURE: `raw` trimmed, with the leading `NAME=value` words dropped, as `push_segment` has always
+/// done it.
+///
+/// Shared with `parse`, whose `SimpleCommand.text` has to be what this reader would have cut for
+/// the same command — that equality is what lets the classifier keep working on strings and keep
+/// every verdict it already gives. A word counts as an assignment when it holds a `=` and does not
+/// start with `-` (`--output=x` is a flag), and only while whitespace follows it: a lone
+/// assignment (`S=x`) has no tail and is kept whole.
+pub(crate) fn without_leading_assignments(raw: &str) -> &str {
     let mut rest = raw.trim();
     while let Some((head, tail)) = rest.split_once(char::is_whitespace) {
         if head.contains('=') && !head.starts_with('-') {
@@ -513,9 +542,7 @@ fn push_segment<'a>(segments: &mut Vec<&'a str>, raw: &'a str) {
             break;
         }
     }
-    if !rest.is_empty() {
-        segments.push(rest);
-    }
+    rest
 }
 
 /// PURE: the heredoc a `<<` at the start of `rest` opens — its terminator, whether `<<-` lets that
