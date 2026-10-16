@@ -381,6 +381,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * `skipped` is the one that does ask: the item put itself down with a `skipped-item` proposal,
    * and that proposal is in Waiting. `orphaned` is the feed's `job_item_orphaned`, quiet for the
    * reason given there. `passed` is terminal success, so Stated Blue.
+   *
+   * `revert_failed` is terminal and Wrong Red: the gate rejected the item, the branch could not be
+   * reset, and the job was stopped, so rejected work is still on the branch for a person to see.
    */
   job_item: {
     pending: { tone: "off", label: "to do" },
@@ -394,6 +397,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     gate_failed: { tone: "danger", label: "the gate failed" },
     // The `gate` domain's rule: a gate that could not run measured nothing.
     gate_errored: { tone: "info", label: "gate not measured" },
+    // The gate said no and the branch could not be put back: the job stopped on the spot, and a
+    // person must look at the branch. Wrong Red, unlike `reverted`, which is only a way station.
+    revert_failed: { tone: "danger", label: "rejected work left on the branch" },
     skipped: { tone: "pending", label: "skipped, needs a decision" },
     conflicted: { tone: "paused", label: "did not merge" },
     orphaned: { tone: "off", label: "never attempted" },

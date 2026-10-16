@@ -45,9 +45,8 @@ pub enum ItemState {
     /// The item's own branch is being merged into the job's branch.
     ///
     /// Arrives from `Implemented`; leaves for `Passed` (merged and gated green), `Conflicted`
-    /// (git refused) or `Reverted` (merged and gated red). Not terminal, and nothing writes it
-    /// yet — the merge step that does is a later slice of this design, and the state exists ahead
-    /// of it so that `item_state_from` cannot read the row it will write as "still to do".
+    /// (git refused) or `Reverted` (merged and gated red). Not terminal. `merge_item` writes it,
+    /// and `item_state_from` reads it so the row is never taken for "still to do".
     Merging,
     /// The merge stopped on a conflict, and the conflict is staged in the item's own tree.
     ///
@@ -55,13 +54,18 @@ pub enum ItemState {
     /// `Merging`. The item is put down rather than failed: a conflict is a question about two
     /// pieces of work, not a verdict on either.
     Conflicted,
-    /// The merge landed, the gate went red, and the job's branch has been reset back to where it
-    /// stood before the merge.
+    /// The gate went red and the reset of the job's branch is owed.
     ///
-    /// Leaves for `GateRetriable` if the item still has an attempt to spend, `GateFailed` if it
-    /// does not. Apart from `GateFailed` because the branch state differs and a reader needs to
-    /// know it: the rejected work is off the job's branch and still on the item's.
+    /// Written by `record_gate` BEFORE the reset as the durable "reset owed" mark, so a crash
+    /// between the mark and the reset is finished by `Next::SettleRevert`. Leaves for
+    /// `GateRetriable` if the item still has an attempt to spend, `GateFailed` if it does not. For
+    /// a sequential item it is used only on the out-of-retries revert.
     Reverted,
+    /// The gate said no and the job's branch could not be put back, so the rejected work is still
+    /// on it.
+    ///
+    /// **Terminal.** The job is retired `stopped` and never continues on top of it.
+    RevertFailed,
     /// Never attempted, because something it depended on ended badly.
     ///
     /// **Terminal**, and the only new terminal here. Distinct from `Skipped`, which is work a
@@ -78,7 +82,7 @@ pub enum ItemState {
 /// derive macro for the sake of one array, and the alternative to both — tests that enumerate the
 /// states inline — is what lets a new variant be born untested everywhere at once.
 #[cfg(any(test, feature = "testkit"))]
-pub(super) const EVERY_ITEM_STATE: [ItemState; 15] = [
+pub(super) const EVERY_ITEM_STATE: [ItemState; 16] = [
     ItemState::Pending,
     ItemState::Running,
     ItemState::Implemented,
@@ -92,6 +96,7 @@ pub(super) const EVERY_ITEM_STATE: [ItemState; 15] = [
     ItemState::Merging,
     ItemState::Conflicted,
     ItemState::Reverted,
+    ItemState::RevertFailed,
     ItemState::Orphaned,
     ItemState::Superseded,
 ];
@@ -193,6 +198,12 @@ pub enum Next {
     /// them apart, so one pass drains two merged-and-gated items rather than four merges with
     /// nothing measured.
     MergeItem {
+        ordinal: usize,
+    },
+    /// Finish taking a red item's work off the job's branch.
+    ///
+    /// A git reset, no run, so the driver takes it before the brakes like `RunGate`.
+    SettleRevert {
         ordinal: usize,
     },
     /// Put an item down because something it depends on will never land.
@@ -411,6 +422,15 @@ impl ItemView {
 /// up?") becomes a table test with no database, no worktree and no subprocess. The caller owns the
 /// I/O and is free to be dumb.
 pub fn next_step(job: &JobView) -> Next {
+    // First of all, before the failure short-circuit: an ending written while the branch may still
+    // hold rejected work would hand that branch to a person as if it had been put back.
+    if let Some(ordinal) = job
+        .items
+        .iter()
+        .position(|i| i.state == ItemState::Reverted)
+    {
+        return Next::SettleRevert { ordinal };
+    }
     // Failures first, and before the in-flight check: a chain with a broken item must stop even if
     // another node is still running, rather than spending budget on work about to be thrown away.
     //
@@ -457,6 +477,9 @@ pub fn next_step(job: &JobView) -> Next {
             }
             ItemState::Cancelled => return Next::Finish(Outcome::Cancelled),
             ItemState::GateErrored if !job.has_team => return Next::Finish(Outcome::GateErrored),
+            // Team or not: the job's branch still holds work the gate rejected, and carrying on
+            // would build the rest of the queue on top of it.
+            ItemState::RevertFailed => return Next::Finish(Outcome::Stopped),
             _ => {}
         }
     }
@@ -484,26 +507,18 @@ pub fn next_step(job: &JobView) -> Next {
     if job.items.is_empty() {
         return Next::Finish(Outcome::Completed);
     }
-    // `Reverted` is the last state left with no step of its own and no writer. It is here because
-    // the alternative is worse than being early: a non-terminal state this search walked past would
-    // be read as finished by every check after it, which is the one direction `item_state_from`
-    // already refuses to err in. `Merging` and `Conflicted` have both left this list, each having
-    // been given a step below.
+    // `Reverted` has left this list: it has a step of its own now (`SettleRevert`, taken first).
     //
     // **`Running` waits only without a team, and that one condition is the whole of continuous
     // start.** The line used to read "anything in flight, wait", and it is what made the queue
     // sequential: a job could never have two items going at once because the first one to start
     // stopped the search. A team's items work in checkouts of their own, so the reason behind the
     // line — the shared tree holding work nothing has measured — is not true for them.
-    if job
-        .items
-        .iter()
-        .any(|item| item.state == ItemState::Reverted)
-        || (!job.has_team
-            && job
-                .items
-                .iter()
-                .any(|item| item.state == ItemState::Running))
+    if !job.has_team
+        && job
+            .items
+            .iter()
+            .any(|item| item.state == ItemState::Running)
     {
         return Next::Wait;
     }
@@ -773,6 +788,8 @@ pub(super) fn never_lands(state: ItemState) -> bool {
             | ItemState::Cancelled
             | ItemState::Skipped
             | ItemState::Orphaned
+            // The gate said no and the branch could not be put back: nothing of it lands.
+            | ItemState::RevertFailed
             // Its own work never lands: the item that took it over is a different item.
             | ItemState::Superseded
     )
@@ -884,6 +901,8 @@ pub(super) fn ending(job: &JobView) -> Outcome {
 ///
 /// The order, worst first:
 ///
+/// 0. `RevertFailed`. Unreachable through `next_step`, which short-circuits it; here so the table
+///    is total. The branch holds work the gate rejected, so the job is `stopped`.
 /// 1. `GateErrored`. Silence beats a verdict. A gate that would not start measured NOTHING, so
 ///    every other reading in this queue is in doubt, and it is a fact about the machine rather
 ///    than about the code — which makes it the one to act on first.
@@ -901,6 +920,13 @@ pub(super) fn ending(job: &JobView) -> Outcome {
 /// `Superseded` is absent too, and that absence is the point of the state: a later round took the
 /// failure over, and the item that did is the one read here.
 pub(super) fn failed_ending(job: &JobView) -> Option<Outcome> {
+    if job
+        .items
+        .iter()
+        .any(|item| item.state == ItemState::RevertFailed)
+    {
+        return Some(Outcome::Stopped);
+    }
     if job
         .items
         .iter()
@@ -967,12 +993,13 @@ pub fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> I
         "gate_errored" => ItemState::GateErrored,
         STATUS_SKIPPED => ItemState::Skipped,
         STATUS_SUPERSEDED => ItemState::Superseded,
-        // The four states of parallel items. Nothing writes these rows yet, and they are read
-        // ahead of the writer on purpose: the `_ =>` below would take any of them for `pending`
-        // and hand the item back to the queue as work nobody had started.
+        // The states of parallel items. These rows ARE written now, and they stay listed on
+        // purpose: the `_ =>` below would take any of them for `pending` and hand the item back
+        // to the queue as work nobody had started.
         "merging" => ItemState::Merging,
         "conflicted" => ItemState::Conflicted,
         "reverted" => ItemState::Reverted,
+        "revert_failed" => ItemState::RevertFailed,
         "orphaned" => ItemState::Orphaned,
         // An unrecognised item status is treated as still to do rather than as done. Erring toward
         // "not finished" costs a repeated item; erring the other way silently skips work the job
@@ -1008,7 +1035,7 @@ impl ItemState {
             // forgotten in between.
             ItemState::Conflicted => Some("conflicted"),
             // `Merging` and `Reverted` are steps the driver takes, not nodes anybody spawns, and
-            // `Orphaned` is terminal.
+            // `Orphaned` and `RevertFailed` are terminal.
             ItemState::Running
             | ItemState::Implemented
             | ItemState::Passed
@@ -1019,6 +1046,7 @@ impl ItemState {
             | ItemState::Skipped
             | ItemState::Merging
             | ItemState::Reverted
+            | ItemState::RevertFailed
             | ItemState::Orphaned
             | ItemState::Superseded => None,
         }

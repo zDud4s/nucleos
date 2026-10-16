@@ -741,14 +741,15 @@ pub(super) async fn record_gate(
         }
     }
 
-    // Red, with a retry left: keep the tree, remember what the gate said, ask for the item again.
+    // Red, with a retry left: remember what the gate said and ask for the item again.
     //
-    // BEFORE the revert below, and the order is the feature rather than tidiness. That block puts
-    // the tree back to this item's footing, which is precisely the work a second attempt would start
-    // from — a retriable item that reached it would be handed a blank page together with an account
-    // of what the gate disliked about something no longer there. Nothing is checkpointed either:
-    // nothing passed, and a footing taken over rejected work is a footing the items after this one
-    // would inherit.
+    // A SEQUENTIAL item keeps the shared tree: it is written straight into the job's checkout, so
+    // its second attempt starts from the rejected work, and nothing is checkpointed (nothing passed,
+    // and a footing taken over rejected work is one the items after this would inherit). A MERGED
+    // item (`merge_base_sha` set) retries in its own tree, so it takes the revert below first: the
+    // job's branch is reset to the merge base and the retry brings the branch back into the item's
+    // tree, which keeps its work (spec 2026-08-19 section 3.2, decision #9). Without that reset the
+    // rejected merge would stay on the job branch while other items merge on top of it.
     if let crate::gate::GateOutcome::Failed { exit_code, output } = &outcome {
         // Counted on BOTH paths, whether or not the count buys anything. A counter that only
         // incremented where a retry was spent would disagree with itself about what happened to the
@@ -782,12 +783,25 @@ pub(super) async fn record_gate(
         .ok()
         .flatten();
 
+        // A merged item's work lives on the job's branch as a merge, not in the shared tree.
+        let merged: bool = sqlx::query_scalar::<_, bool>(
+            "SELECT merge_base_sha IS NOT NULL FROM job_items WHERE job_id = ? AND ordinal = ?",
+        )
+        .bind(job.id)
+        .bind(ordinal as i64)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+
         // ASKED, not restated. `attempts <= retries` written here would be the retriability rule in
         // a second place, and the two would agree only until one of them was edited — which is the
         // failure this module has already had three times, each under a comment asserting they
         // agreed. `item_state_from` owns the comparison; this passes it the status it is about to
         // write and believes the answer.
         if let Some((attempts, retries)) = spendable
+            && !merged
             && item_state_from(item_status, attempts, retries) == ItemState::GateRetriable
         {
             let written = sqlx::query(
@@ -820,11 +834,12 @@ pub(super) async fn record_gate(
         }
     }
 
-    // Red: put the tree back before anything else touches it.
+    // Red: take the rejected work off the branch before anything else touches it.
     //
-    // Before the mark, deliberately. The mark is what lets the queue move on, and the queue moving
-    // on to a tree still holding the rejected work is the exact defect this replaces — the item
-    // after it would build on code the gate has just called broken.
+    // Two halves with a durable mark between them. The item is written `reverted` first, then
+    // [`settle_revert`] does the reset and writes the final status. A restart between the two leaves
+    // `reverted` on the row and `next_step` answers `SettleRevert`, so the reset is finished
+    // instead of the queue carrying on over a tree still holding what the gate rejected.
     //
     // `Errored` is NOT reverted, where the plan for this chunk said both should be. A gate that
     // would not run measured nothing, so the work it did not judge might be perfectly good, and the
@@ -832,66 +847,20 @@ pub(super) async fn record_gate(
     // only crime is that nothing looked at it. `Failed` is different in kind: something looked, and
     // said no.
     if matches!(outcome, crate::gate::GateOutcome::Failed { .. }) {
-        let reverted = match (
-            job_worktree(pool, job.id).await,
-            revert_point(pool, job, ordinal).await,
-        ) {
-            (Ok(Some((worktree, _))), Some(footing)) => {
-                match crate::execution::worktree::revert_to(&worktree, &footing).await {
-                    Ok(()) => true,
-                    Err(error) => {
-                        tracing::warn!(job_id = job.id, ordinal, %error, "could not revert a red item");
-                        false
-                    }
-                }
-            }
-            (_, None) => {
-                tracing::warn!(
-                    job_id = job.id,
-                    ordinal,
-                    "no footing to revert a red item to"
-                );
-                false
-            }
-            _ => {
-                tracing::warn!(job_id = job.id, ordinal, "no worktree on record to revert");
-                false
-            }
-        };
-
-        if !reverted {
-            // Mark the item first — a red gate is a fact whatever happened next — then stop. The
-            // queue must not advance onto a tree still holding work the gate rejected, and this is
-            // the one branch where continuing is worse than ending the job early.
-            let _ = async {
-                let mut tx = pool.begin().await?;
-                sqlx::query(
-                    "UPDATE job_items SET status = ?, gate_status = ? WHERE job_id = ? AND ordinal = ?",
-                )
-                .bind(item_status)
-                .bind(gate_status)
-                .bind(job.id)
-                .bind(ordinal as i64)
-                .execute(&mut *tx)
-                .await?;
-                queue_the_verdict(&mut tx, job.id, ordinal as i64).await;
-                tx.commit().await
-            }
-            .await;
-            credit_the_briefing(pool, job, ordinal).await;
-            say(
-                pool,
-                job,
-                "job_gate_failed",
-                &format!(
-                    "job {} at item {}: the gate failed and the worktree could not be put back, so the job stopped here",
-                    job.id,
-                    ordinal + 1
-                ),
-            )
-            .await;
+        let marked = sqlx::query(
+            "UPDATE job_items SET status = 'reverted', gate_status = ? WHERE job_id = ? AND ordinal = ?",
+        )
+        .bind(gate_status)
+        .bind(job.id)
+        .bind(ordinal as i64)
+        .execute(pool)
+        .await;
+        if let Err(error) = marked {
+            // The item is still `implemented`/`merging`, so the next pass gates it again.
+            tracing::warn!(job_id = job.id, ordinal, %error, "could not mark a red item for revert");
             return Step::Stopped;
         }
+        return settle_revert(state, job, ordinal, note).await;
     }
 
     let written = async {
@@ -927,4 +896,144 @@ pub(super) async fn record_gate(
         .await;
     }
     Step::Continued
+}
+
+/// The second half of `reverted`: put the job's branch back and write the item's final status.
+///
+/// Reached from [`record_gate`] right after it marks the item `reverted`, and from
+/// `Next::SettleRevert` after a restart that found the mark. Idempotent: a `reset --hard` to the
+/// same target twice is the same reset, and nothing else can move the job's branch while an item is
+/// `reverted` (`next_step` settles it before anything else).
+///
+/// A revert that cannot be done writes `revert_failed` and retires the job `stopped` here, AND
+/// `next_step` short-circuits on that status. `Step::Stopped` alone only ends the pass, and the next
+/// tick used to carry on over the work the gate had rejected (the defect this replaces).
+pub(super) async fn settle_revert(
+    state: &AppState,
+    job: &JobRow,
+    ordinal: usize,
+    note: Option<String>,
+) -> Step {
+    let pool = &state.pool;
+    let target = match (
+        job_worktree(pool, job.id).await,
+        revert_point(pool, job, ordinal).await,
+    ) {
+        (Ok(Some((worktree, _))), Some(footing)) => {
+            match crate::execution::worktree::revert_to(&worktree, &footing).await {
+                Ok(()) => Ok(footing),
+                Err(error) => {
+                    tracing::warn!(job_id = job.id, ordinal, %error, "could not revert a red item");
+                    Err(error.to_string())
+                }
+            }
+        }
+        (_, None) => {
+            tracing::warn!(
+                job_id = job.id,
+                ordinal,
+                "no footing to revert a red item to"
+            );
+            Err("no revert point on record".to_string())
+        }
+        _ => {
+            tracing::warn!(job_id = job.id, ordinal, "no worktree on record to revert");
+            Err("no worktree on record".to_string())
+        }
+    };
+
+    match target {
+        Ok(target) => {
+            let written = async {
+                let mut tx = pool.begin().await?;
+                sqlx::query(
+                    "UPDATE job_items SET status = 'gate_failed'
+                     WHERE job_id = ? AND ordinal = ? AND status = 'reverted'",
+                )
+                .bind(job.id)
+                .bind(ordinal as i64)
+                .execute(&mut *tx)
+                .await?;
+                queue_the_verdict(&mut tx, job.id, ordinal as i64).await;
+                tx.commit().await
+            }
+            .await;
+            if let Err(error) = written {
+                // The row stays `reverted`; the next pass settles it again.
+                tracing::warn!(job_id = job.id, ordinal, %error, "could not settle a reverted item");
+                return Step::Stopped;
+            }
+            credit_the_briefing(pool, job, ordinal).await;
+
+            let spendable: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT i.gate_attempts, j.gate_retries
+                 FROM job_items i JOIN jobs j ON j.id = i.job_id
+                 WHERE i.job_id = ? AND i.ordinal = ?",
+            )
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+            let said = note.as_deref().unwrap_or("the gate failed");
+            let message = match spendable {
+                Some((attempts, retries))
+                    if item_state_from("gate_failed", attempts, retries)
+                        == ItemState::GateRetriable =>
+                {
+                    format!(
+                        "job {} at item {}: {said}; the job's branch was put back to {target:.12} \
+                         and the item is being implemented again (attempt {attempts} of {retries} \
+                         allowed)",
+                        job.id,
+                        ordinal + 1
+                    )
+                }
+                _ => format!(
+                    "job {} at item {}: {said}; its work was taken off the job's branch",
+                    job.id,
+                    ordinal + 1
+                ),
+            };
+            say(pool, job, "job_gate_failed", &message).await;
+            Step::Continued
+        }
+        Err(reason) => {
+            let written = async {
+                let mut tx = pool.begin().await?;
+                sqlx::query(
+                    "UPDATE job_items SET status = 'revert_failed'
+                     WHERE job_id = ? AND ordinal = ? AND status = 'reverted'",
+                )
+                .bind(job.id)
+                .bind(ordinal as i64)
+                .execute(&mut *tx)
+                .await?;
+                // The item's own exhaustion verdict is queued with the status, as on the
+                // `gate_failed` path.
+                queue_the_verdict(&mut tx, job.id, ordinal as i64).await;
+                tx.commit().await
+            }
+            .await;
+            if let Err(error) = written {
+                tracing::warn!(job_id = job.id, ordinal, %error, "could not record a failed revert");
+            }
+            credit_the_briefing(pool, job, ordinal).await;
+            let _ = retire(pool, job.id, STATUS_STOPPED).await;
+            say(
+                pool,
+                job,
+                "job_gate_failed",
+                &format!(
+                    "job {} at item {}: the gate failed and the job's branch could not be put back \
+                     ({reason}), so the work the gate rejected is still on it and the job stopped here",
+                    job.id,
+                    ordinal + 1
+                ),
+            )
+            .await;
+            Step::Stopped
+        }
+    }
 }

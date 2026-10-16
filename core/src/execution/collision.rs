@@ -570,7 +570,8 @@ async fn declared_sets(
 /// intersection turns a `Collide` into a `Clean` — and what makes it safe here is precisely that
 /// these three have trees. `orphaned` never gets one and never writes, so there is nothing to lose.
 /// `superseded` leaves for the same reason: a later round took its work over, and it never runs
-/// again.
+/// again. `revert_failed` is terminal too: a red gate whose branch could not be put back stops the
+/// job, so the item never writes again.
 const DECLARED_SETS_SQL: &str = "SELECT worktrees.owner_id, job_items.id, jobs.team_id,
             job_items.files
      FROM worktrees
@@ -582,7 +583,7 @@ const DECLARED_SETS_SQL: &str = "SELECT worktrees.owner_id, job_items.id, jobs.t
        AND job_items.status NOT IN ('implemented','passed','failed','cancelled',
                                     'gate_failed','gate_errored','skipped',
                                     'merging','conflicted','reverted','orphaned',
-                                    'superseded')
+                                    'superseded','revert_failed')
      ORDER BY worktrees.owner_id, job_items.id";
 
 #[cfg(test)]
@@ -1373,6 +1374,8 @@ mod tests {
             "conflicted",
             "reverted",
             "orphaned",
+            // A red gate whose branch could not be put back: terminal, it never writes again.
+            "revert_failed",
             // Taken over by a later round: terminal, and it never writes again.
             crate::execution::job::STATUS_SUPERSEDED,
         ];

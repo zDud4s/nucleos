@@ -1158,26 +1158,80 @@ mod tests {
         );
     }
 
-    /// A non-terminal state with no step of its own is waited for, never walked past.
+    /// `Reverted` is settled before anything else moves.
     ///
-    /// `Merging` and `Conflicted` have both left this list, each having been given a step — the
-    /// gate that measures a landed merge, and the run that resolves a staged one. `Reverted` is the
-    /// last one without either, and unreachable because nothing writes it: the red arm records
-    /// `gate_failed` after the reset, exactly as a sequential job always did, and what says the
-    /// branch was put back is `merge_base_sha` being set beside that verdict.
-    ///
-    /// The assertion is kept anyway, because the direction it guards is the expensive one. Walking
-    /// past a non-terminal state is how an item is reported finished with its work still in flight.
+    /// The state is written between putting the branch back and recording the verdict, so a job
+    /// found holding it was cut off in that window (a restart, a crash). Waiting on it would stall
+    /// the job for ever, since nothing else will ever move that item; walking past it would report
+    /// an item finished with its verdict never written. The settle is the first check of all, ahead
+    /// of the short-circuit on a cancelled item, so it also happens for a job that is already
+    /// being stopped.
     #[test]
-    fn an_item_mid_merge_is_work_in_flight() {
+    fn a_reverted_item_is_settled_before_anything_else_moves() {
         use ItemState::*;
         assert_eq!(
             next_step(&view_with_team(
                 &[Reverted, Pending],
                 ReviewState::NotWanted
             )),
-            Next::Wait,
-            "Reverted must not let the queue move on"
+            Next::SettleRevert { ordinal: 0 },
+            "Reverted must be settled, not waited for and not walked past"
+        );
+        assert_eq!(
+            next_step(&view(true, &[Reverted, Cancelled], ReviewState::NotWanted)),
+            Next::SettleRevert { ordinal: 0 },
+            "the settle comes before the short-circuit on a cancelled item"
+        );
+    }
+
+    /// An item whose branch could not be put back ends the job, team or not.
+    ///
+    /// The tree still holds work a gate called broken, so no later item may start on it. The ending
+    /// is `stopped`, not `failed`: nothing is known about the item beyond the fact that the damage
+    /// is still there, and a person has to look.
+    #[test]
+    fn a_revert_failed_item_ends_the_job_with_or_without_a_team() {
+        use ItemState::*;
+        assert_eq!(
+            next_step(&view(
+                true,
+                &[RevertFailed, Pending],
+                ReviewState::NotWanted
+            )),
+            Next::Finish(Outcome::Stopped),
+            "a job with no team keeps going onto a tree that was not put back"
+        );
+        assert_eq!(
+            next_step(&view_with_team(
+                &[RevertFailed, Pending],
+                ReviewState::NotWanted
+            )),
+            Next::Finish(Outcome::Stopped),
+            "a team's job keeps going onto a tree that was not put back"
+        );
+    }
+
+    /// `revert_failed` is a status `item_state_from` knows, and the item it names is over.
+    ///
+    /// The fallback in `item_state_from` is `Pending`, so a status it did not know would come back
+    /// as work to START on a tree that was never put back. Terminal means it is not claimable, and
+    /// "never lands" means a dependent is orphaned rather than left waiting.
+    #[test]
+    fn revert_failed_is_read_back_and_never_lands() {
+        assert_eq!(
+            item_state_from("revert_failed", 0, 0),
+            ItemState::RevertFailed
+        );
+        assert_eq!(
+            item_state_from("revert_failed", 3, 1),
+            ItemState::RevertFailed,
+            "the attempt counts decide nothing for this status"
+        );
+        assert!(never_lands(ItemState::RevertFailed));
+        assert_eq!(ItemState::RevertFailed.claimable_as(), None);
+        assert!(
+            !holds_paths(ItemState::RevertFailed),
+            "a finished item holds no paths that could collide"
         );
     }
 
@@ -1239,6 +1293,7 @@ mod tests {
                 | ItemState::Merging
                 | ItemState::Conflicted
                 | ItemState::Reverted
+                | ItemState::RevertFailed
                 | ItemState::Orphaned
                 | ItemState::Superseded => (),
             };
@@ -1272,6 +1327,7 @@ mod tests {
                 | ItemState::GateFailed
                 | ItemState::GateErrored
                 | ItemState::Skipped
+                | ItemState::RevertFailed
                 | ItemState::Orphaned
                 | ItemState::Superseded => false,
             }
@@ -1346,6 +1402,7 @@ mod tests {
             ("merging", ItemState::Merging),
             ("conflicted", ItemState::Conflicted),
             ("reverted", ItemState::Reverted),
+            ("revert_failed", ItemState::RevertFailed),
             ("orphaned", ItemState::Orphaned),
         ] {
             assert_eq!(
@@ -3922,6 +3979,261 @@ mod tests {
         assert!(
             job_tree.path.join("green.txt").exists(),
             "undoing item 0 took item 1's merge with it — which is what reverting by ordinal does"
+        );
+    }
+
+    /// A job whose two items have both been merged into its branch, item 0 (`red.txt`) after
+    /// item 1 (`green.txt`) — the ordinals deliberately the reverse of the merge order, as in
+    /// `reverting_a_red_merge_leaves_the_other_items_work_on_the_branch`.
+    ///
+    /// The three tests below start from exactly this state, and it takes a repository, a worktree
+    /// root and two checkouts to build, so it is built once. The caller holds `test_env_lock()`
+    /// BEFORE calling and for as long as it uses the result; the fields are declared in the order
+    /// they must be dropped (the environment override first, the directories it points at last).
+    struct MergedJob {
+        _env: WorktreeRootEnv,
+        _trees: tempfile::TempDir,
+        _container: tempfile::TempDir,
+        pool: sqlx::SqlitePool,
+        state: AppState,
+        job_id: i64,
+        tree: std::path::PathBuf,
+    }
+
+    async fn a_job_with_two_merged_items() -> MergedJob {
+        let (container, repo) = walkable_repo("nucleos-job-red-merge-", "git --version");
+        let trees = tempfile::tempdir().expect("worktree root");
+        let env = WorktreeRootEnv::set(trees.path());
+        let pool = test_pool().await;
+        let job_id = seed_job_in(
+            &pool,
+            "nucleos",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The job's own checkout, on the job's branch. This is what the merges land in.
+        let job_tree = crate::execution::worktree::create(
+            &repo,
+            crate::execution::worktree::Owner::Job(job_id),
+        )
+        .await
+        .expect("the job's checkout");
+        crate::execution::worktree::record(
+            &pool,
+            crate::execution::worktree::Owner::Job(job_id),
+            "nucleos",
+            &repo.to_string_lossy(),
+            &job_tree.path.to_string_lossy(),
+            &job_tree.branch,
+            job_tree.base_sha.as_deref(),
+        )
+        .await
+        .unwrap();
+
+        seed_items(&pool, job_id, &["implemented", "implemented"]).await;
+        let items: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? ORDER BY ordinal")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        // Each item's work is left uncommitted in a checkout of its own, as an implement node
+        // leaves it.
+        for (item_id, file) in [(items[0], "red.txt"), (items[1], "green.txt")] {
+            let base = crate::execution::worktree::head_sha(&job_tree.path)
+                .await
+                .unwrap();
+            let tree = crate::execution::worktree::adopt_or_create_at(
+                &repo,
+                crate::execution::worktree::Owner::Item(item_id),
+                Some(&base),
+            )
+            .await
+            .expect("the item's checkout");
+            crate::execution::worktree::record(
+                &pool,
+                crate::execution::worktree::Owner::Item(item_id),
+                "project-a",
+                &repo.to_string_lossy(),
+                &tree.path.to_string_lossy(),
+                &tree.branch,
+                tree.base_sha.as_deref(),
+            )
+            .await
+            .expect("record the item's checkout");
+            std::fs::write(tree.path.join(file), "work\n").expect("write the item's work");
+        }
+
+        let state = test_state(pool.clone()).await;
+        let state = with_home(state, &container);
+        // The green one lands first, then the red one on top of it.
+        for ordinal in [1, 0] {
+            assert_eq!(
+                merge_item(&state, &load_job(&pool, job_id).await.unwrap(), ordinal).await,
+                Step::Continued
+            );
+        }
+        assert!(job_tree.path.join("green.txt").exists());
+        assert!(job_tree.path.join("red.txt").exists());
+
+        MergedJob {
+            _env: env,
+            _trees: trees,
+            _container: container,
+            pool,
+            state,
+            job_id,
+            tree: job_tree.path,
+        }
+    }
+
+    /// What taking item 0's merge back must have done to the job's branch, and nothing more.
+    fn assert_only_the_red_merge_was_taken_back(tree: &std::path::Path) {
+        assert!(
+            !tree.join("red.txt").exists(),
+            "the rejected merge is still on the branch"
+        );
+        assert!(
+            tree.join("green.txt").exists(),
+            "undoing item 0 took item 1's merge with it"
+        );
+    }
+
+    /// A merged item that goes red with a retry left is taken OFF the job branch, and asked for
+    /// again.
+    ///
+    /// A sequential item that goes red with a retry left keeps its tree, because the tree is where
+    /// the second node starts from. A merged item's work is on the JOB's branch, and the retry
+    /// builds a fresh checkout for the item; leaving the first attempt on the branch would land the
+    /// second on top of it. So the merge is reset away first, and only then does the item read
+    /// `gate_failed` with a retry left.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_merged_item_gated_red_with_a_retry_left_is_taken_off_the_job_branch() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let job = a_job_with_two_merged_items().await;
+        sqlx::query("UPDATE jobs SET gate_retries = 1 WHERE id = ?")
+            .bind(job.job_id)
+            .execute(&job.pool)
+            .await
+            .unwrap();
+        let row = load_job(&job.pool, job.job_id).await.unwrap();
+
+        let step = record_gate(&job.state, &row, 0, red_gate()).await;
+
+        assert_eq!(step, Step::Continued);
+        assert_only_the_red_merge_was_taken_back(&job.tree);
+        let (status, attempts): (String, i64) = sqlx::query_as(
+            "SELECT status, gate_attempts FROM job_items WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job.job_id)
+        .fetch_one(&job.pool)
+        .await
+        .unwrap();
+        assert_eq!((status.as_str(), attempts), ("gate_failed", 1));
+
+        // Item 1 has been gated green in the meantime, as the queue would have done.
+        sqlx::query("UPDATE job_items SET status = 'passed' WHERE job_id = ? AND ordinal = 1")
+            .bind(job.job_id)
+            .execute(&job.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_step(&load_view(&job.pool, job.job_id).await.unwrap()),
+            Next::SpawnImplement(vec![0]),
+            "the queue has to come back to the same item"
+        );
+    }
+
+    /// Out of retries, the same reset happens and the item is over: `gate_failed`, and a lesson
+    /// queued for the distiller.
+    ///
+    /// The distill row is the proof that the settle is the one place the verdict is written: the
+    /// `RunExhausted` cause is queued by the same write that records `gate_failed` once the
+    /// attempts exceed the budget.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_merged_item_gated_red_out_of_retries_is_reverted_then_gate_failed() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let job = a_job_with_two_merged_items().await;
+        sqlx::query("UPDATE jobs SET gate_retries = 0 WHERE id = ?")
+            .bind(job.job_id)
+            .execute(&job.pool)
+            .await
+            .unwrap();
+        let row = load_job(&job.pool, job.job_id).await.unwrap();
+
+        let step = record_gate(&job.state, &row, 0, red_gate()).await;
+
+        assert_eq!(step, Step::Continued);
+        assert_only_the_red_merge_was_taken_back(&job.tree);
+        let (status, attempts): (String, i64) = sqlx::query_as(
+            "SELECT status, gate_attempts FROM job_items WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job.job_id)
+        .fetch_one(&job.pool)
+        .await
+        .unwrap();
+        assert_eq!((status.as_str(), attempts), ("gate_failed", 1));
+        assert_eq!(
+            item_state_from(&status, attempts, 0),
+            ItemState::GateFailed,
+            "no retry is left, so this is the end of the item"
+        );
+        let queued: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM distill_queue WHERE job_id = ? AND cause = ?")
+                .bind(job.job_id)
+                .bind(crate::distill::Cause::RunExhausted.as_str())
+                .fetch_one(&job.pool)
+                .await
+                .unwrap();
+        assert_eq!(queued, 1, "an exhausted item is a lesson for the distiller");
+    }
+
+    /// A job restarted while an item reads `reverted` finishes the settle and moves on.
+    ///
+    /// `reverted` is the window between putting the branch back and writing the verdict. A daemon
+    /// that died inside it leaves the item there, and before the settle was a step of its own such
+    /// a job waited on it for ever. `advance` has to put the branch back (the reset may or may not
+    /// have happened; doing it again is harmless), write the verdict, and not stall.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_restarted_with_an_item_reverted_settles_it_and_moves_on() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let job = a_job_with_two_merged_items().await;
+        sqlx::query(
+            "UPDATE job_items SET status = 'reverted', gate_status = 'failed', gate_attempts = 1
+             WHERE job_id = ? AND ordinal = 0",
+        )
+        .bind(job.job_id)
+        .execute(&job.pool)
+        .await
+        .unwrap();
+        assert!(
+            job.tree.join("red.txt").exists(),
+            "the premise: the branch was not yet put back when the daemon died"
+        );
+
+        let step = advance(
+            &job.state,
+            &load_job(&job.pool, job.job_id).await.unwrap(),
+            Utc::now(),
+        )
+        .await;
+
+        assert_eq!(
+            step,
+            Step::Continued,
+            "a restart must not stall on the item"
+        );
+        assert_only_the_red_merge_was_taken_back(&job.tree);
+        assert_eq!(item_statuses(&job.pool, job.job_id).await[0], "gate_failed");
+        assert_ne!(
+            next_step(&load_view(&job.pool, job.job_id).await.unwrap()),
+            Next::SettleRevert { ordinal: 0 },
+            "settled once is settled"
         );
     }
 
@@ -6965,17 +7277,43 @@ mod tests {
 
         let broken = seed_job(&pool, "project-a", "implementing").await.unwrap();
         seed_items(&pool, broken, &["implemented"]).await;
+        // A real place to put the red item's work back to: a checkout on record and the job's
+        // footing at its HEAD. Without one the red gate ends `revert_failed`/`stopped`, which is a
+        // third ending and not the one this test is about.
+        let checkout = tempfile::tempdir().expect("a checkout for the red job");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@x"],
+            vec!["config", "user.name", "test"],
+            vec!["commit", "--allow-empty", "-m", "seed"],
+        ] {
+            assert!(git_ok(checkout.path(), &args));
+        }
+        let footing = crate::execution::worktree::head_sha(checkout.path())
+            .await
+            .expect("the checkout's HEAD");
+        seed_worktree(&pool, broken, checkout.path()).await;
+        sqlx::query("UPDATE jobs SET head_sha = ? WHERE id = ?")
+            .bind(&footing)
+            .bind(broken)
+            .execute(&pool)
+            .await
+            .unwrap();
         let row = load_job(&pool, broken).await.unwrap();
-        record_gate(
-            &state,
-            &row,
-            0,
-            crate::gate::GateOutcome::Failed {
-                exit_code: 101,
-                output: "test failed".into(),
-            },
-        )
-        .await;
+        assert_eq!(
+            record_gate(
+                &state,
+                &row,
+                0,
+                crate::gate::GateOutcome::Failed {
+                    exit_code: 101,
+                    output: "test failed".into(),
+                },
+            )
+            .await,
+            Step::Continued,
+            "the premise: the red item was taken off the branch"
+        );
 
         let unmeasured = seed_job(&pool, "project-b", "implementing").await.unwrap();
         seed_items(&pool, unmeasured, &["implemented"]).await;
@@ -6990,9 +7328,9 @@ mod tests {
         )
         .await;
 
-        // Neither job has a worktree on record, so the red one takes the branch where a revert
-        // cannot happen: `record_gate` marks the item anyway and answers `Stopped`, refusing to let
-        // a queue advance onto a tree it could not put back. The MARK is what these assertions read.
+        // The red job's item was reverted and marked `gate_failed`; the errored one was not
+        // reverted at all (a gate that did not run judged nothing). The MARK is what these
+        // assertions read.
         //
         // And there the two part company, which is the point of the test: silence ends the job
         // `gate_errored`, a verdict ends it `gate_failed`. Silence stops the job where it stands.
@@ -7924,59 +8262,142 @@ mod tests {
         assert_eq!(pending, ("pending".into(), None));
     }
 
-    /// Out of retries, the tree still governs, and nothing about that branch has moved.
+    /// What a red gate that cannot put its branch back must leave behind, whatever the reason.
     ///
-    /// `gate_retries = 0` is every job written before migration 0068, so this is the regression the
-    /// retry is most likely to break: with no budget the first red gate is final, and a red gate
-    /// whose worktree cannot be put back still stops the night where it stands rather than letting
-    /// the next item build on work the gate has just called broken.
-    ///
-    /// The attempt is counted anyway. It costs nothing here — there is no budget for it to be
-    /// measured against — and a counter that only increments on the paths that spend it would be a
-    /// counter that disagrees with itself about what happened to the item.
-    #[tokio::test]
-    async fn a_red_gate_out_of_retries_still_stops_when_it_cannot_revert() {
-        let pool = test_pool().await;
-        let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        // Said out loud rather than left to the column default, because it is the premise: this is
-        // a job with nothing to spend.
-        sqlx::query("UPDATE jobs SET gate_retries = 0 WHERE id = ?")
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        seed_items(&pool, job_id, &["implemented"]).await;
-        let row = load_job(&pool, job_id).await.unwrap();
-
-        let step = record_gate(
-            &state,
-            &row,
-            0,
-            crate::gate::GateOutcome::Failed {
-                exit_code: 1,
-                output: "boom".into(),
-            },
-        )
-        .await;
-
+    /// The item is `revert_failed` and not `gate_failed`: `gate_failed` reads as "the work was
+    /// rejected and taken off the branch", and here it was rejected and is still ON it. The job
+    /// stops, because every later item would build on work a gate has just called broken. The red
+    /// gate is counted anyway, and the feed line says in words that the branch was not restored.
+    async fn assert_reverts_nothing_and_stops(pool: &sqlx::SqlitePool, job_id: i64, step: Step) {
         assert_eq!(
             step,
             Step::Stopped,
             "a tree that could not be put back still ends the pass"
         );
-        assert_eq!(item_statuses(&pool, job_id).await, vec!["gate_failed"]);
+        assert_eq!(
+            item_statuses(pool, job_id).await,
+            vec!["revert_failed"],
+            "an item still on the branch must not read as one taken off it"
+        );
+        assert_eq!(job_status(pool, job_id).await, "stopped");
         let attempts: i64 = sqlx::query_scalar(
             "SELECT gate_attempts FROM job_items WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job_id)
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .unwrap();
         assert_eq!(
             attempts, 1,
             "the red gate happened, and it is counted whether or not it bought anything"
         );
+        assert!(
+            feed_texts(pool)
+                .await
+                .iter()
+                .any(|text| text.contains("could not be put back")),
+            "the feed has to say the branch was not restored"
+        );
+        assert!(
+            feed_kinds(pool)
+                .await
+                .iter()
+                .any(|kind| kind == "job_gate_failed"),
+            "the line goes out under the existing gate-failed kind"
+        );
+    }
+
+    /// A job with a single item the gate is about to call red, and nothing to spend on a retry.
+    ///
+    /// `gate_retries = 0` is every job written before migration 0068, so this is the regression the
+    /// retry is most likely to break: with no budget the first red gate is final.
+    async fn a_job_with_one_item_about_to_go_red(pool: &sqlx::SqlitePool) -> i64 {
+        let job_id = seed_job(pool, "project-a", "implementing").await.unwrap();
+        // Said out loud rather than left to the column default, because it is the premise: this is
+        // a job with nothing to spend.
+        sqlx::query("UPDATE jobs SET gate_retries = 0 WHERE id = ?")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        seed_items(pool, job_id, &["implemented"]).await;
+        job_id
+    }
+
+    fn red_gate() -> crate::gate::GateOutcome {
+        crate::gate::GateOutcome::Failed {
+            exit_code: 1,
+            output: "boom".into(),
+        }
+    }
+
+    /// Out of retries and no worktree on record: nothing was put back, and the item says so.
+    ///
+    /// Rewrites `a_red_gate_out_of_retries_still_stops_when_it_cannot_revert`, which asserted
+    /// `gate_failed` and so called an item rejected and taken off the branch when neither was true
+    /// of the second half.
+    #[tokio::test]
+    async fn a_red_gate_that_cannot_be_reverted_marks_the_item_and_stops_the_job() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = a_job_with_one_item_about_to_go_red(&pool).await;
+        let row = load_job(&pool, job_id).await.unwrap();
+
+        let step = record_gate(&state, &row, 0, red_gate()).await;
+
+        assert_reverts_nothing_and_stops(&pool, job_id, step).await;
+    }
+
+    /// A worktree on record is not a place to go back TO: with no footing there is no revision to
+    /// reset to, and the honest response is to leave the tree alone and say so.
+    ///
+    /// The job's `head_sha` is NULL (a job written before the column, or one whose head could not
+    /// be read) and no item has a checkpoint, so `revert_point` answers nothing.
+    #[tokio::test]
+    async fn a_red_gate_with_no_revert_point_is_revert_failed() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = a_job_with_one_item_about_to_go_red(&pool).await;
+        let tmp = tempfile::tempdir().expect("a directory for the job");
+        seed_worktree(&pool, job_id, tmp.path()).await;
+        let row = load_job(&pool, job_id).await.unwrap();
+        assert!(
+            revert_point(&pool, &row, 0).await.is_none(),
+            "the premise: nothing knows where this item started"
+        );
+
+        let step = record_gate(&state, &row, 0, red_gate()).await;
+
+        assert_reverts_nothing_and_stops(&pool, job_id, step).await;
+    }
+
+    /// A footing and a worktree, and git still cannot do it: the reset itself fails.
+    ///
+    /// The worktree row points at a plain directory that is no checkout, so `revert_to` errors. An
+    /// error from the reset must land where a missing revert point does, not on `gate_failed`.
+    #[tokio::test]
+    async fn a_red_gate_whose_reset_fails_is_revert_failed() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = a_job_with_one_item_about_to_go_red(&pool).await;
+        let tmp = tempfile::tempdir().expect("a directory that is not a checkout");
+        seed_worktree(&pool, job_id, tmp.path()).await;
+        // Any 40-hex string: it only has to exist so that a footing does.
+        sqlx::query("UPDATE jobs SET head_sha = ? WHERE id = ?")
+            .bind("0123456789abcdef0123456789abcdef01234567")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row = load_job(&pool, job_id).await.unwrap();
+        assert!(
+            revert_point(&pool, &row, 0).await.is_some(),
+            "the premise: there is a revision to go back to"
+        );
+
+        let step = record_gate(&state, &row, 0, red_gate()).await;
+
+        assert_reverts_nothing_and_stops(&pool, job_id, step).await;
     }
 
     #[tokio::test]
@@ -8144,6 +8565,28 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+        // A real revert point, so the red item ends `gate_failed` (its work taken off the
+        // branch). Without one it ends `revert_failed` and the job is retired `stopped`, which
+        // queues the JOB's failure instead and is not what this test is about.
+        let checkout = tempfile::tempdir().expect("a checkout for the job");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@x"],
+            vec!["config", "user.name", "test"],
+            vec!["commit", "--allow-empty", "-m", "seed"],
+        ] {
+            assert!(git_ok(checkout.path(), &args));
+        }
+        let footing = crate::execution::worktree::head_sha(checkout.path())
+            .await
+            .expect("the checkout's HEAD");
+        seed_worktree(&pool, job_id, checkout.path()).await;
+        sqlx::query("UPDATE jobs SET head_sha = ? WHERE id = ?")
+            .bind(&footing)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         let job = load_job(&pool, job_id).await.unwrap();
 
         let step = record_gate(
@@ -8157,9 +8600,47 @@ mod tests {
         )
         .await;
 
-        assert_eq!(step, Step::Stopped);
+        // `Continued`, not the `Stopped` this asserted when its fixture had no revert point: the
+        // item was reverted and the job carries on to its ending, rather than stopping on a branch
+        // it could not put back.
+        assert_eq!(step, Step::Continued);
+        assert_eq!(item_statuses(&pool, job_id).await, vec!["gate_failed"]);
         assert_eq!(
             distill_rows(&pool).await,
+            vec![(
+                "run_exhausted".to_string(),
+                Some(job_id),
+                Some(item_id),
+                "project-a".to_string()
+            )]
+        );
+    }
+
+    /// An exhausted item whose branch cannot be put back is `revert_failed`, and its own
+    /// RunExhausted verdict is queued all the same (the job's failure is a separate row).
+    #[tokio::test]
+    async fn a_revert_failed_item_out_of_retries_still_queues_its_exhaustion() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = a_job_with_one_item_about_to_go_red(&pool).await;
+        let item_id: i64 =
+            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = 0")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let row = load_job(&pool, job_id).await.unwrap();
+
+        let step = record_gate(&state, &row, 0, red_gate()).await;
+
+        assert_reverts_nothing_and_stops(&pool, job_id, step).await;
+        let exhausted: Vec<_> = distill_rows(&pool)
+            .await
+            .into_iter()
+            .filter(|row| row.0 == "run_exhausted" && row.2 == Some(item_id))
+            .collect();
+        assert_eq!(
+            exhausted,
             vec![(
                 "run_exhausted".to_string(),
                 Some(job_id),
