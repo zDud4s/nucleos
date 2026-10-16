@@ -1,6 +1,6 @@
 // §spec novo-frontend
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { useDictation, type CaptureOutcome, type Delivery } from "../app/Dictation";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
@@ -32,18 +32,23 @@ import {
   Rows,
   StaleNote,
   StateBadge,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
   Teach,
   Section,
 } from "../ui";
 import { VoiceOrb } from "./VoiceOrb";
+import { VoiceRoom } from "./VoiceRoom";
 import "./voice.css";
 
 /**
  * Voice — configuration, the capture pipeline, memos and dictations.
  *
  * The two facts from `data/voice.ts`'s header that shape everything below:
- * **`armed` is config, not hardware** — the Teach in {@link CaptureButtons}
- * replaces the capture buttons whenever it is false, and says so rather than
+ * **`armed` is config, not hardware** — the Teach in {@link NotArmed}
+ * stands in the room whenever it is false, and says so rather than
  * offering a button that would 503. **A `204` from `POST /voice/capture` is
  * "nothing was heard", not success** — {@link CaptureOutcomeNote} names it
  * explicitly rather than rendering the silence of a successful mutation.
@@ -52,6 +57,18 @@ import "./voice.css";
  * paste live in `app/Dictation.tsx`, mounted by the shell on every page, because
  * the chords that drive them are global and a dictation is pasted into whatever
  * application has focus. This page draws that state and presses the same controls.
+ *
+ * **The page is a room**, full-bleed: the stage and the orb behind, the captions in the middle, a
+ * dock along the bottom, and the archive (memos, dictations, configuration) in a drawer.
+ *
+ * **The spoken conversation is not the dictation.** The dictation and the microphone in a chat's
+ * composer turn speech into TEXT and hand it over - a dictation is pasted by the host, and the chat's
+ * microphone fills the box you were about to type in. Both leave the words in front of somebody
+ * before anything is sent, which is the right shape THERE: a misheard sentence is editable. The
+ * conversation is the other thing, and it is here because the owner put it here on 2026-09-19: a
+ * spoken turn goes out as it was heard, and the answer comes back out loud. Which conversation it
+ * belongs to is `data/voice-chat.ts`'s whole subject - one dedicated chat, reused, because the
+ * daemon refuses a turn that names none.
  */
 
 /** One derived sentence for the page header. */
@@ -88,7 +105,7 @@ export function Voice() {
   const dictations = useDictations();
   const deleteMemo = useDeleteMemo();
 
-  const { phase, activeKind, pending, outcome, delivery, press, abandon } = useDictation();
+  const { phase, activeKind, pending, outcome, delivery, press: pressCapture, abandon } = useDictation();
   /* Registered by the shell, not here — see `data/hotkeys.ts`. The page reads the outcome of the one
      registration, which the shell has usually finished before anybody opens this page. */
   const hotkeys = useHotkeyRegistration();
@@ -96,60 +113,14 @@ export function Voice() {
   const hotkeyRegisterFailed = hotkeys?.failed ?? false;
   const hotkeysUnavailable = hotkeys?.unavailable ?? null;
 
-  return (
-    <>
-      <PageHeader title="Voice" headline={headline(config.data, memos.data, dictations.data, hotkeyConflicts, hotkeyRegisterFailed)} />
+  const armed = config.data?.armed === true;
+  const dictationHotkey = config.data?.hotkey ?? "";
+  const memoHotkey = config.data?.memo_hotkey ?? "";
+  const conversationHotkey = config.data?.conversation_hotkey ?? "";
 
-      <Panel title="Capture" aside={<PhaseBadge phase={phase} registerFailed={hotkeyRegisterFailed} />}>
-        {hotkeysUnavailable === null ? (
-          <HotkeyConflictNote failed={hotkeyConflicts} registerFailed={hotkeyRegisterFailed} />
-        ) : (
-          // The host's words, not this page's: `dictation.rs` owns the sentence, and a conflict
-          // note would be the wrong one anyway — nothing was registered to conflict with.
-          <p className="voice-hotkey-conflict" role="status">
-            {hotkeysUnavailable}
-          </p>
-        )}
-        <CaptureButtons
-          phase={phase}
-          armed={config.data?.armed ?? false}
-          activeKind={activeKind}
-          pending={pending}
-          onPress={press}
-          onAbandon={abandon}
-        />
-        <CaptureOutcomeNote outcome={outcome} />
-        <DeliveryNote delivery={delivery} />
-      </Panel>
-
-      <Conversation armed={config.data?.armed} />
-
-      <ConfigReadout config={config} />
-
-      <MemoList memos={memos} deleteMemo={deleteMemo} />
-
-      <DictationList dictations={dictations} />
-    </>
-  );
-}
-
-/* --------------------------------------------------------- conversation -- */
-
-/**
- * Talking to the agent out loud: it hears a sentence, sends it as a turn, and reads the answer back.
- *
- * **Not the dictation above, and not the microphone in a chat's composer.** Those two turn speech
- * into TEXT and hand it over — a dictation is pasted by the host, and the chat's microphone fills the
- * box you were about to type in. Both leave the words in front of somebody before anything is sent,
- * which is why they are the right shape THERE: a misheard sentence is editable, and the first sentence
- * in a chat is the one that opens a conversation. This is the other thing, and it is here because the
- * owner put it here on 2026-09-19: a spoken turn goes out as it was heard, and the answer comes back
- * out loud.
- *
- * Which conversation it belongs to is `data/voice-chat.ts`'s whole subject — one dedicated chat,
- * reused, because the daemon refuses a turn that names none.
- */
-function Conversation({ armed }: { armed: boolean | undefined }) {
+  /* The conversation: which chat it speaks into, and the runner that owns the microphone. It lives at
+     the page because the room draws it in four places — the stage, the captions, the dock and the
+     header's badge — and they all read this one view. */
   const chat = useVoiceChat();
   const voice = useVoiceConversation(chat.chatId);
   const [opening, setOpening] = useState(false);
@@ -180,25 +151,270 @@ function Conversation({ armed }: { armed: boolean | undefined }) {
     }
   }
 
-  useChordRequest(armed, press);
+  useChordRequest(config.data?.armed, press);
+
+  /* The archive: the memos, the dictations and the configuration, in a drawer that is not on the page
+     until somebody asks for it. */
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const archiveButton = useRef<HTMLButtonElement>(null);
+
+  function closeArchive() {
+    setArchiveOpen(false);
+    // Focus goes back where it came from: a drawer that closes and leaves it on nothing strands
+    // anybody navigating by keyboard at the top of the page.
+    archiveButton.current?.focus();
+  }
+
+  useEffect(() => {
+    if (!archiveOpen) return undefined;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") closeArchive();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [archiveOpen]);
+
+  const memoCount = memos.data?.length;
+  const dictationCount = dictations.data?.length;
+  const counts = [
+    memoCount === undefined ? null : plural(memoCount, "memo"),
+    dictationCount === undefined ? null : plural(dictationCount, "dictation"),
+  ].filter((part): part is string => part !== null);
 
   return (
-    <Panel title="Conversation" aside={<ConversationBadge phase={voice.phase} />}>
-      {armed === true ? (
-        <>
-          <VoiceOrb phase={voice.phase} level={voice.level} threshold={voice.threshold} />
-          <div className="voice-capture-buttons">
-            <Button intent={on ? "stop" : "go"} disabled={opening} onClick={() => void press()}>
-              {on ? "Stop talking" : "Start talking"}
-            </Button>
-          </div>
+    <div
+      className="voice-room"
+      data-phase={voice.phase}
+      data-archive={archiveOpen ? "open" : undefined}
+    >
+      <VoiceRoom phase={voice.phase} level={voice.level} threshold={voice.threshold} tap={voice.answerTap} />
+      <VoiceOrb phase={voice.phase} tap={voice.answerTap} />
+
+      <div className="voice-room-top">
+        <PageHeader
+          title="Voice"
+          headline={headline(config.data, memos.data, dictations.data, hotkeyConflicts, hotkeyRegisterFailed)}
+          actions={
+            <>
+              <ConversationBadge phase={voice.phase} />
+              {/* A plain button and not the `Button` primitive: focus has to come back to it, which
+                  takes a ref. The counts are spelled out in the label because, drawn beside the word,
+                  they would be announced as "Archive2 memos". */}
+              <button
+                type="button"
+                className="ui-button ui-button-ghost voice-archive-open"
+                ref={archiveButton}
+                aria-expanded={archiveOpen}
+                aria-controls="voice-archive"
+                aria-label={counts.length === 0 ? "Archive" : `Archive, ${counts.join(" and ")}`}
+                onClick={() => (archiveOpen ? closeArchive() : setArchiveOpen(true))}
+              >
+                Archive
+                {counts.length > 0 && (
+                  <span className="voice-archive-count" aria-hidden="true">
+                    {counts.join(" · ")}
+                  </span>
+                )}
+              </button>
+            </>
+          }
+        />
+      </div>
+
+      {armed ? <Captions voice={voice} hotkey={conversationHotkey} /> : <NotArmed />}
+
+      <div className="voice-dock">
+        <div className="voice-dock-diag">
           <ConversationStatus voice={voice} />
-          {chat.trouble !== null && <ErrorNote>{chat.trouble}</ErrorNote>}
-        </>
-      ) : (
-        <Quiet says="not armed — nothing here can transcribe a spoken turn" />
+        </div>
+
+        <div className="voice-dock-talk">
+          {armed && (
+            <>
+              <Button intent={on ? "stop" : "go"} disabled={opening} onClick={() => void press()}>
+                {on ? "Stop talking" : "Start talking"}
+                {conversationHotkey !== "" && (
+                  <kbd aria-hidden="true" className="voice-kbd">
+                    {conversationHotkey}
+                  </kbd>
+                )}
+              </Button>
+              {chat.trouble !== null && <ErrorNote>{chat.trouble}</ErrorNote>}
+            </>
+          )}
+        </div>
+
+        <div className="voice-dock-capture" role="group" aria-label="Capture">
+          <PhaseBadge phase={phase} registerFailed={hotkeyRegisterFailed} />
+          {hotkeysUnavailable === null ? (
+            <HotkeyConflictNote failed={hotkeyConflicts} registerFailed={hotkeyRegisterFailed} />
+          ) : (
+            // The host's words, not this page's: `dictation.rs` owns the sentence, and a conflict
+            // note would be the wrong one anyway — nothing was registered to conflict with.
+            <p className="voice-hotkey-conflict" role="status">
+              {hotkeysUnavailable}
+            </p>
+          )}
+          <CaptureButtons
+            phase={phase}
+            armed={armed}
+            activeKind={activeKind}
+            pending={pending}
+            hotkey={dictationHotkey}
+            memoHotkey={memoHotkey}
+            onPress={pressCapture}
+            onAbandon={abandon}
+          />
+          <CaptureOutcomeNote outcome={outcome} />
+          <DeliveryNote delivery={delivery} />
+        </div>
+      </div>
+
+      {archiveOpen && (
+        <Archive
+          config={config}
+          memos={memos}
+          dictations={dictations}
+          deleteMemo={deleteMemo}
+          onClose={closeArchive}
+        />
       )}
-    </Panel>
+    </div>
+  );
+}
+
+/** "2 memos", "1 memo" — the noun agrees with the number. */
+function plural(n: number, noun: string): string {
+  return `${n} ${n === 1 ? noun : `${noun}s`}`;
+}
+
+/* ------------------------------------------------------------ the archive -- */
+
+/**
+ * The drawer: what has been captured, and how the pillar is configured.
+ *
+ * Mounted only while open, so nothing in it is reachable by keyboard when it is shut. It takes focus
+ * onto its Close button as it mounts; closing — that button or Escape, both handled by the page — gives
+ * focus back to the button that opened it.
+ */
+function Archive({
+  config,
+  memos,
+  dictations,
+  deleteMemo,
+  onClose,
+}: {
+  config: ReturnType<typeof useVoiceConfig>;
+  memos: ReturnType<typeof useMemos>;
+  dictations: ReturnType<typeof useDictations>;
+  deleteMemo: ReturnType<typeof useDeleteMemo>;
+  onClose: () => void;
+}) {
+  const closeButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    closeButton.current?.focus();
+  }, []);
+
+  return (
+    <aside id="voice-archive" className="voice-archive" aria-label="Voice archive">
+      <div className="voice-archive-head">
+        <h2>Archive</h2>
+        <button type="button" className="ui-button ui-button-ghost" ref={closeButton} onClick={onClose}>
+          Close
+        </button>
+      </div>
+      <div className="voice-archive-body">
+        <Tabs defaultValue="memos">
+          <TabsList aria-label="Archive sections">
+            <TabsTrigger value="memos">
+              Memos <Count n={memos.data?.length} />
+            </TabsTrigger>
+            <TabsTrigger value="dictations">
+              Dictations <Count n={dictations.data?.length} />
+            </TabsTrigger>
+            <TabsTrigger value="configuration">Configuration</TabsTrigger>
+          </TabsList>
+          <TabsContent value="memos">
+            <MemoList memos={memos} deleteMemo={deleteMemo} />
+          </TabsContent>
+          <TabsContent value="dictations">
+            <DictationList dictations={dictations} />
+          </TabsContent>
+          <TabsContent value="configuration">
+            <ConfigReadout config={config} />
+          </TabsContent>
+        </Tabs>
+      </div>
+    </aside>
+  );
+}
+
+/* ------------------------------------------------------------ the captions -- */
+
+/**
+ * What the room says in words: what is being heard, what was heard, what the answer is — and, when
+ * there is nothing yet, how to begin.
+ *
+ * Read from the real view and in the order the person lived it. The label names whose words these
+ * are, so a screen reader hears "heard" or "nucleos" before them. The block is a polite live region:
+ * the words are read out as they change, not only found by a cursor.
+ */
+function Captions({ voice, hotkey }: { voice: ConversationView; hotkey: string }) {
+  const { phase, heard, assembling, answer } = voice;
+  const on = phase !== "off";
+  let label: string | null = null;
+  let words: ReactNode = null;
+
+  if (phase === "hearing") {
+    label = "hearing";
+    words = (
+      <>
+        <span className="voice-caption-assembling">{assembling ?? ""}</span>
+        <span className="voice-caption-caret" aria-hidden="true" />
+      </>
+    );
+  } else if (phase === "speaking" && answer !== null && answer !== "") {
+    label = "nucleos";
+    words = answer;
+  } else if (heard !== null) {
+    label = !on ? "last heard" : phase === "thinking" ? "heard — sending" : "heard";
+    words = `“${heard}”`;
+  }
+
+  const quiet =
+    !on && heard === null
+      ? `press Start talking${hotkey === "" ? "" : `, or ${hotkey} from anywhere,`} and speak`
+      : null;
+
+  return (
+    <div className="voice-captions" aria-live="polite">
+      {label !== null && <span className="voice-caption-label">{label}</span>}
+      {words !== null && <p className="voice-caption-words">{words}</p>}
+      {quiet !== null && <p className="voice-caption-quiet">{quiet}</p>}
+    </div>
+  );
+}
+
+/** What stands in the room's middle instead of the captions, on a machine that cannot transcribe. */
+function NotArmed() {
+  return (
+    <div className="voice-notarmed">
+      <Quiet says="not armed — nothing here can transcribe a spoken turn" />
+      <Teach title="Voice is not armed">
+        <p>
+          Armed means a transcriber is configured on this machine —{" "}
+          <code>armed = enabled &amp;&amp; (stt_command != "" || stt_url != "")</code>. Either engine
+          arms it, since 2026-09-20: a machine pointed at a resident whisper server is the
+          configuration that is six times faster, and naming only the command would have reported no
+          voice at all on it. It reflects configuration, not
+          whether a GPU or a model is actually present: the shell is set up to try, which is not the
+          same fact as a capture succeeding.
+        </p>
+        <p>
+          Configuration for this pillar lives in <code>~/.nucleos/voice.yaml</code>.
+        </p>
+      </Teach>
+    </div>
   );
 }
 
@@ -271,21 +487,15 @@ const SILENCE_SENTENCES: Record<SilenceReason, string> = {
   belowThreshold: "sound, but not speech — noise, or too far from the microphone",
 };
 
-/** What the conversation heard, what it is hearing, and anything that stopped it working. */
+/**
+ * The dock's diagnostics: the microphone's level against the bar, why nothing opened a turn, and
+ * anything that stopped the conversation working. What was heard, and what is being assembled, are
+ * the captions' now - said once, where the eye already is.
+ */
 function ConversationStatus({ voice }: { voice: ConversationView }) {
   const on = voice.phase !== "off";
   const metering =
     voice.phase === "listening" || voice.phase === "hearing" || voice.phase === "speaking";
-
-  if (
-    !on &&
-    voice.heard === null &&
-    voice.trouble === null &&
-    voice.assembling === null &&
-    voice.ignoredEcho === 0
-  ) {
-    return null;
-  }
 
   return (
     <div className="voice-conversation-status">
@@ -314,10 +524,7 @@ function ConversationStatus({ voice }: { voice: ConversationView }) {
           />
         </span>
       )}
-      {/* Shown as soon as it is heard and BEFORE the answer, because a misheard question that only
-          becomes visible once it has been answered is a question nobody got to correct. */}
-      {voice.heard !== null && <span>heard: “{voice.heard}”</span>}
-      {voice.assembling !== null && <span>hearing: “{voice.assembling}”</span>}
+      {!on && <span>microphone closed</span>}
       {voice.silence !== null && <span>{SILENCE_SENTENCES[voice.silence]}</span>}
       {/* A silently dropped segment looks exactly like a failed microphone, so say when the answer was
           heard again and deliberately not treated as a turn. */}
@@ -362,6 +569,8 @@ function CaptureButtons({
   armed,
   activeKind,
   pending,
+  hotkey,
+  memoHotkey,
   onPress,
   onAbandon,
 }: {
@@ -369,36 +578,33 @@ function CaptureButtons({
   armed: boolean;
   activeKind: "dictation" | "memo" | null;
   pending: boolean;
+  hotkey: string;
+  memoHotkey: string;
   onPress: (memo: boolean) => void;
   onAbandon: () => void;
 }) {
-  if (!armed) {
-    return (
-      <Teach title="Voice is not armed">
-        <p>
-          Armed means a transcriber is configured on this machine —{" "}
-          <code>armed = enabled &amp;&amp; (stt_command != "" || stt_url != "")</code>. Either engine
-          arms it, since 2026-09-20: a machine pointed at a resident whisper server is the
-          configuration that is six times faster, and naming only the command would have reported no
-          voice at all on it. It reflects configuration, not
-          whether a GPU or a model is actually present: the shell is set up to try, which is not the
-          same fact as a capture succeeding.
-        </p>
-        <p>
-          Configuration for this pillar lives in <code>~/.nucleos/voice.yaml</code>.
-        </p>
-      </Teach>
-    );
-  }
+  // Not armed is the room's to say, in the middle of it (`NotArmed`) - a row of buttons here would
+  // offer what would 503.
+  if (!armed) return null;
 
   if (phase === "idle") {
     return (
       <div className="voice-capture-buttons">
         <Button intent="go" disabled={pending} onClick={() => onPress(false)}>
           Start dictation
+          {hotkey !== "" && (
+            <kbd aria-hidden="true" className="voice-kbd">
+              {hotkey}
+            </kbd>
+          )}
         </Button>
         <Button intent="go" disabled={pending} onClick={() => onPress(true)}>
           Start memo
+          {memoHotkey !== "" && (
+            <kbd aria-hidden="true" className="voice-kbd">
+              {memoHotkey}
+            </kbd>
+          )}
         </Button>
       </div>
     );

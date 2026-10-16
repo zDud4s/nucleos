@@ -264,6 +264,35 @@ describe("the runner while answering", () => {
     expect(client.apiFetch.mock.calls.filter(([path]) => path === "/assistant/message")).toHaveLength(1);
   });
 
+  it("an answer text that arrives after a barge-in still judges the echo", async () => {
+    // `/live` is held back until the person has already interrupted: the generation moved on while
+    // the read was in flight, and the words must still become the echo judge's yardstick.
+    let releaseLive!: (value: unknown) => void;
+    const held = new Promise((resolve) => {
+      releaseLive = resolve;
+    });
+    client.apiFetch.mockImplementation((path: string) => {
+      if (path === "/assistant/message") return Promise.resolve({ turn_id: 7 });
+      if (path === "/assistant/7/live") return held;
+      throw new Error(`unexpected path: ${path}`);
+    });
+    const result = await reachSpeaking();
+    now.mockReturnValue(1000);
+
+    act(() => sendFrames(4, 1));
+    expect(result.current.phase).toBe("hearing");
+
+    await act(async () => {
+      releaseLive({ text: FORECAST, doing: null, did: [], thought: [], thought_tokens: null });
+      await held;
+    });
+    voice.postSegment.mockResolvedValueOnce({ text: "lisboa vai estar sol", verdict: "closes" });
+    act(() => sendFrames(25, 0));
+
+    await waitFor(() => expect(result.current.ignoredEcho).toBe(1));
+    expect(client.apiFetch.mock.calls.filter(([path]) => path === "/assistant/message")).toHaveLength(1);
+  });
+
   it("echo is judged only near the answer", async () => {
     const result = await reachSpeaking();
     expect(player).not.toBeNull();
@@ -505,5 +534,28 @@ describe("useVoiceConversation", () => {
       sendFrames(25, 0);
     });
     await waitFor(() => expect(result.current.assembling).toBe("marca uma reunião para amanhã"));
+  });
+
+  it("the answer's words are exposed while it plays", async () => {
+    const result = await reachSpeaking();
+
+    await waitFor(() => expect(result.current.answer).toBe(FORECAST));
+  });
+
+  it("turning the mode off clears the answer's words", async () => {
+    const result = await reachSpeaking();
+    await waitFor(() => expect(result.current.answer).toBe(FORECAST));
+
+    act(() => result.current.toggle());
+    await waitFor(() => expect(result.current.phase).toBe("off"));
+
+    expect(result.current.answer).toBeNull();
+  });
+
+  it("the answer tap reads silence where the element cannot be captured", async () => {
+    const result = await reachSpeaking();
+
+    // The fake Audio has no captureStream, so nothing can be attached.
+    expect(result.current.answerTap.level()).toBe(0);
   });
 });

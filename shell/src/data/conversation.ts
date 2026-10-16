@@ -44,6 +44,7 @@ import { useListening, type Listening } from "./listening";
 import type { LiveTurn } from "./chats";
 import { apiFetch } from "./client";
 import { fetchSpeechUnit, postSegment } from "./voice";
+import { createAnswerTap, type AnswerTap } from "./answer-tap";
 
 /**
  * The three constraints that make hands-free possible at all.
@@ -103,6 +104,10 @@ export interface ConversationView {
   silence: SilenceReason | null;
   /** Answer fragments discarded before they could become a false new turn. */
   ignoredEcho: number;
+  /** The words of the answer now being spoken, from `/live` or the saved turn; `null` when there are none. */
+  answer: string | null;
+  /** Per-frame reader of the answer's audio — read it in an animation frame, never keep it in React state. */
+  answerTap: AnswerTap;
   toggle: () => void;
 }
 
@@ -123,6 +128,9 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
   const [assembling, setAssembling] = useState<string | null>(null);
   const [silence, setSilence] = useState<SilenceReason | null>(null);
   const [ignoredEcho, setIgnoredEcho] = useState(0);
+  const [answer, setAnswer] = useState<string | null>(null);
+  const tapRef = useRef<ReturnType<typeof createAnswerTap> | null>(null);
+  if (tapRef.current === null) tapRef.current = createAnswerTap();
 
   const phaseRef = useRef<ConversationPhase>("off");
   const chatRef = useRef<string | null>(chatId);
@@ -162,6 +170,12 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
    * `null` for the life of the microphone.
    */
   const listeningWithRef = useRef<"silero" | "energy" | null>(null);
+
+  /** The words the echo judge compares against, and the same words for the window to show. */
+  const publishSpoken = useCallback((text: string) => {
+    spokenRef.current = text;
+    setAnswer(text === "" ? null : text);
+  }, []);
 
   const publishAssembling = useCallback(() => {
     const next = turnRef.current.segments.join(" ") || null;
@@ -232,7 +246,8 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
     segmentChainRef.current = Promise.resolve();
     // A segment already at the core cannot be cancelled, so invalidate its answer before closing.
     generationRef.current += 1;
-  }, [publishAssembling, resetListeningDiagnostics]);
+    publishSpoken("");
+  }, [publishAssembling, publishSpoken, resetListeningDiagnostics]);
 
   const stopPlayback = useCallback(() => {
     // Bumped BEFORE the element is touched: a fetch already in flight checks this number before it
@@ -240,6 +255,7 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
     generationRef.current += 1;
     const player = playerRef.current;
     if (player === null) return;
+    tapRef.current?.detach();
     player.pause();
     if (player.src !== "") URL.revokeObjectURL(player.src);
     player.removeAttribute("src");
@@ -254,11 +270,19 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
    * what makes one unit the whole of the waste.
    */
   const refreshSpoken = useCallback((turnId: number) => {
+    // A reply that lands after the mode was turned off (or after a barge-in) must not set `answer`.
+    // `spokenRef` is written regardless: it is the echo judge's yardstick, and the answer was still
+    // said out loud even if the window no longer shows it, so an echo of it must still be recognised.
+    const generation = generationRef.current;
+    const publish = (text: string) => {
+      spokenRef.current = text;
+      if (generationRef.current === generation) setAnswer(text === "" ? null : text);
+    };
     void (async () => {
       try {
         const live = await apiFetch<LiveTurn | undefined>(`/assistant/${turnId}/live`);
         if (live?.text !== undefined) {
-          spokenRef.current = live.text;
+          publish(live.text);
           return;
         }
       } catch {
@@ -270,7 +294,7 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
       // sentence, against the daemon, while it is speaking.
       const saved = savedAnswerRef.current;
       if (saved !== null && saved.turnId === turnId) {
-        spokenRef.current = saved.text;
+        publish(saved.text);
         return;
       }
 
@@ -280,10 +304,10 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
         const answered = await apiFetch<{ turns: AssistantTurnRow[] }>(
           `/assistant/chats/${encodeURIComponent(chat)}`,
         );
-        const answer = answered.turns.find((turn) => turn.id === turnId)?.answer;
-        if (typeof answer === "string") {
-          savedAnswerRef.current = { turnId, text: answer };
-          spokenRef.current = answer;
+        const said = answered.turns.find((turn) => turn.id === turnId)?.answer;
+        if (typeof said === "string") {
+          savedAnswerRef.current = { turnId, text: said };
+          publish(said);
         }
       } catch {
         // Keep the last spoken words when neither source is available.
@@ -356,11 +380,12 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
         // Per unit, not per answer: the attack of each unit's first syllable is its loudest, least
         // cancelled moment, and an answer is many units long.
         unitStartedAtRef.current = performance.now();
-        void player.play().catch(fail);
+        void player.play().then(() => tapRef.current?.attach(player), fail);
       });
     } finally {
       player.onended = null;
       player.onerror = null;
+      tapRef.current?.detach();
       URL.revokeObjectURL(url);
     }
   }, []);
@@ -422,7 +447,7 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
     pendingTurnRef.current = null;
     // The previous answer's words stop being the yardstick the moment a new turn goes out: judging
     // this answer's echo against the last one's vocabulary is how a real question gets eaten.
-    spokenRef.current = "";
+    publishSpoken("");
     const chat = chatRef.current;
     const generation = generationRef.current;
 
@@ -456,7 +481,7 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
       setTrouble(sentenceFor(error));
       dispatchRef.current({ type: "turnRefused" });
     }
-  }, [speakAnswer]);
+  }, [publishSpoken, speakAnswer]);
 
   const openMic = useCallback(async () => {
     if (await (listenerRef.current?.open(CONVERSATION_AUDIO) ?? Promise.resolve(false))) {
@@ -602,6 +627,7 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
   // The microphone must not outlive the page. Without this, navigating away leaves a live capture
   // with nothing on screen saying so — which in a pillar built for privacy is the worst leak it has.
   useEffect(() => closeMic, [closeMic]);
+  useEffect(() => () => tapRef.current?.close(), []);
 
   const toggle = useCallback(() => dispatchRef.current({ type: "toggled" }), []);
 
@@ -617,6 +643,8 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
     assembling,
     silence,
     ignoredEcho,
+    answer,
+    answerTap: tapRef.current.tap,
     toggle,
   };
 }
