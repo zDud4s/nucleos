@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use sqlx::SqlitePool;
 
+use super::{TopRun, Window};
 use crate::governance::budget::{parse_run_timestamp, time_approx_usd};
 
 /// One finished run, as the analytics reads it.
@@ -170,6 +171,43 @@ pub fn token_sessions(rows: &[RunRow]) -> Vec<TokenSession> {
         }
     }
     sessions.into_values().collect()
+}
+
+/// PURE: the costliest sessions among the runs completed in `window` — each session's runs
+/// summed, estimated if any was, linked to its last run — cost desc, then the later
+/// `completed_at`, then the higher run id; at most `limit`.
+pub fn top_sessions(priced: &[Priced<'_>], window: Window, limit: usize) -> Vec<TopRun> {
+    let mut sessions: BTreeMap<String, TopRun> = BTreeMap::new();
+    for run in priced.iter().filter(|run| window.holds(run.day())) {
+        let row = run.row;
+        let session = sessions.entry(row.session_key()).or_insert_with(|| TopRun {
+            run_id: row.id,
+            project_id: row.project_id.clone(),
+            mode: row.mode.clone(),
+            completed_at: row.completed_at.clone(),
+            cost_usd: 0.0,
+            cost_is_estimated: false,
+        });
+        session.cost_usd += run.usd;
+        session.cost_is_estimated |= run.estimated;
+        let later =
+            (row.completed_at.as_str(), row.id) > (session.completed_at.as_str(), session.run_id);
+        if later {
+            session.run_id = row.id;
+            session.project_id = row.project_id.clone();
+            session.mode = row.mode.clone();
+            session.completed_at = row.completed_at.clone();
+        }
+    }
+    let mut top: Vec<TopRun> = sessions.into_values().collect();
+    top.sort_by(|a, b| {
+        b.cost_usd
+            .total_cmp(&a.cost_usd)
+            .then_with(|| b.completed_at.cmp(&a.completed_at))
+            .then_with(|| b.run_id.cmp(&a.run_id))
+    });
+    top.truncate(limit);
+    top
 }
 
 #[cfg(test)]

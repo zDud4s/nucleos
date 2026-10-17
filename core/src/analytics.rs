@@ -11,6 +11,9 @@
 //! the largest value per session — `session_totals`' rule (`project/readings.rs`): the token counts
 //! a resumed run reports ARE cumulative. Different bases, kept different.
 
+pub mod cost;
+pub mod delivered;
+pub mod quota;
 pub mod sessions;
 
 use std::collections::BTreeMap;
@@ -19,11 +22,17 @@ use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use serde::Serialize;
 use sqlx::SqlitePool;
 
+pub use self::cost::{
+    CostBlock, CostKey, CostPart, CostPoint, CostTotal, JUDGE_KEY, NO_PROJECT_KEY, OTHER_KEY,
+};
+pub use self::delivered::{DeliveredBlock, DeliveredPoint, DeliveredTotal};
+pub use self::quota::{QuotaAnalytics, QuotaPoint, QuotaSeries, quota_history};
 use self::sessions::{RunRow, TokenSession, day_of};
 
 /// The windows served. Anything else is the client's error (400), never clamped (spec §4.1).
 pub const ALLOWED_DAYS: [i64; 3] = [7, 30, 90];
 pub const DEFAULT_DAYS: i64 = 30;
+const TOP_RUNS: usize = 10;
 
 /// Whose history a report reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,8 +156,12 @@ pub struct Analytics {
     pub window: Span,
     pub previous: Span,
     pub counted: Counted,
+    pub cost: CostBlock,
     pub tokens: TokensBlock,
     pub throughput: ThroughputBlock,
+    pub delivered: DeliveredBlock,
+    /// The ten costliest sessions of the window (spec §4.8). Runs only: the judge has no run.
+    pub top_runs: Vec<TopRun>,
 }
 
 /// Gate outcomes of finished runs. Five counters so they always add up to `runs_completed`.
@@ -223,6 +236,19 @@ pub struct TokensBlock {
     pub series: Vec<TokenPoint>,
 }
 
+/// One of the costliest sessions, linked to its last run (`/runs/$id`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TopRun {
+    pub run_id: i64,
+    pub project_id: Option<String>,
+    pub mode: String,
+    pub completed_at: String,
+    /// The session's runs in the window, summed (measured and estimated alike).
+    pub cost_usd: f64,
+    /// True when any of those runs was estimated.
+    pub cost_is_estimated: bool,
+}
+
 /* --------------------------------------------------------------- report -- */
 
 /// Everything the analytics page shows for one scope and window.
@@ -247,6 +273,13 @@ pub async fn report(
     .fetch_one(pool)
     .await?;
 
+    let rate = crate::governance::budget::load_budget_config(pool)
+        .await?
+        .time_cost_per_hour_usd;
+    let priced = sessions::price(&rows, rate)?;
+    let judge = cost::judge_lines(pool, project, &from, &to).await?;
+    let merges = delivered::merge_lines(pool, project, &from, &to).await?;
+
     Ok(Analytics {
         scope: if project.is_some() {
             "project"
@@ -260,8 +293,11 @@ pub async fn report(
         window: window.span(),
         previous: previous.span(),
         counted: Counted { modes: "all" },
+        cost: cost::cost_block(scope, window, &priced, &judge),
         tokens: tokens_block(window, &rows),
         throughput: throughput_block(window, &rows, in_flight),
+        delivered: delivered::delivered_block(window, &merges),
+        top_runs: sessions::top_sessions(&priced, window, TOP_RUNS),
     })
 }
 
@@ -400,34 +436,34 @@ fn tokens_block(window: Window, rows: &[RunRow]) -> TokensBlock {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn at(moment: &str) -> DateTime<Utc> {
+    pub(crate) fn at(moment: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(moment)
             .unwrap()
             .with_timezone(&Utc)
     }
 
     /// The spec's own example clock (§6).
-    fn now() -> DateTime<Utc> {
+    pub(crate) fn now() -> DateTime<Utc> {
         at("2026-10-17T14:03:11Z")
     }
 
     /// One run as a test describes it. `done` is a measured, finished, gate-less worktree run.
     #[derive(Clone)]
-    struct Run {
-        project: Option<&'static str>,
-        mode: &'static str,
-        session: Option<&'static str>,
-        created: &'static str,
-        completed: Option<&'static str>,
-        tokens: Option<(i64, i64, i64, i64)>,
-        gate: Option<&'static str>,
-        cost: Option<f64>,
+    pub(crate) struct Run {
+        pub(crate) project: Option<&'static str>,
+        pub(crate) mode: &'static str,
+        pub(crate) session: Option<&'static str>,
+        pub(crate) created: &'static str,
+        pub(crate) completed: Option<&'static str>,
+        pub(crate) tokens: Option<(i64, i64, i64, i64)>,
+        pub(crate) gate: Option<&'static str>,
+        pub(crate) cost: Option<f64>,
     }
 
-    fn done(project: &'static str, completed: &'static str) -> Run {
+    pub(crate) fn done(project: &'static str, completed: &'static str) -> Run {
         Run {
             project: Some(project),
             mode: "worktree",
@@ -440,7 +476,7 @@ mod tests {
         }
     }
 
-    async fn insert(pool: &SqlitePool, run: Run) -> i64 {
+    pub(crate) async fn insert(pool: &SqlitePool, run: Run) -> i64 {
         let (input, cache_read, cache_creation, output) = match run.tokens {
             Some((a, b, c, d)) => (Some(a), Some(b), Some(c), Some(d)),
             None => (None, None, None, None),
@@ -467,7 +503,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn report_of(pool: &SqlitePool, scope: Scope<'_>, days: i64) -> Analytics {
+    pub(crate) async fn report_of(pool: &SqlitePool, scope: Scope<'_>, days: i64) -> Analytics {
         report(pool, scope, Window::new(days, now()).unwrap(), now())
             .await
             .unwrap()
@@ -664,7 +700,7 @@ mod tests {
         );
     }
 
-    fn close(a: f64, b: f64) -> bool {
+    pub(crate) fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
     }
 
@@ -773,5 +809,99 @@ mod tests {
             report.tokens.total.cache_hit_ratio, None,
             "a zero denominator is no ratio"
         );
+    }
+
+    /* ----------------------------------------------------------- top runs -- */
+
+    /// Spec test 8: ten at most, by session cost, ties to the later run then the higher id, each
+    /// linking the session's LAST run; a session with an estimated run is marked.
+    #[tokio::test]
+    async fn the_costliest_sessions_come_ten_at_most_in_order() {
+        let pool = crate::testdb::fresh_pool().await;
+        const AT: [&str; 11] = [
+            "2026-10-10T01:00:00Z",
+            "2026-10-10T02:00:00Z",
+            "2026-10-10T03:00:00Z",
+            "2026-10-10T04:00:00Z",
+            "2026-10-10T05:00:00Z",
+            "2026-10-10T06:00:00Z",
+            "2026-10-10T07:00:00Z",
+            "2026-10-10T08:00:00Z",
+            "2026-10-10T09:00:00Z",
+            "2026-10-10T10:00:00Z",
+            "2026-10-10T11:00:00Z",
+        ];
+        const SESSIONS: [&str; 11] = [
+            "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
+        ];
+        let mut ids = Vec::new();
+        for (index, (session, at)) in SESSIONS.iter().zip(AT).enumerate() {
+            let id = insert(
+                &pool,
+                Run {
+                    session: Some(*session),
+                    cost: Some((index + 1) as f64),
+                    ..done("alpha", at)
+                },
+            )
+            .await;
+            ids.push(id);
+        }
+        // Same cost as s6, finished later: it goes first.
+        let s13 = insert(
+            &pool,
+            Run {
+                session: Some("s13"),
+                cost: Some(6.0),
+                ..done("alpha", "2026-10-10T20:00:00Z")
+            },
+        )
+        .await;
+        // Two runs, one estimated (30 min at $3/h = 1.5): 6.0 + 1.5 = 7.5, linked to the second.
+        insert(
+            &pool,
+            Run {
+                session: Some("s12"),
+                cost: Some(6.0),
+                ..done("alpha", "2026-10-11T01:00:00Z")
+            },
+        )
+        .await;
+        let s12_last = insert(
+            &pool,
+            Run {
+                session: Some("s12"),
+                created: "2026-10-11T02:00:00Z",
+                cost: None,
+                ..done("alpha", "2026-10-11T02:30:00Z")
+            },
+        )
+        .await;
+
+        let report = report_of(&pool, Scope::Global, 30).await;
+        let got: Vec<(i64, f64, bool)> = report
+            .top_runs
+            .iter()
+            .map(|top| (top.run_id, top.cost_usd, top.cost_is_estimated))
+            .collect();
+
+        assert_eq!(
+            got,
+            vec![
+                (ids[10], 11.0, false),
+                (ids[9], 10.0, false),
+                (ids[8], 9.0, false),
+                (ids[7], 8.0, false),
+                (s12_last, 7.5, true),
+                (ids[6], 7.0, false),
+                (s13, 6.0, false),
+                (ids[5], 6.0, false),
+                (ids[4], 5.0, false),
+                (ids[3], 4.0, false),
+            ]
+        );
+        assert_eq!(report.top_runs[4].completed_at, "2026-10-11T02:30:00Z");
+        assert_eq!(report.top_runs[4].project_id.as_deref(), Some("alpha"));
+        assert_eq!(report.top_runs[4].mode, "worktree");
     }
 }
