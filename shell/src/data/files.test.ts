@@ -50,11 +50,36 @@ describe("diskPathFor", () => {
   });
 });
 
+describe("diskPathFor traversal", () => {
+  it("never lets a dot segment climb out of the files root", () => {
+    expect(diskPathFor("/home/ana/.local/share", "../../etc/passwd")).toBe(
+      "/home/ana/.local/share/nucleos/files/etc/passwd",
+    );
+    expect(diskPathFor("C:\\Users\\ana\\AppData\\Local", "a/./b/..\\c")).toBe(
+      "C:\\Users\\ana\\AppData\\Local\\nucleos\\NucleOS\\data\\files\\a\\b\\c",
+    );
+  });
+});
+
 describe("runsOnOpen", () => {
   it("catches what Windows would run, in any case", () => {
     expect(runsOnOpen("setup.EXE")).toBe(true);
     expect(runsOnOpen("tools/fix.ps1")).toBe(true);
     expect(runsOnOpen("shortcut.lnk")).toBe(true);
+  });
+
+  it("sees through the trailing dots and spaces Windows strips, and a stream suffix", () => {
+    expect(runsOnOpen("evil.exe.")).toBe(true);
+    expect(runsOnOpen("evil.exe ")).toBe(true);
+    expect(runsOnOpen("evil.exe. .")).toBe(true);
+    expect(runsOnOpen("evil.exe::$DATA")).toBe(true);
+    expect(runsOnOpen("dir.d\\evil.EXE.")).toBe(true);
+  });
+
+  it("knows more of what Windows runs", () => {
+    for (const name of ["a.appx", "a.msix", "a.application", "a.inf", "a.scf", "a.ws", "a.msu", "a.chm", "a.jnlp"]) {
+      expect(runsOnOpen(name)).toBe(true);
+    }
   });
 
   it("leaves documents, and names with no extension, alone", () => {

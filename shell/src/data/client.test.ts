@@ -220,6 +220,32 @@ describe("the daemon token", () => {
   });
 });
 
+describe("a rotated token", () => {
+  it("is dropped on a 401, re-read once and the call retried once", async () => {
+    const { apiFetch } = await freshClient();
+    invoke.mockResolvedValueOnce("old").mockResolvedValueOnce("new");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(401, { refusal: "unauthorized" }))
+      .mockResolvedValueOnce(jsonResponse(200, ["ok"]));
+
+    await expect(apiFetch("/projects")).resolves.toEqual(["ok"]);
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const sent = fetchMock.mock.calls.map((c) => new Headers((c[1] as RequestInit).headers).get("Authorization"));
+    expect(sent).toEqual(["Bearer old", "Bearer new"]);
+  });
+
+  it("is retried only once: a second 401 is the refusal", async () => {
+    const { apiFetch, isApiRefusal } = await freshClient();
+    fetchMock.mockResolvedValue(jsonResponse(401, { refusal: "unauthorized" }));
+
+    const error = await apiFetch("/projects").catch((e: unknown) => e);
+
+    expect(isApiRefusal(error)).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("probeHealth", () => {
   it("answers false instead of throwing when the daemon is not there", async () => {
     const { probeHealth } = await freshClient();
