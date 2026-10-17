@@ -1371,13 +1371,32 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.0, "dev");
         assert_eq!(parsed.1, "1.0.0");
-        assert_eq!(parsed.2, std::path::PathBuf::from("/p"));
-        assert_eq!(parsed.3, std::path::PathBuf::from("m.yaml"));
+        assert_eq!(
+            parsed.2,
+            PackageFrom::Project {
+                root: std::path::PathBuf::from("/p"),
+                manifest: std::path::PathBuf::from("m.yaml"),
+            }
+        );
+
+        let parsed = workflow_package_args(&words(
+            "nucleos-core --workflow-package nucleos-dev 2.0.0 --source core/assets/nucleos-dev",
+        ))
+        .unwrap();
+        assert_eq!(parsed.0, "nucleos-dev");
+        assert_eq!(
+            parsed.2,
+            PackageFrom::Source(std::path::PathBuf::from("core/assets/nucleos-dev"))
+        );
 
         for line in [
             "nucleos-core --workflow-package dev --from /p --manifest m.yaml",
             "nucleos-core --workflow-package dev 1.0.0 --from /p",
             "nucleos-core --workflow-package dev 1.0.0 --from --manifest m.yaml",
+            "nucleos-core --workflow-package dev 1.0.0 --source",
+            // Two sources at once is a mistake, not a choice to be made for the caller.
+            "nucleos-core --workflow-package dev 1.0.0 --source /s --manifest m.yaml",
+            "nucleos-core --workflow-package dev 1.0.0 --source /s --from /p --manifest m.yaml",
         ] {
             assert!(workflow_package_args(&words(line)).is_err(), "{line}");
         }

@@ -245,6 +245,16 @@ struct ManifestFile {
     hooks: serde_yaml::Value,
 }
 
+/// Whether `text` parses as a manifest, field types included.
+///
+/// [`read_bundle`] is lenient on purpose — a manifest that does not parse lists as an empty one —
+/// so packaging asks this instead: a mistyped field there would ship a bundle that owns nothing.
+pub fn parse_manifest(text: &str) -> Result<(), String> {
+    serde_yaml::from_str::<Option<ManifestFile>>(text)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 /// One bundle in the library, as it is on disk right now.
 #[derive(Debug, Clone, Serialize)]
 pub struct Bundle {

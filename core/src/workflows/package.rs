@@ -1,7 +1,9 @@
 //! §spec motor-de-workflows
 //!
 //! Make a library bundle out of a folder that already holds a workflow:
-//! `nucleos-core --workflow-package <name> <version> --from <project root> --manifest <bundle.yaml>`.
+//! `nucleos-core --workflow-package <name> <version> --from <project root> --manifest <bundle.yaml>`,
+//! or out of a tracked source tree laid out as the bundle itself, with
+//! `--source <dir>` in place of the last two ([`package_source`]).
 //!
 //! The library (`workflows.rs`) could list, pin, eject and drift bundles, and the only way one got
 //! INTO it was the daemon seeding its own autopilot. A workflow a person already works by — this
@@ -59,11 +61,18 @@ struct Owns {
     hooks: serde_yaml::Value,
 }
 
+/// Whether `name` is an interpreter's cache rather than something an author wrote. Running a
+/// bundle's own script tests leaves `__pycache__/` beside them, and copying it would make the
+/// version's hash depend on which Python last ran there.
+fn is_cache(name: &std::ffi::OsStr) -> bool {
+    name == "__pycache__" || Path::new(name).extension().is_some_and(|ext| ext == "pyc")
+}
+
 /// Copy one file or directory tree, files only, skipping symlinks for the reason
 /// `workflows::copy_tree` gives: following one would copy whatever it points at into the library.
 fn copy_into(from: &Path, to: &Path, count: &mut usize) -> std::io::Result<()> {
     let kind = std::fs::symlink_metadata(from)?.file_type();
-    if kind.is_symlink() {
+    if kind.is_symlink() || from.file_name().is_some_and(is_cache) {
         return Ok(());
     }
     if kind.is_dir() {
@@ -217,6 +226,304 @@ pub async fn package(
         hash,
         commit,
     })
+}
+
+/* ------------------------------------------------------ from a source tree -- */
+
+/// The Claude skills tree, which the Codex mirror below is generated from at packaging.
+const CLAUDE_SKILLS: &str = ".claude/skills";
+/// The skills mirror a Codex controller reads. Generated, never authored: two authored copies of
+/// one skill are two skills free to disagree.
+const AGENTS_SKILLS: &str = ".agents/skills";
+/// The phase cockpits. Only `wf-*.md` here is a cockpit; anything else is not this check's.
+const COCKPITS: &str = ".claude/agents";
+/// How many offending lines a refusal lists before it stops: enough to fix a batch, short enough
+/// to read.
+const MAX_NAMED: usize = 20;
+
+/// Package a bundle whose source is a directory laid out as the bundle itself, into
+/// `library_root` as `name@version`:
+/// `nucleos-core --workflow-package <name> <version> --source <dir>`.
+///
+/// The directory holds `bundle.yaml` at its top, the files to materialize at the paths they take
+/// in a project, and whatever else the bundle carries (`scripts/`), which is copied into the
+/// library and never materialized because `owns:` does not name it. [`package`] copies a workflow
+/// OUT of a project that runs it; this is the way in for a workflow whose tracked source is not
+/// any project's live tree (`core/assets/nucleos-dev/`).
+///
+/// So it also does what that project used to do for itself: it generates `.agents/skills/` from
+/// `.claude/skills/`, and checks what the project's own gates checked — the cockpits' and skills'
+/// frontmatter — plus the one thing a bundle meant for any project must not do, which is point
+/// into a `.ai/` that project does not have.
+///
+/// **Checked as it will be published.** The tree is copied into a staging directory beside the
+/// version, the mirror generated there, every check run there, and only then renamed into place.
+/// Checking the source and copying after would validate a tree that is not the one shipped — the
+/// generated mirror is in neither the source nor the manifest author's head — and a failure leaves
+/// no version behind.
+pub async fn package_source(
+    library_root: &Path,
+    name: &str,
+    version: &str,
+    source: &Path,
+) -> Result<Packaged, String> {
+    if !workflows::valid_name(name) {
+        return Err(format!("`{name}` is not a usable workflow name"));
+    }
+    if !workflows::valid_name(version) {
+        return Err(format!("`{version}` is not a usable version"));
+    }
+    let manifest = source.join(workflows::MANIFEST);
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|error| format!("{}: {error}", manifest.display()))?;
+    workflows::parse_manifest(&text).map_err(|error| format!("{}: {error}", manifest.display()))?;
+    let Owns {
+        owns,
+        agents_block,
+        hooks,
+    } = serde_yaml::from_str::<Option<Owns>>(&text)
+        .map_err(|error| format!("{}: {error}", manifest.display()))?
+        .unwrap_or_default();
+    if owns.is_empty() {
+        return Err(format!(
+            "{} names no files under `owns:`, so there is nothing to materialize",
+            manifest.display()
+        ));
+    }
+    if std::fs::symlink_metadata(source.join(AGENTS_SKILLS)).is_ok() {
+        return Err(format!(
+            "{AGENTS_SKILLS}/ is generated from {CLAUDE_SKILLS}/ at packaging; remove it from {}",
+            source.display()
+        ));
+    }
+
+    let home = library_root.join(name);
+    let dir = home.join(version);
+    if dir.exists() {
+        return Err(format!(
+            "{name}@{version} is already in the library; a version is written once — package a new one"
+        ));
+    }
+    // Dot-named, so `workflows::library` never lists it: `valid_name` refuses a leading dot.
+    let staging = home.join(format!(".{version}.staging"));
+    let _ = std::fs::remove_dir_all(&staging);
+    let staged = (|| -> Result<usize, String> {
+        let mut count = 0;
+        copy_into(source, &staging, &mut count)
+            .map_err(|error| format!("copying into {}: {error}", staging.display()))?;
+        count += mirror_skills(&staging)?;
+        check_source(&staging, &owns, agents_block.as_deref(), hooks)?;
+        std::fs::rename(&staging, &dir)
+            .map_err(|error| format!("moving into {}: {error}", dir.display()))?;
+        // The manifest came along with the tree; [`Packaged::files`] does not count it.
+        Ok(count.saturating_sub(1))
+    })();
+    let files = match staged {
+        Ok(files) => files,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            // Only when empty: a first version that failed leaves no name behind in the listing,
+            // and a name with other versions (or its history) keeps them.
+            let _ = std::fs::remove_dir(&home);
+            return Err(error);
+        }
+    };
+    let hash = workflows::digest_of(
+        &workflows::file_hashes(&dir).map_err(|error| format!("{}: {error}", dir.display()))?,
+    );
+    let commit = commit_version(&home, name, version).await;
+    Ok(Packaged {
+        dir,
+        files,
+        hash,
+        commit,
+    })
+}
+
+/// Copy every skill under `.claude/skills/` to `.agents/skills/`, whole. Returns the files copied.
+fn mirror_skills(root: &Path) -> Result<usize, String> {
+    let from = root.join(CLAUDE_SKILLS);
+    let Ok(skills) = std::fs::read_dir(&from) else {
+        return Ok(0);
+    };
+    let mut count = 0;
+    for skill in skills {
+        let skill = skill.map_err(|error| format!("{}: {error}", from.display()))?;
+        if !skill.path().is_dir() {
+            continue;
+        }
+        copy_into(
+            &skill.path(),
+            &root.join(AGENTS_SKILLS).join(skill.file_name()),
+            &mut count,
+        )
+        .map_err(|error| format!("mirroring {}: {error}", skill.path().display()))?;
+    }
+    Ok(count)
+}
+
+/// Every check a source tree must pass, run against the staged copy at `root`.
+fn check_source(
+    root: &Path,
+    owns: &[String],
+    agents_block: Option<&str>,
+    hooks: serde_yaml::Value,
+) -> Result<(), String> {
+    let mut entries = Vec::new();
+    for entry in owns {
+        let Some(rel) = crate::ownership::normalise(entry) else {
+            return Err(format!(
+                "`{entry}` is not a relative path inside the bundle (no `..`, nothing absolute, \
+                 forward slashes)"
+            ));
+        };
+        if std::fs::symlink_metadata(root.join(&rel)).is_err() {
+            return Err(format!("`{rel}` is under `owns:` and not in the bundle"));
+        }
+        entries.push(rel);
+    }
+    // The daemon writes the pointer per checkout (`materialize::place_project_pointer`); a bundle
+    // shipping one would hand every project the packager's paths until the first sync.
+    let pointer = crate::workflows::materialize::PROJECT_POINTER;
+    if std::fs::symlink_metadata(root.join(pointer)).is_ok() {
+        return Err(format!(
+            "`{pointer}` is written by the daemon for each checkout; remove it from the bundle"
+        ));
+    }
+
+    // Materialization reads the block from the bundle directory whether or not `owns:` names it,
+    // so here it only has to be there and framed (`materialize::read_block`).
+    let mut scanned = Vec::new();
+    if let Some(source) = agents_block {
+        let framed = crate::ownership::normalise(source).filter(|rel| {
+            std::fs::read(root.join(rel))
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .and_then(|text| crate::workflows::materialize::render_block(&text))
+                .is_some()
+        });
+        let Some(rel) = framed else {
+            return Err(format!(
+                "agents_block `{source}` must be a UTF-8 file in the bundle whose first line is the \
+                 begin marker and last line the end marker of the AI WORKFLOW MANAGED BLOCK"
+            ));
+        };
+        scanned.push(rel);
+    }
+
+    let hooks = crate::workflows::hooks::parse(hooks)?;
+    crate::workflows::hooks::validate(&hooks, |rel| root.join(rel).is_file())?;
+
+    if let Ok(cockpits) = std::fs::read_dir(root.join(COCKPITS)) {
+        let mut names: Vec<String> = cockpits
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("wf-") && name.ends_with(".md"))
+            .collect();
+        names.sort();
+        for name in names {
+            require_frontmatter(
+                root,
+                &format!("{COCKPITS}/{name}"),
+                &["name", "description", "tools"],
+            )?;
+        }
+    }
+    if let Ok(skills) = std::fs::read_dir(root.join(CLAUDE_SKILLS)) {
+        let mut names: Vec<String> = skills
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for name in names {
+            require_frontmatter(
+                root,
+                &format!("{CLAUDE_SKILLS}/{name}/SKILL.md"),
+                &["name", "description"],
+            )?;
+        }
+    }
+
+    // Everything that lands in a project, the generated mirror included.
+    let files =
+        workflows::file_hashes(root).map_err(|error| format!("{}: {error}", root.display()))?;
+    scanned.extend(
+        files
+            .into_keys()
+            .filter(|path| crate::workflows::materialize::provided(&entries, path)),
+    );
+    let mut offending = Vec::new();
+    for rel in &scanned {
+        let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        for (index, line) in text.lines().enumerate() {
+            if names_legacy_root(line) {
+                offending.push(format!("{rel}:{}", index + 1));
+            }
+        }
+    }
+    if !offending.is_empty() {
+        let more = offending.len().saturating_sub(MAX_NAMED);
+        offending.truncate(MAX_NAMED);
+        let mut said = format!(
+            "these lines would be materialized and still point into `.ai/`, which a project using \
+             this bundle does not have:\n  {}",
+            offending.join("\n  ")
+        );
+        if more > 0 {
+            said.push_str(&format!("\n  …and {more} more"));
+        }
+        return Err(said);
+    }
+    Ok(())
+}
+
+/// Whether `line` names the legacy `.ai/` root: `.ai/` not glued to a word before it, so
+/// `https://x.ai/` or `openai/` are not it, and `` `.ai/` ``, `~/.ai/`, `(.ai/x)` are.
+fn names_legacy_root(line: &str) -> bool {
+    line.match_indices(".ai/").any(|(at, _)| {
+        line[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !(before.is_alphanumeric() || before == '_' || before == '-'))
+    })
+}
+
+/// Refuse `rel` unless it opens with a YAML frontmatter block naming every key in `keys` with a
+/// non-empty value. What a harness reads to list an agent or a skill; one without it is silently
+/// not offered, which is the failure this exists to make loud.
+fn require_frontmatter(root: &Path, rel: &str, keys: &[&str]) -> Result<(), String> {
+    let text =
+        std::fs::read_to_string(root.join(rel)).map_err(|error| format!("{rel}: {error}"))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    // Fenced on both sides: without the closing `---` the whole document would be read as YAML.
+    let lines: Vec<&str> = text.lines().collect();
+    let block = (lines.first().map(|line| line.trim_end()) == Some("---"))
+        .then(|| lines[1..].iter().position(|line| line.trim_end() == "---"))
+        .flatten()
+        .map(|end| lines[1..=end].join("\n"));
+    let Some(map) = block
+        .and_then(|body| serde_yaml::from_str::<serde_yaml::Value>(&body).ok())
+        .and_then(|value| value.as_mapping().cloned())
+    else {
+        return Err(format!(
+            "{rel}: no YAML frontmatter (a `---` block on its first line)"
+        ));
+    };
+    for key in keys {
+        let present = match map.get(*key) {
+            None | Some(serde_yaml::Value::Null) => false,
+            Some(serde_yaml::Value::String(value)) => !value.trim().is_empty(),
+            Some(serde_yaml::Value::Sequence(values)) => !values.is_empty(),
+            Some(_) => true,
+        };
+        if !present {
+            return Err(format!("{rel}: frontmatter has no `{key}`"));
+        }
+    }
+    Ok(())
 }
 
 /// Run git in `dir` through the daemon's own runner (`worktree::git`, which disables the
@@ -541,5 +848,192 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    /* ------------------------------------------------------ source trees -- */
+
+    const SOURCE_MANIFEST: &str = "description: dev\nowns:\n  - .nucleos/workflow/\n  \
+        - .claude/skills/\n  - .claude/agents/\n  - .agents/skills/\nagents_block: \
+        agents-block.md\nhooks:\n  - event: Stop\n    script: scripts/spec_loop.py\n";
+
+    /// A bundle source laid out as `core/assets/nucleos-dev/` is, with `changes` applied: `Some`
+    /// writes (or overwrites) a file, `None` leaves one out. Returns (temp, source dir).
+    fn source_tree(
+        changes: &[(&'static str, Option<&'static str>)],
+    ) -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("src");
+        let mut files: std::collections::BTreeMap<&str, &str> = [
+            ("bundle.yaml", SOURCE_MANIFEST),
+            (
+                "agents-block.md",
+                "# >>> AI WORKFLOW MANAGED BLOCK >>>\nrules\n# <<< AI WORKFLOW MANAGED BLOCK <<<\n",
+            ),
+            (".nucleos/workflow/workflow.md", "# Workflow\nstate lives in <state_dir>\n"),
+            (
+                ".claude/skills/planner/SKILL.md",
+                "---\nname: planner\ndescription: plans\n---\nbody\n",
+            ),
+            (".claude/skills/planner/ref.md", "more"),
+            (
+                ".claude/agents/wf-planner.md",
+                "---\nname: wf-planner\ndescription: cockpit\ntools: Read, Grep\n---\nbody\n",
+            ),
+            (".claude/agents/README.md", "not a cockpit, so no frontmatter needed"),
+            // Never materialized, so it may still name the old root.
+            ("scripts/spec_loop.py", "# migrates the legacy .ai/local/loops/\n"),
+            ("scripts/__pycache__/spec_loop.cpython-311.pyc", "bytes"),
+        ]
+        .into_iter()
+        .collect();
+        for &(path, contents) in changes {
+            match contents {
+                Some(contents) => files.insert(path, contents),
+                None => files.remove(path),
+            };
+        }
+        for (path, contents) in files {
+            let target = root.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, contents).unwrap();
+        }
+        (temp, root)
+    }
+
+    #[tokio::test]
+    async fn a_source_tree_is_packaged_whole_with_its_codex_mirror_generated() {
+        let (temp, source) = source_tree(&[]);
+        let library = temp.path().join("lib");
+        let packaged = package_source(&library, "nucleos-dev", "2.0.0", &source)
+            .await
+            .unwrap();
+
+        let dir = library.join("nucleos-dev").join("2.0.0");
+        assert_eq!(packaged.dir, dir);
+        // Seven authored files besides the manifest, plus the two of the generated mirror.
+        assert_eq!(packaged.files, 9);
+        assert!(dir.join("scripts/spec_loop.py").is_file());
+        assert!(dir.join("agents-block.md").is_file());
+        assert!(!dir.join("scripts/__pycache__").exists());
+        for file in ["SKILL.md", "ref.md"] {
+            assert_eq!(
+                std::fs::read(dir.join(".agents/skills/planner").join(file)).unwrap(),
+                std::fs::read(source.join(".claude/skills/planner").join(file)).unwrap(),
+            );
+        }
+        assert!(!source.join(".agents").exists(), "the source is never written to");
+        assert!(!library.join("nucleos-dev").join(".2.0.0.staging").exists());
+
+        let bundle = workflows::read_bundle(&dir, "nucleos-dev", "2.0.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bundle.hash, packaged.hash);
+        assert_eq!(bundle.agents_block.as_deref(), Some("agents-block.md"));
+        assert_eq!(
+            crate::workflows::hooks::manifest_hooks(&dir).unwrap()[0].script,
+            "scripts/spec_loop.py"
+        );
+
+        // Written once, from a source as from a project.
+        assert!(
+            package_source(&library, "nucleos-dev", "2.0.0", &source)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_tree_that_fails_a_check_is_refused_and_leaves_nothing() {
+        for (changes, expected) in [
+            (
+                vec![(
+                    ".claude/agents/wf-planner.md",
+                    Some("---\nname: wf-planner\ndescription: cockpit\n---\nbody\n"),
+                )],
+                ".claude/agents/wf-planner.md: frontmatter has no `tools`",
+            ),
+            (
+                vec![(".claude/skills/planner/SKILL.md", Some("# planner\nno frontmatter\n"))],
+                ".claude/skills/planner/SKILL.md: no YAML frontmatter",
+            ),
+            (
+                vec![(
+                    ".claude/skills/planner/SKILL.md",
+                    Some("---\nname: planner\ndescription: plans\nbody, never closed\n"),
+                )],
+                "no YAML frontmatter",
+            ),
+            (
+                vec![(
+                    ".nucleos/workflow/workflow.md",
+                    Some("# Workflow\nread `.ai/memory.md` first\n"),
+                )],
+                ".nucleos/workflow/workflow.md:2",
+            ),
+            (
+                vec![(
+                    ".claude/skills/planner/ref.md",
+                    Some("one\ntwo\nsee (.ai/plans/x.md)\n"),
+                )],
+                ".agents/skills/planner/ref.md:3",
+            ),
+            (
+                vec![(
+                    "agents-block.md",
+                    Some(
+                        "# >>> AI WORKFLOW MANAGED BLOCK >>>\nsee .ai/workflow\n\
+                         # <<< AI WORKFLOW MANAGED BLOCK <<<\n",
+                    ),
+                )],
+                "agents-block.md:2",
+            ),
+            (
+                vec![("agents-block.md", Some("rules, unframed\n"))],
+                "agents_block `agents-block.md`",
+            ),
+            (
+                vec![(".nucleos/workflow/workflow.md", None)],
+                "`.nucleos/workflow` is under `owns:` and not in the bundle",
+            ),
+            (
+                vec![("scripts/spec_loop.py", None)],
+                "hook script `scripts/spec_loop.py` is not a file in the bundle",
+            ),
+            (
+                vec![(".agents/skills/planner/SKILL.md", Some("authored by hand"))],
+                "is generated from .claude/skills/",
+            ),
+            (vec![("bundle.yaml", Some("owns: .nucleos/\n"))], "bundle.yaml"),
+            (
+                vec![(".nucleos/workflow/project.json", Some("{}"))],
+                "is written by the daemon for each checkout",
+            ),
+        ] {
+            let (temp, source) = source_tree(&changes);
+            let library = temp.path().join("lib");
+            let error = package_source(&library, "nucleos-dev", "2.0.0", &source)
+                .await
+                .unwrap_err();
+            assert!(error.contains(expected), "{expected}\n---\n{error}");
+            let home = library.join("nucleos-dev");
+            assert!(!home.join("2.0.0").exists(), "{expected}");
+            assert!(!home.join(".2.0.0.staging").exists(), "{expected}");
+        }
+    }
+
+    #[test]
+    fn only_a_free_standing_dot_ai_names_the_legacy_root() {
+        for line in [".ai/x", "see `.ai/memory.md`", "~/.ai/local", "(.ai/plans)", "a .ai/b"] {
+            assert!(names_legacy_root(line), "{line}");
+        }
+        for line in [
+            "https://x.ai/docs",
+            "openai/gpt",
+            "my-tool.ai/x",
+            ".nucleos/workflow",
+            "ai/",
+        ] {
+            assert!(!names_legacy_root(line), "{line}");
+        }
     }
 }
