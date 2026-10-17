@@ -1,4 +1,4 @@
-import { useId, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import type { AnalyticsReport, QuotaHistory } from "../data/analytics";
 import { compactTokens, humanMinutes } from "../data/project-readings";
@@ -385,43 +385,67 @@ export function DetailPanel({ report, metric, id }: DetailPanelProps) {
 
 /* --------------------------------------------------------------- lower row -- */
 
+/** The sessions shown before `Show N more`: enough to rank, and a row about as tall as the quota card. */
+const TOP_SHOWN = 5;
+
 export function TopRunsSection({ report }: SectionProps) {
   const global = report.scope === "global";
+  const listId = useId();
+  const [all, setAll] = useState(false);
   const top = Math.max(0, ...report.top_runs.map((run) => run.cost_usd));
+  const hidden = Math.max(0, report.top_runs.length - TOP_SHOWN);
+  const runs = all ? report.top_runs : report.top_runs.slice(0, TOP_SHOWN);
   return (
     <Card label="Most expensive sessions">
       {report.top_runs.length === 0 ? (
         <p className="an-note">No run finished in this window.</p>
       ) : (
-        <ol className="an-top">
-          {report.top_runs.map((run) => {
-            const day = run.completed_at.slice(0, 10);
-            // A share of the costliest, as an svg attribute: a bar width in CSS would be inline style.
-            const share = top > 0 ? Math.round((run.cost_usd / top) * 1000) / 10 : 0;
-            return (
-              <li key={run.run_id}>
-                {/* `run_id` is the session's last run, an integer: `/runs/$runId` as the rest of the shell links it. */}
-                <Link to={`/runs/${run.run_id}`} className="an-top-link">
-                  <span className="an-top-name">{global ? (run.project_id ?? "No project") : run.mode}</span>
-                  <span className="an-top-meta">{global ? `${run.mode} · ${day}` : day}</span>
-                  <svg
-                    className="an-top-bar ui-chart-cost"
-                    viewBox="0 0 100 4"
-                    preserveAspectRatio="none"
-                    aria-hidden="true"
-                    focusable="false"
-                  >
-                    <rect className="an-top-bar-fill" width={share} height={4} />
-                  </svg>
-                  <span className="an-top-cost">
-                    {usd(run.cost_usd)}
-                    {run.cost_is_estimated ? " (estimated)" : ""}
-                  </span>
-                </Link>
-              </li>
-            );
-          })}
-        </ol>
+        <>
+          <ol className="an-top" id={listId}>
+            {runs.map((run) => {
+              const day = run.completed_at.slice(0, 10);
+              // A share of the costliest, as an svg attribute: a bar width in CSS would be inline style.
+              const share = top > 0 ? Math.round((run.cost_usd / top) * 1000) / 10 : 0;
+              return (
+                <li key={run.run_id}>
+                  {/* `run_id` is the session's last run, an integer: `/runs/$runId` as the rest of the shell links it. */}
+                  <Link to={`/runs/${run.run_id}`} className="an-top-link">
+                    <span className="an-top-name">{global ? (run.project_id ?? "No project") : run.mode}</span>
+                    <span className="an-top-meta">{global ? `${run.mode} · ${day}` : day}</span>
+                    <svg
+                      className="an-top-bar ui-chart-cost"
+                      viewBox="0 0 100 4"
+                      preserveAspectRatio="none"
+                      aria-hidden="true"
+                      focusable="false"
+                    >
+                      <rect className="an-top-bar-fill" width={share} height={4} />
+                    </svg>
+                    <span className="an-top-cost">{usd(run.cost_usd)}</span>
+                    {/* A track of its own, so the amount never moves: the tag is short to see, the words are whole to hear. */}
+                    {run.cost_is_estimated ? (
+                      <span className="an-top-est" title="Estimated from run time">
+                        <span aria-hidden="true">est.</span>
+                        <span className="sr-only"> (estimated)</span>
+                      </span>
+                    ) : null}
+                  </Link>
+                </li>
+              );
+            })}
+          </ol>
+          {hidden === 0 ? null : (
+            <button
+              type="button"
+              className="ui-button ui-button-quiet an-top-more"
+              aria-expanded={all}
+              aria-controls={listId}
+              onClick={() => setAll((open) => !open)}
+            >
+              {all ? "Show fewer" : `Show ${hidden} more`}
+            </button>
+          )}
+        </>
       )}
     </Card>
   );
@@ -436,7 +460,9 @@ export interface QuotaSectionProps extends SectionProps {
 }
 
 /**
- * Global only (§9.8). The time axis is the report's window, so quota lines up with the charts above.
+ * Global only (§9.8). The time axis ends at the report's `now` and starts at the later of the
+ * window's first day and the day of the first recorded reading: before that there is nothing to
+ * draw, and a chart four-fifths empty says so less clearly than the note above it.
  * A step line, not an area: each reading holds until the next, and a curve between them would claim
  * values nobody read.
  */
@@ -448,10 +474,6 @@ export function QuotaSection({ report, history, failed, staleSince }: QuotaSecti
   );
 }
 
-/** The step line's own drawing size, near the half-width card it lives in, so its labels stay legible. */
-const QUOTA_WIDTH = 440;
-const QUOTA_HEIGHT = 170;
-
 function QuotaBody({ report, history, failed, staleSince }: QuotaSectionProps) {
   if (history === undefined) {
     return failed ? (
@@ -461,6 +483,9 @@ function QuotaBody({ report, history, failed, staleSince }: QuotaSectionProps) {
     );
   }
   const since = history.since === null ? null : history.since.slice(0, 10);
+  const windowStart = Date.parse(`${report.window.from}T00:00:00Z`);
+  const recordedFrom = since === null ? Number.NaN : Date.parse(`${since}T00:00:00Z`);
+  const from = Number.isNaN(recordedFrom) ? windowStart : Math.max(windowStart, recordedFrom);
   return (
     <>
       {staleSince === undefined ? null : <StaleNote dataUpdatedAt={staleSince} />}
@@ -471,13 +496,11 @@ function QuotaBody({ report, history, failed, staleSince }: QuotaSectionProps) {
       </p>
       <StepLine
         series={quotaSeries(history)}
-        from={Date.parse(`${report.window.from}T00:00:00Z`)}
+        from={from}
         to={Date.parse(report.now)}
         label={`Quota used, 5h and 7d windows, last ${report.days} days`}
         format={percent}
         empty={since === null ? "No quota history yet" : `History started on ${since}; nothing recorded in this window`}
-        width={QUOTA_WIDTH}
-        height={QUOTA_HEIGHT}
       />
     </>
   );

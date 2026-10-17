@@ -4,6 +4,7 @@ import { AreaClosed, LinePath } from "@visx/shape";
 import { useId, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from "react";
 
 import { seriesClass, type ChartDatum, type ChartKey } from "./chart-series";
+import { ChartTip, clamp, tipSentence, type TipRow } from "./chart-tip";
 import { useWidth } from "./useWidth";
 
 /**
@@ -63,13 +64,6 @@ const COMPACT = { top: 4, bottom: 3, side: 3 };
 /** Roughly this many day labels: one every `ceil((n - 1) / 5)` days, plus the last. */
 const DAY_STEPS = 5;
 /**
- * Tooltip metrics. Text cannot be measured without layout, so its width is estimated from the
- * character count at `--text-xs` in the mono face the values are set in; the minimum keeps a short
- * tooltip from looking cramped.
- */
-const TIP = { pad: 8, row: 16, char: 6.6, swatch: 8, gap: 16, offset: 12, min: 120 };
-
-/**
  * Gridline values from 0 to a round maximum, in about three steps of 1, 2 or 5 × 10ⁿ. When every
  * value is whole (runs, merges) a step is never fractional: half a run is not a reading.
  */
@@ -97,14 +91,6 @@ export function dayLabelIndices(n: number): number[] {
   return picked;
 }
 
-interface TipRow {
-  key: string;
-  label: string;
-  value: string;
-  className?: string;
-  kind: "part" | "total" | "apart";
-}
-
 /** The tooltip's rows for one day: its non-zero parts in `keys` order, a `Total`, then `apart`. */
 function tipRows(datum: ChartDatum, total: number, keys: ChartKey[], format: (value: number) => string, apart?: string): TipRow[] {
   const sums = new Map<string, number>();
@@ -127,8 +113,6 @@ function tipRows(datum: ChartDatum, total: number, keys: ChartKey[], format: (va
   }
   return rows;
 }
-
-const clamp = (value: number, low: number, high: number) => Math.min(Math.max(value, low), high);
 
 export function AreaChart({ data, keys, label, format, empty, tone, apart, height, compact = false }: AreaChartProps) {
   const { ref, width } = useWidth<HTMLElement>();
@@ -187,50 +171,14 @@ export function AreaChart({ data, keys, label, format, empty, tone, apart, heigh
     const datum = data[shown];
     const rows = tipRows(datum, totals[shown], keys, format, apart);
     const head = `${datum.day}${datum.partial === true ? " · so far" : ""}`;
-    const widest = Math.max(
-      head.length * TIP.char,
-      ...rows.map((row) => TIP.swatch + 6 + row.label.length * TIP.char + TIP.gap + row.value.length * TIP.char),
-    );
-    const tipWidth = Math.max(TIP.min, Math.ceil(widest + TIP.pad * 2));
-    const tipHeight = TIP.pad * 2 + TIP.row * (rows.length + 1);
     const cx = xAt(shown);
     const cy = y(totals[shown]);
-    // Beside the crosshair, never on it: to the right, or to the left near the right edge.
-    const right = cx + TIP.offset;
-    const left = right + tipWidth > svgWidth ? Math.max(0, cx - TIP.offset - tipWidth) : right;
-    const down = clamp(cy - tipHeight / 2, 0, Math.max(0, svgHeight - tipHeight));
-    const baseline = (row: number) => TIP.pad + TIP.row * row + 12;
-    said = `${head}: ${rows.map((row) => `${row.label} ${row.value}`).join(", ")}`;
+    said = tipSentence(head, rows);
     tip = (
       <g className="ui-area-hover">
         <line className="ui-area-crosshair" x1={cx} x2={cx} y1={pad.top} y2={base} />
         <circle className="ui-area-dot" cx={cx} cy={cy} r={4} />
-        <g className="ui-area-tip" transform={`translate(${left}, ${down})`}>
-          <rect className="ui-area-tip-bg" width={tipWidth} height={tipHeight} rx={6} />
-          <text className="ui-area-tip-head" x={TIP.pad} y={baseline(0)}>
-            {head}
-          </text>
-          {rows.map((row, k) => (
-            <g key={row.key} className={`ui-area-tip-row ui-area-tip-${row.kind}`}>
-              {row.className === undefined ? null : (
-                <rect
-                  className={`ui-area-tip-swatch ${row.className}`}
-                  x={TIP.pad}
-                  y={baseline(k + 1) - TIP.swatch}
-                  width={TIP.swatch}
-                  height={TIP.swatch}
-                  rx={2}
-                />
-              )}
-              <text className="ui-area-tip-label" x={TIP.pad + TIP.swatch + 6} y={baseline(k + 1)}>
-                {row.label}
-              </text>
-              <text className="ui-area-tip-value" x={tipWidth - TIP.pad} y={baseline(k + 1)} textAnchor="end">
-                {row.value}
-              </text>
-            </g>
-          ))}
-        </g>
+        <ChartTip head={head} rows={rows} cx={cx} cy={cy} width={svgWidth} height={svgHeight} />
       </g>
     );
   }

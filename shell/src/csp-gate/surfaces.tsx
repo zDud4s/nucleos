@@ -245,12 +245,12 @@ function PaletteSurface({ done }: { done: () => void }) {
  * be clean — "should be" is precisely what a gate is for.
  *
  * Every chart twice, because each has two branches: with data, and empty (a rail for `Sparkline`,
- * axes plus a sentence for `StepLine`, a grid plus a sentence for `AreaChart`, and nothing at all
- * for `ShareBar`). `AreaChart` a third time, compact, its sparkline branch; its
- * tooltip is only drawn on hover, so the gate sees the resting chart and the unit test
- * (`AreaChart.test.tsx`) holds the hovered one to the same no-`style` rule. `@visx/axis` is the new risk: its default
- * tick labels go through `@visx/text`, which writes `style="overflow: visible"`; `StepLine` swaps it
- * for a bare `<text>`, and this surface is where that is proved under the real policy.
+ * a grid plus a sentence for `StepLine` and for `AreaChart`, and nothing at all for `ShareBar`).
+ * `AreaChart` a third time, compact, its sparkline branch. The tooltips of `AreaChart` and
+ * `StepLine` are only drawn on hover, so the gate sees the resting charts and the unit tests
+ * (`AreaChart.test.tsx`, `StepLine.test.tsx`) hold the hovered ones to the same no-`style` rule.
+ * No chart uses `@visx/axis` any more: its tick labels go through `@visx/text`, which writes
+ * `style="overflow: visible"`, so every label here is a bare `<text>`.
  */
 function ChartSurface({ done }: { done: () => void }) {
   useDoneAfter(done);
@@ -437,7 +437,7 @@ export const SURFACES: Surface[] = [
   },
   {
     name: "charts",
-    why: "@visx/{axis,curve,group,scale,shape}, which compute geometry per render — Sparkline, StepLine, AreaChart (also compact) and ShareBar, each with data and empty",
+    why: "@visx/{curve,group,scale,shape}, which compute geometry per render — Sparkline, StepLine, AreaChart (also compact) and ShareBar, each with data and empty",
     Component: ChartSurface,
   },
   {

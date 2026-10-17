@@ -40,7 +40,7 @@ describe("forced colors", () => {
     expect(block).toContain(".ui-chart-svg");
     expect(block).toContain("forced-color-adjust: none");
     expect(block).toContain(".ui-share-seg");
-    expect(block).toContain(".ui-chart-tick-label");
+    expect(block).toContain(".ui-area-tick");
   });
 
   it("field borders use --border-field, and the token is defined", () => {

@@ -13,6 +13,7 @@ import {
   daemonFetch,
   daemonState,
   project,
+  quotaHistory,
   renderWithRouter,
   type DaemonState,
 } from "../test/harness";
@@ -218,6 +219,76 @@ describe("AnalyticsView, global", () => {
     await mount(busy());
     const quota = await screen.findByRole("region", { name: "Quota" });
     expect(await within(quota).findByText("No quota history yet")).toBeTruthy();
+  });
+
+  it("starts the quota chart on the first recorded day, not the window's, and keys both windows", async () => {
+    const state = busy();
+    state.analyticsQuota = quotaHistory({
+      since: "2026-08-20T07:12:00Z",
+      series: [
+        {
+          provider: "anthropic",
+          window: "5h",
+          fidelity: "official",
+          points: [
+            { at: "2026-08-20T08:00:00Z", used_fraction: 0.3, resets_at: null, stale: false },
+            { at: "2026-08-22T12:00:00Z", used_fraction: 0.7, resets_at: null, stale: true },
+          ],
+        },
+        {
+          provider: "anthropic",
+          window: "7d",
+          fidelity: "official",
+          points: [{ at: "2026-08-21T00:00:00Z", used_fraction: 0.4, resets_at: null, stale: false }],
+        },
+      ],
+    });
+    await mount(state);
+    const quota = await screen.findByRole("region", { name: "Quota" });
+    expect(await within(quota).findByText(/^Recorded since 2026-08-20/)).toBeTruthy();
+    // The window opens on 07-26, but nothing was read before 08-20: the axis starts there.
+    const days = [...quota.querySelectorAll("text.ui-area-day")].map((node) => node.textContent);
+    expect(days[0]).toBe("08-20");
+    expect(days[days.length - 1]).toBe("today");
+    expect(quota.querySelectorAll("path.ui-step-line")).toHaveLength(2);
+    expect(quota.querySelectorAll("circle.ui-step-stale")).toHaveLength(1);
+    const legend = within(quota).getByRole("list", { name: /series$/ });
+    expect(legend.querySelector(".ui-chart-swatch")).not.toBeNull();
+    expect(legend.querySelector(".ui-step-key-dash")).not.toBeNull();
+    expect(quota.querySelectorAll("[style]")).toHaveLength(0);
+  });
+
+  it("shows the five costliest sessions, and the rest behind a toggle", async () => {
+    const state = busy();
+    state.analytics = {
+      ...state.analytics,
+      top_runs: Array.from({ length: 7 }, (_, index) => ({
+        run_id: 500 + index,
+        project_id: "nucleos",
+        mode: "worktree",
+        completed_at: `2026-08-${String(10 + index).padStart(2, "0")}T10:00:00Z`,
+        cost_usd: 7 - index,
+        cost_is_estimated: index === 6,
+      })),
+    };
+    await mount(state);
+    const top = await screen.findByRole("region", { name: "Most expensive sessions" });
+    expect(within(top).getAllByRole("link")).toHaveLength(5);
+
+    const more = within(top).getByRole("button", { name: "Show 2 more" });
+    expect(more.getAttribute("aria-expanded")).toBe("false");
+    expect(document.getElementById(more.getAttribute("aria-controls") ?? "")?.tagName).toBe("OL");
+    fireEvent.click(more);
+    expect(within(top).getAllByRole("link")).toHaveLength(7);
+    // The seventh is estimated: a short tag to see, the whole word to hear.
+    const last = within(top).getByRole("link", { name: /\$1\.00 \(estimated\)/ });
+    expect(last.getAttribute("href")).toBe("/runs/506");
+    expect(last.querySelector(".an-top-est")?.textContent).toContain("est.");
+
+    const fewer = within(top).getByRole("button", { name: "Show fewer" });
+    expect(fewer.getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(fewer);
+    expect(within(top).getAllByRole("link")).toHaveLength(5);
   });
 
   it("writes no inline style, whichever chart is open", async () => {
