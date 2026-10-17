@@ -92,6 +92,14 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
 
       <Section label="Readings">
         <Readings projectId={projectId} />
+        {/*
+          Four numbers answer "how is it now"; the trend behind them is a mode of its own. A link
+          and not a fifth card: it changes nothing here, and it is there whether this read worked or
+          not, because the trends come from a different route.
+        */}
+        <Link to={`/projects/${projectId}/analytics`} className="ws-trends">
+          See trends
+        </Link>
       </Section>
 
       <Section label="Occupancy">

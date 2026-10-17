@@ -242,6 +242,20 @@ describe("the readings", () => {
     expect(within(readingsSection).getByText(/^Last 30 days, read at \d\d:\d\d\.$/)).toBeTruthy();
   });
 
+  it("leads from the readings to their trends, in this project's Analytics mode", async () => {
+    const { router } = await openState(
+      daemonState({ projects: [project({ project_id: "nucleos", mode: "shadow" })] }),
+    );
+    const readingsSection = await screen.findByRole("region", { name: "Readings" });
+    const link = within(readingsSection).getByRole("link", { name: "See trends" });
+    expect(link.getAttribute("href")).toBe("/projects/nucleos/analytics");
+
+    fireEvent.click(link);
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/projects/nucleos/analytics"));
+    expect(await screen.findByRole("region", { name: "Cost and tokens" })).toBeTruthy();
+  });
+
   it("a refused read says so once, rather than four em dashes that look like four answers", async () => {
     await openState(
       daemonState({ projects: [project({ project_id: "nucleos", mode: "shadow" })] }),
