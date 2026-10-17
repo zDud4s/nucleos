@@ -15482,7 +15482,8 @@ mod tests {
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
-        let ask = crate::hooks::ask_about(&id, 1, "Bash", Some("npm publish".into()));
+        // A run id of its own: the ask registry is process-wide and keeps one question per run.
+        let ask = crate::hooks::ask_about(&id, 7_015_485, "Bash", Some("npm publish".into()));
 
         let (status, body) = chats_request(&state, "GET", "/assistant/chats", None).await;
         crate::hooks::answer_ask(&ask, false);

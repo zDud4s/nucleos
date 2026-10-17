@@ -6822,10 +6822,11 @@ mod tests {
         ));
     }
 
-    /// One of the two waits, and it is always the same one.
+    /// One of the two waits on the other's SLOT, and it is always the same one.
     ///
     /// The asymmetry is the deadlock argument, not a detail of the query: the low id is never parked
-    /// by this brake, so of any two excluded jobs at least one is always free to run. Were the
+    /// for a slot — only for a node already in flight, which ends by itself (the test below) — so
+    /// of any two excluded jobs at least one is always free to run. Were the
     /// tie-break decided at read time, two reads that disagreed would park both — and two jobs
     /// somebody asked to SERIALISE, stopped forever on each other, is the one failure this feature
     /// must not be able to produce.
@@ -6855,11 +6856,74 @@ mod tests {
             "the reason has to name what to wait for, got: {detail}"
         );
 
-        // The other side of the same rule, at the same moment: never parked by it.
+        // The other side of the same rule, at the same moment: never parked by a partner that is
+        // merely live. Both hold slots for their whole lives, so a slot-wait would park both.
         let low_row = load_job(&pool, low).await.unwrap();
         assert!(matches!(
             brakes(&state, &low_row, Utc::now()).await,
             Brake::Go
+        ));
+    }
+
+    /// The other start order. The higher job got going first and has a node running when the lower
+    /// one comes to start its own.
+    ///
+    /// Waiting on the slot alone held the exclusion in one order only: the low side never looked,
+    /// so it started a node beside the high side's running one — the very overlap the rule forbids.
+    /// The low side waits for a node IN FLIGHT and never for a slot, which keeps the deadlock
+    /// argument: a running node ends by itself, and the high side cannot start another while the
+    /// low one lives.
+    #[tokio::test]
+    async fn the_lower_job_waits_for_a_node_its_partner_already_has_running() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        exclude(&pool, "project-a", low, high).await;
+        for job in [low, high] {
+            crate::execution::concurrency::claim(
+                &pool,
+                "project-a",
+                crate::execution::worktree::Owner::Job(job),
+            )
+            .await
+            .unwrap();
+        }
+        let node = seed_node(&pool, high, "implement", "running").await;
+
+        let low_row = load_job(&pool, low).await.unwrap();
+        let Brake::Park { reason, detail } = brakes(&state, &low_row, Utc::now()).await else {
+            panic!("the lower job started a node beside its excluded partner's running one");
+        };
+        assert_eq!(reason, "excluded");
+        assert!(detail.contains(&format!("job {high}")), "got: {detail}");
+
+        // A node paused on a person is still a node in the tree.
+        sqlx::query("UPDATE runs SET status = 'awaiting_approval' WHERE id = ?")
+            .bind(node)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            brakes(&state, &low_row, Utc::now()).await,
+            Brake::Park { .. }
+        ));
+
+        // The node lands: the lower job goes, and the higher one is the one that now waits.
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(node)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            brakes(&state, &low_row, Utc::now()).await,
+            Brake::Go
+        ));
+        let high_row = load_job(&pool, high).await.unwrap();
+        assert!(matches!(
+            brakes(&state, &high_row, Utc::now()).await,
+            Brake::Park { .. }
         ));
     }
 

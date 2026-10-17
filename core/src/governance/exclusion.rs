@@ -86,9 +86,6 @@ pub async fn propose(
     if live_rule_for(pool, low, high).await?.is_some() {
         return Err(ProposeError::AlreadyExcluded);
     }
-    if pending_request_for(pool, low, high).await? {
-        return Err(ProposeError::AlreadyAsked);
-    }
 
     let tool_input = serde_json::json!({
         "pair": pair_key(low, high),
@@ -109,18 +106,33 @@ pub async fn propose(
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
-    let proposal_id: i64 = sqlx::query_scalar(
+    // **The "already asked" check is part of the INSERT, not a read before it.** Without it,
+    // drawing the same edge twice mints two proposals, and approving both would meet the unique
+    // index as a 500 — the second approval failing for a reason the person could not act on. As a
+    // separate read it held for two requests one after the other and not for two at once: both read
+    // "nothing pending" before either wrote. One statement takes SQLite's write lock before it
+    // evaluates its own `NOT EXISTS`, so the second request sees the first's row. No unique index
+    // does this job because `proposals` is shared by every kind and the pair lives inside
+    // `tool_input`.
+    let proposal_id: Option<i64> = sqlx::query_scalar(
         "INSERT INTO proposals
          (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
-         VALUES ('fleet-exclusion', 'pending', NULL, NULL, ?, NULL, ?, ?, ?, NULL)
+         SELECT 'fleet-exclusion', 'pending', NULL, NULL, ?, NULL, ?, ?, ?, NULL
+          WHERE NOT EXISTS (SELECT 1 FROM proposals
+                             WHERE kind = 'fleet-exclusion' AND status = 'pending'
+                               AND tool_input LIKE ?)
          RETURNING id",
     )
     .bind(&project_low)
     .bind(reasoning)
     .bind(tool_input)
     .bind(&now)
-    .fetch_one(&mut *transaction)
+    .bind(format!("%\"pair\":\"{}\"%", pair_key(low, high)))
+    .fetch_optional(&mut *transaction)
     .await?;
+    let Some(proposal_id) = proposal_id else {
+        return Err(ProposeError::AlreadyAsked);
+    };
 
     sqlx::query(
         "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
@@ -155,17 +167,22 @@ pub async fn live_rule_for(pool: &SqlitePool, low: i64, high: i64) -> sqlx::Resu
     .await
 }
 
-/// The partner whose slot is keeping this job waiting, if there is one.
+/// The partner keeping this job waiting, if there is one.
 ///
-/// **Only the higher id ever waits, and that is the whole of the deadlock argument.** The query asks
-/// about `job_high` alone: a job that is the low side of every rule it appears in can never be
-/// parked by this brake, so of any two excluded jobs at least one is always free to run. A
-/// tie-break decided at read time — who asked first, who has less left to do — could park both if
-/// the two reads disagreed, and two jobs a person asked to SERIALISE deadlocking on each other is
-/// the one outcome this feature must not be able to produce.
+/// **The two sides wait on different things, and that is the whole of the deadlock argument.**
 ///
-/// "Holds a slot" and not "is live": a live job that is waiting for a slot is not running anything,
-/// so there is nothing for the other one to run at the same time as.
+/// - The HIGH side waits while the low one holds a slot, which is for as long as it is live.
+/// - The LOW side waits only while the high one has a node in flight (`running` or
+///   `awaiting_approval`, `node_in_flight`'s two statuses) — never for its slot.
+///
+/// The low side has to look at all: without it the rule held in one start order only, and a high
+/// job that started first had the low one start a node right beside its running one. But it must
+/// not wait on the slot. A live job holds its slot for its whole life, parked or not, so two
+/// slot-waits would park both forever. A node in flight ends by itself, and the high side cannot
+/// start another while the low side is live, so of any two excluded jobs at least one is always
+/// free to run. A tie-break decided at read time — who asked first, who has less left to do — could
+/// park both if the two reads disagreed, and two jobs a person asked to SERIALISE deadlocking on
+/// each other is the one outcome this feature must not be able to produce.
 pub async fn blocking_partner(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<i64>> {
     sqlx::query_scalar(
         "SELECT fleet_exclusions.job_low
@@ -174,27 +191,19 @@ pub async fn blocking_partner(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Op
              ON project_slots.owner_kind = 'job'
             AND project_slots.owner_id = fleet_exclusions.job_low
           WHERE fleet_exclusions.job_high = ? AND fleet_exclusions.revoked_at IS NULL
+         UNION ALL
+         SELECT fleet_exclusions.job_high
+           FROM fleet_exclusions
+          WHERE fleet_exclusions.job_low = ? AND fleet_exclusions.revoked_at IS NULL
+            AND EXISTS (SELECT 1 FROM runs
+                         WHERE runs.job_id = fleet_exclusions.job_high
+                           AND runs.status IN ('running','awaiting_approval'))
           LIMIT 1",
     )
     .bind(job_id)
+    .bind(job_id)
     .fetch_optional(pool)
     .await
-}
-
-/// Whether this pair already has a request waiting on a person.
-///
-/// Without it, drawing the same edge twice mints two proposals, and approving both would meet the
-/// unique index as a 500 — the second approval failing for a reason the person could not act on.
-async fn pending_request_for(pool: &SqlitePool, low: i64, high: i64) -> sqlx::Result<bool> {
-    let found: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM proposals
-          WHERE kind = 'fleet-exclusion' AND status = 'pending' AND tool_input LIKE ?
-          LIMIT 1",
-    )
-    .bind(format!("%\"pair\":\"{}\"%", pair_key(low, high)))
-    .fetch_optional(pool)
-    .await?;
-    Ok(found.is_some())
 }
 
 /// One rule in force, as the canvas draws it.
@@ -547,6 +556,50 @@ mod tests {
             matches!(second, Err(ProposeError::AlreadyAsked)),
             "{second:?}"
         );
+    }
+
+    /// The same edge drawn twice AT ONCE — a double click, two screens — is still one request.
+    ///
+    /// A read and then a write let both requests pass the read before either wrote, and approving
+    /// the two then met the unique index as a 500 on the second. The check is part of the write.
+    #[tokio::test]
+    async fn the_same_pair_asked_for_twice_at_once_is_one_request() {
+        let pool = crate::testdb::fresh_shared_pool().await;
+        let low = add_job(&pool, "alpha").await;
+        let high = add_job(&pool, "alpha").await;
+
+        let handles: Vec<_> = (0..8)
+            .map(|n| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    if n % 2 == 0 {
+                        propose(&pool, low, high, &[]).await
+                    } else {
+                        propose(&pool, high, low, &[]).await
+                    }
+                })
+            })
+            .collect();
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.unwrap());
+        }
+
+        let minted = results.iter().filter(|result| result.is_ok()).count();
+        assert_eq!(minted, 1, "{results:?}");
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Ok(_) | Err(ProposeError::AlreadyAsked))),
+            "{results:?}"
+        );
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proposals WHERE kind = 'fleet-exclusion' AND status = 'pending'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 1);
     }
 
     /// Two jobs of different projects share no slots, so there is nothing to serialise.

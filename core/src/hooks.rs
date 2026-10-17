@@ -2441,6 +2441,80 @@ mod tests {
         answer_ask(&id, false);
     }
 
+    /// A question whose hook died before it came back to wait is a ghost, and a ghost must not
+    /// answer the run's NEXT call.
+    ///
+    /// The judge does not know the hook is gone and may still say yes to the ghost. Were the ghost
+    /// left standing, `wait_for_run` — which finds a run's question by the run — could pick it over
+    /// the live one (map order) and hand the new call a yes given about a different call. A run has
+    /// one call in flight, so its newer question replaces any older one.
+    #[tokio::test]
+    async fn a_ghost_question_cannot_answer_the_next_call_of_its_run() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+
+        // Several ghosts, each answered yes by a judge nobody is listening to any more.
+        for _ in 0..8 {
+            let ghost = ask_about(&chat_id, run_id, "Bash", Some("rm -rf build".to_owned()));
+            answer_ask(&ghost, true);
+        }
+
+        let _live = ask_about(&chat_id, run_id, "Bash", Some("npm publish".to_owned()));
+        let waiting = asks_for(&chat_id);
+        assert_eq!(
+            waiting.len(),
+            1,
+            "one call in flight, one question standing"
+        );
+        assert_eq!(waiting[0].detail.as_deref(), Some("npm publish"));
+
+        assert_eq!(
+            wait_for_run(run_id, Duration::from_millis(30)).await,
+            None,
+            "the live call collected a yes somebody gave to a ghost"
+        );
+    }
+
+    /// A hook killed while it waits drops the wait, and the question goes down with it rather than
+    /// standing in the window about a call nobody is making.
+    #[tokio::test]
+    async fn a_wait_cut_off_mid_window_takes_its_question_down() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+
+        let _id = ask_about(&chat_id, run_id, "Bash", Some("npm publish".to_owned()));
+        let waiting =
+            tokio::spawn(async move { wait_for_run(run_id, Duration::from_secs(30)).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+
+        assert!(asks_for(&chat_id).is_empty());
+    }
+
+    /// A question older than any hook call could still be waiting on is about nothing: the CLI cut
+    /// both of the hook's calls off long ago. It leaves the window by itself.
+    #[tokio::test]
+    async fn a_question_older_than_any_live_hook_expires() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+
+        let id = ask_about(&chat_id, run_id, "Bash", Some("npm publish".to_owned()));
+        {
+            let mut asks = super::asks::ASKS.lock().unwrap();
+            let pending = asks.get_mut(&id).unwrap();
+            pending.asked_at = std::time::Instant::now()
+                .checked_sub(ASK_LIFETIME + Duration::from_secs(1))
+                .expect("the clock has run long enough to age a question");
+        }
+
+        assert!(asks_for(&chat_id).is_empty());
+        assert!(!answer_ask(&id, true), "an expired question took an answer");
+    }
+
     /// A conversation with a directory and a running turn, which is what `rooted_decision` needs.
     async fn rooted_conversation(state: &AppState, root: &tempfile::TempDir) -> (String, i64) {
         let chat_id = format!("asking-{}", crate::auth::generate_uuid_v4());
