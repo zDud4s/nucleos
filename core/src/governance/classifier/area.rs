@@ -283,16 +283,24 @@ fn checkouts_of(root: &Path) -> Vec<PathBuf> {
 
 /// The daemon's own worktrees stay out of every conversation's area: a run's branch
 /// (`nucleos/run-<id>`, and the rest under `nucleos/`) and the queue's merge workspaces
-/// (`integration-*`), which an autonomous run or `compute_merge` is using at that moment.
+/// (`integration-*`), which an autonomous run or `compute_merge` is using at that moment, and the
+/// post-merge gate's tree (`postgate-<project>`). That last one is checked out DETACHED, so no
+/// branch names it: only its directory does, and without the prefix here it counted as one of every
+/// conversation's checkouts, writable by any chat while the gate was measuring it.
 fn daemon_worktree(worktree: &Path, head: &str) -> bool {
     let name = worktree
         .file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     head.trim().starts_with("ref: refs/heads/nucleos/")
-        || ["integration-", "run-", "job-"]
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
+        || [
+            "integration-",
+            "run-",
+            "job-",
+            crate::verify::postgate::POSTGATE_PREFIX,
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -359,6 +367,59 @@ mod tests {
             Path::new("C:/P/nucleos-chat-perms"),
             "ref: refs/heads/fix/x"
         ));
+    }
+
+    /// The post-merge gate's tree is detached at the tip it measures, so only its directory says
+    /// whose it is: it is the daemon's, and it is not in any conversation's area. Laid out as under
+    /// `NUCLEOS_WORKTREE_ROOT` (a worktree root outside the project), where the checkout list is
+    /// the only thing that would put the tree in the area.
+    #[test]
+    fn the_post_merge_gate_tree_is_left_out_of_the_area() {
+        let project = Path::new("C:/Projects/repo");
+        let postgate = crate::verify::postgate::postgate_worktree(project);
+        let detached = "0123456789abcdef0123456789abcdef01234567
+";
+        assert!(
+            daemon_worktree(&postgate, detached),
+            "{}",
+            postgate.display()
+        );
+        assert!(daemon_worktree(
+            Path::new("C:/Users/me/.nucleos/worktrees/postgate-repo"),
+            detached
+        ));
+
+        let dir = std::env::temp_dir().join(format!("nucleos-area-pg-{}", std::process::id()));
+        let main = dir.join("repo");
+        let gate = dir.join("worktrees/postgate-repo");
+        std::fs::create_dir_all(main.join(".git/worktrees/postgate-repo")).unwrap();
+        std::fs::create_dir_all(&gate).unwrap();
+        let admin = main.join(".git/worktrees/postgate-repo");
+        std::fs::write(
+            admin.join("gitdir"),
+            format!(
+                "{}
+",
+                gate.join(".git").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(admin.join("HEAD"), detached).unwrap();
+
+        let found = checkouts_of(&main)
+            .iter()
+            .map(|path| fold_for_containment(&normalize_path(&path.to_string_lossy(), None)))
+            .collect::<Vec<_>>();
+        let gate_folded = fold_for_containment(&normalize_path(&gate.to_string_lossy(), None));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            !found.contains(&gate_folded),
+            "the gate tree is not a conversation's checkout: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|root| inside(&gate_folded, root)),
+            "nothing in the area contains the gate tree: {found:?}"
+        );
     }
 
     #[test]
