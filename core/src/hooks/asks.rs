@@ -12,6 +12,14 @@
 /// stepping away costs one refused tool call rather than a conversation that hangs.
 pub const ASK_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// How long a question may stand before it is taken to be about nothing.
+///
+/// The hook asks in two calls — one that registers the question, one that waits on it — and the CLI
+/// cuts each off at sixty seconds (see `ASK_WINDOW`). A question older than both together has no
+/// hook left that could collect its answer: the hook died in between, and nothing else would ever
+/// take the question down. Without this it would sit in the window, and in the map, for good.
+pub const ASK_LIFETIME: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// One tool call a conversation is waiting to be allowed.
 ///
 /// In memory and nowhere else, deliberately. A proposal is a durable row because the run it belongs
@@ -59,6 +67,14 @@ pub(super) struct Pending {
     pub(super) answer: Option<tokio::sync::oneshot::Sender<bool>>,
     /// Handed to the hook call that waits, and taken for the same reason.
     pub(super) heard: Option<tokio::sync::oneshot::Receiver<bool>>,
+    /// When it was asked, so a question whose hook died can expire (`ASK_LIFETIME`).
+    pub(super) asked_at: std::time::Instant,
+}
+
+/// Takes down every question older than `ASK_LIFETIME`. Called wherever the map is written or
+/// shown, which is exactly where a ghost would otherwise be seen or grow the map.
+fn forget_expired(asks: &mut std::collections::HashMap<String, Pending>) {
+    asks.retain(|_, pending| pending.asked_at.elapsed() < ASK_LIFETIME);
 }
 
 pub(super) static ASKS: std::sync::LazyLock<
@@ -90,7 +106,14 @@ fn register_ask(
 ) -> String {
     let id = crate::auth::generate_uuid_v4();
     let (answer, heard) = tokio::sync::oneshot::channel();
-    ASKS.lock().unwrap().insert(
+    let mut asks = ASKS.lock().unwrap();
+    forget_expired(&mut asks);
+    // **One question per run, the newest.** A run has one tool call in flight (see `wait_for_run`),
+    // so an older question of the same run is a ghost: its hook died between asking and waiting.
+    // Left standing, the judge could still answer it `true`, and `wait_for_run` — which finds a
+    // question by its run — could hand that yes to THIS call, which nobody judged.
+    asks.retain(|_, pending| pending.ask.run_id != run_id);
+    asks.insert(
         id.clone(),
         Pending {
             ask: Ask {
@@ -103,6 +126,7 @@ fn register_ask(
             call,
             answer: Some(answer),
             heard: Some(heard),
+            asked_at: std::time::Instant::now(),
         },
     );
     id
@@ -110,9 +134,9 @@ fn register_ask(
 
 /// What this conversation is waiting to be allowed, which is nearly always nothing or one thing.
 pub fn asks_for(chat_id: &str) -> Vec<Ask> {
-    ASKS.lock()
-        .unwrap()
-        .values()
+    let mut asks = ASKS.lock().unwrap();
+    forget_expired(&mut asks);
+    asks.values()
         .filter(|pending| pending.ask.chat_id == chat_id)
         .map(|pending| pending.ask.clone())
         .collect()
@@ -162,6 +186,8 @@ pub fn answer_ask(id: &str, allow: bool) -> bool {
 ///
 /// The question is taken down either way. A turn whose call was refused has moved on, and a
 /// question still standing in the window would be about something that is no longer happening.
+/// "Either way" includes this future being dropped mid-wait — the hook's connection cut — which is
+/// why the taking down is a drop guard and not a line after the `await`.
 pub async fn wait_for_run(run_id: i64, window: std::time::Duration) -> Option<bool> {
     let (id, heard) = {
         let mut asks = ASKS.lock().unwrap();
@@ -170,10 +196,23 @@ pub async fn wait_for_run(run_id: i64, window: std::time::Duration) -> Option<bo
             .find(|(_, pending)| pending.ask.run_id == run_id)?;
         (id.clone(), pending.heard.take()?)
     };
+    // Built only once the lock above is released: its `drop` takes the same lock.
+    let taken_down = TakeDown(id);
     let answer = tokio::time::timeout(window, heard)
         .await
         .ok()
         .and_then(|heard| heard.ok());
-    ASKS.lock().unwrap().remove(&id);
+    drop(taken_down);
     answer
+}
+
+/// Removes a question when the wait on it ends, however it ends.
+struct TakeDown(String);
+
+impl Drop for TakeDown {
+    fn drop(&mut self) {
+        ASKS.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
 }

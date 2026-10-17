@@ -290,7 +290,14 @@ pub fn merge_from_command(command: &str, current_branch: &str) -> Option<Op> {
 /// to agree — but `HEAD` is refused in both routes, whether it arrived from a detached worktree or
 /// was typed, because a queued row naming `HEAD` names nothing by the time it runs.
 pub fn push_from_command(command: &str, current_branch: &str) -> Option<Op> {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    // Each word as the shell hands it to git: `"git" push origin main` and `git pu\sh origin main`
+    // are this push, and read raw they matched no shape and ran by hand. Not the backtick: in bash
+    // it opens a command substitution, and dropping it would queue a branch nobody named.
+    let words: Vec<String> = command
+        .split_whitespace()
+        .map(|word| shell_unescaped(word, &['\\']))
+        .collect();
+    let tokens: Vec<&str> = words.iter().map(String::as_str).collect();
     let (program, subcommand, remote, branch) = match tokens.as_slice() {
         [program, subcommand, remote] => (program, subcommand, remote, current_branch.trim()),
         [program, subcommand, remote, branch] => (program, subcommand, remote, *branch),
@@ -574,6 +581,22 @@ pub(super) fn asks_to_delete(args: &[&str]) -> bool {
         }
     })
 }
+/// PURE: a word as the shell hands it to the program, as far as these readers need one: quotes
+/// dropped, and the character after any of `escapes` taken literally (`\` in sh, `` ` `` in
+/// PowerShell). Not a shell parser — nothing is expanded — only enough that a quote or an escape
+/// typed inside a git word cannot hide which word it is.
+pub(super) fn shell_unescaped(word: &str, escapes: &[char]) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' | '"' => {}
+            escape if escapes.contains(&escape) => out.extend(chars.next()),
+            _ => out.push(character),
+        }
+    }
+    out
+}
 /// PURE: why a command the parsers declined must still not be run by hand, or `None`.
 ///
 /// **"Declined by the queue" and "fine to run directly" are not the same sentence, and treating
@@ -595,7 +618,7 @@ pub(super) fn asks_to_delete(args: &[&str]) -> bool {
 /// This is a refusal and NOT an admission: there is nothing to queue, because the queue does not
 /// know how to perform the spelling either. The caller is told which spelling it does know.
 pub fn unqueueable_but_shared(command: &str) -> Option<String> {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let raw: Vec<&str> = command.split_whitespace().collect();
     // **The segment must BEGIN with git, and that is what separates a command from a mention.**
     // Scanning for `git` anywhere inside it is what the first version did, and it refused this
     // feature's own commit message: segments split on newlines, so that `cd repo` and `git push` on
@@ -607,15 +630,27 @@ pub fn unqueueable_but_shared(command: &str) -> Option<String> {
     // segments by the time it arrives here, and the second begins with git. What it stops is every
     // quoted and narrated occurrence — most of them, in a repository whose commit messages argue
     // about git commands for a living.
-    let program = tokens
-        .first()?
-        .replace('\\', "/")
-        .rsplit('/')
-        .next()?
-        .to_ascii_lowercase();
-    if program != "git" && program != "git.exe" {
+    //
+    // Every word is read as the shell hands it to git, with both shells' escape characters:
+    // `"git" push --force`, `git pu\sh --force` and ``git pu`sh --force`` are the same forced push,
+    // and read raw they matched no arm and were allowed. Over-reading here only ever refuses. The program is
+    // also tried with its backslashes kept, because there they separate a Windows path, not escape.
+    let first = raw.first()?;
+    let names_git = |word: &str| {
+        let path = word.replace('\\', "/");
+        let name = path.rsplit('/').next().unwrap_or_default();
+        name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
+    };
+    if !names_git(&first.replace(['\'', '"'], ""))
+        && !names_git(&shell_unescaped(first, &['\\', '`']))
+    {
         return None;
     }
+    let words: Vec<String> = raw
+        .iter()
+        .map(|word| shell_unescaped(word, &['\\', '`']))
+        .collect();
+    let tokens: Vec<&str> = words.iter().map(String::as_str).collect();
     // Skipping the VALUE of a global flag, not merely the flag. `find(|t| !t.starts_with('-'))`
     // reads `git -C <path> merge <branch>` as the verb `<path>`, which matches no arm below and
     // was therefore allowed — the same fail-open this function exists to close, one token earlier.

@@ -26,6 +26,13 @@ func TestCheckIPRefusesEveryNonPublicDestination(t *testing.T) {
 		"v4-in-v6 loopback":       "::ffff:127.0.0.1",
 		"v4-in-v6 home network":   "::ffff:192.168.0.1",
 		"v4-in-v6 cloud metadata": "::ffff:169.254.169.254",
+		"CGNAT / tailnet":         "100.64.0.1",
+		"CGNAT upper edge":        "100.127.255.254",
+		"IETF protocol block":     "192.0.0.8",
+		"NAT64 to loopback":       "64:ff9b::7f00:1",
+		"benchmarking":            "198.18.0.1",
+		"reserved 240/4":          "240.0.0.1",
+		"6to4":                    "2002:c0a8:0101::1",
 	}
 
 	for what, addr := range blocked {
@@ -53,6 +60,8 @@ func TestCheckIPAllowsPublicDestinations(t *testing.T) {
 		"just above 10/8":   "11.0.0.0",
 		"just below 172.16": "172.15.255.255",
 		"just above 172.31": "172.32.0.0",
+		"just below CGNAT":  "100.63.255.255",
+		"just above CGNAT":  "100.128.0.0",
 	}
 
 	for what, addr := range allowed {

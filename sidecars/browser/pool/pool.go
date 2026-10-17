@@ -155,6 +155,10 @@ type entry struct {
 	visible bool
 
 	sessions map[browser.SessionID]struct{}
+	// opening counts Opens that acquired this browser and have not registered a session on it yet.
+	// A browser with opens in flight is busy: without it the last registered session closing would
+	// retire the browser under a navigation. Read and written under Pool.mu.
+	opening int
 }
 
 // New builds a pool. maxSessions is spec §8's max_sessions; limits are its profile ceilings.
@@ -162,7 +166,7 @@ func New(launcher Launcher, store profile.Store, limits profile.Limits, maxSessi
 	if maxSessions < 1 {
 		maxSessions = 1
 	}
-	return &Pool{
+	p := &Pool{
 		launcher: launcher,
 		store:    store,
 		limits:   limits,
@@ -170,6 +174,19 @@ func New(launcher Launcher, store profile.Store, limits profile.Limits, maxSessi
 		running:  map[profile.Ref]*entry{},
 		sessions: map[browser.SessionID]placed{},
 	}
+	// Admit sweeps ephemeral profiles to make room, and must not take one a browser here is using.
+	// Called without p.mu held (Admit runs from start/startHuman, outside the lock).
+	p.store.InUse = func(name string) bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		for ref := range p.running {
+			if ref.Name() == name {
+				return true
+			}
+		}
+		return false
+	}
+	return p
 }
 
 // Name reports the driver behind the pool, because that is what a health readout means by "driver".
@@ -198,11 +215,13 @@ func (p *Pool) Open(ctx context.Context, req browser.OpenRequest) (browser.Sessi
 	// stall every snapshot and every act on every other session.
 	session, err := holder.driver.Open(ctx, req)
 	if err != nil {
+		p.finishOpening(holder)
 		p.release(ctx, holder, "")
 		return browser.Session{}, err
 	}
 
 	p.mu.Lock()
+	holder.opening--
 	if holder.person {
 		// A person took the browser while this navigation was in flight, and the fence is down for
 		// as long as they drive: this session must not exist.
@@ -321,6 +340,13 @@ func (p *Pool) Shutdown(ctx context.Context) {
 	}
 }
 
+// finishOpening gives back the hold acquire took on a browser, for an Open that produced no session.
+func (p *Pool) finishOpening(holder *entry) {
+	p.mu.Lock()
+	holder.opening--
+	p.mu.Unlock()
+}
+
 // reserve takes one of spec §9.6's session slots, or refuses.
 func (p *Pool) reserve() error {
 	p.mu.Lock()
@@ -353,6 +379,7 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 				visible:  visible,
 				ready:    make(chan struct{}),
 				sessions: map[browser.SessionID]struct{}{},
+				opening:  1,
 			}
 			p.running[placement.Profile] = starting
 			p.mu.Unlock()
@@ -372,6 +399,11 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 			continue
 		}
 		p.mu.Lock()
+		if p.running[placement.Profile] != existing {
+			// Retired between its launch finishing and this check; it is shut down or going to be.
+			p.mu.Unlock()
+			continue
+		}
 		personDriving := existing.person
 		p.mu.Unlock()
 		if existing.human || personDriving {
@@ -385,7 +417,7 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 			// Same shape as the fingerprint relaunch below: refuse under a live page, otherwise
 			// stop the idle browser and go round to launch one in the requested visibility.
 			p.mu.Lock()
-			if len(existing.sessions) > 0 {
+			if len(existing.sessions) > 0 || existing.opening > 0 {
 				p.mu.Unlock()
 				return nil, fmt.Errorf("%w: %s", browser.ErrVisibilityConflict, placement.Profile)
 			}
@@ -397,6 +429,15 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 			continue
 		}
 		if existing.fenced == fingerprint {
+			// Take the hold in the same critical section that confirms the browser is still the
+			// profile's, so a release cannot retire it between this check and the Open.
+			p.mu.Lock()
+			if p.running[placement.Profile] != existing {
+				p.mu.Unlock()
+				continue
+			}
+			existing.opening++
+			p.mu.Unlock()
 			return existing, nil
 		}
 
@@ -404,7 +445,7 @@ func (p *Pool) acquire(ctx context.Context, placement browser.Placement, policy 
 		// otherwise it refuses, because a policy swap under a live page is a fence that changes its
 		// mind mid-document.
 		p.mu.Lock()
-		if len(existing.sessions) > 0 {
+		if len(existing.sessions) > 0 || existing.opening > 0 {
 			p.mu.Unlock()
 			return nil, fmt.Errorf("%w: %s", ErrPolicyChanged, placement.Profile)
 		}
@@ -469,7 +510,7 @@ func (p *Pool) release(ctx context.Context, holder *entry, id browser.SessionID)
 	// Retire it only if it is idle AND still the browser this profile points at. If it is not, a
 	// Shutdown or a relaunch already took it out of the map and has already stopped it — stopping it
 	// again here would be the second close of a browser somebody else is responsible for.
-	retire := len(holder.sessions) == 0 && p.running[holder.ref] == holder
+	retire := len(holder.sessions) == 0 && holder.opening == 0 && p.running[holder.ref] == holder
 	if retire {
 		delete(p.running, holder.ref)
 	}

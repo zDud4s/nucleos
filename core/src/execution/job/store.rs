@@ -350,7 +350,7 @@ pub async fn finish(pool: &SqlitePool, job_id: i64, outcome: Outcome) -> sqlx::R
 /// that led here and this write. The caller must stop: writing the stage anyway is exactly what
 /// used to bring a cancelled job back to `implementing` and start its next item.
 pub(super) async fn set_live_status(
-    pool: &SqlitePool,
+    pool: impl sqlx::SqliteExecutor<'_>,
     job_id: i64,
     status: &str,
 ) -> sqlx::Result<bool> {
@@ -715,29 +715,14 @@ pub(super) async fn cancel_parked_node(pool: &SqlitePool, run_id: i64) -> sqlx::
     Ok(())
 }
 
-/// Stops a whole job: the node in flight, and the sequence behind it.
+/// Stops every node of a job still in flight, and the items they held.
 ///
-/// This is the second of the two cancellation levels. Cancelling a *run* stops one node, and the
-/// chain then ends `cancelled` too — a stopped node leaves the tree holding edits no gate measured,
-/// so the next item must not build on them. What this adds is stopping a job that has no node in
-/// flight at all: one parked for budget, waiting for the slot, or between two nodes.
-///
-/// The node is cancelled BEFORE the job is retired, so a daemon that dies in between heals itself:
-/// the next pass sees a cancelled node and reaches the same ending. Retiring first would leave a
-/// live node in a job nothing drives.
-pub async fn cancel(state: &AppState, job_id: i64) -> sqlx::Result<CancelOutcome> {
+/// Every ending that retires a live job goes through here BEFORE the retirement — a cancel, the
+/// life ceiling, a brake that stops the job — for the reason [`cancel`] gives: a job retired with a
+/// node still running is a node editing a tree nobody drives, and no later pass will come to stop
+/// it, because a retired job is never driven again.
+pub(super) async fn stop_nodes_in_flight(state: &AppState, job_id: i64) -> sqlx::Result<()> {
     let pool = &state.pool;
-    let Some(job): Option<JobSummary> = sqlx::query_as(summary_query("WHERE jobs.id = ?"))
-        .bind(job_id)
-        .fetch_optional(pool)
-        .await?
-    else {
-        return Ok(CancelOutcome::NotFound);
-    };
-    if !LIVE_STATUSES.contains(&job.status.as_str()) {
-        return Ok(CancelOutcome::NotLive);
-    }
-
     let in_flight: Vec<(i64, String)> = sqlx::query_as(
         "SELECT id, status FROM runs WHERE job_id = ? AND status IN ('running','awaiting_approval')",
     )
@@ -761,6 +746,33 @@ pub async fn cancel(state: &AppState, job_id: i64) -> sqlx::Result<CancelOutcome
         .bind(job_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Stops a whole job: the node in flight, and the sequence behind it.
+///
+/// This is the second of the two cancellation levels. Cancelling a *run* stops one node, and the
+/// chain then ends `cancelled` too — a stopped node leaves the tree holding edits no gate measured,
+/// so the next item must not build on them. What this adds is stopping a job that has no node in
+/// flight at all: one parked for budget, waiting for the slot, or between two nodes.
+///
+/// The node is cancelled BEFORE the job is retired, so a daemon that dies in between heals itself:
+/// the next pass sees a cancelled node and reaches the same ending. Retiring first would leave a
+/// live node in a job nothing drives.
+pub async fn cancel(state: &AppState, job_id: i64) -> sqlx::Result<CancelOutcome> {
+    let pool = &state.pool;
+    let Some(job): Option<JobSummary> = sqlx::query_as(summary_query("WHERE jobs.id = ?"))
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(CancelOutcome::NotFound);
+    };
+    if !LIVE_STATUSES.contains(&job.status.as_str()) {
+        return Ok(CancelOutcome::NotLive);
+    }
+
+    stop_nodes_in_flight(state, job_id).await?;
     if !retire(pool, job_id, STATUS_CANCELLED).await? {
         // Another ending got there first, between the liveness read above and this write. That
         // ending stands, and the caller is told the job was already over rather than cancelled.

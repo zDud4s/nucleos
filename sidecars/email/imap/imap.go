@@ -12,7 +12,10 @@
 package imap
 
 import (
+	"crypto/tls"
+	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	imapv2 "github.com/emersion/go-imap/v2"
@@ -27,21 +30,70 @@ type Raw struct {
 	Body         []byte
 }
 
+// ErrNoMessage and ErrNoBody mark a uid the server answered for but could not give a body for (it
+// was expunged between the search and the fetch, or it has no body section). They describe the
+// MESSAGE, not the connection, so the collector records a skip and moves on instead of stopping
+// the pass at the same uid on every poll.
+var (
+	ErrNoMessage = errors.New("returned no message")
+	ErrNoBody    = errors.New("returned no body")
+)
+
+// DialTimeout bounds connecting and the TLS handshake; IOTimeout bounds each single read or write
+// afterwards. Without them a server that accepts and then stalls blocks the poll loop forever.
+const (
+	DialTimeout = 30 * time.Second
+	IOTimeout   = 2 * time.Minute
+)
+
 type Conn struct {
 	client *imapclient.Client
 }
 
+// deadlineConn arms a fresh deadline before every read and write, so a stalled server surfaces
+// as an error on the call that is waiting instead of hanging it.
+type deadlineConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (d deadlineConn) Read(p []byte) (int, error) {
+	if err := d.Conn.SetReadDeadline(time.Now().Add(d.timeout)); err != nil {
+		return 0, err
+	}
+	return d.Conn.Read(p)
+}
+
+func (d deadlineConn) Write(p []byte) (int, error) {
+	if err := d.Conn.SetWriteDeadline(time.Now().Add(d.timeout)); err != nil {
+		return 0, err
+	}
+	return d.Conn.Write(p)
+}
+
+// newConn builds a Conn whose I/O is bounded by `timeout` per operation.
+func newConn(netConn net.Conn, timeout time.Duration) *Conn {
+	return &Conn{client: imapclient.New(deadlineConn{Conn: netConn, timeout: timeout}, nil)}
+}
+
 // Dial opens a TLS connection and authenticates.
 func Dial(addr, username, password string) (*Conn, error) {
-	client, err := imapclient.DialTLS(addr, nil)
+	tlsConn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: DialTimeout},
+		"tcp",
+		addr,
+		&tls.Config{NextProtos: []string{"imap"}},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("could not connect to %s: %w", addr, err)
 	}
+	conn := newConn(tlsConn, IOTimeout)
+	client := conn.client
 	if err := client.Login(username, password).Wait(); err != nil {
 		client.Close()
 		return nil, fmt.Errorf("could not authenticate as %s: %w", username, err)
 	}
-	return &Conn{client: client}, nil
+	return conn, nil
 }
 
 func (c *Conn) Close() {
@@ -110,7 +162,7 @@ func (c *Conn) Fetch(uid imapv2.UID) (Raw, error) {
 		return Raw{}, fmt.Errorf("could not fetch uid %d: %w", uid, err)
 	}
 	if len(messages) == 0 {
-		return Raw{}, fmt.Errorf("uid %d returned no message", uid)
+		return Raw{}, fmt.Errorf("uid %d %w", uid, ErrNoMessage)
 	}
 
 	message := messages[0]
@@ -120,7 +172,7 @@ func (c *Conn) Fetch(uid imapv2.UID) (Raw, error) {
 		break
 	}
 	if body == nil {
-		return Raw{}, fmt.Errorf("uid %d returned no body", uid)
+		return Raw{}, fmt.Errorf("uid %d %w", uid, ErrNoBody)
 	}
 
 	return Raw{

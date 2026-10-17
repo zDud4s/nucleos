@@ -784,6 +784,29 @@ mod tests {
         }
     }
 
+    /// pflag reads everything after a short flag's letter as its value, so `-L1000` IS `-L 1000`.
+    #[test]
+    fn a_short_flag_with_its_value_glued_on_is_still_that_flag() {
+        let policy = policy_from(Some(
+            "autonomous_reads:
+  - gh pr list
+",
+        ));
+        for command in [
+            "gh pr list -L1000",
+            "gh pr list -qEXPR",
+            "gh pr list -t{{.body}}",
+            "gh pr list -S 'in:body x'",
+            "gh pr list -Sin:body",
+        ] {
+            assert!(
+                !policy.read_is_autonomous(command),
+                "{command} should have lost its autonomy"
+            );
+        }
+        assert!(policy.read_is_autonomous("gh pr list -l bug"));
+    }
+
     /// `-L` is `--limit` and `-l` is `--label`. Folding the comparison to one case would either
     /// miss the first or refuse the second, which is why the raw command is what gets read.
     #[test]

@@ -312,6 +312,8 @@ pub(super) async fn spawn_agent(
         Ok(token) => token,
         Err(error) => {
             tracing::warn!(team_run = %run.id, %error, "a team run has no key; its agent cannot call a tool");
+            // Nothing was spawned, so nothing else would ever close the row `open_run` wrote.
+            fail_run(&state.pool, run_id, "the team run has no key").await;
             return;
         }
     };

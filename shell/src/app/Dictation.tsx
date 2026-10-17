@@ -88,6 +88,10 @@ export function DictationProvider({ children }: { children: ReactNode }) {
   const [delivery, setDelivery] = useState<Delivery | null>(null);
 
   const captureRef = useRef<ActiveRecording | null>(null);
+  /** The microphone is being opened (the permission prompt can sit there for as long as it likes). */
+  const startingRef = useRef(false);
+  /** A stop arrived while `startingRef` was set: honoured the moment the microphone is up. */
+  const stopRequestedRef = useRef(false);
 
   /** The phase the host already holds, in case it is mid-capture from before this window loaded. */
   useEffect(() => {
@@ -107,27 +111,56 @@ export function DictationProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  /**
+   * Tells the host nothing is being captured, so it leaves `recording`/`transcribing`. Without it a
+   * failed capture leaves the host there and every hotkey answers "busy" until the app restarts.
+   */
+  async function abandonHost() {
+    try {
+      await invoke("voice_abandon");
+    } catch {
+      // Best-effort — the host may already have nothing to abandon either.
+    }
+  }
+
   async function beginRecording(kind: "dictation" | "memo") {
     setOutcome(null);
     setDelivery(null);
+    startingRef.current = true;
+    stopRequestedRef.current = false;
+    let started = false;
     try {
       captureRef.current = { ...(await startCapture()), kind };
+      started = true;
       setActiveKind(kind);
       setPhase(phaseAfter({ type: "start", kind }));
     } catch {
       setOutcome({ kind: "mic-error" });
+      setActiveKind(null);
+      await abandonHost();
+      setPhase(phaseAfter({ type: "abandon" }));
+    } finally {
+      startingRef.current = false;
     }
+    if (started && stopRequestedRef.current) {
+      stopRequestedRef.current = false;
+      await endRecordingAndCapture();
+    }
+    stopRequestedRef.current = false;
   }
 
   async function endRecordingAndCapture() {
     const active = captureRef.current;
-    if (active === null) return;
+    if (active === null) {
+      // The stop chord came while the permission prompt was still open; dropping it would record forever.
+      if (startingRef.current) stopRequestedRef.current = true;
+      return;
+    }
     captureRef.current = null;
     setPhase(phaseAfter({ type: "stop" }));
 
-    const { bytes, ms } = await finishCapture(active);
-
     try {
+      const { bytes, ms } = await finishCapture(active);
       const result = await postCapture(bytes, active.kind, ms);
       if (result === undefined) {
         // The one route in this shell where a success-family status is a
@@ -142,6 +175,7 @@ export function DictationProvider({ children }: { children: ReactNode }) {
       setPhase(phaseAfter({ type: "capture-done" }));
     } catch (error) {
       setOutcome({ kind: "refused", error });
+      await abandonHost();
       setPhase(phaseAfter({ type: "capture-error" }));
     } finally {
       setActiveKind(null);

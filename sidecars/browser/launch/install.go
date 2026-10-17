@@ -41,6 +41,13 @@ type Pin struct {
 // compromised mirror or a redirected URL installs whatever it likes, once, permanently.
 var ErrNoDigest = errors.New("launch: refusing to install a Chromium with no pinned sha256")
 
+// maxArchive bounds the downloaded archive (1 GiB; a Chromium zip is a few hundred MB). A variable
+// so a test can lower it.
+var maxArchive int64 = 1 << 30
+
+// ErrArchiveTooLarge means the download exceeded maxArchive and was abandoned unread.
+var ErrArchiveTooLarge = errors.New("launch: chromium archive is implausibly large")
+
 // ErrDigestMismatch means the bytes are not the bytes we pinned.
 var ErrDigestMismatch = errors.New("launch: chromium archive does not match its pinned sha256")
 
@@ -74,7 +81,7 @@ func (i Install) ProfilesDir() string { return filepath.Join(i.Root, "profiles")
 // Present reports whether the pinned Chromium is installed and executable.
 func (i Install) Present() bool {
 	info, err := os.Stat(i.ExecutablePath())
-	return err == nil && !info.IsDir() && info.Size() > 0
+	return err == nil && info.Mode().IsRegular() && info.Size() > 0
 }
 
 // Fetcher opens the archive. An interface so the download is testable without the internet — the
@@ -102,9 +109,14 @@ func (i Install) Download(ctx context.Context, fetcher Fetcher) error {
 	}
 	defer body.Close()
 
-	archive, err := io.ReadAll(body)
+	// Read one byte past the ceiling so an endless or oversized body is told apart from one that
+	// ends exactly on it; the archive is held in memory for hashing, so it must be bounded.
+	archive, err := io.ReadAll(io.LimitReader(body, maxArchive+1))
 	if err != nil {
 		return fmt.Errorf("reading chromium archive: %w", err)
+	}
+	if int64(len(archive)) > maxArchive {
+		return fmt.Errorf("%w: more than %d bytes", ErrArchiveTooLarge, maxArchive)
 	}
 
 	sum := sha256.Sum256(archive)

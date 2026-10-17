@@ -319,6 +319,10 @@ export function useRunTail(id: number, since: number, alive: boolean) {
       return chunk ?? RECORDED;
     },
     refetchInterval: alive ? POLL.fast : false,
+    // The reader keeps the cursor and the accumulated text as component state,
+    // so a cached chunk outliving it would be replayed into a reader whose
+    // cursor is back at 0: duplicated, out-of-order output.
+    gcTime: 0,
   });
 }
 

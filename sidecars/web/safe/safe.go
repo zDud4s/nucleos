@@ -22,6 +22,37 @@ import (
 	"syscall"
 )
 
+// special lists IANA special-purpose ranges the net.IP predicates do not cover. None of them is a
+// public destination: CGNAT is an ISP's (or a tailnet's) internal network, NAT64 and 6to4/Teredo
+// embed an IPv4 address that can point anywhere, and the rest are reserved, documentation or
+// benchmarking space that only ever appears in a request when somebody is probing.
+var special = func() []*net.IPNet {
+	var nets []*net.IPNet
+	for _, cidr := range []string{
+		"100.64.0.0/10",   // carrier-grade NAT, also Tailscale
+		"192.0.0.0/24",    // IETF protocol assignments
+		"192.0.2.0/24",    // documentation
+		"192.88.99.0/24",  // deprecated 6to4 relay anycast
+		"198.18.0.0/15",   // benchmarking
+		"198.51.100.0/24", // documentation
+		"203.0.113.0/24",  // documentation
+		"240.0.0.0/4",     // reserved, includes the broadcast address
+		"64:ff9b::/96",    // NAT64: embeds an arbitrary IPv4 address
+		"64:ff9b:1::/48",  // local-use NAT64
+		"100::/64",        // discard-only
+		"2001::/32",       // Teredo
+		"2001:db8::/32",   // documentation
+		"2002::/16",       // 6to4
+	} {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic(err)
+		}
+		nets = append(nets, network)
+	}
+	return nets
+}()
+
 // ErrBlocked is the class every refusal here belongs to. Callers match on it rather than on message
 // text, because the message names the address and the address came from somebody else.
 var ErrBlocked = errors.New("blocked destination")
@@ -69,6 +100,11 @@ func CheckIP(ip net.IP) error {
 		return fmt.Errorf("%w: %s is link-local", ErrBlocked, ip)
 	case ip.IsMulticast(), ip.IsInterfaceLocalMulticast():
 		return fmt.Errorf("%w: %s is multicast", ErrBlocked, ip)
+	}
+	for _, network := range special {
+		if network.Contains(ip) {
+			return fmt.Errorf("%w: %s is in the special-purpose range %s", ErrBlocked, ip, network)
+		}
 	}
 	// An IPv4 address carried inside an IPv6 one (::ffff:127.0.0.1, and the 6to4/Teredo shapes) is
 	// the classic way past a check that only looked at the 16-byte form. Unmap and judge again.

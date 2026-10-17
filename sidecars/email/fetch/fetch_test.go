@@ -135,3 +135,23 @@ func TestBulkMarksOnlyTheCutAttachmentsTruncated(t *testing.T) {
 		t.Errorf("wire form lacks the flag: %s", raw)
 	}
 }
+
+func TestAChangedUIDValidityIsNotTheSameMessage(t *testing.T) {
+	r, _ := http.NewRequest(http.MethodGet, "/attachment?uid=1&position=0&uidvalidity=7", nil)
+	if got := expectedValidity(r); got != 7 {
+		t.Fatalf("expectedValidity = %d, want 7", got)
+	}
+	if validityMatches(7, 8) {
+		t.Error("accepted a different UIDVALIDITY")
+	}
+	if !validityMatches(7, 7) {
+		t.Error("rejected the same UIDVALIDITY")
+	}
+	if !validityMatches(0, 8) {
+		t.Error("an absent validity must skip the check")
+	}
+	bare, _ := http.NewRequest(http.MethodGet, "/attachment?uid=1&position=0", nil)
+	if expectedValidity(bare) != 0 {
+		t.Error("a request without uidvalidity must read as 0")
+	}
+}

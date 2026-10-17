@@ -533,6 +533,12 @@ pub async fn submit(
 /// A suffix is dropped, never repaired, when it is empty, `.` or `..`, when it holds any character
 /// outside `[A-Za-z0-9._-]`, or when it is one of the shared directories (`test`, `gates`, `gate`)
 /// that belong to nobody's branch. A branch literally named `test` therefore derives nothing.
+fn is_pool_slot(suffix: &str) -> bool {
+    suffix
+        .strip_prefix("pool-")
+        .is_some_and(|slot| !slot.is_empty() && slot.chars().all(|c| c.is_ascii_digit()))
+}
+
 pub fn target_dir_names(branch: &str) -> Vec<String> {
     const PREFIX: &str = ".cargo-target-";
     const SHARED: [&str; 3] = ["test", "gates", "gate"];
@@ -545,7 +551,10 @@ pub fn target_dir_names(branch: &str) -> Vec<String> {
             && suffix
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-            && !SHARED.contains(&suffix.as_str());
+            && !SHARED.contains(&suffix.as_str())
+            // `.cargo-target-pool-<k>` is a leased slot of the broker's fixed pool, shared by every
+            // worktree: a branch named `pool-1` must not take the live slot with it.
+            && !is_pool_slot(&suffix);
         if !safe {
             continue;
         }

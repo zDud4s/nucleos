@@ -396,22 +396,38 @@ pub(super) static RESUME_INSERT: std::sync::LazyLock<String> = std::sync::LazyLo
     )
 });
 
+/// PURE: whether a run that ended with `status` may be continued by a context-handoff successor.
+///
+/// Only a run that finished its turn (`completed`) — or one not yet terminated — hands off. A run
+/// that `failed`, `timed_out`, was `cancelled`, `interrupted` or `superseded` ended for a reason a
+/// fresh window does not answer: a turn ceiling or a deadline is a brake, and a successor would
+/// relaunch the very work the brake stopped. Worse, the successor takes over `job_items.run_id`, so
+/// the job reads a live node instead of the failure that ended this one.
+pub(super) fn ends_in_a_handoff(status: &str) -> bool {
+    status == "completed" || !TERMINAL_RUN_STATUSES.contains(&status)
+}
+
 pub(super) async fn prepare_handoff_successor(
     pool: &sqlx::SqlitePool,
     run_id: i64,
 ) -> sqlx::Result<Option<HandoffSuccessor>> {
-    let (context_fill, existing_successor, job_id, transcript, steerable): (
+    let (status, context_fill, existing_successor, job_id, transcript, steerable): (
+        String,
         Option<i64>,
         Option<i64>,
         Option<i64>,
         Option<String>,
         i64,
     ) = sqlx::query_as(
-        "SELECT context_fill, successor_run_id, job_id, stdout, steerable FROM runs WHERE id = ?",
+        "SELECT status, context_fill, successor_run_id, job_id, stdout, steerable
+         FROM runs WHERE id = ?",
     )
     .bind(run_id)
     .fetch_one(pool)
     .await?;
+    if !ends_in_a_handoff(&status) {
+        return Ok(None);
+    }
     let Some(context_fill) = context_fill else {
         return Ok(None);
     };

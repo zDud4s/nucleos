@@ -210,9 +210,15 @@ pub(super) fn is_powershell_delete_switch(token: &str) -> bool {
 /// `busybox rm -rf` and `xargs rm -rf` all put the real command in an argument. This widens the
 /// over-match — a commit message quoting `rm -r -f` is now denied — but only to where the phrase
 /// blocklist already was: it matches ` rm -rf ` anywhere in the line and always has.
+///
+/// The program is read from the RAW word and only its arguments are dequoted (`flag_words`), so
+/// `find . "-delete"` is the delete it is while a commit message opening on `"rm -rf` does not
+/// newly start one.
 pub(super) fn has_destructive_flags(command: &str) -> bool {
-    let tokens: Vec<_> = command.split_whitespace().collect();
-    tokens.iter().enumerate().any(|(index, token)| {
+    let raw: Vec<_> = command.split_whitespace().collect();
+    let words = flag_words(command);
+    let tokens: Vec<&str> = words.iter().map(String::as_str).collect();
+    raw.iter().enumerate().any(|(index, token)| {
         let rest = &tokens[index + 1..];
         match program_name(token) {
             "rm" => rm_deletes_recursively_and_forcibly(rest),
@@ -334,13 +340,43 @@ pub(super) fn shapes_output_only(command: &str) -> bool {
 /// said, and the test pinning that refusal went red the first time it ran. One place decides
 /// `cargo fmt` now.
 pub(super) fn checks_formatting_without_writing(command: &str) -> bool {
-    let mut tokens = command.split_whitespace();
+    let words = flag_words(command);
+    let mut tokens = words.iter().map(String::as_str);
     tokens.next().map(program_name) == Some("cargo")
         && tokens.next() == Some("fmt")
-        && command.split_whitespace().any(|token| token == "--check")
-        && !command
-            .split_whitespace()
-            .any(|token| token.starts_with("--emit"))
+        && words.iter().any(|token| token == "--check")
+        && !words.iter().any(|token| token.starts_with("--emit"))
+}
+
+/// PURE: every whitespace-separated word of `command` as the program will receive it, for the
+/// flag guards below to compare against their lists.
+///
+/// The shell strips quotes and backslash escapes before a program sees a word, so `"-exec"`,
+/// `'-exec'`, `-ex""ec` and `-exe\c` all reach `find` as `-exec`. Compared raw, every one of them
+/// slipped past the guard that refuses `-exec` and the line was `read-local`. `grammar::unquoted`
+/// drops only the quotes, and is kept that way because its callers read PATHS, where a Windows
+/// `\` is a separator; here every caller compares against a flag list, and a word bash would read
+/// as a flag after dropping its `\` is one the guard has to see as that flag.
+///
+/// Splitting on raw whitespace still breaks a quoted string with spaces into several words, which
+/// over-matches (`rg "a -exec b"` is refused) — the cheap side, and what the raw split did already.
+pub(super) fn flag_words(command: &str) -> Vec<String> {
+    command.split_whitespace().map(dequoted).collect()
+}
+
+/// PURE: one word without its quotes and with each backslash escape replaced by the character it
+/// escapes.
+fn dequoted(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' | '"' => {}
+            '\\' => out.extend(chars.next()),
+            _ => out.push(character),
+        }
+    }
+    out
 }
 
 /// The guards a command has to clear before ANY list may say yes to it, separated from the lists
@@ -372,7 +408,7 @@ pub(super) fn checks_formatting_without_writing(command: &str) -> bool {
 /// mais nunca deixou correr nada."
 pub fn shell_form_is_readable(command: &str) -> bool {
     !has_shell_control(command)
-        && !command.split_whitespace().any(|token| token == "--fix")
+        && !flag_words(command).iter().any(|token| token == "--fix")
         && !writes_an_output_file(command)
         && !forces_external_diff_or_textconv(command)
         && !runs_a_helper_command(command)
@@ -388,7 +424,7 @@ pub fn shell_form_is_readable(command: &str) -> bool {
 /// path and writes the walk to it, so a search allowed for reading would write a file — and, given
 /// an absolute path, write it outside the workspace.
 pub(super) fn writes_an_output_file(command: &str) -> bool {
-    command.split_whitespace().any(|token| {
+    flag_words(command).iter().any(|token| {
         token.starts_with("--output") || token.starts_with("-fprint") || token == "-fls"
     })
 }
@@ -422,12 +458,61 @@ pub(super) fn runs_a_helper_command(command: &str) -> bool {
     // `--compress-program` is GNU `sort`'s, which runs it to compress its temporary files; GNU
     // accepts any unambiguous prefix of a long option, and `--co` is already unambiguous on `sort`.
     const RUNS_A_COMMAND_ATTACHED: &[&str] = &["--pre=", "--pre-glob=", "--hostname-bin="];
-    command.split_whitespace().any(|token| {
+    flag_words(command).iter().map(String::as_str).any(|token| {
         RUNS_A_COMMAND.contains(&token)
             || RUNS_A_COMMAND_ATTACHED
                 .iter()
                 .any(|flag| token.starts_with(flag))
             || (token.starts_with("--co") && "--compress-program".starts_with(token_name(token)))
+    })
+}
+
+/// PURE: whether a path value given to a flag that writes (or, for pytest, deletes) it resolves
+/// STRICTLY inside the workspace, read lexically because the shape guards have no `cwd`.
+///
+/// Relative and inside is the owner's line (2026-10-17): `cover.out`, `tmp/x` and `./out/c.out`
+/// pass; an absolute path, a drive path, `~`, anything with a `$` or `%` the shell rewrites, and
+/// anything whose `..` climbs out do not. "Strictly" is for pytest's `--basetemp`, which is
+/// deleted before the run: a value that normalizes to the workspace root itself (`.`, `./`,
+/// `tmp/..`, an empty string) or above it would empty the workspace, so it does not count as inside.
+/// The resolution is `normalize_path` with no `cwd`, the one the containment checks use: it keeps a
+/// leading `..` it cannot pop, which is exactly the climb out, and leaves nothing for the root.
+fn relative_path_stays_inside(value: &str) -> bool {
+    use super::paths::{is_absolute_path, normalize_path};
+    if value.is_empty()
+        || value.starts_with('~')
+        || value.contains('$')
+        || value.contains('%')
+        || is_absolute_path(&value.replace('\\', "/"))
+    {
+        return false;
+    }
+    let resolved = normalize_path(value, None);
+    !resolved.is_empty() && resolved != ".." && !resolved.starts_with("../")
+}
+
+/// PURE: whether `tokens[index]` is a flag whose path value (attached after `=` or the next word)
+/// is missing or does not stay inside the workspace.
+fn flag_value_leaves_the_workspace(tokens: &[&str], index: usize) -> bool {
+    match tokens[index].split_once('=') {
+        Some((_, value)) => !relative_path_stays_inside(value),
+        None => tokens
+            .get(index + 1)
+            .is_none_or(|value| !relative_path_stays_inside(value)),
+    }
+}
+
+/// PURE: whether a pytest argument list names a `--basetemp` (attached `--basetemp=x` or apart
+/// `--basetemp x`, or an unambiguous prefix argparse would expand) whose value is not a directory
+/// strictly inside the workspace.
+fn removes_a_basetemp(tokens: &[&str]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        token.strip_prefix("--").is_some_and(|long| {
+            let name = token_name(long);
+            name.len() >= 4
+                && "basetemp".starts_with(name)
+                && flag_value_leaves_the_workspace(tokens, index)
+        })
     })
 }
 
@@ -447,7 +532,8 @@ pub(super) fn token_name(token: &str) -> &str {
 /// The file's other rejections (`--fix`, `--output`, `--ext-diff`) are global because no allowed
 /// program gives them a second meaning. These do, so they are the only ones read next to a program.
 pub(super) fn uses_a_flag_its_program_makes_dangerous(command: &str) -> bool {
-    let mut tokens = command.split_whitespace();
+    let words = flag_words(command);
+    let mut tokens = words.iter().map(String::as_str);
     let Some(program) = tokens.next().map(program_name) else {
         return false;
     };
@@ -460,10 +546,48 @@ pub(super) fn uses_a_flag_its_program_makes_dangerous(command: &str) -> bool {
         //
         // Read with the value attached as well as apart. Go's flag package takes `-o x`, `-o=x`
         // and `--o=x` alike; `-exec`, `-toolexec` and `-vettool` name a program it runs.
-        "go" => tokens.any(|token| {
-            let name = token_name(token.trim_start_matches('-'));
-            token.starts_with('-') && matches!(name, "o" | "exec" | "toolexec" | "vettool")
-        }),
+        //
+        // The profile, trace and coverage flags are `-o` again: each writes a file (or a
+        // directory of them) wherever its value points, so `go test -coverprofile=/c/Users/x/f`
+        // writes outside the workspace. Refused unless the value is a relative path that stays
+        // inside the workspace (`-coverprofile=cover.out`); `-o`, `-exec`, `-toolexec` and
+        // `-vettool` are refused whatever the value. `go test` hands the binary its own
+        // `-test.<name>` spelling of each, so that prefix is read through.
+        "go" => {
+            let rest: Vec<&str> = tokens.collect();
+            rest.iter().enumerate().any(|(index, token)| {
+                let name = token_name(token.trim_start_matches('-'));
+                let name = name.strip_prefix("test.").unwrap_or(name);
+                token.starts_with('-')
+                    && match name {
+                        "o" | "exec" | "toolexec" | "vettool" => true,
+                        "coverprofile"
+                        | "cpuprofile"
+                        | "memprofile"
+                        | "blockprofile"
+                        | "mutexprofile"
+                        | "trace"
+                        | "outputdir"
+                        | "gocoverdir"
+                        | "debug-trace"
+                        | "debug-actiongraph"
+                        | "debug-runtime-trace" => flag_value_leaves_the_workspace(&rest, index),
+                        _ => false,
+                    }
+            })
+        }
+        // pytest REMOVES its `--basetemp` directory before the run, so the flag is a recursive
+        // delete of whatever it names: `--basetemp=.` empties the workspace, an absolute value
+        // anywhere else. Refused unless the value is a directory strictly inside the workspace
+        // (`--basetemp=tmp`), in every spelling that reaches pytest — including the module form,
+        // whose program is the interpreter.
+        "pytest" | "py.test" => removes_a_basetemp(&tokens.collect::<Vec<_>>()),
+        "python" | "python3" | "py" => {
+            let rest: Vec<&str> = tokens.collect();
+            let runs_pytest =
+                rest.windows(2).any(|pair| pair == ["-m", "pytest"]) || rest.contains(&"-mpytest");
+            runs_pytest && removes_a_basetemp(&rest)
+        }
         // `sort` is GNU: short options cluster and take their value attached (`-o~/.bashrc`,
         // `-no out`), and a long option may be any unambiguous prefix (`--out=x`, `--o x`). So
         // any short cluster holding an `o`, and any long option starting `--o`, is the output
@@ -509,8 +633,8 @@ pub(super) fn uses_a_flag_its_program_makes_dangerous(command: &str) -> bool {
 /// `--textconv` likewise forces a configured textconv filter where it would not otherwise run.
 /// `--no-ext-diff` / `--no-textconv` disable the drivers (the safe direction) and must not match.
 pub(super) fn forces_external_diff_or_textconv(command: &str) -> bool {
-    command
-        .split_whitespace()
+    flag_words(command)
+        .iter()
         .any(|token| token.starts_with("--ext-diff") || token.starts_with("--textconv"))
 }
 
@@ -527,9 +651,9 @@ pub(super) fn find_executes_or_writes(command: &str) -> bool {
     const EXECUTES_OR_WRITES: &[&str] = &[
         "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls",
     ];
-    command
-        .split_whitespace()
-        .any(|token| EXECUTES_OR_WRITES.contains(&token))
+    flag_words(command)
+        .iter()
+        .any(|token| EXECUTES_OR_WRITES.contains(&token.as_str()))
 }
 
 /// `pub(crate)` for `project_policy::ShellRules`, which measures a project's declared prefixes with

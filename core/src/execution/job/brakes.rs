@@ -145,7 +145,7 @@ pub(super) async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -
     //
     // Placed after the budget and before the attention check, and the order is what the person
     // reads. Two of these can be true at once — the owner at the keyboard AND a partner holding a
-    // slot — and "job 42 holds a slot and the two are excluded" is the more useful of the two,
+    // slot — and "job 42 is running and the two are excluded" is the more useful of the two,
     // because it names something that will resolve on its own and says what to watch for.
     //
     // Fails CLOSED like its neighbours, and the choice is nearly moot: a pool that cannot answer
@@ -156,7 +156,7 @@ pub(super) async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -
         Ok(Some(partner)) => {
             return Brake::Park {
                 reason: "excluded",
-                detail: format!("job {partner} holds a slot and the two are excluded"),
+                detail: format!("job {partner} is running and the two are excluded"),
             };
         }
         Err(error) => {

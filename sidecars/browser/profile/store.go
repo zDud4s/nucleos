@@ -17,6 +17,11 @@ import (
 // that a bug in this package cannot reach the pinned Chromium next to it.
 type Store struct {
 	Root string
+	// InUse, when set, reports whether a profile directory (by name, e.g. "run-3") belongs to a
+	// browser that is open right now. SweepEphemeral never touches such a directory: Admit sweeps
+	// while this process has browsers running, so "every run-* is a crash leftover" holds only for
+	// the startup sweep, where InUse is nil.
+	InUse func(name string) bool
 }
 
 // Dir is where a profile lives.
@@ -270,6 +275,9 @@ func (s Store) SweepEphemeral() (int, error) {
 	var failures []error
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), EphemeralPrefix) {
+			continue
+		}
+		if s.InUse != nil && s.InUse(entry.Name()) {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(s.Root, entry.Name())); err != nil {

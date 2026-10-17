@@ -382,7 +382,9 @@ export async function downloadFile(path: string): Promise<void> {
  */
 export function diskPathFor(localDataDir: string, relative: string): string {
   const base = localDataDir.replace(/[\\/]+$/, "");
-  const parts = pathSegments(relative);
+  // `.` and `..` are dropped, and `\` splits like `/`: the opener scope is the
+  // last wall, not the only one.
+  const parts = relative.split(/[\\/]/).filter((part) => part !== "" && part !== "." && part !== "..");
   if (base.includes("\\")) return [base, "nucleos", "NucleOS", "data", "files", ...parts].join("\\");
   const project = base.endsWith("/Library/Application Support") ? "dev.nucleos.NucleOS" : "nucleos";
   return [base, project, "files", ...parts].join("/");
@@ -412,12 +414,18 @@ export async function diskPath(relative: string): Promise<string> {
 const RUNS_ON_OPEN = new Set([
   "bat", "cmd", "com", "cpl", "exe", "hta", "jar", "js", "jse", "lnk", "msc", "msi", "msp", "pif",
   "ps1", "psm1", "reg", "scr", "url", "vb", "vbe", "vbs", "wsf", "wsh",
+  "appx", "appxbundle", "msix", "msixbundle", "application", "gadget", "inf", "ins", "isp", "jnlp",
+  "msu", "mst", "scf", "sct", "ws", "wsc", "chm", "ps1xml", "ps2", "psc1", "psc2", "psd1", "pyw",
+  "settingcontent-ms", "library-ms", "search-ms",
 ]);
 
 /** Whether opening this name would run it rather than show it. */
 export function runsOnOpen(name: string): boolean {
-  const dot = name.lastIndexOf(".");
-  return dot > 0 && RUNS_ON_OPEN.has(name.slice(dot + 1).toLowerCase());
+  // What Windows resolves, not what was typed: it strips trailing dots and
+  // spaces (`evil.exe.` runs) and ignores an NTFS stream suffix (`evil.exe::$DATA`).
+  const base = (name.split(/[\\/]/).pop() ?? "").split(":")[0].replace(/[. ]+$/, "");
+  const dot = base.lastIndexOf(".");
+  return dot > 0 && RUNS_ON_OPEN.has(base.slice(dot + 1).toLowerCase());
 }
 
 /**

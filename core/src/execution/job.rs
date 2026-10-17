@@ -5881,6 +5881,57 @@ mod tests {
         );
     }
 
+    /// A plan is ingested whole or not at all. The queue and the `implementing` that says it exists
+    /// are one transaction, so a write that dies part-way leaves a `planning` job with no items, and
+    /// the next pass ingests the same plan once rather than on top of half of it.
+    #[tokio::test]
+    async fn a_plan_that_dies_mid_ingest_leaves_no_half_queue() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_node(&pool, job_id, "plan", "completed").await;
+        write_plan(
+            worktree.path(),
+            r#"{"items": [{"description": "first"}, {"description": "boom"}]}"#,
+        )
+        .await;
+        // The crash, stood in for by the second insert failing.
+        sqlx::query(
+            "CREATE TRIGGER die_mid_ingest BEFORE INSERT ON job_items
+             WHEN NEW.description = 'boom'
+             BEGIN SELECT RAISE(ABORT, 'simulated crash'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert!(reconcile_nodes(&state, &job).await.is_err());
+        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_items WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(items, 0, "half a queue survived the failed ingest");
+        assert_eq!(job_status(&pool, job_id).await, "planning");
+
+        sqlx::query("DROP TRIGGER die_mid_ingest")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_items WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(items, 2);
+        assert_eq!(job_status(&pool, job_id).await, "implementing");
+    }
+
     // ---- the replan node (Chunk 3, task 11) ------------------------------------------------------
 
     /// Seeds a job at the end of a round, with a landed replan node and the answer it wrote.
@@ -6305,6 +6356,63 @@ mod tests {
             next_step(&load_view(&pool, job_id).await.unwrap()),
             Next::SpawnImplement(vec![2])
         );
+    }
+
+    /// A round opens whole or not at all. Its items and the `replan_run_id` marker that says the
+    /// replan was taken are one transaction: written apart, a crash between them left the items
+    /// queued and the replan untaken, and the next pass opened the same round a second time.
+    #[tokio::test]
+    async fn a_round_that_dies_while_opening_is_not_opened_twice() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_closed_round(
+            &pool,
+            worktree.path(),
+            "completed",
+            Some(r#"{"items": [{"description": "one more thing"}]}"#),
+        )
+        .await;
+        // The crash, stood in for by the round counter's write failing after the items went in.
+        sqlx::query(
+            "CREATE TRIGGER die_opening_the_round BEFORE UPDATE OF round ON jobs
+             BEGIN SELECT RAISE(ABORT, 'simulated crash'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert!(reconcile_nodes(&state, &job).await.is_err());
+        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_items WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            items, 2,
+            "the new round's items outlived the round that failed to open"
+        );
+
+        sqlx::query("DROP TRIGGER die_opening_the_round")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+        let placed: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT ordinal, round FROM job_items WHERE job_id = ? ORDER BY ordinal",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            placed,
+            vec![(0, 0), (1, 0), (2, 1)],
+            "the round was opened twice"
+        );
+        assert_eq!(round_counters(&pool, job_id).await.0, 1);
     }
 
     /// The whole reason `jobs.replan_run_id` exists, stated as the loop it prevents.
@@ -6822,10 +6930,11 @@ mod tests {
         ));
     }
 
-    /// One of the two waits, and it is always the same one.
+    /// One of the two waits on the other's SLOT, and it is always the same one.
     ///
     /// The asymmetry is the deadlock argument, not a detail of the query: the low id is never parked
-    /// by this brake, so of any two excluded jobs at least one is always free to run. Were the
+    /// for a slot — only for a node already in flight, which ends by itself (the test below) — so
+    /// of any two excluded jobs at least one is always free to run. Were the
     /// tie-break decided at read time, two reads that disagreed would park both — and two jobs
     /// somebody asked to SERIALISE, stopped forever on each other, is the one failure this feature
     /// must not be able to produce.
@@ -6855,11 +6964,74 @@ mod tests {
             "the reason has to name what to wait for, got: {detail}"
         );
 
-        // The other side of the same rule, at the same moment: never parked by it.
+        // The other side of the same rule, at the same moment: never parked by a partner that is
+        // merely live. Both hold slots for their whole lives, so a slot-wait would park both.
         let low_row = load_job(&pool, low).await.unwrap();
         assert!(matches!(
             brakes(&state, &low_row, Utc::now()).await,
             Brake::Go
+        ));
+    }
+
+    /// The other start order. The higher job got going first and has a node running when the lower
+    /// one comes to start its own.
+    ///
+    /// Waiting on the slot alone held the exclusion in one order only: the low side never looked,
+    /// so it started a node beside the high side's running one — the very overlap the rule forbids.
+    /// The low side waits for a node IN FLIGHT and never for a slot, which keeps the deadlock
+    /// argument: a running node ends by itself, and the high side cannot start another while the
+    /// low one lives.
+    #[tokio::test]
+    async fn the_lower_job_waits_for_a_node_its_partner_already_has_running() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        set_budget(&pool, None, None).await;
+        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        exclude(&pool, "project-a", low, high).await;
+        for job in [low, high] {
+            crate::execution::concurrency::claim(
+                &pool,
+                "project-a",
+                crate::execution::worktree::Owner::Job(job),
+            )
+            .await
+            .unwrap();
+        }
+        let node = seed_node(&pool, high, "implement", "running").await;
+
+        let low_row = load_job(&pool, low).await.unwrap();
+        let Brake::Park { reason, detail } = brakes(&state, &low_row, Utc::now()).await else {
+            panic!("the lower job started a node beside its excluded partner's running one");
+        };
+        assert_eq!(reason, "excluded");
+        assert!(detail.contains(&format!("job {high}")), "got: {detail}");
+
+        // A node paused on a person is still a node in the tree.
+        sqlx::query("UPDATE runs SET status = 'awaiting_approval' WHERE id = ?")
+            .bind(node)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            brakes(&state, &low_row, Utc::now()).await,
+            Brake::Park { .. }
+        ));
+
+        // The node lands: the lower job goes, and the higher one is the one that now waits.
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(node)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            brakes(&state, &low_row, Utc::now()).await,
+            Brake::Go
+        ));
+        let high_row = load_job(&pool, high).await.unwrap();
+        assert!(matches!(
+            brakes(&state, &high_row, Utc::now()).await,
+            Brake::Park { .. }
         ));
     }
 
@@ -7181,6 +7353,57 @@ mod tests {
 
         assert_eq!(job_status(&pool, job_id).await, STATUS_EXPIRED);
         assert!(feed_kinds(&pool).await.contains(&"job_expired".to_owned()));
+    }
+
+    /// The life ceiling stops the node in flight, not only the job.
+    ///
+    /// A retired job is never driven again, so a node left running past the ceiling would keep
+    /// editing a tree nobody drives, with nothing left to stop it. The ceiling takes the node the
+    /// way a cancel does, and the item it held reads `cancelled` rather than `running` forever.
+    #[tokio::test]
+    async fn the_life_ceiling_stops_the_node_in_flight() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_items(&pool, job_id, &["running"]).await;
+        let run_id = seed_node(&pool, job_id, "implement", "running").await;
+        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ?")
+            .bind(run_id)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let task = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(60)));
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        let started = Utc::now() - MAX_JOB_LIFETIME - chrono::Duration::minutes(1);
+        sqlx::query("UPDATE jobs SET created_at = ? WHERE id = ?")
+            .bind(started.to_rfc3339())
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        job_tick(&state, Utc::now()).await;
+
+        assert_eq!(job_status(&pool, job_id).await, STATUS_EXPIRED);
+        let run_status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_status, STATUS_CANCELLED,
+            "the node outlived the job the ceiling retired"
+        );
+        assert!(
+            !state.run_handles.lock().unwrap().contains_key(&run_id),
+            "the node's task was never stopped"
+        );
+        assert_eq!(item_statuses(&pool, job_id).await, vec![STATUS_CANCELLED]);
     }
 
     /// The life ceiling asks who commissioned the job, and answers with a different number.
@@ -9825,6 +10048,83 @@ tests:
         );
     }
 
+    /// A plan node created while its job was being cancelled is cancelled too.
+    ///
+    /// The job is read live, the cancel lands, and only then does the node's run exist — so the
+    /// cancel's own sweep never saw it. An implement or review node catches this through the status
+    /// write it makes anyway; a spec, plan or replan node makes none, and used to be left running on
+    /// a job nothing drives any more.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_plan_node_started_as_its_job_was_cancelled_is_cancelled() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-plan-cancel-", "git --version");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let pool = test_pool().await;
+        let (state, runner) = test_state_with_runner(pool.clone()).await;
+        // Slow enough that the node is still in flight when the pass decides about it, so a
+        // `completed` cannot stand in for the cancel this test is about.
+        *runner.delay.lock().unwrap() = Some(std::time::Duration::from_secs(60));
+        let state = with_home(state, &_container);
+
+        let job_id = seed_job_in(
+            &pool,
+            "project-a",
+            "planning",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        let owner = crate::execution::worktree::Owner::Job(job_id);
+        let info = crate::execution::worktree::create(&repo, owner)
+            .await
+            .expect("provision the job's worktree");
+        crate::execution::worktree::record(
+            &pool,
+            owner,
+            "project-a",
+            &repo.to_string_lossy(),
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job's worktree");
+
+        // Read live; the cancel lands after the read and before the node exists.
+        let job = load_job(&pool, job_id).await.unwrap();
+        sqlx::query("UPDATE jobs SET status = ? WHERE id = ?")
+            .bind(STATUS_CANCELLED)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        spawn_node(
+            &state,
+            &job,
+            "plan",
+            "plan the job".to_owned(),
+            None,
+            (info.path.clone(), info.branch.clone()),
+            NoRoom::Park,
+        )
+        .await;
+
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM runs WHERE job_id = ? AND stage = 'plan'")
+                .bind(job_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses,
+            vec![STATUS_CANCELLED.to_owned()],
+            "a plan node was left running on a cancelled job"
+        );
+    }
+
     // ---- which gate an item takes, driven through `gate_item_with` -----------------------------
 
     /// A job whose project root and worktree are one real repository carrying a test map, cut at
@@ -10161,5 +10461,84 @@ tests:
             gate_status, None,
             "nothing was measured, so no gate verdict is recorded"
         );
+    }
+
+    // ---- a job still being provisioned --------------------------------------------------------
+
+    /// `start` inserts the row live before `git worktree add` runs, so a tick can find a job that
+    /// has no worktree YET. That job is being born, not broken: the pass waits for it.
+    #[tokio::test]
+    async fn a_job_still_being_provisioned_is_not_failed_for_having_no_worktree() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert_eq!(advance(&state, &job, Utc::now()).await, Step::Stopped);
+
+        assert_eq!(
+            job_status(&pool, job_id).await,
+            "planning",
+            "a tick inside `start`'s window failed a job whose worktree was still being made"
+        );
+        assert!(!feed_kinds(&pool).await.contains(&"job_failed".to_owned()));
+        assert!(stages_run(&pool, job_id).await.is_empty());
+    }
+
+    /// The grace is a grace and not a pass: a job that has gone without a worktree for longer than
+    /// any `start` takes is one whose start is gone, and it is failed so its slot comes back.
+    #[tokio::test]
+    async fn a_job_with_no_worktree_past_the_provisioning_grace_is_failed() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        let later = Utc::now() + PROVISIONING_GRACE + chrono::Duration::minutes(1);
+        assert_eq!(advance(&state, &job, later).await, Step::Stopped);
+
+        assert_eq!(job_status(&pool, job_id).await, "failed");
+        assert!(feed_kinds(&pool).await.contains(&"job_failed".to_owned()));
+    }
+
+    /// A worktree read that errors is a database hiccup, not a fact about the job. The pass is
+    /// skipped and the job is left live for the next tick — even past the grace, so this is the
+    /// error arm being measured and not the grace.
+    #[tokio::test]
+    async fn a_worktree_that_cannot_be_read_skips_the_pass_rather_than_failing_the_job() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        // Nothing REFERENCES worktrees (migrations 0044, 0096), so this drops no other row; every
+        // read of it from here on is an error.
+        sqlx::query("DROP TABLE worktrees")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        let later = Utc::now() + PROVISIONING_GRACE + chrono::Duration::minutes(1);
+        assert_eq!(advance(&state, &job, later).await, Step::Stopped);
+
+        assert_eq!(
+            job_status(&pool, job_id).await,
+            "planning",
+            "a failed read of the worktree table failed the job"
+        );
+        assert!(!feed_kinds(&pool).await.contains(&"job_failed".to_owned()));
+    }
+
+    /// PURE: the window itself, and what an unreadable timestamp falls back to.
+    #[test]
+    fn still_provisioning_is_the_grace_after_creation_and_no_longer() {
+        let created = Utc::now();
+        let stamp = created.to_rfc3339();
+        assert!(still_provisioning(&stamp, created));
+        assert!(still_provisioning(&stamp, created + PROVISIONING_GRACE));
+        assert!(!still_provisioning(
+            &stamp,
+            created + PROVISIONING_GRACE + chrono::Duration::seconds(1)
+        ));
+        assert!(!still_provisioning("not a timestamp", created));
     }
 }

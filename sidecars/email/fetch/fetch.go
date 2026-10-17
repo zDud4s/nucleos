@@ -62,7 +62,7 @@ func handler(cfg config.Config) http.HandlerFunc {
 			return
 		}
 
-		attachment, content, err := read(cfg, uid, position)
+		attachment, content, err := read(cfg, uid, expectedValidity(r), position)
 		serveAttachment(w, uid, position, attachment, content, err)
 	}
 }
@@ -99,7 +99,7 @@ func serveAttachment(w http.ResponseWriter, uid imapv2.UID, position int, attach
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "attachment_corrupt"})
 		return
 	}
-	if errors.Is(err, extract.ErrNoSuchAttachment) {
+	if errors.Is(err, extract.ErrNoSuchAttachment) || errors.Is(err, errStaleUID) {
 		// The stored description and the live message disagree — the message was replaced or
 		// removed. A 404 rather than an empty file, which a caller would happily save.
 		http.Error(w, "no attachment at that position", http.StatusNotFound)
@@ -167,7 +167,11 @@ func allHandler(cfg config.Config) http.HandlerFunc {
 			return
 		}
 
-		described, contents, err := readAll(cfg, uid)
+		described, contents, err := readAll(cfg, uid, expectedValidity(r))
+		if errors.Is(err, errStaleUID) {
+			http.Error(w, "the message is not at that uid any more", http.StatusNotFound)
+			return
+		}
 		if errors.Is(err, extract.ErrAttachmentCorrupt) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnprocessableEntity)
@@ -189,15 +193,19 @@ func allHandler(cfg config.Config) http.HandlerFunc {
 	}
 }
 
-func readAll(cfg config.Config, uid imapv2.UID) ([]daemon.Attachment, map[int][]byte, error) {
+func readAll(cfg config.Config, uid imapv2.UID, validity uint32) ([]daemon.Attachment, map[int][]byte, error) {
 	conn, err := imap.Dial(cfg.Addr(), cfg.Username, cfg.Password)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer conn.Close()
 
-	if _, err := conn.Select(cfg.Mailbox); err != nil {
+	selected, err := conn.Select(cfg.Mailbox)
+	if err != nil {
 		return nil, nil, err
+	}
+	if !validityMatches(validity, selected) {
+		return nil, nil, errStaleUID
 	}
 	raw, err := conn.Fetch(uid)
 	if err != nil {
@@ -256,15 +264,19 @@ func requestUID(r *http.Request) (imapv2.UID, error) {
 // A TLS handshake per download is the cheaper mistake: an IMAP connection carries protocol state
 // per command, and sharing one between a background poll and an interactive request would
 // interleave two conversations on one socket.
-func read(cfg config.Config, uid imapv2.UID, position int) (attachment, []byte, error) {
+func read(cfg config.Config, uid imapv2.UID, validity uint32, position int) (attachment, []byte, error) {
 	conn, err := imap.Dial(cfg.Addr(), cfg.Username, cfg.Password)
 	if err != nil {
 		return attachment{}, nil, err
 	}
 	defer conn.Close()
 
-	if _, err := conn.Select(cfg.Mailbox); err != nil {
+	selected, err := conn.Select(cfg.Mailbox)
+	if err != nil {
 		return attachment{}, nil, err
+	}
+	if !validityMatches(validity, selected) {
+		return attachment{}, nil, errStaleUID
 	}
 	raw, err := conn.Fetch(uid)
 	if err != nil {
@@ -283,4 +295,23 @@ func read(cfg config.Config, uid imapv2.UID, position int) (attachment, []byte, 
 type attachment struct {
 	Filename  string
 	SizeBytes int64
+}
+
+// errStaleUID means the mailbox's UIDVALIDITY is no longer the one the daemon stored the message
+// under, so the uid may now name a different message. Answered as a 404, never with that message.
+var errStaleUID = errors.New("uidvalidity changed")
+
+// expectedValidity is the UIDVALIDITY the caller stored the message under, or 0 when it sent none
+// (an older daemon), which skips the check.
+func expectedValidity(r *http.Request) uint32 {
+	value, err := strconv.ParseUint(r.URL.Query().Get("uidvalidity"), 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(value)
+}
+
+// validityMatches is true when no validity was asked for or the selected mailbox still has it.
+func validityMatches(expected, selected uint32) bool {
+	return expected == 0 || expected == selected
 }

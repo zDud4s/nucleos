@@ -170,10 +170,21 @@ export function useListening(handlers: ListeningHandlers): Listening {
    * there would read whatever it was when the callback was built, which is `null` forever.
    */
   const usingRef = useRef<"silero" | "energy" | null>(null);
+  /**
+   * Bumped by every `close`. An `open` is async (model load, permission prompt) and remembers the
+   * generation it began in: if that is no longer current when an await returns, the person has left
+   * and whatever it just acquired has no owner, so it is released instead of kept.
+   */
+  const generationRef = useRef(0);
+  /** The `open` in flight, so a second call joins it instead of acquiring a second microphone. */
+  const openingRef = useRef<Promise<boolean> | null>(null);
 
   const close = useCallback(() => {
     const live = liveRef.current;
     liveRef.current = null;
+    generationRef.current += 1;
+    // Cancelled, so an `open` after this one starts afresh and does not join the doomed attempt.
+    openingRef.current = null;
     recordingRef.current = null;
     prerollRef.current = [];
     gateRef.current = IDLE_GATE;
@@ -240,6 +251,9 @@ export function useListening(handlers: ListeningHandlers): Listening {
     // the lag would grow for as long as the runtime stayed slow, and never recover.
     if (pendingRef.current > 3) return;
 
+    // A frame scheduled before a `close` is not counted any more: `close` zeroed the counter, and its
+    // `finally` decrementing anyway would take it negative and defeat the drop guard above.
+    const generation = generationRef.current;
     pendingRef.current += 1;
     chainRef.current = chainRef.current
       .then(() => probe.probability(frame))
@@ -248,12 +262,14 @@ export function useListening(handlers: ListeningHandlers): Listening {
       // frame presents as a gate that never opens, which is what the fallback above is for.
       .catch(() => undefined)
       .finally(() => {
-        pendingRef.current -= 1;
+        if (generation === generationRef.current) pendingRef.current -= 1;
       });
   }, []);
 
-  const open = useCallback(
-    async (constraints: MediaTrackConstraints | boolean = true): Promise<boolean> => {
+  const openOnce = useCallback(
+    async (constraints: MediaTrackConstraints | boolean): Promise<boolean> => {
+      const generation = generationRef.current;
+      let stream: MediaStream | null = null;
       try {
         // Loaded once per process and kept. 13 MB of WebAssembly and a 2.3 MB model, so paying for
         // it on every open would put a second of dead air at the front of every session.
@@ -263,7 +279,12 @@ export function useListening(handlers: ListeningHandlers): Listening {
           usingRef.current = session === null ? "energy" : "silero";
           handlersRef.current.onDetector?.(usingRef.current, why);
         }
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: constraints });
+        if (generation !== generationRef.current) return false;
+        stream = await navigator.mediaDevices.getUserMedia({ audio: constraints });
+        if (generation !== generationRef.current) {
+          for (const track of stream.getTracks()) track.stop();
+          return false;
+        }
         const AudioContextCtor =
           window.AudioContext ??
           (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -299,11 +320,26 @@ export function useListening(handlers: ListeningHandlers): Listening {
         liveRef.current = { stream, context, source, processor, sink };
         return true;
       } catch {
+        // Past `getUserMedia` the device is already on; failing to build the graph must not leave it so.
+        if (stream !== null) for (const track of stream.getTracks()) track.stop();
         handlersRef.current.onTrouble("the microphone could not be opened");
         return false;
       }
     },
     [onAudioFrame],
+  );
+
+  const open = useCallback(
+    (constraints: MediaTrackConstraints | boolean = true): Promise<boolean> => {
+      if (liveRef.current !== null) return Promise.resolve(true);
+      if (openingRef.current !== null) return openingRef.current;
+      const opening = openOnce(constraints).finally(() => {
+        if (openingRef.current === opening) openingRef.current = null;
+      });
+      openingRef.current = opening;
+      return opening;
+    },
+    [openOnce],
   );
 
   const record = useCallback(() => {

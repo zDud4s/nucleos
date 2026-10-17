@@ -154,7 +154,7 @@ fn resolve(local: NaiveDateTime, tz: Tz) -> Option<DateTime<Utc>> {
         LocalResult::Ambiguous(first, _second) => Some(first.with_timezone(&Utc)),
         LocalResult::None => {
             for minute in 1..=MAX_GAP_MINUTES {
-                let shifted = local + Duration::minutes(minute);
+                let shifted = add_minutes(local, minute)?;
                 match tz.from_local_datetime(&shifted) {
                     LocalResult::Single(at) => return Some(at.with_timezone(&Utc)),
                     LocalResult::Ambiguous(first, _) => return Some(first.with_timezone(&Utc)),
@@ -166,8 +166,21 @@ fn resolve(local: NaiveDateTime, tz: Tz) -> Option<DateTime<Utc>> {
     }
 }
 
-fn week_start(date: NaiveDate) -> NaiveDate {
-    date - Duration::days(date.weekday().num_days_from_monday() as i64)
+/// `date` plus `days`, or `None` when the result is outside chrono's calendar.
+///
+/// A stored row can carry any interval, and `date + Duration::days(n)` panics on overflow — which
+/// would take the busy check, and the notifier loop that calls it, down with it. Every date step in
+/// this file goes through here so a bad row yields no occurrences instead.
+fn add_days(date: NaiveDate, days: i64) -> Option<NaiveDate> {
+    date.checked_add_signed(Duration::try_days(days)?)
+}
+
+fn add_minutes(local: NaiveDateTime, minutes: i64) -> Option<NaiveDateTime> {
+    local.checked_add_signed(Duration::try_minutes(minutes)?)
+}
+
+fn week_start(date: NaiveDate) -> Option<NaiveDate> {
+    add_days(date, -(date.weekday().num_days_from_monday() as i64))
 }
 
 /// Adds whole months, keeping the day of month.
@@ -176,14 +189,14 @@ fn week_start(date: NaiveDate) -> NaiveDate {
 /// is the feature: the month is skipped, which is what every calendar does and what a person
 /// means by "monthly on the 31st".
 fn add_months(date: NaiveDate, months: i64) -> Option<NaiveDate> {
-    let total = date.year() as i64 * 12 + date.month0() as i64 + months;
+    let total = (date.year() as i64 * 12 + date.month0() as i64).checked_add(months)?;
     let year = i32::try_from(total.div_euclid(12)).ok()?;
     let month0 = total.rem_euclid(12) as u32;
     NaiveDate::from_ymd_opt(year, month0 + 1, date.day())
 }
 
 fn first_of_month(date: NaiveDate, months: i64) -> Option<NaiveDate> {
-    let total = date.year() as i64 * 12 + date.month0() as i64 + months;
+    let total = (date.year() as i64 * 12 + date.month0() as i64).checked_add(months)?;
     let year = i32::try_from(total.div_euclid(12)).ok()?;
     let month0 = total.rem_euclid(12) as u32;
     NaiveDate::from_ymd_opt(year, month0 + 1, 1)
@@ -196,22 +209,21 @@ fn nth_weekday(anchor: NaiveDate, weekday: Weekday, nth: i8) -> Option<NaiveDate
     let offset = (7 + weekday.num_days_from_monday() as i64
         - first.weekday().num_days_from_monday() as i64)
         % 7;
-    let first_match = first + Duration::days(offset);
+    let first_match = add_days(first, offset)?;
 
     if nth > 0 {
-        let candidate = first_match + Duration::weeks(i64::from(nth) - 1);
+        let candidate = add_days(first_match, (i64::from(nth) - 1) * 7)?;
         (candidate.month() == anchor.month()).then_some(candidate)
     } else if nth < 0 {
         let mut candidate = first_match;
-        loop {
-            let next = candidate + Duration::weeks(1);
+        while let Some(next) = add_days(candidate, 7) {
             if next.month() != anchor.month() {
                 break;
             }
             candidate = next;
         }
         // `-1` is the last, `-2` the one before it.
-        let candidate = candidate + Duration::weeks(i64::from(nth) + 1);
+        let candidate = add_days(candidate, (i64::from(nth) + 1) * 7)?;
         (candidate.month() == anchor.month()).then_some(candidate)
     } else {
         None
@@ -236,9 +248,15 @@ fn block_occurrences(rule: &Rule, block: i64) -> Vec<NaiveDateTime> {
                 vec![]
             }
         }
-        Some(Freq::Daily) => vec![start_date + Duration::days(block * interval)],
+        Some(Freq::Daily) => add_days(start_date, block.saturating_mul(interval))
+            .into_iter()
+            .collect(),
         Some(Freq::Weekly) => {
-            let base = week_start(start_date) + Duration::weeks(block * interval);
+            let Some(base) = week_start(start_date)
+                .and_then(|week| add_days(week, block.saturating_mul(interval).saturating_mul(7)))
+            else {
+                return vec![];
+            };
             let weekdays: Vec<Weekday> = if rule.byday.is_empty() {
                 vec![start_date.weekday()]
             } else {
@@ -251,7 +269,7 @@ fn block_occurrences(rule: &Rule, block: i64) -> Vec<NaiveDateTime> {
             };
             let mut dates: Vec<NaiveDate> = weekdays
                 .into_iter()
-                .map(|weekday| base + Duration::days(weekday.num_days_from_monday() as i64))
+                .filter_map(|weekday| add_days(base, weekday.num_days_from_monday() as i64))
                 .collect();
             dates.sort_unstable();
             dates.dedup();
@@ -267,11 +285,12 @@ fn block_occurrences(rule: &Rule, block: i64) -> Vec<NaiveDateTime> {
                 })
                 .collect();
             if positional.is_empty() {
-                add_months(start_date, block * interval)
+                add_months(start_date, block.saturating_mul(interval))
                     .into_iter()
                     .collect()
             } else {
-                let Some(anchor) = first_of_month(start_date, block * interval) else {
+                let Some(anchor) = first_of_month(start_date, block.saturating_mul(interval))
+                else {
                     return vec![];
                 };
                 let mut dates: Vec<NaiveDate> = positional
@@ -342,7 +361,13 @@ pub fn expand(
             let Some(start) = resolve(local_start, rule.tz) else {
                 continue;
             };
-            let end = start + Duration::minutes(duration.max(0));
+            // An absurd stored duration is a row to skip, not a panic: `Duration::minutes` and `+`
+            // both abort on overflow.
+            let Some(end) = Duration::try_minutes(duration.max(0))
+                .and_then(|length| start.checked_add_signed(length))
+            else {
+                continue;
+            };
 
             if start >= to {
                 // A moved occurrence can land anywhere, so one candidate past the window does not
@@ -873,5 +898,58 @@ mod tests {
     fn a_positional_byday_token_parses_its_index() {
         assert_eq!(parse_byday("TH#3"), vec![ByDay::Nth(Weekday::Thu, 3)]);
         assert_eq!(parse_byday("FR#-1"), vec![ByDay::Nth(Weekday::Fri, -1)]);
+    }
+
+    #[test]
+    fn an_absurd_stored_duration_is_skipped_not_panicked_on() {
+        for minutes in [i64::MAX, i64::MAX / 2, 1 << 60] {
+            let mut huge = rule("2026-08-03T09:00:00", None);
+            huge.duration_minutes = minutes;
+            let found = expand(
+                &huge,
+                &BTreeMap::new(),
+                utc("2026-08-01T00:00:00Z"),
+                utc("2026-08-31T00:00:00Z"),
+            );
+            assert!(found.is_empty(), "duration {minutes} must yield nothing");
+        }
+    }
+
+    #[test]
+    fn an_absurd_stored_interval_expands_without_panicking() {
+        for freq in [Freq::Daily, Freq::Weekly, Freq::Monthly] {
+            for byday in [vec![], vec![ByDay::Nth(Weekday::Mon, 2)]] {
+                let mut huge = rule("2026-08-03T09:00:00", Some(freq));
+                huge.interval = u32::MAX;
+                huge.byday = byday;
+                let found = expand(
+                    &huge,
+                    &BTreeMap::new(),
+                    utc("2026-08-01T00:00:00Z"),
+                    utc("2026-08-31T00:00:00Z"),
+                );
+                // Only the first block can land in the window; the rest are out of range.
+                assert!(found.len() <= 1, "{freq:?} gave {found:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_moved_occurrence_with_an_absurd_duration_is_skipped_not_panicked_on() {
+        let mut exceptions = BTreeMap::new();
+        exceptions.insert(
+            local("2026-08-03T09:00:00"),
+            Exception::Moved {
+                to_local: local("2026-08-04T09:00:00"),
+                duration_minutes: i64::MAX,
+            },
+        );
+        let found = expand(
+            &rule("2026-08-03T09:00:00", None),
+            &exceptions,
+            utc("2026-08-01T00:00:00Z"),
+            utc("2026-08-31T00:00:00Z"),
+        );
+        assert!(found.is_empty());
     }
 }

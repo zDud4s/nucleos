@@ -961,24 +961,8 @@ pub(super) fn spawn_run(
                         // the same guard: losing that CAS means another terminator owns the row,
                         // and it is the owner's business what the run's cost and status are.
                         record_time_approx_cost(&pool, id).await;
-                        Box::pin(spawn_handoff_if_needed(
-                            handoff_state.clone(),
-                            runner.clone(),
-                            id,
-                            project_id.clone(),
-                            spawn_cwd.clone(),
-                            permission,
-                            completion_feed.clone(),
-                            gate_config.clone(),
-                            max_attempts,
-                            tool_policy,
-                            run_timeout,
-                            progress_timeout,
-                            classifier_governs_tools,
-                            model.clone(),
-                            effort.clone(),
-                        ))
-                        .await;
+                        // No context handoff here: a deadline is a brake, and a successor would
+                        // relaunch the work it just stopped (`handoff::ends_in_a_handoff`).
                     }
                     break;
                 }

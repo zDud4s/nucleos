@@ -3,6 +3,7 @@
 package poll
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -93,6 +94,15 @@ func Collect(fetcher Fetcher, uids []imapv2.UID, limit int, extractor Extractor)
 			break
 		}
 		raw, err := fetcher.Fetch(uid)
+		if errors.Is(err, imap.ErrNoMessage) || errors.Is(err, imap.ErrNoBody) {
+			// The server has nothing readable at this uid. Retrying it forever would stall the
+			// cursor behind it, so it is recorded as a skip like any unparseable message.
+			skipped = append(skipped, daemon.Skipped{UID: uint32(uid), Reason: err.Error()})
+			if uint32(uid) > maxExamined {
+				maxExamined = uint32(uid)
+			}
+			continue
+		}
 		if err != nil {
 			// The connection, not the message. Stop here and report only what was read.
 			log.Printf("email: fetch of uid %d failed (%v) — stopping this pass", uid, err)

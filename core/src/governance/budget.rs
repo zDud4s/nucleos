@@ -503,13 +503,22 @@ pub async fn job_spend(pool: &SqlitePool, job_id: i64, now: DateTime<Utc>) -> sq
 }
 
 /// Total autonomous spend in the current budget window (calendar-anchored in UTC by the configured period).
+///
+/// A run counts if it was still spending when the window opened, by the same rule and for the same
+/// reason as `hourly_spend`: `created_at >= since` left a run begun before midnight and still going
+/// after it out of the new day altogether. A known cost counts whole, an approximated one for its
+/// time inside the window.
 pub async fn window_spend(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<f64> {
     let cfg = load_budget_config(pool).await?;
     let since = window_start(cfg.period, now);
     let rows: Vec<SpendRow> = autonomous_rows(pool)
         .await?
         .into_iter()
-        .filter(|row| row.created_at >= since)
+        .filter(|row| overlaps_window(row, since))
+        .map(|row| SpendRow {
+            created_at: row.created_at.max(since),
+            ..row
+        })
         .collect();
     Ok(compute_spend(&rows, now, &cfg)
         + judge_spend(pool, Some(since), None, JudgeSpendScope::All).await?)
@@ -1280,6 +1289,61 @@ mod tests {
 
         approx(window_spend(&pool, now).await.unwrap(), 0.0); // before today's UTC midnight -> excluded
         approx(hourly_spend(&pool, now).await.unwrap(), 0.7); // within the trailing hour -> included
+    }
+
+    /// The window had the bug the hourly cap had: `created_at >= since` asks when a run STARTED,
+    /// so a run begun at 23:00 and still spending at 01:00 counted nothing toward the new day — the
+    /// long expensive run walking through the ceiling on a technicality. Same answer as the hourly
+    /// cap: a run counts in a window it had not finished before, a known cost whole, an
+    /// approximated one for its time inside the window.
+    #[tokio::test]
+    async fn window_spend_sees_a_run_that_straddles_the_window_start() {
+        let pool = test_pool().await;
+        set_budget_config(
+            &pool,
+            &BudgetConfig {
+                limit_usd: None,
+                period: BudgetPeriod::Daily,
+                hourly_limit_usd: None,
+                per_run_reserve_usd: 0.0,
+                time_cost_per_hour_usd: 3.0,
+            },
+        )
+        .await
+        .unwrap();
+        let now = ts("2026-07-20T01:00:00Z");
+        // Known cost, started yesterday, still running.
+        insert_run(
+            &pool,
+            "worktree",
+            Some("known"),
+            Some(40.0),
+            "2026-07-19T23:00:00Z",
+            None,
+        )
+        .await;
+        // Unknown cost, started yesterday, still running: only its hour inside today counts.
+        insert_run(
+            &pool,
+            "worktree",
+            Some("approximated"),
+            None,
+            "2026-07-19T22:00:00Z",
+            None,
+        )
+        .await;
+        // Finished before midnight: yesterday's spend, not today's.
+        insert_run(
+            &pool,
+            "worktree",
+            Some("done"),
+            Some(9.0),
+            "2026-07-19T20:00:00Z",
+            Some("2026-07-19T21:00:00Z"),
+        )
+        .await;
+
+        approx(window_spend(&pool, now).await.unwrap(), 43.0);
     }
 
     #[tokio::test]

@@ -142,8 +142,10 @@ pub(super) fn validate_payload(kind: &str, payload: &serde_json::Value) -> Resul
             let minutes = payload
                 .get("duration_minutes")
                 .and_then(serde_json::Value::as_i64)
-                .filter(|minutes| *minutes > 0)
-                .ok_or("a `calendar_event` needs a `duration_minutes` above zero")?;
+                .filter(|minutes| crate::integrations::calendar::duration_in_bounds(*minutes))
+                .ok_or(
+                    "a `calendar_event` needs a `duration_minutes` above zero and at most 31 days",
+                )?;
             // Both parsed HERE and stored as strings, so an unparseable date is the agent's problem
             // and not a `failed` row a human approved in good faith.
             chrono::NaiveDateTime::parse_from_str(
@@ -336,11 +338,19 @@ async fn open_actions_of(pool: &sqlx::SqlitePool, team_id: &str) -> sqlx::Result
 /// `proposal_id IS NULL` is an `allow` action, which was decided when it was written. Otherwise the
 /// proposal has to read `approved`: `rejected` is handled by `refuse_action`, and `pending` means
 /// nobody has answered.
-const DUE_ACTIONS_SQL: &str =
+///
+/// An action of a run that has ended in ANY way is never carried out. The state list is spelled out
+/// because sqlx refuses a query built at runtime; `the_due_actions_query_skips_every_terminal_state`
+/// holds it equal to `TERMINAL_STATES`.
+pub(super) const DUE_ACTIONS_SQL: &str =
     "SELECT id, team_run_id, ordinal, kind, payload, why, proposal_id, state,
                                       error, created_at, executed_at
                                  FROM team_actions
                                 WHERE state = 'pending'
+                                  AND team_run_id NOT IN (SELECT id FROM team_runs
+                                                           WHERE state IN ('done', 'stopped',
+                                                                           'expired', 'failed',
+                                                                           'cancelled'))
                                   AND (proposal_id IS NULL
                                        OR proposal_id IN (SELECT id FROM proposals
                                                            WHERE status = 'approved'))
@@ -484,6 +494,9 @@ async fn perform(state: &AppState, action: &TeamAction) -> Result<(), String> {
                 .get("duration_minutes")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
+            if !crate::integrations::calendar::duration_in_bounds(minutes) {
+                return Err("the stored duration is not one the calendar accepts".to_owned());
+            }
             crate::integrations::calendar::insert_event(
                 &state.pool,
                 &text("title"),

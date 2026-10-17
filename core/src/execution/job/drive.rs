@@ -33,6 +33,26 @@ pub const MAX_JOB_LIFETIME: chrono::Duration = chrono::Duration::hours(4);
 /// job with no allowance keeps the four hours and is never left with no bound at all.
 pub const COMMISSIONED_JOB_LIFETIME: chrono::Duration = chrono::Duration::hours(12);
 
+/// How long a live job may have no worktree on record before a pass calls it broken.
+///
+/// `start` writes the row live, claims the slot, runs `git worktree add` and records the tree, in
+/// that order; until the last step lands the job has nothing to run in, and that is not a fault.
+/// Generous on purpose: a `git worktree add` on a large repository on a busy disk takes minutes,
+/// and failing early costs a job somebody asked for while waiting costs a few idle ticks. Past
+/// it, the start that should have recorded the tree is gone — a request future dropped mid-start,
+/// say — and the job is failed as before, which is what gives its slot back.
+pub(super) const PROVISIONING_GRACE: chrono::Duration = chrono::Duration::minutes(10);
+
+/// PURE: whether a job with no worktree on record may still be inside `start`.
+///
+/// An unreadable `created_at` answers `false`, the behaviour from before the grace existed: a job
+/// that cannot say how old it is gets no open-ended pass to hold its slot.
+pub(super) fn still_provisioning(created_at: &str, now: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(created_at)
+        .map(|created| now.signed_duration_since(created.with_timezone(&Utc)) <= PROVISIONING_GRACE)
+        .unwrap_or(false)
+}
+
 /// How many moves one pass will make for a single job.
 ///
 /// A pass stops as soon as it starts a node, so the only steps that chain are the ones that cost no
@@ -352,6 +372,11 @@ pub(super) async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) 
         Brake::Go => {}
         Brake::Park { reason, detail } => return park(state, job, reason, &detail).await,
         Brake::Stop { detail } => {
+            // A batch can still have nodes in flight here; a retired job is never driven again,
+            // so nothing else would stop them.
+            if let Err(error) = stop_nodes_in_flight(state, job.id).await {
+                tracing::warn!(job_id = job.id, %error, "could not stop a stopped job's nodes");
+            }
             let _ = retire(pool, job.id, STATUS_STOPPED).await;
             say(
                 pool,
@@ -376,7 +401,24 @@ pub(super) async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) 
         }
     }
 
-    let Ok(Some(worktree)) = job_worktree(pool, job.id).await else {
+    // Three answers, and only one of them is a broken job. `start` inserts the row live BEFORE it
+    // runs `git worktree add` (the tree is keyed on the job's id, so it cannot come first), and a
+    // tick landing in that window used to fail a job that was still being born. A read that errored
+    // is a database hiccup rather than a fact about the job: this pass is skipped, never the job.
+    let worktree = match job_worktree(pool, job.id).await {
+        Ok(Some(worktree)) => Some(worktree),
+        Err(error) => {
+            tracing::warn!(
+                job_id = job.id,
+                %error,
+                "could not read a job's worktree; skipping this pass"
+            );
+            return Step::Stopped;
+        }
+        Ok(None) if still_provisioning(&job.created_at, now) => return Step::Stopped,
+        Ok(None) => None,
+    };
+    let Some(worktree) = worktree else {
         let _ = finish(pool, job.id, Outcome::Failed).await;
         say(
             pool,
@@ -654,6 +696,11 @@ pub(super) async fn drive(state: &AppState, job: JobRow, now: DateTime<Utc>) {
     if let Ok(started) = DateTime::parse_from_rfc3339(&job.created_at)
         && now.signed_duration_since(started.with_timezone(&Utc)) > ceiling
     {
+        // The node in flight goes first, as a cancel's does: the job is never driven again once
+        // it is retired, so a node left running would work on with nobody to stop it.
+        if let Err(error) = stop_nodes_in_flight(state, job.id).await {
+            tracing::warn!(job_id = job.id, %error, "could not stop an expired job's nodes");
+        }
         let _ = retire(pool, job.id, STATUS_EXPIRED).await;
         say(
             pool,

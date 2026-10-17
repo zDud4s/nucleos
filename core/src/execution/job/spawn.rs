@@ -463,13 +463,17 @@ pub(super) async fn spawn_node(
             // Whether the job was still live to record the node against. `None` is a write that
             // failed, which says nothing about the job and is left alone as before.
             let still_live = if let Some(ItemClaim { ordinal, .. }) = item {
-                let _ =
+                if let Err(error) =
                     sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = ?")
                         .bind(run_id)
                         .bind(job.id)
                         .bind(ordinal as i64)
                         .execute(pool)
-                        .await;
+                        .await
+                {
+                    // Said out loud: an item that does not name its node is judged without it.
+                    tracing::warn!(job_id = job.id, run_id, ordinal, %error, "could not record a node on its item");
+                }
                 // Denormalised on purpose: the item statuses are what a resume actually reads, and
                 // this is here so a row nobody joins does not read as a lie.
                 sqlx::query(concat!(
@@ -486,7 +490,18 @@ pub(super) async fn spawn_node(
             } else if stage == "review" {
                 set_live_status(pool, job.id, "reviewing").await.ok()
             } else {
-                None
+                // A spec, plan or replan node moves no status of its own, so it only READS whether
+                // the job is still live. It used to answer `None` here, and a cancel that landed
+                // while one of these nodes was being created left it running on a dead job.
+                sqlx::query_scalar::<_, i64>(concat!(
+                    "SELECT COUNT(*) FROM jobs WHERE id = ? AND status IN ",
+                    live_statuses_sql!()
+                ))
+                .bind(job.id)
+                .fetch_one(pool)
+                .await
+                .ok()
+                .map(|live| live > 0)
             };
             if still_live == Some(false) {
                 // The job ended while this node was being created — a cancel that swept the job's

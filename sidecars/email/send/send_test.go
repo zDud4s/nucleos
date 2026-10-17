@@ -88,7 +88,7 @@ func TestMessageFramingAndTLSRequirement(t *testing.T) {
 		}
 		text := string(source)
 
-		if !strings.Contains(text, "tls.Dial(") {
+		if !strings.Contains(text, "tls.Dial(") && !strings.Contains(text, "tls.DialWithDialer(") {
 			t.Error("the connection must be opened with tls.Dial: implicit TLS, no negotiation to downgrade")
 		}
 		if strings.Contains(text, "smtp.Dial(") {

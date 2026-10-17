@@ -15202,6 +15202,44 @@ mod tests {
         );
     }
 
+    /// An edit to anything a conversation's process was spawned with stops that process, so an
+    /// answer it begins on its own between turns cannot go on with the reach the owner just removed.
+    /// A rename touches nothing it was spawned with and leaves it alone.
+    #[tokio::test]
+    async fn editing_what_a_process_was_spawned_with_stops_the_process_a_conversation_kept() {
+        let state = test_state().await;
+        for body in [
+            r#"{"denied_tools":["Bash"]}"#,
+            r#"{"extra_dirs":null}"#,
+            r#"{"system_prompt":"be brief"}"#,
+            r#"{"agents":null}"#,
+            r#"{"turn_budget_usd":1.0}"#,
+            r#"{"fallback_model":null}"#,
+        ] {
+            let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+                .await
+                .unwrap();
+            crate::assistant::keep_a_process_for_testing(&id);
+
+            let status = patch_chat_request(state.clone(), &id, body).await;
+            let kept = crate::assistant::has_a_kept_process(&id);
+            crate::assistant::evict_live(&id);
+
+            assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+            assert!(!kept, "{body} left the process spawned before it standing");
+        }
+
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::assistant::keep_a_process_for_testing(&id);
+        let status = patch_chat_request(state.clone(), &id, r#"{"title":"renamed"}"#).await;
+        let kept = crate::assistant::has_a_kept_process(&id);
+        crate::assistant::evict_live(&id);
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(kept, "a rename stopped the conversation's process");
+    }
+
     #[tokio::test]
     async fn a_conversation_can_be_told_not_to_reach_for_a_tool() {
         let state = test_state().await;
@@ -15482,7 +15520,8 @@ mod tests {
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
-        let ask = crate::hooks::ask_about(&id, 1, "Bash", Some("npm publish".into()));
+        // A run id of its own: the ask registry is process-wide and keeps one question per run.
+        let ask = crate::hooks::ask_about(&id, 7_015_485, "Bash", Some("npm publish".into()));
 
         let (status, body) = chats_request(&state, "GET", "/assistant/chats", None).await;
         crate::hooks::answer_ask(&ask, false);
@@ -18762,6 +18801,63 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(parsed["turn_id"].is_number());
+    }
+
+    /// A run-creating key must not reach Control through the assistant. An orchestrator turn is
+    /// spawned holding the control token, and `origin: "shell"` asks for a rooted turn with Bash —
+    /// either one is the control token by one hop. Asserted against the real router and on the
+    /// rows as well as the status: a refusal that still wrote a turn would have spawned it.
+    #[tokio::test]
+    async fn a_run_creating_key_cannot_start_an_assistant_turn_whatever_origin_it_names() {
+        let state = test_state().await;
+        let run_creating =
+            store_api_token_at_level(&state, "launcher", ApiTokenLevel::RunCreating).await;
+
+        for origin in [Some("shell"), Some("telegram"), None] {
+            let mut body = serde_json::json!({ "chat_id": "chat-1", "text": "hello" });
+            if let Some(origin) = origin {
+                body["origin"] = serde_json::json!(origin);
+            }
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/assistant/message")
+                        .header("Authorization", format!("Bearer {run_creating}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "origin {origin:?} must be refused to a run-creating key"
+            );
+        }
+
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE mode = 'assistant'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(turns, 0, "a refused message must not have started a turn");
+
+        // The control token, on the very same body, still opens a turn exactly as it did.
+        let body = serde_json::json!({ "chat_id": "chat-1", "text": "hello", "origin": "shell" });
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/message")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

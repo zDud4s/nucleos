@@ -615,6 +615,17 @@ function minutes(seconds: number): string {
 
 /* ----------------------------------------------------------------- tail -- */
 
+/** The live well keeps the newest ~2 MB of a run's output; a long run must not grow the page without bound. */
+const TAIL_TEXT_CAP = 2_000_000;
+
+function capTail(text: string): string {
+  if (text.length <= TAIL_TEXT_CAP) return text;
+  const cut = text.slice(text.length - TAIL_TEXT_CAP);
+  // Start on a whole line so the stream reader never sees half an event.
+  const newline = cut.indexOf(String.fromCharCode(10));
+  return newline === -1 ? cut : cut.slice(newline + 1);
+}
+
 /**
  * The live tail, advanced by the daemon's byte cursor.
  *
@@ -644,7 +655,7 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
     if (consumed.current === chunk) return;
     consumed.current = chunk;
     if (chunk.text === "") return;
-    setText((current) => current + chunk.text);
+    setText((current) => capTail(current + chunk.text));
     setSince(chunk.next);
   }, [chunk]);
 

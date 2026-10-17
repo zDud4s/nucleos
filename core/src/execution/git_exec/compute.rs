@@ -26,16 +26,23 @@ pub const INTEGRATION_PREFIX: &str = "integration-";
 /// directory already there, takes the reset path, and computes inside the **first** project's
 /// worktree and object database. Nothing is published — `publish` reads the target ref from the
 /// second project's root and finds a sha the first project's merge never saw — but the failure
-/// arrives late, wearing a message about the branch having moved. Left unfixed here and carried
-/// forward; the fix, when it is wanted, is a name derived from the whole project path rather than
-/// its last component.
+/// arrives late, wearing a message about the branch having moved. Fixed by suffixing the leaf name
+/// with a hash of the whole project path, so two projects named alike no longer share a directory.
 pub fn integration_worktree(project_root: &Path) -> std::path::PathBuf {
     let project = project_root
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unnamed".to_owned());
+    // FNV-1a over the whole path: stable across builds (unlike `DefaultHasher`), so the directory
+    // found after a restart is the one left before it.
+    let hash = project_root
+        .to_string_lossy()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
     crate::execution::worktree::worktree_root(project_root)
-        .join(format!("{INTEGRATION_PREFIX}{project}"))
+        .join(format!("{INTEGRATION_PREFIX}{project}-{:08x}", hash as u32))
 }
 
 /// A merge that exists as an object and has not been published.

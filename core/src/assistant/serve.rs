@@ -42,10 +42,14 @@ pub(super) async fn serve_turn(
         // speaking to; it falls through and is dropped on the way out.
         let known = live.session_id.lock().unwrap().clone();
         // Everything a process fixed when it was spawned and cannot be told to change: where it is
-        // standing, and which conversation it is having. Both are resolved per turn — a fresh context abandons the session — so a process that no
-        // longer matches this turn is not a process this turn may be answered by. It falls through
-        // and is dropped, which stops it, and a new one is started to the turn's own shape.
-        let same_ground = live.cwd == request.cwd && live.permission == request.permission;
+        // standing, which conversation it is having, and the rest of its command line — the tools it
+        // may not reach for, the directories it may, who answers and how. All of it is resolved per
+        // turn — a fresh context abandons the session, a narrowing removes reach — so a process that
+        // no longer matches this turn is not a process this turn may be answered by. It falls
+        // through and is dropped, which stops it, and a new one is started to the turn's own shape.
+        let same_ground = live.cwd == request.cwd
+            && live.permission == request.permission
+            && live.shape == SpawnShape::of(&request);
         let same_conversation = known.is_some() && request.resume_session_id == known;
         if let Some(session_id) = known.filter(|_| same_ground && same_conversation) {
             let _ = session_tx.send(session_id.clone());
@@ -138,6 +142,7 @@ pub(super) async fn start_live_chat(
     // wrong one.
     let started_in = request.cwd.clone();
     let was_permission = request.permission;
+    let shape = SpawnShape::of(&request);
 
     // stdin IS the channel a later turn arrives on, so a process meant to serve more than one has to
     // take that door whether or not this turn carries anything that could only fit through it.
@@ -234,6 +239,7 @@ pub(super) async fn start_live_chat(
         stopped_because,
         permission: was_permission,
         cwd: started_in,
+        shape,
         idle_since: std::time::Instant::now(),
         idle_for: LIVE_IDLE,
         _counted: LiveCount::start(),

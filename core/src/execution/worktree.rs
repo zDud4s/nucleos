@@ -610,7 +610,57 @@ pub async fn prepare_artifacts(worktree: &Path) -> io::Result<PathBuf> {
     Ok(artifacts)
 }
 
+/// Unlinks every symlink and junction inside `root` without following any of them, and returns
+/// how many it removed. `.git` is skipped. Any failure is an error: the caller must not go on to
+/// delete a tree that still holds a link, because on Windows git deletes THROUGH a junction (a
+/// `shell\node_modules` junctioned to the main checkout emptied the main one, 2026-10-11).
+fn unlink_links(root: &Path) -> io::Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        let path = entry.path();
+        if kind.is_symlink() {
+            #[cfg(windows)]
+            let dir_link = {
+                use std::os::windows::fs::FileTypeExt;
+                kind.is_symlink_dir()
+                    // A junction reports as a symlink; only a file symlink needs `remove_file`.
+                    || !kind.is_symlink_file()
+            };
+            #[cfg(windows)]
+            if dir_link {
+                std::fs::remove_dir(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+            #[cfg(not(windows))]
+            std::fs::remove_file(&path)?;
+            removed += 1;
+        } else if kind.is_dir() {
+            removed += unlink_links(&path)?;
+        }
+    }
+    Ok(removed)
+}
+
 pub async fn try_remove_once(project_root: &Path, path: &Path) -> io::Result<()> {
+    // A missing directory has nothing to unlink; git decides what that means.
+    if path.is_dir() {
+        let tree = path.to_path_buf();
+        let unlinked = tokio::task::spawn_blocking(move || unlink_links(&tree))
+            .await
+            .map_err(io::Error::other)?;
+        if let Err(error) = unlinked {
+            return Err(io::Error::other(format!(
+                "refusing to remove {}: a link inside it could not be unlinked ({error})",
+                path.display()
+            )));
+        }
+    }
     let output = git()
         .arg("-C")
         .arg(project_root)
@@ -747,6 +797,44 @@ async fn registration(project_root: &Path, path: &Path) -> io::Result<Registrati
         ));
     }
     Ok(Registration::Absent)
+}
+
+/// Retires a daemon-owned worktree left at an address the daemon no longer uses, so the tree
+/// about to be created at `current` does not leave a second registered checkout behind it.
+///
+/// Written for the integration directory rename (`integration-<leaf>` to `integration-<leaf>-<hash>`).
+/// The legacy name is exactly the one that two projects sharing a leaf could collide on, so a
+/// directory there is only ours to touch when THIS repository's own worktree list registers it:
+/// another project's tree, or a directory git does not know, is left strictly alone.
+///
+/// Best effort by contract. Nothing here returns an error: a failure is logged and the caller
+/// creates the new tree regardless. Removal goes through `try_remove_once`, which unlinks any
+/// junction first, then `git worktree prune` clears a row whose directory is gone.
+pub async fn retire_legacy_worktree(project_root: &Path, legacy: &Path, current: &Path) {
+    if paths_equal(legacy, current) || tokio::fs::metadata(current).await.is_ok() {
+        return;
+    }
+    if tokio::fs::metadata(legacy).await.is_err() {
+        return;
+    }
+    match registration(project_root, legacy).await {
+        Ok(Registration::Present) => {}
+        Ok(Registration::Absent) => return,
+        Err(error) => {
+            tracing::warn!(path = %legacy.display(), %error, "could not tell whether a legacy worktree is ours");
+            return;
+        }
+    }
+    if let Err(error) = try_remove_once(project_root, legacy).await {
+        tracing::warn!(path = %legacy.display(), %error, "could not remove the legacy worktree");
+    }
+    let _ = git()
+        .arg("-C")
+        .arg(project_root)
+        .arg("worktree")
+        .arg("prune")
+        .output()
+        .await;
 }
 
 /// Clears git's row for a directory that is already gone, and proves it cleared.
@@ -949,6 +1037,42 @@ async fn is_worktree_root(worktree_path: &Path) -> bool {
     !(path_contains(&toplevel, &here) && !paths_equal(&toplevel, &here))
 }
 
+/// Names the multi-step git operation stopped in `worktree_path`, if any, by the marker files git
+/// keeps in the worktree's own git directory (`--git-path` resolves that for linked worktrees).
+async fn operation_in_progress(worktree_path: &Path) -> io::Result<Option<&'static str>> {
+    const MARKERS: [(&str, &str); 5] = [
+        ("MERGE_HEAD", "merge"),
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+    ];
+    for (marker, name) in MARKERS {
+        let output = git()
+            .arg("-C")
+            .arg(worktree_path)
+            .arg("rev-parse")
+            .arg("--git-path")
+            .arg(marker)
+            .output()
+            .await?;
+        if !output.status.success() {
+            continue;
+        }
+        let reported = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let path = Path::new(&reported);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            worktree_path.join(path)
+        };
+        if path.exists() {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
 pub async fn preserve_uncommitted(worktree_path: &Path, byte_ceiling: u64) -> io::Result<bool> {
     if !is_worktree_root(worktree_path).await {
         // A plain directory inside someone else's repository. Nothing here belongs to a run, and
@@ -977,6 +1101,15 @@ pub async fn preserve_uncommitted(worktree_path: &Path, byte_ceiling: u64) -> io
     }
     if status.stdout.is_empty() {
         return Ok(false);
+    }
+
+    // A merge, rebase, cherry-pick or revert stopped on a conflict leaves markers in the files;
+    // `add -A` + `commit` would bake them into a "preserved" commit and complete the operation by
+    // accident. Refuse, which defers the removal and leaves the worktree for a person.
+    if let Some(operation) = operation_in_progress(worktree_path).await? {
+        return Err(io::Error::other(format!(
+            "a {operation} is in progress in the worktree; refusing to commit its conflict state"
+        )));
     }
 
     measure_status_paths(worktree_path, &status.stdout, byte_ceiling).await?;
@@ -1273,6 +1406,49 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const ROOT_ENV: &str = "NUCLEOS_WORKTREE_ROOT";
+
+    /// A directory junction (Windows) or symlink (unix) at `link` pointing at `target`.
+    fn link_dir(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        {
+            let status = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .status()
+                .expect("mklink should start");
+            assert!(status.success(), "mklink /J should not need elevation");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("create symlink");
+    }
+
+    #[test]
+    fn unlink_links_removes_a_link_and_spares_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), "x").unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("shell")).unwrap();
+        link_dir(&tree.join("shell").join("node_modules"), &target);
+
+        let removed = unlink_links(&tree).expect("unlink");
+
+        assert_eq!(removed, 1);
+        assert!(!tree.join("shell").join("node_modules").exists());
+        assert!(tree.join("shell").is_dir(), "real directories stay");
+        assert!(target.join("keep.txt").exists(), "the target must survive");
+    }
+
+    #[test]
+    fn unlink_links_leaves_a_tree_without_links_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a").join("f.txt"), "x").unwrap();
+        assert_eq!(unlink_links(dir.path()).unwrap(), 0);
+        assert!(dir.path().join("a").join("f.txt").exists());
+    }
 
     /// Every owner kind, for the tests that have to say something about all of them.
     const EVERY_OWNER: [Owner; 3] = [Owner::Run(7), Owner::Job(7), Owner::Item(7)];
@@ -1631,6 +1807,61 @@ mod tests {
             exclude.lines().any(|line| line.trim() == entry),
             "creation alone must anchor an exclude entry covering the worktree root, got: {exclude:?}"
         );
+    }
+
+    /// The integration directory gained a hash suffix. A tree at the old name that THIS repository
+    /// registers is retired; one that another repository registers (the collision the hash fixes)
+    /// or that git does not know at all is left exactly as it was.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_legacy_worktree_of_this_repository_is_retired_and_a_foreign_one_is_not() {
+        let base = space_free_tempdir();
+        let mine = base.path().join("mine");
+        let other = base.path().join("other");
+        for repo in [&mine, &other] {
+            std::fs::create_dir_all(repo).expect("create repository directory");
+            init_repo_at(repo);
+        }
+        let shared = base.path().join("shared");
+        std::fs::create_dir_all(&shared).expect("create shared root");
+        let add = |repo: &Path, path: &Path| {
+            assert!(git_ok(
+                repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    OsStr::new("--detach"),
+                    path.as_os_str(),
+                ],
+            ));
+        };
+
+        // This repository's legacy tree: retired, and the new directory is free to be created.
+        let legacy = shared.join("integration-app");
+        let current = shared.join("integration-app-00000001");
+        add(&mine, &legacy);
+        retire_legacy_worktree(&mine, &legacy, &current).await;
+        assert!(!legacy.exists(), "the legacy tree should be gone");
+        assert!(
+            !git_stdout(&mine, &[OsStr::new("worktree"), OsStr::new("list")])
+                .contains("integration-app"),
+            "git should no longer register it"
+        );
+
+        // Another repository's tree at the same name: untouched, still registered there.
+        add(&other, &legacy);
+        retire_legacy_worktree(&mine, &legacy, &current).await;
+        assert!(legacy.exists(), "a foreign tree must survive");
+        assert!(
+            git_stdout(&other, &[OsStr::new("worktree"), OsStr::new("list")])
+                .contains("integration-app")
+        );
+
+        // A plain directory git does not know: untouched.
+        let plain = shared.join("integration-plain");
+        std::fs::create_dir_all(&plain).expect("create plain directory");
+        let plain_current = shared.join("integration-plain-00000002");
+        retire_legacy_worktree(&mine, &plain, &plain_current).await;
+        assert!(plain.exists(), "an unregistered directory must survive");
     }
 
     /// A `run-<id>` worktree left at the OLD sibling location by a daemon that predates this
@@ -2281,6 +2512,55 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(info.path.join("failure.txt")).expect("read surviving work"),
             "must survive release\n"
+        );
+        pool.close().await;
+    }
+
+    /// A release whose removal fails must not mark the row removed, or the gc sweep never sees the
+    /// leftover directory again. A locked worktree makes `git worktree remove --force` refuse.
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_keeps_the_row_registered_when_removal_fails() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(
+            &pool,
+            "awaiting_approval",
+            None,
+            "2026-07-29T00:00:00+00:00",
+        )
+        .await;
+        let info = create_and_record(&pool, repo.path(), run_id).await;
+        assert!(git_ok(
+            repo.path(),
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("lock"),
+                info.path.as_os_str(),
+            ],
+        ));
+
+        assert_eq!(
+            release(&pool, run_id).await.unwrap(),
+            ReleaseOutcome::Released
+        );
+
+        assert!(
+            info.path.is_dir(),
+            "the locked worktree could not be removed"
+        );
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            removed_at.is_none(),
+            "a worktree that is still on disk must stay registered for the gc sweep"
         );
         pool.close().await;
     }
@@ -4027,6 +4307,67 @@ mod tests {
             "uncommitted work in a real worktree is preserved"
         );
         assert_eq!(commit_count(repo.path(), &info.branch), before + 1);
+    }
+
+    /// A merge stopped on a conflict has markers in its files; preserving would commit them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserve_refuses_a_worktree_with_a_merge_in_progress() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), Owner::Run(79))
+            .await
+            .expect("create worktree");
+        std::fs::write(
+            info.path.join("work.txt"),
+            "<<<<<<< ours
+x
+=======
+y
+>>>>>>> theirs
+",
+        )
+        .expect("write conflicted file");
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&info.path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8");
+        let merge_head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&info.path)
+                .args(["rev-parse", "--git-path", "MERGE_HEAD"])
+                .output()
+                .expect("git-path")
+                .stdout,
+        )
+        .expect("utf8");
+        let merge_head = Path::new(merge_head.trim());
+        let merge_head = if merge_head.is_absolute() {
+            merge_head.to_path_buf()
+        } else {
+            info.path.join(merge_head)
+        };
+        std::fs::write(&merge_head, head).expect("simulate a stopped merge");
+        let before = commit_count(repo.path(), &info.branch);
+
+        let error = preserve_uncommitted(&info.path, DEFAULT_PRESERVATION_BYTE_CEILING)
+            .await
+            .expect_err("a worktree mid-merge must not be committed");
+
+        assert!(error.to_string().contains("merge"), "got: {error}");
+        assert_eq!(
+            commit_count(repo.path(), &info.branch),
+            before,
+            "no commit may have been made"
+        );
     }
 
     #[test]

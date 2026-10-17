@@ -14,14 +14,29 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"mime"
+	"net"
 	"net/http"
+	"net/mail"
 	"net/smtp"
 	"strings"
 	"time"
 
 	"nucleosemail/config"
+)
+
+// Bounds on talking to the submission server: connecting (with the TLS handshake), and the whole
+// SMTP exchange once connected. Without them a server that stalls holds the request forever.
+// sessionTimeout is a variable only so a test can shorten it.
+var sessionTimeout = 2 * time.Minute
+
+const (
+	dialTimeout = 30 * time.Second
+	// maxRequestBody caps the JSON the núcleo may post: a mail's plain text, never a file.
+	maxRequestBody = 1 << 20
 )
 
 // Message is one outbound mail as the núcleo hands it over: a recipient, a subject, and plain text.
@@ -52,6 +67,10 @@ func Build(from, fromName string, msg Message, now time.Time, id string) ([]byte
 		}
 	}
 
+	if _, err := Recipients(msg.To); err != nil {
+		return nil, err
+	}
+
 	sender := from
 	if fromName != "" {
 		sender = fmt.Sprintf("%s <%s>", fromName, from)
@@ -69,7 +88,9 @@ func Build(from, fromName string, msg Message, now time.Time, id string) ([]byte
 
 	header("From", sender)
 	header("To", msg.To)
-	header("Subject", msg.Subject)
+	// RFC 2047: a non-ASCII subject sent raw is mojibake at best and rejected by a strict server.
+	// Pure ASCII passes through unchanged.
+	header("Subject", mime.QEncoding.Encode("utf-8", msg.Subject))
 	// RFC1123Z, so the offset is a number. RFC1123 would print the zone's name, which no reader
 	// outside this machine can resolve back to an hour.
 	header("Date", now.Format(time.RFC1123Z))
@@ -82,6 +103,20 @@ func Build(from, fromName string, msg Message, now time.Time, id string) ([]byte
 	framed.WriteString(msg.Body)
 
 	return []byte(framed.String()), nil
+}
+
+// Recipients splits the To field into bare addresses, one RCPT TO each. A comma-separated list is
+// legal in the To header, and sending only the first would silently drop the rest.
+func Recipients(to string) ([]string, error) {
+	list, err := mail.ParseAddressList(to)
+	if err != nil || len(list) == 0 {
+		return nil, fmt.Errorf("To is not a list of addresses")
+	}
+	addresses := make([]string, len(list))
+	for i, a := range list {
+		addresses[i] = a.Address
+	}
+	return addresses, nil
 }
 
 // domainOf is the right-hand side of an address, for the Message-ID.
@@ -106,10 +141,15 @@ func Send(cfg config.Config, msg Message) error {
 		return err
 	}
 
+	recipients, err := Recipients(msg.To)
+	if err != nil {
+		return err
+	}
+
 	// Encrypted before the first byte of SMTP, so there is no plaintext greeting for anything in
 	// between to answer by refusing STARTTLS — a downgrade that a client which retries in the clear
 	// would never notice. The person's mail password crosses this socket.
-	conn, err := tls.Dial("tcp", cfg.SMTPAddr(), &tls.Config{
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", cfg.SMTPAddr(), &tls.Config{
 		ServerName: cfg.SMTPHost,
 		MinVersion: tls.VersionTLS12,
 	})
@@ -117,6 +157,15 @@ func Send(cfg config.Config, msg Message) error {
 		return fmt.Errorf("connecting to %s: %w", cfg.SMTPAddr(), err)
 	}
 	defer conn.Close()
+
+	return submit(conn, cfg, recipients, framed)
+}
+
+// submit runs the SMTP exchange on an established connection, under one overall deadline.
+func submit(conn net.Conn, cfg config.Config, recipients []string, framed []byte) error {
+	if err := conn.SetDeadline(time.Now().Add(sessionTimeout)); err != nil {
+		return fmt.Errorf("arming the deadline: %w", err)
+	}
 
 	client, err := smtp.NewClient(conn, cfg.SMTPHost)
 	if err != nil {
@@ -130,8 +179,10 @@ func Send(cfg config.Config, msg Message) error {
 	if err := client.Mail(cfg.Username); err != nil {
 		return fmt.Errorf("sender rejected: %w", err)
 	}
-	if err := client.Rcpt(msg.To); err != nil {
-		return fmt.Errorf("recipient rejected: %w", err)
+	for _, recipient := range recipients {
+		if err := client.Rcpt(recipient); err != nil {
+			return fmt.Errorf("recipient rejected: %w", err)
+		}
 	}
 
 	body, err := client.Data()
@@ -171,7 +222,13 @@ func Handler(cfg config.Config) http.HandlerFunc {
 		}
 
 		var msg Message
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			var tooBig *http.MaxBytesError
+			if errors.As(err, &tooBig) {
+				http.Error(w, "the message is too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "the body is not a message", http.StatusBadRequest)
 			return
 		}
