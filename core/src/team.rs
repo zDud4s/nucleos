@@ -1591,6 +1591,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_calendar_event_with_an_absurd_duration_is_refused_before_it_is_filed() {
+        for minutes in [serde_json::json!(i64::MAX), serde_json::json!(44_641)] {
+            let refusal = validate_payload(
+                "calendar_event",
+                &serde_json::json!({
+                    "title": "launch review",
+                    "starts_at_local": "2026-08-17T09:30:00",
+                    "duration_minutes": minutes,
+                    "tz": "Europe/Lisbon",
+                }),
+            );
+            assert!(refusal.is_err(), "{minutes} minutes must be refused");
+        }
+    }
+
     /// An event the department asked for, written by the core after a person said yes — the shape
     /// `proposals::create_calendar_event` established, with a department in place of the triage.
     #[tokio::test]

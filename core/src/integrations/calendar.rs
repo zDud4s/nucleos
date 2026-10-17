@@ -193,6 +193,19 @@ pub struct EventOccurrence {
     pub ends_at: DateTime<Utc>,
 }
 
+/// The longest event the calendar accepts: 31 days. A multi-week trip is a handful of events, and
+/// nothing in a personal calendar is longer. The bound exists because chrono panics on overflow, so
+/// an unbounded `duration_minutes` stored by one request would crash the busy check on every notify.
+pub const MAX_DURATION_MINUTES: i64 = 31 * 24 * 60;
+
+/// The largest repeat interval accepted: 1000 units, i.e. ~2.7 years of daily or ~83 of monthly.
+pub const MAX_INTERVAL: u32 = 1000;
+
+/// Whether `minutes` is a duration the calendar will store.
+pub fn duration_in_bounds(minutes: i64) -> bool {
+    (1..=MAX_DURATION_MINUTES).contains(&minutes)
+}
+
 /// A stored row, before expansion.
 struct StoredEvent {
     id: i64,
@@ -610,6 +623,9 @@ pub async fn approve_proposed_event(
     ) else {
         return Err(DecisionError::Malformed);
     };
+    if !duration_in_bounds(duration) {
+        return Err(DecisionError::Malformed);
+    }
 
     let at = Utc::now().to_rfc3339();
     let mut transaction = pool.begin().await?;
@@ -719,6 +735,19 @@ pub async fn create_event(
     }
     if request.duration_minutes <= 0 {
         return (StatusCode::BAD_REQUEST, "duration_minutes must be positive").into_response();
+    }
+    if !duration_in_bounds(request.duration_minutes) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "duration_minutes must be at most 31 days",
+        )
+            .into_response();
+    }
+    if request
+        .interval
+        .is_some_and(|interval| interval > MAX_INTERVAL)
+    {
+        return (StatusCode::BAD_REQUEST, "interval must be at most 1000").into_response();
     }
     let Some(starts_at_local) = parse_local(&request.starts_at_local) else {
         return (
@@ -862,6 +891,13 @@ pub async fn move_occurrence(
         return (
             StatusCode::BAD_REQUEST,
             "duration_minutes must be positive when moving an occurrence",
+        )
+            .into_response();
+    }
+    if !duration_in_bounds(duration) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "duration_minutes must be at most 31 days",
         )
             .into_response();
     }
@@ -1548,5 +1584,80 @@ mod tests {
     async fn a_message_with_no_subject_still_gets_a_readable_title() {
         assert_eq!(title_for_action(None), "follow up on a message");
         assert_eq!(title_for_action(Some("   ")), "follow up on a message");
+    }
+
+    async fn create_status(request: CreateEventRequest) -> StatusCode {
+        let state = state_with(test_pool().await, false).await;
+        create_event(State(state), axum::Json(request))
+            .await
+            .into_response()
+            .status()
+    }
+
+    fn request(duration_minutes: i64, interval: Option<u32>) -> CreateEventRequest {
+        CreateEventRequest {
+            title: "standup".to_owned(),
+            starts_at_local: "2026-08-03T09:00:00".to_owned(),
+            duration_minutes,
+            tz: Some("Europe/Lisbon".to_owned()),
+            freq: interval.map(|_| "daily".to_owned()),
+            interval,
+            byday: None,
+            until_local: None,
+            count: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_absurd_duration_is_refused_at_creation() {
+        for minutes in [MAX_DURATION_MINUTES + 1, i64::MAX] {
+            assert_eq!(
+                create_status(request(minutes, None)).await,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            create_status(request(MAX_DURATION_MINUTES, None)).await,
+            StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absurd_interval_is_refused_at_creation() {
+        assert_eq!(
+            create_status(request(60, Some(u32::MAX))).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            create_status(request(60, Some(MAX_INTERVAL + 1))).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            create_status(request(60, Some(MAX_INTERVAL))).await,
+            StatusCode::CREATED
+        );
+    }
+
+    /// A row stored before the bounds existed (or by hand) must not take the notifier loop down.
+    #[tokio::test]
+    async fn an_already_stored_extreme_row_does_not_panic_the_busy_check() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO calendar_events
+                 (starts_at_local, tz, duration_minutes, title, source, freq, interval_n, created_at)
+             VALUES ('2026-08-03T09:00:00', 'Europe/Lisbon', ?, 'huge', 'human', 'daily', 4294967295, '2026-08-01T00:00:00Z'),
+                    ('2026-08-03T09:00:00', 'Europe/Lisbon', 60, 'wide', 'human', 'weekly', 4294967295, '2026-08-01T00:00:00Z')",
+        )
+        .bind(i64::MAX)
+        .execute(&pool)
+        .await
+        .expect("rows to insert");
+
+        let at = utc("2026-08-10T09:30:00Z");
+        assert!(!busy_at(&pool, at).await);
+        let found = occurrences(&pool, at, at + Duration::days(30))
+            .await
+            .expect("occurrences to be readable");
+        assert!(found.iter().all(|occurrence| occurrence.title != "huge"));
     }
 }
