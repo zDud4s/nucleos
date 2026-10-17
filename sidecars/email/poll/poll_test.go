@@ -2,6 +2,7 @@ package poll
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -35,6 +36,19 @@ func (f *fakeFetcher) Fetch(uid imapv2.UID) (imap.Raw, error) {
 		InternalDate: time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC),
 		Body:         body,
 	}, nil
+}
+
+// bodyless answers ErrNoBody for the uids in `empty`, like a server that has no body section.
+type bodyless struct {
+	fakeFetcher
+	empty map[uint32]bool
+}
+
+func (b *bodyless) Fetch(uid imapv2.UID) (imap.Raw, error) {
+	if b.empty[uint32(uid)] {
+		return imap.Raw{}, fmt.Errorf("uid %d %w", uid, imap.ErrNoBody)
+	}
+	return b.fakeFetcher.Fetch(uid)
 }
 
 func validMessage(subject string) []byte {
@@ -239,5 +253,32 @@ func TestTheSentFolderIsReadForItsRecipients(t *testing.T) {
 	}
 	if _, ok := inbound[0].Headers["to"]; ok {
 		t.Fatalf("inbound headers = %+v, must not forward recipients", inbound[0].Headers)
+	}
+}
+
+// A message with no body at the head of the batch is a decision, not a failure: recorded as a
+// skip, the cursor passes it, or the same uid stalls the mailbox on every poll.
+func TestABodylessMessageIsSkippedNotStalled(t *testing.T) {
+	fetcher := &bodyless{
+		fakeFetcher: fakeFetcher{bodies: map[uint32][]byte{2: validMessage("second")}},
+		empty:       map[uint32]bool{1: true},
+	}
+
+	messages, skipped, maxExamined := Collect(fetcher, uidRange(1, 2), MaxPerBatch, extract.Message)
+
+	if len(messages) != 1 {
+		t.Fatalf("delivered %d messages, want 1", len(messages))
+	}
+	if len(skipped) != 1 || skipped[0].UID != 1 {
+		t.Fatalf("skipped = %+v, want exactly uid 1", skipped)
+	}
+	if maxExamined != 2 {
+		t.Fatalf("max examined = %d, want 2", maxExamined)
+	}
+
+	// Even when the bodyless one is the only message, the cursor must move past it.
+	_, _, only := Collect(&bodyless{empty: map[uint32]bool{1: true}}, uidRange(1, 1), MaxPerBatch, extract.Message)
+	if only != 1 {
+		t.Fatalf("max examined = %d, want 1", only)
 	}
 }

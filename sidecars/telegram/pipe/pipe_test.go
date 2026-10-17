@@ -1631,3 +1631,33 @@ func TestACaptureRequestFeedLineIsSentWithoutItsKindPrefix(t *testing.T) {
 		t.Errorf("other kinds lost their prefix: %q", got)
 	}
 }
+
+// slowTurn reports "running" for the first `runningFor` GetRun calls, then completes.
+type slowTurn struct {
+	*recordingDaemon
+	runningFor int
+	calls      int
+}
+
+func (d *slowTurn) GetRun(int64) (map[string]any, error) {
+	d.calls++
+	if d.calls <= d.runningFor {
+		return map[string]any{"status": "running"}, nil
+	}
+	return map[string]any{"status": "completed", "stdout": "late answer"}, nil
+}
+
+// A turn longer than the first polling window used to get "turn still running" and then nothing,
+// ever. It must get a notice and, when it finishes, its reply.
+func TestALongTurnStillGetsItsReply(t *testing.T) {
+	dc := &slowTurn{recordingDaemon: &recordingDaemon{}, runningFor: 10}
+	var notices []string
+	got := watchTurnWith(dc, 1, func(n string) { notices = append(notices, n) },
+		time.Microsecond, 3, time.Microsecond, 50)
+	if got != "late answer" {
+		t.Fatalf("watchTurn() = %q, want the late reply", got)
+	}
+	if len(notices) != 1 {
+		t.Fatalf("notices = %v, want exactly one still-working notice", notices)
+	}
+}

@@ -25,6 +25,14 @@ import (
 const pollInterval = 3 * time.Second
 const maxPollAttempts = 200
 
+// After the first window (maxPollAttempts x pollInterval, ten minutes) a turn that is still running
+// is not abandoned: the person is told it is still working and the watcher keeps going at a gentler
+// pace, up to a day, so a long turn's reply still arrives.
+const longPollInterval = 30 * time.Second
+const maxLongPollAttempts = 2880
+
+const stillRunningReply = "turn still running — check /budget or the dashboard"
+
 // A turn outlives a daemon restart — the run keeps going server-side — so a failed GetRun is not a
 // reason to stop watching. A daemon that is gone for good still has to produce an answer, which is
 // what bounds the tolerance.
@@ -521,7 +529,7 @@ func startTurn(bot Bot, dc Daemon, tr *Tracker, to telegram.Destination, text st
 	tr.Set(ChatKey(to), turnID)
 	logSend("turn acknowledgement", bot.SendMessage(to, fmt.Sprintf("working… (turn %d)", turnID)))
 	GoGuarded("turn watcher", func() {
-		reply := pollTurnAndReply(dc, turnID, pollInterval, maxPollAttempts)
+		reply := watchTurn(dc, turnID, func(notice string) { sendReply(bot, to, notice) })
 		sendReply(bot, to, reply)
 	})
 }
@@ -548,6 +556,24 @@ func sendReply(bot Bot, to telegram.Destination, reply string) {
 	}
 }
 
+// watchTurn waits for the turn through the short window, says once that it is still working, then
+// keeps waiting through the long window before it gives up.
+func watchTurn(dc Daemon, turnID int64, notify func(string)) string {
+	return watchTurnWith(dc, turnID, notify, pollInterval, maxPollAttempts, longPollInterval, maxLongPollAttempts)
+}
+
+func watchTurnWith(
+	dc Daemon, turnID int64, notify func(string),
+	interval time.Duration, attempts int, longInterval time.Duration, longAttempts int,
+) string {
+	reply := pollTurnAndReply(dc, turnID, interval, attempts)
+	if reply != stillRunningReply {
+		return reply
+	}
+	notify("still working on it — I'll reply here when the turn finishes.")
+	return pollTurnAndReply(dc, turnID, longInterval, longAttempts)
+}
+
 func pollTurnAndReply(dc Daemon, turnID int64, interval time.Duration, maxAttempts int) string {
 	consecutiveErrors := 0
 	for i := 0; i < maxAttempts; i++ {
@@ -569,7 +595,7 @@ func pollTurnAndReply(dc Daemon, turnID int64, interval time.Duration, maxAttemp
 		}
 		time.Sleep(interval)
 	}
-	return "turn still running — check /budget or the dashboard"
+	return stillRunningReply
 }
 
 func isTerminal(status string) bool {
