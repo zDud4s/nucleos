@@ -4317,6 +4317,8 @@ mod tests {
     /// pytest REMOVES its `--basetemp` before it runs, so `--basetemp=.` empties the workspace
     /// and `--basetemp=/c/Users/x` a home directory. Go's profile and trace flags each write a
     /// file wherever their value points. Every one of them arrived as an allowed test run.
+    /// Only a RELATIVE value that stays strictly inside the workspace is ordinary again; the
+    /// workspace root itself (`.`, `./`, empty, `tmp/..`) still pends for `--basetemp`.
     #[test]
     fn a_test_runner_flag_that_writes_or_deletes_a_path_stays_pending() {
         let workspace = Path::new(r"C:\work\repo");
@@ -4324,7 +4326,14 @@ mod tests {
             "pytest --basetemp=/c/Users/x",
             "pytest --basetemp /c/Users/x",
             "pytest --basetemp=.",
-            "pytest --basetemp=tmp",
+            "pytest --basetemp=./",
+            r#"pytest --basetemp="""#,
+            "pytest --basetemp ''",
+            "pytest --basetemp=tmp/..",
+            "pytest --basetemp=../x",
+            "pytest --basetemp=~/x",
+            "pytest --basetemp=$HOME/x",
+            "pytest --basetemp",
             r#"pytest "--basetemp=/c/Users/x""#,
             r"pytest --base\temp=/c/Users/x",
             "pytest -q tests/ --basetemp=C:/Users/x",
@@ -4335,7 +4344,12 @@ mod tests {
             "go test -coverprofile /c/Users/x/cover.out ./...",
             "go test --coverprofile=/c/Users/x/cover.out ./...",
             r#"go test "-coverprofile=/c/Users/x/cover.out" ./..."#,
-            "go test -coverprofile=cover.out ./...",
+            "go test -coverprofile=../x ./...",
+            "go test -coverprofile ../x ./...",
+            "go test -coverprofile=~/x ./...",
+            "go test -coverprofile=$HOME/x ./...",
+            "go test -coverprofile=sub/../../x ./...",
+            "go test -o cover.out ./...",
             "go test -cpuprofile=/c/Users/x/cpu.out ./...",
             "go test -memprofile /c/Users/x/mem.out ./...",
             "go test -blockprofile=/c/Users/x/b.out ./...",
@@ -4365,6 +4379,15 @@ mod tests {
             "pytest",
             "pytest -q tests/",
             "pytest -k basetemp",
+            // Relative and strictly inside the workspace: ordinary again.
+            "pytest --basetemp=tmp",
+            "pytest --basetemp .pytest-tmp/x",
+            "pytest --basetemp=./tmp/../tmp2",
+            "python -m pytest --basetemp=tmp",
+            "go test -coverprofile=cover.out ./...",
+            "go test -coverprofile cover.out ./...",
+            "go test -cpuprofile=prof/cpu.out ./...",
+            "go test ./... -args -test.coverprofile=cover.out",
             "python -m pytest -x",
             "go test ./...",
             "go test -cover ./...",
