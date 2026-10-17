@@ -43,7 +43,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 /// The most bytes one transaction covers.
@@ -126,6 +126,21 @@ fn sorted_entries(dir: &Path) -> Vec<PathBuf> {
     entries
 }
 
+/// Agent files whose launch link already sits on its attempt row, by [`path_key`]. Such a file needs
+/// neither its meta read again nor the link re-applied, so it is checked like any other file. Without
+/// this every agent file re-read its meta and re-ran the UPDATE on every cycle: 1949 of 2125 on the
+/// owner's machine (2026-10-17), all of them already linked.
+fn settled_links() -> &'static Mutex<HashSet<String>> {
+    static SETTLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SETTLED.get_or_init(Mutex::default)
+}
+
+fn link_settled(key: &str) -> bool {
+    settled_links()
+        .lock()
+        .is_ok_and(|settled| settled.contains(key))
+}
+
 fn read_meta(path: &Path) -> Option<AgentMeta> {
     let value: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
@@ -162,7 +177,11 @@ fn walk(projects_dir: &Path) -> Vec<Found> {
                     if !file.is_file() {
                         continue;
                     }
-                    let meta = read_meta(&subagents.join(format!("agent-{id}.meta.json")));
+                    let meta = if link_settled(&path_key(&file)) {
+                        None
+                    } else {
+                        read_meta(&subagents.join(format!("agent-{id}.meta.json")))
+                    };
                     found.push(Found {
                         lane: format!("agent:{id}"),
                         path: file,
@@ -721,6 +740,11 @@ async fn ingest_file(
         .await?;
         if changed > 0 {
             touched.insert(file.session.clone());
+        }
+        if devtime_store::attempt_exists(&mut conn, &file.session, tool_use_id).await?
+            && let Ok(mut settled) = settled_links().lock()
+        {
+            settled.insert(key.clone());
         }
     }
 
@@ -1316,6 +1340,50 @@ mod tests {
         assert_eq!(from_files, inline);
         assert_eq!(files_agent.as_deref(), Some("a1"));
         assert_eq!(inline_agent.as_deref(), Some("a1"));
+    }
+
+    async fn agent_of(pool: &SqlitePool, tool_use_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT agent_id FROM devtime_attempts WHERE tool_use_id = ?")
+            .bind(tool_use_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_settled_agent_link_is_not_applied_again() {
+        let h = harness(&["background"]).await;
+        ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        assert_eq!(agent_of(&h.pool, "toolu_ag1").await.as_deref(), Some("a1"));
+
+        // Were the link re-applied each cycle, the next one would put this back.
+        sqlx::query("UPDATE devtime_attempts SET agent_id = NULL WHERE tool_use_id = 'toolu_ag1'")
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        assert_eq!(agent_of(&h.pool, "toolu_ag1").await, None);
+    }
+
+    #[tokio::test]
+    async fn an_agent_link_waits_for_its_attempt_to_be_ingested() {
+        let h = harness(&["background"]).await;
+        let main = proj_file(&h, "s-bg.jsonl");
+        let full = std::fs::read_to_string(&main).unwrap();
+        let head: String = full.split_inclusive('\n').take(3).collect();
+        std::fs::write(&main, &head).unwrap();
+        ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        let launched: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM devtime_attempts WHERE tool_use_id = 'toolu_ag1'",
+        )
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(launched, 0, "the launching call is not ingested yet");
+
+        std::fs::write(&main, &full).unwrap();
+        ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        assert_eq!(agent_of(&h.pool, "toolu_ag1").await.as_deref(), Some("a1"));
     }
 
     async fn dump(pool: &SqlitePool) -> Vec<String> {
