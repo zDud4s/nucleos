@@ -498,7 +498,7 @@ fn flag_value_leaves_the_workspace(tokens: &[&str], index: usize) -> bool {
         Some((_, value)) => !relative_path_stays_inside(value),
         None => tokens
             .get(index + 1)
-            .map_or(true, |value| !relative_path_stays_inside(value)),
+            .is_none_or(|value| !relative_path_stays_inside(value)),
     }
 }
 
