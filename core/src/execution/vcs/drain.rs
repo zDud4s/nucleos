@@ -22,6 +22,29 @@ pub trait VcsExecutor: Send + Sync {
     /// against the row, not a failure to have asked.
     async fn execute(&self, request: &ClaimedRequest) -> Outcome;
 }
+/// Polls an `Unpin` future (the executor's boxed one) under `catch_unwind`, so a panic comes back as a value instead of unwinding the
+/// caller. `AssertUnwindSafe` is sound here because the wrapped future is dropped on a panic and
+/// never polled again.
+struct CatchUnwind<F>(F);
+
+impl<F: std::future::Future + Unpin> std::future::Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::pin::Pin::new(&mut this.0).poll(cx)
+        })) {
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    }
+}
+
 /// How many times a merge's target may move while it is being computed before the row gives up and
 /// says so, rather than retrying against something that keeps rewriting the target out from under
 /// it. Design decision #4: once is the ordinary race with whatever else touches the branch; three
@@ -207,7 +230,25 @@ pub async fn drain_once(
         }
     }
     let id = claimed.id;
-    let outcome = executor.execute(&claimed).await;
+    let outcome = match CatchUnwind(executor.execute(&claimed)).await {
+        Ok(outcome) => outcome,
+        // A panic in the executor must not leave the row `running`: the partial unique index would
+        // hold the repository's only slot until a restart reconciled it. It becomes an ordinary
+        // failure, written by the same `finish` below.
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_owned());
+            tracing::error!(vcs_request_id = id, %detail, "vcs: the executor panicked");
+            Outcome::Failed {
+                reason: format!("the executor panicked: {detail}"),
+                exit_code: None,
+                output_tail: String::new(),
+            }
+        }
+    };
 
     // Design decision #4. `publish` answers "the target moved while this merge was being
     // computed" with a `Failed` nobody resubmits — the row just sits there having said "resubmit"

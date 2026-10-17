@@ -32,6 +32,19 @@ pub(super) async fn prepare_integration_worktree(
     deadline: std::time::Instant,
 ) -> Result<std::path::PathBuf, Outcome> {
     let integration = integration_worktree(project_root);
+    // Before the hash suffix the directory was `integration-<leaf>`. Retire this repository's tree
+    // there, if any, so an upgraded machine does not keep an orphaned registered checkout.
+    if let Some(parent) = integration.parent() {
+        let legacy = parent.join(format!(
+            "{INTEGRATION_PREFIX}{}",
+            project_root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unnamed".to_owned())
+        ));
+        crate::execution::worktree::retire_legacy_worktree(project_root, &legacy, &integration)
+            .await;
+    }
     reset_or_create_worktree(project_root, &integration, "integration", deadline).await
 }
 

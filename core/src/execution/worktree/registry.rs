@@ -189,11 +189,15 @@ pub async fn release(pool: &SqlitePool, run_id: i64) -> sqlx::Result<ReleaseOutc
                 );
                 return Ok(ReleaseOutcome::Released);
             }
+            // Not marked removed: the directory is still there, and a row saying otherwise hides it
+            // from the gc sweep, leaking it until the next restart reconciles. Left registered, the
+            // sweep retries it.
             tracing::warn!(
                 run_id,
                 %error,
-                "failed to remove released worktree; continuing with discard"
+                "failed to remove released worktree; leaving it registered for the gc sweep"
             );
+            return Ok(ReleaseOutcome::Released);
         }
         mark_removed(pool, Owner::Run(run_id)).await?;
     }

@@ -3088,6 +3088,38 @@ mod tests {
         );
     }
 
+    /// An executor that panics used to unwind through `drain_once`, leaving its row `running` — and
+    /// the partial unique index then held the repository's only slot until a restart.
+    #[tokio::test]
+    async fn a_panicking_executor_fails_its_row_and_frees_the_repository() {
+        struct Panicking;
+        #[async_trait::async_trait]
+        impl VcsExecutor for Panicking {
+            async fn execute(&self, _request: &ClaimedRequest) -> Outcome {
+                panic!("the executor blew up");
+            }
+        }
+
+        let pool = test_pool().await;
+        let first = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        let second = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+
+        drain_once(&pool, "alpha", &Panicking).await;
+
+        assert_eq!(status_of(&pool, first).await, "failed");
+        assert!(
+            failure_reason_of(&pool, first).await.contains("panicked"),
+            "the row must say the executor panicked"
+        );
+        // The slot is free: the next request in the same repository is claimed and runs.
+        drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
+        assert_eq!(status_of(&pool, second).await, "succeeded");
+    }
+
     #[tokio::test]
     async fn the_queue_is_drained_in_order_and_each_outcome_recorded() {
         let pool = test_pool().await;

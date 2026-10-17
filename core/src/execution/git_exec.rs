@@ -301,6 +301,34 @@ pub mod tests {
         );
     }
 
+    /// `NUCLEOS_WORKTREE_ROOT` makes every project share one parent, so two projects whose leaf
+    /// directory is `app` must still get different integration directories.
+    #[test]
+    fn two_projects_with_the_same_leaf_name_get_distinct_integration_worktrees() {
+        let first = integration_worktree(Path::new("/work/one/app"));
+        let second = integration_worktree(Path::new("/work/two/app"));
+        assert_ne!(first.file_name(), second.file_name());
+        assert_eq!(first, integration_worktree(Path::new("/work/one/app")));
+    }
+
+    /// A fetch or push never takes the index lock, so a lock present after its timeout is somebody
+    /// else's and stays; an index-touching command's timeout still clears it.
+    #[test]
+    fn a_network_timeout_is_not_taken_for_a_killed_index_writer() {
+        let argv = |parts: &[&str]| parts.iter().map(OsString::from).collect::<Vec<_>>();
+        let held = |parts: &[&str]| {
+            let owned = argv(parts);
+            let refs: Vec<&OsStr> = owned.iter().map(|a| a.as_os_str()).collect();
+            super::transport::may_have_held_index_lock(&refs)
+        };
+        assert!(!held(&["fetch", "origin"]));
+        assert!(!held(&["-c", "http.x=1", "push", "origin", "main"]));
+        assert!(!held(&["ls-remote", "origin"]));
+        assert!(held(&["reset", "--hard"]));
+        assert!(held(&["-c", "alias.nap=!sleep 30", "nap"]));
+        assert!(held(&["merge", "fetch"]));
+    }
+
     /// The control: a lock is only stale when nothing of ours is still running in that checkout.
     #[tokio::test]
     async fn a_timeout_leaves_the_index_lock_of_a_git_still_running_there() {
