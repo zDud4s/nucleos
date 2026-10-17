@@ -533,12 +533,14 @@ pub(super) async fn fetch_all_attachments(
     state: &AppState,
     id: i64,
 ) -> Result<Vec<BulkAttachment>, StatusCode> {
-    let uid: Option<i64> = sqlx::query_scalar("SELECT uid FROM emails WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let uid = uid.ok_or(StatusCode::NOT_FOUND)?;
+    let row: Option<(i64, i64, String)> =
+        sqlx::query_as("SELECT uid, uidvalidity, mailbox FROM emails WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (uid, uidvalidity, mailbox) = row.ok_or(StatusCode::NOT_FOUND)?;
+    let token = sidecar_bearer(state, &mailbox)?;
 
     let client = reqwest::Client::builder()
         .timeout(ATTACHMENT_TIMEOUT)
@@ -546,10 +548,11 @@ pub(super) async fn fetch_all_attachments(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let response = client
         .get(format!(
-            "http://{}/attachments?uid={uid}",
-            crate::sidecar::EMAIL_FETCH_ADDR
+            "http://{}{}",
+            crate::sidecar::EMAIL_FETCH_ADDR,
+            attachment_query("/attachments", uid, uidvalidity, None)
         ))
-        .bearer_auth(&state.token.0)
+        .bearer_auth(token)
         .send()
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -623,6 +626,31 @@ pub(super) async fn post_email_attachments_save_all(
     saved.map(Json).map_err(folder_status)
 }
 
+/// The path and query for one sidecar attachment request. It names the UIDVALIDITY the message was
+/// stored under, so the sidecar can refuse a uid that a reset has since given to another message.
+fn attachment_query(path: &str, uid: i64, uidvalidity: i64, position: Option<i64>) -> String {
+    match position {
+        Some(position) => format!("{path}?uid={uid}&uidvalidity={uidvalidity}&position={position}"),
+        None => format!("{path}?uid={uid}&uidvalidity={uidvalidity}"),
+    }
+}
+
+/// The key to present to the email sidecar for a message stored under `mailbox`.
+///
+/// The sidecar's OWN key, never the control token (the process parses MIME written by strangers;
+/// see `mailsend::send`). It also only ever selects the configured mailbox, so a message stored
+/// under any other one cannot be fetched by uid and is reported missing rather than mis-served.
+fn sidecar_bearer<'a>(state: &'a AppState, mailbox: &str) -> Result<&'a str, StatusCode> {
+    if mailbox != state.email.mailbox {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    state
+        .email
+        .sidecar_token
+        .as_deref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
 /// Asks the sidecar for one attachment's bytes, and reports the name it was described under.
 ///
 /// Shared by the route that hands a file to a person and the one that files it into a folder,
@@ -632,8 +660,8 @@ pub(super) async fn fetch_attachment(
     id: i64,
     position: i64,
 ) -> Result<(Vec<u8>, String), StatusCode> {
-    let row: Option<(i64, Option<String>)> = sqlx::query_as(
-        "SELECT emails.uid, email_attachments.filename
+    let row: Option<(i64, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT emails.uid, emails.uidvalidity, emails.mailbox, email_attachments.filename
            FROM email_attachments
            JOIN emails ON emails.id = email_attachments.email_id
           WHERE email_attachments.email_id = ? AND email_attachments.position = ?",
@@ -643,7 +671,8 @@ pub(super) async fn fetch_attachment(
     .fetch_optional(&state.pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let (uid, filename) = row.ok_or(StatusCode::NOT_FOUND)?;
+    let (uid, uidvalidity, mailbox, filename) = row.ok_or(StatusCode::NOT_FOUND)?;
+    let token = sidecar_bearer(state, &mailbox)?;
 
     let client = reqwest::Client::builder()
         .timeout(ATTACHMENT_TIMEOUT)
@@ -651,10 +680,11 @@ pub(super) async fn fetch_attachment(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let response = client
         .get(format!(
-            "http://{}/attachment?uid={uid}&position={position}",
-            crate::sidecar::EMAIL_FETCH_ADDR
+            "http://{}{}",
+            crate::sidecar::EMAIL_FETCH_ADDR,
+            attachment_query("/attachment", uid, uidvalidity, Some(position))
         ))
-        .bearer_auth(&state.token.0)
+        .bearer_auth(token)
         .send()
         .await
         // The sidecar not answering is not the same as the file not existing, and telling a person
@@ -830,4 +860,21 @@ pub(super) async fn post_email_requeue(
             RequeueError::UnknownEmail => StatusCode::NOT_FOUND,
             RequeueError::BodyPurged | RequeueError::ClaimedByRun(_) => StatusCode::CONFLICT,
         })
+}
+
+#[cfg(test)]
+mod attachment_request_tests {
+    use super::*;
+
+    #[test]
+    fn the_attachment_request_carries_the_uidvalidity() {
+        assert_eq!(
+            attachment_query("/attachment", 5, 77, Some(2)),
+            "/attachment?uid=5&uidvalidity=77&position=2"
+        );
+        assert_eq!(
+            attachment_query("/attachments", 5, 77, None),
+            "/attachments?uid=5&uidvalidity=77"
+        );
+    }
 }

@@ -96,17 +96,15 @@ pub async fn flush_due(pool: &sqlx::SqlitePool) -> sqlx::Result<usize> {
 
     let mut delivered = 0;
     for (id, kind, summary) in waiting {
-        // The feed row is written BEFORE the row is marked delivered, so a crash in between
-        // re-delivers rather than loses. Between an unwanted second ping and a message that never
-        // arrives, this pillar has already chosen: the whole reason the queue is durable is that
-        // notifications must not evaporate.
-        crate::feed::append(pool, None, &kind, &summary, None, None).await?;
-        sqlx::query("UPDATE pending_notifications SET delivered_at = ? WHERE id = ?")
-            .bind(Utc::now().to_rfc3339())
-            .bind(id)
-            .execute(pool)
-            .await?;
-        delivered += 1;
+        // The feed row and the delivered mark commit together: a crash re-delivers nothing and
+        // loses nothing, and a row that fails rolls back whole and is retried on the next tick.
+        // One bad row is logged and skipped rather than stalling every notification behind it.
+        match deliver_one(pool, id, &kind, &summary).await {
+            Ok(()) => delivered += 1,
+            Err(error) => {
+                tracing::warn!(%error, id, "notify: delivering a held notification failed; will retry");
+            }
+        }
     }
 
     if delivered > 0 {
@@ -116,6 +114,22 @@ pub async fn flush_due(pool: &sqlx::SqlitePool) -> sqlx::Result<usize> {
         );
     }
     Ok(delivered)
+}
+
+async fn deliver_one(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    kind: &str,
+    summary: &str,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    crate::feed::append_on(&mut tx, None, kind, summary, None, None).await?;
+    sqlx::query("UPDATE pending_notifications SET delivered_at = ? WHERE id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
 }
 
 /// The 30-second tick that empties the waiting room. Sibling of the scheduler and the worktree GC.
@@ -194,6 +208,38 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("the queue to be countable")
+    }
+
+    #[tokio::test]
+    async fn one_row_that_fails_does_not_stall_the_rows_behind_it() {
+        let pool = test_pool().await;
+        book_around_now(&pool).await;
+        for summary in ["first", "poison", "third"] {
+            deliver_or_defer(&pool, "email_urgent", summary)
+                .await
+                .expect("the hold to succeed");
+        }
+        sqlx::query(
+            "CREATE TRIGGER refuse_poison BEFORE INSERT ON feed
+             WHEN NEW.summary = 'poison' BEGIN SELECT RAISE(ABORT, 'poison'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM calendar_events")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let delivered = flush_due(&pool).await.expect("the flush not to fail whole");
+
+        assert_eq!(delivered, 2);
+        assert_eq!(feed_count(&pool).await, 2);
+        assert_eq!(
+            undelivered_count(&pool).await,
+            1,
+            "the failed row stays queued, and has no half-written feed row"
+        );
     }
 
     #[tokio::test]
