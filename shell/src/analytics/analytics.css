@@ -1,0 +1,95 @@
+/*
+  The analytics view (spec analytics-fundacao §9): one column, four sections, each a strip of tiles,
+  a chart, and a line of detail. No colour of its own — charts get theirs from `ui.css`.
+*/
+.an-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+.an-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.an-head-note,
+.an-note {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.an-coverage {
+  margin: 0;
+  max-width: var(--measure-prose);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.an-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.an-charts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.an-pairs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
+  margin: var(--space-3) 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+}
+
+.an-pair-mode {
+  color: var(--text-muted);
+}
+
+.an-pair-count {
+  margin-left: var(--space-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.an-top {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.an-top-link {
+  display: flex;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  text-decoration: none;
+  font-size: var(--text-sm);
+}
+
+.an-top-link:hover {
+  background: var(--surface-raised);
+}
+
+.an-top-meta {
+  color: var(--text-muted);
+}
+
+.an-top-cost {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
