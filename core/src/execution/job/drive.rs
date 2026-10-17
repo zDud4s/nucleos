@@ -372,6 +372,11 @@ pub(super) async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) 
         Brake::Go => {}
         Brake::Park { reason, detail } => return park(state, job, reason, &detail).await,
         Brake::Stop { detail } => {
+            // A batch can still have nodes in flight here; a retired job is never driven again,
+            // so nothing else would stop them.
+            if let Err(error) = stop_nodes_in_flight(state, job.id).await {
+                tracing::warn!(job_id = job.id, %error, "could not stop a stopped job's nodes");
+            }
             let _ = retire(pool, job.id, STATUS_STOPPED).await;
             say(
                 pool,
@@ -691,6 +696,11 @@ pub(super) async fn drive(state: &AppState, job: JobRow, now: DateTime<Utc>) {
     if let Ok(started) = DateTime::parse_from_rfc3339(&job.created_at)
         && now.signed_duration_since(started.with_timezone(&Utc)) > ceiling
     {
+        // The node in flight goes first, as a cancel's does: the job is never driven again once
+        // it is retired, so a node left running would work on with nobody to stop it.
+        if let Err(error) = stop_nodes_in_flight(state, job.id).await {
+            tracing::warn!(job_id = job.id, %error, "could not stop an expired job's nodes");
+        }
         let _ = retire(pool, job.id, STATUS_EXPIRED).await;
         say(
             pool,

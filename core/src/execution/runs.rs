@@ -3558,6 +3558,89 @@ pub mod tests {
         assert!(!successor.steerable);
     }
 
+    /// A run that ended for a reason a fresh window does not answer is never handed off.
+    ///
+    /// A turn ceiling exits non-zero (`failed`) and a deadline writes `timed_out`; both are brakes.
+    /// A successor relaunched the work the brake had just stopped, and because the successor takes
+    /// over `job_items.run_id`, the job then read a live node where the failure should have been.
+    #[tokio::test]
+    async fn a_run_that_did_not_complete_is_never_handed_off() {
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at)
+             VALUES (8, 'project-f', 'C:/somewhere', 'implementing', 5, '2026-10-17T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (offset, status) in ["failed", "timed_out", "cancelled", "interrupted"]
+            .into_iter()
+            .enumerate()
+        {
+            let run_id = 43401 + offset as i64;
+            sqlx::query(
+                "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill, job_id, created_at)
+                 VALUES (?, 'project-f', 'the task', ?, 'worktree', ?, 8, '2026-10-17T00:00:00Z')",
+            )
+            .bind(run_id)
+            .bind(status)
+            .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO job_items (job_id, ordinal, description, status, run_id)
+                 VALUES (8, ?, 'an item', 'running', ?)",
+            )
+            .bind(offset as i64)
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let successor = prepare_handoff_successor(&pool, run_id).await.unwrap();
+
+            assert!(
+                successor.is_none(),
+                "a `{status}` run over the threshold was handed off"
+            );
+            let item_run: i64 =
+                sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = 8 AND ordinal = ?")
+                    .bind(offset as i64)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                item_run, run_id,
+                "the item no longer points at the `{status}` run"
+            );
+        }
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            runs, 4,
+            "a successor row was inserted for a run that did not complete"
+        );
+    }
+
+    /// The other side: a `completed` run over the threshold still hands off.
+    #[test]
+    fn only_a_completed_or_live_run_ends_in_a_handoff() {
+        assert!(ends_in_a_handoff("completed"));
+        assert!(ends_in_a_handoff("running"));
+        for status in [
+            "failed",
+            "timed_out",
+            "cancelled",
+            "interrupted",
+            "superseded",
+        ] {
+            assert!(!ends_in_a_handoff(status), "{status}");
+        }
+    }
+
     /// Freezes `tools` as `run_id`'s loadout, as `create_run_with` does for a job node.
     async fn seed_run_loadout(pool: &sqlx::SqlitePool, run_id: i64, tools: &str) {
         sqlx::query(
