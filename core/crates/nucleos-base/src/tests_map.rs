@@ -20,7 +20,7 @@ pub const MAP_FILE: &str = "nucleos.tests.yaml";
 pub const VERSION: u32 = 1;
 
 /// A map is a hand-written list of groups; anything this size is not one.
-const MAX_MAP: u64 = 256 * 1024;
+pub const MAX_MAP: u64 = 256 * 1024;
 
 /// The markers a `select` template may carry, each a whole argv word (spec §3.2). The
 /// language-aware ones (`{modules}`, `{packages}`, `{crates}`) are F4 and refused until then.
