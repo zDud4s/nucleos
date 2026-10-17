@@ -484,6 +484,15 @@ pub(crate) fn assigns_a_loader_variable(command: &str) -> Option<&'static str> {
         // `core.fsmonitor`, an alias starting with `!`.
         "git_config_parameters",
         "git_config_count",
+        // Whole-file replacements of the global and system git configuration, which name programs
+        // exactly like the injected parameters above.
+        "git_config_global",
+        "git_config_system",
+        // rustc flags carry `-C linker=<program>` and `-C link-arg=...`.
+        "rustflags",
+        "cargo_encoded_rustflags",
+        "cargo_build_rustflags",
+        "cargo_build_target_rustflags",
         // cargo puts these in front of, or in place of, every rustc it runs.
         "rustc",
         "rustdoc",
@@ -496,12 +505,33 @@ pub(crate) fn assigns_a_loader_variable(command: &str) -> Option<&'static str> {
     ];
     // Names that are a family rather than one variable: the index is the caller's to choose.
     const LOADER_PREFIXES: &[&str] = &["git_config_key_", "git_config_value_"];
-    command.split_whitespace().find_map(|token| {
-        let (name, _) = token.split_once('=')?;
+    // `CARGO_TARGET_<triple>_RUNNER` / `_LINKER` name a program the build tool runs; `..._DIR` and the
+    // rest of the prefix do not, so this is a suffix test and not a prefix one.
+    const RUNNER_LABEL: &str = "cargo_target_runner_or_linker";
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    tokens.iter().enumerate().find_map(|(position, token)| {
+        // `NAME=value` in one token, or PowerShell's spaced `$env:NAME = value`, where the `=` is the
+        // next token or starts it.
+        let name = match token.split_once('=') {
+            Some((name, _)) => name,
+            None => {
+                let next = tokens.get(position + 1)?;
+                if token.starts_with('$') && next.starts_with('=') {
+                    token
+                } else {
+                    return None;
+                }
+            }
+        };
         let name = name.trim_start_matches('$').to_ascii_lowercase();
         // PowerShell spells an environment assignment `$env:NAME=...`; without this the `env:`
         // prefix made every name above unrecognisable to the list.
         let name = name.strip_prefix("env:").unwrap_or(&name);
+        if name.starts_with("cargo_target_")
+            && (name.ends_with("_runner") || name.ends_with("_linker"))
+        {
+            return Some(RUNNER_LABEL);
+        }
         LOADER_VARIABLES
             .iter()
             .find(|known| **known == name)
@@ -708,6 +738,40 @@ mod tests {
         }
         assert!(matches!(
             read("$env:GIT_SSH_COMMAND='./x'; git fetch", Shell::PowerShell),
+            Reading::Unreadable(_)
+        ));
+    }
+
+    /// Gaps found in review: whole-file git config replacement, rustc flags (`-C linker=`), the
+    /// per-target runner and linker, and PowerShell's spaced `$env:X = value`.
+    #[test]
+    fn the_remaining_program_naming_assignments_are_refused() {
+        for command in [
+            "GIT_CONFIG_GLOBAL=./evil git log",
+            "GIT_CONFIG_SYSTEM=./evil git log",
+            "RUSTFLAGS='-C linker=./x' cargo build",
+            "CARGO_ENCODED_RUSTFLAGS=x cargo build",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=./x cargo test",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=./x cargo build",
+        ] {
+            assert!(
+                matches!(posix(command), Reading::Unreadable(_)),
+                "{command} should not be readable"
+            );
+        }
+        for command in [
+            "$env:RUSTFLAGS = '-C linker=./x'; cargo build",
+            "$env:GIT_SSH_COMMAND = './x'; git fetch",
+            "$env:PATH = 'C:/evil'; git status",
+        ] {
+            assert!(
+                matches!(read(command, Shell::PowerShell), Reading::Unreadable(_)),
+                "{command} should not be readable"
+            );
+        }
+        // The runner/linker suffix must not catch the directory variable.
+        assert!(!matches!(
+            posix("CARGO_TARGET_DIR=C:/t cargo build"),
             Reading::Unreadable(_)
         ));
     }

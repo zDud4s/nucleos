@@ -91,14 +91,45 @@ impl Drop for TempAudio {
     }
 }
 
-/// Distinct per call within a process, and per process, without a clock or a random source.
+/// Distinct per call within a process, and per process, and not guessable from either: the name
+/// carries a per-call random nonce (std's `RandomState` is seeded from the OS), so another local
+/// user cannot pre-create the path in a shared temp directory. [`write_new_audio`] closes the rest.
 fn temp_audio_path(extension: &str) -> PathBuf {
+    use std::hash::{BuildHasher, Hasher};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(ordinal);
+    let nonce = hasher.finish();
     std::env::temp_dir().join(format!(
-        "nucleos-voice-{}-{ordinal}.{extension}",
+        "nucleos-voice-{}-{ordinal}-{nonce:016x}.{extension}",
         std::process::id()
     ))
+}
+
+/// Writes the recording to a path that must not exist yet (`create_new`: it fails rather than follow
+/// a planted file or symlink), owner-only on POSIX.
+fn write_new_audio(path: &std::path::Path, audio: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(audio)
+}
+
+/// Appends a body chunk, refusing once the total would pass [`MAX_TRANSCRIPT_BYTES`].
+fn append_capped(body: &mut Vec<u8>, chunk: &[u8]) -> std::io::Result<()> {
+    if body.len() + chunk.len() > MAX_TRANSCRIPT_BYTES {
+        return Err(std::io::Error::other(format!(
+            "the transcriber answered with more than {MAX_TRANSCRIPT_BYTES} bytes"
+        )));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 /// PURE: the filename extension for the temp recording, resolved through an allowlist.
@@ -156,10 +187,12 @@ impl Transcriber for CommandTranscriber {
 
         // Built before anything can await, and owning the file from this line onwards. Constructing it
         // after the spawn would reintroduce exactly the leak it exists to prevent.
-        let audio_file = TempAudio {
-            path: temp_audio_path(extension),
-        };
-        std::fs::write(&audio_file.path, audio)?;
+        let path = temp_audio_path(extension);
+        // Created before the guard exists: if `create_new` refuses a planted path, the guard must not
+        // go on to delete a file this call never made.
+        let created = write_new_audio(&path, audio);
+        let audio_file = TempAudio { path };
+        created?;
 
         let mut command = Command::new(program);
         command
@@ -324,7 +357,12 @@ impl Transcriber for HttpTranscriber {
             )));
         }
 
-        let text = response.text().await.map_err(std::io::Error::other)?;
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(std::io::Error::other)? {
+            append_capped(&mut body, &chunk)?;
+        }
+        let text = String::from_utf8_lossy(&body).into_owned();
         // Trimmed like the spawning path trims stdout, so one transcript does not depend on which
         // engine produced it. `voice.rs` treats an empty transcript as "nothing was heard", and a
         // stray newline would make that judgement differ between the two implementations.
@@ -640,6 +678,39 @@ mod tests {
         assert_eq!(extension_for(Some("wav.exe")), None);
         assert_eq!(extension_for(Some("")), None);
         assert_eq!(extension_for(Some("   ")), None);
+    }
+
+    #[test]
+    fn two_temp_audio_paths_never_repeat_and_are_not_the_old_predictable_name() {
+        let first = temp_audio_path("wav");
+        let second = temp_audio_path("wav");
+        assert_ne!(first, second);
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        let predictable = format!("nucleos-voice-{}-0.wav", std::process::id());
+        assert_ne!(name, predictable);
+        // pid, ordinal and a 16-digit nonce.
+        assert_eq!(name.matches('-').count(), 4, "name was {name}");
+    }
+
+    #[test]
+    fn the_recording_is_never_written_over_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("planted.wav");
+        std::fs::write(&path, b"planted").unwrap();
+        assert!(write_new_audio(&path, b"voice").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"planted");
+
+        let fresh = dir.path().join("fresh.wav");
+        write_new_audio(&fresh, b"voice").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"voice");
+    }
+
+    #[test]
+    fn a_transcript_body_past_the_cap_is_refused() {
+        let mut body = Vec::new();
+        append_capped(&mut body, &vec![b'a'; MAX_TRANSCRIPT_BYTES]).unwrap();
+        assert!(append_capped(&mut body, b"b").is_err());
+        assert_eq!(body.len(), MAX_TRANSCRIPT_BYTES);
     }
 
     #[test]
