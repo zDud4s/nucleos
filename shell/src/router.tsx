@@ -1,5 +1,5 @@
 // §spec novo-frontend
-import type { ReactNode } from "react";
+import { Suspense, lazy, type ComponentType, type ReactNode } from "react";
 import {
   createMemoryHistory,
   createRootRoute,
@@ -11,14 +11,9 @@ import { AppShell } from "./app/AppShell";
 import { RouteError } from "./app/RouteError";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
 import { Agents } from "./pages/Agents";
-import { Autopilot } from "./pages/Autopilot";
 import { Calendar, validateCalendarSearch } from "./pages/Calendar";
-import { Chats } from "./pages/Chats";
 import { Contacts } from "./pages/Contacts";
-import { Council } from "./pages/Council";
 import { Feed, validateFeedSearch } from "./pages/Feed";
-import { Files } from "./pages/Files";
-import { Fleet } from "./pages/Fleet";
 import { Home } from "./pages/Home";
 import { Mail } from "./pages/Mail";
 import { MailDetail } from "./pages/MailDetail";
@@ -28,14 +23,38 @@ import { NewProject } from "./pages/NewProject";
 import { Workspace } from "./project/Workspace";
 import { RunDetail } from "./pages/RunDetail";
 import { Runs, validateRunSearch } from "./pages/Runs";
-import { System } from "./pages/System";
 import { TeamRunDetail } from "./pages/TeamRunDetail";
-import { Teams } from "./pages/Teams";
 import { Bench } from "./team/Bench";
 import { Voice, validateVoiceSearch } from "./pages/Voice";
-import { Brain, validateBrainSearch } from "./pages/Brain";
+import { validateBrainSearch } from "./brain/search";
 import { Waiting, validateWaitingSearch } from "./pages/Waiting";
 import { BrowserRedirect, WebTabs } from "./pages/WebTabs";
+
+/**
+ * Pages that are not the landing route load on first visit rather than at startup. `Chats` alone is
+ * thousands of lines and `Brain` pulls in d3-force; none of it is needed to paint Home. The
+ * boundary lives here, around the page, so the shell (rail, kill switch) stays on screen while a
+ * chunk loads. Chunks are local, so the fallback is empty rather than a spinner that would flash.
+ */
+function lazyPage(load: () => Promise<{ default: ComponentType }>): () => ReactNode {
+  const Page = lazy(load);
+  return function LazyPage() {
+    return (
+      <Suspense fallback={null}>
+        <Page />
+      </Suspense>
+    );
+  };
+}
+
+const Autopilot = lazyPage(() => import("./pages/Autopilot").then((m) => ({ default: m.Autopilot })));
+const Brain = lazyPage(() => import("./pages/Brain").then((m) => ({ default: m.Brain })));
+const Chats = lazyPage(() => import("./pages/Chats").then((m) => ({ default: m.Chats })));
+const Council = lazyPage(() => import("./pages/Council").then((m) => ({ default: m.Council })));
+const Files = lazyPage(() => import("./pages/Files").then((m) => ({ default: m.Files })));
+const Fleet = lazyPage(() => import("./pages/Fleet").then((m) => ({ default: m.Fleet })));
+const System = lazyPage(() => import("./pages/System").then((m) => ({ default: m.System })));
+const Teams = lazyPage(() => import("./pages/Teams").then((m) => ({ default: m.Teams })));
 
 /**
  * Memory history, in the real app as well as in the tests.
