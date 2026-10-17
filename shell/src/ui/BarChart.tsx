@@ -3,6 +3,8 @@ import { Group } from "@visx/group";
 import { scaleBand, scaleLinear } from "@visx/scale";
 import { Bar } from "@visx/shape";
 
+import { seriesClass, type ChartDatum, type ChartKey, type ChartPart } from "./chart-series";
+
 /**
  * Days, stacked.
  *
@@ -23,26 +25,14 @@ import { Bar } from "@visx/shape";
  * **Empty is drawn, not blank.** A window with nothing in it keeps its axes and says why in `empty`.
  */
 
-export interface BarPart {
-  key: string;
-  value: number;
-}
-
-export interface BarDatum {
-  /** `YYYY-MM-DD`, a UTC day. */
-  day: string;
-  /** Parts in any order; missing keys are zero. */
-  parts: BarPart[];
-  /** Today, not over yet: drawn hollow and titled as such. */
-  partial?: boolean;
-}
-
-export interface BarKey {
-  key: string;
-  label: string;
-  /** A fixed series class (`ui-chart-judge`, `ui-chart-failed`, …). Otherwise one of the eight by position. */
-  className?: string;
-}
+/*
+  The day/part/key types and `seriesClass` live in `chart-series.ts`, shared with `AreaChart` and
+  `ShareBar`. The old names stay as aliases so every existing import keeps compiling.
+*/
+export type BarPart = ChartPart;
+export type BarDatum = ChartDatum;
+export type BarKey = ChartKey;
+export { seriesClass };
 
 export interface BarChartProps {
   data: BarDatum[];
@@ -61,19 +51,8 @@ export interface BarChartProps {
 const WIDTH = 640;
 const HEIGHT = 180;
 const MARGIN = { top: 8, right: 8, bottom: 22, left: 52 };
-const CATEGORICAL = 8;
 /** At most this many day labels under the axis, or they overlap at 90 days. */
 const DAY_TICKS = 6;
-
-/** The series class for a key: its own, or one of the eight categorical ones by position. */
-export function seriesClass(keys: BarKey[], key: string): string {
-  const index = keys.findIndex((candidate) => candidate.key === key);
-  // A key the legend does not know is "other": falling back to series 1 would pass it off as that one.
-  if (index < 0) return "ui-chart-other";
-  const own = index >= 0 ? keys[index].className : undefined;
-  if (own !== undefined) return own;
-  return `ui-chart-s${(index % CATEGORICAL) + 1}`;
-}
 
 export interface StackedPart extends BarPart {
   from: number;

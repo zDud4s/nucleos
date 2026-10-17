@@ -5,6 +5,7 @@
  * page, and one place to see what the app is built out of. A primitive that is
  * not exported here does not exist as far as the rest of the shell is concerned.
  */
+export { AreaChart, type AreaChartProps } from "./AreaChart";
 export { Badge, type BadgeProps, type BadgeTone } from "./Badge";
 export {
   BarChart,
@@ -16,6 +17,7 @@ export {
   type BarKey,
   type BarPart,
 } from "./BarChart";
+export { type ChartDatum, type ChartKey, type ChartPart } from "./chart-series";
 export { Button, type ButtonIntent, type ButtonProps, type ButtonVariant } from "./Button";
 export { ConfirmButton, type ConfirmButtonProps } from "./ConfirmButton";
 export { CopyButton, type CopyButtonProps } from "./CopyButton";
@@ -90,6 +92,7 @@ export {
 export { Row, Rows, type RowProps, type RowsProps } from "./Rows";
 export { Section, type SectionProps } from "./Section";
 export { SectionTitle, type SectionTitleProps } from "./SectionTitle";
+export { ShareBar, type ShareBarProps, type ShareItem } from "./ShareBar";
 export { SlotPips, type SlotPipsProps } from "./SlotPips";
 export { Sparkline, type SparklineProps } from "./Sparkline";
 export { StaleNote, type StaleNoteProps } from "./StaleNote";
