@@ -12,7 +12,7 @@ import {
   readings,
   renderApp,
   slot,
-  renderWithQuery,
+  renderWithRouter,
   type DaemonState,
 } from "../test/harness";
 import { ApiRefusal } from "../data/client";
@@ -367,9 +367,10 @@ describe("the project workspace", () => {
   it("says it is still reading before the roster answers, rather than saying all is well", async () => {
     // The mode on its own, not the app: `renderApp` waits behind the connection
     // gate, so by the time it paints the roster has already answered and this
-    // state is over. Mounting the mode directly is the only way to see it.
+    // state is over. Mounting the mode directly is the only way to see it. Inside a router
+    // because the Readings section now carries a "See trends" link.
     daemon.apiFetch.mockImplementation(() => new Promise(() => {}));
-    const { container } = renderWithQuery(<ModeState projectId="nucleos" answered={false} />);
+    const { container } = await renderWithRouter(<ModeState projectId="nucleos" answered={false} />);
 
     const leading = container.querySelector('section[aria-label="Leading"]');
     expect(leading?.textContent).toBe("Reading nucleos…");
