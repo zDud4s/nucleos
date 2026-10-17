@@ -81,6 +81,23 @@ CASES = [
     (f'{G} --git-dir="C:/My Repo/.git" push', "push"),
     (f'{G} -c "user.name=A B" fetch origin', "fetch"),
     (f'sh -c "{G} push origin master"', "push"),
+    # `pull` fetches and merges into the checked-out branch: the daemon refuses a direct one, so
+    # the hook has to ask it.
+    (f"{G} pull", "pull"),
+    (f"cd /repo && {G} pull origin master", "pull"),
+    # The word as the shell sees it, not as it is typed: a bash backslash escape, a PowerShell
+    # backtick escape, and quotes around the program or the verb all run the same git.
+    (f"{G} pu\\sh origin master", "push"),
+    (f"{G} pu`sh origin master", "push"),
+    (f"{G} m`erge feature", "merge"),
+    (f'"{G}" push origin master', "push"),
+    (f'{G} "push" origin master', "push"),
+    (f"'{G}' 'merge' feature", "merge"),
+    (f'{G} p"u"sh origin master', "push"),
+    (f"{G} p''ull", "pull"),
+    # And the escapes leave the harmless alone.
+    (f"{G} st`atus", ""),
+    (f"{G} st\\atus", ""),
     # And the ordinary work of a session, which must stay untouched. A guard that refuses these is
     # a guard someone turns off.
     (f"{G} status", ""),

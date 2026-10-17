@@ -63,8 +63,9 @@ SESSION_ID_SHAPE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 #
 # `branch` is in the list for `branch -d` and lets `branch --list` through to the daemon, which
 # declines it. That is the right way round: over-including costs one HTTP call, under-including
-# costs the guarantee.
-QUEUE_SUBCOMMANDS = ("merge", "push", "tag", "fetch", "branch", "rebase")
+# costs the guarantee. `pull` is a fetch plus a merge into the checked-out branch, and the daemon
+# refuses a direct one; a filter that never asked it let every editor session pull unqueued.
+QUEUE_SUBCOMMANDS = ("merge", "push", "tag", "fetch", "branch", "rebase", "pull")
 
 # Where one command word can end and another begin, in sh or in PowerShell. Normalized to spaces
 # before the scan below, so `cd x&&git push` splits with no spaces in it anywhere.
@@ -92,6 +93,22 @@ def governed_git_verb(command: str) -> str:
     of a false positive is one refusal a person can reword; the cost of a false negative is the
     queue's whole promise, silently.
     """
+    # The words as the shell would hand them to git, not as they were typed. bash drops the
+    # backslash of `pu\sh` and PowerShell the backtick of `pu`sh`; both run `push`, and the raw
+    # text matched neither. Every reading is scanned and any one governing the command is enough:
+    # stripping an escape character also mangles a Windows path or a bash command substitution,
+    # which the untouched reading still sees.
+    unescaped_bash = re.sub(r"\\(.)", r"\1", command, flags=re.DOTALL)
+    for variant in (command, command.replace("`", ""), unescaped_bash,
+                    unescaped_bash.replace("`", "")):
+        verb = _verb_in_command(variant)
+        if verb:
+            return verb
+    return ""
+
+
+def _verb_in_command(command: str) -> str:
+    """One reading of `governed_git_verb`: separators, then quote-aware and plain tokens."""
     normalized = command
     for separator in SEGMENT_SEPARATORS:
         normalized = normalized.replace(separator, " ")

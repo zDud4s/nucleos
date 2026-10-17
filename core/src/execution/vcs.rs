@@ -1655,6 +1655,45 @@ mod tests {
         }
     }
 
+    /// **The word git receives, not the word as it was typed.** `"git" push --force`, `git
+    /// pu\sh --force` (bash drops the backslash) and ``git pu`sh --force`` (PowerShell drops the
+    /// backtick) all run the same forced push, and the raw tokens matched no arm, so each came back
+    /// `None` — which the session gate reads as ALLOW. A quoted verb the parsers did not take falls
+    /// to the refusing arms like any other unread spelling, and a quoted read stays a read.
+    #[test]
+    fn a_quoted_or_escaped_git_word_is_read_as_the_word_git_receives() {
+        for command in [
+            r#""git" push --force origin main"#,
+            r#"git "push" --force origin main"#,
+            "'git' 'push' --force origin main",
+            r"git pu\sh --force origin main",
+            "git pu`sh --force origin main",
+            r#""git" pull origin main"#,
+            r"git pu\ll origin main",
+            "git pu`ll origin main",
+            r#""git" merge feature"#,
+            r#"git "merge" --no-ff feature -m msg"#,
+            r#"git branch "-D" feature"#,
+            r"git branch \-D feature",
+            r#""git" -C /somewhere push --force origin main"#,
+            // The program by path, backslashes and all: still git, and not mangled by the unescape.
+            r"C:\Git\bin\git.exe push --force origin main",
+            r#""C:\Git\bin\git.exe" push --force origin main"#,
+        ] {
+            assert!(unqueueable_but_shared(command).is_some(), "{command}");
+        }
+
+        for command in [
+            r#""git" status"#,
+            "git st`atus",
+            r"git st\atus",
+            r#""git" merge --squash feature"#,
+            r#"git "tag" --list "v1.*""#,
+        ] {
+            assert_eq!(unqueueable_but_shared(command), None, "{command}");
+        }
+    }
+
     /// The bypass every parser in this file was open to, and it needed no cleverness to use.
     ///
     /// Each of them matches the whole token list as an exact shape, so a shell operator in front of
@@ -1909,6 +1948,33 @@ mod tests {
             push_from_command("git push origin --exec=x", "master"),
             None
         );
+    }
+
+    /// A push spelled with quotes or bash escapes is the same push, and is queued as one. Read raw,
+    /// `"git" push origin main` matched no shape, nothing else refused it, and it ran by hand.
+    #[test]
+    fn a_quoted_or_escaped_push_is_queued_as_the_push_it_runs() {
+        for command in [
+            r#""git" push origin main"#,
+            r#"git "push" origin main"#,
+            "'git' 'push' 'origin' 'main'",
+            r#"git push origin "main""#,
+            r"git pu\sh origin main",
+            r#"git p"u"sh origin main"#,
+        ] {
+            assert_eq!(
+                push_from_command(command, "master"),
+                Some(Op::Push {
+                    remote: "origin".into(),
+                    branch: "main".into()
+                }),
+                "{command}"
+            );
+        }
+        // The strict shapes survive the unescape: a quoted flag is still the flag.
+        for command in [r#"git push "--force" origin main"#, r#""git" push"#] {
+            assert_eq!(push_from_command(command, "master"), None, "{command}");
+        }
     }
 
     /// The parsers are tried one after another in `runs::queueable_operation`, and this is why that
