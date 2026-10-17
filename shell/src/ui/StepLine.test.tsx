@@ -25,6 +25,14 @@ function draw(series: StepSeries[] = SERIES) {
   );
 }
 
+/** The absolute `x,y` pairs of a path made of M/L commands (what a step curve emits). */
+function pathPoints(d: string): Array<[number, number]> {
+  const nums = (d.match(/-?\d+(?:\.\d+)?(?:e-?\d+)?/g) ?? []).map(Number);
+  const out: Array<[number, number]> = [];
+  for (let i = 0; i + 1 < nums.length; i += 2) out.push([nums[i], nums[i + 1]]);
+  return out;
+}
+
 describe("StepLine", () => {
   it("names the chart and draws one stepped path per series with points", () => {
     const { container } = draw();
@@ -32,7 +40,13 @@ describe("StepLine", () => {
     const paths = [...container.querySelectorAll("path.ui-step-line")];
     expect(paths).toHaveLength(2);
     // Steps, not slopes: a step-after path only ever moves horizontally or vertically.
-    expect(paths[0].getAttribute("d")).not.toMatch(/C|Q|S/);
+    const coords = pathPoints(paths[0].getAttribute("d") ?? "");
+    expect(coords.length).toBeGreaterThan(2);
+    for (let i = 1; i < coords.length; i += 1) {
+      const [px, py] = coords[i - 1];
+      const [cx, cy] = coords[i];
+      expect(px === cx || py === cy, `segment ${i} is neither horizontal nor vertical`).toBe(true);
+    }
   });
 
   it("titles every point with its series, time and value, and marks a stale one", () => {
@@ -57,5 +71,34 @@ describe("StepLine", () => {
     expect(container.querySelectorAll("path.ui-step-line")).toHaveLength(0);
     expect(container.querySelectorAll(".ui-chart-axis").length).toBeGreaterThanOrEqual(2);
     expect(getByText("No quota history yet")).toBeTruthy();
+  });
+
+  it("keeps every point and the held tail inside the plot", () => {
+    const day = 24 * 3600 * 1000;
+    const { container } = draw([
+      {
+        key: "anthropic:5h",
+        label: "anthropic 5h",
+        points: [
+          { at: FROM - 2 * day, value: 0.3 },
+          { at: FROM + day, value: 1.4 },
+          { at: TO + day, value: 0.5 },
+        ],
+      },
+    ]);
+    const inner = { w: 640 - 44 - 8, h: 160 - 8 - 22 };
+    const coords = pathPoints(container.querySelector("path.ui-step-line")?.getAttribute("d") ?? "");
+    expect(coords.length).toBeGreaterThan(1);
+    for (const [px, py] of coords) {
+      expect(px).toBeGreaterThanOrEqual(-0.001);
+      expect(px).toBeLessThanOrEqual(inner.w + 0.001);
+      expect(py).toBeGreaterThanOrEqual(-0.001);
+      expect(py).toBeLessThanOrEqual(inner.h + 0.001);
+    }
+    for (const dot of container.querySelectorAll("circle.ui-step-dot")) {
+      expect(Number(dot.getAttribute("cx"))).toBeLessThanOrEqual(inner.w + 0.001);
+      expect(Number(dot.getAttribute("cx"))).toBeGreaterThanOrEqual(-0.001);
+      expect(Number(dot.getAttribute("cy"))).toBeLessThanOrEqual(inner.h + 0.001);
+    }
   });
 });

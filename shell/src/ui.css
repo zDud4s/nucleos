@@ -3404,6 +3404,30 @@ ol.ui-well {
 /* Windows high-contrast replaces every colour, and a tone carried only by background or fill
    disappears with it. Each of these gets a system-colour edge or fill back. */
 @media (forced-colors: active) {
+  /* Data colours are content, not decoration: keep them, and give them an edge to be read by. */
+  .ui-chart-svg,
+  .ui-chart-swatch {
+    forced-color-adjust: none;
+  }
+
+  .ui-chart-swatch {
+    border: 1px solid CanvasText;
+  }
+
+  .ui-bar {
+    stroke: Canvas;
+    stroke-width: 1px;
+  }
+
+  .ui-chart-tick-label {
+    fill: CanvasText;
+  }
+
+  .ui-chart-axis line,
+  .ui-chart-tick line {
+    stroke: CanvasText;
+  }
+
   .ui-badge {
     border: 1px solid CanvasText;
   }

@@ -68,9 +68,11 @@ const DAY_TICKS = 6;
 /** The series class for a key: its own, or one of the eight categorical ones by position. */
 export function seriesClass(keys: BarKey[], key: string): string {
   const index = keys.findIndex((candidate) => candidate.key === key);
+  // A key the legend does not know is "other": falling back to series 1 would pass it off as that one.
+  if (index < 0) return "ui-chart-other";
   const own = index >= 0 ? keys[index].className : undefined;
   if (own !== undefined) return own;
-  return `ui-chart-s${(Math.max(index, 0) % CATEGORICAL) + 1}`;
+  return `ui-chart-s${(index % CATEGORICAL) + 1}`;
 }
 
 export interface StackedPart extends BarPart {

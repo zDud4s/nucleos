@@ -68,9 +68,18 @@ export function StepLine({ series, from, to, label, format, empty, width = WIDTH
         <Group left={MARGIN.left} top={MARGIN.top}>
           {series.map((one) => {
             if (one.points.length === 0) return null;
-            const last = one.points[one.points.length - 1];
+            // Nothing after `to` is drawn; a reading from before `from` still holds into the window, so it
+            // starts at the left edge. Values are clamped to the scale: the svg does not clip.
+            const upTo = one.points.filter((point) => point.at <= to);
+            if (upTo.length === 0) return null;
+            const last = upTo[upTo.length - 1];
             // The last reading holds until now: a step has to end somewhere, and "now" is where it is still true.
-            const held = [...one.points, { at: Math.max(to, last.at), value: last.value }];
+            const held = [...upTo, { at: to, value: last.value }].map((point) => ({
+              ...point,
+              at: Math.max(point.at, from),
+              value: Math.min(Math.max(point.value, 0), 1),
+            }));
+            const inWindow = upTo.filter((point) => point.at >= from);
             const tone = seriesClass(keys, one.key);
             return (
               <g key={one.key} className={tone}>
@@ -81,10 +90,10 @@ export function StepLine({ series, from, to, label, format, empty, width = WIDTH
                   y={(point) => y(point.value)}
                   curve={curveStepAfter}
                 />
-                {one.points.map((point) => (
+                {inWindow.map((point) => (
                   <g key={point.at} className={point.stale === true ? "ui-step-point ui-step-stale" : "ui-step-point"}>
                     <title>{`${one.label} · ${utcMinute(point.at)}: ${format(point.value)}${point.stale === true ? " (stale)" : ""}`}</title>
-                    <circle className="ui-step-dot" cx={x(point.at)} cy={y(point.value)} r={2.5} />
+                    <circle className="ui-step-dot" cx={x(point.at)} cy={y(Math.min(Math.max(point.value, 0), 1))} r={2.5} />
                   </g>
                 ))}
               </g>

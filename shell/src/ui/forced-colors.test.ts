@@ -34,6 +34,15 @@ describe("forced colors", () => {
     expect(block).toContain('.ui-switch-seg[aria-pressed="true"]');
   });
 
+  it("keeps chart series colours as content under forced colours", () => {
+    const block = forcedColorsBlock();
+    expect(block).toContain(".ui-chart-swatch");
+    expect(block).toContain(".ui-chart-svg");
+    expect(block).toContain("forced-color-adjust: none");
+    expect(block).toContain(".ui-bar");
+    expect(block).toContain(".ui-chart-tick-label");
+  });
+
   it("field borders use --border-field, and the token is defined", () => {
     expect(tokens).toContain("--border-field:");
     for (const control of ["input", "select", "textarea"]) {
