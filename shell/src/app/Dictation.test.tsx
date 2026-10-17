@@ -17,11 +17,14 @@ type Handler = (event: { payload?: unknown }) => void;
 let handlers: Record<string, Handler>;
 
 /** jsdom has neither `getUserMedia` nor `AudioContext`; this is enough to capture zero frames and post them. */
-function stubAudioPipeline() {
-  const stream = { getTracks: () => [{ stop: vi.fn() }] } as unknown as MediaStream;
+function stubAudioPipeline(
+  getUserMedia: () => Promise<MediaStream> = () =>
+    Promise.resolve({ getTracks: () => [{ stop: vi.fn() }] } as unknown as MediaStream),
+  closeContext: () => Promise<void> = () => Promise.resolve(),
+) {
   Object.defineProperty(window.navigator, "mediaDevices", {
     configurable: true,
-    value: { getUserMedia: vi.fn().mockResolvedValue(stream) },
+    value: { getUserMedia: vi.fn(getUserMedia) },
   });
   class FakeAudioContext {
     sampleRate = 48000;
@@ -36,7 +39,7 @@ function stubAudioPipeline() {
       return { connect: vi.fn(), disconnect: vi.fn(), gain: { value: 1 } };
     }
     close() {
-      return Promise.resolve();
+      return closeContext();
     }
   }
   (window as unknown as { AudioContext: typeof AudioContext }).AudioContext =
@@ -119,5 +122,64 @@ describe("DictationProvider", () => {
 
     await waitFor(() => expect(tauri.listen).toHaveBeenCalledTimes(2));
     expect(screen.getByText("idle")).toBeDefined();
+  });
+
+  /* The host moved to `recording` the moment the chord fired; a microphone that then cannot open must
+     hand it back, or every later hotkey answers "busy" until the app restarts. */
+  it("abandons the host when the microphone cannot be opened", async () => {
+    stubAudioPipeline(() => Promise.reject(new Error("permission denied")));
+    render(
+      <DictationProvider>
+        <SomeOtherPage />
+      </DictationProvider>,
+    );
+    await waitFor(() => expect(handlers["voice://stop"]).toBeDefined());
+
+    act(() => handlers["voice://start"]({ payload: "dictation" }));
+
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("voice_abandon"));
+    expect(await screen.findByText("idle")).toBeDefined();
+  });
+
+  it("honours a stop that arrives while the permission prompt is open", async () => {
+    let allow: () => void = () => {};
+    stubAudioPipeline(
+      () =>
+        new Promise((resolve) => {
+          allow = () => resolve({ getTracks: () => [{ stop: vi.fn() }] } as unknown as MediaStream);
+        }),
+    );
+    render(
+      <DictationProvider>
+        <SomeOtherPage />
+      </DictationProvider>,
+    );
+    await waitFor(() => expect(handlers["voice://stop"]).toBeDefined());
+
+    act(() => handlers["voice://start"]({ payload: "dictation" }));
+    act(() => handlers["voice://stop"]({}));
+    await act(async () => allow());
+
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("voice_paste", { text: "hello from anywhere" }),
+    );
+    expect(await screen.findByText("idle")).toBeDefined();
+  });
+
+  it("abandons the host when closing the microphone fails", async () => {
+    stubAudioPipeline(undefined, () => Promise.reject(new Error("context gone")));
+    render(
+      <DictationProvider>
+        <SomeOtherPage />
+      </DictationProvider>,
+    );
+    await waitFor(() => expect(handlers["voice://stop"]).toBeDefined());
+
+    act(() => handlers["voice://start"]({ payload: "dictation" }));
+    expect(await screen.findByText("recording")).toBeDefined();
+    act(() => handlers["voice://stop"]({}));
+
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("voice_abandon"));
+    expect(await screen.findByText("idle")).toBeDefined();
   });
 });
