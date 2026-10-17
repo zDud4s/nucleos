@@ -101,6 +101,35 @@ func TestAnUnverifiedInstallIsRefused(t *testing.T) {
 	}
 }
 
+// TestAnOversizedDownloadIsRefused. The archive is held in memory to be hashed, so a body that never
+// ends must stop at a ceiling instead of taking the process down.
+func TestAnOversizedDownloadIsRefused(t *testing.T) {
+	old := maxArchive
+	maxArchive = 64
+	t.Cleanup(func() { maxArchive = old })
+
+	install := installInto(t, strings.Repeat("0", 64))
+	err := install.Download(context.Background(), &fakeFetcher{body: bytes.Repeat([]byte("x"), 1000)})
+	if !errors.Is(err, ErrArchiveTooLarge) {
+		t.Fatalf("got %v, want ErrArchiveTooLarge", err)
+	}
+}
+
+// TestAnEmptyOrNonRegularExecutableIsNotPresent.
+func TestAnEmptyOrNonRegularExecutableIsNotPresent(t *testing.T) {
+	install := installInto(t, "x")
+	exe := install.ExecutablePath()
+	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if install.Present() {
+		t.Error("a zero-byte executable counted as installed")
+	}
+}
+
 func TestATamperedArchiveIsRefusedAndNothingIsWritten(t *testing.T) {
 	archive, digest := buildZip(t, map[string]string{"chrome-win/chrome.exe": "MZ real"})
 	tampered, _ := buildZip(t, map[string]string{"chrome-win/chrome.exe": "MZ evil"})
