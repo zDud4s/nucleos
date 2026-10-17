@@ -803,6 +803,27 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The tools whose calls the classifier has to see for the barrier to mean anything.
+const GOVERNED_TOOLS: [&str; 3] = ["Bash", "Write", "Edit"];
+
+/// Claude Code's matcher semantics: absent, empty or `*` match every tool; otherwise the matcher is
+/// a regex over the tool name (a plain `A|B` list is the same thing). An unparsable matcher
+/// matches nothing, so the hook counts as not covering the governed tools.
+fn matcher_covers_governed_tools(matcher: Option<&serde_json::Value>) -> bool {
+    let text = match matcher {
+        None | Some(serde_json::Value::Null) => return true,
+        Some(serde_json::Value::String(text)) => text.as_str(),
+        Some(_) => return false,
+    };
+    if text.is_empty() || text == "*" {
+        return true;
+    }
+    let Ok(pattern) = regex::Regex::new(text) else {
+        return false;
+    };
+    GOVERNED_TOOLS.iter().all(|tool| pattern.is_match(tool))
+}
+
 /// Whether THIS daemon's classifier hook is both registered in `dir` and executable there.
 ///
 /// Two callers ask this, and they must never diverge. Activation asks it before letting a project
@@ -837,22 +858,31 @@ pub fn classifier_hook_is_wired(dir: &Path) -> bool {
     // Matching on the script's path rather than the whole command line, because the invocation
     // around it is the user's business (`python`, `py -3`, a venv, extra flags) and only the
     // script identifies the hook as this daemon's.
+    // Hooks switched off wholesale classify nothing, whatever is registered.
+    if settings
+        .get("disableAllHooks")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return false;
+    }
     let registered = settings
         .get("hooks")
         .and_then(|hooks| hooks.get("PreToolUse"))
         .and_then(serde_json::Value::as_array)
         .is_some_and(|entries| {
             entries.iter().any(|entry| {
-                entry
-                    .get("hooks")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|inner| {
-                        inner.iter().any(|hook| {
-                            hook.get("command")
-                                .and_then(serde_json::Value::as_str)
-                                .is_some_and(|command| command.contains(HOOK_SCRIPT))
+                matcher_covers_governed_tools(entry.get("matcher"))
+                    && entry
+                        .get("hooks")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|inner| {
+                            inner.iter().any(|hook| {
+                                hook.get("command")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|command| command.contains(HOOK_SCRIPT))
+                            })
                         })
-                    })
             })
         });
 
@@ -3070,5 +3100,55 @@ pub mod tests {
         assert!(bare.path().join(".claude/settings.json").is_file());
         assert!(bare.path().join(HOOK_SCRIPT).is_file());
         assert!(classifier_hook_is_wired(bare.path()));
+    }
+
+    fn wire_with(root: &TempDir, matcher: Option<&str>, extra: &str) {
+        let matcher = matcher.map_or(String::new(), |m| format!("\"matcher\":\"{m}\","));
+        write_settings(
+            root,
+            &format!(
+                r#"{{{extra}"hooks":{{"PreToolUse":[{{{matcher}"hooks":[{{"type":"command","command":"python \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\""}}]}}]}}}}"#
+            ),
+        );
+        let hooks_dir = root.path().join(".claude/hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        fs::write(hooks_dir.join("ask_daemon.py"), "# hook").unwrap();
+    }
+
+    /// A hook whose matcher does not cover the governed tools classifies nothing that matters,
+    /// yet used to open `Permission::Bypass`.
+    #[test]
+    fn a_matcher_that_misses_the_governed_tools_is_not_wired() {
+        for matcher in ["Read", "Grep|Glob", "Notebook.*", "^Bash$x"] {
+            let root = TempDir::new().unwrap();
+            wire_with(&root, Some(matcher), "");
+            assert!(!classifier_hook_is_wired(root.path()), "{matcher}");
+        }
+    }
+
+    #[test]
+    fn a_matcher_that_covers_the_governed_tools_is_wired() {
+        for matcher in [
+            None,
+            Some(""),
+            Some("*"),
+            Some("Bash|Write|Edit"),
+            Some(".*"),
+        ] {
+            let root = TempDir::new().unwrap();
+            wire_with(&root, matcher, "");
+            assert!(classifier_hook_is_wired(root.path()), "{matcher:?}");
+        }
+    }
+
+    #[test]
+    fn disabling_all_hooks_means_not_wired() {
+        let root = TempDir::new().unwrap();
+        wire_with(&root, Some("*"), r#""disableAllHooks":true,"#);
+        assert!(!classifier_hook_is_wired(root.path()));
+
+        let root = TempDir::new().unwrap();
+        wire_with(&root, Some("*"), r#""disableAllHooks":false,"#);
+        assert!(classifier_hook_is_wired(root.path()));
     }
 }
