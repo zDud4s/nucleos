@@ -19,6 +19,7 @@ import type { FeedEntry, FeedSeen, FeedTimeline, NotifyPolicy, PendingNotificati
 import type { MachineConfig, MachineSecret } from "../data/machine-config";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
+import type { AnalyticsReport, QuotaHistory } from "../data/analytics";
 import type {
   ApiTokenSummary,
   BackupInfo,
@@ -62,6 +63,205 @@ const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 /** Fixed, because a screenshot taken twice should be the same screenshot. */
 export const NOW = Date.parse("2026-08-24T09:41:00Z");
+
+/** A `?days=` value as one of the three windows the núcleo serves, 30 otherwise. Local on purpose: this file imports only types from `data/`. */
+function windowDays(raw: string | null): number {
+  return raw === "7" || raw === "30" || raw === "90" ? Number(raw) : 30;
+}
+
+/** `days` UTC days ending on the preview's today, oldest first. */
+function previewDays(days: number): string[] {
+  const end = Date.parse(`${new Date(NOW).toISOString().slice(0, 10)}T00:00:00Z`);
+  return Array.from({ length: days }, (_, index) =>
+    new Date(end - (days - 1 - index) * 86_400_000).toISOString().slice(0, 10),
+  );
+}
+
+const cents = (value: number) => Math.round(value * 100) / 100;
+
+/** `GET /analytics` (projectId null) and `GET /projects/{id}/analytics`. Deterministic, never random. */
+export function previewAnalytics(projectId: string | null, rawDays: string | null): AnalyticsReport {
+  const days = windowDays(rawDays);
+  const both = previewDays(days * 2);
+  const list = both.slice(days);
+  const last = days - 1;
+  // The núcleo's labels for the reserved keys (core shapes): `Judge`, `Other projects`, `No project`.
+  const keys =
+    projectId === null
+      ? [
+          { key: "nucleos", label: "nucleos" },
+          { key: "alpha", label: "alpha" },
+          { key: "__none__", label: "No project" },
+          { key: "__other__", label: "Other projects" },
+          { key: "judge", label: "Judge" },
+        ]
+      : [
+          { key: "worktree", label: "worktree" },
+          { key: "shadow", label: "shadow" },
+          { key: "council", label: "council" },
+          { key: "judge", label: "Judge" },
+        ];
+  const wave = (day: number, key: number) => ((day * 7 + key * 3) % 5) / 4;
+  const costSeries = list.map((day, index) => ({
+    day,
+    partial: index === last,
+    by: keys.map((key, k) => ({
+      key: key.key,
+      measured_usd: key.key === "judge" ? cents(0.08 * wave(index, k)) : cents(1.6 * wave(index, k)),
+      estimated_usd: k === 0 && index % 9 === 0 ? 0.4 : 0,
+    })),
+  }));
+  const sumCost = (pick: (part: { key: string; measured_usd: number; estimated_usd: number }) => number) =>
+    cents(costSeries.reduce((total, point) => total + point.by.reduce((s, part) => s + pick(part), 0), 0));
+  const measured = sumCost((part) => (part.key === "judge" ? 0 : part.measured_usd));
+  const judge = sumCost((part) => (part.key === "judge" ? part.measured_usd : 0));
+  const estimated = sumCost((part) => part.estimated_usd);
+  const estimatedRuns = costSeries.filter((point) => point.by[0].estimated_usd > 0).length;
+
+  const tokenSeries = list.map((day, index) => {
+    const quiet = index % 5 === 4;
+    return {
+      day,
+      partial: index === last,
+      input: quiet ? 0 : 20_000 + index * 300,
+      cache_read: quiet ? 0 : 120_000,
+      cache_creation: quiet ? 0 : 8_000,
+      output: quiet ? 0 : 6_000,
+    };
+  });
+  const sumTokens = (pick: (point: (typeof tokenSeries)[number]) => number) =>
+    tokenSeries.reduce((total, point) => total + pick(point), 0);
+  const input = sumTokens((point) => point.input);
+  const cacheRead = sumTokens((point) => point.cache_read);
+  const cacheCreation = sumTokens((point) => point.cache_creation);
+
+  const gateSeries = list.map((day, index) => ({
+    day,
+    partial: index === last,
+    passed: (index % 4) + 1,
+    failed: index % 7 === 0 ? 1 : 0,
+    errored: index % 11 === 0 ? 1 : 0,
+    no_gate: index % 3 === 0 ? 1 : 0,
+    other: index === 3 ? 1 : 0,
+  }));
+  const sumGate = (pick: (point: (typeof gateSeries)[number]) => number) =>
+    gateSeries.reduce((total, point) => total + pick(point), 0);
+  const passed = sumGate((point) => point.passed);
+  const failed = sumGate((point) => point.failed);
+  const errored = sumGate((point) => point.errored);
+  const noGate = sumGate((point) => point.no_gate);
+  const other = sumGate((point) => point.other);
+  const completed = passed + failed + errored + noGate + other;
+
+  const landedSeries = list.map((day, index) => ({ day, partial: index === last, landed: index % 3 === 0 ? 1 : 0 }));
+  const landed = landedSeries.reduce((total, point) => total + point.landed, 0);
+
+  return {
+    scope: projectId === null ? "global" : "project",
+    project_id: projectId,
+    days,
+    timezone: "UTC",
+    now: new Date(NOW).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    window: { from: list[0], to: list[last] },
+    previous: { from: both[0], to: both[days - 1] },
+    counted: { modes: "all" },
+    cost: {
+      total: { measured_usd: measured, estimated_usd: estimated, judge_usd: judge, runs: completed, estimated_runs: estimatedRuns },
+      previous: { measured_usd: cents(measured * 0.7), estimated_usd: 0, judge_usd: cents(judge * 0.9), runs: 40, estimated_runs: 0 },
+      series: costSeries,
+      by_label: projectId === null ? "project" : "mode",
+      keys,
+    },
+    tokens: {
+      total: {
+        input,
+        cache_read: cacheRead,
+        cache_creation: cacheCreation,
+        output: sumTokens((point) => point.output),
+        measured_sessions: tokenSeries.filter((point) => point.input > 0).length * 2,
+        unmeasured_runs: 3,
+        cache_hit_ratio: cacheRead / (input + cacheRead + cacheCreation),
+      },
+      previous: {
+        input: Math.round(input * 1.2),
+        cache_read: cacheRead,
+        cache_creation: cacheCreation,
+        output: 5_000 * days,
+        measured_sessions: days,
+        unmeasured_runs: 0,
+        cache_hit_ratio: 0.55,
+      },
+      series: tokenSeries,
+    },
+    throughput: {
+      total: { runs_completed: completed, passed, failed, errored, no_gate: noGate, other },
+      previous: { runs_completed: 40, passed: 30, failed: 4, errored: 1, no_gate: 5, other: 0 },
+      series: gateSeries,
+      by_mode:
+        projectId === null
+          ? [
+              { mode: "worktree", runs_completed: passed },
+              { mode: "shadow", runs_completed: failed + errored + noGate },
+              { mode: "relay_v2", runs_completed: other },
+            ]
+          : [{ mode: "worktree", runs_completed: completed }],
+      in_flight: 2,
+    },
+    delivered: {
+      // An integer median (the núcleo's `median_of`), sent as a float: 47, never 47.5.
+      total: { landed, timed: Math.max(landed - 1, 0), median_minutes: landed > 1 ? 47 : null },
+      previous: { landed: Math.max(landed - 2, 0), timed: Math.max(landed - 2, 0), median_minutes: 61 },
+      series: landedSeries,
+    },
+    top_runs: Array.from({ length: 10 }, (_, n) => ({
+      run_id: 4100 + n,
+      // Globally, one run with no project: `project_id` is nullable in the núcleo's shape.
+      project_id: projectId ?? (n === 7 ? null : n % 2 === 0 ? "nucleos" : "alpha"),
+      mode: n % 3 === 0 ? "shadow" : "worktree",
+      completed_at: `${list[Math.max(last - n * 2, 0)]}T1${n}:05:00Z`,
+      cost_usd: cents(3.2 - n * 0.27),
+      cost_is_estimated: n === 4,
+    })),
+  };
+}
+
+/** `GET /analytics/quota`: a history that began five days ago, one stale reading among them. */
+export function previewQuotaHistory(rawDays: string | null): QuotaHistory {
+  const days = windowDays(rawDays);
+  const start = NOW - 5 * 86_400_000;
+  const at = (hours: number) => new Date(start + hours * 3_600_000).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const fiveHour = [0.12, 0.41, 0.08, 0.66, 0.3, 0.92, 0.18];
+  const sevenDay = [0.2, 0.31, 0.38, 0.47, 0.55];
+  return {
+    days,
+    timezone: "UTC",
+    since: at(0),
+    series: [
+      {
+        provider: "anthropic",
+        window: "5h",
+        fidelity: "official",
+        points: [0, 6, 12, 30, 54, 80, 101].map((hours, index) => ({
+          at: at(hours),
+          used_fraction: fiveHour[index],
+          resets_at: at(hours + 5),
+          stale: index === 4,
+        })),
+      },
+      {
+        provider: "anthropic",
+        window: "7d",
+        fidelity: "official",
+        points: [0, 24, 48, 72, 101].map((hours, index) => ({
+          at: at(hours),
+          used_fraction: sevenDay[index],
+          resets_at: null,
+          stale: false,
+        })),
+      },
+    ],
+  };
+}
 
 function ago(ms: number): string {
   return new Date(NOW - ms).toISOString();
@@ -3211,6 +3411,19 @@ export function answer(path: string, init?: RequestInit): unknown {
           holds: { slots: 0, worktrees: 0 },
         };
     }
+  }
+
+  /*
+    Analytics (spec analytics-fundacao §6), so the /analytics page and a project's Analytics mode
+    can both be photographed with every block populated. The window comes from `?days=` and falls
+    back to 30 as the núcleo does.
+  */
+  const analyticsDaysParam = query.get("days");
+  if (route === "/analytics/quota") return previewQuotaHistory(analyticsDaysParam);
+  if (route === "/analytics") return previewAnalytics(null, analyticsDaysParam);
+  const projectAnalytics = /^\/projects\/([^/]+)\/analytics$/.exec(route);
+  if (projectAnalytics !== null) {
+    return previewAnalytics(decodeURIComponent(projectAnalytics[1]), analyticsDaysParam);
   }
 
   const readings = /^\/projects\/([^/]+)\/readings$/.exec(route);
