@@ -703,6 +703,19 @@ pub(super) async fn post_project_onboard(
     project_state_dir(&state, &id)?;
     let machine_root = machine_config_root(&state)?;
     let root = onboarding_root(&state, &id, body.project_root).await?;
+    // Asked before onboarding writes anything. The wizard onboards a project before it registers
+    // it, so no roster row is what a NEW project looks like here — and only a new one gets the
+    // default workflow; a project already on the roster keeps whatever it uses. An unreadable
+    // roster reads as rostered: pinning is the one of the two answers that changes something.
+    let rostered = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM autopilot_state WHERE project_id = ?",
+    )
+    .bind(&id)
+    .fetch_one(&state.pool)
+    .await
+    .map(|rows| rows > 0)
+    .unwrap_or(true);
+    let home = machine_root.clone();
     let gate = body
         .gate_command
         .map(|command| command.trim().to_string())
@@ -769,8 +782,64 @@ pub(super) async fn post_project_onboard(
             "a project was onboarded and its feed line was not recorded"
         );
     }
+    if !rostered && let Some(library) = state.workflow_library.clone() {
+        pin_default_workflow(&state, &id, &root, home, library).await;
+    }
 
     onboarding_view(&state, &id, root).await.map(Json)
+}
+
+/// Pin the default workflow for a project being brought in, place its files in the project, and
+/// say so in the feed.
+///
+/// **Never fails the onboarding.** The hook and the gate are what onboarding promises; the
+/// workflow is a default on top of them, and a project whose files could not be placed is told so
+/// in the feed line (`materialize_after_pin`) rather than refused a hook it already has.
+async fn pin_default_workflow(
+    state: &AppState,
+    id: &str,
+    root: &std::path::Path,
+    machine_root: PathBuf,
+    library: PathBuf,
+) {
+    let (project_id, project_root) = (id.to_string(), root.to_path_buf());
+    let pinned = tokio::task::spawn_blocking(move || {
+        let Some(bundle) =
+            crate::onboarding::pin_default_workflow(&machine_root, &library, &project_id)?
+        else {
+            return Ok(None);
+        };
+        let state_dir = crate::project::state::dir(&machine_root, &project_id)
+            .ok_or_else(|| format!("`{project_id}` cannot name a state directory"))?;
+        let placed = super::workflows::materialize_after_pin(
+            &project_root,
+            &state_dir.join(crate::project::state::PINS_FILE),
+            &library,
+            &state_dir.join(crate::project::state::MATERIALIZED_FILE),
+            &bundle.name,
+        );
+        Ok::<_, String>(Some((bundle, placed)))
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result);
+    match pinned {
+        Ok(Some((bundle, placed))) => {
+            super::workflows::workflow_feed(
+                state,
+                id,
+                &format!(
+                    "{}@{} pinned by default for a new project{placed}",
+                    bundle.name, bundle.version
+                ),
+            )
+            .await
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, project_id = %id, "the default workflow was not pinned")
+        }
+    }
 }
 
 #[derive(Deserialize)]

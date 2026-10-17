@@ -690,6 +690,23 @@ fn hook_entry() -> serde_json::Value {
     })
 }
 
+/// The events that are not about a tool call, wired beside the three that are so that a pinned
+/// workflow bundle can declare a hook on them (`crate::workflows::hooks`). The daemon never
+/// classifies anything on these: they are forwarded, and fail open when nobody answers.
+pub const SESSION_EVENTS: [&str; 3] = ["Stop", "SubagentStop", "UserPromptSubmit"];
+
+/// The entry for a [`SESSION_EVENTS`] event: the same command as [`hook_entry`], without a
+/// matcher, because Claude Code matches only tool events and a `"*"` here would read as if it
+/// filtered something. The command is identical, which is what keeps `wire_event`'s dedupe sound.
+fn session_hook_entry() -> serde_json::Value {
+    serde_json::json!({
+        "hooks": [{
+            "type": "command",
+            "command": format!("{HOOK_INTERPRETER} \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\"")
+        }]
+    })
+}
+
 /// Registers one hook entry under `event_name` in `hooks`, deduped the same way for every event.
 ///
 /// A free function rather than the chain inlined three times, because `.entry("hooks")…
@@ -789,6 +806,15 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
     // NOT succeed.
     for event_name in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
         wire_event(hooks, event_name, hook_entry())
+            .map_err(|error| format!("{}: {error}", settings_path.display()))?;
+    }
+    // The session events a workflow bundle may hang a hook on (`workflows::hooks`). Wired always,
+    // not only when a pinned bundle declares one: pins change through the app at any time, and a
+    // settings file that had to be rewritten on every install and uninstall would be one more
+    // thing that drifts out of step with them. The daemon answers "nothing to run" in one lookup,
+    // and the script lets the session go on when it cannot reach the daemon at all.
+    for event_name in SESSION_EVENTS {
+        wire_event(hooks, event_name, session_hook_entry())
             .map_err(|error| format!("{}: {error}", settings_path.display()))?;
     }
 
@@ -3005,6 +3031,64 @@ pub mod tests {
                 "our hook is missing from `{event}`: {entries:?}"
             );
         }
+    }
+
+    /// The session events are wired on every project, so a bundle pinned later needs no second
+    /// wiring pass before its `Stop` or `UserPromptSubmit` hook can run. Wiring twice still
+    /// leaves one entry per event, and the command is the tool events' one.
+    #[test]
+    fn wiring_a_project_registers_the_session_events_once_each() {
+        let root = TempDir::new().unwrap();
+
+        wire_classifier_hook(root.path()).unwrap();
+        wire_classifier_hook(root.path()).unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let tool_command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"].clone();
+        for event in SESSION_EVENTS {
+            let entries = settings["hooks"][event]
+                .as_array()
+                .unwrap_or_else(|| panic!("`{event}` was not wired: {settings}"));
+            let ours: Vec<_> = entries
+                .iter()
+                .filter(|entry| serde_json::to_string(entry).unwrap().contains(HOOK_SCRIPT))
+                .collect();
+            assert_eq!(ours.len(), 1, "`{event}`: {entries:?}");
+            assert_eq!(ours[0]["hooks"][0]["command"], tool_command, "`{event}`");
+            assert!(ours[0].get("matcher").is_none(), "`{event}`: {:?}", ours[0]);
+        }
+    }
+
+    /// A project that already had its own `Stop` hook keeps it, with ours beside it.
+    #[test]
+    fn wiring_keeps_a_stop_hook_the_project_already_had() {
+        let root = TempDir::new().unwrap();
+        write_settings(
+            &root,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"python their_guard.py"}]}]}}"#,
+        );
+
+        wire_classifier_hook(root.path()).unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "{stop:?}");
+        assert!(
+            serde_json::to_string(&stop[0])
+                .unwrap()
+                .contains("their_guard.py")
+        );
+        assert!(
+            serde_json::to_string(&stop[1])
+                .unwrap()
+                .contains(HOOK_SCRIPT)
+        );
     }
 
     #[test]

@@ -4208,6 +4208,71 @@ mod tests {
         assert_eq!(view["configured_gate"], "npm run test");
     }
 
+    /// A project brought in for the first time is pinned to the default workflow, with its files
+    /// placed; one already on the roster keeps what it uses, which here is nothing.
+    #[tokio::test]
+    async fn onboarding_pins_the_default_workflow_for_a_new_project_only() {
+        let mut state = test_state().await;
+        let home = with_project_home(&mut state);
+        let library = home.path().join("library");
+        let bundle = library
+            .join(crate::onboarding::DEFAULT_WORKFLOW)
+            .join("2.0.0");
+        std::fs::create_dir_all(bundle.join(".nucleos/workflow")).unwrap();
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            "owns:\n  - .nucleos/workflow/\n",
+        )
+        .unwrap();
+        std::fs::write(bundle.join(".nucleos/workflow/workflow.md"), "rules").unwrap();
+        state.workflow_library = Some(library);
+        let pins_of = |id: &str| {
+            home.path()
+                .join("projects")
+                .join(id)
+                .join(crate::project::state::PINS_FILE)
+        };
+
+        let new = tempfile::tempdir().unwrap();
+        let (status, view) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/onboard",
+            Some(serde_json::json!({ "project_root": new.path().to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        let pins = crate::workflows::read_pins(&pins_of("alpha")).unwrap();
+        assert_eq!(pins.workflows.len(), 1);
+        assert_eq!(pins.workflows[0].name, crate::onboarding::DEFAULT_WORKFLOW);
+        assert_eq!(pins.workflows[0].version, "2.0.0");
+        assert!(new.path().join(".nucleos/workflow/workflow.md").is_file());
+        assert!(
+            new.path()
+                .join(crate::workflows::materialize::PROJECT_POINTER)
+                .is_file()
+        );
+
+        let old = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('beta', 'off', ?)",
+        )
+        .bind(old.path().to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let (status, view) = workflow_call(
+            state,
+            "POST",
+            "/projects/beta/onboard",
+            Some(serde_json::json!({ "project_root": old.path().to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert!(!pins_of("beta").exists());
+        assert!(!old.path().join(".nucleos").exists());
+    }
+
     /// Each refusal before anything is written, by name.
     #[tokio::test]
     async fn onboarding_refuses_by_name_before_it_writes() {

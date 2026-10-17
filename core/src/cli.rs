@@ -230,13 +230,27 @@ pub(super) fn ambiguous_sync_message(body: &str) -> Option<String> {
     Some(said)
 }
 
-/// `--workflow-package <name> <version> --from <project> --manifest <bundle.yaml>`, all required.
-/// Refused as a usage line rather than guessed: packaging writes a version that is never
-/// rewritten, so a default that picked the wrong folder would be permanent.
+/// Where `--workflow-package` takes a bundle from.
+#[derive(Debug, PartialEq)]
+pub(super) enum PackageFrom {
+    /// A project that runs the workflow, and the manifest naming which of its files it is.
+    Project {
+        root: std::path::PathBuf,
+        manifest: std::path::PathBuf,
+    },
+    /// A tree laid out as the bundle itself, `bundle.yaml` at its top.
+    Source(std::path::PathBuf),
+}
+
+/// `--workflow-package <name> <version>` and then either `--from <project> --manifest
+/// <bundle.yaml>` or `--source <dir>`, all required. Refused as a usage line rather than guessed:
+/// packaging writes a version that is never rewritten, so a default that picked the wrong folder
+/// would be permanent — and so would a mix of both sources, which is refused rather than resolved.
 pub(super) fn workflow_package_args(
     args: &[String],
-) -> Result<(String, String, std::path::PathBuf, std::path::PathBuf), String> {
-    const USAGE: &str = "usage: nucleos-core --workflow-package <name> <version> --from <project root> --manifest <bundle.yaml>";
+) -> Result<(String, String, PackageFrom), String> {
+    const USAGE: &str = "usage: nucleos-core --workflow-package <name> <version> \
+                         (--from <project root> --manifest <bundle.yaml> | --source <bundle dir>)";
     let at = args
         .iter()
         .position(|arg| arg == "--workflow-package")
@@ -255,12 +269,19 @@ pub(super) fn workflow_package_args(
             .map(std::path::PathBuf::from)
             .ok_or(USAGE)
     };
-    Ok((
-        positional(1)?,
-        positional(2)?,
-        value_of("--from")?,
-        value_of("--manifest")?,
-    ))
+    let named = |flag: &str| args.iter().any(|arg| arg == flag);
+    let from = if named("--source") {
+        if named("--from") || named("--manifest") {
+            return Err(USAGE.to_string());
+        }
+        PackageFrom::Source(value_of("--source")?)
+    } else {
+        PackageFrom::Project {
+            root: value_of("--from")?,
+            manifest: value_of("--manifest")?,
+        }
+    };
+    Ok((positional(1)?, positional(2)?, from))
 }
 
 fn print_token() {
@@ -662,6 +683,8 @@ async fn workflow_sync() {
 
 // `nucleos-core --workflow-package <name> <version> --from <project> --manifest <bundle.yaml>`:
 // copy a workflow out of a project into the library as a new version, and commit it there.
+// `--source <dir>` in place of the last two packages a tree laid out as the bundle itself
+// (`core/assets/nucleos-dev/`), generating and checking what that needs.
 //
 // No daemon: this reads a folder and writes `~/.nucleos/workflows/`, and neither is the
 // database. A library a running daemon lists mid-copy sees no manifest yet, which it already
@@ -670,7 +693,7 @@ async fn workflow_sync() {
 
 async fn workflow_package() {
     let args: Vec<String> = std::env::args().collect();
-    let (name, version, from, manifest) = match workflow_package_args(&args) {
+    let (name, version, from) = match workflow_package_args(&args) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("{error}");
@@ -681,7 +704,15 @@ async fn workflow_package() {
         eprintln!("this machine has no home directory, so it has no workflow library");
         std::process::exit(1);
     };
-    match workflows::package::package(&library, &name, &version, &from, &manifest).await {
+    let packaged = match &from {
+        PackageFrom::Project { root, manifest } => {
+            workflows::package::package(&library, &name, &version, root, manifest).await
+        }
+        PackageFrom::Source(dir) => {
+            workflows::package::package_source(&library, &name, &version, dir).await
+        }
+    };
+    match packaged {
         Ok(packaged) => {
             println!(
                 "{name}@{version}: {} files into {} ({})",

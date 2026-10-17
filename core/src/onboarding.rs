@@ -326,9 +326,112 @@ pub fn migrate_legacy(
     written
 }
 
+/// The workflow a project brought in for the first time is pinned to, when the library has it.
+pub const DEFAULT_WORKFLOW: &str = "nucleos-dev";
+
+/// Pin [`DEFAULT_WORKFLOW`], newest version in `library_root`, for a project being rostered.
+///
+/// The caller decides that the project is new (`POST /projects/{id}/onboard` asks the roster);
+/// this only refuses to overrule a decision already on disk: a project whose pins file exists has
+/// chosen its workflows, even if the choice was none, and is left alone. A library without the
+/// bundle is skipped with a log line rather than an error — onboarding is about the hook and the
+/// gate, and a machine that never packaged the workflow still onboards. Returns the pinned bundle.
+pub fn pin_default_workflow(
+    machine_root: &Path,
+    library_root: &Path,
+    project_id: &str,
+) -> Result<Option<crate::workflows::Bundle>, String> {
+    let Some(state_dir) = crate::project::state::dir(machine_root, project_id) else {
+        return Err(format!("`{project_id}` cannot name a state directory"));
+    };
+    let pins = state_dir.join(crate::project::state::PINS_FILE);
+    if pins.exists() {
+        return Ok(None);
+    }
+    // Newest first within a name (`workflows::library`), so the first match is the latest.
+    let newest = crate::workflows::library(library_root)
+        .map_err(|error| format!("{}: {error}", library_root.display()))?
+        .into_iter()
+        .find(|bundle| bundle.name == DEFAULT_WORKFLOW);
+    let Some(bundle) = newest else {
+        tracing::info!(
+            project_id,
+            workflow = DEFAULT_WORKFLOW,
+            "the library has no default workflow, so the new project pins none"
+        );
+        return Ok(None);
+    };
+    crate::workflows::install(&pins, &bundle).map_err(|refused| format!("{refused:?}"))?;
+    Ok(Some(bundle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A library holding `nucleos-dev` at `versions`, under `root/lib`.
+    fn library_with(root: &Path, versions: &[&str]) -> PathBuf {
+        let library = root.join("lib");
+        for version in versions {
+            write(
+                &library
+                    .join(DEFAULT_WORKFLOW)
+                    .join(version)
+                    .join("bundle.yaml"),
+                "owns:\n  - .nucleos/workflow/\n",
+            );
+        }
+        library
+    }
+
+    #[test]
+    fn a_new_project_pins_the_newest_default_workflow() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = library_with(temp.path(), &["1.9.0", "2.0.0", "2.0.0-rc1"]);
+        let home = temp.path().join("home");
+
+        let pinned = pin_default_workflow(&home, &library, "alpha")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.version, "2.0.0");
+        let pins = crate::workflows::read_pins(
+            &home
+                .join("projects/alpha")
+                .join(crate::project::state::PINS_FILE),
+        )
+        .unwrap();
+        assert_eq!(pins.workflows.len(), 1);
+        assert_eq!(pins.workflows[0].name, DEFAULT_WORKFLOW);
+        assert_eq!(pins.workflows[0].version, "2.0.0");
+        assert_eq!(pins.workflows[0].hash, pinned.hash);
+    }
+
+    #[test]
+    fn a_project_that_chose_its_workflows_or_a_library_without_the_default_pins_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+
+        // No such bundle: skipped, not refused, and no pins file appears.
+        let empty = library_with(temp.path(), &[]);
+        assert!(pin_default_workflow(&home, &empty, "alpha").unwrap().is_none());
+        assert!(
+            !home
+                .join("projects/alpha")
+                .join(crate::project::state::PINS_FILE)
+                .exists()
+        );
+
+        // A pins file, even an empty one, is a choice already made.
+        let library = library_with(temp.path(), &["2.0.0"]);
+        let pins = home
+            .join("projects/beta")
+            .join(crate::project::state::PINS_FILE);
+        write(&pins, "workflows: []\n");
+        assert!(pin_default_workflow(&home, &library, "beta").unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(&pins).unwrap(), "workflows: []\n");
+
+        assert!(pin_default_workflow(&home, &library, "a:b").is_err());
+    }
 
     const NOW: &str = "2026-09-27T12:00:00+00:00";
 
