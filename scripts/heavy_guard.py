@@ -33,7 +33,26 @@ DENY_CARGO = (
 # a full path to cargo.exe or an unparsable line cannot slip past. Lowercase
 # only and bounded by word/dash, so `Cargo.toml`, `.cargo-target-*` and
 # `CARGO_TARGET_DIR` do not trip it.
-_CARGO_WORD = re.compile(r"(?<![\w-])(?:cargo(?:-clippy)?|rustfmt|rustc)(?:\.exe)?(?![\w-])")
+_CARGO_NAME = r"(?:cargo(?:-clippy)?|rustfmt|rustc)(?:\.exe)?"
+_CARGO_WORD = re.compile(r"(?<![\w-])" + _CARGO_NAME + r"(?![\w-])")
+# Used when the line parses: cargo only counts in COMMAND position (line start, after a
+# separator, `--`, `-c '`, or a wrapper word, past env assignments and any path prefix), so a
+# path (`.cargo/config.toml`) or prose (a commit message saying "cargo") is not a denial.
+_CARGO_CMD = re.compile(
+    r"(?:^|[;&|(`{\n]|\$\(|(?<=\s)--|(?<=\s)-(?:c|lc|command|Command))\s*"
+    r"(?:\w+=\S*\s+)*[\"']?\s*(?:(?:time|exec|command|nohup|sudo|env|nice|call|start)\s+)*"
+    r"(?:\w+=\S*\s+)*(?:[^\s\"';&|]*[/\\])?"
+    + _CARGO_NAME + r"(?![\w\-/\\.])")
+
+
+def _runs_cargo(command, posix):
+    """True when `command` names cargo/rustc/rustfmt as a program."""
+    try:
+        _load_classify().split_segments(command, posix)
+    except ValueError:
+        # Unparsable (e.g. an unterminated quote): stay conservative, match anywhere.
+        return bool(_CARGO_WORD.search(command))
+    return bool(_CARGO_CMD.search(command))
 _WARM = re.compile(r"heavy\.py\b.*\bwarm\b")
 DENY_ISOLATION = (
     "Launching a subagent with isolation: worktree is not permitted here; "
@@ -124,7 +143,7 @@ def decide(payload, main, broker_ok, py):
     command = tool_input.get("command")
     if not isinstance(command, str) or not command.strip():
         return None
-    if subagent and (_CARGO_WORD.search(command) or _WARM.search(command)):
+    if subagent and (_runs_cargo(command, tool == "Bash") or _WARM.search(command)):
         return _deny(DENY_CARGO)
 
     posix = tool == "Bash"

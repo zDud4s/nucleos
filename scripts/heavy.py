@@ -212,6 +212,27 @@ class Mutex:
             except OSError:
                 return False
 
+    def _break_stale(self) -> bool:
+        """Remove a stale mutex under a breaker lock. Two waiters that both judged it stale
+        must not both delete it: the second would delete the FIRST one's fresh mutex and both
+        would hold it. Only the holder of `<mutex>.break` removes, and it re-checks first."""
+        brk = self.path.with_name(self.path.name + ".break")
+        try:
+            brk.mkdir()
+        except (FileExistsError, PermissionError):
+            try:  # a breaker that crashed mid-removal must not wedge the broker for good
+                if time.time() - brk.stat().st_mtime > 10.0:
+                    shutil.rmtree(brk, ignore_errors=True)
+            except OSError:
+                pass
+            return False
+        try:
+            if self._stale():
+                shutil.rmtree(self.path, ignore_errors=True)
+            return True
+        finally:
+            shutil.rmtree(brk, ignore_errors=True)
+
     def acquire(self) -> None:
         t0 = time.time()
         deadline = t0 + self.timeout
@@ -227,8 +248,7 @@ class Mutex:
                     self.n_perm += 1
                 else:
                     self.n_exists += 1
-                if self._stale():
-                    shutil.rmtree(self.path, ignore_errors=True)
+                if self._stale() and self._break_stale():
                     continue
                 if time.time() > deadline:
                     self.waited = time.time() - t0
@@ -1639,28 +1659,48 @@ def prepare_slot(directory: Path, lease, worktree: str, program: str, cwd: str,
     env["CARGO_TARGET_DIR"] = path
     if not os.path.dirname(program):
         program = shutil.which(program, path=env.get("PATH")) or program
-    ok = False
-    try:
-        md = subprocess.run([program, "metadata", "--no-deps", "--format-version", "1"],
-                            cwd=cwd, env=env, capture_output=True, timeout=300)
-        if md.returncode == 0:
-            data = json.loads(md.stdout.decode("utf-8", "replace"))
-            members = set(data.get("workspace_members") or [])
-            names = sorted({p.get("name") for p in data.get("packages") or []
-                            if p.get("id") in members and p.get("name")})
-            ok = bool(names)
-            for name in names:
+    # `metadata` failing says the CALLING checkout is unreadable (or the call timed out), not
+    # that the slot is bad; `clean` failing says the slot is. Each step gets a second try, and
+    # only a slot whose clean keeps failing is removed whole.
+    names: list[str] = []
+    for _attempt in range(2):
+        try:
+            md = subprocess.run([program, "metadata", "--no-deps", "--format-version", "1"],
+                                cwd=cwd, env=env, capture_output=True, timeout=300)
+            if md.returncode == 0:
+                data = json.loads(md.stdout.decode("utf-8", "replace"))
+                members = set(data.get("workspace_members") or [])
+                names = sorted({p.get("name") for p in data.get("packages") or []
+                                if p.get("id") in members and p.get("name")})
+                if names:
+                    break
+        except Exception:
+            pass
+    if not names:
+        # Members unknown: drop the profile's fingerprints (every artifact becomes stale, so
+        # nothing from the previous owner is reused) and keep the dependency builds.
+        sys.stderr.write(f"heavy: could not list the workspace for {path}; "
+                         "dropping its fingerprints\n")
+        pname = prof[-1] if prof and prof[0] == "--profile" else ("release" if prof else "debug")
+        pname = {"dev": "debug", "test": "debug", "bench": "release"}.get(pname, pname)
+        shutil.rmtree(Path(path) / pname / ".fingerprint", ignore_errors=True)
+        return
+    for name in names:
+        done = False
+        for _attempt in range(2):
+            try:
                 r = subprocess.run([program, "clean", "-p", name, *prof], cwd=cwd, env=env,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    timeout=600)
-                if r.returncode != 0:
-                    ok = False
+                if r.returncode == 0:
+                    done = True
                     break
-    except Exception:
-        ok = False
-    if not ok:
-        sys.stderr.write(f"heavy: could not clean {path} for its new owner; removing it\n")
-        shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                pass
+        if not done:
+            sys.stderr.write(f"heavy: could not clean {path} for its new owner; removing it\n")
+            shutil.rmtree(path, ignore_errors=True)
+            return
 
 
 def resolve_target_dir(argv: list[str], crate: Path, root: str, cwd: str,

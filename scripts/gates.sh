@@ -157,8 +157,20 @@ _slot_try() {
     pid="$(cat "$dir/.mutex/pid" 2>/dev/null)"
     if { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; } \
       || [ -n "$(find "$dir/.mutex" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
-      rm -rf "$dir/.mutex"
-      mkdir "$dir/.mutex" 2>/dev/null || return 1
+      # Break it under a breaker lock: two callers that both judged it stale must not both
+      # delete it, or the second removes the first's fresh mutex and both hold it.
+      mkdir "$dir/.mutex.break" 2>/dev/null || {
+        [ -n "$(find "$dir/.mutex.break" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rm -rf "$dir/.mutex.break"
+        return 1
+      }
+      pid="$(cat "$dir/.mutex/pid" 2>/dev/null)"
+      if { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; }         || [ -n "$(find "$dir/.mutex" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+        rm -rf "$dir/.mutex"
+      fi
+      mkdir "$dir/.mutex" 2>/dev/null; got=$?
+      rm -rf "$dir/.mutex.break"
+      [ "$got" -eq 0 ] || return 1
+      got=1
     else
       return 1
     fi

@@ -154,7 +154,8 @@ def split_segments(text, posix=True):
 
 def shell_tokens(segment, posix=True):
     if posix:
-        toks = shlex.split(segment, posix=True)
+        # A backslash-newline is a line continuation; shlex would keep the newline as a word.
+        toks = shlex.split(segment.replace("\\\r\n", "").replace("\\\n", ""), posix=True)
     else:
         toks = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"" else t
                 for t in shlex.split(segment, posix=False)]
