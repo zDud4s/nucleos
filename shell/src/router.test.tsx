@@ -226,7 +226,9 @@ describe("the app router", () => {
     );
 
     daemon.apiFetch.mockClear();
-    await router.navigate({ to: "/analytics", search: { days: 14 } as never });
+    // The harness types the router narrowly; this is the real one createAppRouter built.
+    const app = router as unknown as ReturnType<typeof createAppRouter>;
+    await app.navigate({ to: "/analytics", search: { days: 14 } as never });
     await waitFor(() =>
       expect(daemon.apiFetch.mock.calls.map(([path]) => String(path))).toContain("/analytics?days=30"),
     );
