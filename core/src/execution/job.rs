@@ -10162,4 +10162,83 @@ tests:
             "nothing was measured, so no gate verdict is recorded"
         );
     }
+
+    // ---- a job still being provisioned --------------------------------------------------------
+
+    /// `start` inserts the row live before `git worktree add` runs, so a tick can find a job that
+    /// has no worktree YET. That job is being born, not broken: the pass waits for it.
+    #[tokio::test]
+    async fn a_job_still_being_provisioned_is_not_failed_for_having_no_worktree() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        assert_eq!(advance(&state, &job, Utc::now()).await, Step::Stopped);
+
+        assert_eq!(
+            job_status(&pool, job_id).await,
+            "planning",
+            "a tick inside `start`'s window failed a job whose worktree was still being made"
+        );
+        assert!(!feed_kinds(&pool).await.contains(&"job_failed".to_owned()));
+        assert!(stages_run(&pool, job_id).await.is_empty());
+    }
+
+    /// The grace is a grace and not a pass: a job that has gone without a worktree for longer than
+    /// any `start` takes is one whose start is gone, and it is failed so its slot comes back.
+    #[tokio::test]
+    async fn a_job_with_no_worktree_past_the_provisioning_grace_is_failed() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        let later = Utc::now() + PROVISIONING_GRACE + chrono::Duration::minutes(1);
+        assert_eq!(advance(&state, &job, later).await, Step::Stopped);
+
+        assert_eq!(job_status(&pool, job_id).await, "failed");
+        assert!(feed_kinds(&pool).await.contains(&"job_failed".to_owned()));
+    }
+
+    /// A worktree read that errors is a database hiccup, not a fact about the job. The pass is
+    /// skipped and the job is left live for the next tick — even past the grace, so this is the
+    /// error arm being measured and not the grace.
+    #[tokio::test]
+    async fn a_worktree_that_cannot_be_read_skips_the_pass_rather_than_failing_the_job() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        // Nothing REFERENCES worktrees (migrations 0044, 0096), so this drops no other row; every
+        // read of it from here on is an error.
+        sqlx::query("DROP TABLE worktrees")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        let later = Utc::now() + PROVISIONING_GRACE + chrono::Duration::minutes(1);
+        assert_eq!(advance(&state, &job, later).await, Step::Stopped);
+
+        assert_eq!(
+            job_status(&pool, job_id).await,
+            "planning",
+            "a failed read of the worktree table failed the job"
+        );
+        assert!(!feed_kinds(&pool).await.contains(&"job_failed".to_owned()));
+    }
+
+    /// PURE: the window itself, and what an unreadable timestamp falls back to.
+    #[test]
+    fn still_provisioning_is_the_grace_after_creation_and_no_longer() {
+        let created = Utc::now();
+        let stamp = created.to_rfc3339();
+        assert!(still_provisioning(&stamp, created));
+        assert!(still_provisioning(&stamp, created + PROVISIONING_GRACE));
+        assert!(!still_provisioning(
+            &stamp,
+            created + PROVISIONING_GRACE + chrono::Duration::seconds(1)
+        ));
+        assert!(!still_provisioning("not a timestamp", created));
+    }
 }
