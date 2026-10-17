@@ -448,7 +448,7 @@ export const FEED_KIND_NAMES: string[] = statesOf("feed").sort();
  * `job {id} is waiting: {detail}` and the detail is the only carrier — so it is
  * matched here, against the exact sentences `job.rs` and `budget.rs` build.
  *
- * The order matters. The exclusion detail is *"job 9 holds a slot and the two
+ * The order matters. The exclusion detail is *"job 9 is running and the two
  * are excluded"* and the slot detail is *"another run holds the project's
  * worktree slot"*; a naive match on "slot" would read the first as the second
  * and send somebody looking for capacity that is already there.
