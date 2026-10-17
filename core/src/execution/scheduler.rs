@@ -1213,6 +1213,103 @@ mod tests {
         assert_eq!(stored, old, "the window must go back for the next tick");
     }
 
+    /// A released window was never run, so it must not be counted either. Otherwise a rule on a
+    /// busy project spends `DAILY_CAP` in a few minutes of retries without starting anything, and
+    /// then runs as a plan-only catch-up once the day turns over.
+    #[tokio::test]
+    async fn a_released_window_does_not_spend_the_daily_allowance() {
+        let project = tempfile::tempdir().expect("create active project");
+        let (state, _home) = test_state(None).await;
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "active", &old).await;
+        write_graph_schedule(&state);
+        sqlx::query("UPDATE autopilot_global SET max_concurrent_slots = 1")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        crate::execution::job::insert_job(
+            &state.pool,
+            &crate::execution::job::NewJob {
+                project_id: "proj",
+                project_root: &project.path().to_string_lossy(),
+                rule_name: Some("r1"),
+                prompt: "go",
+                max_items: 3,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+            },
+        )
+        .await
+        .expect("a job is already live for this project");
+        crate::execution::concurrency::claim(
+            &state.pool,
+            "proj",
+            crate::execution::worktree::Owner::Job(1),
+        )
+        .await
+        .expect("the live job holds the project's only slot");
+
+        // More refusals than the allowance could ever cover.
+        for _ in 0..(DAILY_CAP + 3) {
+            scheduler_tick(&state, now).await;
+        }
+
+        let (stored, count): (String, i64) = sqlx::query_as(
+            "SELECT last_fired_at, fires_today FROM scheduler_state
+             WHERE project_id = 'proj' AND rule_name = 'r1'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, old, "every refused window went back");
+        assert_eq!(count, 0, "nothing ran, so nothing was spent");
+    }
+
+    /// The release gives back one fire and never more: a count already at zero stays at zero, and
+    /// one earned by real fires earlier the same day is kept.
+    #[tokio::test]
+    async fn releasing_a_window_never_takes_the_count_below_what_real_fires_earned() {
+        let project = tempfile::tempdir().expect("create active project");
+        let (state, _home) = test_state(None).await;
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "active", &old).await;
+        sqlx::query("UPDATE scheduler_state SET fires_date = '2026-07-18', fires_today = 2")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        // Claim as the tick does, then hand it back.
+        sqlx::query(
+            "UPDATE scheduler_state
+             SET last_fired_at = ?, fires_today = fires_today + 1, fires_date = '2026-07-18'",
+        )
+        .bind(now.to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        release_window(&state, "proj", "r1", Some(old.as_str()), None, now).await;
+        let count: i64 = sqlx::query_scalar("SELECT fires_today FROM scheduler_state")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "only the released claim is given back");
+
+        // A release that finds the claim gone changes nothing.
+        release_window(&state, "proj", "r1", Some(old.as_str()), None, now).await;
+        let count: i64 = sqlx::query_scalar("SELECT fires_today FROM scheduler_state")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_graph_rule_starts_a_job_that_owns_its_worktree() {
         // Re-executed in a child process, like the other worktree-provisioning scheduler test:
