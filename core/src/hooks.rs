@@ -6424,6 +6424,38 @@ mod tests {
         );
     }
 
+    /// The provenance is copied onto the proposal and served to the screen, so a credential in the
+    /// arguments of a read (a token in a url's query) is redacted there too, while the host stays.
+    #[tokio::test]
+    async fn a_credential_in_what_the_turn_read_does_not_reach_the_provenance() {
+        let state = test_state().await;
+        let run_id = chat_bound_run(&state, "-1002003004:14").await;
+        let app = test_router(state.clone());
+        let token = format!("ghp_{}", "b".repeat(36));
+
+        orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": format!("https://stand.example/anuncio?key={token}")}),
+        )
+        .await;
+        orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "x"}),
+        )
+        .await;
+
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        let read_from = refused[0].read_from.as_deref().unwrap_or_default();
+        assert!(!read_from.contains(&token), "{read_from}");
+        assert!(read_from.contains("stand.example/anuncio"), "{read_from}");
+    }
+
     /// Every stranger, not the first one.
     ///
     /// A browsing turn opens, snapshots, acts and snapshots again, and the page that planted an idea
