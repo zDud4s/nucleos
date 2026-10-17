@@ -498,6 +498,21 @@ def rustc_info(p, primed: dict) -> dict | None:
         return None
 
 
+def _alive(p) -> bool:
+    try:
+        return p.is_running()
+    except Exception:  # psutil.Error, or psutil absent
+        return False
+
+
+def prune_primed(primed: dict) -> None:
+    """Drops the processes that have exited. Every rustc ever seen leaves its psutil.Process
+    in `primed`, and on Windows each one holds an open process handle: unpruned, a day of
+    builds left ~1700 handles open in one watcher (measured 2026-10-17)."""
+    for pid in [pid for pid, p in primed.items() if not _alive(p)]:
+        del primed[pid]
+
+
 def rustc_line(info: dict, indent: str, with_target: bool = False) -> str:
     cpu = "   …" if info["cpu"] is None else f"{info['cpu']:4.1f}%"
     target = f"  {CYAN}{info['target']}{RESET}" if with_target else ""
@@ -813,6 +828,7 @@ def main() -> int:
         while True:
             size = shutil.get_terminal_size((120, 40))
             out = render(primed, size.columns, max(5, size.lines))
+            prune_primed(primed)
             sys.stdout.write("\x1b[H" + "\x1b[K\n".join(out) + "\x1b[K\x1b[J")
             sys.stdout.flush()
             time.sleep(args.interval)
