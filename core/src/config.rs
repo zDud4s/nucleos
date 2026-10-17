@@ -2044,6 +2044,40 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     /// blank case is the one worth pinning — a key left in the file with its value deleted reads as
     /// "turn this off", and `Some("")` would instead pass an empty string to `--model`.
     #[test]
+    fn a_broken_models_file_keeps_the_last_good_config_instead_of_the_defaults() {
+        let path = std::path::Path::new("nucleos-models.yaml");
+        let good = ModelsConfig {
+            local_triage_model: Some("local-model".to_string()),
+            ..ModelsConfig::default()
+        };
+        let mut last_good = None;
+
+        let first = resolve_models_config(Ok(good.clone()), &mut last_good, path);
+        assert_eq!(first, good);
+
+        let broken = Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad yaml",
+        ));
+        let kept = resolve_models_config(broken, &mut last_good, path);
+        assert_eq!(kept, good, "a parse error must not drop the local routing");
+    }
+
+    #[test]
+    fn a_broken_models_file_with_no_last_good_config_falls_back_to_defaults() {
+        let broken = Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad yaml",
+        ));
+        let config = resolve_models_config(
+            broken,
+            &mut None,
+            std::path::Path::new("nucleos-models.yaml"),
+        );
+        assert_eq!(config, ModelsConfig::default());
+    }
+
+    #[test]
     fn models_config_reads_the_per_role_keys_and_falls_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("models.yaml");

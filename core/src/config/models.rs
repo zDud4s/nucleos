@@ -214,10 +214,41 @@ pub fn is_effort_level(config: &ModelsConfig, value: &str) -> bool {
 }
 
 /// Loads the current models configuration, falling back to defaults on failure.
+///
+/// An unreadable or unparseable file is NOT the same as an absent one: absent means defaults, but a
+/// typo in the YAML silently becoming defaults would drop a local routing and send turns to the
+/// cloud. So the failure is logged with its path and cause, and the last configuration that did
+/// parse keeps applying; only a daemon that never saw a good one falls back to defaults.
 pub fn models_config_now() -> ModelsConfig {
-    models_config_path()
-        .and_then(|path| load_models_config(&path).ok())
-        .unwrap_or_default()
+    static LAST_GOOD: std::sync::Mutex<Option<ModelsConfig>> = std::sync::Mutex::new(None);
+    let Some(path) = models_config_path() else {
+        return ModelsConfig::default();
+    };
+    let loaded = load_models_config(&path);
+    let mut last_good = LAST_GOOD.lock().unwrap_or_else(|e| e.into_inner());
+    resolve_models_config(loaded, &mut last_good, &path)
+}
+
+/// The decision inside [`models_config_now`], apart from the file and the static so a test can drive it.
+pub(super) fn resolve_models_config(
+    loaded: std::io::Result<ModelsConfig>,
+    last_good: &mut Option<ModelsConfig>,
+    path: &Path,
+) -> ModelsConfig {
+    match loaded {
+        Ok(config) => {
+            *last_good = Some(config.clone());
+            config
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                path = %path.display(),
+                "models config: could not be loaded; keeping the last good configuration"
+            );
+            last_good.clone().unwrap_or_default()
+        }
+    }
 }
 
 pub(super) fn default_assistant_choices() -> Vec<AssistantChoice> {

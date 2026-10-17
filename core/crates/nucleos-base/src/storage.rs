@@ -331,6 +331,37 @@ mod tests {
         assert_eq!(next, 4);
     }
 
+    /// Migration `0198` indexes the `runs` lookups that were full scans of a 229 MB table.
+    #[tokio::test]
+    async fn the_runs_lookups_by_job_status_and_project_use_an_index() {
+        let pool = crate::testdb::fresh_pool().await;
+        for (sql, index) in [
+            (
+                "SELECT id, stdout FROM runs WHERE job_id = 1 AND stage = 'review' ORDER BY id",
+                "idx_runs_job_id",
+            ),
+            (
+                "SELECT id FROM runs WHERE status = 'awaiting_approval'",
+                "idx_runs_awaiting_approval",
+            ),
+            (
+                "SELECT 1 FROM runs WHERE project_id = 'p' AND status = 'running'",
+                "idx_runs_project_status",
+            ),
+        ] {
+            // `EXPLAIN QUERY PLAN` has four columns; the detail is the last.
+            let detail: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert!(
+                detail.iter().any(|row| row.3.contains(index)),
+                "{sql} does not use {index}: {detail:?}"
+            );
+        }
+    }
+
     /// The pool reads the database through a memory map and a page cache sized for it, rather than
     /// SQLite's 2 MiB default, so a repeated scan is served from memory instead of `ReadFile`.
     #[tokio::test]
