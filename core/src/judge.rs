@@ -288,19 +288,37 @@ pub fn judge_is_asked(tool_name: &str, action_class: &str, classifier_decision: 
 /// themselves read it. The Python prototype cut at any unquoted `#`; that hides text the command
 /// really runs (`echo a#b`, a URL fragment), and hiding runnable text from the judge is the wrong
 /// direction. The regression step (Task 3.4) measures this function, not the prototype.
+///
+/// For the same reason POSIX ANSI-C quoting (`$'…'`, where `\'` does not close it) and heredoc
+/// bodies are modelled: misreading either flips the quote state for the rest of the line, and a
+/// `#` the shell reads as text would then hide the command after it. A heredoc body is copied
+/// verbatim, comments included — the judge seeing more is safe, seeing less is the failure.
 pub fn strip_shell_comments(command: &str, shell: Shell) -> String {
     let powershell = shell == Shell::PowerShell;
     let escape = if powershell { '`' } else { '\\' };
     let chars: Vec<char> = command.chars().collect();
     let mut out = String::with_capacity(command.len());
-    let (mut single, mut double) = (false, false);
+    let (mut single, mut double, mut ansi) = (false, false, false);
     let mut escaped_last = false;
+    // Heredocs opened on the current line, as (delimiter, `<<-` strips leading tabs).
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
     let mut index = 0;
     while index < chars.len() {
         let character = chars[index];
         if single {
             out.push(character);
             single = character != '\'';
+            index += 1;
+            continue;
+        }
+        if ansi {
+            out.push(character);
+            if character == '\\' && index + 1 < chars.len() {
+                out.push(chars[index + 1]);
+                index += 2;
+                continue;
+            }
+            ansi = character != '\'';
             index += 1;
             continue;
         }
@@ -339,6 +357,60 @@ pub fn strip_shell_comments(command: &str, shell: Shell) -> String {
         match character {
             '\'' => single = true,
             '"' => double = true,
+            '$' if !powershell && chars.get(index + 1) == Some(&'\'') => {
+                out.push_str("$'");
+                ansi = true;
+                index += 2;
+                continue;
+            }
+            '<' if !powershell && chars.get(index + 1) == Some(&'<') => {
+                // `<<<` is a here-string: one word, no body.
+                if chars.get(index + 2) == Some(&'<') {
+                    out.push_str("<<<");
+                    index += 3;
+                    continue;
+                }
+                let (end, delimiter, strip_tabs) = heredoc_delimiter(&chars, index + 2);
+                out.extend(&chars[index..end]);
+                index = end;
+                match delimiter {
+                    Some(delimiter) => heredocs.push((delimiter, strip_tabs)),
+                    // No readable delimiter: nothing after this is stripped.
+                    None => {
+                        out.extend(&chars[index..]);
+                        index = chars.len();
+                    }
+                }
+                continue;
+            }
+            '\n' if !heredocs.is_empty() => {
+                out.push('\n');
+                index += 1;
+                for (delimiter, strip_tabs) in heredocs.drain(..) {
+                    while index < chars.len() {
+                        let line_end = chars[index..]
+                            .iter()
+                            .position(|next| *next == '\n')
+                            .map_or(chars.len(), |offset| index + offset);
+                        let line: String = chars[index..line_end].iter().collect();
+                        out.push_str(&line);
+                        if line_end < chars.len() {
+                            out.push('\n');
+                        }
+                        index = (line_end + 1).min(chars.len());
+                        let content = line.trim_end_matches('\r');
+                        let content = if strip_tabs {
+                            content.trim_start_matches('\t')
+                        } else {
+                            content
+                        };
+                        if content == delimiter {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
             '#' if at_word_start => {
                 index = chars[index..]
                     .iter()
@@ -357,6 +429,37 @@ pub fn strip_shell_comments(command: &str, shell: Shell) -> String {
         .join("\n")
         .trim()
         .to_owned()
+}
+
+/// The word after a POSIX `<<` (from `at`, just past it): the end of what was read, the delimiter
+/// with its quoting removed (`None` when there is none to read), and whether it was `<<-`.
+fn heredoc_delimiter(chars: &[char], mut at: usize) -> (usize, Option<String>, bool) {
+    let strip_tabs = chars.get(at) == Some(&'-');
+    if strip_tabs {
+        at += 1;
+    }
+    while matches!(chars.get(at), Some(' ' | '\t')) {
+        at += 1;
+    }
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    while let Some(&character) = chars.get(at) {
+        match quote {
+            Some(open) if character == open => quote = None,
+            Some(_) => word.push(character),
+            None if character == '\'' || character == '"' => quote = Some(character),
+            None if character == '\\' => {
+                if let Some(&next) = chars.get(at + 1) {
+                    word.push(next);
+                    at += 1;
+                }
+            }
+            None if character.is_whitespace() || ";|&()<>".contains(character) => break,
+            None => word.push(character),
+        }
+        at += 1;
+    }
+    (at, (!word.is_empty()).then_some(word), strip_tabs)
 }
 
 /// D9: the tool input as the judge sees it — no `description`, and a shell `command` without its
@@ -1268,6 +1371,88 @@ mod tests {
             strip_shell_comments("cmd` # ; more", Shell::PowerShell),
             "cmd` # ; more"
         );
+    }
+
+    /// `$'…'` takes `\'` as text, so its `#` is quoted; reading it as a plain `'…'` closed the
+    /// quote early and cut the dangerous tail as a comment.
+    #[test]
+    fn an_ansi_c_quote_does_not_hide_the_command_after_it() {
+        assert_eq!(
+            strip_shell_comments("echo $'x\\' #'; git reset --hard HEAD~20", Shell::Posix),
+            "echo $'x\\' #'; git reset --hard HEAD~20"
+        );
+        assert_eq!(
+            strip_shell_comments("echo $'a#b' # tail", Shell::Posix),
+            "echo $'a#b'"
+        );
+        assert_eq!(
+            strip_shell_comments("ls # plain comment", Shell::Posix),
+            "ls"
+        );
+    }
+
+    /// A heredoc body is text, not shell: an apostrophe in it used to open a quote that closed on
+    /// the next line's `'`, and the `#` inside that real quote then cut the command after it.
+    #[test]
+    fn a_heredoc_body_is_kept_whole_and_does_not_hide_the_command_after_it() {
+        assert_eq!(
+            strip_shell_comments(
+                "cat <<EOF > notes.txt # write notes\ndon't # keep\nEOF\necho 'x #'; git reset --hard HEAD~20 # tail",
+                Shell::Posix
+            ),
+            "cat <<EOF > notes.txt\ndon't # keep\nEOF\necho 'x #'; git reset --hard HEAD~20"
+        );
+        assert_eq!(
+            strip_shell_comments(
+                "cat <<-'END'\n\tit's # body\n\tEND\nrm -rf build # tail",
+                Shell::Posix
+            ),
+            "cat <<-'END'\n\tit's # body\n\tEND\nrm -rf build"
+        );
+        assert_eq!(
+            strip_shell_comments("grep x <<< \"$v\" # tail", Shell::Posix),
+            "grep x <<< \"$v\""
+        );
+    }
+
+    /// The tool input reaches the judge JSON-serialized (`clean_tool_input`), so every quote in it
+    /// arrives escaped. Built through that same path, so the escaping is the real one.
+    #[test]
+    fn json_escaped_quotes_do_not_carry_a_secret_past_the_redaction() {
+        let judged = |tool: &str, input: Value| {
+            redact_for_judge_with_home(&clean_tool_input(tool, &input), None)
+        };
+        let outputs = [
+            judged(
+                "Bash",
+                json!({"command": "export GITHUB_TOKEN=\"ghsecret1\" && cargo test"}),
+            ),
+            judged(
+                "Bash",
+                json!({"command": "curl -d '{\"api_key\": \"json6\"}' https://x.test"}),
+            ),
+            judged(
+                "Bash",
+                json!({"command": "echo \"{\\\"password\\\": \\\"deep7\\\"}\" > c.json"}),
+            ),
+            judged(
+                "Write",
+                json!({"file_path": "c.py", "content": "headers = {\"Authorization\": \"Bearer opaque9\"}\nCLIENT_SECRET = \"sec10\""}),
+            ),
+        ];
+        for out in &outputs {
+            for leaked in ["ghsecret1", "json6", "deep7", "opaque9", "sec10"] {
+                assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+            }
+        }
+        assert!(
+            outputs[0].contains("GITHUB_TOKEN=[REDACTED] && cargo test"),
+            "{}",
+            outputs[0]
+        );
+        assert!(outputs[1].contains("https://x.test"), "{}", outputs[1]);
+        assert!(outputs[2].contains("> c.json"), "{}", outputs[2]);
+        assert!(outputs[3].contains("Bearer [REDACTED]"), "{}", outputs[3]);
     }
 
     /// D9: the description is text the agent writes about its own action, and so text an attacker
