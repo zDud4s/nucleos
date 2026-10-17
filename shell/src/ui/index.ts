@@ -6,6 +6,16 @@
  * not exported here does not exist as far as the rest of the shell is concerned.
  */
 export { Badge, type BadgeProps, type BadgeTone } from "./Badge";
+export {
+  BarChart,
+  ChartTickLabel,
+  seriesClass,
+  stackDay,
+  type BarChartProps,
+  type BarDatum,
+  type BarKey,
+  type BarPart,
+} from "./BarChart";
 export { Button, type ButtonIntent, type ButtonProps, type ButtonVariant } from "./Button";
 export { ConfirmButton, type ConfirmButtonProps } from "./ConfirmButton";
 export { CopyButton, type CopyButtonProps } from "./CopyButton";
