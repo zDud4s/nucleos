@@ -277,6 +277,23 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
             }
         };
     let path = info.path.to_string_lossy().into_owned();
+
+    // The project's workflow, into the tree its nodes will read it from. `.ai/`, `.claude/` and
+    // their like are usually gitignored, so a fresh worktree has none of them; without this every
+    // job ran without the rules its project pinned, and nothing said so. Fail-soft: a missing
+    // workflow is a feed line, never a failed job (`workflow_materialize::into_worktree`).
+    //
+    // BEFORE the tree is recorded, not after: the record is what makes the tree visible to the
+    // tick, and a tick landing between the two would start the first node in a tree with no rules.
+    crate::workflows::materialize::into_worktree(
+        &state.pool,
+        state.machine_config_root.as_deref(),
+        state.workflow_library.as_deref(),
+        request.project_id,
+        &info.path,
+    )
+    .await;
+
     if let Err(error) = crate::execution::worktree::record(
         &state.pool,
         owner,
@@ -288,9 +305,20 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
     )
     .await
     {
-        // The directory exists and nothing in the database knows it does. Left alone it would be
-        // invisible to the GC forever; the startup orphan sweeper recognises `job-<id>` and is what
-        // eventually collects it.
+        // The directory exists and nothing in the database knows it does, so the GC never will.
+        // Taken down here, best effort; the startup orphan sweeper recognises `job-<id>` and is the
+        // backstop when this removal fails too.
+        if let Err(remove_error) =
+            crate::execution::worktree::remove(Path::new(request.project_root), &info.path, &[])
+                .await
+        {
+            tracing::warn!(
+                job_id,
+                path = %path,
+                %remove_error,
+                "an unrecorded job worktree could not be removed; the orphan sweeper will"
+            );
+        }
         return fail_early(
             state,
             request.project_id,
@@ -300,18 +328,32 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
         .await;
     }
 
-    // The project's workflow, into the tree its nodes will read it from. `.ai/`, `.claude/` and
-    // their like are usually gitignored, so a fresh worktree has none of them; without this every
-    // job ran without the rules its project pinned, and nothing said so. Fail-soft: a missing
-    // workflow is a feed line, never a failed job (`workflow_materialize::into_worktree`).
-    crate::workflows::materialize::into_worktree(
-        &state.pool,
-        state.machine_config_root.as_deref(),
-        state.workflow_library.as_deref(),
-        request.project_id,
-        &info.path,
-    )
-    .await;
+    // Asked once more before saying `Started`, because the row has been live the whole time this
+    // function was in git: a cancel, or a pass past `PROVISIONING_GRACE`, may have ended it. A
+    // caller told `Started` about a job that is already over reports work that will never happen.
+    // The tree is recorded by now, so the worktree GC collects it with the ended job.
+    match load_job(&state.pool, job_id).await {
+        Ok(job) if LIVE_STATUSES.contains(&job.status.as_str()) => {}
+        Ok(job) => {
+            tracing::warn!(
+                project_id = request.project_id,
+                job_id,
+                status = %job.status,
+                "a job ended while it was being provisioned"
+            );
+            return JobStart::Failed;
+        }
+        // Unreadable is not ended. The row went in and the tree is recorded; the tick decides from
+        // here, and a caller told `Failed` would retry a job that is in fact running.
+        Err(error) => {
+            tracing::warn!(
+                project_id = request.project_id,
+                job_id,
+                %error,
+                "could not re-read a job just started"
+            );
+        }
+    }
 
     // Two sentences rather than one with a hole in it. A job nobody scheduled has no rule, and
     // `for rule 'None'` would be a line a person reads as a bug in the scheduler.
