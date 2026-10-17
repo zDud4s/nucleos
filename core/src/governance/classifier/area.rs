@@ -252,7 +252,15 @@ fn checkouts_of(root: &Path) -> Vec<PathBuf> {
     let Some(main) = main_checkout_of(root) else {
         return Vec::new();
     };
+    // `normalize_path` drops a POSIX path's leading `/`, which is harmless to the lexical
+    // comparison but turns this into a path relative to the cwd: put the root back before
+    // reading the disk with it.
     let main = PathBuf::from(main);
+    let main = if root.has_root() && !main.has_root() {
+        Path::new("/").join(main)
+    } else {
+        main
+    };
     let mut checkouts = vec![main.clone()];
     let Ok(entries) = std::fs::read_dir(main.join(".git").join("worktrees")) else {
         return checkouts;
