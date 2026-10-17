@@ -54,6 +54,9 @@ struct Owns {
     owns: Vec<String>,
     /// The managed block's source (`workflow_materialize`), which must be among what is copied.
     agents_block: Option<String>,
+    /// The bundle's hook declarations (`workflows::hooks`), raw until they are parsed below.
+    #[serde(default)]
+    hooks: serde_yaml::Value,
 }
 
 /// Copy one file or directory tree, files only, skipping symlinks for the reason
@@ -102,7 +105,11 @@ pub async fn package(
     }
     let text = std::fs::read_to_string(manifest)
         .map_err(|error| format!("{}: {error}", manifest.display()))?;
-    let Owns { owns, agents_block } = serde_yaml::from_str::<Option<Owns>>(&text)
+    let Owns {
+        owns,
+        agents_block,
+        hooks,
+    } = serde_yaml::from_str::<Option<Owns>>(&text)
         .map_err(|error| format!("{}: {error}", manifest.display()))?
         .unwrap_or_default();
     if owns.is_empty() {
@@ -154,6 +161,29 @@ pub async fn package(
         }
     }
 
+    // A hook script is copied into the library whether or not `owns:` names it, and when it does
+    // not, it is in the library ONLY: materialization provides what `owns:` lists and nothing else,
+    // so a gate kept out of that list never lands in a checkout an agent could edit it in. Checked
+    // here, against the project, because a hook naming a file the bundle does not have would
+    // package fine and then be skipped on every event it was meant to watch.
+    let hooks = crate::workflows::hooks::parse(hooks)
+        .and_then(|hooks| {
+            crate::workflows::hooks::validate(&hooks, |rel| {
+                std::fs::symlink_metadata(project_root.join(rel)).is_ok_and(|meta| meta.is_file())
+            })
+            .map(|()| hooks)
+        })
+        .map_err(|error| format!("{}: {error}", manifest.display()))?;
+    let mut hook_scripts: Vec<String> = Vec::new();
+    for hook in &hooks {
+        if let Some(rel) = crate::ownership::normalise(&hook.script)
+            && !crate::workflows::materialize::provided(&entries, &rel)
+            && !hook_scripts.contains(&rel)
+        {
+            hook_scripts.push(rel);
+        }
+    }
+
     let home = library_root.join(name);
     let dir = home.join(version);
     if dir.exists() {
@@ -164,7 +194,7 @@ pub async fn package(
 
     let copied = (|| -> std::io::Result<usize> {
         let mut count = 0;
-        for rel in &entries {
+        for rel in entries.iter().chain(&hook_scripts) {
             copy_into(&project_root.join(rel), &dir.join(rel), &mut count)?;
         }
         std::fs::write(dir.join(workflows::MANIFEST), &text)?;
@@ -427,6 +457,49 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("MANAGED BLOCK"), "{error}");
         assert!(!library.exists());
+    }
+
+    /// A hook script outside `owns:` is still packaged — into the library, where it runs from —
+    /// and a hook naming a file the project does not have, or an event nobody fires, refuses the
+    /// whole package rather than shipping a guard that would never run.
+    #[tokio::test]
+    async fn hook_scripts_are_packaged_and_a_hook_that_could_not_run_refuses_packaging() {
+        let temp = project();
+        let library = temp.path().join("lib");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("gates")).unwrap();
+        std::fs::write(root.join("gates/stop.py"), "print()").unwrap();
+
+        for bad in [
+            "hooks:\n  - event: Stop\n    script: gates/missing.py\n",
+            "hooks:\n  - event: Teardown\n    script: gates/stop.py\n",
+            "hooks:\n  - event: Stop\n    script: ../gates/stop.py\n",
+        ] {
+            let manifest = temp.path().join("bad.yaml");
+            std::fs::write(&manifest, format!("owns:\n  - .ai/workflow/\n{bad}")).unwrap();
+            assert!(
+                package(&library, "dev", "1.0.0", &root, &manifest)
+                    .await
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        assert!(!library.exists());
+
+        let manifest = temp.path().join("hooked.yaml");
+        std::fs::write(
+            &manifest,
+            "owns:\n  - .ai/workflow/\nhooks:\n  - event: Stop\n    script: gates/stop.py\n    args: [\"--stop-hook\"]\n",
+        )
+        .unwrap();
+        let packaged = package(&library, "dev", "1.0.0", &root, &manifest)
+            .await
+            .unwrap();
+        assert!(packaged.dir.join("gates/stop.py").is_file());
+        assert_eq!(packaged.files, 3);
+        let hooks = crate::workflows::hooks::manifest_hooks(&packaged.dir).unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].args, vec!["--stop-hook".to_string()]);
     }
 
     #[tokio::test]

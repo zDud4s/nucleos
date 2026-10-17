@@ -61,6 +61,7 @@
 //! pinned is not the 1.0 you have" are opposite facts that would send a person to opposite places.
 
 pub mod graph;
+pub mod hooks;
 pub mod materialize;
 pub mod package;
 
@@ -232,6 +233,16 @@ struct ManifestFile {
     /// A bundle-relative file whose text is the managed block of the project's `AGENTS.md`. See
     /// [`crate::workflows::materialize`]. Absent, and the bundle never touches `AGENTS.md`.
     agents_block: Option<String>,
+    /// Claude Code hooks this workflow runs, from the library, for any project that pins it: a
+    /// list of [`hooks::HookDecl`]. See [`crate::workflows::hooks`], the only reader and the place
+    /// they are parsed and validated.
+    ///
+    /// Kept as raw YAML here on purpose. `read_bundle` falls back to an empty manifest when this
+    /// struct does not parse, so a typed field would let one mistyped hook key erase the bundle's
+    /// `owns:` and `agents_block` from every listing and materialization — a broken hook would
+    /// take the whole workflow with it. Parsed late, it costs only the hooks.
+    #[serde(default)]
+    hooks: serde_yaml::Value,
 }
 
 /// One bundle in the library, as it is on disk right now.
@@ -1067,6 +1078,25 @@ mod tests {
 
         assert_ne!(before, after);
         assert!(before.starts_with("sha256:"));
+    }
+
+    /// A mistyped hook costs the hooks and nothing else: the bundle still lists with the files it
+    /// owns, which is what every materialization of it reads.
+    #[test]
+    fn a_broken_hook_declaration_does_not_erase_the_rest_of_the_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = shelf(temp.path(), "harness", "1.0", &[]);
+        let dir = root.join("harness/1.0");
+        std::fs::write(
+            dir.join(MANIFEST),
+            "description: a workflow\nowns:\n  - .ai/workflow/\nhooks:\n  - event: Stop\n    scirpt: x.py\n",
+        )
+        .unwrap();
+
+        let bundle = bundle_at(&root, "harness", "1.0");
+        assert_eq!(bundle.owns, vec![".ai/workflow/".to_string()]);
+        assert_eq!(bundle.description.as_deref(), Some("a workflow"));
+        assert!(hooks::manifest_hooks(&dir).is_err());
     }
 
     #[test]
