@@ -4,6 +4,7 @@ package launch
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -85,7 +86,7 @@ type Fetcher interface {
 
 // Download fetches, verifies and extracts the pinned Chromium. It is a no-op if already present.
 //
-// Order matters: the whole archive is read and hashed BEFORE anything is extracted. Streaming
+// Order matters: the whole archive is downloaded and hashed BEFORE anything is extracted. Streaming
 // straight to disk and checking the digest afterwards would leave a half-written, unverified
 // browser on disk if the check failed, and something would eventually run it.
 func (i Install) Download(ctx context.Context, fetcher Fetcher) error {
@@ -102,21 +103,41 @@ func (i Install) Download(ctx context.Context, fetcher Fetcher) error {
 	}
 	defer body.Close()
 
-	archive, err := io.ReadAll(body)
+	// The body goes to a file beside the install, not into memory: a Chromium archive is hundreds of
+	// megabytes. The file is hashed while it is written, and removed on every way out.
+	if err := os.MkdirAll(i.Root, 0o755); err != nil {
+		return fmt.Errorf("creating %s: %w", i.Root, err)
+	}
+	staged, err := os.CreateTemp(i.Root, "chromium-download-*.zip")
+	if err != nil {
+		return fmt.Errorf("staging chromium archive: %w", err)
+	}
+	defer func() {
+		staged.Close()
+		os.Remove(staged.Name())
+	}()
+
+	hash := sha256.New()
+	size, err := io.Copy(io.MultiWriter(staged, hash), body)
 	if err != nil {
 		return fmt.Errorf("reading chromium archive: %w", err)
 	}
 
-	sum := sha256.Sum256(archive)
-	if !strings.EqualFold(hex.EncodeToString(sum[:]), i.Pin.Sha256) {
-		return fmt.Errorf("%w: got %s, want %s", ErrDigestMismatch, hex.EncodeToString(sum[:]), i.Pin.Sha256)
+	got := hex.EncodeToString(hash.Sum(nil))
+	if !strings.EqualFold(got, i.Pin.Sha256) {
+		return fmt.Errorf("%w: got %s, want %s", ErrDigestMismatch, got, i.Pin.Sha256)
 	}
 
-	return i.extract(archive)
+	return i.extractZip(staged, size)
 }
 
+// extract unpacks an archive already held in memory.
 func (i Install) extract(archive []byte) error {
-	reader, err := zip.NewReader(newByteReaderAt(archive), int64(len(archive)))
+	return i.extractZip(bytes.NewReader(archive), int64(len(archive)))
+}
+
+func (i Install) extractZip(source io.ReaderAt, size int64) error {
+	reader, err := zip.NewReader(source, size)
 	if err != nil {
 		return fmt.Errorf("opening chromium archive: %w", err)
 	}
@@ -307,21 +328,4 @@ func safeJoin(root, name string) (string, error) {
 		return "", fmt.Errorf("launch: archive entry %q escapes the install directory", name)
 	}
 	return target, nil
-}
-
-// byteReaderAt adapts a []byte to io.ReaderAt without a temp file — the archive is already in
-// memory because it had to be hashed whole before anything was written.
-type byteReaderAt struct{ data []byte }
-
-func newByteReaderAt(data []byte) *byteReaderAt { return &byteReaderAt{data: data} }
-
-func (b *byteReaderAt) ReadAt(p []byte, off int64) (int, error) {
-	if off < 0 || off >= int64(len(b.data)) {
-		return 0, io.EOF
-	}
-	n := copy(p, b.data[off:])
-	if n < len(p) {
-		return n, io.EOF
-	}
-	return n, nil
 }
