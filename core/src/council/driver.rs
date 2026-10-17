@@ -84,6 +84,11 @@ impl Driver {
             }
         }
 
+        // A cancel that landed during the last critique/revise phase must not start a chairman
+        // nothing would then kill.
+        if self.was_settled().await {
+            return;
+        }
         self.chairman_phase(rounds_run, &current, &anon, &last_critiques, changes)
             .await;
     }
