@@ -244,12 +244,12 @@ fn cached_models_config(
         return ModelsConfig::default();
     };
     let (len, modified) = (meta.len(), meta.modified().ok());
-    if let Ok(guard) = cache.lock() {
-        if let Some(hit) = guard.as_ref().filter(|hit| {
+    if let Ok(guard) = cache.lock()
+        && let Some(hit) = guard.as_ref().filter(|hit| {
             hit.path == path && hit.len == len && modified.is_some() && hit.modified == modified
-        }) {
-            return hit.config.clone();
-        }
+        })
+    {
+        return hit.config.clone();
     }
     let Ok(config) = load_models_config(path) else {
         return ModelsConfig::default();
