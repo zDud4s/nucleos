@@ -81,6 +81,7 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange }: Analytic
         global={global}
         quota={quota.data}
         quotaFailed={quota.isError}
+        quotaUpdatedAt={quota.dataUpdatedAt}
       />
     </div>
   );
@@ -99,10 +100,11 @@ interface ReadoutProps {
   global: boolean;
   quota: QuotaHistory | undefined;
   quotaFailed: boolean;
+  quotaUpdatedAt: number;
 }
 
 /** Absent, refused, stale and read are four different answers (§9.7), and never render as one. */
-function Readout({ data, failed, missing, updatedAt, global, quota, quotaFailed }: ReadoutProps) {
+function Readout({ data, failed, missing, updatedAt, global, quota, quotaFailed, quotaUpdatedAt }: ReadoutProps) {
   if (data === undefined) {
     if (missing) return <Absent label="Analytics" why="No project by that name." />;
     if (failed) return <ErrorNote>The núcleo did not answer for analytics.</ErrorNote>;
@@ -115,7 +117,7 @@ function Readout({ data, failed, missing, updatedAt, global, quota, quotaFailed 
       <ThroughputSection report={data} />
       <DeliveredSection report={data} />
       <TopRunsSection report={data} />
-      {global ? <QuotaSection report={data} history={quota} failed={quotaFailed} /> : null}
+      {global ? <QuotaSection report={data} history={quota} failed={quotaFailed} staleSince={quota !== undefined && quotaFailed ? quotaUpdatedAt : undefined} /> : null}
     </>
   );
 }

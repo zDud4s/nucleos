@@ -82,7 +82,7 @@
 }
 
 .an-top-link:hover {
-  background: var(--surface-raised);
+  text-decoration: underline;
 }
 
 .an-top-meta {

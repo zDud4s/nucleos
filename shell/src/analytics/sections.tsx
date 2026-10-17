@@ -3,9 +3,10 @@ import { Link } from "@tanstack/react-router";
 import type { BarDatum } from "../ui/BarChart";
 import type { AnalyticsReport, QuotaHistory } from "../data/analytics";
 import { compactTokens, humanMinutes } from "../data/project-readings";
-import { BarChart, ErrorNote, Section, StatCard, StepLine, usd } from "../ui";
+import { BarChart, ErrorNote, Section, StaleNote, StatCard, StepLine, usd } from "../ui";
 import {
   DELIVERED_KEYS,
+  ESTIMATED_KEY,
   GATE_KEYS,
   TOKEN_KEYS,
   costBars,
@@ -34,14 +35,21 @@ const percent = (fraction: number) => `${Math.round(fraction * 100)}%`;
 
 /**
  * One sentence for a screen reader: the charts are `role="img"`, so their per-segment titles do not
- * reach it. Total and the busiest day; nothing to say when the window is empty.
+ * reach it. Total and the busiest day; nothing to say when the window is empty. The part named by
+ * `apart` (the estimate) is never folded into the total or the peak: it is stated on its own.
  */
-function summary(data: BarDatum[], format: (value: number) => string): ReactNode {
-  const days = data.map((datum) => ({ day: datum.day, total: datum.parts.reduce((sum, part) => sum + part.value, 0) }));
+function summary(data: BarDatum[], format: (value: number) => string, apart?: string): ReactNode {
+  const days = data.map((datum) => ({
+    day: datum.day,
+    total: datum.parts.reduce((sum, part) => (part.key === apart ? sum : sum + part.value), 0),
+    apart: datum.parts.reduce((sum, part) => (part.key === apart ? sum + part.value : sum), 0),
+  }));
   const total = days.reduce((sum, entry) => sum + entry.total, 0);
-  if (total <= 0) return null;
+  const estimated = days.reduce((sum, entry) => sum + entry.apart, 0);
+  if (total <= 0 && estimated <= 0) return null;
   const peak = days.reduce((best, entry) => (entry.total > best.total ? entry : best), days[0]);
-  return <p className="sr-only">{`Total ${format(total)}; peak ${format(peak.total)} on ${peak.day}.`}</p>;
+  const head = estimated > 0 ? `Total ${format(total)} measured; ${format(estimated)} estimated from run time` : `Total ${format(total)}`;
+  return <p className="sr-only">{`${head}; peak ${format(peak.total)} on ${peak.day}.`}</p>;
 }
 
 function plural(n: number, one: string, many: string): string {
@@ -55,6 +63,8 @@ function joined(parts: string[]): string {
 
 export function CostSection({ report }: SectionProps) {
   const { cost, tokens, days } = report;
+  const costData = costBars(cost);
+  const tokenData = tokenBars(tokens);
   const tokensNow = tokens.total.measured_sessions === 0 ? null : totalTokens(tokens.total);
   const tokensBefore = tokens.previous.measured_sessions === 0 ? null : totalTokens(tokens.previous);
   const ratio = tokens.total.cache_hit_ratio;
@@ -99,22 +109,22 @@ export function CostSection({ report }: SectionProps) {
         <p className="an-note">{`${plural(tokens.total.unmeasured_runs, "run", "runs")} not measured`}</p>
       ) : null}
       <div className="an-charts">
-        {summary(costBars(cost), usd)}
         <BarChart
-          data={costBars(cost)}
+          data={costData}
           keys={costKeys(cost)}
           label={`Cost per day by ${cost.by_label}, last ${days} days`}
           format={usd}
           empty={EMPTY}
         />
-        {summary(tokenBars(tokens), compactTokens)}
+        {summary(costData, usd, ESTIMATED_KEY)}
         <BarChart
-          data={tokenBars(tokens)}
+          data={tokenData}
           keys={TOKEN_KEYS}
           label={`Tokens per day by kind, last ${days} days`}
           format={compactTokens}
           empty={EMPTY}
         />
+        {summary(tokenData, compactTokens)}
       </div>
     </Section>
   );
@@ -122,6 +132,7 @@ export function CostSection({ report }: SectionProps) {
 
 export function ThroughputSection({ report }: SectionProps) {
   const { throughput, days } = report;
+  const gateData = gateBars(throughput);
   const { total } = throughput;
   const rate = passRate(total);
   const judged = total.passed + total.failed + total.errored;
@@ -151,14 +162,14 @@ export function ThroughputSection({ report }: SectionProps) {
           }
         />
       </div>
-      {summary(gateBars(throughput), count)}
       <BarChart
-        data={gateBars(throughput)}
+        data={gateData}
         keys={GATE_KEYS}
         label={`Runs per day by gate result, last ${days} days`}
         format={count}
         empty={EMPTY}
       />
+      {summary(gateData, count)}
       {throughput.by_mode.length === 0 ? null : (
         <ul className="an-pairs" aria-label="Runs by mode">
           {throughput.by_mode.map((row) => (
@@ -175,6 +186,7 @@ export function ThroughputSection({ report }: SectionProps) {
 
 export function DeliveredSection({ report }: SectionProps) {
   const { delivered, days } = report;
+  const deliveredData = deliveredBars(delivered);
   const median = delivered.total.median_minutes;
   return (
     <Section label="Delivered">
@@ -194,14 +206,14 @@ export function DeliveredSection({ report }: SectionProps) {
           }
         />
       </div>
-      {summary(deliveredBars(delivered), count)}
       <BarChart
-        data={deliveredBars(delivered)}
+        data={deliveredData}
         keys={DELIVERED_KEYS}
         label={`Merges per day, last ${days} days`}
         format={count}
         empty="Nothing landed in this window"
       />
+      {summary(deliveredData, count)}
     </Section>
   );
 }
@@ -238,18 +250,20 @@ export interface QuotaSectionProps extends SectionProps {
   history: QuotaHistory | undefined;
   /** The quota read failed with nothing cached. */
   failed: boolean;
+  /** When the quota read last succeeded; set only when a refetch failed over cached data. */
+  staleSince?: number;
 }
 
 /** Global only (§9.8). The time axis is the report's window, so quota lines up with the bars above. */
-export function QuotaSection({ report, history, failed }: QuotaSectionProps) {
+export function QuotaSection({ report, history, failed, staleSince }: QuotaSectionProps) {
   return (
     <Section label="Quota">
-      <QuotaBody report={report} history={history} failed={failed} />
+      <QuotaBody report={report} history={history} failed={failed} staleSince={staleSince} />
     </Section>
   );
 }
 
-function QuotaBody({ report, history, failed }: QuotaSectionProps) {
+function QuotaBody({ report, history, failed, staleSince }: QuotaSectionProps) {
   if (history === undefined) {
     return failed ? (
       <ErrorNote>The núcleo did not answer for the quota history.</ErrorNote>
@@ -260,6 +274,7 @@ function QuotaBody({ report, history, failed }: QuotaSectionProps) {
   const since = history.since === null ? null : history.since.slice(0, 10);
   return (
     <>
+      {staleSince === undefined ? null : <StaleNote dataUpdatedAt={staleSince} />}
       <p className="an-note">
         {since === null
           ? "Nothing recorded yet: the history starts with the first quota reading taken while the app is open."

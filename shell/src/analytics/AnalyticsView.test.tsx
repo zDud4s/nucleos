@@ -198,6 +198,15 @@ describe("what the tiles say", () => {
     expect(within(measured).getByText(/\$0\.35 judge, counted apart/)).toBeTruthy();
   });
 
+  it("reads the estimate apart from the measured total in the cost summary", async () => {
+    await mount(busy());
+    await screen.findByRole("region", { name: "Cost and tokens" });
+    const text = screen.getByText(/^Total \$.*measured/).textContent ?? "";
+    expect(text).toContain("Total $2.35 measured");
+    expect(text).toContain("$0.50 estimated from run time");
+    expect(text).toContain("peak $2.35");
+  });
+
   it("says the change in words", async () => {
     await mount(busy());
     const measured = await screen.findByRole("article", { name: "Cost" });
