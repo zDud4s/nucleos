@@ -12,6 +12,7 @@ import {
 } from "../lib/turns";
 import { apiFetch, apiText } from "./client";
 import { keys } from "./keys";
+import { backoffDelay } from "./liveRecords";
 import { streamLiveTurn } from "./liveStream";
 import { POLL, backgroundCadence } from "./poll";
 
@@ -1458,13 +1459,26 @@ export function useLiveTurn(
   useEffect(() => {
     if (!wantStream) return;
     const controller = new AbortController();
+    const { signal } = controller;
     setMode("stream");
-    void streamLiveTurn(turnId, {
-      signal: controller.signal,
-      onLive: (live) => queryClient.setQueryData(keys.chats.live(turnId), live),
-    }).then((outcome) => {
-      if (outcome === "failed" && !controller.signal.aborted) setMode("poll");
-    });
+    void (async () => {
+      // A dropped stream degrades to the poll only while it is being retried: a
+      // restart of the daemon must not leave the turn polling for good.
+      for (let attempt = 0; !signal.aborted; attempt += 1) {
+        const outcome = await streamLiveTurn(turnId, {
+          signal,
+          onLive: (live) => queryClient.setQueryData(keys.chats.live(turnId), live),
+        });
+        if (outcome === "ended" || signal.aborted) return;
+        setMode("poll");
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, backoffDelay(attempt));
+          signal.addEventListener("abort", () => (clearTimeout(timer), resolve()), { once: true });
+        });
+        if (signal.aborted) return;
+        setMode("stream");
+      }
+    })();
     return () => controller.abort();
   }, [turnId, wantStream, queryClient]);
 

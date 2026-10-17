@@ -193,7 +193,23 @@ async function refusalFrom(res: Response): Promise<ApiRefusal> {
   return new ApiRefusal(res.status, fallback, trimmed);
 }
 
+/**
+ * A 401 most likely means the daemon restarted and rotated its token, so the
+ * memoised one is stale: drop it, read the credential again and retry once.
+ * Safe for mutations too — a 401 means the request was never acted on. A second
+ * 401 is a real refusal.
+ */
 async function request(path: string, init: RequestInit | undefined): Promise<Response> {
+  try {
+    return await requestOnce(path, init);
+  } catch (error) {
+    if (!(error instanceof ApiRefusal) || error.status !== 401) throw error;
+    tokenRequest = null;
+    return await requestOnce(path, init);
+  }
+}
+
+async function requestOnce(path: string, init: RequestInit | undefined): Promise<Response> {
   let token: string;
   try {
     token = await daemonToken();
