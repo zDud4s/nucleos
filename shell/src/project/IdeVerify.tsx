@@ -39,10 +39,11 @@ export function IdeVerifyPanel({
     <Panel title="IDE verify">
       <Why lead="Lets an IDE session in this project's worktrees reach the núcleo's verify box.">
         <p>
-          Switching it on writes a daemon-owned <code>.mcp.json</code> and an
-          approval in <code>.claude/settings.local.json</code> into every IDE
-          worktree of the project, hidden from git. Switching it off removes
-          exactly that and nothing else.
+          On by default. While it is on, the núcleo keeps a daemon-owned{" "}
+          <code>.mcp.json</code> and an approval in{" "}
+          <code>.claude/settings.local.json</code> in every IDE worktree of the
+          project, hidden from git, and checks for new worktrees every five
+          minutes. Switching it off removes exactly that and nothing else.
         </p>
       </Why>
 

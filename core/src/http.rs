@@ -3933,23 +3933,24 @@ mod tests {
 
         let (status, body) = read_rules(state.clone(), "alpha").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["ide_verify"], false);
+        assert_eq!(body["ide_verify"], true);
 
-        sqlx::query("UPDATE autopilot_state SET ide_verify = 1 WHERE project_id = 'alpha'")
+        sqlx::query("UPDATE autopilot_state SET ide_verify_off = 1 WHERE project_id = 'alpha'")
             .execute(&state.pool)
             .await
             .unwrap();
         let (_, body) = read_rules(state.clone(), "alpha").await;
-        assert_eq!(body["ide_verify"], true);
+        assert_eq!(body["ide_verify"], false);
 
-        // Reading it again changes nothing: the switch is still on.
+        // Reading it again changes nothing: the switch is still off.
         let (_, body) = read_rules(state.clone(), "alpha").await;
-        assert_eq!(body["ide_verify"], true);
-        let stored: i64 =
-            sqlx::query_scalar("SELECT ide_verify FROM autopilot_state WHERE project_id = 'alpha'")
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        assert_eq!(body["ide_verify"], false);
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT ide_verify_off FROM autopilot_state WHERE project_id = 'alpha'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
         assert_eq!(stored, 1);
     }
 

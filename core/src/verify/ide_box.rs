@@ -303,11 +303,11 @@ mod tests {
     async fn pool_with(repo: &Path, ide_verify: bool) -> SqlitePool {
         let pool = crate::testdb::fresh_pool().await;
         sqlx::query(
-            "INSERT INTO autopilot_state (project_id, mode, project_root, ide_verify) \
+            "INSERT INTO autopilot_state (project_id, mode, project_root, ide_verify_off) \
              VALUES ('alpha', 'active', ?, ?)",
         )
         .bind(repo.to_string_lossy().into_owned())
-        .bind(i64::from(ide_verify))
+        .bind(i64::from(!ide_verify))
         .execute(&pool)
         .await
         .unwrap();

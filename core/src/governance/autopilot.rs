@@ -239,14 +239,25 @@ pub async fn autopilot_judge_mode(pool: &SqlitePool, project_id: &str) -> sqlx::
 }
 
 /// Whether interactive sessions in this project's worktrees may receive the `verify` tools
-/// (spec 2026-10-05 section 4.7; migration 0178). A project with no row reads as off.
+/// (spec 2026-10-05 section 4.7; migrations 0178 and 0200). On unless the owner switched it off;
+/// a project with no row reads as off, since there is nothing to provision.
 pub async fn ide_verify_enabled(pool: &SqlitePool, project_id: &str) -> sqlx::Result<bool> {
     let stored: Option<i64> =
-        sqlx::query_scalar("SELECT ide_verify FROM autopilot_state WHERE project_id = ?")
+        sqlx::query_scalar("SELECT ide_verify_off FROM autopilot_state WHERE project_id = ?")
             .bind(project_id)
             .fetch_optional(pool)
             .await?;
-    Ok(stored.is_some_and(|value| value != 0))
+    Ok(stored.is_some_and(|off| off == 0))
+}
+
+/// The rostered projects whose IDE verify switch is on and that have a root to provision.
+pub async fn ide_verify_projects(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT project_id FROM autopilot_state \
+         WHERE ide_verify_off = 0 AND project_root IS NOT NULL ORDER BY project_id",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 /// Writes the IDE verify switch of one project. `true` when a row matched, so an unknown project
@@ -256,8 +267,8 @@ pub async fn set_ide_verify(
     project_id: &str,
     enabled: bool,
 ) -> sqlx::Result<bool> {
-    let done = sqlx::query("UPDATE autopilot_state SET ide_verify = ? WHERE project_id = ?")
-        .bind(i64::from(enabled))
+    let done = sqlx::query("UPDATE autopilot_state SET ide_verify_off = ? WHERE project_id = ?")
+        .bind(i64::from(!enabled))
         .bind(project_id)
         .execute(pool)
         .await?;
@@ -1691,24 +1702,25 @@ pub mod tests {
         crate::testdb::fresh_pool().await
     }
 
-    /// The IDE verify switch (spec 4.7, migration 0178) is off unless somebody turns it on, and
-    /// a project the roster has never heard of reads as off rather than as an error.
+    /// The IDE verify switch (spec 4.7, migration 0200) is on for a new project until somebody
+    /// turns it off, and a project the roster has never heard of reads as off rather than as an
+    /// error.
     #[tokio::test]
-    async fn ide_verify_is_off_for_a_new_project_and_for_an_unknown_one() {
+    async fn ide_verify_is_on_for_a_new_project_and_off_for_an_unknown_one() {
         let pool = test_pool().await;
         sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
             .execute(&pool)
             .await
             .unwrap();
 
-        assert!(!ide_verify_enabled(&pool, "p").await.unwrap());
+        assert!(ide_verify_enabled(&pool, "p").await.unwrap());
         assert!(!ide_verify_enabled(&pool, "nobody").await.unwrap());
 
-        sqlx::query("UPDATE autopilot_state SET ide_verify = 1 WHERE project_id = 'p'")
+        sqlx::query("UPDATE autopilot_state SET ide_verify_off = 1 WHERE project_id = 'p'")
             .execute(&pool)
             .await
             .unwrap();
-        assert!(ide_verify_enabled(&pool, "p").await.unwrap());
+        assert!(!ide_verify_enabled(&pool, "p").await.unwrap());
         assert!(!ide_verify_enabled(&pool, "nobody").await.unwrap());
     }
 
@@ -1725,16 +1737,16 @@ pub mod tests {
                 .unwrap();
         }
 
-        assert!(set_ide_verify(&pool, "p", true).await.unwrap());
-        assert!(ide_verify_enabled(&pool, "p").await.unwrap());
-        assert!(!ide_verify_enabled(&pool, "q").await.unwrap());
+        assert!(set_ide_verify(&pool, "p", false).await.unwrap());
+        assert!(!ide_verify_enabled(&pool, "p").await.unwrap());
+        assert!(ide_verify_enabled(&pool, "q").await.unwrap());
 
         assert!(!set_ide_verify(&pool, "nobody", true).await.unwrap());
         assert!(!ide_verify_enabled(&pool, "nobody").await.unwrap());
 
-        assert!(set_ide_verify(&pool, "p", false).await.unwrap());
-        assert!(!ide_verify_enabled(&pool, "p").await.unwrap());
-        assert!(!ide_verify_enabled(&pool, "q").await.unwrap());
+        assert!(set_ide_verify(&pool, "p", true).await.unwrap());
+        assert!(ide_verify_enabled(&pool, "p").await.unwrap());
+        assert!(ide_verify_enabled(&pool, "q").await.unwrap());
     }
 
     /// The stand-in for `~/.nucleos` beside one test's project: inside the project's own temporary

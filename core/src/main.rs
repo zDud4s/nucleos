@@ -942,6 +942,9 @@ async fn main() {
     tokio::spawn(team::trigger::run_team_trigger_loop(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(execution::worktree::run_gc(state.pool.clone()));
+    // Plan 2026-10-17 F1: every session in a rostered project gets the `verify` box, the main
+    // checkout's and a worktree added by hand included, unless the owner switched it off.
+    tokio::spawn(verify::provision::run_reconcile_loop(state.pool.clone()));
     // The worktree GC's counterpart inside the database. It collects the directories a finished run
     // leaves on disk; this expires the transcript it leaves in `runs`, the events it leaves in
     // `run_events`, and eventually its line in the feed. Nothing removed any of those, so all three
