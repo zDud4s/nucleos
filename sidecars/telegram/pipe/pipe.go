@@ -896,9 +896,15 @@ func RunNotifier(ctx context.Context, bot Bot, dc Daemon, to telegram.Destinatio
 		}
 	}
 
-	for sleepUntil(ctx, interval) {
+	wait := interval
+	for sleepUntil(ctx, wait) {
+		// Whether this round found anything to say. An idle round lengthens the next sleep (see
+		// nextIdleDelay); the first round that finds something puts it back to the configured interval.
+		active := false
 		if props, err := dc.GetProposals(); err == nil {
-			for _, p := range state.NewProposals(props) {
+			newProps := state.NewProposals(props)
+			active = active || len(newProps) > 0
+			for _, p := range newProps {
 				err := bot.SendMessageWithButtons(to, "🆕 "+formatProposal(p), approveRejectRow(idOf(p)))
 				logSend("new proposal", err)
 				if err != nil {
@@ -911,14 +917,21 @@ func RunNotifier(ctx context.Context, bot Bot, dc Daemon, to telegram.Destinatio
 			}
 		}
 		if feed, err := dc.GetFeed(); err == nil {
-			policy := notifyPolicy(dc)
 			// AFTER NewFeedItems, never before, and this is the whole reason the ordering is
 			// written down: NewFeedItems marks the entire round as seen — `newItems` rebuilds
 			// `stillPresent` from `current` regardless of what it returns — so a suppressed row
 			// still enters `seen`. Turning a family back on tomorrow therefore affects future
 			// lines only. Filter the feed before this call instead and re-enabling a family dumps
 			// ninety days of backlog into the chat at once.
-			for _, f := range state.NewFeedItems(feed) {
+			newItems := state.NewFeedItems(feed)
+			active = active || len(newItems) > 0
+			// The policy only filters new items, so it is fetched only when there are some: an idle
+			// round saves a daemon GET.
+			var policy notifier.Policy
+			if len(newItems) > 0 {
+				policy = notifyPolicy(dc)
+			}
+			for _, f := range newItems {
 				if !policy.Allows(kindOf(f)) {
 					// A decision, not a failed send — so no state.Forget. Forgetting would offer
 					// the row again next round, and it would be declined again for ever.
@@ -940,6 +953,7 @@ func RunNotifier(ctx context.Context, bot Bot, dc Daemon, to telegram.Destinatio
 			}
 		}
 		if kill, err := dc.GetKill(); err == nil && state.KillChanged(kill) {
+			active = true
 			word := "disengaged"
 			if kill {
 				word = "ENGAGED"
@@ -951,9 +965,37 @@ func RunNotifier(ctx context.Context, bot Bot, dc Daemon, to telegram.Destinatio
 			}
 		}
 		if budget, err := dc.GetBudget(); err == nil && state.BudgetChanged(budget) {
+			active = true
 			logSend("budget alert", bot.SendMessage(to, formatBudget(budget)))
 		}
+		if active {
+			wait = interval
+		} else {
+			wait = nextIdleDelay(wait, interval)
+		}
 	}
+}
+
+// nextIdleDelay is the sleep after an idle round: double the current one, capped at six times the
+// configured interval (5s -> 10s -> 20s -> 30s by default), but never above 30s unless the
+// configured interval itself is larger, and never below the configured interval.
+func nextIdleDelay(cur, base time.Duration) time.Duration {
+	const ceiling = 30 * time.Second
+	limit := 6 * base
+	if limit > ceiling {
+		limit = ceiling
+	}
+	if limit < base {
+		limit = base
+	}
+	next := cur * 2
+	if next > limit {
+		next = limit
+	}
+	if next < base {
+		next = base
+	}
+	return next
 }
 
 // notifyPolicy is the owner's selection, or a policy that allows everything when it cannot be

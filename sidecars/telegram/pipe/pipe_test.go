@@ -884,9 +884,12 @@ type bootingDaemon struct {
 	// policy silences everything the feed carries.
 	killFrom         int
 	budgetPausedFrom int
+	// policyCalls counts GetNotifyPolicy reads.
+	policyCalls int
 }
 
 func (d *bootingDaemon) GetNotifyPolicy() (notifier.Policy, error) {
+	d.policyCalls++
 	if d.notifyPolicyErr != nil {
 		return notifier.Policy{}, d.notifyPolicyErr
 	}
@@ -1629,5 +1632,52 @@ func TestACaptureRequestFeedLineIsSentWithoutItsKindPrefix(t *testing.T) {
 	}
 	if got := formatFeed(map[string]any{"kind": "job_failed", "summary": "x"}); got != "job_failed: x" {
 		t.Errorf("other kinds lost their prefix: %q", got)
+	}
+}
+
+// The policy only filters new feed items, so an idle round must not fetch it.
+func TestTheNotifierReadsThePolicyOnlyWhenThereAreNewFeedItems(t *testing.T) {
+	cases := []struct {
+		name        string
+		feedArrives map[int][]map[string]any
+		wantReads   int
+	}{
+		{"idle feed", nil, 0},
+		{"one new item", map[int][]map[string]any{3: {{"id": float64(7), "kind": "run", "summary": "fresh"}}}, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			bot := &recordingBot{}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			dc := &bootingDaemon{
+				recordingDaemon: &recordingDaemon{},
+				stopAfter:       6,
+				stop:            cancel,
+				feedArriving:    c.feedArrives,
+			}
+			RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, nil, time.Millisecond)
+			if dc.policyCalls != c.wantReads {
+				t.Errorf("policy reads = %d, want %d", dc.policyCalls, c.wantReads)
+			}
+		})
+	}
+}
+
+func TestNextIdleDelay(t *testing.T) {
+	s := time.Second
+	cases := []struct{ cur, base, want time.Duration }{
+		{5 * s, 5 * s, 10 * s},
+		{10 * s, 5 * s, 20 * s},
+		{20 * s, 5 * s, 30 * s},
+		{30 * s, 5 * s, 30 * s},
+		{60 * s, 60 * s, 60 * s}, // configured interval above the cap wins
+		{time.Millisecond, time.Millisecond, 2 * time.Millisecond},
+		{5 * time.Millisecond, time.Millisecond, 6 * time.Millisecond},
+	}
+	for _, c := range cases {
+		if got := nextIdleDelay(c.cur, c.base); got != c.want {
+			t.Errorf("nextIdleDelay(%v, %v) = %v, want %v", c.cur, c.base, got, c.want)
+		}
 	}
 }
