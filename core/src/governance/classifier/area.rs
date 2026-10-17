@@ -21,16 +21,40 @@ use std::time::{Duration, Instant};
 pub struct Area {
     roots: Vec<String>,
     temp: Option<String>,
+    /// Where the daemon keeps its own worktrees, normalised and folded: `<root>/.nucleos/worktrees`
+    /// for every root, and `NUCLEOS_WORKTREE_ROOT` when a conversation's area is built under one.
+    /// See `daemon_tree`.
+    daemon: Vec<String>,
+}
+
+fn fold(path: &Path) -> String {
+    fold_for_containment(&normalize_path(&path.to_string_lossy(), None))
+}
+
+/// `<root>/.nucleos/worktrees`, for a root already normalised and folded: the default
+/// `worktree::worktree_root`, spelled the way `inside` compares.
+fn daemon_root_of(root: &str) -> String {
+    fold_for_containment(&format!(
+        "{root}/{}/worktrees",
+        crate::execution::worktree::ARTIFACTS_DIR
+    ))
 }
 
 impl Area {
     pub fn new(roots: &[PathBuf], temp: Option<&Path>) -> Self {
-        let fold =
-            |path: &Path| fold_for_containment(&normalize_path(&path.to_string_lossy(), None));
+        let roots: Vec<String> = roots.iter().map(|root| fold(root)).collect();
         Self {
-            roots: roots.iter().map(|root| fold(root)).collect(),
+            daemon: roots.iter().map(|root| daemon_root_of(root)).collect(),
+            roots,
             temp: temp.map(fold),
         }
+    }
+
+    /// The same area with one more place the daemon keeps its worktrees: the configured
+    /// `NUCLEOS_WORKTREE_ROOT`, which `worktree::worktree_root` uses instead of the default.
+    pub fn with_daemon_root(mut self, root: Option<&Path>) -> Self {
+        self.daemon.extend(root.map(fold));
+        self
     }
 }
 
@@ -39,7 +63,9 @@ impl Area {
     /// longer holds.
     #[cfg(test)]
     pub fn with_roots(mut self, roots: &[PathBuf]) -> Self {
-        self.roots.extend(Self::new(roots, None).roots);
+        let more = Self::new(roots, None);
+        self.roots.extend(more.roots);
+        self.daemon.extend(more.daemon);
         self
     }
 }
@@ -69,15 +95,51 @@ pub fn within<T>(area: &Area, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+fn under(path: &str, root: &str) -> bool {
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
 /// PURE but for the active area: whether a resolved, folded path lies in the workspace or, inside
-/// `within`, in one of the area's roots or the temp directory.
+/// `within`, in one of the area's roots or the temp directory — and, inside `within`, not in one
+/// of the daemon's own worktrees (`daemon_tree`).
 pub(super) fn inside(resolved: &str, workspace: &str) -> bool {
-    let under = |root: &str| resolved == root || resolved.starts_with(&format!("{root}/"));
-    under(workspace)
-        || ACTIVE.with(|active| {
-            active.borrow().as_ref().is_some_and(|area| {
-                area.roots.iter().any(|root| under(root)) || area.temp.as_deref().is_some_and(under)
-            })
+    ACTIVE.with(|active| {
+        let active = active.borrow();
+        let Some(area) = active.as_ref() else {
+            return under(resolved, workspace);
+        };
+        !daemon_tree(resolved, workspace, area)
+            && (under(resolved, workspace)
+                || area.roots.iter().any(|root| under(resolved, root))
+                || area
+                    .temp
+                    .as_deref()
+                    .is_some_and(|temp| under(resolved, temp)))
+    })
+}
+
+/// Whether a conversation's path lies in a tree the daemon is working in: under a daemon worktree
+/// root (`Area::daemon`, and the workspace's own `.nucleos/worktrees`) and not in a checkout of the
+/// conversation that itself lies there.
+///
+/// Leaving those trees out of the checkout list (`daemon_worktree`) was not enough: they default to
+/// `<project>/.nucleos/worktrees/`, INSIDE the main checkout, which is a root of every chat's area.
+/// So `run-*`, `job-*`, the merge queue's `integration-*` and the post-merge gate's `postgate-*`
+/// were all writable by any chat, as plain files of the main checkout. A conversation rooted in one
+/// of those trees keeps it: its workspace lies under the daemon root, so it is the exception. So
+/// does a sibling checkout a human placed under a `NUCLEOS_WORKTREE_ROOT` they share with it.
+/// An unattended run is unaffected: it has no area, and its workspace is its own tree.
+fn daemon_tree(resolved: &str, workspace: &str, area: &Area) -> bool {
+    let own = daemon_root_of(workspace);
+    area.daemon
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(own.as_str()))
+        .filter(|daemon| under(resolved, daemon))
+        .any(|daemon| {
+            !std::iter::once(workspace)
+                .chain(area.roots.iter().map(String::as_str))
+                .any(|base| base != daemon && under(base, daemon) && under(resolved, base))
         })
 }
 
@@ -239,7 +301,11 @@ pub fn conversation_area(root: &Path) -> Area {
     {
         return area.clone();
     }
-    let area = Area::new(&checkouts_of(root), Some(&std::env::temp_dir()));
+    let area = Area::new(&checkouts_of(root), Some(&std::env::temp_dir())).with_daemon_root(
+        std::env::var_os("NUCLEOS_WORKTREE_ROOT")
+            .as_deref()
+            .map(Path::new),
+    );
     if let Ok(mut areas) = AREAS.lock() {
         areas.insert(key, (Instant::now(), area.clone()));
     }
@@ -321,6 +387,96 @@ mod tests {
         // A sibling whose name merely starts the same is not inside.
         let lookalike = fold_for_containment("C:/Projects/repo-wt2/core");
         assert!(!within(&area, || inside(&lookalike, &workspace)));
+    }
+
+    /// The daemon's trees default to `<project>/.nucleos/worktrees/`, inside the main checkout, so
+    /// the main checkout being in the area must not carry them in with it.
+    #[test]
+    fn a_chat_rooted_at_the_main_checkout_does_not_reach_the_daemons_trees() {
+        let main = PathBuf::from("C:/Projects/repo");
+        let area = Area::new(std::slice::from_ref(&main), Some(Path::new("C:/Temp")));
+        let workspace = fold(&main);
+        let at = |path: &str| fold_for_containment(&normalize_path(path, None));
+        let mut daemon = vec![
+            "C:/Projects/repo/.nucleos/worktrees/postgate-repo/core/src/lib.rs",
+            "C:/Projects/repo/.nucleos/worktrees/integration-3/Cargo.toml",
+            "C:/Projects/repo/.nucleos/worktrees/run-5/src/a.rs",
+            "C:/Projects/repo/.nucleos/worktrees/job-26",
+            "C:/Projects/repo/.nucleos/worktrees",
+            r"C:\Projects\repo\.nucleos\worktrees\run-5\src\a.rs",
+        ];
+        if cfg!(windows) {
+            // Case folds the same way the rest of the classifier folds it.
+            daemon.push("c:/projects/REPO/.Nucleos/Worktrees/run-5/x");
+        }
+        for path in daemon {
+            let folded = at(path);
+            assert!(
+                !within(&area, || inside(&folded, &workspace)),
+                "a chat reached {path}"
+            );
+        }
+        for path in [
+            "C:/Projects/repo/core/src/lib.rs",
+            "C:/Projects/repo/.nucleos/notes.txt",
+            "C:/Projects/repo/.nucleos/worktrees-old/x",
+            "C:/Temp/gate.log",
+        ] {
+            let folded = at(path);
+            assert!(
+                within(&area, || inside(&folded, &workspace)),
+                "a chat lost {path}"
+            );
+        }
+        // Even when the area does not list the main checkout, the workspace's own trees are out.
+        let bare = Area::new(&[], None);
+        let run = at("C:/Projects/repo/.nucleos/worktrees/run-5/src/a.rs");
+        assert!(!within(&bare, || inside(&run, &workspace)));
+    }
+
+    /// A conversation (or a run) working in its own daemon tree is still inside it, and only it.
+    #[test]
+    fn a_run_in_its_own_tree_keeps_it_and_nothing_beside_it() {
+        let main = PathBuf::from("C:/Projects/repo");
+        let area = Area::new(std::slice::from_ref(&main), None);
+        let at = |path: &str| fold_for_containment(path);
+        let workspace = at("C:/Projects/repo/.nucleos/worktrees/run-5");
+        let own = at("C:/Projects/repo/.nucleos/worktrees/run-5/src/a.rs");
+        let other = at("C:/Projects/repo/.nucleos/worktrees/run-6/src/a.rs");
+        let gate = at("C:/Projects/repo/.nucleos/worktrees/postgate-repo/x");
+        let checkout = at("C:/Projects/repo/core/src/lib.rs");
+        // Unattended: no area, its workspace only.
+        assert!(inside(&own, &workspace));
+        assert!(!inside(&other, &workspace));
+        // A conversation rooted there.
+        assert!(within(&area, || inside(&own, &workspace)));
+        assert!(within(&area, || inside(&checkout, &workspace)));
+        assert!(!within(&area, || inside(&other, &workspace)));
+        assert!(!within(&area, || inside(&gate, &workspace)));
+    }
+
+    /// Under `NUCLEOS_WORKTREE_ROOT` the trees are wherever that names, and a checkout of the
+    /// conversation that a human placed in the same directory stays in the area.
+    #[test]
+    fn the_configured_worktree_root_is_the_daemons_too() {
+        let main = PathBuf::from("C:/Projects/repo");
+        let sibling = PathBuf::from("C:/Trees/repo-feature");
+        let area = Area::new(&[main.clone(), sibling], None)
+            .with_daemon_root(Some(Path::new(r"C:\Trees")));
+        let workspace = fold(&main);
+        let at = |path: &str| fold_for_containment(path);
+        assert!(!within(&area, || inside(
+            &at("C:/Trees/postgate-repo/x"),
+            &workspace
+        )));
+        assert!(!within(&area, || inside(
+            &at("C:/Trees/run-5/x"),
+            &workspace
+        )));
+        assert!(within(&area, || inside(
+            &at("C:/Trees/repo-feature/src/a.rs"),
+            &workspace
+        )));
     }
 
     #[test]
