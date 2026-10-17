@@ -59,6 +59,8 @@ pub(super) async fn get_project_analytics(
 ) -> Result<Json<crate::analytics::Analytics>, Refusal> {
     let now = chrono::Utc::now();
     let window = window_of(&query, now)?;
+    // Same query as `common::project_is_on_the_roster`, repeated on purpose: the plan wants a
+    // plain-text 404 body here, and that helper answers a JSON refusal.
     let known: Option<i64> =
         sqlx::query_scalar("SELECT 1 FROM autopilot_state WHERE project_id = ?")
             .bind(&id)

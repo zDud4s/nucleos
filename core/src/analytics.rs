@@ -938,4 +938,24 @@ pub(crate) mod tests {
         assert_eq!(report.top_runs[4].project_id.as_deref(), Some("alpha"));
         assert_eq!(report.top_runs[4].mode, "worktree");
     }
+
+    /// Two sessions with equal cost and the same completion instant: the higher run id first.
+    #[tokio::test]
+    async fn equal_cost_and_completion_put_the_higher_run_id_first() {
+        let pool = crate::testdb::fresh_pool().await;
+        let mut ids = Vec::new();
+        for session in ["tie-a", "tie-b"] {
+            let run = Run {
+                session: Some(session),
+                cost: Some(4.0),
+                ..done("alpha", "2026-10-10T05:00:00Z")
+            };
+            ids.push(insert(&pool, run).await);
+        }
+
+        let report = report_of(&pool, Scope::Global, 30).await;
+        let got: Vec<i64> = report.top_runs.iter().map(|top| top.run_id).collect();
+
+        assert_eq!(got, vec![ids[1], ids[0]]);
+    }
 }

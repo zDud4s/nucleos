@@ -1,6 +1,8 @@
 //! The delivered block: merges the queue completed, per day, and the median time from a run's
 //! start to its merge (spec §4.7).
 
+use std::collections::BTreeMap;
+
 use chrono::DateTime;
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -89,13 +91,17 @@ fn delivered_total(window: Window, merges: &[MergeLine]) -> DeliveredTotal {
 pub fn delivered_block(window: Window, merges: &[MergeLine]) -> DeliveredBlock {
     let days = window.day_list();
     let last = days.len() - 1;
+    let mut per_day: BTreeMap<&str, i64> = BTreeMap::new();
+    for merge in merges {
+        *per_day.entry(merge.day.as_str()).or_default() += 1;
+    }
     let series = days
         .iter()
         .enumerate()
         .map(|(index, day)| DeliveredPoint {
             day: day.clone(),
             partial: index == last,
-            landed: merges.iter().filter(|m| m.day == *day).count() as i64,
+            landed: per_day.get(day.as_str()).copied().unwrap_or(0),
         })
         .collect();
     DeliveredBlock {

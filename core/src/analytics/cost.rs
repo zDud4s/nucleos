@@ -104,12 +104,21 @@ pub async fn judge_lines(
 
 fn cost_key(scope: Scope<'_>, row: &RunRow) -> String {
     match scope {
-        Scope::Global => row
-            .project_id
-            .clone()
-            .unwrap_or_else(|| NO_PROJECT_KEY.to_owned()),
+        Scope::Global => match row.project_id.as_deref() {
+            None => NO_PROJECT_KEY.to_owned(),
+            // A project named like a reserved key would share its cell and repeat its key.
+            Some(id) if is_reserved(id) => format!("{PROJECT_PREFIX}{id}"),
+            Some(id) => id.to_owned(),
+        },
         Scope::Project(_) => row.mode.clone(),
     }
+}
+
+const PROJECT_PREFIX: &str = "project:";
+
+/// Ids that would collide with a synthetic key, or with an escaped one.
+fn is_reserved(id: &str) -> bool {
+    matches!(id, JUDGE_KEY | OTHER_KEY | NO_PROJECT_KEY) || id.starts_with(PROJECT_PREFIX)
 }
 
 fn key_label(key: &str) -> String {
@@ -117,7 +126,10 @@ fn key_label(key: &str) -> String {
         JUDGE_KEY => "Judge".to_owned(),
         OTHER_KEY => "Other projects".to_owned(),
         NO_PROJECT_KEY => "No project".to_owned(),
-        other => other.to_owned(),
+        other => other
+            .strip_prefix(PROJECT_PREFIX)
+            .unwrap_or(other)
+            .to_owned(),
     }
 }
 
@@ -397,7 +409,7 @@ mod tests {
                 &pool,
                 Run {
                     cost: Some(10.0 - rank as f64),
-                    ..done(*project, "2026-10-10T12:00:00Z")
+                    ..done(project, "2026-10-10T12:00:00Z")
                 },
             )
             .await;
@@ -420,6 +432,64 @@ mod tests {
         let project = report_of(&pool, Scope::Project("p01"), 30).await;
         assert_eq!(keys_of(&project), vec!["worktree", JUDGE_KEY]);
         assert!(close(project.cost.total.measured_usd, 10.0));
+    }
+
+    /// A run with no project is the `__none__` key in global scope, labelled, and not in a
+    /// project's report.
+    #[tokio::test]
+    async fn a_run_with_no_project_is_the_none_key_in_global_scope_only() {
+        let pool = crate::testdb::fresh_pool().await;
+        insert(
+            &pool,
+            Run {
+                project: None,
+                cost: Some(0.5),
+                ..done("alpha", "2026-10-10T12:00:00Z")
+            },
+        )
+        .await;
+        insert(&pool, done("alpha", "2026-10-10T13:00:00Z")).await;
+
+        let global = report_of(&pool, Scope::Global, 30).await;
+        assert!(keys_of(&global).contains(&NO_PROJECT_KEY));
+        let key = global
+            .cost
+            .keys
+            .iter()
+            .find(|key| key.key == NO_PROJECT_KEY)
+            .unwrap();
+        assert_eq!(key.label, "No project");
+        assert!(close(cost_on(&global, "2026-10-10", NO_PROJECT_KEY).0, 0.5));
+
+        let project = report_of(&pool, Scope::Project("alpha"), 30).await;
+        assert!(!keys_of(&project).contains(&NO_PROJECT_KEY));
+        assert!(close(project.cost.total.measured_usd, 1.0));
+    }
+
+    /// A project whose id equals a reserved key must not share the key's cell or repeat it.
+    #[tokio::test]
+    async fn a_project_named_like_a_reserved_key_keeps_its_own_key() {
+        let pool = crate::testdb::fresh_pool().await;
+        let run = insert(
+            &pool,
+            Run {
+                cost: Some(2.0),
+                ..done("judge", "2026-10-10T12:00:00Z")
+            },
+        )
+        .await;
+        judge_verdict(&pool, run, "2026-10-10T13:00:00Z", 0.25).await;
+
+        let global = report_of(&pool, Scope::Global, 30).await;
+        let keys = keys_of(&global);
+        assert_eq!(keys, vec!["project:judge", JUDGE_KEY]);
+        let label = &global.cost.keys[0].label;
+        assert_eq!(label, "judge");
+        assert!(close(
+            cost_on(&global, "2026-10-10", "project:judge").0,
+            2.0
+        ));
+        assert!(close(cost_on(&global, "2026-10-10", JUDGE_KEY).0, 0.25));
     }
 
     /// An empty window still names the judge key, and answers zeros rather than nothing.
@@ -486,6 +556,8 @@ mod tests {
             "never estimated"
         );
         assert!(close(alpha.cost.total.judge_usd, 0.75));
+        assert!(close(alpha.cost.total.measured_usd, 1.5));
+        assert!(close(alpha.cost.total.estimated_usd, 3.0));
         let spend =
             crate::governance::budget::project_spend(&pool, "alpha", window.start(), window.end())
                 .await
@@ -499,6 +571,8 @@ mod tests {
             "analytics {total:?} against project_spend {}",
             spend.usd
         );
+        // 1.5 measured + 3.0 estimated + 0.75 judge, worked out by hand.
+        assert!(close(spend.usd, 5.25));
 
         let global = report(&pool, Scope::Global, window, now()).await.unwrap();
         let all = crate::governance::budget::judge_spend(
