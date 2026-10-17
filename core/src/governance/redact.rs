@@ -54,6 +54,9 @@ pub fn scan_secrets(input: &str) -> Vec<Finding> {
     findings.extend(prefixed_tokens(input));
     findings.extend(json_web_tokens(input));
     findings.extend(bearer_tokens(input));
+    findings.extend(basic_auth_tokens(input));
+    findings.extend(url_credentials(input));
+    findings.extend(telegram_bot_tokens(input));
     findings.extend(daemon_tokens(input));
     findings.extend(nucleos_secrets(input));
     findings.extend(checksummed_numbers(input));
@@ -266,6 +269,9 @@ const PREFIXED: &[(&str, usize, &str)] = &[
     ("AIza", 35, "[SECRET:google]"),
     ("sk_live_", 16, "[SECRET:stripe]"),
     ("rk_live_", 16, "[SECRET:stripe]"),
+    ("hf_", 30, "[SECRET:huggingface]"),
+    ("npm_", 36, "[SECRET:npm]"),
+    ("glpat-", 20, "[SECRET:gitlab]"),
 ];
 
 fn prefixed_tokens(input: &str) -> Vec<Finding> {
@@ -334,6 +340,100 @@ fn bearer_tokens(input: &str) -> Vec<Finding> {
             });
         }
         from = tail_start;
+    }
+    findings
+}
+
+/// The credential in an `Authorization: Basic <base64>` header. Only the encoded `user:pass` is
+/// replaced, like [`bearer_tokens`]. The English word ("basic understanding") is kept out by the
+/// length floor plus a requirement that the run looks encoded: a digit, a base64 symbol, or a
+/// capital after the first character.
+fn basic_auth_tokens(input: &str) -> Vec<Finding> {
+    const MARK: &str = "basic ";
+    let lower = input.to_ascii_lowercase();
+    let mut findings = Vec::new();
+    let mut from = 0;
+    while let Some(relative) = lower[from..].find(MARK) {
+        let start = from + relative;
+        let tail_start = start + MARK.len();
+        let tail = &input.as_bytes()[tail_start..];
+        let tail_len = tail
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+            .count();
+        let boundary = start == 0
+            || !lower[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_token_character);
+        let looks_encoded = tail[..tail_len].iter().enumerate().any(|(index, b)| {
+            b.is_ascii_digit() || matches!(b, b'+' | b'/' | b'=') || (index > 0 && b.is_ascii_uppercase())
+        });
+        if boundary && tail_len >= 12 && looks_encoded {
+            findings.push(Finding {
+                start: tail_start,
+                end: tail_start + tail_len,
+                label: "[SECRET:basic-auth]",
+            });
+        }
+        from = tail_start;
+    }
+    findings
+}
+
+/// `user:pass` in the authority of a URL (`https://user:pass@host/`). Only the userinfo is replaced,
+/// so the host stays readable. A bare `user@host` carries no secret and is left alone.
+fn url_credentials(input: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut from = 0;
+    while let Some(relative) = input[from..].find("://") {
+        let authority_start = from + relative + 3;
+        let authority_len = input[authority_start..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '''))
+            .unwrap_or(input.len() - authority_start);
+        let authority = &input[authority_start..authority_start + authority_len];
+        if let Some(at) = authority.rfind('@')
+            && authority[..at].contains(':')
+        {
+            findings.push(Finding {
+                start: authority_start,
+                end: authority_start + at,
+                label: "[SECRET:url-credentials]",
+            });
+        }
+        from = authority_start;
+    }
+    findings
+}
+
+/// A Telegram bot token, `<8-10 digits>:<35 base64url characters>`, bare or inside
+/// `https://api.telegram.org/bot<token>/...`. The long secret half is what keeps `12:30` and
+/// `localhost:8080` out; the digits are not required to start at a word boundary because the URL
+/// form glues them to `bot`.
+fn telegram_bot_tokens(input: &str) -> Vec<Finding> {
+    let bytes = input.as_bytes();
+    let mut findings = Vec::new();
+    for (colon, _) in input.match_indices(':') {
+        let digits = bytes[..colon]
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if !(8..=10).contains(&digits) {
+            continue;
+        }
+        let tail_start = colon + 1;
+        let tail_len = bytes[tail_start..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            .count();
+        if tail_len >= 35 {
+            findings.push(Finding {
+                start: colon - digits,
+                end: tail_start + tail_len,
+                label: "[SECRET:telegram]",
+            });
+        }
     }
     findings
 }
@@ -832,6 +932,70 @@ mod tests {
                 "{input:?} was not marked; got {redacted:?}"
             );
         }
+    }
+
+    #[test]
+    fn newer_issuer_prefixes_are_redacted() {
+        for (input, marker) in [
+            (
+                "hf_abcdefghijklmnopqrstuvwxyzABCD",
+                "[SECRET:huggingface]",
+            ),
+            ("npm_abcdefghijklmnopqrstuvwxyzABCDEF0123", "[SECRET:npm]"),
+            ("glpat-abcdefghij0123456789", "[SECRET:gitlab]"),
+        ] {
+            let redacted = redact_secrets(&format!("token {input} end"));
+            assert_eq!(redacted, format!("token {marker} end"));
+        }
+    }
+
+    #[test]
+    fn short_values_of_the_newer_prefixes_are_left_alone() {
+        for input in ["hf_short", "npm_abc123", "glpat-tooshort", "half_life_hf_x"] {
+            assert_eq!(redact_secrets(input), input);
+        }
+    }
+
+    #[test]
+    fn a_telegram_bot_token_is_redacted_bare_and_inside_a_url() {
+        let token = "123456789:AAHabcdefghijklmnopqrstuvwxyz012345";
+        assert_eq!(redact_secrets(&format!("t {token} x")), "t [SECRET:telegram] x");
+        let redacted = redact_secrets(&format!("https://api.telegram.org/bot{token}/getMe"));
+        assert!(redacted.contains("[SECRET:telegram]"), "{redacted:?}");
+        assert!(!redacted.contains("AAHabc"), "{redacted:?}");
+        assert!(redacted.ends_with("/getMe"), "{redacted:?}");
+    }
+
+    #[test]
+    fn ordinary_colon_pairs_are_not_telegram_tokens() {
+        for input in [
+            "at 12:30 sharp",
+            "localhost:8080",
+            "123456789:short",
+            "12345678901:AAHabcdefghijklmnopqrstuvwxyz012345",
+        ] {
+            assert_eq!(redact_secrets(input), input);
+        }
+    }
+
+    #[test]
+    fn a_basic_authorization_credential_is_redacted_and_the_word_is_not() {
+        let redacted = redact_secrets("Authorization: Basic dXNlcjpwYXNzd29yZA==");
+        assert_eq!(redacted, "Authorization: Basic [SECRET:basic-auth]");
+        let plain = "a basic understanding of the matter";
+        assert_eq!(redact_secrets(plain), plain);
+        assert_eq!(redact_secrets("Basic dXNlcjpw"), "Basic [SECRET:basic-auth]");
+    }
+
+    #[test]
+    fn url_userinfo_with_a_password_is_redacted_and_a_bare_user_is_not() {
+        let redacted = redact_secrets("clone https://bob:hunter2@example.com/repo.git now");
+        assert_eq!(
+            redacted,
+            "clone https://[SECRET:url-credentials]@example.com/repo.git now"
+        );
+        let bare = "mail ssh://git@example.com/repo and http://localhost:8080/x";
+        assert_eq!(redact_secrets(bare), bare);
     }
 
     /// A prefix inside a longer word is not a token, and the boundary check is the only thing
