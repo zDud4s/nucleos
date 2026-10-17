@@ -142,8 +142,10 @@ pub(super) fn validate_payload(kind: &str, payload: &serde_json::Value) -> Resul
             let minutes = payload
                 .get("duration_minutes")
                 .and_then(serde_json::Value::as_i64)
-                .filter(|minutes| *minutes > 0)
-                .ok_or("a `calendar_event` needs a `duration_minutes` above zero")?;
+                .filter(|minutes| crate::integrations::calendar::duration_in_bounds(*minutes))
+                .ok_or(
+                    "a `calendar_event` needs a `duration_minutes` above zero and at most 31 days",
+                )?;
             // Both parsed HERE and stored as strings, so an unparseable date is the agent's problem
             // and not a `failed` row a human approved in good faith.
             chrono::NaiveDateTime::parse_from_str(
@@ -484,6 +486,9 @@ async fn perform(state: &AppState, action: &TeamAction) -> Result<(), String> {
                 .get("duration_minutes")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
+            if !crate::integrations::calendar::duration_in_bounds(minutes) {
+                return Err("the stored duration is not one the calendar accepts".to_owned());
+            }
             crate::integrations::calendar::insert_event(
                 &state.pool,
                 &text("title"),
