@@ -131,8 +131,15 @@ fn fingerprint_settled(fingerprint: &RefFingerprint, now: std::time::SystemTime)
 /// The tip of the land target. The poll runs every 30 s per gated project, and most of the time
 /// the branch has not moved, so a stat of the ref files replaces the `git rev-parse` spawn while
 /// they are unchanged (and git is still asked at least every `TIP_RECHECK`).
-async fn target_tip(project_root: &Path, target: &str, deadline: Instant) -> Result<String, String> {
-    let key = (project_root.to_string_lossy().into_owned(), target.to_owned());
+async fn target_tip(
+    project_root: &Path,
+    target: &str,
+    deadline: Instant,
+) -> Result<String, String> {
+    let key = (
+        project_root.to_string_lossy().into_owned(),
+        target.to_owned(),
+    );
     let fingerprint = ref_fingerprint(project_root, target);
     if let Some(current) = fingerprint.as_ref() {
         let cache = TIP_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -147,7 +154,8 @@ async fn target_tip(project_root: &Path, target: &str, deadline: Instant) -> Res
             return Ok(hit.sha.clone());
         }
     }
-    let tip = verify::resolve_commit(project_root, &format!("refs/heads/{target}"), deadline).await?;
+    let tip =
+        verify::resolve_commit(project_root, &format!("refs/heads/{target}"), deadline).await?;
     let mut cache = TIP_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
     match fingerprint {
         Some(fingerprint) => {
@@ -952,13 +960,28 @@ mod tests {
 
     #[test]
     fn an_unchanged_settled_fingerprint_reuses_the_cached_tip() {
-        assert!(tip_reusable(&fp(41), Duration::from_secs(30), &fp(41), true));
+        assert!(tip_reusable(
+            &fp(41),
+            Duration::from_secs(30),
+            &fp(41),
+            true
+        ));
     }
 
     #[test]
     fn a_changed_unsettled_or_stale_fingerprint_asks_git() {
-        assert!(!tip_reusable(&fp(41), Duration::from_secs(30), &fp(42), true));
-        assert!(!tip_reusable(&fp(41), Duration::from_secs(30), &fp(41), false));
+        assert!(!tip_reusable(
+            &fp(41),
+            Duration::from_secs(30),
+            &fp(42),
+            true
+        ));
+        assert!(!tip_reusable(
+            &fp(41),
+            Duration::from_secs(30),
+            &fp(41),
+            false
+        ));
         assert!(!tip_reusable(&fp(41), TIP_RECHECK, &fp(41), true));
     }
 

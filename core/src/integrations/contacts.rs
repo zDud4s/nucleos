@@ -2008,14 +2008,34 @@ mod tests {
     async fn the_merge_count_matches_the_pending_list() {
         let pool = test_pool().await;
         for (kind, status, input) in [
-            ("contact-merge", "pending", Some(r#"{"keep_id":1,"absorb_id":2}"#)),
-            ("contact-merge", "pending", Some(r#"{"keep_id":3,"absorb_id":4}"#)),
+            (
+                "contact-merge",
+                "pending",
+                Some(r#"{"keep_id":1,"absorb_id":2}"#),
+            ),
+            (
+                "contact-merge",
+                "pending",
+                Some(r#"{"keep_id":3,"absorb_id":4}"#),
+            ),
             // Unreadable payload, same ids, no payload, decided, another kind: none is a suggestion.
             ("contact-merge", "pending", Some("not json")),
-            ("contact-merge", "pending", Some(r#"{"keep_id":5,"absorb_id":5}"#)),
+            (
+                "contact-merge",
+                "pending",
+                Some(r#"{"keep_id":5,"absorb_id":5}"#),
+            ),
             ("contact-merge", "pending", None),
-            ("contact-merge", "approved", Some(r#"{"keep_id":6,"absorb_id":7}"#)),
-            ("action-approval", "pending", Some(r#"{"keep_id":8,"absorb_id":9}"#)),
+            (
+                "contact-merge",
+                "approved",
+                Some(r#"{"keep_id":6,"absorb_id":7}"#),
+            ),
+            (
+                "action-approval",
+                "pending",
+                Some(r#"{"keep_id":8,"absorb_id":9}"#),
+            ),
         ] {
             sqlx::query(
                 "INSERT INTO proposals (kind, status, tool_name, reasoning, tool_input, created_at)

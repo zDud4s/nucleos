@@ -2340,12 +2340,11 @@ mod tests {
         team_action(&pool, None).await;
         team_action(&pool, Some(4)).await;
         // The same proposal answered by two action rows: the list repeats it, so the count must too.
-        let repeated: i64 = sqlx::query_scalar(
-            "SELECT proposal_id FROM team_actions ORDER BY id LIMIT 1",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let repeated: i64 =
+            sqlx::query_scalar("SELECT proposal_id FROM team_actions ORDER BY id LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         sqlx::query(
             "INSERT INTO team_actions
                (team_run_id, ordinal, kind, payload, why, proposal_id, state, created_at)

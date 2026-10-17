@@ -248,7 +248,8 @@ impl CwdCache {
                 Some(CwdMemo::Missing { len: seen }) if seen == len => continue,
                 _ => {}
             }
-            self.scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let found = cwd_in(path);
             if let Ok(mut memo) = self.memo.lock() {
                 let entry = match &found {

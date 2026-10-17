@@ -2433,7 +2433,11 @@ resolve_effort: \"  \"
         };
         assert!(cache_hit(&entry, 10, Some(t)));
         assert!(!cache_hit(&entry, 11, Some(t)));
-        assert!(!cache_hit(&entry, 10, Some(t + std::time::Duration::from_secs(1))));
+        assert!(!cache_hit(
+            &entry,
+            10,
+            Some(t + std::time::Duration::from_secs(1))
+        ));
         assert!(!cache_hit(&entry, 10, None));
     }
 

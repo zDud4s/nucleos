@@ -389,8 +389,8 @@ async fn cli_probe() -> SubsystemReadout {
             cached_lookup(&CLI_BINARY_LOOKUP, LOOKUP_CACHE_TTL, resolve_cli_binary)
         })
         .await
-            .map_err(classify_error)?
-            .ok_or(FailureCategory::Missing)?;
+        .map_err(classify_error)?
+        .ok_or(FailureCategory::Missing)?;
         // The resolved path, not the configured name: the lookup has already decided which file on
         // PATH this is, and re-deriving it in another process would be a second chance to disagree.
         exec_probe(resolved.to_string_lossy().into_owned(), "--version").await

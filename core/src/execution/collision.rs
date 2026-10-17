@@ -245,7 +245,10 @@ fn resolve_gitdir(worktree: &std::path::Path) -> Option<std::path::PathBuf> {
         return Some(dot_git);
     }
     let text = std::fs::read_to_string(&dot_git).ok()?;
-    let dir = text.lines().find_map(|line| line.strip_prefix("gitdir:"))?.trim();
+    let dir = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
     let dir = std::path::Path::new(dir);
     Some(if dir.is_absolute() {
         dir.to_path_buf()
@@ -359,7 +362,9 @@ pub async fn measure(pool: &sqlx::SqlitePool) {
             // The terminal statuses are the ones `worktree::gc` collects on, so a tree skipped here
             // is one nobody is writing to: what it touched can only change by hand.
             let skip = !live && {
-                let cache = fingerprint_cache().lock().unwrap_or_else(|e| e.into_inner());
+                let cache = fingerprint_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 !needs_measure(cache.get(&key), now_fp.as_ref(), Instant::now())
             };
             if skip {
@@ -380,7 +385,9 @@ pub async fn measure(pool: &sqlx::SqlitePool) {
                     // Remembered only after the row is stored: a fingerprint without its row
                     // would skip a tree that has no answer on record.
                     Ok(()) => {
-                        let mut cache = fingerprint_cache().lock().unwrap_or_else(|e| e.into_inner());
+                        let mut cache = fingerprint_cache()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         match now_fp {
                             Some(fp) => {
                                 cache.insert(owner, (fp, Instant::now()));
@@ -1706,7 +1713,11 @@ mod tests {
         let later = then + REMEASURE_AFTER;
         assert!(needs_measure(Some(&prev), Some(&fingerprint_of(1)), later));
         let sooner = then + REMEASURE_AFTER - std::time::Duration::from_secs(1);
-        assert!(!needs_measure(Some(&prev), Some(&fingerprint_of(1)), sooner));
+        assert!(!needs_measure(
+            Some(&prev),
+            Some(&fingerprint_of(1)),
+            sooner
+        ));
     }
 
     #[test]

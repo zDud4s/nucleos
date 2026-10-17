@@ -816,17 +816,25 @@ mod stat_cache_tests {
         let path = dir.path().join(MODELS_CONFIG_FILE);
         let cache = std::sync::Mutex::new(None);
 
-        std::fs::write(&path, "claude_model: opus
+        std::fs::write(
+            &path,
+            "claude_model: opus
 codex_model: gpt-a
-").unwrap();
+",
+        )
+        .unwrap();
         let first = cached_models_config(&path, &cache);
         assert_eq!(first.claude_model, "opus");
         assert_eq!(cached_models_config(&path, &cache), first);
 
         // A different length, so the check holds even on a coarse-mtime filesystem.
-        std::fs::write(&path, "claude_model: sonnet-long
+        std::fs::write(
+            &path,
+            "claude_model: sonnet-long
 codex_model: gpt-a
-").unwrap();
+",
+        )
+        .unwrap();
         assert_eq!(
             cached_models_config(&path, &cache).claude_model,
             "sonnet-long"
@@ -839,17 +847,15 @@ codex_model: gpt-a
         let path = dir.path().join(MODELS_CONFIG_FILE);
         let cache = std::sync::Mutex::new(None);
 
-        assert_eq!(
-            cached_models_config(&path, &cache),
-            ModelsConfig::default()
-        );
+        assert_eq!(cached_models_config(&path, &cache), ModelsConfig::default());
 
-        std::fs::write(&path, "claude_model: [not, a, string
-").unwrap();
-        assert_eq!(
-            cached_models_config(&path, &cache),
-            ModelsConfig::default()
-        );
+        std::fs::write(
+            &path,
+            "claude_model: [not, a, string
+",
+        )
+        .unwrap();
+        assert_eq!(cached_models_config(&path, &cache), ModelsConfig::default());
         assert!(cache.lock().unwrap().is_none());
     }
 }

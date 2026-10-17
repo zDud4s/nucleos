@@ -2102,10 +2102,18 @@ mod tests {
         record(&pool, &measured(0.56), noon()).await.unwrap();
         record(&pool, &measured(0.56), noon()).await.unwrap();
         record(&pool, &measured(0.56), noon()).await.unwrap();
-        assert_eq!(writes(pool.clone()).await, 0, "an identical reading was rewritten");
+        assert_eq!(
+            writes(pool.clone()).await,
+            0,
+            "an identical reading was rewritten"
+        );
 
         record(&pool, &measured(0.70), noon()).await.unwrap();
-        assert_eq!(writes(pool.clone()).await, 1, "a changed reading was not recorded");
+        assert_eq!(
+            writes(pool.clone()).await,
+            1,
+            "a changed reading was not recorded"
+        );
         let stored = stored(&pool, noon()).await.unwrap();
         assert!((stored[0].windows[0].used_fraction - 0.70).abs() < f64::EPSILON);
     }
