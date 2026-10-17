@@ -4720,6 +4720,76 @@ mod tests {
         );
     }
 
+    /// The due-actions query spells its terminal states out (sqlx refuses a query built at
+    /// runtime), so this holds that list equal to `TERMINAL_STATES`: a state added to one and not
+    /// the other would let an ended run's actions run again.
+    #[test]
+    fn the_due_actions_query_skips_every_terminal_state() {
+        let sql = actions::DUE_ACTIONS_SQL;
+        let start = sql
+            .find("WHERE state IN (")
+            .expect("the terminal-state list")
+            + 16;
+        let end = start + sql[start..].find(')').expect("the list closes");
+        let mut listed: Vec<String> = sql[start..end]
+            .split(',')
+            .map(|state| state.trim().trim_matches('\'').to_owned())
+            .collect();
+        let mut expected: Vec<String> = TERMINAL_STATES.iter().map(|s| (*s).to_owned()).collect();
+        listed.sort();
+        expected.sort();
+        assert_eq!(listed, expected);
+    }
+
+    /// A pending `allow` action belongs to a run that is going somewhere. Whichever way the run
+    /// ended (every `TERMINAL_STATES` entry, not only a cancel) its action is not carried out; a
+    /// run still working keeps getting its actions done.
+    #[tokio::test]
+    async fn pending_actions_run_only_while_their_team_run_is_live() {
+        for (ending, runs) in TERMINAL_STATES
+            .iter()
+            .map(|s| (*s, false))
+            .chain(std::iter::once(("working", true)))
+        {
+            let (state, root) = state_with_root().await;
+            let run_id = team_with_grant(&state, "file_document", "allow").await;
+            let file = format!("{ending}-run.md");
+            let filed = ask(
+                &state,
+                &run_id,
+                "file_document",
+                serde_json::json!({ "path": file, "content": "x" }),
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE team_runs SET state = ? WHERE id = ?")
+                .bind(ending)
+                .bind(&run_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+
+            execute_due_actions(&state).await;
+
+            let after: String = sqlx::query_scalar("SELECT state FROM team_actions WHERE id = ?")
+                .bind(filed.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            let written = std::fs::canonicalize(root.path())
+                .unwrap()
+                .join(&file)
+                .exists();
+            if runs {
+                assert_eq!(after, "done", "a {ending} run's action was not carried out");
+                assert!(written, "a {ending} run's file was not written");
+            } else {
+                assert_eq!(after, "pending", "a {ending} run's action was carried out");
+                assert!(!written, "a {ending} run's file was written");
+            }
+        }
+    }
+
     /// Cancelling twice is a no-op rather than a way to overwrite how a run ended.
     #[tokio::test]
     async fn a_finished_run_cannot_be_cancelled_into_a_different_ending() {

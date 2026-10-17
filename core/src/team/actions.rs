@@ -336,13 +336,19 @@ async fn open_actions_of(pool: &sqlx::SqlitePool, team_id: &str) -> sqlx::Result
 /// `proposal_id IS NULL` is an `allow` action, which was decided when it was written. Otherwise the
 /// proposal has to read `approved`: `rejected` is handled by `refuse_action`, and `pending` means
 /// nobody has answered.
-const DUE_ACTIONS_SQL: &str =
+///
+/// An action of a run that has ended in ANY way is never carried out. The state list is spelled out
+/// because sqlx refuses a query built at runtime; `the_due_actions_query_skips_every_terminal_state`
+/// holds it equal to `TERMINAL_STATES`.
+pub(super) const DUE_ACTIONS_SQL: &str =
     "SELECT id, team_run_id, ordinal, kind, payload, why, proposal_id, state,
                                       error, created_at, executed_at
                                  FROM team_actions
                                 WHERE state = 'pending'
                                   AND team_run_id NOT IN (SELECT id FROM team_runs
-                                                           WHERE state = 'cancelled')
+                                                           WHERE state IN ('done', 'stopped',
+                                                                           'expired', 'failed',
+                                                                           'cancelled'))
                                   AND (proposal_id IS NULL
                                        OR proposal_id IN (SELECT id FROM proposals
                                                            WHERE status = 'approved'))
