@@ -327,13 +327,20 @@ fn in_window(window: Window, rows: &[RunRow]) -> impl Iterator<Item = &RunRow> {
 fn throughput_block(window: Window, rows: &[RunRow], in_flight: i64) -> ThroughputBlock {
     let days = window.day_list();
     let last = days.len() - 1;
+    // Bucketed once by day, then the day list is mapped through it: O(rows + days).
+    let mut by_day: BTreeMap<&str, Vec<&RunRow>> = BTreeMap::new();
+    for row in rows {
+        by_day.entry(row.day()).or_default().push(row);
+    }
     let series = days
         .iter()
         .enumerate()
         .map(|(index, day)| {
             let t = tally(
-                rows.iter()
-                    .filter(|row| row.day() == day.as_str())
+                by_day
+                    .get(day.as_str())
+                    .into_iter()
+                    .flatten()
                     .map(|row| row.gate_status.as_deref()),
             );
             GatePoint {
@@ -407,6 +414,13 @@ fn tokens_block(window: Window, rows: &[RunRow]) -> TokensBlock {
     let sessions = sessions::token_sessions(rows);
     let days = window.day_list();
     let last = days.len() - 1;
+    let mut by_day: BTreeMap<&str, Vec<&TokenSession>> = BTreeMap::new();
+    for session in &sessions {
+        by_day
+            .entry(day_of(&session.completed_at))
+            .or_default()
+            .push(session);
+    }
     let series = days
         .iter()
         .enumerate()
@@ -416,10 +430,7 @@ fn tokens_block(window: Window, rows: &[RunRow]) -> TokensBlock {
                 partial: index == last,
                 ..TokenPoint::default()
             };
-            for session in sessions
-                .iter()
-                .filter(|session| day_of(&session.completed_at) == day.as_str())
-            {
+            for session in by_day.get(day.as_str()).into_iter().flatten() {
                 point.input += session.input;
                 point.cache_read += session.cache_read;
                 point.cache_creation += session.cache_creation;
@@ -760,6 +771,29 @@ pub(crate) mod tests {
         );
         assert_eq!(report.tokens.total.measured_sessions, 3);
         assert_eq!(report.tokens.total.input, 400);
+    }
+
+    /// A session whose last run is the first day of the current window counts there, never in the
+    /// previous window, even though its earlier run sits on the previous window's last day.
+    #[tokio::test]
+    async fn a_session_straddling_the_window_boundary_counts_once_in_the_current_window() {
+        let pool = crate::testdb::fresh_pool().await;
+        // now() is 2026-10-17, so the 7-day window opens on 10-11 and the previous one ends 10-10.
+        for completed in ["2026-10-10T23:50:00Z", "2026-10-11T00:10:00Z"] {
+            insert(
+                &pool,
+                Run {
+                    session: Some("s1"),
+                    ..done("alpha", completed)
+                },
+            )
+            .await;
+        }
+
+        let report = report_of(&pool, Scope::Project("alpha"), 7).await;
+
+        assert_eq!(report.tokens.previous.measured_sessions, 0);
+        assert_eq!(report.tokens.total.measured_sessions, 1);
     }
 
     /// Spec test 4 (tokens): silence is counted apart, never as a zero; no denominator, no ratio.

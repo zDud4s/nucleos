@@ -23,7 +23,9 @@ CREATE TABLE quota_history (
     stale         INTEGER NOT NULL DEFAULT 0 CHECK (stale IN (0, 1))
 );
 
-CREATE INDEX quota_history_series ON quota_history (provider, window_name, recorded_at);
+-- UNIQUE: concurrent polls, or a stale flip carrying the same `read_at`, must not write the same
+-- point twice; `quota::record` upserts on this key.
+CREATE UNIQUE INDEX quota_history_series ON quota_history (provider, window_name, recorded_at);
 
 -- The analytics read (`analytics/sessions.rs`) takes finished runs by a `completed_at` range, for
 -- every project at once on the global page; without this the read is a full scan of `runs` on
