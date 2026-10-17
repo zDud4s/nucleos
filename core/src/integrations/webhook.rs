@@ -144,9 +144,19 @@ pub async fn deliver(
         return Ok(DeliveryOutcome::Duplicate);
     }
 
+    // A trigger that already fired for this very SHA (a partial delivery retried, or the poller got
+    // there first) must not start a second run.
+    let last_shas = crate::repo_trigger::last_shas_for_project(&state.pool, &project_id)
+        .await
+        .map_err(DeliveryError::Storage)?;
     let mut run_ids = Vec::new();
     let mut deferred_reason = None;
+    let mut already_fired = 0usize;
     for trigger in &triggers {
+        if last_shas.get(&trigger.name).map(String::as_str) == Some(delivery.sha.as_str()) {
+            already_fired += 1;
+            continue;
+        }
         match crate::repo_trigger::fire_configured_trigger(
             state,
             now,
@@ -174,10 +184,16 @@ pub async fn deliver(
         }
     }
 
-    if run_ids.is_empty() {
-        // No autonomous work was created, so a sender retry is not a duplicate run attempt. Release
-        // the claim and let the same delivery try again after the fail-closed brake clears.
+    if deferred_reason.is_some() {
+        // The delivery did not complete: a trigger was deferred, busy or failed. Release the claim
+        // so the sender's retry runs again; triggers that already fired are skipped above through
+        // their recorded SHA, so only the unfinished part is retried.
         release_claim(state, &key).await?;
+    }
+    if run_ids.is_empty() {
+        if deferred_reason.is_none() && already_fired > 0 {
+            return Ok(DeliveryOutcome::Duplicate);
+        }
         return Ok(DeliveryOutcome::Deferred {
             reason: deferred_reason.unwrap_or_else(|| "no configured trigger fired".to_string()),
         });
@@ -341,6 +357,74 @@ mod tests {
         assert!(
             claim(push("aaa")).await,
             "A after B is a new push, not a replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deferred_delivery_is_retried_on_the_next_pass() {
+        let (state, _home) = test_state().await;
+        let _project = configured_project(&state).await;
+        crate::governance::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+        assert!(matches!(
+            deliver(&state, delivery("retry"), now()).await.unwrap(),
+            DeliveryOutcome::Deferred { .. }
+        ));
+        crate::governance::autopilot::set_kill_switch(&state.pool, false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            deliver(&state, delivery("retry"), now()).await.unwrap(),
+            DeliveryOutcome::Fired { .. }
+        ));
+        assert_eq!(run_count(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_partial_fire_releases_the_claim_and_only_the_unfinished_trigger_retries() {
+        let (state, _home) = test_state().await;
+        let project = configured_project(&state).await;
+        crate::project::state::write_for_test(
+            state.machine_config_root.as_deref().unwrap(),
+            "configured",
+            crate::project::state::AUTOPILOT_FILE,
+            "repo_triggers:
+  - name: first
+    branch: main
+    prompt: \"one\"
+  - name: second
+    branch: main
+    prompt: \"two\"
+",
+        );
+        drop(project);
+        let _project = tempfile::tempdir().unwrap();
+        sqlx::query("UPDATE autopilot_state SET project_root = ? WHERE project_id = 'configured'")
+            .bind(_project.path().to_string_lossy().as_ref())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        // The first trigger fires and finishes its run; the second then finds the project busy.
+        let first = deliver(&state, delivery("partial"), now()).await.unwrap();
+        let DeliveryOutcome::Fired { run_ids } = first else {
+            panic!("the first trigger should fire, got {first:?}");
+        };
+        assert_eq!(run_ids.len(), 1);
+        assert_eq!(run_count(&state).await, 1);
+
+        // The claim was released, so the retry is not a Duplicate and does not re-fire `first`.
+        let retry = deliver(&state, delivery("partial"), now()).await.unwrap();
+        assert_ne!(
+            retry,
+            DeliveryOutcome::Duplicate,
+            "partial fire kept its claim"
+        );
+        assert_eq!(
+            run_count(&state).await,
+            1,
+            "the finished trigger fired again"
         );
     }
 
