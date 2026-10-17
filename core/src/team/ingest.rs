@@ -143,8 +143,17 @@ pub(super) async fn ingest_director(state: &AppState, run: TeamRun) -> Result<()
     let answer = crate::execution::runner::extract_reply(&answer).unwrap_or(answer);
 
     if node == "delivering" {
-        write_into_workspace(state, &run, DELIVERY_FILE, &answer)
-            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        // A delivery that cannot be written ends the run: returning the error instead would repeat
+        // it on every tick, with the run counting as live (and un-deletable) forever.
+        if let Err(error) = write_into_workspace(state, &run, DELIVERY_FILE, &answer) {
+            return finish(
+                state,
+                &run,
+                "failed",
+                &format!("the delivery could not be written: {error}"),
+            )
+            .await;
+        }
         return finish(state, &run, "done", "the department delivered").await;
     }
 
@@ -283,8 +292,11 @@ pub(super) async fn finish(
         TERMINAL_STATES.contains(&ending),
         "{ending} is not one of the five ways a team run ends"
     );
+    // Kill what is in flight BEFORE the row reads terminal (see `cancel`): a run that ends with
+    // specialists still running would keep spending on a department nobody is waiting on.
+    super::lifecycle::terminate_in_flight(state, &run.id).await?;
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
+    let ended = sqlx::query(
         "UPDATE team_runs
          SET state = ?, outcome = ?, why = ?, director_node = 'none', updated_at = ?,
              finished_at = ?
@@ -298,6 +310,15 @@ pub(super) async fn finish(
     .bind(&run.id)
     .execute(&state.pool)
     .await?;
+    if ended.rows_affected() > 0 {
+        sqlx::query(
+            "UPDATE team_items SET state = 'failed'
+             WHERE team_run_id = ? AND state IN ('pending', 'running')",
+        )
+        .bind(&run.id)
+        .execute(&state.pool)
+        .await?;
+    }
 
     let _ = crate::feed::append(
         &state.pool,

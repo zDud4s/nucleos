@@ -341,6 +341,8 @@ const DUE_ACTIONS_SQL: &str =
                                       error, created_at, executed_at
                                  FROM team_actions
                                 WHERE state = 'pending'
+                                  AND team_run_id NOT IN (SELECT id FROM team_runs
+                                                           WHERE state = 'cancelled')
                                   AND (proposal_id IS NULL
                                        OR proposal_id IN (SELECT id FROM proposals
                                                            WHERE status = 'approved'))

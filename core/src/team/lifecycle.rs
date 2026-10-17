@@ -212,12 +212,9 @@ pub async fn start_with(
 // Cancellation, reconciliation, retention
 // ---------------------------------------------------------------------------------------------
 
-/// Cancels a run and everything it has in flight.
-///
-/// The runs are terminated BEFORE the row is marked, so there is no window in which the run reads
-/// terminal while its subprocesses are still spending. A cancelled run that left an orphan is the
-/// one failure `core/AGENTS.md` §*Cancellation safety* names.
-pub async fn cancel(state: &AppState, id: &str) -> Result<(), TeamError> {
+/// Terminates every subprocess a team run still has running, and sweeps the rows that no abort
+/// handle covers. Shared by `cancel` and by `ingest::finish`, so no ending leaves a run spending.
+pub(super) async fn terminate_in_flight(state: &AppState, id: &str) -> Result<(), sqlx::Error> {
     let in_flight: Vec<i64> =
         sqlx::query_scalar("SELECT id FROM runs WHERE team_run_id = ? AND status = 'running'")
             .bind(id)
@@ -244,6 +241,16 @@ pub async fn cancel(state: &AppState, id: &str) -> Result<(), TeamError> {
     .bind(id)
     .execute(&state.pool)
     .await?;
+    Ok(())
+}
+
+/// Cancels a run and everything it has in flight.
+///
+/// The runs are terminated BEFORE the row is marked, so there is no window in which the run reads
+/// terminal while its subprocesses are still spending. A cancelled run that left an orphan is the
+/// one failure `core/AGENTS.md` §*Cancellation safety* names.
+pub async fn cancel(state: &AppState, id: &str) -> Result<(), TeamError> {
+    terminate_in_flight(state, id).await?;
 
     let now = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(

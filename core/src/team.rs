@@ -4597,6 +4597,129 @@ mod tests {
         assert_eq!(items_left, 0);
     }
 
+    /// Every ending, not just a cancel, leaves nothing in flight: a run that fails or is
+    /// delivered must not keep its specialists spending, nor leave their items open.
+    #[tokio::test]
+    async fn finishing_a_run_stops_its_specialists_and_closes_their_items() {
+        let (state, _root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let (run_id, _) = open_run(&state, &id, "one", false).await.unwrap();
+        sqlx::query(
+            "INSERT INTO team_items (team_run_id, ordinal, round, agent_id, description, state,
+                                     run_id)
+             VALUES (?, 1, 0, 'copywriter', 'work', 'running', ?)",
+        )
+        .bind(&id)
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let run = fetch_run(&state, &id).await;
+        finish(&state, &run, "failed", "the director failed")
+            .await
+            .unwrap();
+
+        let still_running: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs WHERE team_run_id = ? AND status = 'running'",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            still_running, 0,
+            "a finished department left a run spending"
+        );
+        let open_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM team_items WHERE team_run_id = ? AND state IN ('pending', 'running')",
+        )
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(open_items, 0, "a finished department left open items");
+    }
+
+    /// A delivery that cannot be written must end the run, not fail the same way every tick while
+    /// the run counts as live forever.
+    #[tokio::test]
+    async fn a_delivery_that_cannot_be_written_fails_the_run() {
+        let (state, root) = state_with_root().await;
+        marketing(&state).await;
+        let id = start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        let run = fetch_run(&state, &id).await;
+        // Put a FILE where the workspace folder should be, so the write cannot succeed.
+        let folder = std::fs::canonicalize(root.path())
+            .unwrap()
+            .join(&run.workspace);
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(folder.parent().unwrap()).unwrap();
+        std::fs::write(&folder, b"in the way").unwrap();
+
+        let (run_id, _) = open_run(&state, &id, "deliver", false).await.unwrap();
+        sqlx::query(
+            "UPDATE runs SET status = 'completed', exit_code = 0, stdout = 'done' WHERE id = ?",
+        )
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE team_runs SET state = 'delivering', director_node = 'delivering',
+                                  director_run_id = ? WHERE id = ?",
+        )
+        .bind(run_id)
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let run = fetch_run(&state, &id).await;
+        ingest_director(&state, run).await.unwrap();
+
+        let after = fetch_run(&state, &id).await;
+        assert_eq!(after.state, "failed");
+        assert!(after.finished_at.is_some());
+    }
+
+    /// An auto-mode (`allow`) action still pending when the owner cancels must not be carried out
+    /// afterwards.
+    #[tokio::test]
+    async fn a_cancelled_run_does_not_carry_out_its_pending_actions() {
+        let (state, root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "file_document", "allow").await;
+        let filed = ask(
+            &state,
+            &run_id,
+            "file_document",
+            serde_json::json!({ "path": "after-cancel.md", "content": "no" }),
+        )
+        .await
+        .unwrap();
+
+        cancel(&state, &run_id).await.unwrap();
+        execute_due_actions(&state).await;
+
+        let done: String = sqlx::query_scalar("SELECT state FROM team_actions WHERE id = ?")
+            .bind(filed.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_ne!(done, "done", "an action ran after its run was cancelled");
+        assert!(
+            !std::fs::canonicalize(root.path())
+                .unwrap()
+                .join("after-cancel.md")
+                .exists()
+        );
+    }
+
     /// Cancelling twice is a no-op rather than a way to overwrite how a run ended.
     #[tokio::test]
     async fn a_finished_run_cannot_be_cancelled_into_a_different_ending() {
