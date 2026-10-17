@@ -596,23 +596,6 @@ fn create_error_is_transient(error: &crate::execution::runs::CreateRunError) -> 
     matches!(error, crate::execution::runs::CreateRunError::Db(_))
 }
 
-#[cfg(test)]
-mod create_error_tests {
-    use super::create_error_is_transient;
-    use crate::execution::runs::CreateRunError;
-
-    #[test]
-    fn a_database_error_is_transient_and_the_rest_are_not() {
-        assert!(create_error_is_transient(&CreateRunError::Db(
-            sqlx::Error::PoolTimedOut
-        )));
-        assert!(!create_error_is_transient(&CreateRunError::Invalid("x")));
-        assert!(!create_error_is_transient(&CreateRunError::Worktree(
-            std::io::Error::other("boom")
-        )));
-    }
-}
-
 /// Gives back a claim whose node never started.
 ///
 /// Puts back the status the claim TOOK, not a fixed `pending`. The difference is a retry: an item
@@ -660,4 +643,21 @@ pub(super) async fn park(state: &AppState, job: &JobRow, reason: &str, detail: &
         .await;
     }
     Step::Stopped
+}
+
+#[cfg(test)]
+mod create_error_tests {
+    use super::create_error_is_transient;
+    use crate::execution::runs::CreateRunError;
+
+    #[test]
+    fn a_database_error_is_transient_and_the_rest_are_not() {
+        assert!(create_error_is_transient(&CreateRunError::Db(
+            sqlx::Error::PoolTimedOut
+        )));
+        assert!(!create_error_is_transient(&CreateRunError::Invalid("x")));
+        assert!(!create_error_is_transient(&CreateRunError::Worktree(
+            std::io::Error::other("boom")
+        )));
+    }
 }

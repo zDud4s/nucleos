@@ -879,6 +879,8 @@ where
     }
 }
 
+pub(super) const JOB_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[cfg(test)]
 mod survive_panic_tests {
     use super::survive_panic;
@@ -889,5 +891,3 @@ mod survive_panic_tests {
         assert!(survive_panic(async {}).await);
     }
 }
-
-pub(super) const JOB_TICK: std::time::Duration = std::time::Duration::from_secs(30);
