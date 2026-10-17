@@ -1038,22 +1038,51 @@ async fn enqueue_inner(
 /// one lost message is a person retyping a sentence, one duplicated message is a turn nobody asked
 /// for acting on a conversation twice.
 ///
-/// The fourth element is the relay this message travelled on, or `None` for a message a person
-/// typed. Read straight off the row rather than re-derived: `enqueue_inner` is the one place that
-/// decides whether a message carries a relay id, and a second opinion here could only ever disagree
-/// with it.
-pub async fn take_queued(
-    pool: &SqlitePool,
-    chat_id: &str,
-) -> sqlx::Result<Option<(String, Option<String>, Option<String>, Option<i64>)>> {
+/// `relay_id` is the relay this message travelled on, or `None` for a message a person typed. Read
+/// straight off the row rather than re-derived: `enqueue_inner` is the one place that decides
+/// whether a message carries a relay id, and a second opinion here could only ever disagree with it.
+pub async fn take_queued(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<Queued>> {
     sqlx::query_as(
         "DELETE FROM chat_queue
           WHERE id = (SELECT id FROM chat_queue WHERE chat_id = ? ORDER BY id LIMIT 1)
-      RETURNING text, origin, images, relay_id",
+      RETURNING id, text, origin, images, relay_id, created_at",
     )
     .bind(chat_id)
     .fetch_optional(pool)
     .await
+}
+
+/// A message `take_queued` took off the queue: the whole row, so it can be put back exactly.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Queued {
+    pub id: i64,
+    pub text: String,
+    pub origin: Option<String>,
+    pub images: Option<String>,
+    pub relay_id: Option<i64>,
+    pub created_at: String,
+}
+
+/// Puts a message `take_queued` took back where it was, under its own id.
+///
+/// For the drain that took it and then found the conversation's turn already taken by somebody
+/// else. Its own id and not a new one, because the queue is ordered by id: a message put back at
+/// the end would be sent after the ones typed after it.
+pub async fn requeue(pool: &SqlitePool, chat_id: &str, taken: &Queued) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO chat_queue (id, chat_id, text, origin, images, relay_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(taken.id)
+    .bind(chat_id)
+    .bind(&taken.text)
+    .bind(&taken.origin)
+    .bind(&taken.images)
+    .bind(taken.relay_id)
+    .bind(&taken.created_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 /// Where this conversation runs, keeping "no such conversation" apart from "no directory".
@@ -1365,7 +1394,7 @@ mod queue_tests {
         enqueue_relayed(&pool, "c-1", "onward to c-1", "shell", "[]", 7)
             .await
             .unwrap();
-        let (_, _, _, relayed) = take_queued(&pool, "c-1").await.unwrap().unwrap();
+        let relayed = take_queued(&pool, "c-1").await.unwrap().unwrap().relay_id;
         assert_eq!(
             relayed,
             Some(7),
@@ -1373,7 +1402,7 @@ mod queue_tests {
         );
 
         enqueue(&pool, "c-1", "hello", "shell", "[]").await.unwrap();
-        let (_, _, _, ordinary) = take_queued(&pool, "c-1").await.unwrap().unwrap();
+        let ordinary = take_queued(&pool, "c-1").await.unwrap().unwrap().relay_id;
         assert_eq!(
             ordinary, None,
             "an ordinary message must not acquire a relay id by accident"

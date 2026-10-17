@@ -681,6 +681,22 @@ pub(super) async fn patch_chat(
         return Err(StatusCode::CONFLICT.into());
     }
 
+    // Every one of these is fixed on a process's command line when it is spawned, so a kept process
+    // goes on with the old value for as long as it lives — and it can answer on its own between
+    // turns, with no person's turn to notice the mismatch (`serve_turn` compares the rest of them
+    // when a person speaks). Stopped once the edit is written, below. The rung is not here: three of
+    // them are the hook's alone, and the spontaneous path checks the other two itself.
+    let respawns = body.brain.is_some()
+        || body.cwd.is_some()
+        || body.model.is_some()
+        || body.effort.is_some()
+        || body.fallback_model.is_some()
+        || body.extra_dirs.is_some()
+        || body.turn_budget_usd.is_some()
+        || body.agents.is_some()
+        || body.system_prompt.is_some()
+        || body.denied_tools.is_some();
+
     if let Some(cwd) = body.cwd.as_deref() {
         // Absolute, and a directory that is there. Checked HERE rather than at the first turn: a
         // conversation pointed at a typo would look exactly like one pointed at a project until
@@ -909,6 +925,10 @@ pub(super) async fn patch_chat(
                 tracing::warn!(%error, "renaming a chat failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+    }
+
+    if respawns {
+        crate::assistant::evict_live(&chat_id);
     }
 
     Ok(StatusCode::NO_CONTENT)

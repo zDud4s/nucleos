@@ -115,6 +115,42 @@ pub(super) async fn start_spontaneous_turn(
         drain_queued(state, chat_id).await;
         return;
     };
+    // The rung the conversation is on NOW must be one this process can be on. `plan`, `acceptEdits`
+    // and bypass are the CLI's own `--permission-mode`, fixed at spawn, and the hook keeps a turn on
+    // its process's rung whenever `plan` is involved — so an owner who moved the conversation to
+    // `plan` since the last turn would otherwise watch this answer go on acting on the old one. A
+    // person's turn gets a new process for that (`serve_turn`); an answer nobody asked for gets
+    // none, and the process is stopped. A rung that cannot be read stops it too.
+    //
+    // The three rungs that share one command line (`manual`, `auto`, `dont_ask`) need nothing here:
+    // the hook reads the conversation's current rung on every call (`hooks::rooted::rooted_turn`).
+    let now_on = crate::chats::permission_mode_of(&state.pool, chat_id)
+        .await
+        .map(crate::execution::runner::Permission::for_chat);
+    // Only a NARROWER rung stops it: an answer on a wider rung than the process was started on
+    // keeps the process's own, stricter barrier, which is what it is recorded under.
+    let strictness = |permission: crate::execution::runner::Permission| {
+        use crate::execution::runner::Permission::*;
+        match permission {
+            Plan => 0,
+            Default => 1,
+            AcceptEdits => 2,
+            Bypass => 3,
+        }
+    };
+    if now_on
+        .ok()
+        .is_none_or(|now| strictness(now) < strictness(live.permission))
+    {
+        tracing::warn!(
+            chat_id = %chat_id,
+            "the assistant's unprompted turn belongs to a process started on a rung the conversation has left; its process was stopped"
+        );
+        drop(live);
+        drop(slot);
+        drain_queued(state, chat_id).await;
+        return;
+    }
     // Fails closed: a served row that cannot be read or found counts as having read untrusted text.
     let mut read_untrusted = 0_i64;
     let mut readable = true;

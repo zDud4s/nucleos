@@ -3986,6 +3986,7 @@ mod tests {
                 carried: Default::default(),
                 background: HashSet::new(),
                 watcher: 0,
+                shape: SpawnShape::of(&silence_request()),
             },
             said,
             events_tx,
@@ -4837,6 +4838,298 @@ mod tests {
         assert_eq!(later[0].images[0].data, "aGVsbG8=");
     }
 
+    /// A tool the conversation stops allowing is gone from the very next turn.
+    ///
+    /// `--disallowedTools` is an argument, fixed when the process was spawned, and a kept process
+    /// used to be matched on its directory, its rung and its session only — so a narrowing made
+    /// between two turns was silently ignored for as long as the process lived.
+    #[tokio::test]
+    async fn a_kept_process_is_not_reused_once_the_conversation_denies_a_tool() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("narrowed-denials");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        crate::chats::set_denied_tools(&state.pool, &chat, &["Bash".to_owned()])
+            .await
+            .unwrap();
+        let second = send_message(&state, &chat, "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+        evict_live(&chat);
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            2,
+            "the narrowed turn went down the process spawned without the denial"
+        );
+        assert_eq!(
+            fake.last_denied_tools.lock().unwrap().clone(),
+            Some(vec!["Bash".to_owned()])
+        );
+    }
+
+    /// The same for a directory taken away: the process that could reach it does not answer again.
+    #[tokio::test]
+    async fn a_kept_process_is_not_reused_once_the_conversation_loses_a_directory() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("narrowed-dirs");
+        let _root = rooted_chat(&state, &chat).await;
+        let notes = tempfile::TempDir::new().unwrap();
+        crate::chats::set_extra_dirs(
+            &state.pool,
+            &chat,
+            &[notes.path().to_str().unwrap().to_owned()],
+        )
+        .await
+        .unwrap();
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        crate::chats::set_extra_dirs(&state.pool, &chat, &[])
+            .await
+            .unwrap();
+        let second = send_message(&state, &chat, "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+        evict_live(&chat);
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            2,
+            "the turn without the directory went down the process that could reach it"
+        );
+        assert_eq!(fake.last_add_dirs.lock().unwrap().clone(), Some(Vec::new()));
+    }
+
+    /// What a turn may change down a kept process does not make it the wrong process: the words,
+    /// the pictures, the session it resumes (compared on its own), the per-turn knowledge briefing
+    /// folded into the appended prompt, the environment (keyed at spawn) and the cosmetic name.
+    #[test]
+    fn a_spawn_shape_ignores_what_a_turn_may_change_down_a_kept_process() {
+        let base = seam_request("one", &std::env::temp_dir(), Some("s-1".into()));
+        let mut other = seam_request("two", &std::env::temp_dir().join("elsewhere"), None);
+        other.images = vec![crate::execution::runner::Attachment {
+            media_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        }];
+        other.append_system_prompt = Some("a briefing for this turn only".into());
+        other.env = vec![("KEY".into(), "value".into())];
+        other.session_name = Some("named".into());
+        other.steerable = true;
+
+        assert_eq!(SpawnShape::of(&base), SpawnShape::of(&other));
+    }
+
+    /// Everything else a spawn fixes on the command line makes it the wrong process when it moves.
+    #[test]
+    fn a_spawn_shape_changes_with_everything_a_spawn_fixes() {
+        type Change = fn(&mut crate::execution::runner::RunRequest);
+        let base = SpawnShape::of(&seam_request("one", &std::env::temp_dir(), None));
+        let changes: [(&str, Change); 15] = [
+            ("denied_tools", |r| r.denied_tools = vec!["Bash".into()]),
+            ("add_dirs", |r| r.add_dirs = vec!["/elsewhere".into()]),
+            ("model", |r| r.model = Some("opus".into())),
+            ("effort", |r| r.effort = Some("high".into())),
+            ("fallback_model", |r| {
+                r.fallback_model = vec!["haiku".into()]
+            }),
+            ("max_budget_usd", |r| r.max_budget_usd = Some(1.0)),
+            ("agents", |r| {
+                r.agents = vec![crate::execution::runner::Subagent {
+                    name: "reviewer".into(),
+                    description: "reviews".into(),
+                    prompt: "review".into(),
+                    tools: None,
+                    model: None,
+                    effort: None,
+                }]
+            }),
+            ("ambient_mcp", |r| r.ambient_mcp = true),
+            ("tool_policy", |r| {
+                r.tool_policy = crate::execution::runner::ToolPolicy::McpOnly
+            }),
+            ("context_window", |r| r.context_window = Some(500_000)),
+            ("classifier_governs_tools", |r| {
+                r.classifier_governs_tools = true
+            }),
+            ("allowed_mcp_tools", |r| {
+                r.allowed_mcp_tools = Some(Vec::new())
+            }),
+            ("mcp_config", |r| {
+                r.mcp_config = Some("/elsewhere.json".into())
+            }),
+            ("max_turns", |r| r.max_turns = Some(3)),
+            ("background_tasks", |r| r.background_tasks = true),
+        ];
+        for (field, change) in changes {
+            let mut request = seam_request("one", &std::env::temp_dir(), None);
+            change(&mut request);
+            assert_ne!(
+                SpawnShape::of(&request),
+                base,
+                "a change to `{field}` left the kept process looking reusable"
+            );
+        }
+    }
+
+    /// A process the assistant keeps answering in on its own is stopped once the conversation moved
+    /// to a rung that process cannot be put on.
+    ///
+    /// `plan` (like `acceptEdits` and bypass) is the CLI's own `--permission-mode`, fixed at spawn,
+    /// and the hook keeps a turn on the rung its process was started with when either side is `plan`
+    /// (`hooks::rooted::effective_permission`). A person's next turn already gets a new process for
+    /// it; an answer the CLI starts on its own between turns used to go on in the old one.
+    #[tokio::test]
+    async fn a_spontaneous_answer_is_not_taken_after_the_conversation_moved_to_another_rung() {
+        let (fake, unprompted) = fake_with_a_background_task();
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("spontaneous-moved-rung");
+        let _root = rooted_chat(&state, &chat).await;
+
+        let first = send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        assert!(LIVE_CHATS.lock().unwrap().contains_key(&chat));
+        crate::chats::set_permission_mode(&state.pool, &chat, crate::chats::PermissionMode::Plan)
+            .await
+            .unwrap();
+
+        unprompted.send(ANSWERS_ON_ITS_OWN.to_owned()).unwrap();
+        let mut recorded = None;
+        for _ in 0..200 {
+            recorded = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM runs WHERE chat_id = ? AND origin = 'task'",
+            )
+            .bind(&chat)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+            let kept = LIVE_CHATS.lock().unwrap().contains_key(&chat);
+            if recorded.is_some() || (!kept && !is_busy(&chat)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let still_kept = LIVE_CHATS.lock().unwrap().contains_key(&chat);
+        evict_live(&chat);
+
+        assert_eq!(
+            recorded, None,
+            "an answer was taken from a process spawned on a rung the conversation left"
+        );
+        assert!(!still_kept, "the process on the old rung was kept");
+    }
+
+    /// A message the drain takes off the queue and cannot send yet — another turn took the slot
+    /// first — goes back where it was rather than being dropped with a warning.
+    #[tokio::test]
+    async fn a_queued_message_the_drain_cannot_send_yet_keeps_its_place() {
+        let state = test_state().await;
+        let chat_id = "drain-finds-the-slot-taken";
+        crate::chats::enqueue(&state.pool, chat_id, "primeiro", "shell", "[]")
+            .await
+            .unwrap();
+        crate::chats::enqueue(&state.pool, chat_id, "segundo", "shell", "[]")
+            .await
+            .unwrap();
+        let before: Vec<i64> = crate::chats::queued(&state.pool, chat_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|waiting| waiting.id)
+            .collect();
+        let held = take_the_slot_for_testing(chat_id);
+
+        drain_queued(&state, chat_id).await;
+
+        let after = crate::chats::queued(&state.pool, chat_id).await.unwrap();
+        drop(held);
+        assert_eq!(
+            after
+                .iter()
+                .map(|waiting| waiting.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primeiro", "segundo"],
+            "the message the drain could not send was lost or moved"
+        );
+        assert_eq!(
+            after.iter().map(|waiting| waiting.id).collect::<Vec<_>>(),
+            before,
+            "the message went back under a new place in the queue"
+        );
+    }
+
+    /// A turn refused before it ran — its permission mode could not be recorded — still lets
+    /// whatever was waiting through, rather than leaving it for some later turn to send out of
+    /// order.
+    #[tokio::test]
+    async fn a_turn_refused_before_it_ran_still_drains_the_queue() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("refused-turn-drains");
+        let _root = rooted_chat(&state, &chat).await;
+        sqlx::query(
+            "CREATE TRIGGER refuse_the_mode BEFORE UPDATE OF permission_mode ON runs
+             BEGIN SELECT RAISE(ABORT, 'refused for the test'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        crate::chats::enqueue(&state.pool, &chat, "esperou", "shell", "[]")
+            .await
+            .unwrap();
+
+        // Not `settled_turn`: the drained turn may already hold the slot again by the time it looks.
+        send_message(&state, &chat, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        let mut drained = None;
+        for _ in 0..250 {
+            drained = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM runs WHERE chat_id = ? AND prompt = 'esperou'",
+            )
+            .bind(&chat)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+            if drained.as_deref().is_some_and(|status| status != "running") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            drained.is_some(),
+            "the message that waited was never sent after the refused turn"
+        );
+        assert!(
+            crate::chats::queued(&state.pool, &chat)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            0,
+            "a refused turn reached the CLI"
+        );
+    }
+
     /// Dropping a conversation's `LiveChat` stops the process behind it.
     ///
     /// The mechanism the whole lifetime rests on. Closing stdin would let a process finish whatever
@@ -4864,6 +5157,7 @@ mod tests {
             carried: Default::default(),
             background: HashSet::new(),
             watcher: 0,
+            shape: SpawnShape::of(&silence_request()),
         };
 
         drop(live);
@@ -4903,6 +5197,7 @@ mod tests {
             carried: Default::default(),
             background: HashSet::new(),
             watcher: 0,
+            shape: SpawnShape::of(&silence_request()),
         };
         note_served(
             live.process_key(),

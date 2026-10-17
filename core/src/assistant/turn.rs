@@ -557,6 +557,12 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             .execute(&pool)
             .await;
             crate::execution::runs::warn_on_terminal_write_err(&failed, id, "failed");
+            // A refused turn ends like a failed one: whatever waited behind it goes next, in
+            // order, rather than staying queued until some later turn's drain sends it after
+            // that turn's own message. The guard goes first, for the reason the end of this
+            // task gives.
+            drop(turn);
+            drain_queued(&after, &drained_chat).await;
             return;
         }
 
