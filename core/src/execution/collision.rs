@@ -160,6 +160,9 @@ struct LiveTree {
     project_id: String,
     path: String,
     base_sha: Option<String>,
+    /// Whether the owner may still be writing to the tree. A live owner's tree is measured every
+    /// pass; only a finished owner's tree may be skipped on an unchanged fingerprint.
+    live: bool,
 }
 
 /// PURE: the trees one pass takes, at most `cap`, dealt one per project in turn.
@@ -293,9 +296,25 @@ fn needs_measure(
 /// row, and the read turns that into `not_measured`.
 pub async fn measure(pool: &sqlx::SqlitePool) {
     let trees: Vec<LiveTree> = match sqlx::query_as(
-        "SELECT owner_kind, owner_id, project_id, path, base_sha
-         FROM worktrees WHERE removed_at IS NULL
-         ORDER BY project_id, owner_kind, owner_id",
+        "SELECT w.owner_kind, w.owner_id, w.project_id, w.path, w.base_sha,
+                CASE w.owner_kind
+                  WHEN 'run' THEN NOT EXISTS (
+                    SELECT 1 FROM runs r WHERE r.id = w.owner_id
+                      AND r.status IN ('completed','failed','cancelled','timed_out',
+                                       'interrupted','superseded'))
+                  WHEN 'job' THEN NOT EXISTS (
+                    SELECT 1 FROM jobs j WHERE j.id = w.owner_id
+                      AND j.status IN ('completed','failed','gate_failed','gate_errored',
+                                       'expired','stopped','cancelled','interrupted'))
+                  WHEN 'item' THEN NOT EXISTS (
+                    SELECT 1 FROM job_items i JOIN jobs j ON j.id = i.job_id
+                     WHERE i.id = w.owner_id
+                      AND j.status IN ('completed','failed','gate_failed','gate_errored',
+                                       'expired','stopped','cancelled','interrupted'))
+                  ELSE 1
+                END AS live
+         FROM worktrees w WHERE w.removed_at IS NULL
+         ORDER BY w.project_id, w.owner_kind, w.owner_id",
     )
     .fetch_all(pool)
     .await
@@ -331,12 +350,15 @@ pub async fn measure(pool: &sqlx::SqlitePool) {
         let path = std::path::PathBuf::from(&tree.path);
         let base = tree.base_sha.clone().expect("filtered to Some above");
         let key = (tree.owner_kind.clone(), tree.owner_id);
+        let live = tree.live;
         // The fingerprint stats files, so it runs in the blocking pool with the `git` calls and
         // never on the async thread. The closure answers `(fingerprint, None)` when the tree is
         // unchanged and its stored row stands.
         let handle = tokio::task::spawn_blocking(move || {
             let now_fp = fingerprint(&path, &base);
-            let skip = {
+            // The terminal statuses are the ones `worktree::gc` collects on, so a tree skipped here
+            // is one nobody is writing to: what it touched can only change by hand.
+            let skip = !live && {
                 let cache = fingerprint_cache().lock().unwrap_or_else(|e| e.into_inner());
                 !needs_measure(cache.get(&key), now_fp.as_ref(), Instant::now())
             };
@@ -1400,6 +1422,7 @@ mod tests {
             project_id: project_id.to_string(),
             path: "C:/x".to_string(),
             base_sha: Some("a".repeat(40)),
+            live: true,
         }
     }
 
