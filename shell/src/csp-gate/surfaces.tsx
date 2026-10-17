@@ -17,7 +17,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/ui/vendor/dialog";
+import { BarChart } from "@/ui/BarChart";
 import { Sparkline } from "@/ui/Sparkline";
+import { StepLine } from "@/ui/StepLine";
 import { ForceGraph } from "../brain/ForceGraph";
 import type { GModel } from "../brain/graph-types";
 import type { Placed } from "../brain/hit-test";
@@ -234,24 +236,76 @@ function PaletteSurface({ done }: { done: () => void }) {
 }
 
 /**
- * `@visx/*`, through the one chart this app draws.
+ * `@visx/*`, through every chart this app draws.
  *
  * A chart library is this gate's canonical case: it computes geometry at render time and the
  * question is always whether it writes the result into the CSSOM or into a `style` attribute in
  * markup. visx composes d3's scales into React elements rather than mutating the DOM, so it should
  * be clean — "should be" is precisely what a gate is for.
  *
- * Two sparklines rather than one, because the component has two branches and only one of them
- * emits an `<svg>`: a series with points, and the dashed rail it draws for a series too short to
- * plot. A surface that exercised only the happy branch would go green on half the component.
+ * Every chart twice, because each has two branches: with data, and empty (a rail for `Sparkline`,
+ * axes plus a sentence for `BarChart` and `StepLine`). `@visx/axis` is the new risk: its default
+ * tick labels go through `@visx/text`, which writes `style="overflow: visible"`; both charts swap it
+ * for a bare `<text>`, and this surface is where that is proved under the real policy.
  */
 function ChartSurface({ done }: { done: () => void }) {
   useDoneAfter(done);
+  const day = (n: number) => `2026-10-${String(10 + n).padStart(2, "0")}`;
+  const keys = [
+    { key: "alpha", label: "alpha" },
+    { key: "beta", label: "beta" },
+    { key: "judge", label: "Judge", className: "ui-chart-judge" },
+  ];
+  const usd = (value: number) => `$${value.toFixed(2)}`;
+  const pct = (value: number) => `${Math.round(value * 100)}%`;
+  const from = Date.parse("2026-10-10T00:00:00Z");
+  const to = Date.parse("2026-10-17T00:00:00Z");
 
   return (
     <div className="p-6">
       <Sparkline values={[0, 2, 1, 4, 3, 6, 2, 5]} label="the 8 runs in the window" />
       <Sparkline values={[]} label="no run in the window" />
+      <BarChart
+        data={Array.from({ length: 7 }, (_, n) => ({
+          day: day(n),
+          parts: [
+            { key: "alpha", value: n % 3 },
+            { key: "beta", value: (n + 1) % 2 },
+            { key: "judge", value: 0.25 },
+          ],
+          partial: n === 6,
+        }))}
+        keys={keys}
+        label="Cost per day, last 7 days"
+        format={usd}
+        empty="No runs in this window"
+      />
+      <BarChart
+        data={Array.from({ length: 7 }, (_, n) => ({ day: day(n), parts: [] }))}
+        keys={keys}
+        label="Cost per day, nothing in it"
+        format={usd}
+        empty="No runs in this window"
+      />
+      <StepLine
+        series={[
+          {
+            key: "anthropic:5h",
+            label: "anthropic 5h",
+            points: [
+              { at: Date.parse("2026-10-11T08:00:00Z"), value: 0.2 },
+              { at: Date.parse("2026-10-12T08:00:00Z"), value: 0.6, stale: true },
+            ],
+          },
+          { key: "anthropic:7d", label: "anthropic 7d", points: [{ at: Date.parse("2026-10-13T00:00:00Z"), value: 0.41 }] },
+        ]}
+        from={from}
+        to={to}
+        label="Quota used, last 7 days"
+        format={pct}
+        empty="No quota history yet"
+      />
+      <StepLine series={[]} from={from} to={to} label="Quota, no history" format={pct} empty="No quota history yet" />
     </div>
   );
 }
@@ -357,7 +411,7 @@ export const SURFACES: Surface[] = [
   },
   {
     name: "charts",
-    why: "@visx/{group,scale,shape}, which compute geometry per render — both branches of Sparkline",
+    why: "@visx/{axis,curve,group,scale,shape}, which compute geometry per render — Sparkline, BarChart and StepLine, each with data and empty",
     Component: ChartSurface,
   },
   {
