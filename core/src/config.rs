@@ -454,11 +454,63 @@ pub fn load_schedule_rules(
 }
 
 /// The same rules, from one file. Absent is `AutopilotRules::default()`.
+///
+/// Callers poll this every 30s per project from async tasks, so a successful parse is cached per path
+/// and keyed by the file's `(len, mtime)`: an unchanged file costs one `metadata` call and a clone,
+/// not a read, a YAML parse and a validation. Known limit: two writes inside one mtime tick that
+/// leave the length identical are not told apart; the next change that moves either value is picked
+/// up. Errors are never cached, so a bad file is reported on every call exactly as before, and a
+/// vanished file drops its entry.
 pub fn load_schedule_rules_from(path: &Path) -> std::io::Result<AutopilotRules> {
-    if !path.exists() {
+    let Some(meta) = std::fs::metadata(path).ok() else {
+        schedule_rules_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(path);
         return Ok(AutopilotRules::default());
+    };
+    let (len, mtime) = (meta.len(), meta.modified().ok());
+    let cached = schedule_rules_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+        .filter(|entry| cache_hit(entry, len, mtime))
+        .map(|entry| entry.rules.clone());
+    if let Some(rules) = cached {
+        return Ok(rules);
     }
-    parse_schedule_rules(&std::fs::read_to_string(path)?)
+    let rules = parse_schedule_rules(&std::fs::read_to_string(path)?)?;
+    schedule_rules_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            path.to_path_buf(),
+            RulesCacheEntry {
+                len,
+                mtime,
+                rules: rules.clone(),
+            },
+        );
+    Ok(rules)
+}
+
+struct RulesCacheEntry {
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    rules: AutopilotRules,
+}
+
+type RulesCache = std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, RulesCacheEntry>>;
+
+fn schedule_rules_cache() -> &'static RulesCache {
+    static CACHE: std::sync::OnceLock<RulesCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Whether a cached parse still describes the file. An unreadable mtime never hits: with only the
+/// length to go on, a same-length edit would be served stale.
+fn cache_hit(entry: &RulesCacheEntry, len: u64, mtime: Option<std::time::SystemTime>) -> bool {
+    mtime.is_some() && entry.len == len && entry.mtime == mtime
 }
 
 /// The same rules, from text that is not on disk yet.
@@ -2369,6 +2421,52 @@ resolve_effort: \"  \"
         let loose = parse_schedule_rules("judge_resolve:\n  avoidable_at: 0.5\n").unwrap();
         assert_eq!(loose.resolve_thresholds().avoidable_at, 0.85);
         assert!(parse_schedule_rules("judge_resolve:\n  offtask: 0.7\n").is_err());
+    }
+
+    #[test]
+    fn cache_hit_needs_equal_len_and_a_known_equal_mtime() {
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5);
+        let entry = RulesCacheEntry {
+            len: 10,
+            mtime: Some(t),
+            rules: AutopilotRules::default(),
+        };
+        assert!(cache_hit(&entry, 10, Some(t)));
+        assert!(!cache_hit(&entry, 11, Some(t)));
+        assert!(!cache_hit(&entry, 10, Some(t + std::time::Duration::from_secs(1))));
+        assert!(!cache_hit(&entry, 10, None));
+    }
+
+    #[test]
+    fn a_cached_rules_file_follows_edits_and_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autopilot.yaml");
+        std::fs::write(&path, "verify_disk_cap_gb: 3\n").unwrap();
+        let first = load_schedule_rules_from(&path).unwrap();
+        assert_eq!(first.verify_disk_cap_gb, Some(3));
+        // Unchanged file: the cached parse comes back equal.
+        assert_eq!(load_schedule_rules_from(&path).unwrap(), first);
+        // A different length is a different file, whatever the mtime tick says.
+        std::fs::write(&path, "verify_disk_cap_gb: 120\n").unwrap();
+        assert_eq!(
+            load_schedule_rules_from(&path).unwrap().verify_disk_cap_gb,
+            Some(120)
+        );
+        // A bad edit is an error on every call, never a stale success.
+        std::fs::write(&path, "verify_disk_cap_gb: 0\n").unwrap();
+        assert!(load_schedule_rules_from(&path).is_err());
+        assert!(load_schedule_rules_from(&path).is_err());
+        // Deleted: the missing-file answer, not the old content.
+        std::fs::write(&path, "verify_disk_cap_gb: 7\n").unwrap();
+        assert_eq!(
+            load_schedule_rules_from(&path).unwrap().verify_disk_cap_gb,
+            Some(7)
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            load_schedule_rules_from(&path).unwrap(),
+            AutopilotRules::default()
+        );
     }
 
     /// The brake a project never configured is ON, and the derived `Default` is exactly why this
