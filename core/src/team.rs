@@ -1780,6 +1780,51 @@ mod tests {
         assert_eq!(left, 0);
     }
 
+    /// The delete is one transaction and the folder goes only after it commits. A statement that
+    /// fails (a trigger stands in for any constraint) must leave the rows AND the folder as they were.
+    #[tokio::test]
+    async fn a_failed_delete_leaves_the_rows_and_the_folder() {
+        let (state, _root) = state_with_root().await;
+        let id = team_with_grant(&state, "send_email", "propose").await;
+        ask(&state, &id, "send_email", an_email()).await.unwrap();
+        sqlx::query("UPDATE team_runs SET state = 'done' WHERE id = ?")
+            .bind(&id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let workspace: String = sqlx::query_scalar("SELECT workspace FROM team_runs WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let folder =
+            crate::files::resolve_within(&files_root(&state).unwrap(), &workspace).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("keep.md"), "x").unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_run_delete BEFORE DELETE ON team_runs
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let outcome = delete_team_run(State(state.clone()), Path(id.clone())).await;
+
+        assert!(outcome.is_err());
+        assert!(
+            folder.join("keep.md").exists(),
+            "the folder survived a failed delete"
+        );
+        let actions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM team_actions WHERE team_run_id = ?")
+                .bind(&id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(actions, 1, "the earlier statements rolled back with it");
+    }
+
     /// Spec §4.4: `context_refs` is polymorphic (`owner_kind`, `owner_id`), so no foreign key can
     /// cascade it and deleting a team has to clear its own rows. A reference owned by one of its
     /// members is that agent's, and stays.

@@ -563,6 +563,18 @@ pub(super) async fn spawn_node(
                 NoRoom::ShrinkTheBatch => Step::Stopped,
             }
         }
+        // A database error is the store hiccuping, not the work being wrong: the item goes back and
+        // the next tick asks again, rather than failing a job whose worktree and gated items are
+        // untouched. Nothing is parked, because no wait reason describes it.
+        Err(error) if create_error_is_transient(&error) => {
+            release_item(pool, job, item).await;
+            tracing::warn!(
+                job_id = job.id,
+                %error,
+                "could not create the {stage} node's run; trying again next tick"
+            );
+            Step::Stopped
+        }
         Err(error) => {
             release_item(pool, job, item).await;
             let _ = finish(pool, job.id, Outcome::Failed).await;
@@ -575,6 +587,29 @@ pub(super) async fn spawn_node(
             .await;
             Step::Stopped
         }
+    }
+}
+
+/// Whether a failed run creation says something about the moment rather than about the job: a
+/// database error passes, an invalid request or a worktree that cannot be provisioned does not.
+fn create_error_is_transient(error: &crate::execution::runs::CreateRunError) -> bool {
+    matches!(error, crate::execution::runs::CreateRunError::Db(_))
+}
+
+#[cfg(test)]
+mod create_error_tests {
+    use super::create_error_is_transient;
+    use crate::execution::runs::CreateRunError;
+
+    #[test]
+    fn a_database_error_is_transient_and_the_rest_are_not() {
+        assert!(create_error_is_transient(&CreateRunError::Db(
+            sqlx::Error::PoolTimedOut
+        )));
+        assert!(!create_error_is_transient(&CreateRunError::Invalid("x")));
+        assert!(!create_error_is_transient(&CreateRunError::Worktree(
+            std::io::Error::other("boom")
+        )));
     }
 }
 

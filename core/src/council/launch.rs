@@ -301,10 +301,14 @@ pub async fn start_with(
     }
 
     let id = crate::auth::generate_uuid_v4();
+    // The fallible steps that need no row run BEFORE the insert: a failure after it would leave a
+    // council `running` with no driver, forever.
+    let mcp_path = mcp_config_path(&id);
+    write_mcp_config(&mcp_path).map_err(StartError::Unavailable)?;
     // The request's count when it gave one, bounded above by `MAX_COUNCIL_ROUNDS` like the file's
     // — so a caller can ask for more deliberation, never for more than the daemon will ever run.
     let rounds = i64::from(rounds);
-    insert_council_with_roles(
+    if let Err(error) = insert_council_with_roles(
         &state.pool,
         &id,
         question,
@@ -314,18 +318,10 @@ pub async fn start_with(
         &roles,
     )
     .await
-    .map_err(|error| StartError::Unavailable(error.to_string()))?;
-
-    let mcp_path = mcp_config_path(&id);
-    let exe = std::env::current_exe()
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(|error| StartError::Unavailable(error.to_string()))?;
-    crate::storage::write_atomic(
-        &mcp_path,
-        &serde_json::to_vec(&crate::assistant::build_mcp_config(&exe))
-            .map_err(|error| StartError::Unavailable(error.to_string()))?,
-    )
-    .map_err(|error| StartError::Unavailable(error.to_string()))?;
+    {
+        let _ = std::fs::remove_file(&mcp_path);
+        return Err(StartError::Unavailable(error.to_string()));
+    }
 
     let _ = crate::feed::append(
         &state.pool,
@@ -358,6 +354,16 @@ pub async fn start_with(
     });
 
     Ok(id)
+}
+
+/// Writes the seats' MCP config to `path`; the error is the sentence a caller gets.
+pub(super) fn write_mcp_config(path: &std::path::Path) -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(&crate::assistant::build_mcp_config(&exe))
+        .map_err(|error| error.to_string())?;
+    crate::storage::write_atomic(path, &bytes).map_err(|error| error.to_string())
 }
 
 /// A request's `{seat index: role}` as one entry per seat, or the refusal that names what is wrong.

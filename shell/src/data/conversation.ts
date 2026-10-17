@@ -380,7 +380,10 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
         // Per unit, not per answer: the attack of each unit's first syllable is its loudest, least
         // cancelled moment, and an answer is many units long.
         unitStartedAtRef.current = performance.now();
-        void player.play().then(() => tapRef.current?.attach(player), fail);
+        // A play() that resolves after a barge-in or exit belongs to an abandoned player state.
+        void player.play().then(() => {
+          if (generationRef.current === generation) tapRef.current?.attach(player);
+        }, fail);
       });
     } finally {
       player.onended = null;

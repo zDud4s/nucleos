@@ -22,6 +22,25 @@ vi.mock("./voice", async (importOriginal) => ({
   postSegment: voice.postSegment,
 }));
 
+const tapSpy = vi.hoisted(() => ({ attach: vi.fn() }));
+vi.mock("./answer-tap", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./answer-tap")>();
+  return {
+    ...real,
+    createAnswerTap: () => {
+      const made = real.createAnswerTap();
+      const attach = made.attach.bind(made);
+      made.attach = (element: HTMLAudioElement) => {
+        tapSpy.attach(element);
+        attach(element);
+      };
+      return made;
+    },
+  };
+});
+
+let playGate: Promise<void> | null = null;
+
 const client = vi.hoisted(() => ({ apiFetch: vi.fn() }));
 vi.mock("./client", () => ({ apiFetch: client.apiFetch }));
 
@@ -105,6 +124,8 @@ beforeEach(() => {
   voice.fetchSpeechUnit.mockReset();
   voice.postSegment.mockReset();
   player = null;
+  playGate = null;
+  tapSpy.attach.mockReset();
   now = vi.spyOn(performance, "now").mockReturnValue(0);
 
   processor = {
@@ -137,7 +158,7 @@ beforeEach(() => {
       onended: (() => void) | null = null;
       onerror: (() => void) | null = null;
       src = "";
-      play = vi.fn().mockResolvedValue(undefined);
+      play = vi.fn(() => playGate ?? Promise.resolve());
       pause = vi.fn();
       removeAttribute = vi.fn();
       constructor() {
@@ -550,6 +571,25 @@ describe("useVoiceConversation", () => {
     await waitFor(() => expect(result.current.phase).toBe("off"));
 
     expect(result.current.answer).toBeNull();
+  });
+
+  it("a play() that resolves after the mode was turned off does not attach the tap", async () => {
+    let release: () => void = () => {};
+    playGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const result = await reachSpeaking();
+    await waitFor(() => expect(player?.play).toHaveBeenCalled());
+
+    act(() => result.current.toggle());
+    await waitFor(() => expect(result.current.phase).toBe("off"));
+    release();
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(tapSpy.attach).not.toHaveBeenCalled();
   });
 
   it("the answer tap reads silence where the element cannot be captured", async () => {
