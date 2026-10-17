@@ -216,10 +216,7 @@ fn nth_weekday(anchor: NaiveDate, weekday: Weekday, nth: i8) -> Option<NaiveDate
         (candidate.month() == anchor.month()).then_some(candidate)
     } else if nth < 0 {
         let mut candidate = first_match;
-        loop {
-            let Some(next) = add_days(candidate, 7) else {
-                break;
-            };
+        while let Some(next) = add_days(candidate, 7) {
             if next.month() != anchor.month() {
                 break;
             }
