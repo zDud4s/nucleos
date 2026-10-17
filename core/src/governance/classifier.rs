@@ -4367,6 +4367,75 @@ mod tests {
         }
     }
 
+    /// The shell removes quotes and backslashes before the program sees a word, so `"-exec"`,
+    /// `'-exec'`, `-ex""ec` and `-exe\c` all reach `find` as `-exec`. The shape guards used to
+    /// compare the RAW word against their flag lists, and every one of these was waved through as
+    /// `read-local` — which also skips the judge for Bash.
+    #[test]
+    fn quoted_or_escaped_flags_do_not_slip_past_the_shape_guards() {
+        for command in [
+            "find . \"-exec\" rm {} +",
+            "find . '-exec' rm {} +",
+            "find . -ex\"\"ec cat {} +",
+            "find . -exe\\c cat {} +",
+            "find . \"-execdir\" ./payload.sh +",
+            "find . \"-fprint\" out.txt",
+            "find / \"-delete\"",
+            "rg \"--pre=./x.sh\" pattern",
+            "rg '--pre' ./x.sh pattern",
+            "rg --pr\\e ./x.sh pattern",
+            "git log \"--output=../x\"",
+            "git log '--output=../x'",
+            "git log \"--ext-diff\"",
+            "go build \"-o\" ../x.exe",
+            "go build '-o' ../x.exe ./cmd",
+            "sort \"-o\" ../x file.txt",
+            "tail \"-f\" daemon.log",
+        ] {
+            let classification = classify("Bash", &json!({"command": command}), None);
+            assert_ne!(
+                classification.action_class, "read-local",
+                "{command} must not read as read-local"
+            );
+            assert_ne!(
+                classification.decision.decision, "allow",
+                "{command} must not be allowed"
+            );
+        }
+    }
+
+    /// Quoting the flag does not turn `find . -delete` back into a search: it is still the
+    /// recursive delete `rm -rf` is, and gets the same `deny`.
+    #[test]
+    fn a_quoted_delete_on_find_is_denied_like_the_bare_one() {
+        for command in ["find . \"-delete\"", "find . '-delete'", "find . -de\\lete"] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "deny",
+                "destructive",
+            );
+        }
+    }
+
+    /// The other side of the quoted-flag fix: a quoted argument that is NOT one of the guarded
+    /// flags still reads, and the bare spellings of the harmless forms are unchanged.
+    #[test]
+    fn a_harmless_quoted_argument_still_reads_locally() {
+        for command in [
+            "rg \"foo\"",
+            "rg 'fn main' core/src",
+            "git log \"--pretty=oneline\"",
+            "git log --pretty=oneline",
+            "find . -name \"*.rs\"",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({"command": command}), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
     /// `-o` is a file write on `go` and stdout on `grep`, so it cannot be judged without knowing
     /// which program is reading it. A shell command carries no `file_path`, so the containment
     /// checks that catch `Write ../../evil.exe` never see `go build -o ../../evil.exe`.
