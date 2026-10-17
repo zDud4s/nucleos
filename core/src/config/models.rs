@@ -214,10 +214,55 @@ pub fn is_effort_level(config: &ModelsConfig, value: &str) -> bool {
 }
 
 /// Loads the current models configuration, falling back to defaults on failure.
+///
+/// Handlers call this on the async path, so it costs one `metadata` call and re-reads the file only
+/// when its length or modification time moved.
 pub fn models_config_now() -> ModelsConfig {
-    models_config_path()
-        .and_then(|path| load_models_config(&path).ok())
-        .unwrap_or_default()
+    static CACHE: std::sync::Mutex<Option<ModelsConfigCache>> = std::sync::Mutex::new(None);
+    match models_config_path() {
+        Some(path) => cached_models_config(&path, &CACHE),
+        None => ModelsConfig::default(),
+    }
+}
+
+/// A parsed file and the (path, length, mtime) it was parsed at.
+struct ModelsConfigCache {
+    path: std::path::PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    config: ModelsConfig,
+}
+
+/// The stat-checked read behind [`models_config_now`]. A missing (or unstat-able) file answers the
+/// default, as before. A failed read or parse also answers the default and is never cached, so the
+/// next call tries again.
+fn cached_models_config(
+    path: &Path,
+    cache: &std::sync::Mutex<Option<ModelsConfigCache>>,
+) -> ModelsConfig {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return ModelsConfig::default();
+    };
+    let (len, modified) = (meta.len(), meta.modified().ok());
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.as_ref().filter(|hit| {
+            hit.path == path && hit.len == len && modified.is_some() && hit.modified == modified
+        }) {
+            return hit.config.clone();
+        }
+    }
+    let Ok(config) = load_models_config(path) else {
+        return ModelsConfig::default();
+    };
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(ModelsConfigCache {
+            path: path.to_path_buf(),
+            len,
+            modified,
+            config: config.clone(),
+        });
+    }
+    config
 }
 
 pub(super) fn default_assistant_choices() -> Vec<AssistantChoice> {
@@ -759,4 +804,52 @@ pub fn load_models_config(path: &Path) -> std::io::Result<ModelsConfig> {
     let contents = std::fs::read_to_string(path)?;
     parse_models_config(&contents)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+#[cfg(test)]
+mod stat_cache_tests {
+    use super::*;
+
+    #[test]
+    fn an_edited_models_file_is_re_read_and_an_unchanged_one_is_served_from_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MODELS_CONFIG_FILE);
+        let cache = std::sync::Mutex::new(None);
+
+        std::fs::write(&path, "claude_model: opus
+codex_model: gpt-a
+").unwrap();
+        let first = cached_models_config(&path, &cache);
+        assert_eq!(first.claude_model, "opus");
+        assert_eq!(cached_models_config(&path, &cache), first);
+
+        // A different length, so the check holds even on a coarse-mtime filesystem.
+        std::fs::write(&path, "claude_model: sonnet-long
+codex_model: gpt-a
+").unwrap();
+        assert_eq!(
+            cached_models_config(&path, &cache).claude_model,
+            "sonnet-long"
+        );
+    }
+
+    #[test]
+    fn a_missing_models_file_keeps_the_default_and_a_bad_one_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MODELS_CONFIG_FILE);
+        let cache = std::sync::Mutex::new(None);
+
+        assert_eq!(
+            cached_models_config(&path, &cache),
+            ModelsConfig::default()
+        );
+
+        std::fs::write(&path, "claude_model: [not, a, string
+").unwrap();
+        assert_eq!(
+            cached_models_config(&path, &cache),
+            ModelsConfig::default()
+        );
+        assert!(cache.lock().unwrap().is_none());
+    }
 }
