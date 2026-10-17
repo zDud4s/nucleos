@@ -19,6 +19,11 @@ use crate::state::AppState;
 /// next window is not clobbered. Only ever called where nothing was started: past the point where a
 /// run row or a job row exists, the window stays spent, because re-firing on a maybe is the
 /// duplicate the claim-first ordering exists to prevent.
+///
+/// The daily allowance is given back in the same statement the claim spent it in: a window that
+/// never ran must not count against `DAILY_CAP`, or a rule on a busy project burns the whole day's
+/// allowance in retries and then fires as a catch-up after midnight. The claim stamped today's
+/// `fires_date` and added one, so subtracting one (floored at zero) undoes exactly that.
 pub(super) async fn release_window(
     state: &AppState,
     project_id: &str,
@@ -29,7 +34,8 @@ pub(super) async fn release_window(
 ) {
     let released = sqlx::query(
         "UPDATE scheduler_state
-         SET last_fired_at = ?, last_head_sha = ?
+         SET last_fired_at = ?, last_head_sha = ?,
+             fires_today = MAX(fires_today - 1, 0)
          WHERE project_id = ? AND rule_name = ? AND last_fired_at = ?",
     )
     .bind(previous_fired_at)
