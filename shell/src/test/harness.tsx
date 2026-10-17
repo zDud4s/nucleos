@@ -36,6 +36,7 @@ import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
 import type { Detected } from "../data/detect";
 import type { Onboarding } from "../data/onboarding";
 import type { ProjectReadings } from "../data/project-readings";
+import type { AnalyticsReport, QuotaHistory } from "../data/analytics";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
 
 /**
@@ -107,6 +108,15 @@ export interface DaemonState {
    * it is what a new project looks like for its first month.
    */
   readings: ProjectReadings;
+  /**
+   * `GET /analytics` and `GET /projects/{id}/analytics`, one payload for both — like `readings`, no
+   * test needs two scopes to differ in the same render. The project route answers it with `scope`,
+   * `project_id` and `cost.by_label` rewritten, and a 404 for a project the roster does not have
+   * (spec §8).
+   */
+  analytics: AnalyticsReport;
+  /** `GET /analytics/quota`. Empty by default: a history that has not started (`since: null`). */
+  analyticsQuota: QuotaHistory;
   /** A project's local branches and the one they are measured against. */
   branches: Branches;
   /** A project's recent commits. */
@@ -349,6 +359,8 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     proposals: [],
     concurrency: { house: { limit: 4, held: 0 }, projects: [] },
     readings: readings(),
+    analytics: analyticsReport(),
+    analyticsQuota: quotaHistory(),
     branches: { integration: "master", branches: [], omitted: 0 },
     log: [],
     changed: { paths: [], tracked: 0 },
@@ -666,6 +678,99 @@ export function readings(overrides: Partial<ProjectReadings> = {}): ProjectReadi
     delivered: { landed: 0, timed: 0, median_minutes: null },
     ...overrides,
   };
+}
+
+/** `days` consecutive UTC days ending on `last`, oldest first. */
+export function analyticsDays(days: number, last = "2026-08-24"): string[] {
+  const end = Date.parse(`${last}T00:00:00Z`);
+  return Array.from({ length: days }, (_, index) =>
+    new Date(end - (days - 1 - index) * 86_400_000).toISOString().slice(0, 10),
+  );
+}
+
+/**
+ * An analytics answer with nothing in it — §8's "no data in the window": every series present with
+ * explicit zeros, totals zero, ratio and median `null`, `top_runs: []`, and the `judge` key that is
+ * always there — with its zero part on every day, because `by` has one part per key (the core's
+ * as-built shape). Overrides replace whole blocks; `days` alone resizes the series.
+ */
+export function analyticsReport(overrides: Partial<AnalyticsReport> = {}): AnalyticsReport {
+  const days = overrides.days ?? 30;
+  const both = analyticsDays(days * 2);
+  const list = both.slice(days);
+  const partial = (index: number) => index === days - 1;
+  const cost = { measured_usd: 0, estimated_usd: 0, judge_usd: 0, runs: 0, estimated_runs: 0 };
+  const tokens = {
+    input: 0,
+    cache_read: 0,
+    cache_creation: 0,
+    output: 0,
+    measured_sessions: 0,
+    unmeasured_runs: 0,
+    cache_hit_ratio: null,
+  };
+  const gate = { runs_completed: 0, passed: 0, failed: 0, errored: 0, no_gate: 0, other: 0 };
+  const delivered = { landed: 0, timed: 0, median_minutes: null };
+  return {
+    scope: "global",
+    project_id: null,
+    days,
+    timezone: "UTC",
+    now: `${list[days - 1]}T09:41:00Z`,
+    window: { from: list[0], to: list[days - 1] },
+    previous: { from: both[0], to: both[days - 1] },
+    counted: { modes: "all" },
+    cost: {
+      total: cost,
+      previous: cost,
+      series: list.map((day, index) => ({
+        day,
+        partial: partial(index),
+        by: [{ key: "judge", measured_usd: 0, estimated_usd: 0 }],
+      })),
+      by_label: "project",
+      keys: [{ key: "judge", label: "Judge" }],
+    },
+    tokens: {
+      total: tokens,
+      previous: tokens,
+      series: list.map((day, index) => ({
+        day,
+        partial: partial(index),
+        input: 0,
+        cache_read: 0,
+        cache_creation: 0,
+        output: 0,
+      })),
+    },
+    throughput: {
+      total: gate,
+      previous: gate,
+      series: list.map((day, index) => ({
+        day,
+        partial: partial(index),
+        passed: 0,
+        failed: 0,
+        errored: 0,
+        no_gate: 0,
+        other: 0,
+      })),
+      by_mode: [],
+      in_flight: 0,
+    },
+    delivered: {
+      total: delivered,
+      previous: delivered,
+      series: list.map((day, index) => ({ day, partial: partial(index), landed: 0 })),
+    },
+    top_runs: [],
+    ...overrides,
+  };
+}
+
+/** `GET /analytics/quota` before anything was recorded (§8: `points: []`, `since: null`). */
+export function quotaHistory(overrides: Partial<QuotaHistory> = {}): QuotaHistory {
+  return { days: 30, timezone: "UTC", since: null, series: [], ...overrides };
 }
 
 export function project(overrides: Partial<ProjectSummary> = {}): ProjectSummary {
@@ -1096,6 +1201,25 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
 
     // Parameterised before the exact matches: the readings route carries a project id, which a
     // `switch` over literals cannot express.
+    // Analytics (spec analytics-fundacao §6). Matched on the path before its `?days=`: the window is
+    // the caller's business, and the fake answers whatever the test put in the state.
+    if (path.startsWith("/analytics/quota")) return state.analyticsQuota;
+    if (path === "/analytics" || path.startsWith("/analytics?")) return state.analytics;
+    const projectAnalytics = /^\/projects\/([^/?]+)\/analytics(?:\?|$)/.exec(path);
+    if (projectAnalytics !== null) {
+      const projectId = decodeURIComponent(projectAnalytics[1]);
+      if (!state.projects.some((row) => row.project_id === projectId)) {
+        // The núcleo's own text for this 404 (core fragment, "Errors").
+        throw new ApiRefusal(404, "not_found", "no such project");
+      }
+      return {
+        ...state.analytics,
+        scope: "project",
+        project_id: projectId,
+        // A project's cost is split by mode (core shapes: `by_label`); the keys stay what the test set.
+        cost: { ...state.analytics.cost, by_label: "mode" },
+      };
+    }
     if (path.startsWith("/projects/") && path.endsWith("/folder")) return state.folder;
     if (path.startsWith("/projects/") && path.endsWith("/record")) {
       // 404 for a name the roster does not have, which is what the daemon answers: a record of all
