@@ -193,3 +193,91 @@ describe("useListening", () => {
     expect(result.current.isOpen()).toBe(false);
   });
 });
+
+describe("useListening open lifecycle", () => {
+  /** A getUserMedia whose answer the test releases by hand, and the tracks it hands out. */
+  function slowMicrophone() {
+    const stops: Array<ReturnType<typeof vi.fn>> = [];
+    const resolvers: Array<() => void> = [];
+    const getUserMedia = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          const stop = vi.fn();
+          stops.push(stop);
+          resolvers.push(() => resolve({ getTracks: () => [{ stop }] }));
+        }),
+    );
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
+    return { stops, resolvers, getUserMedia };
+  }
+
+  const handlers = { onSignal: () => {}, onTrouble: () => {} } satisfies ListeningHandlers;
+
+  it("stops the tracks when it was closed while the permission prompt was open", async () => {
+    const mic = slowMicrophone();
+    const { result } = renderHook(() => useListening(handlers));
+
+    let opened: Promise<boolean> = Promise.resolve(true);
+    await act(async () => {
+      opened = result.current.open();
+    });
+    await waitFor(() => expect(mic.getUserMedia).toHaveBeenCalled());
+    act(() => result.current.close());
+    await act(async () => {
+      mic.resolvers[0]();
+      await opened;
+    });
+
+    expect(await opened).toBe(false);
+    expect(mic.stops[0]).toHaveBeenCalled();
+    expect(result.current.isOpen()).toBe(false);
+  });
+
+  it("does not open a second stream while one is opening", async () => {
+    const mic = slowMicrophone();
+    const { result } = renderHook(() => useListening(handlers));
+
+    let first: Promise<boolean> = Promise.resolve(false);
+    let second: Promise<boolean> = Promise.resolve(false);
+    await act(async () => {
+      first = result.current.open();
+      second = result.current.open();
+    });
+    await waitFor(() => expect(mic.getUserMedia).toHaveBeenCalled());
+    await act(async () => {
+      for (const release of mic.resolvers) release();
+      await Promise.all([first, second]);
+    });
+
+    expect(mic.getUserMedia).toHaveBeenCalledTimes(1);
+    expect(await first).toBe(true);
+    expect(await second).toBe(true);
+  });
+
+  it("stops the tracks when building the audio graph fails", async () => {
+    const stop = vi.fn();
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop }] }) },
+    });
+    Object.defineProperty(window, "AudioContext", {
+      configurable: true,
+      value: class {
+        destination = {};
+        createMediaStreamSource() {
+          throw new Error("no graph");
+        }
+        close = vi.fn().mockResolvedValue(undefined);
+      },
+    });
+    const onTrouble = vi.fn();
+    const { result } = renderHook(() => useListening({ ...handlers, onTrouble }));
+
+    await act(async () => {
+      expect(await result.current.open()).toBe(false);
+    });
+
+    expect(stop).toHaveBeenCalled();
+    expect(onTrouble).toHaveBeenCalled();
+  });
+});
