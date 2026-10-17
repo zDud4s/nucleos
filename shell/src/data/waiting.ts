@@ -240,7 +240,7 @@ export function useWaitingCount(): number | undefined {
   const read = useQuery({
     queryKey: keys.waiting.count,
     queryFn: () => apiFetch<WaitingCountRead>("/waiting/count"),
-    refetchInterval: POLL.fast,
+    refetchInterval: POLL.queue,
     placeholderData: keepPreviousData,
   });
   return read.data === undefined ? undefined : sumWaitingCount(read.data);
