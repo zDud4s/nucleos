@@ -47,6 +47,55 @@ impl Drop for LiveCount {
     }
 }
 
+/// What a process was spawned with that a later turn cannot change down its stdin, beyond its
+/// directory, its rung and its session (compared on their own in `serve_turn`).
+///
+/// Left out on purpose: the prompt and pictures (they travel per turn), the environment (the chat
+/// key is minted at spawn and must not rotate on a kept turn), the session name (cosmetic), and
+/// `append_system_prompt` — it folds a knowledge briefing chosen from each turn's own text into the
+/// chat's instructions, so comparing it would retire the process on almost every turn. A change to
+/// the instructions themselves retires it at the edit instead (`patch_chat`).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct SpawnShape {
+    tool_policy: crate::execution::runner::ToolPolicy,
+    denied_tools: Vec<String>,
+    add_dirs: Vec<std::path::PathBuf>,
+    model: Option<String>,
+    effort: Option<String>,
+    fallback_model: Vec<String>,
+    max_budget_usd: Option<f64>,
+    agents: Vec<crate::execution::runner::Subagent>,
+    ambient_mcp: bool,
+    mcp_config: Option<std::path::PathBuf>,
+    allowed_mcp_tools: Option<Vec<String>>,
+    classifier_governs_tools: bool,
+    context_window: Option<i64>,
+    max_turns: Option<i64>,
+    background_tasks: bool,
+}
+
+impl SpawnShape {
+    pub(super) fn of(request: &crate::execution::runner::RunRequest) -> Self {
+        Self {
+            tool_policy: request.tool_policy,
+            denied_tools: request.denied_tools.clone(),
+            add_dirs: request.add_dirs.clone(),
+            model: request.model.clone(),
+            effort: request.effort.clone(),
+            fallback_model: request.fallback_model.clone(),
+            max_budget_usd: request.max_budget_usd,
+            agents: request.agents.clone(),
+            ambient_mcp: request.ambient_mcp,
+            mcp_config: request.mcp_config.clone(),
+            allowed_mcp_tools: request.allowed_mcp_tools.clone(),
+            classifier_governs_tools: request.classifier_governs_tools,
+            context_window: request.context_window,
+            max_turns: request.max_turns,
+            background_tasks: request.background_tasks,
+        }
+    }
+}
+
 /// One conversation's living CLI, kept between turns instead of started again for each.
 ///
 /// **Measured before it was built**, on the real CLI, two turns down one stdin against a fresh spawn
@@ -106,6 +155,12 @@ pub(super) struct LiveChat {
     /// in, and a turn spoken down it would then run in the wrong directory with nothing anywhere
     /// saying so.
     pub(super) cwd: Option<std::path::PathBuf>,
+    /// Everything else on its command line that the conversation can change between two turns.
+    ///
+    /// Kept so it can be COMPARED, like `cwd` and `permission`. A tool the owner has just denied or
+    /// a directory just taken away is an argument this process was spawned with, so a turn written
+    /// down it would still run with the reach the owner removed.
+    pub(super) shape: SpawnShape,
     /// When it last finished a turn, which is what the reaper measures.
     pub(super) idle_since: std::time::Instant,
     /// How long it may stay idle before the reaper takes it; set from its last turn by `keep_live`.
@@ -550,6 +605,54 @@ pub fn ambient_mcp_for(policy: crate::execution::runner::ToolPolicy, opted_in: b
 pub fn evict_live(chat_id: &str) {
     // The removed value is dropped here, which is what aborts it.
     LIVE_CHATS.lock().unwrap().remove(chat_id);
+}
+
+/// Keeps a stand-in process for a conversation, for the tests of modules that must see one stopped.
+///
+/// Nothing runs behind it; the abort handle is a pending task's, so dropping it stops nothing real.
+#[cfg(any(test, feature = "testkit"))]
+pub fn keep_a_process_for_testing(chat_id: &str) {
+    let (messages, _said) = tokio::sync::mpsc::unbounded_channel();
+    let (_events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+    let live = LiveChat {
+        messages,
+        events,
+        session_id: std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
+        abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+        stopped_because: tokio::sync::watch::channel(None).1,
+        permission: crate::execution::runner::Permission::Default,
+        cwd: None,
+        shape: SpawnShape {
+            tool_policy: crate::execution::runner::ToolPolicy::Unrestricted,
+            denied_tools: Vec::new(),
+            add_dirs: Vec::new(),
+            model: None,
+            effort: None,
+            fallback_model: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            ambient_mcp: false,
+            mcp_config: None,
+            allowed_mcp_tools: None,
+            classifier_governs_tools: false,
+            context_window: None,
+            max_turns: None,
+            background_tasks: false,
+        },
+        idle_since: std::time::Instant::now(),
+        idle_for: LIVE_IDLE,
+        _counted: LiveCount::start(),
+        carried: Default::default(),
+        background: HashSet::new(),
+        watcher: 0,
+    };
+    LIVE_CHATS.lock().unwrap().insert(chat_id.to_owned(), live);
+}
+
+/// Whether a conversation has a process kept between turns.
+#[cfg(any(test, feature = "testkit"))]
+pub fn has_a_kept_process(chat_id: &str) -> bool {
+    LIVE_CHATS.lock().unwrap().contains_key(chat_id)
 }
 
 /// Starts the one task that stops processes nobody came back to.

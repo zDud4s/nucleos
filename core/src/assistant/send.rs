@@ -216,26 +216,44 @@ pub(super) async fn record_images(pool: &SqlitePool, id: i64, kept: &[String]) -
 /// again when it ends. Sending them all at once would only refuse every one after the first.
 ///
 /// Boxed because this and `send_message` call each other — a real cycle, and the compiler needs the
-/// indirection to size the future. Nothing is retried: a message that cannot be sent has been taken
-/// off the queue by `take_queued` and is gone, which is the trade that file documents.
+/// indirection to size the future. A message that cannot be sent has been taken off the queue by
+/// `take_queued` and is gone, which is the trade that file documents — with one exception: a send
+/// refused only because another turn took the slot first has not been tried at all, and goes back
+/// under its own id for that turn's drain to send.
 ///
 /// A relay-born message gets a second look here that a person's own message does not — see the
 /// `Some(relay_id)` branch below for why the gap between `relay::admit` deciding and this drain
 /// spending the turn is the one place its answer can go stale.
 pub(super) async fn drain_queued(state: &crate::state::AppState, chat_id: &str) {
-    let taken = match crate::chats::take_queued(&state.pool, chat_id).await {
-        Ok(Some(taken)) => taken,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(%error, chat_id, "could not read what was waiting for this conversation");
+    // Again only when the message went back AND nothing holds the slot any more — the turn that
+    // took it ended before the message was back, so its own drain found nothing. Bounded, because
+    // each round needs a turn to start and end inside one send, and a few of those in a row is a
+    // conversation busy enough that its next turn's drain will come.
+    for _ in 0..3 {
+        if !drain_once(state, chat_id).await {
             return;
         }
+    }
+}
+
+/// One message off the queue, sent or put back; `true` when it was put back and nothing is left to
+/// drain it.
+async fn drain_once(state: &crate::state::AppState, chat_id: &str) -> bool {
+    let taken = match crate::chats::take_queued(&state.pool, chat_id).await {
+        Ok(Some(taken)) => taken,
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "could not read what was waiting for this conversation");
+            return false;
+        }
     };
-    // The fourth element is the relay this message travelled on, or `None` for one a person typed —
-    // see `take_queued`'s own doc. It decides which of the two doors below the resend goes back
+    // `relay_id` is the relay this message travelled on, or `None` for one a person typed — see
+    // `take_queued`'s own doc. It decides which of the two doors below the resend goes back
     // through, so a message that waited still produces a run recording where it came from.
-    let (text, origin, carried, relay_id) = taken;
-    let origin = Origin::from_wire(origin.as_deref());
+    let text = taken.text.clone();
+    let origin = Origin::from_wire(taken.origin.as_deref());
+    let carried = taken.images.clone();
+    let relay_id = taken.relay_id;
     let sent = match relay_id {
         // No pictures on this branch: `send_relayed_message` never takes any, for the reason its
         // own doc gives — a relay carries `chat_relays.body`, plain text, never an attachment — so
@@ -275,7 +293,7 @@ pub(super) async fn drain_queued(state: &crate::state::AppState, chat_id: &str) 
                     relay_id,
                     "a relayed message that had been waiting was dropped: the owner is no longer present"
                 );
-                return;
+                return false;
             }
             let room = match crate::relay::root_of_relay(&state.pool, relay_id).await {
                 Ok(root) => crate::relay::chain_has_room(&state.pool, root, now).await,
@@ -291,7 +309,7 @@ pub(super) async fn drain_queued(state: &crate::state::AppState, chat_id: &str) 
                     ?refusal,
                     "a relayed message that had been waiting was dropped: its chain has no room left"
                 );
-                return;
+                return false;
             }
             match crate::chats::brain_of(&state.pool, chat_id).await {
                 Ok(Some(_)) => {}
@@ -301,7 +319,7 @@ pub(super) async fn drain_queued(state: &crate::state::AppState, chat_id: &str) 
                         relay_id,
                         "a relayed message that had been waiting was dropped: its destination is gone or archived"
                     );
-                    return;
+                    return false;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -310,7 +328,7 @@ pub(super) async fn drain_queued(state: &crate::state::AppState, chat_id: &str) 
                         relay_id,
                         "a relayed message that had been waiting was dropped: its destination could not be read"
                     );
-                    return;
+                    return false;
                 }
             }
             Box::pin(send_relayed_message(
@@ -337,13 +355,32 @@ pub(super) async fn drain_queued(state: &crate::state::AppState, chat_id: &str) 
             Box::pin(send_message_with(state, chat_id, &text, &images, origin)).await
         }
     };
-    if let Err(refusal) = sent {
-        tracing::warn!(
-            %refusal,
-            chat_id,
-            "a message that had been waiting could not be sent"
-        );
+    match sent {
+        Ok(_) => {}
+        // Another turn took the slot between this drain's turn ending and this send: a person's
+        // message that arrived in the gap, or the assistant answering on its own. Nothing was tried,
+        // so the message goes back where it was, and the turn holding the slot drains it when it
+        // ends. If that turn has ALREADY ended — it may have drained before the message was back —
+        // nothing else is coming for it, and the caller tries again.
+        Err(refusal) if refusal == TURN_IN_PROGRESS => {
+            match crate::chats::requeue(&state.pool, chat_id, &taken).await {
+                Ok(()) => return !is_busy(chat_id),
+                Err(error) => tracing::warn!(
+                    %error,
+                    chat_id,
+                    "a message that had been waiting found the conversation busy and could not be put back"
+                ),
+            }
+        }
+        Err(refusal) => {
+            tracing::warn!(
+                %refusal,
+                chat_id,
+                "a message that had been waiting could not be sent"
+            );
+        }
     }
+    false
 }
 
 /// Why a turn was refused before it cost anything: this conversation is already answering one.
