@@ -610,7 +610,57 @@ pub async fn prepare_artifacts(worktree: &Path) -> io::Result<PathBuf> {
     Ok(artifacts)
 }
 
+/// Unlinks every symlink and junction inside `root` without following any of them, and returns
+/// how many it removed. `.git` is skipped. Any failure is an error: the caller must not go on to
+/// delete a tree that still holds a link, because on Windows git deletes THROUGH a junction (a
+/// `shell\node_modules` junctioned to the main checkout emptied the main one, 2026-10-11).
+fn unlink_links(root: &Path) -> io::Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        let path = entry.path();
+        if kind.is_symlink() {
+            #[cfg(windows)]
+            let dir_link = {
+                use std::os::windows::fs::FileTypeExt;
+                kind.is_symlink_dir()
+                    // A junction reports as a symlink; only a file symlink needs `remove_file`.
+                    || !kind.is_symlink_file()
+            };
+            #[cfg(windows)]
+            if dir_link {
+                std::fs::remove_dir(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+            #[cfg(not(windows))]
+            std::fs::remove_file(&path)?;
+            removed += 1;
+        } else if kind.is_dir() {
+            removed += unlink_links(&path)?;
+        }
+    }
+    Ok(removed)
+}
+
 pub async fn try_remove_once(project_root: &Path, path: &Path) -> io::Result<()> {
+    // A missing directory has nothing to unlink; git decides what that means.
+    if path.is_dir() {
+        let tree = path.to_path_buf();
+        let unlinked = tokio::task::spawn_blocking(move || unlink_links(&tree))
+            .await
+            .map_err(io::Error::other)?;
+        if let Err(error) = unlinked {
+            return Err(io::Error::other(format!(
+                "refusing to remove {}: a link inside it could not be unlinked ({error})",
+                path.display()
+            )));
+        }
+    }
     let output = git()
         .arg("-C")
         .arg(project_root)
@@ -1273,6 +1323,49 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const ROOT_ENV: &str = "NUCLEOS_WORKTREE_ROOT";
+
+    /// A directory junction (Windows) or symlink (unix) at `link` pointing at `target`.
+    fn link_dir(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        {
+            let status = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .status()
+                .expect("mklink should start");
+            assert!(status.success(), "mklink /J should not need elevation");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("create symlink");
+    }
+
+    #[test]
+    fn unlink_links_removes_a_link_and_spares_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), "x").unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("shell")).unwrap();
+        link_dir(&tree.join("shell").join("node_modules"), &target);
+
+        let removed = unlink_links(&tree).expect("unlink");
+
+        assert_eq!(removed, 1);
+        assert!(!tree.join("shell").join("node_modules").exists());
+        assert!(tree.join("shell").is_dir(), "real directories stay");
+        assert!(target.join("keep.txt").exists(), "the target must survive");
+    }
+
+    #[test]
+    fn unlink_links_leaves_a_tree_without_links_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("a").join("f.txt"), "x").unwrap();
+        assert_eq!(unlink_links(dir.path()).unwrap(), 0);
+        assert!(dir.path().join("a").join("f.txt").exists());
+    }
 
     /// Every owner kind, for the tests that have to say something about all of them.
     const EVERY_OWNER: [Owner; 3] = [Owner::Run(7), Owner::Job(7), Owner::Item(7)];
