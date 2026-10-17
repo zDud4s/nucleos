@@ -1,0 +1,112 @@
+# What a dispatched phase's prompt may contain. The context half of the cockpit.
+#
+# The tool half is mechanical: `.claude/agents/wf-*.md` carries a `tools:` line the harness
+# enforces. The CONTEXT half used to be prose in the orchestrate skill, read by a model and
+# checked by nothing: a controller that inlined `dispatch.md` into an executor's prompt, or
+# fell back to the whole of `memory.md`, broke the cockpit and nothing said so.
+#
+# This file is that list as DATA, read by <bundle_dir>/scripts/assemble_prompt.py (which refuses
+# to write a prompt that violates it) and by whatever checks recorded manifests. The controller
+# records which of these keys it actually used in the phase's metric row (`prompt_sections`,
+# plus `memory_tags` and `memory_lines`), taken from the manifest the script writes beside the
+# archive -- never typed by hand.
+
+schema_version: prompt-contract/v1
+
+# The cache-stable order from dispatch.md. Sections shared across sequential phases of one
+# task must form a byte-identical prefix, so the stable ones come first and in this order.
+order:
+  - phase_skill      # the body of the skill named after the phase. ONE skill, never two.
+  - packet_schema    # the read-only template(s) from .nucleos/workflow/packets/ this phase will fill
+  - project_yaml     # <state_dir>/project.yaml
+  # The task's confirmed intent, filled from `intent.md` by the controller for medium/large or
+  # elevated-risk tasks. A first-class key rather than a `prior_artifacts` payload: `plan` needs
+  # it MOST and is the one phase whose `allowed` list deliberately excludes `prior_artifacts`.
+  # Task-constant, so it sits with the other constants and ahead of the per-phase `objective`.
+  - intent           # the filled, confirmed intent -- absent for trivial/small low-risk tasks
+  - objective        # the user task, or the filled packet's Objective
+  - memory_slice     # memory.md entries matching the planner's Memory tags, + the header
+  # memory.md's header and vocabulary plus a per-tag entry COUNT, and no entries. What `plan`
+  # needs in order to choose the tags every later phase is sliced by: the inventory, not the
+  # text under it. The entries are one grep away (the planner's cockpit carries Read and Grep).
+  - memory_index     # memory.md's header + a per-tag entry count, never the entries
+  - memory_full      # the whole memory.md -- only where a phase legitimately needs it
+  - decisions        # <state_dir>/decisions.md
+  - prior_artifacts  # the previous phase's output: a filled packet, a Handoff, findings
+
+# Never, in any phase, for any reason. Each of these is addressed to the controller, and a
+# dispatched phase that acts on one is doing the thing the controller-only invariant forbids.
+never:
+  - dispatch_md          # the controller's contract
+  - controller_skill     # orchestrate / orchestrate-tdd
+  - other_phase_skill    # a phase gets its own skill and no other
+  - bridge_skill         # `claude` / `codex` -- named after a tool, not a phase
+
+phases:
+  plan:
+    allowed: [phase_skill, packet_schema, project_yaml, intent, objective, memory_index, decisions]
+    required: [phase_skill, packet_schema, project_yaml, objective, memory_index]
+
+  execute:
+    allowed: [phase_skill, packet_schema, project_yaml, objective, memory_slice, prior_artifacts]
+    required: [phase_skill, packet_schema, project_yaml, objective, memory_slice]
+
+  review:
+    allowed: [phase_skill, packet_schema, project_yaml, intent, objective, memory_slice, prior_artifacts]
+    required: [phase_skill, packet_schema, project_yaml, objective, prior_artifacts]
+
+  rescue:
+    allowed: [phase_skill, packet_schema, project_yaml, objective, memory_slice, prior_artifacts]
+    required: [phase_skill, packet_schema, project_yaml, objective, prior_artifacts]
+
+  maintenance:
+    # Writes memory.md, so it needs the file rather than a view of it.
+    allowed: [phase_skill, project_yaml, objective, memory_full, decisions, prior_artifacts]
+    required: [phase_skill, project_yaml, objective]
+
+  bootstrap:
+    # There is nothing to slice yet -- this phase is what fills project.yaml and memory.md.
+    allowed: [phase_skill, project_yaml, objective]
+    required: [phase_skill, objective]
+
+  # The three orchestrate-tdd dispatches are `execute` under different objectives and
+  # boundaries, and get the executor's cockpit and the executor's sections.
+  red:
+    allowed: [phase_skill, packet_schema, project_yaml, objective, memory_slice, prior_artifacts]
+    required: [phase_skill, packet_schema, project_yaml, objective, memory_slice]
+  green:
+    allowed: [phase_skill, packet_schema, project_yaml, objective, memory_slice, prior_artifacts]
+    required: [phase_skill, packet_schema, project_yaml, objective, memory_slice]
+  refactor:
+    allowed: [phase_skill, packet_schema, project_yaml, objective, memory_slice, prior_artifacts]
+    required: [phase_skill, packet_schema, project_yaml, objective, memory_slice]
+
+# Where the controller archives the prompt it actually assembled. The script writes it to
+# `<dir>/<task_slug>-<phase>-<n>.md`, with `<!-- section: <key> -->` on its own line
+# immediately before each section, and a `<archive>.manifest.json` beside it. `assemble_prompt.py`
+# re-derives the manifest from the markers and scans the assembled file for the
+# `never_fingerprints` below, refusing to write it on a violation. That catches a section
+# declared and absent, present and undeclared, and forbidden material pasted in.
+# It does NOT catch a paraphrase of forbidden material, or a section whose marker is honest
+# and whose content is wrong. `prompt_sha256` in the metric row pins the archive's bytes, so
+# an archive edited after the fact is visible as such.
+prompt_archive:
+  dir: <state_dir>/prompts   # resolved from .nucleos/workflow/project.json
+  marker: "<!-- section: {key} -->"
+
+# Content fingerprints for the `never` keys: distinctive headings that appear only in the real
+# thing. Marker checking alone is not enough: text pasted INSIDE a legitimate section (append
+# `dispatch.md` to the end of the `phase_skill` body) leaves the manifest matching. A paraphrase
+# still evades this; pasting the file in does not, and that is the failure that actually happens.
+never_fingerprints:
+  dispatch_md:
+    - "#### The phase cockpit"
+    - "## Controller-only invariant"
+    - "## Dispatch routing"
+  controller_skill:
+    - "You are the orchestrator."
+    - "## Fast path - single-call execution"
+    - "### Auto-select handoff"
+  bridge_skill:
+    - "# Claude Skill Guide"
+    - "### Agent mode — the normal one here"
