@@ -63,6 +63,20 @@ async fn claim_delivery(
     key: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<bool, DeliveryError> {
+    // A push keyed by (project, branch, sha) only needs to dedupe against the LAST sha seen on its
+    // branch. Keeping every older one made push A -> B -> A drop the second A forever.
+    if key.starts_with("[\"push\"") {
+        sqlx::query(
+            "DELETE FROM webhook_deliveries
+              WHERE project_id = ? AND branch = ? AND sha <> ? AND delivery_key LIKE '[\"push\"%'",
+        )
+        .bind(&delivery.project_id)
+        .bind(&delivery.branch)
+        .bind(&delivery.sha)
+        .execute(&state.pool)
+        .await
+        .map_err(DeliveryError::Storage)?;
+    }
     let result = sqlx::query(
         "INSERT INTO webhook_deliveries
              (delivery_key, project_id, branch, sha, received_at)
@@ -299,6 +313,35 @@ mod tests {
             DeliveryOutcome::Duplicate
         );
         assert_eq!(run_count(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_sha_seen_earlier_on_the_branch_fires_again_after_a_different_one() {
+        let (state, _home) = test_state().await;
+        let push = |sha: &str| Delivery {
+            project_id: "configured".to_string(),
+            branch: "main".to_string(),
+            sha: sha.to_string(),
+            delivery_id: None,
+        };
+        let claim = |d: Delivery| {
+            let state = state.clone();
+            async move {
+                let key = dedupe_key(&d).unwrap();
+                claim_delivery(&state, &d, &key, now()).await.unwrap()
+            }
+        };
+
+        assert!(claim(push("aaa")).await);
+        assert!(
+            !claim(push("aaa")).await,
+            "an immediate replay is a duplicate"
+        );
+        assert!(claim(push("bbb")).await);
+        assert!(
+            claim(push("aaa")).await,
+            "A after B is a new push, not a replay"
+        );
     }
 
     #[tokio::test]

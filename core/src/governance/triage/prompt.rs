@@ -83,7 +83,14 @@ fn fenced_body(body: &str) -> String {
 fn header_field(raw: &str) -> String {
     let flattened: String = raw
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        // U+2028 and U+2029 are not control characters but still end a line for many readers.
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let mut out: String = flattened.chars().take(PROMPT_HEADER_CHARS).collect();
     if flattened.chars().count() > PROMPT_HEADER_CHARS {
@@ -208,4 +215,15 @@ pub(super) async fn triage_inputs(
         }
     }
     Ok(inputs)
+}
+
+#[cfg(test)]
+mod header_field_tests {
+    use super::header_field;
+
+    #[test]
+    fn unicode_line_separators_cannot_break_a_header_onto_a_new_line() {
+        let out = header_field("a\u{2028}b\u{2029}c\u{0085}d\re\nf");
+        assert_eq!(out, "a b c d e f");
+    }
 }

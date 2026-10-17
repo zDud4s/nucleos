@@ -91,6 +91,7 @@ pub const REFUSED_READ_FLAGS: &[&str] = &[
     "--search",
     "-L",
     "--limit",
+    "-S",
 ];
 
 /// One row of the map below: what a `gh` command line has to say in order to BE one operation.
@@ -282,5 +283,8 @@ pub fn op_kind_of_gh_command(command: &str) -> Option<&'static str> {
 /// of difference between an implementation that works and one that looks like it does — and a second
 /// copy of that character is exactly how the two would come to disagree.
 pub(super) fn word_is_flag(word: &str, flag: &str) -> bool {
-    word == flag || word.starts_with(&format!("{flag}="))
+    // A short flag takes its value glued on (`-L1000`, `-qEXPR`, `-S"x"`): pflag reads everything
+    // after the letter as the value, so the word is still that flag.
+    let short = flag.len() == 2 && flag.starts_with('-') && !flag.starts_with("--");
+    word == flag || word.starts_with(&format!("{flag}=")) || (short && word.starts_with(flag))
 }
