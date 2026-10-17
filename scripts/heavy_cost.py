@@ -47,7 +47,12 @@ def _tool(argv: list[str]) -> str:
     name = Path(str(argv[0])).name.lower() if argv else "-"
     for ext in (".exe", ".cmd", ".bat"):
         if name.endswith(ext):
-            return name[: -len(ext)]
+            name = name[: -len(ext)]
+            break
+    # One interpreter, one class: `python3` (macOS, Linux, a CI runner) and `python3.11` cost the
+    # same as this machine's `python`, and would otherwise split one history across three keys.
+    if name.startswith("python3"):
+        return "python"
     return name
 
 

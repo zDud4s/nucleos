@@ -66,6 +66,8 @@ class ClassKey(unittest.TestCase):
         self.assertEqual(c.class_key(["go", "test", "./..."], compiled=False), "go|test|-|a|c")
         self.assertEqual(c.class_key(["C:/x/npm.cmd", "exec", "tsc"]), "npm|exec:tsc|-|a|c")
         self.assertEqual(c.class_key([sys.executable, "-c", "print(1)"]), "python|-|-|a|c")
+        for spelling in ("python3", "/usr/bin/python3.11", "C:/py/python3.exe"):
+            self.assertEqual(c.class_key([spelling, "-c", "print(1)"]), "python|-|-|a|c")
 
 
 class Measure(unittest.TestCase):
