@@ -120,6 +120,28 @@ pub(super) mod in_flight {
     }
 }
 
+/// Whether a git command with this argv can have been holding `index.lock` when it was killed.
+///
+/// `fetch`, `push`, `ls-remote` and `clone` never take the index lock, so a timeout of one of them
+/// says nothing about a lock found in the checkout: that lock belongs to somebody else — an editor, a
+/// git the user ran by hand in the main checkout — and deleting it corrupts their operation. Only the
+/// subcommand is looked at, after skipping the global options (`-c key=value`, `-C dir`) that precede it.
+pub(super) fn may_have_held_index_lock(args: &[&OsStr]) -> bool {
+    let mut iter = args.iter().map(|argument| argument.to_string_lossy());
+    while let Some(argument) = iter.next() {
+        match argument.as_ref() {
+            "-c" | "-C" => {
+                iter.next();
+            }
+            option if option.starts_with('-') => {}
+            subcommand => {
+                return !matches!(subcommand, "fetch" | "push" | "ls-remote" | "clone");
+            }
+        }
+    }
+    true
+}
+
 /// Removes the `index.lock` a timed-out git was killed holding, when nothing of ours still runs there.
 ///
 /// A git killed mid-write never gets to delete its lock, and every later index-touching command in
@@ -339,7 +361,9 @@ pub async fn run_git(
             // The process is gone, so this one no longer counts — and a kill mid-write leaves its
             // `index.lock` behind, which would wedge every later command in this checkout.
             drop(live);
-            remove_stale_index_lock(repo).await;
+            if may_have_held_index_lock(args) {
+                remove_stale_index_lock(repo).await;
+            }
             return Err(format!(
                 "git {} timed out after {timeout:?}",
                 rendered(args)

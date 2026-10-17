@@ -999,6 +999,42 @@ async fn is_worktree_root(worktree_path: &Path) -> bool {
     !(path_contains(&toplevel, &here) && !paths_equal(&toplevel, &here))
 }
 
+/// Names the multi-step git operation stopped in `worktree_path`, if any, by the marker files git
+/// keeps in the worktree's own git directory (`--git-path` resolves that for linked worktrees).
+async fn operation_in_progress(worktree_path: &Path) -> io::Result<Option<&'static str>> {
+    const MARKERS: [(&str, &str); 5] = [
+        ("MERGE_HEAD", "merge"),
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+    ];
+    for (marker, name) in MARKERS {
+        let output = git()
+            .arg("-C")
+            .arg(worktree_path)
+            .arg("rev-parse")
+            .arg("--git-path")
+            .arg(marker)
+            .output()
+            .await?;
+        if !output.status.success() {
+            continue;
+        }
+        let reported = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let path = Path::new(&reported);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            worktree_path.join(path)
+        };
+        if path.exists() {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
 pub async fn preserve_uncommitted(worktree_path: &Path, byte_ceiling: u64) -> io::Result<bool> {
     if !is_worktree_root(worktree_path).await {
         // A plain directory inside someone else's repository. Nothing here belongs to a run, and
@@ -1027,6 +1063,15 @@ pub async fn preserve_uncommitted(worktree_path: &Path, byte_ceiling: u64) -> io
     }
     if status.stdout.is_empty() {
         return Ok(false);
+    }
+
+    // A merge, rebase, cherry-pick or revert stopped on a conflict leaves markers in the files;
+    // `add -A` + `commit` would bake them into a "preserved" commit and complete the operation by
+    // accident. Refuse, which defers the removal and leaves the worktree for a person.
+    if let Some(operation) = operation_in_progress(worktree_path).await? {
+        return Err(io::Error::other(format!(
+            "a {operation} is in progress in the worktree; refusing to commit its conflict state"
+        )));
     }
 
     measure_status_paths(worktree_path, &status.stdout, byte_ceiling).await?;
@@ -2374,6 +2419,55 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(info.path.join("failure.txt")).expect("read surviving work"),
             "must survive release\n"
+        );
+        pool.close().await;
+    }
+
+    /// A release whose removal fails must not mark the row removed, or the gc sweep never sees the
+    /// leftover directory again. A locked worktree makes `git worktree remove --force` refuse.
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_keeps_the_row_registered_when_removal_fails() {
+        let _lock = env_lock();
+        let pool = test_pool().await;
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let run_id = insert_run(
+            &pool,
+            "awaiting_approval",
+            None,
+            "2026-07-29T00:00:00+00:00",
+        )
+        .await;
+        let info = create_and_record(&pool, repo.path(), run_id).await;
+        assert!(git_ok(
+            repo.path(),
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("lock"),
+                info.path.as_os_str(),
+            ],
+        ));
+
+        assert_eq!(
+            release(&pool, run_id).await.unwrap(),
+            ReleaseOutcome::Released
+        );
+
+        assert!(
+            info.path.is_dir(),
+            "the locked worktree could not be removed"
+        );
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            removed_at.is_none(),
+            "a worktree that is still on disk must stay registered for the gc sweep"
         );
         pool.close().await;
     }
@@ -4120,6 +4214,67 @@ mod tests {
             "uncommitted work in a real worktree is preserved"
         );
         assert_eq!(commit_count(repo.path(), &info.branch), before + 1);
+    }
+
+    /// A merge stopped on a conflict has markers in its files; preserving would commit them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn preserve_refuses_a_worktree_with_a_merge_in_progress() {
+        let _lock = env_lock();
+        let repo = init_space_free_repo();
+        let root = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let info = create(repo.path(), Owner::Run(79))
+            .await
+            .expect("create worktree");
+        std::fs::write(
+            info.path.join("work.txt"),
+            "<<<<<<< ours
+x
+=======
+y
+>>>>>>> theirs
+",
+        )
+        .expect("write conflicted file");
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&info.path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf8");
+        let merge_head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&info.path)
+                .args(["rev-parse", "--git-path", "MERGE_HEAD"])
+                .output()
+                .expect("git-path")
+                .stdout,
+        )
+        .expect("utf8");
+        let merge_head = Path::new(merge_head.trim());
+        let merge_head = if merge_head.is_absolute() {
+            merge_head.to_path_buf()
+        } else {
+            info.path.join(merge_head)
+        };
+        std::fs::write(&merge_head, head).expect("simulate a stopped merge");
+        let before = commit_count(repo.path(), &info.branch);
+
+        let error = preserve_uncommitted(&info.path, DEFAULT_PRESERVATION_BYTE_CEILING)
+            .await
+            .expect_err("a worktree mid-merge must not be committed");
+
+        assert!(error.to_string().contains("merge"), "got: {error}");
+        assert_eq!(
+            commit_count(repo.path(), &info.branch),
+            before,
+            "no commit may have been made"
+        );
     }
 
     #[test]
