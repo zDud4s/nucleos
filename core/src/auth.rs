@@ -320,6 +320,12 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // this is the pile a run left behind, and that one is what spends a model per decision to
     // fill it.
     (Method::GET, "/projects/{id}/readings"),
+    // Trends over the same rows `/projects/{id}/readings` totals, and the quota history behind
+    // `/quota`: aggregates of what this key already reads (run ids and costs come out of `/runs`
+    // too), no secrets, nothing changed.
+    (Method::GET, "/projects/{id}/analytics"),
+    (Method::GET, "/analytics"),
+    (Method::GET, "/analytics/quota"),
     (Method::GET, "/projects/{id}/log"),
     (Method::GET, "/projects/{id}/branches"),
     (Method::GET, "/projects/{id}/blame"),
@@ -3502,6 +3508,16 @@ mod tests {
             &Method::GET,
             "/projects/7/readings"
         ));
+    }
+
+    /// The analytics reads are reads: a read-only key reaches all three, and only with GET.
+    #[test]
+    fn analytics_reads_are_open_to_a_read_only_key() {
+        let reader = Scope::ApiToken(ApiTokenLevel::ReadOnly);
+        for path in ["/analytics", "/analytics/quota", "/projects/7/analytics"] {
+            assert!(permits(&reader, &Method::GET, path), "GET {path}");
+            assert!(!permits(&reader, &Method::POST, path), "POST {path}");
+        }
     }
 
     /// Which repository a project points at is in no scope table, and this is the closest call of
