@@ -548,9 +548,20 @@ func sendReply(bot Bot, to telegram.Destination, reply string) {
 	}
 }
 
+// pollTurnAndReply waits for a turn to finish. The total wait budget is maxAttempts x interval, as
+// it always was, but a run that is still going is asked about less and less often (see
+// nextPollDelay): a turn that takes minutes does not need a GetRun every few seconds. The budget is
+// the sum of the waits, so the slower cadence does not stretch it.
 func pollTurnAndReply(dc Daemon, turnID int64, interval time.Duration, maxAttempts int) string {
+	return pollTurnWith(dc, turnID, interval, maxAttempts, time.Sleep)
+}
+
+func pollTurnWith(dc Daemon, turnID int64, interval time.Duration, maxAttempts int, sleep func(time.Duration)) string {
+	budget := time.Duration(maxAttempts) * interval
+	delay := interval
+	var spent time.Duration
 	consecutiveErrors := 0
-	for i := 0; i < maxAttempts; i++ {
+	for spent < budget {
 		run, err := dc.GetRun(turnID)
 		if err != nil {
 			// The run is the daemon's, not ours: it keeps going while the daemon restarts, and
@@ -559,7 +570,8 @@ func pollTurnAndReply(dc Daemon, turnID int64, interval time.Duration, maxAttemp
 			if consecutiveErrors >= maxConsecutivePollErrors {
 				return "error checking turn: " + err.Error()
 			}
-			time.Sleep(interval)
+			sleep(interval)
+			spent += interval
 			continue
 		}
 		consecutiveErrors = 0
@@ -567,9 +579,26 @@ func pollTurnAndReply(dc Daemon, turnID int64, interval time.Duration, maxAttemp
 		if isTerminal(status) {
 			return runReply(run)
 		}
-		time.Sleep(interval)
+		sleep(delay)
+		spent += delay
+		delay = nextPollDelay(delay, interval)
 	}
 	return "turn still running — check /budget or the dashboard"
+}
+
+// nextPollDelay grows the wait between polls of a run that is still going by half each time, capped
+// at 15s, or at the configured interval when that is larger.
+func nextPollDelay(cur, base time.Duration) time.Duration {
+	const ceiling = 15 * time.Second
+	limit := ceiling
+	if limit < base {
+		limit = base
+	}
+	next := cur + cur/2
+	if next > limit {
+		next = limit
+	}
+	return next
 }
 
 func isTerminal(status string) bool {

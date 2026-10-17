@@ -1681,3 +1681,40 @@ func TestNextIdleDelay(t *testing.T) {
 		}
 	}
 }
+
+func TestNextPollDelayProgression(t *testing.T) {
+	cases := []struct {
+		cur, base, want time.Duration
+	}{
+		{2 * time.Second, 2 * time.Second, 3 * time.Second},
+		{3 * time.Second, 2 * time.Second, 4500 * time.Millisecond},
+		{10 * time.Second, 2 * time.Second, 15 * time.Second},
+		{15 * time.Second, 2 * time.Second, 15 * time.Second},
+		{20 * time.Second, 20 * time.Second, 20 * time.Second},
+		{30 * time.Second, 20 * time.Second, 20 * time.Second},
+	}
+	for _, c := range cases {
+		if got := nextPollDelay(c.cur, c.base); got != c.want {
+			t.Errorf("nextPollDelay(%v, %v) = %v, want %v", c.cur, c.base, got, c.want)
+		}
+	}
+}
+
+func TestPollingKeepsItsTotalWaitBudget(t *testing.T) {
+	dc := &recordingDaemon{run: map[string]any{"status": "running"}}
+	var total time.Duration
+	var sleeps []time.Duration
+	got := pollTurnWith(dc, 1, 2*time.Second, 300, func(d time.Duration) {
+		total += d
+		sleeps = append(sleeps, d)
+	})
+	if !strings.Contains(got, "still running") {
+		t.Fatalf("pollTurnWith() = %q, want the still-running notice", got)
+	}
+	if total < 600*time.Second || total >= 600*time.Second+15*time.Second {
+		t.Errorf("total wait = %v, want the 600s budget (not shorter, not stretched)", total)
+	}
+	if sleeps[1] <= sleeps[0] || len(sleeps) >= 300 {
+		t.Errorf("sleeps = %d starting %v, want fewer polls with a growing delay", len(sleeps), sleeps[:2])
+	}
+}
