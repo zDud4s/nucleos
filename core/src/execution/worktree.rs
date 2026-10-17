@@ -799,6 +799,44 @@ async fn registration(project_root: &Path, path: &Path) -> io::Result<Registrati
     Ok(Registration::Absent)
 }
 
+/// Retires a daemon-owned worktree left at an address the daemon no longer uses, so the tree
+/// about to be created at `current` does not leave a second registered checkout behind it.
+///
+/// Written for the integration directory rename (`integration-<leaf>` to `integration-<leaf>-<hash>`).
+/// The legacy name is exactly the one that two projects sharing a leaf could collide on, so a
+/// directory there is only ours to touch when THIS repository's own worktree list registers it:
+/// another project's tree, or a directory git does not know, is left strictly alone.
+///
+/// Best effort by contract. Nothing here returns an error: a failure is logged and the caller
+/// creates the new tree regardless. Removal goes through `try_remove_once`, which unlinks any
+/// junction first, then `git worktree prune` clears a row whose directory is gone.
+pub async fn retire_legacy_worktree(project_root: &Path, legacy: &Path, current: &Path) {
+    if paths_equal(legacy, current) || tokio::fs::metadata(current).await.is_ok() {
+        return;
+    }
+    if tokio::fs::metadata(legacy).await.is_err() {
+        return;
+    }
+    match registration(project_root, legacy).await {
+        Ok(Registration::Present) => {}
+        Ok(Registration::Absent) => return,
+        Err(error) => {
+            tracing::warn!(path = %legacy.display(), %error, "could not tell whether a legacy worktree is ours");
+            return;
+        }
+    }
+    if let Err(error) = try_remove_once(project_root, legacy).await {
+        tracing::warn!(path = %legacy.display(), %error, "could not remove the legacy worktree");
+    }
+    let _ = git()
+        .arg("-C")
+        .arg(project_root)
+        .arg("worktree")
+        .arg("prune")
+        .output()
+        .await;
+}
+
 /// Clears git's row for a directory that is already gone, and proves it cleared.
 ///
 /// Order is the whole point. `prune` only drops rows whose directory is missing, so running it
@@ -1769,6 +1807,61 @@ mod tests {
             exclude.lines().any(|line| line.trim() == entry),
             "creation alone must anchor an exclude entry covering the worktree root, got: {exclude:?}"
         );
+    }
+
+    /// The integration directory gained a hash suffix. A tree at the old name that THIS repository
+    /// registers is retired; one that another repository registers (the collision the hash fixes)
+    /// or that git does not know at all is left exactly as it was.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_legacy_worktree_of_this_repository_is_retired_and_a_foreign_one_is_not() {
+        let base = space_free_tempdir();
+        let mine = base.path().join("mine");
+        let other = base.path().join("other");
+        for repo in [&mine, &other] {
+            std::fs::create_dir_all(repo).expect("create repository directory");
+            init_repo_at(repo);
+        }
+        let shared = base.path().join("shared");
+        std::fs::create_dir_all(&shared).expect("create shared root");
+        let add = |repo: &Path, path: &Path| {
+            assert!(git_ok(
+                repo,
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    OsStr::new("--detach"),
+                    path.as_os_str(),
+                ],
+            ));
+        };
+
+        // This repository's legacy tree: retired, and the new directory is free to be created.
+        let legacy = shared.join("integration-app");
+        let current = shared.join("integration-app-00000001");
+        add(&mine, &legacy);
+        retire_legacy_worktree(&mine, &legacy, &current).await;
+        assert!(!legacy.exists(), "the legacy tree should be gone");
+        assert!(
+            !git_stdout(&mine, &[OsStr::new("worktree"), OsStr::new("list")])
+                .contains("integration-app"),
+            "git should no longer register it"
+        );
+
+        // Another repository's tree at the same name: untouched, still registered there.
+        add(&other, &legacy);
+        retire_legacy_worktree(&mine, &legacy, &current).await;
+        assert!(legacy.exists(), "a foreign tree must survive");
+        assert!(
+            git_stdout(&other, &[OsStr::new("worktree"), OsStr::new("list")])
+                .contains("integration-app")
+        );
+
+        // A plain directory git does not know: untouched.
+        let plain = shared.join("integration-plain");
+        std::fs::create_dir_all(&plain).expect("create plain directory");
+        let plain_current = shared.join("integration-plain-00000002");
+        retire_legacy_worktree(&mine, &plain, &plain_current).await;
+        assert!(plain.exists(), "an unregistered directory must survive");
     }
 
     /// A `run-<id>` worktree left at the OLD sibling location by a daemon that predates this
