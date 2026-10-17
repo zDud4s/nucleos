@@ -385,10 +385,12 @@ async fn pool_probe(pool: SqlitePool) -> SubsystemReadout {
 
 async fn cli_probe() -> SubsystemReadout {
     run_probe("cli_binary", async {
-        let resolved = tokio::task::spawn_blocking(resolve_cli_binary)
-            .await
-            .map_err(classify_error)?
-            .ok_or(FailureCategory::Missing)?;
+        let resolved = tokio::task::spawn_blocking(|| {
+            cached_lookup(&CLI_BINARY_LOOKUP, LOOKUP_CACHE_TTL, resolve_cli_binary)
+        })
+        .await
+        .map_err(classify_error)?
+        .ok_or(FailureCategory::Missing)?;
         // The resolved path, not the configured name: the lookup has already decided which file on
         // PATH this is, and re-deriving it in another process would be a second chance to disagree.
         exec_probe(resolved.to_string_lossy().into_owned(), "--version").await
@@ -575,12 +577,17 @@ async fn embeddings_probe() -> SubsystemReadout {
     let Some(embedder) = crate::embed::installed() else {
         return embeddings_row(None, &[]);
     };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(400))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    // One client for the process: the readout is polled about once a second, and a new client per
+    // poll rebuilds its connection pool and TLS state each time.
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_millis(400))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
     let listed = crate::capabilities::installed_local_models(
-        &client,
+        client,
         crate::execution::runner::OLLAMA_BASE_URL,
     )
     .await;
@@ -610,9 +617,12 @@ fn router_row(plan: &RouterPlan, reachable: bool) -> SubsystemReadout {
 /// Reads `~/.nucleos/router.yaml` as the settings door does, then asks the router for its tiers.
 /// Task text never travels: `targets` is a GET with no body.
 async fn router_probe() -> SubsystemReadout {
+    // Only the file's text is cached; whether the router answers is asked live every poll.
     let text = tokio::task::spawn_blocking(|| {
-        let path = crate::machine_config::root()?.join(crate::machine_config::ROUTER_FILE);
-        std::fs::read_to_string(path).ok()
+        cached_lookup(&ROUTER_TEXT_LOOKUP, LOOKUP_CACHE_TTL, || {
+            let path = crate::machine_config::root()?.join(crate::machine_config::ROUTER_FILE);
+            std::fs::read_to_string(path).ok()
+        })
     })
     .await
     .ok()
@@ -659,9 +669,11 @@ fn hook_interpreter_row(resolved: Option<PathBuf>, wired_anywhere: bool) -> Subs
 /// always did. Both lookups run on the blocking pool, as `get_projects` does for the same roots.
 async fn hook_interpreter_probe(pool: SqlitePool) -> SubsystemReadout {
     let resolved = match tokio::task::spawn_blocking(|| {
-        resolve_program(std::ffi::OsStr::new(
-            crate::governance::autopilot::HOOK_INTERPRETER,
-        ))
+        cached_lookup(&HOOK_INTERPRETER_LOOKUP, LOOKUP_CACHE_TTL, || {
+            resolve_program(std::ffi::OsStr::new(
+                crate::governance::autopilot::HOOK_INTERPRETER,
+            ))
+        })
     })
     .await
     {
@@ -844,11 +856,16 @@ async fn github_probe(asked_for: bool, binary: String) -> SubsystemReadout {
 
 async fn credential_manager_probe() -> SubsystemReadout {
     run_probe("credential_manager", async {
-        tokio::task::spawn_blocking(|| crate::secrets::load_secret(DAEMON_TOKEN_KEY))
-            .await
-            .map_err(classify_error)?
-            .map(|_| HealthState::Ok)
-            .map_err(classify_error)
+        // The verdict is cached, never the secret itself.
+        tokio::task::spawn_blocking(|| {
+            cached_lookup(&DAEMON_TOKEN_LOOKUP, LOOKUP_CACHE_TTL, || {
+                crate::secrets::load_secret(DAEMON_TOKEN_KEY)
+                    .map(|_| HealthState::Ok)
+                    .map_err(classify_error)
+            })
+        })
+        .await
+        .map_err(classify_error)?
     })
     .await
 }
@@ -879,17 +896,22 @@ async fn disk_probe() -> SubsystemReadout {
 
 async fn telegram_sidecar_probe() -> SubsystemReadout {
     let configured = run_probe("telegram_sidecar", async {
-        tokio::task::spawn_blocking(|| crate::secrets::load_secret(TELEGRAM_TOKEN_KEY))
-            .await
-            .map_err(classify_error)?
-            .map_err(classify_error)
-            .map(|secret| {
-                if secret.is_some() {
-                    HealthState::Ok
-                } else {
-                    HealthState::Disabled
-                }
+        // Whether a token is configured is cached; the sidecar's liveness below stays live.
+        tokio::task::spawn_blocking(|| {
+            cached_lookup(&TELEGRAM_TOKEN_LOOKUP, LOOKUP_CACHE_TTL, || {
+                crate::secrets::load_secret(TELEGRAM_TOKEN_KEY)
+                    .map_err(classify_error)
+                    .map(|secret| {
+                        if secret.is_some() {
+                            HealthState::Ok
+                        } else {
+                            HealthState::Disabled
+                        }
+                    })
             })
+        })
+        .await
+        .map_err(classify_error)?
     })
     .await;
 
@@ -992,6 +1014,42 @@ fn binary_candidate(path: &Path) -> Option<PathBuf> {
 }
 
 type ExecVerdict = Result<HealthState, FailureCategory>;
+
+/// How long a slow-moving lookup (a PATH scan, a Credential Manager read, `router.yaml`'s text) is
+/// trusted. The shell polls the readout about once a second; none of these change on that scale.
+const LOOKUP_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// One cached lookup result and when it was taken.
+type LookupSlot<T> = Mutex<Option<(Instant, T)>>;
+
+/// PURE: the value in `slot` while it is younger than `ttl`.
+fn fresh_lookup<T: Clone>(slot: &LookupSlot<T>, now: Instant, ttl: Duration) -> Option<T> {
+    let guard = slot.lock().ok()?;
+    guard
+        .as_ref()
+        .filter(|(stamped, _)| now.duration_since(*stamped) < ttl)
+        .map(|(_, value)| value.clone())
+}
+
+/// Runs `lookup` at most once per `ttl`, answering the stored result in between. For BLOCKING
+/// lookups only: call it inside `spawn_blocking`. Only the lookup's result is kept, so a probe's
+/// live half (is the process up right now, does the router answer) stays outside it.
+fn cached_lookup<T: Clone>(slot: &LookupSlot<T>, ttl: Duration, lookup: impl FnOnce() -> T) -> T {
+    if let Some(value) = fresh_lookup(slot, Instant::now(), ttl) {
+        return value;
+    }
+    let value = lookup();
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some((Instant::now(), value.clone()));
+    }
+    value
+}
+
+static CLI_BINARY_LOOKUP: LookupSlot<Option<PathBuf>> = Mutex::new(None);
+static HOOK_INTERPRETER_LOOKUP: LookupSlot<Option<PathBuf>> = Mutex::new(None);
+static ROUTER_TEXT_LOOKUP: LookupSlot<Option<String>> = Mutex::new(None);
+static DAEMON_TOKEN_LOOKUP: LookupSlot<ExecVerdict> = Mutex::new(None);
+static TELEGRAM_TOKEN_LOOKUP: LookupSlot<ExecVerdict> = Mutex::new(None);
 
 /// Keyed by the program itself, not by the row: the verdict is a fact about a specific binary, so
 /// re-pointing `stt_command` at a different transcriber must not inherit the old one's answer.
@@ -1722,6 +1780,26 @@ url: http://127.0.0.1:{port}
         entry.state = "running";
         entry.spawn_error = None;
         assert_eq!(entry.liveness(), Liveness::Running);
+    }
+
+    #[test]
+    fn a_cached_lookup_runs_once_within_the_ttl_and_again_after_it() {
+        let slot: LookupSlot<u32> = Mutex::new(None);
+        let calls = std::cell::Cell::new(0u32);
+        let lookup = || {
+            calls.set(calls.get() + 1);
+            calls.get()
+        };
+        let ttl = Duration::from_secs(30);
+        assert_eq!(cached_lookup(&slot, ttl, lookup), 1);
+        assert_eq!(cached_lookup(&slot, ttl, lookup), 1);
+        assert_eq!(calls.get(), 1);
+
+        // A zero TTL makes every entry stale, so the lookup runs again.
+        assert_eq!(cached_lookup(&slot, Duration::ZERO, lookup), 2);
+        let now = Instant::now();
+        assert_eq!(fresh_lookup(&slot, now, ttl), Some(2));
+        assert_eq!(fresh_lookup(&slot, now + ttl * 2, ttl), None);
     }
 
     /// Non-zero exit is `degraded`, never `down`. `--help` and `--version` conventions differ across

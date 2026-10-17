@@ -12,8 +12,17 @@ import (
 // from turning into unbounded memory.
 const queueDepth = 64
 
-// restartDelay keeps a loop that panics on every attempt from spinning.
+// restartDelay keeps a loop that panics on every attempt from spinning. It is the first wait; a
+// loop that keeps panicking doubles it up to maxRestartDelay.
 const restartDelay = 5 * time.Second
+
+// maxRestartDelay caps the backoff, so a deterministic panic logs a stack every five minutes at
+// most instead of every five seconds.
+const maxRestartDelay = 5 * time.Minute
+
+// healthyRun is how long fn must have run before panicking for the backoff to start over: a loop
+// that worked for a while and then hit a one-off panic is not the crash loop the backoff is for.
+const healthyRun = time.Minute
 
 // Dispatcher runs updates off the polling loop. Handling used to happen inside the loop, so one
 // slow update held up every update behind it — including `/kill`, which is the one message this
@@ -98,9 +107,33 @@ func (d *Dispatcher) serve(queue chan func()) {
 // path that carries the emergency stop, without a word on the way out. It is for the loops that
 // must come back — a notifier that dies silently is the failure this is here to prevent.
 func Supervise(name string, fn func()) {
-	for !runGuarded(name, fn) {
-		time.Sleep(restartDelay)
+	superviseWith(name, fn, time.Sleep, time.Now)
+}
+
+// superviseWith is Supervise with the clock and the sleep injected, so the backoff is testable
+// without waiting minutes.
+func superviseWith(name string, fn func(), sleep func(time.Duration), now func() time.Time) {
+	delay := restartDelay
+	for {
+		started := now()
+		if runGuarded(name, fn) {
+			return
+		}
+		if now().Sub(started) >= healthyRun {
+			delay = restartDelay
+		}
+		sleep(delay)
+		delay = nextRestartDelay(delay)
 	}
+}
+
+// nextRestartDelay doubles the restart wait, capped at maxRestartDelay.
+func nextRestartDelay(cur time.Duration) time.Duration {
+	next := cur * 2
+	if next > maxRestartDelay {
+		next = maxRestartDelay
+	}
+	return next
 }
 
 // GoGuarded runs fn once, in its own goroutine, and swallows a panic instead of taking the process

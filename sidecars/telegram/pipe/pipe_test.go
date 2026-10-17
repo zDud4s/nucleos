@@ -884,9 +884,12 @@ type bootingDaemon struct {
 	// policy silences everything the feed carries.
 	killFrom         int
 	budgetPausedFrom int
+	// policyCalls counts GetNotifyPolicy reads.
+	policyCalls int
 }
 
 func (d *bootingDaemon) GetNotifyPolicy() (notifier.Policy, error) {
+	d.policyCalls++
 	if d.notifyPolicyErr != nil {
 		return notifier.Policy{}, d.notifyPolicyErr
 	}
@@ -1659,5 +1662,89 @@ func TestALongTurnStillGetsItsReply(t *testing.T) {
 	}
 	if len(notices) != 1 {
 		t.Fatalf("notices = %v, want exactly one still-working notice", notices)
+	}
+}
+
+// The policy only filters new feed items, so an idle round must not fetch it.
+func TestTheNotifierReadsThePolicyOnlyWhenThereAreNewFeedItems(t *testing.T) {
+	cases := []struct {
+		name        string
+		feedArrives map[int][]map[string]any
+		wantReads   int
+	}{
+		{"idle feed", nil, 0},
+		{"one new item", map[int][]map[string]any{3: {{"id": float64(7), "kind": "run", "summary": "fresh"}}}, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			bot := &recordingBot{}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			dc := &bootingDaemon{
+				recordingDaemon: &recordingDaemon{},
+				stopAfter:       6,
+				stop:            cancel,
+				feedArriving:    c.feedArrives,
+			}
+			RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: 42}, nil, time.Millisecond)
+			if dc.policyCalls != c.wantReads {
+				t.Errorf("policy reads = %d, want %d", dc.policyCalls, c.wantReads)
+			}
+		})
+	}
+}
+
+func TestNextIdleDelay(t *testing.T) {
+	s := time.Second
+	cases := []struct{ cur, base, want time.Duration }{
+		{5 * s, 5 * s, 10 * s},
+		{10 * s, 5 * s, 20 * s},
+		{20 * s, 5 * s, 30 * s},
+		{30 * s, 5 * s, 30 * s},
+		{60 * s, 60 * s, 60 * s}, // configured interval above the cap wins
+		{time.Millisecond, time.Millisecond, 2 * time.Millisecond},
+		{5 * time.Millisecond, time.Millisecond, 6 * time.Millisecond},
+	}
+	for _, c := range cases {
+		if got := nextIdleDelay(c.cur, c.base); got != c.want {
+			t.Errorf("nextIdleDelay(%v, %v) = %v, want %v", c.cur, c.base, got, c.want)
+		}
+	}
+}
+
+func TestNextPollDelayProgression(t *testing.T) {
+	cases := []struct {
+		cur, base, want time.Duration
+	}{
+		{2 * time.Second, 2 * time.Second, 3 * time.Second},
+		{3 * time.Second, 2 * time.Second, 4500 * time.Millisecond},
+		{10 * time.Second, 2 * time.Second, 15 * time.Second},
+		{15 * time.Second, 2 * time.Second, 15 * time.Second},
+		{20 * time.Second, 20 * time.Second, 20 * time.Second},
+		{30 * time.Second, 20 * time.Second, 20 * time.Second},
+	}
+	for _, c := range cases {
+		if got := nextPollDelay(c.cur, c.base); got != c.want {
+			t.Errorf("nextPollDelay(%v, %v) = %v, want %v", c.cur, c.base, got, c.want)
+		}
+	}
+}
+
+func TestPollingKeepsItsTotalWaitBudget(t *testing.T) {
+	dc := &recordingDaemon{run: map[string]any{"status": "running"}}
+	var total time.Duration
+	var sleeps []time.Duration
+	got := pollTurnWith(dc, 1, 2*time.Second, 300, func(d time.Duration) {
+		total += d
+		sleeps = append(sleeps, d)
+	})
+	if !strings.Contains(got, "still running") {
+		t.Fatalf("pollTurnWith() = %q, want the still-running notice", got)
+	}
+	if total < 600*time.Second || total >= 600*time.Second+15*time.Second {
+		t.Errorf("total wait = %v, want the 600s budget (not shorter, not stretched)", total)
+	}
+	if sleeps[1] <= sleeps[0] || len(sleeps) >= 300 {
+		t.Errorf("sleeps = %d starting %v, want fewer polls with a growing delay", len(sleeps), sleeps[:2])
 	}
 }

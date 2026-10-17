@@ -99,31 +99,26 @@ pub(super) struct WaitingCount {
 /// the number.
 pub(super) async fn get_waiting_count(State(state): State<AppState>) -> Json<WaitingCount> {
     let pool = &state.pool;
+    // Counts, not lists: this is polled every few seconds by every page, and each list used to be
+    // materialised in full (joins, JSON, `output_tail`) only to take its length.
     let (wheel, approvals, team_actions, recruits, merges, exclusions, git) = tokio::join!(
-        crate::browser::open_sessions(pool),
-        crate::proposals::list_pending(pool),
-        crate::proposals::list_pending_team_actions(pool),
-        crate::proposals::list_pending_recruits(pool, None),
-        crate::integrations::contacts::pending_merges(pool),
-        crate::governance::exclusion::pending_requests(pool),
-        vcs::waiting_on_a_person(pool),
+        crate::browser::count_wheel_requests(pool),
+        crate::proposals::count_pending(pool),
+        crate::proposals::count_pending_team_actions(pool),
+        crate::proposals::count_pending_recruits(pool),
+        crate::integrations::contacts::count_pending_merges(pool),
+        crate::governance::exclusion::count_pending_requests(pool),
+        vcs::count_waiting_on_a_person(pool),
     );
     Json(WaitingCount {
         // The shell's `isWheelRequest`: an agent asked for the wheel and a proposal stands behind it.
-        wheel: wheel.ok().map(|sessions| {
-            sessions
-                .iter()
-                .filter(|session| {
-                    session.mode == "wheel-requested" && session.proposal_id.is_some()
-                })
-                .count()
-        }),
-        approvals: approvals.ok().map(|rows| rows.len()),
-        team_actions: team_actions.ok().map(|rows| rows.len()),
-        recruits: recruits.ok().map(|rows| rows.len()),
-        merges: merges.ok().map(|rows| rows.len()),
-        exclusions: exclusions.ok().map(|rows| rows.len()),
-        git: git.ok().map(|rows| rows.len()),
+        wheel: wheel.ok(),
+        approvals: approvals.ok(),
+        team_actions: team_actions.ok(),
+        recruits: recruits.ok(),
+        merges: merges.ok(),
+        exclusions: exclusions.ok(),
+        git: git.ok(),
     })
 }
 

@@ -160,6 +160,16 @@ pub async fn waiting_on_a_person(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<Re
     .fetch_all(pool)
     .await
 }
+/// How many requests `waiting_on_a_person` lists — the badge's number, read from the same two
+/// predicates and without the payload columns (`output_tail` can be large).
+pub async fn count_waiting_on_a_person(pool: &sqlx::SqlitePool) -> sqlx::Result<usize> {
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM vcs_requests WHERE ({WANTS_A_PERSON_SQL}) OR {OWNER_DECISION_SQL}"
+    )))
+    .fetch_one(pool)
+    .await?;
+    Ok(count as usize)
+}
 /// Marks an open `escalated`/`blocked` request as no longer wanting a person, and says why.
 ///
 /// The status is left alone: it is the history. Only the first settlement counts, so a row keeps
@@ -344,6 +354,7 @@ pub async fn approve_for_owner(pool: &sqlx::SqlitePool, id: i64) -> Result<(), D
     .bind(id)
     .execute(pool)
     .await?;
+    wake_worker();
     owner_decided(pool, id, approved.rows_affected()).await
 }
 /// The `failure_reason` `refuse_for_owner` records; the session hook matches on it to tell the

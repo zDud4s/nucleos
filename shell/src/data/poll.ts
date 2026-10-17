@@ -99,15 +99,33 @@ export function currentAttention(): Attention {
 }
 
 /**
+ * How often a window that is on screen but not focused refreshes what it shows.
+ *
+ * Not zero: a conversation left open beside an editor is still being watched, and an answer
+ * that stopped moving the moment somebody clicked elsewhere would read as a stuck turn. But it is
+ * a glance, not a stare, and the 1.5–3 s cadences the pages ask for are for the window somebody
+ * is working in.
+ */
+export const BLURRED_CADENCE = 10_000;
+
+/**
  * The cadence for a query that keeps polling in the background, slowed while the window is
- * hidden.
+ * blurred or hidden.
  *
  * Health, the kill switch, the credential check and the chat list keep going in the tray, each for
  * a reason written beside it — but none of those reasons needs three seconds. Coming back from the
  * tray refetches every stale query at once anyway (react-query's refetch on focus), so a hidden
  * window only has to notice a change eventually, and the window somebody returns to is current the
  * instant it is shown. React-query re-reads this after every fetch, which is when it switches.
+ *
+ * Blurred (visible, not focused) gets {@link BLURRED_CADENCE}: these queries opt out of the blurred
+ * sweep in `app/pacing.ts` (`refetchInterval` skips ticks only when hidden), so without this they
+ * would poll at the focused cadence all day beside an editor. Hidden is slower still.
  */
 export function backgroundCadence(visibleMs: number): () => number {
-  return () => (currentAttention() === "hidden" ? POLL.slow : visibleMs);
+  return () => {
+    const attention = currentAttention();
+    if (attention === "hidden") return POLL.slow;
+    return attention === "blurred" ? Math.max(visibleMs, BLURRED_CADENCE) : visibleMs;
+  };
 }
