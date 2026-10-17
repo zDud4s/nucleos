@@ -6334,6 +6334,53 @@ mod tests {
         );
     }
 
+    /// The refused action's input is served to the screen whole, so it is stored the way a shadow
+    /// row is: a credential in it redacted, a long text cut, the JSON shape kept.
+    #[tokio::test]
+    async fn a_refused_action_is_written_down_redacted_and_capped() {
+        let state = test_state().await;
+        let run_id = chat_bound_run(&state, "-1002003004:9").await;
+        let app = test_router(state.clone());
+        let token = format!("ghp_{}", "a".repeat(36));
+
+        orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": "https://stand.example/anuncio"}),
+        )
+        .await;
+        let prompt = format!(
+            "encomendar o Golf {token} {}",
+            "x".repeat(crate::governance::shadow::STORED_TEXT_CHARS * 2)
+        );
+        let act = orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": prompt}),
+        )
+        .await;
+
+        assert_eq!(act.decision, "deny");
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(refused.len(), 1);
+        let stored = refused[0]
+            .tool_input
+            .as_deref()
+            .expect("the input is stored");
+        assert!(!stored.contains(&token), "{stored}");
+        assert!(stored.contains("encomendar o Golf"), "{stored}");
+        assert!(
+            stored.chars().count() < crate::governance::shadow::STORED_TEXT_CHARS * 2,
+            "{}",
+            stored.len()
+        );
+        serde_json::from_str::<serde_json::Value>(stored).expect("still JSON");
+    }
+
     /// The record says what the turn was going to do; this says where the idea came from.
     ///
     /// Those are different questions and only the second one decides. "Send an email to accounts

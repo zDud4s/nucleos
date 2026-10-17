@@ -167,7 +167,12 @@ pub(super) async fn record_refused_action(
         session_id.as_deref(),
         tool,
         reason,
-        Some(&payload.tool_input.to_string()),
+        // Redacted and capped like a shadow row: this column is served to the screen whole, and a
+        // `refused-action` is never approved or replayed (only an `action-approval` is), so nothing
+        // needs the raw input back.
+        Some(&crate::governance::shadow::stored_tool_input(
+            &payload.tool_input,
+        )),
         read_from.as_deref(),
     )
     .await
