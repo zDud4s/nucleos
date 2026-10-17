@@ -22,7 +22,14 @@ pub(super) fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>
     let Some(file_path) = written_path(tool_input) else {
         return false;
     };
-    let normalized = fold_for_match(&normalize_path(file_path, cwd));
+    names_self_governing(file_path, cwd)
+}
+
+/// PURE: whether `path` is one of the files whose contents are the policy, or lies under one of
+/// the directories that are. The question `targets_self_governing_file` asks of a write tool's
+/// `file_path`, and `segment_names_self_governing` of each word of a shell command.
+pub(super) fn names_self_governing(path: &str, cwd: Option<&Path>) -> bool {
+    let normalized = fold_for_match(&normalize_path(path, cwd));
 
     SELF_GOVERNING_FILES
         .iter()
@@ -30,7 +37,62 @@ pub(super) fn targets_self_governing_file(tool_input: &Value, cwd: Option<&Path>
         || SELF_GOVERNING_DIRS
             .iter()
             .any(|dir| normalized.starts_with(dir) || normalized.contains(&format!("/{dir}")))
-        || names_machine_settings(file_path)
+        || names_machine_settings(path)
+}
+
+/// PURE: whether any word of one shell command names a self-governing file or directory. See
+/// [`names_self_governing`].
+///
+/// Asked before confinement widens a command, because confinement answers only "does this point
+/// inside the workspace", and `.claude/hooks/ask_daemon.py` is inside it: `cp ./x
+/// .claude/hooks/ask_daemon.py` was allowed for pointing nowhere else.
+///
+/// Every word is tried, not just the ones `confined_to_workspace` reads as paths, so a bare
+/// `nucleos.tests.yaml` counts. Each is read twice — with only its quotes dropped (a Windows `\`
+/// is a separator) and the way `flag_words` reads it (a POSIX `\` escapes) — and a word naming a
+/// DIRECTORY itself (`./.claude/hooks`) counts, because a copy into it lands underneath. A value
+/// is read on the right of an `=` and after a flag it is attached to, for the reasons
+/// `confined_to_workspace` gives. Every extra reading can only refuse more.
+pub(super) fn segment_names_self_governing(segment: &str, cwd: Option<&Path>) -> bool {
+    shell_words(segment)
+        .into_iter()
+        .chain(flag_words(segment))
+        .any(|word| {
+            let value = word
+                .split_once('=')
+                .map_or(word.as_str(), |(_, value)| value);
+            let value = if value.starts_with('-') {
+                match value.find(['/', '\\', '.']) {
+                    Some(start) => &value[start..],
+                    None => return false,
+                }
+            } else {
+                value
+            };
+            !value.is_empty()
+                && (names_self_governing(value, cwd) || is_a_self_governing_dir(value, cwd))
+        })
+}
+
+/// PURE: whether `path` IS a directory a self-governing file or directory sits in — `.claude`,
+/// `.claude/hooks`, `.ai`, `.agents/skills` — rather than something under one. A copy or a move
+/// into it lands the file underneath under its own name (`cp ./settings.json ./.claude`), and a
+/// move of it takes everything inside along.
+fn is_a_self_governing_dir(path: &str, cwd: Option<&Path>) -> bool {
+    let normalized = fold_for_match(&normalize_path(path, cwd));
+    let parents = SELF_GOVERNING_FILES
+        .iter()
+        .chain(SELF_GOVERNING_DIRS)
+        .flat_map(|entry| {
+            let entry = entry.trim_end_matches('/');
+            entry.match_indices('/').map(move |(end, _)| &entry[..end])
+        });
+    let dirs = SELF_GOVERNING_DIRS
+        .iter()
+        .map(|dir| dir.trim_end_matches('/'));
+    parents
+        .chain(dirs)
+        .any(|dir| path_has_suffix(&normalized, dir))
 }
 
 /// Spellings the shell or the editor turns into the home directory before the path is used.
