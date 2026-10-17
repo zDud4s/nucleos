@@ -51,6 +51,48 @@ pub struct ClassTally {
     pub disagree: i64,
 }
 
+/// How much of one stored text a `shadow_decisions` row keeps: each string inside `tool_input`, and
+/// the whole `tool_response`. The same 8 KiB as a git transport's `OUTPUT_TAIL_BYTES`, counted in
+/// characters so a cut never splits one. A `Read` of a large file or a `Write` of one used to land in
+/// this table whole, and every row is served to the review screen.
+pub const STORED_TEXT_CHARS: usize = 8 * 1024;
+
+/// The `tool_input` as a row stores it: every string inside it through the judge's redaction and
+/// cut to `STORED_TEXT_CHARS` (`[...]` marks a cut), the JSON shape kept.
+///
+/// String by string rather than over the serialized JSON, because `judge::state_with_note` parses
+/// this column back as JSON to show the judge a run's recent actions: a cut through the middle of
+/// the serialized text, or a redaction that swallowed a closing quote, would turn the column into
+/// `[unparseable]`. Deterministic, so `record_outcome` finds the row `record_decision` wrote by
+/// computing the same value.
+pub fn stored_tool_input(tool_input: &Value) -> String {
+    fn scrub(value: &Value) -> Value {
+        match value {
+            Value::String(text) => Value::String(crate::judge::trim_two_thirds(
+                &crate::judge::redact_for_judge(text),
+                STORED_TEXT_CHARS,
+            )),
+            Value::Array(items) => Value::Array(items.iter().map(scrub).collect()),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), scrub(value)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    scrub(tool_input).to_string()
+}
+
+/// The `tool_response` as a row stores it: redacted, then cut to `STORED_TEXT_CHARS` with `[...]`
+/// where the middle went. Nothing parses the `outcome` column back, so the cut is over the text.
+pub fn stored_tool_response(tool_response: &Value) -> String {
+    crate::judge::trim_two_thirds(
+        &crate::judge::redact_for_judge(&tool_response.to_string()),
+        STORED_TEXT_CHARS,
+    )
+}
+
 /// Records what the classifier WOULD have done, and under which code and which configuration.
 ///
 /// **Two identifiers and not one, and they mean different things.** `classifier_version` is the
@@ -84,7 +126,7 @@ pub async fn record_decision(
     )
     .bind(run_id)
     .bind(tool_name)
-    .bind(tool_input.to_string())
+    .bind(stored_tool_input(tool_input))
     .bind(&classification.decision.decision)
     .bind(&classification.reason)
     .bind(classification.action_class)
@@ -135,12 +177,12 @@ pub async fn record_outcome(
              ORDER BY id ASC LIMIT 1
          )",
     )
-    .bind(tool_response.to_string())
+    .bind(stored_tool_response(tool_response))
     .bind(outcome_at)
     .bind(outcome_event)
     .bind(run_id)
     .bind(tool_name)
-    .bind(tool_input.to_string())
+    .bind(stored_tool_input(tool_input))
     .execute(pool)
     .await?;
 
@@ -572,6 +614,63 @@ mod tests {
         assert_eq!(row.outcome, None);
         assert_eq!(row.outcome_at, None);
         assert_eq!(row.outcome_event, None);
+    }
+
+    /// Every row is served to the review screen, so a secret on the command line or in what the
+    /// tool printed is redacted before it is stored, a huge response is cut with a marker, and the
+    /// input stays JSON the judge can parse back. The outcome still lands on its own decision:
+    /// both halves store the input the same way.
+    #[tokio::test]
+    async fn a_stored_decision_is_redacted_and_capped() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let token = format!("ghp_{}", "a".repeat(36));
+        let tool_input =
+            json!({"command": format!("export GITHUB_TOKEN=\"ghsecret1\"; echo {token}")});
+
+        let id = record_decision(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &classification("allow", "read-local"),
+            "digest",
+        )
+        .await
+        .unwrap();
+        let tool_response = json!({
+            "stdout": format!("{token}\n{}", "x".repeat(STORED_TEXT_CHARS * 4)),
+            "exit_code": 0
+        });
+        record_outcome(
+            &pool,
+            run_id,
+            "Bash",
+            &tool_input,
+            &tool_response,
+            "PostToolUse",
+        )
+        .await
+        .unwrap();
+
+        let row: ShadowDecision = sqlx::query_as("SELECT * FROM shadow_decisions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let input = row.tool_input.expect("the input is stored");
+        assert!(!input.contains(&token), "{input}");
+        assert!(!input.contains("ghsecret1"), "{input}");
+        serde_json::from_str::<Value>(&input).expect("the stored input is still JSON");
+
+        let outcome = row.outcome.expect("the outcome landed on its own decision");
+        assert!(!outcome.contains(&token), "{outcome}");
+        assert!(
+            outcome.chars().count() <= STORED_TEXT_CHARS,
+            "{}",
+            outcome.len()
+        );
+        assert!(outcome.contains("[...]"), "a cut is marked");
     }
 
     /// The ledger's whole point: one `Bash` call, its decision AND its outcome, on the same row.
