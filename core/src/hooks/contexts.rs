@@ -57,7 +57,14 @@ pub(super) async fn assistant_decision(
                 &state.pool,
                 payload.run_id,
                 tool,
-                Some(&payload.tool_input.to_string()),
+                // Redacted like the refused action's input below: this text is copied onto a
+                // proposal and served to the screen, and a `web_read`/`browser_open` url can carry
+                // a token in its query. Nothing matches on it - the only reader,
+                // `untrusted_reads_json`, passes it through for a person to read - and the url's
+                // host and path survive the redaction, which is the part that decides.
+                Some(&crate::governance::shadow::stored_tool_input(
+                    &payload.tool_input,
+                )),
             )
             .await
             {

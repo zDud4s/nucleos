@@ -807,6 +807,25 @@ mod tests {
         assert!(policy.read_is_autonomous("gh pr list -l bug"));
     }
 
+    /// pflag also bundles short flags: `-dL5` is `--draft --limit 5`, so a refused letter behind a
+    /// valueless one is still that flag. Behind a flag that takes a value it is part of the value.
+    #[test]
+    fn a_short_flag_bundled_behind_another_is_still_that_flag() {
+        let policy = policy_from(Some("autonomous_reads:\n  - gh pr list\n"));
+        for command in [
+            "gh pr list -dL5",
+            "gh pr list -dqEXPR",
+            "gh pr list -wt{{.body}}",
+        ] {
+            assert!(
+                !policy.read_is_autonomous(command),
+                "{command} should have lost its autonomy"
+            );
+        }
+        assert!(policy.read_is_autonomous("gh pr list -lLabel"));
+        assert!(policy.read_is_autonomous("gh pr list -d"));
+    }
+
     /// `-L` is `--limit` and `-l` is `--label`. Folding the comparison to one case would either
     /// miss the first or refuse the second, which is why the raw command is what gets read.
     #[test]

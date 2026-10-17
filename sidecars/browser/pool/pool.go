@@ -94,6 +94,10 @@ var ErrTooManySessions = browser.ErrTooManySessions
 // changed while a session on that profile was still open.
 var ErrPolicyChanged = errors.New("pool: the site list changed while a session on this profile was open")
 
+// ErrForgotten means the profile was forgotten (or the pool shut down) while an open on it was still
+// in flight. The open closes what it started and reports this; nothing is left registered.
+var ErrForgotten = errors.New("pool: the profile was forgotten while a session was opening on it")
+
 // Pool routes sessions to browsers. Its zero value is not usable; see New.
 type Pool struct {
 	launcher Launcher
@@ -222,6 +226,14 @@ func (p *Pool) Open(ctx context.Context, req browser.OpenRequest) (browser.Sessi
 
 	p.mu.Lock()
 	holder.opening--
+	if p.running[holder.ref] != holder {
+		// Forgotten (or shut down) while this navigation was in flight: Forget already took the
+		// entry out of the map and stopped the browser, so a session registered now would point at
+		// a dead driver and an entry nobody owns. The forget wins.
+		p.mu.Unlock()
+		_ = holder.driver.Close(ctx, session.ID)
+		return browser.Session{}, fmt.Errorf("%w: %s", ErrForgotten, req.Placement.Profile)
+	}
 	if holder.person {
 		// A person took the browser while this navigation was in flight, and the fence is down for
 		// as long as they drive: this session must not exist.

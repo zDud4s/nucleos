@@ -516,6 +516,79 @@ fn removes_a_basetemp(tokens: &[&str]) -> bool {
     })
 }
 
+/// pytest's long options (its own and pytest-html's, pytest-reportlog's, pytest-json-report's)
+/// whose value is a FILE it writes: the JUnit XML, the result log, the report log, the HTML report
+/// and the JSON report.
+const PYTEST_FILE_FLAGS: &[&str] = &[
+    "junitxml",
+    "junit-xml",
+    "resultlog",
+    "report-log",
+    "html",
+    "json-report-file",
+];
+
+/// Long options that are a prefix of one of `PYTEST_FILE_FLAGS` and are complete options of their
+/// own, taking no path: argparse matches an exact name before it expands a prefix, so
+/// `--json-report` is the switch that turns the JSON report on and not `--json-report-file`.
+const PYTEST_SWITCHES_SHARING_A_PREFIX: &[&str] = &["json-report"];
+
+/// `pytest-cov` report types whose `--cov-report=<type>:<dest>` form names a file or directory it
+/// writes. The bare type writes to a default inside the run's directory (`coverage.xml`,
+/// `htmlcov/`), and `term`/`term-missing` take a modifier after the colon (`:skip-covered`), not a
+/// path.
+const COV_REPORT_TYPES_WITH_A_PATH: &[&str] = &[
+    "xml",
+    "html",
+    "json",
+    "lcov",
+    "annotate",
+    "markdown",
+    "markdown-append",
+];
+
+/// PURE: whether a pytest argument list names a report file (`--junitxml`, `--resultlog`,
+/// `--report-log`, `--html`, `--json-report-file`, or a `--cov-report=<type>:<path>`) whose path is
+/// not a relative one that stays inside the workspace.
+///
+/// The sibling of `removes_a_basetemp`, read the same way: attached or apart, and an unambiguous
+/// prefix argparse would expand. These WRITE rather than delete, so `-coverprofile`'s rule is the
+/// one that applies — `--junitxml=reports/j.xml` is ordinary, `--junitxml=/c/Users/x/j.xml` writes
+/// outside the workspace with no containment guard seeing it, because those read a tool call's
+/// `file_path` and a shell command has none.
+fn writes_a_report_outside_the_workspace(tokens: &[&str]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        token.strip_prefix("--").is_some_and(|long| {
+            let name = token_name(long);
+            if name.len() < 4 || PYTEST_SWITCHES_SHARING_A_PREFIX.contains(&name) {
+                return false;
+            }
+            if PYTEST_FILE_FLAGS.iter().any(|flag| flag.starts_with(name)) {
+                return flag_value_leaves_the_workspace(tokens, index);
+            }
+            if "cov-report".starts_with(name) {
+                let value = match token.split_once('=') {
+                    Some((_, value)) => Some(value),
+                    None => tokens.get(index + 1).copied(),
+                };
+                return value.and_then(|value| value.split_once(':')).is_some_and(
+                    |(kind, path)| {
+                        COV_REPORT_TYPES_WITH_A_PATH.contains(&kind)
+                            && !relative_path_stays_inside(path)
+                    },
+                );
+            }
+            false
+        })
+    })
+}
+
+/// PURE: whether a pytest argument list carries a flag that deletes or writes a path outside the
+/// workspace. See `removes_a_basetemp` and `writes_a_report_outside_the_workspace`.
+fn pytest_reaches_outside(tokens: &[&str]) -> bool {
+    removes_a_basetemp(tokens) || writes_a_report_outside_the_workspace(tokens)
+}
+
 /// PURE: a long option's name without its attached `=value`.
 pub(super) fn token_name(token: &str) -> &str {
     token.split_once('=').map_or(token, |(name, _)| name)
@@ -580,13 +653,15 @@ pub(super) fn uses_a_flag_its_program_makes_dangerous(command: &str) -> bool {
         // delete of whatever it names: `--basetemp=.` empties the workspace, an absolute value
         // anywhere else. Refused unless the value is a directory strictly inside the workspace
         // (`--basetemp=tmp`), in every spelling that reaches pytest — including the module form,
-        // whose program is the interpreter.
-        "pytest" | "py.test" => removes_a_basetemp(&tokens.collect::<Vec<_>>()),
+        // whose program is the interpreter. Its report flags (`--junitxml`, `--html`, a
+        // `--cov-report=xml:<path>`, ...) write a file where their value points, and follow
+        // `-coverprofile`'s rule instead: a relative path inside the workspace passes.
+        "pytest" | "py.test" => pytest_reaches_outside(&tokens.collect::<Vec<_>>()),
         "python" | "python3" | "py" => {
             let rest: Vec<&str> = tokens.collect();
             let runs_pytest =
                 rest.windows(2).any(|pair| pair == ["-m", "pytest"]) || rest.contains(&"-mpytest");
-            runs_pytest && removes_a_basetemp(&rest)
+            runs_pytest && pytest_reaches_outside(&rest)
         }
         // `sort` is GNU: short options cluster and take their value attached (`-o~/.bashrc`,
         // `-no out`), and a long option may be any unambiguous prefix (`--out=x`, `--o x`). So
