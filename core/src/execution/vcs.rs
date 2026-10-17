@@ -5132,6 +5132,21 @@ mod tests {
         assert!(!ids.contains(&queued));
     }
 
+    #[tokio::test]
+    async fn the_waiting_count_matches_the_waiting_list() {
+        let pool = test_pool().await;
+        paused_row(&pool, "feat/p", "abc").await;
+        row_in_status(&pool, "alpha", "feat/e", "escalated").await;
+        row_in_status(&pool, "alpha", "feat/b", "blocked").await;
+        let settled = row_in_status(&pool, "alpha", "feat/s", "escalated").await;
+        row_in_status(&pool, "alpha", "feat/q", "queued").await;
+        row_in_status(&pool, "alpha", "feat/ok", "succeeded").await;
+        assert!(settle(&pool, settled, "merged").await.unwrap());
+        let listed = waiting_on_a_person(&pool).await.unwrap().len();
+        assert_eq!(listed, 3);
+        assert_eq!(count_waiting_on_a_person(&pool).await.unwrap(), listed);
+    }
+
     #[test]
     fn a_pause_for_the_owner_is_its_own_status() {
         let outcome = Outcome::AwaitingOwner {

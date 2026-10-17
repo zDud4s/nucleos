@@ -700,6 +700,28 @@ async fn merge_side(pool: &SqlitePool, contact_id: i64) -> sqlx::Result<MergeSid
     })
 }
 
+/// How many merges `pending_merges` would list — the badge's number.
+///
+/// Reads only the payload, not the two contacts' addresses and counts the list resolves for each
+/// row, and applies the one filter the list applies in Rust: a payload that no longer parses is not
+/// a suggestion. The SQL predicate is the list's own, repeated here because that query also selects
+/// the columns the list needs.
+pub async fn count_pending_merges(pool: &SqlitePool) -> sqlx::Result<usize> {
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT tool_input
+           FROM proposals
+          WHERE kind = 'contact-merge'
+            AND status = 'pending'
+            AND tool_input IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(payloads
+        .iter()
+        .filter(|payload| contact_merge_pair(payload).is_ok())
+        .count())
+}
+
 /// Every merge the heuristic has suggested and nobody has answered.
 ///
 /// Kept out of `proposals::list_pending`, which stays action approvals only. The two kinds share a
@@ -1980,5 +2002,34 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(proposal_count, 0);
+    }
+
+    #[tokio::test]
+    async fn the_merge_count_matches_the_pending_list() {
+        let pool = test_pool().await;
+        for (kind, status, input) in [
+            ("contact-merge", "pending", Some(r#"{"keep_id":1,"absorb_id":2}"#)),
+            ("contact-merge", "pending", Some(r#"{"keep_id":3,"absorb_id":4}"#)),
+            // Unreadable payload, same ids, no payload, decided, another kind: none is a suggestion.
+            ("contact-merge", "pending", Some("not json")),
+            ("contact-merge", "pending", Some(r#"{"keep_id":5,"absorb_id":5}"#)),
+            ("contact-merge", "pending", None),
+            ("contact-merge", "approved", Some(r#"{"keep_id":6,"absorb_id":7}"#)),
+            ("action-approval", "pending", Some(r#"{"keep_id":8,"absorb_id":9}"#)),
+        ] {
+            sqlx::query(
+                "INSERT INTO proposals (kind, status, tool_name, reasoning, tool_input, created_at)
+                 VALUES (?, ?, 't', 'r', ?, '2026-08-15T00:00:00Z')",
+            )
+            .bind(kind)
+            .bind(status)
+            .bind(input)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let listed = pending_merges(&pool).await.unwrap().len();
+        assert_eq!(listed, 2);
+        assert_eq!(count_pending_merges(&pool).await.unwrap(), listed);
     }
 }

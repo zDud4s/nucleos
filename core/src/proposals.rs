@@ -623,12 +623,28 @@ pub async fn recruit_pending_for(pool: &SqlitePool, slug: &str) -> sqlx::Result<
     Ok(found.is_some())
 }
 
+/// What makes a proposal a recruitment still waiting. The list and `count_pending_recruits` both
+/// read it, so the badge and the page cannot disagree about what is open.
+const PENDING_RECRUIT_WHERE: &str = "p.status = 'pending' AND p.kind = 'agent-recruit'";
+
+/// How many recruitments are waiting — the badge's number, without the joins or the columns.
+///
+/// The list's joins are all LEFT onto primary keys, so they neither filter nor multiply rows.
+pub async fn count_pending_recruits(pool: &SqlitePool) -> sqlx::Result<usize> {
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM proposals p WHERE {PENDING_RECRUIT_WHERE}"
+    )))
+    .fetch_one(pool)
+    .await?;
+    Ok(count as usize)
+}
+
 /// Every recruitment still waiting, and — for a director's prompt — the ones from one run.
 pub async fn list_pending_recruits(
     pool: &SqlitePool,
     team_run_id: Option<&str>,
 ) -> sqlx::Result<Vec<Proposal>> {
-    let rows = sqlx::query_as::<_, Proposal>(
+    let rows = sqlx::query_as::<_, Proposal>(sqlx::AssertSqlSafe(format!(
         // The team run is named inside the payload, so the join reads it out of the JSON. The
         // director is who asks for a recruit; a pruned run or team leaves the context NULL.
         "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.tool_name,
@@ -641,9 +657,9 @@ pub async fn list_pending_recruits(
          LEFT JOIN team_runs tr ON tr.id = json_extract(p.tool_input, '$.team_run_id')
          LEFT JOIN teams t ON t.id = tr.team_id
          LEFT JOIN agents d ON d.id = t.director_agent_id
-         WHERE p.status = 'pending' AND p.kind = 'agent-recruit'
-         ORDER BY p.id ASC",
-    )
+         WHERE {PENDING_RECRUIT_WHERE}
+         ORDER BY p.id ASC"
+    )))
     .fetch_all(pool)
     .await?;
     let Some(team_run_id) = team_run_id else {
@@ -677,7 +693,7 @@ pub async fn list_pending_recruits(
 /// work stopped mid-stride that `approve` lets through; this is work that will START when approved,
 /// and the run that asked has usually finished by then.
 pub async fn list_pending_team_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
-    sqlx::query_as::<_, Proposal>(
+    sqlx::query_as::<_, Proposal>(sqlx::AssertSqlSafe(format!(
         // Who asked lives on `team_actions`, not on the proposal: a NULL ordinal is the director,
         // anything else is the specialist working that item.
         "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.tool_name,
@@ -695,11 +711,30 @@ pub async fn list_pending_team_actions(pool: &SqlitePool) -> sqlx::Result<Vec<Pr
          LEFT JOIN agents d ON d.id = t.director_agent_id
          LEFT JOIN team_items i ON i.team_run_id = a.team_run_id AND i.ordinal = a.ordinal
          LEFT JOIN agents g ON g.id = i.agent_id
-         WHERE p.status = 'pending' AND p.kind = 'team-action'
-         ORDER BY p.id ASC",
-    )
+         WHERE {PENDING_TEAM_ACTION_WHERE}
+         ORDER BY p.id ASC"
+    )))
     .fetch_all(pool)
     .await
+}
+
+/// What makes a proposal a department action still waiting; shared with `count_pending_team_actions`.
+const PENDING_TEAM_ACTION_WHERE: &str = "p.status = 'pending' AND p.kind = 'team-action'";
+
+/// How many department actions are waiting — the badge's number.
+///
+/// `team_actions.proposal_id` is not unique, so the list's LEFT JOIN onto it can repeat a proposal
+/// and the list's length counts that repeat; this keeps that one join so the two agree. The other
+/// joins land on primary keys and neither filter nor multiply rows.
+pub async fn count_pending_team_actions(pool: &SqlitePool) -> sqlx::Result<usize> {
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM proposals p
+         LEFT JOIN team_actions a ON a.proposal_id = p.id
+         WHERE {PENDING_TEAM_ACTION_WHERE}"
+    )))
+    .fetch_one(pool)
+    .await?;
+    Ok(count as usize)
 }
 
 /// Whether a message already has a calendar proposal waiting on a decision.
@@ -731,8 +766,22 @@ pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Proposal>> {
     .await
 }
 
+/// What makes a proposal an approval still waiting; shared with `count_pending`.
+const PENDING_APPROVAL_WHERE: &str = "p.status = 'pending' AND p.kind = 'action-approval'";
+
+/// How many approvals are waiting — the badge's number. The list's only join is a LEFT onto
+/// `runs` by primary key, so it neither filters nor multiplies rows, and the JSON work is skipped.
+pub async fn count_pending(pool: &SqlitePool) -> sqlx::Result<usize> {
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM proposals p WHERE {PENDING_APPROVAL_WHERE}"
+    )))
+    .fetch_one(pool)
+    .await?;
+    Ok(count as usize)
+}
+
 pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
-    sqlx::query_as::<_, Proposal>(
+    sqlx::query_as::<_, Proposal>(sqlx::AssertSqlSafe(format!(
         // LEFT so a pruned run still lists. The prompt is cut to its opening, which is where a
         // task says what it is; the steps are the last few, each detail cut to a line or two.
         "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.tool_name,
@@ -750,9 +799,9 @@ pub async fn list_pending(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>> {
                 ) END AS run_recent
          FROM proposals p
          LEFT JOIN runs r ON r.id = p.run_id
-         WHERE p.status = 'pending' AND p.kind = 'action-approval'
-         ORDER BY p.id ASC",
-    )
+         WHERE {PENDING_APPROVAL_WHERE}
+         ORDER BY p.id ASC"
+    )))
     .fetch_all(pool)
     .await
 }
@@ -2258,5 +2307,65 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    async fn raw_proposal(pool: &sqlx::SqlitePool, kind: &str, status: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO proposals (kind, status, tool_name, reasoning, tool_input, created_at)
+             VALUES (?, ?, 't', 'r', '{}', '2026-10-10T00:00:00Z')",
+        )
+        .bind(kind)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// The badge counts must equal the lengths of the lists they stand in for, including with rows
+    /// the lists leave out (other kinds, already decided) and a proposal whose run is gone.
+    #[tokio::test]
+    async fn the_waiting_counts_match_the_pending_lists() {
+        let pool = test_pool().await;
+        parked_run(&pool, "awaiting_approval").await;
+        let (_, decided) = parked_run(&pool, "awaiting_approval").await;
+        reject_proposal(&pool, decided).await.unwrap();
+        raw_proposal(&pool, "action-approval", "pending").await; // no run behind it
+        raw_proposal(&pool, "skipped-item", "pending").await;
+        raw_proposal(&pool, "agent-recruit", "pending").await;
+        raw_proposal(&pool, "agent-recruit", "pending").await;
+        raw_proposal(&pool, "agent-recruit", "rejected").await;
+        raw_proposal(&pool, "team-action", "approved").await;
+        seed_department(&pool).await;
+        team_action(&pool, None).await;
+        team_action(&pool, Some(4)).await;
+        // The same proposal answered by two action rows: the list repeats it, so the count must too.
+        let repeated: i64 = sqlx::query_scalar(
+            "SELECT proposal_id FROM team_actions ORDER BY id LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO team_actions
+               (team_run_id, ordinal, kind, payload, why, proposal_id, state, created_at)
+             VALUES ('tr-1', NULL, 'send_email', '{}', 'why', ?, 'pending', '2026-10-10T00:00:00Z')",
+        )
+        .bind(repeated)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let approvals = list_pending(&pool).await.unwrap().len();
+        assert_eq!(approvals, 2);
+        assert_eq!(count_pending(&pool).await.unwrap(), approvals);
+
+        let actions = list_pending_team_actions(&pool).await.unwrap().len();
+        assert_eq!(actions, 3);
+        assert_eq!(count_pending_team_actions(&pool).await.unwrap(), actions);
+
+        let recruits = list_pending_recruits(&pool, None).await.unwrap().len();
+        assert_eq!(recruits, 2);
+        assert_eq!(count_pending_recruits(&pool).await.unwrap(), recruits);
     }
 }
