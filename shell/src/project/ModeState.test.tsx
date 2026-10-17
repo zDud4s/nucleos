@@ -253,7 +253,7 @@ describe("the readings", () => {
     fireEvent.click(link);
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/projects/nucleos/analytics"));
-    expect(await screen.findByRole("region", { name: "Cost and tokens" })).toBeTruthy();
+    expect(await screen.findByRole("region", { name: "Spend per day" })).toBeTruthy();
   });
 
   it("a refused read says so once, rather than four em dashes that look like four answers", async () => {

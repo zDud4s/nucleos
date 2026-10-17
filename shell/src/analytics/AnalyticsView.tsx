@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
   DEFAULT_DAYS,
@@ -10,18 +10,21 @@ import {
   type QuotaHistory,
 } from "../data/analytics";
 import { ErrorNote, StaleNote, StatCard } from "../ui";
-import { CostSection, DeliveredSection, QuotaSection, ThroughputSection, TopRunsSection } from "./sections";
+import { DetailPanel, MetricCard, QuotaSection, TopRunsSection, metrics, type MetricKey } from "./sections";
 import "./analytics.css";
 
 /**
  * Trends, for the whole machine or one project (spec analytics-fundacao §9).
  *
  * One component in two places: the `/analytics` page (global, window in `?days=`) and a project's
- * Analytics mode (`projectId` set, window in local state). Global stacks cost by project and adds
- * quota; a project stacks by mode and has no quota (§9.8).
+ * Analytics mode (`projectId` set, window in local state). Global breaks cost down by project and
+ * adds quota; a project breaks it down by mode and has no quota (§9.8).
  *
  * The window is controlled when `days` and `onDaysChange` are passed (the page) and local otherwise
  * (the Workspace mode).
+ *
+ * Numbers first: four metric cards, each a button that opens its chart in the one detail panel
+ * under them (spend by default, and always exactly one), then the costliest sessions and quota.
  */
 
 export interface AnalyticsViewProps {
@@ -30,7 +33,10 @@ export interface AnalyticsViewProps {
   onDaysChange?: (days: AnalyticsDays) => void;
 }
 
-/** §9.6, fixed at the top. The totals here and the autonomy ceiling's are built differently, on purpose. */
+/**
+ * §9.6. The totals here and the autonomy ceiling's are built differently, on purpose. Behind the
+ * "About these numbers" disclosure beside the range, rather than a paragraph over the numbers.
+ */
 const COVERAGE =
   "Every run counts here, in every mode. The global autonomy ceiling counts only some modes, so these totals can be higher than its. Run cost is dated by when a run finished; the ceiling dates it by when it started. The judge's cost is included as its own part, dated by its verdict.";
 
@@ -41,6 +47,8 @@ function clockOf(at: number): string {
 
 export function AnalyticsView({ projectId, days: asked, onDaysChange }: AnalyticsViewProps) {
   const [local, setLocal] = useState<AnalyticsDays>(DEFAULT_DAYS);
+  // Kept across a window change and a refetch: switching 30 to 7 days keeps the chart being read.
+  const [open, setOpen] = useState<MetricKey>("cost");
   const days = asked ?? local;
   const choose = onDaysChange ?? setLocal;
   const global = projectId === undefined;
@@ -66,13 +74,20 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange }: Analytic
             </button>
           ))}
         </div>
-        <p className="an-head-note">
-          {data === undefined
-            ? "days in UTC"
-            : `${data.window.from} to ${data.window.to}, days in UTC · read at ${clockOf(report.dataUpdatedAt)}`}
-        </p>
+        <div className="an-range">
+          <p className="an-head-note">
+            {data === undefined
+              ? "days in UTC"
+              : `${data.window.from} to ${data.window.to}, days in UTC · read at ${clockOf(report.dataUpdatedAt)}`}
+          </p>
+          {data === undefined || data.counted.modes === "all" ? (
+            <details className="an-about">
+              <summary className="an-about-toggle">About these numbers</summary>
+              <p className="an-about-text">{COVERAGE}</p>
+            </details>
+          ) : null}
+        </div>
       </div>
-      {data === undefined || data.counted.modes === "all" ? <p className="an-coverage">{COVERAGE}</p> : null}
       <Readout
         data={data}
         failed={report.isError}
@@ -82,6 +97,8 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange }: Analytic
         quota={quota.data}
         quotaFailed={quota.isError}
         quotaUpdatedAt={quota.dataUpdatedAt}
+        open={open}
+        onOpen={setOpen}
       />
     </div>
   );
@@ -101,10 +118,13 @@ interface ReadoutProps {
   quota: QuotaHistory | undefined;
   quotaFailed: boolean;
   quotaUpdatedAt: number;
+  open: MetricKey;
+  onOpen: (metric: MetricKey) => void;
 }
 
 /** Absent, refused, stale and read are four different answers (§9.7), and never render as one. */
-function Readout({ data, failed, missing, updatedAt, global, quota, quotaFailed, quotaUpdatedAt }: ReadoutProps) {
+function Readout({ data, failed, missing, updatedAt, global, quota, quotaFailed, quotaUpdatedAt, open, onOpen }: ReadoutProps) {
+  const panelId = `an-detail-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
   if (data === undefined) {
     if (missing) return <Absent label="Analytics" why="No project by that name." />;
     if (failed) return <ErrorNote>The núcleo did not answer for analytics.</ErrorNote>;
@@ -113,11 +133,30 @@ function Readout({ data, failed, missing, updatedAt, global, quota, quotaFailed,
   return (
     <>
       {failed ? <StaleNote dataUpdatedAt={updatedAt} /> : null}
-      <CostSection report={data} />
-      <ThroughputSection report={data} />
-      <DeliveredSection report={data} />
-      <TopRunsSection report={data} />
-      {global ? <QuotaSection report={data} history={quota} failed={quotaFailed} staleSince={quota !== undefined && quotaFailed ? quotaUpdatedAt : undefined} /> : null}
+      <div className="an-metrics">
+        {metrics(data).map((metric) => (
+          <MetricCard
+            key={metric.key}
+            metric={metric}
+            open={metric.key === open}
+            controls={panelId}
+            // Clicking the open card keeps it open: there is no "none", so the page never loses its chart.
+            onOpen={() => onOpen(metric.key)}
+          />
+        ))}
+      </div>
+      <DetailPanel id={panelId} report={data} metric={open} />
+      <div className={global ? "an-lower an-lower-split" : "an-lower"}>
+        <TopRunsSection report={data} />
+        {global ? (
+          <QuotaSection
+            report={data}
+            history={quota}
+            failed={quotaFailed}
+            staleSince={quota !== undefined && quotaFailed ? quotaUpdatedAt : undefined}
+          />
+        ) : null}
+      </div>
     </>
   );
 }

@@ -39,7 +39,7 @@ describe("forced colors", () => {
     expect(block).toContain(".ui-chart-swatch");
     expect(block).toContain(".ui-chart-svg");
     expect(block).toContain("forced-color-adjust: none");
-    expect(block).toContain(".ui-bar");
+    expect(block).toContain(".ui-share-seg");
     expect(block).toContain(".ui-chart-tick-label");
   });
 

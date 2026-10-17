@@ -2248,9 +2248,9 @@ ol.ui-well {
 /* ----------------------------------------------------------------- charts -- */
 
 /*
-  `BarChart` and `StepLine`. Colour reaches a mark through ONE custom property, `--series`, set by
-  a series class and read by the mark: a bar fills with it, a line strokes with it, a legend swatch
-  paints its background with it. One class per series therefore colours all three, and no colour
+  `StepLine`, `AreaChart` and `ShareBar`. Colour reaches a mark through ONE custom property,
+  `--series`, set by a series class and read by the mark: a share segment fills with it, a line
+  strokes with it, a legend swatch paints its background with it. One class per series therefore colours all three, and no colour
   is ever written inline — `style=` is what the CSP gate refuses.
 */
 .ui-chart {
@@ -2309,18 +2309,6 @@ ol.ui-well {
   height: 0.625rem;
   border-radius: var(--radius-sm);
   background-color: var(--series, var(--border-strong));
-}
-
-.ui-bar {
-  fill: var(--series, var(--border-strong));
-}
-
-/* Today, which is not over: same colour, hollowed and dashed, so it never reads as a whole day. */
-.ui-bar-partial .ui-bar {
-  fill-opacity: 0.45;
-  stroke: var(--text-muted);
-  stroke-width: 1px;
-  stroke-dasharray: 2 2;
 }
 
 .ui-step-line {
@@ -3578,11 +3566,6 @@ ol.ui-well {
 
   .ui-chart-swatch {
     border: 1px solid CanvasText;
-  }
-
-  .ui-bar {
-    stroke: Canvas;
-    stroke-width: 1px;
   }
 
   .ui-chart-tick-label {

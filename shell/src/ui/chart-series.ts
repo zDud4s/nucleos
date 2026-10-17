@@ -1,9 +1,10 @@
 /**
  * The vocabulary every day-by-day chart shares: a day, its parts, and the keys that name them.
  *
- * Lifted out of `BarChart` so `AreaChart` and `ShareBar` speak the same types and, above all, pick
- * the same colour for the same key. `seriesClass` is the one place that decides it: a chart's
- * tooltip swatch and the share bar under it agree because they call this with the same keys.
+ * Lifted out of the old stacked `BarChart` so `AreaChart` and `ShareBar` speak the same types
+ * and, above all, pick the same colour for the same key. `seriesClass` is the one place that
+ * decides it: a chart's tooltip swatch and the share bar under it agree because they call this
+ * with the same keys.
  */
 
 export interface ChartPart {
@@ -16,7 +17,7 @@ export interface ChartDatum {
   day: string;
   /** Parts in any order; missing keys are zero. */
   parts: ChartPart[];
-  /** Today, not over yet: drawn as such (hollow bar, dashed segment) and titled as such. */
+  /** Today, not over yet: drawn as such (a dashed segment) and titled as such. */
   partial?: boolean;
 }
 

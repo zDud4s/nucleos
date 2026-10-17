@@ -7,10 +7,14 @@ import {
   costBars,
   costKeys,
   gateBars,
+  gateShares,
   passRate,
   quotaSeries,
+  runningTotal,
+  tokenShares,
   totalTokens,
   versus,
+  windowShares,
 } from "./series";
 
 const zeroCost = { measured_usd: 0, estimated_usd: 0, judge_usd: 0, runs: 0, estimated_runs: 0 };
@@ -161,6 +165,75 @@ describe("quotaSeries", () => {
         label: "anthropic 5h (derived)",
         points: [{ at: Date.parse("2026-10-12T10:00:00Z"), value: 0.41, stale: true }],
       },
+    ]);
+  });
+});
+
+describe("runningTotal", () => {
+  it("adds each day to the days before it, under one key, and keeps today partial", () => {
+    const days = [
+      { day: "2026-10-15", partial: false, parts: [{ key: "landed", value: 1 }] },
+      { day: "2026-10-16", partial: false, parts: [{ key: "landed", value: 0 }] },
+      { day: "2026-10-17", partial: true, parts: [{ key: "landed", value: 2 }] },
+    ];
+    expect(runningTotal(days, "landed")).toEqual([
+      { day: "2026-10-15", partial: false, parts: [{ key: "landed", value: 1 }] },
+      { day: "2026-10-16", partial: false, parts: [{ key: "landed", value: 1 }] },
+      { day: "2026-10-17", partial: true, parts: [{ key: "landed", value: 3 }] },
+    ]);
+  });
+
+  it("sums every part of a day, and leaves partial out when the day never said", () => {
+    const days = [{ day: "2026-10-17", parts: [{ key: "a", value: 1 }, { key: "b", value: 2 }] }];
+    expect(runningTotal(days, "landed")).toEqual([{ day: "2026-10-17", parts: [{ key: "landed", value: 3 }] }]);
+  });
+});
+
+describe("windowShares", () => {
+  it("totals each key over the window, in key order, carrying each key's own class", () => {
+    const keys = [
+      { key: "nucleos", label: "nucleos" },
+      { key: "judge", label: "Judge", className: "ui-chart-judge" },
+      { key: ESTIMATED_KEY, label: "Estimated from run time", className: "ui-chart-estimated" },
+    ];
+    const data = [
+      { day: "2026-10-16", parts: [{ key: "nucleos", value: 1 }, { key: ESTIMATED_KEY, value: 0.5 }] },
+      { day: "2026-10-17", parts: [{ key: "nucleos", value: 2 }, { key: "judge", value: 0.25 }, { key: "stranger", value: 9 }] },
+    ];
+    expect(windowShares(data, keys)).toEqual([
+      { key: "nucleos", label: "nucleos", value: 3 },
+      { key: "judge", label: "Judge", value: 0.25, className: "ui-chart-judge" },
+      { key: ESTIMATED_KEY, label: "Estimated from run time", value: 0.5, className: "ui-chart-estimated" },
+    ]);
+  });
+});
+
+describe("gateShares and tokenShares", () => {
+  it("read the window's totals block, one item per key, in the chart's order", () => {
+    const gate = gateShares({ runs_completed: 52, passed: 40, failed: 5, errored: 2, no_gate: 4, other: 1 });
+    expect(gate.map((item) => [item.key, item.value])).toEqual([
+      ["passed", 40],
+      ["failed", 5],
+      ["errored", 2],
+      ["no_gate", 4],
+      ["other", 1],
+    ]);
+    expect(gate[1].className).toBe("ui-chart-failed");
+
+    const tokens = tokenShares({
+      input: 1,
+      cache_read: 2,
+      cache_creation: 3,
+      output: 4,
+      measured_sessions: 1,
+      unmeasured_runs: 0,
+      cache_hit_ratio: 0.5,
+    });
+    expect(tokens.map((item) => [item.key, item.value])).toEqual([
+      ["input", 1],
+      ["cache_read", 2],
+      ["cache_creation", 3],
+      ["output", 4],
     ]);
   });
 });

@@ -1,13 +1,21 @@
 /*
-  The analytics view (spec analytics-fundacao §9): one column, four sections, each a strip of tiles,
-  a chart, and a line of detail. No colour of its own — charts get theirs from `ui.css`.
+  The analytics view (spec analytics-fundacao §9), numbers first: a head row, four metric cards that
+  each open one detail chart, the detail panel, and a lower row of the costliest sessions and quota.
+  No colour of its own — every mark takes its tone from a `ui-chart-*` class in `ui.css`; the cards
+  and panels are surface, border and text tokens only.
+
+  The view sizes itself from its own width (a container), not the window's: the same component is a
+  page and a pane in the Workspace, and a pane beside the rail is narrower than the screen.
 */
 .an-view {
+  container: analytics / inline-size;
   display: flex;
   flex-direction: column;
-  gap: var(--space-5);
+  gap: var(--space-4);
   min-width: 0;
 }
+
+/* ---------------------------------------------------------------- head row -- */
 
 .an-head {
   display: flex;
@@ -17,6 +25,13 @@
   gap: var(--space-3);
 }
 
+.an-range {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+}
+
 .an-head-note,
 .an-note {
   margin: 0;
@@ -24,43 +39,271 @@
   color: var(--text-faint);
 }
 
-.an-coverage {
+/* "About these numbers": the coverage note behind a native disclosure, opened over the page. */
+.an-about {
+  position: relative;
+}
+
+.an-about-toggle {
+  cursor: pointer;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+.an-about-toggle:hover {
+  color: var(--text);
+}
+
+.an-about[open] .an-about-toggle {
+  color: var(--text);
+}
+
+.an-about-text {
+  position: absolute;
+  z-index: var(--z-overlay);
+  top: calc(100% + var(--space-2));
+  right: 0;
+  width: min(28rem, 80vw);
   margin: 0;
-  max-width: var(--measure-prose);
+  padding: var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-md);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+/* ------------------------------------------------------------ metric cards -- */
+
+.an-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.an-metric {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  transition:
+    border-color var(--dur-quick) var(--ease),
+    background-color var(--dur-quick) var(--ease);
+}
+
+.an-metric:hover {
+  border-color: var(--border-strong);
+}
+
+.an-metric-open {
+  border-color: var(--border-strong);
+  background: var(--surface-raised);
+}
+
+/* The button carries the words; its `::after` covers the card, so the sparkline is clickable too. */
+.an-metric-button {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.an-metric-button::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+
+/* The ring goes round the card, which is what the button stands for, not round its text. */
+.an-metric-button:focus-visible {
+  outline: none;
+}
+
+.an-metric:has(.an-metric-button:focus-visible) {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.an-metric-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.an-metric-label {
   font-size: var(--text-sm);
   color: var(--text-muted);
 }
 
-.an-tiles {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
-  gap: var(--space-3);
-  margin-bottom: var(--space-3);
+.an-metric-hint {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
 }
 
-.an-charts {
+.an-metric-value {
+  font-family: var(--font-display);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-tight);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.an-metric-sub {
+  min-height: 1lh;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* The sparkline is decoration under the words: a click on it belongs to the card's button. */
+.an-metric .ui-area {
+  pointer-events: none;
+}
+
+@container analytics (max-width: 46rem) {
+  .an-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container analytics (max-width: 24rem) {
+  .an-metrics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ------------------------------------------------------------------ cards -- */
+
+.an-card {
   display: flex;
   flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.an-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
+}
+
+.an-card-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.an-card-aside {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.an-detail {
   gap: var(--space-4);
 }
 
+/* Runs by mode, as quiet chips under the runs chart. */
 .an-pairs {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-1) var(--space-4);
-  margin: var(--space-3) 0 0;
+  gap: var(--space-2);
+  margin: 0;
   padding: 0;
   list-style: none;
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
+}
+
+.an-pair {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
 }
 
 .an-pair-mode {
+  font-family: var(--font-mono);
   color: var(--text-muted);
 }
 
 .an-pair-count {
-  margin-left: var(--space-1);
   font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+/* Delivered's figures under its running total, laid out like the share keys of the other charts. */
+.an-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-6);
+  margin: 0;
+}
+
+.an-stat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.an-stat dt {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.an-stat dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+/* --------------------------------------------------------------- lower row -- */
+
+.an-lower {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+}
+
+.an-lower-split {
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+}
+
+@container analytics (max-width: 46rem) {
+  .an-lower-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .an-top {
@@ -72,7 +315,9 @@
 }
 
 .an-top-link {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(6rem, 1fr) minmax(0, 1.4fr) minmax(3rem, 1fr) auto;
+  align-items: center;
   gap: var(--space-3);
   padding: var(--space-2) 0;
   border-bottom: 1px solid var(--border);
@@ -81,15 +326,66 @@
   font-size: var(--text-sm);
 }
 
-.an-top-link:hover {
+.an-top li:last-child .an-top-link {
+  border-bottom: 0;
+}
+
+.an-top-link:hover .an-top-name {
   text-decoration: underline;
 }
 
+.an-top-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--weight-medium);
+}
+
 .an-top-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
   color: var(--text-muted);
 }
 
+/* A share of the costliest session: an svg stretched to its cell, the width an attribute. */
+.an-top-bar {
+  display: block;
+  width: 100%;
+  height: 4px;
+}
+
+.an-top-bar-fill {
+  fill: var(--series, var(--border-strong));
+  fill-opacity: 0.55;
+}
+
 .an-top-cost {
-  margin-left: auto;
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+@container analytics (max-width: 30rem) {
+  .an-top-link {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .an-top-bar {
+    display: none;
+  }
+
+  .an-top-meta {
+    grid-column: 1;
+    grid-row: 2;
+  }
+}
+
+/* Windows high-contrast drops the raised surface; the open card keeps a system-colour edge instead. */
+@media (forced-colors: active) {
+  .an-metric-open {
+    border-color: Highlight;
+  }
 }

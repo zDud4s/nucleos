@@ -579,7 +579,7 @@ describe("the project workspace", () => {
     await waitFor(() =>
       expect(within(modes).getByRole("link", { name: "Analytics" }).getAttribute("aria-current")).toBe("page"),
     );
-    expect(await screen.findByRole("region", { name: "Cost and tokens" })).toBeTruthy();
+    expect(await screen.findByRole("region", { name: "Spend per day" })).toBeTruthy();
     expect(daemon.apiFetch.mock.calls.map(([path]) => String(path))).toContain(
       "/projects/nucleos/analytics?days=30",
     );

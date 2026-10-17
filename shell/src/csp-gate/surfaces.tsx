@@ -18,7 +18,6 @@ import {
   DialogTitle,
 } from "@/ui/vendor/dialog";
 import { AreaChart } from "@/ui/AreaChart";
-import { BarChart } from "@/ui/BarChart";
 import { ShareBar } from "@/ui/ShareBar";
 import { Sparkline } from "@/ui/Sparkline";
 import { StepLine } from "@/ui/StepLine";
@@ -246,11 +245,11 @@ function PaletteSurface({ done }: { done: () => void }) {
  * be clean — "should be" is precisely what a gate is for.
  *
  * Every chart twice, because each has two branches: with data, and empty (a rail for `Sparkline`,
- * axes plus a sentence for `BarChart` and `StepLine`, a grid plus a sentence for `AreaChart`, and
- * nothing at all for `ShareBar`). `AreaChart` a third time, compact, its sparkline branch; its
+ * axes plus a sentence for `StepLine`, a grid plus a sentence for `AreaChart`, and nothing at all
+ * for `ShareBar`). `AreaChart` a third time, compact, its sparkline branch; its
  * tooltip is only drawn on hover, so the gate sees the resting chart and the unit test
  * (`AreaChart.test.tsx`) holds the hovered one to the same no-`style` rule. `@visx/axis` is the new risk: its default
- * tick labels go through `@visx/text`, which writes `style="overflow: visible"`; both charts swap it
+ * tick labels go through `@visx/text`, which writes `style="overflow: visible"`; `StepLine` swaps it
  * for a bare `<text>`, and this surface is where that is proved under the real policy.
  */
 function ChartSurface({ done }: { done: () => void }) {
@@ -270,28 +269,6 @@ function ChartSurface({ done }: { done: () => void }) {
     <div className="p-6">
       <Sparkline values={[0, 2, 1, 4, 3, 6, 2, 5]} label="the 8 runs in the window" />
       <Sparkline values={[]} label="no run in the window" />
-      <BarChart
-        data={Array.from({ length: 7 }, (_, n) => ({
-          day: day(n),
-          parts: [
-            { key: "alpha", value: n % 3 },
-            { key: "beta", value: (n + 1) % 2 },
-            { key: "judge", value: 0.25 },
-          ],
-          partial: n === 6,
-        }))}
-        keys={keys}
-        label="Cost per day, last 7 days"
-        format={usd}
-        empty="No runs in this window"
-      />
-      <BarChart
-        data={Array.from({ length: 7 }, (_, n) => ({ day: day(n), parts: [] }))}
-        keys={keys}
-        label="Cost per day, nothing in it"
-        format={usd}
-        empty="No runs in this window"
-      />
       <StepLine
         series={[
           {
@@ -460,7 +437,7 @@ export const SURFACES: Surface[] = [
   },
   {
     name: "charts",
-    why: "@visx/{axis,curve,group,scale,shape}, which compute geometry per render — Sparkline, BarChart, StepLine, AreaChart (also compact) and ShareBar, each with data and empty",
+    why: "@visx/{axis,curve,group,scale,shape}, which compute geometry per render — Sparkline, StepLine, AreaChart (also compact) and ShareBar, each with data and empty",
     Component: ChartSurface,
   },
   {

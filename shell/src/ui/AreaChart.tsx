@@ -16,9 +16,9 @@ import { useWidth } from "./useWidth";
  *
  * **Drawn at its real size.** The svg's `viewBox` is the measured width of its box (`useWidth`) by
  * a fixed height, so one unit is one pixel and an `--text-xs` label stays `--text-xs`. A fixed
- * 640-wide `viewBox` stretched into a wide card is what made `BarChart`'s axis text huge.
+ * 640-wide `viewBox` stretched into a wide card is what made the old `BarChart`'s axis text huge.
  *
- * **No inline style, anywhere** — `BarChart`'s rule and reason (the CSP gate refuses `style=`).
+ * **No inline style, anywhere** — every chart's rule, and its reason: the CSP gate refuses `style=`.
  * Colour reaches every mark through `--series`, set by the `tone` class: the line strokes with it,
  * and the gradient's stops take `stop-color` from it in `ui.css`, so the fill is a class too. No
  * `@visx/axis` and no `@visx/text`: the few labels are bare `<text>` elements placed here. The

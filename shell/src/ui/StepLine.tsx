@@ -1,19 +1,24 @@
-import { AxisBottom, AxisLeft } from "@visx/axis";
+import { AxisBottom, AxisLeft, type TickRendererProps } from "@visx/axis";
 import { curveStepAfter } from "@visx/curve";
 import { Group } from "@visx/group";
 import { scaleLinear, scaleUtc } from "@visx/scale";
 import { LinePath } from "@visx/shape";
 
-import { ChartTickLabel, seriesClass } from "./BarChart";
+import { seriesClass } from "./chart-series";
 
 /**
  * A fraction over continuous time, in steps (spec §9.10, decided: its own component, not a mode of
- * `BarChart`). Built for the quota history: each reading holds until the next one — never
+ * the day charts). Built for the quota history: each reading holds until the next one — never
  * interpolated — and the last one holds until `to`. Before the first point there is nothing, which
  * is the honest gap of a history that only records while the app is open (spec §7, §13.6).
  *
- * The scale is fixed at 0–1 (the caller's `format` writes it as a percentage); the same rules as
- * `BarChart` apply: mandatory `label`, a `<title>` per point, no inline style, axes kept when empty.
+ * The scale is fixed at 0–1 (the caller's `format` writes it as a percentage); the chart rules
+ * apply: mandatory `label`, a `<title>` per point, no inline style, axes kept when empty.
+ *
+ * **No inline style, anywhere** — the CSP gate refuses `style=`. That is why the axes never draw
+ * their own text: `@visx/axis` renders tick labels through `@visx/text`, whose `Text` wraps every
+ * label in an `<svg style="overflow: visible">`. `ChartTickLabel` replaces it with a plain
+ * `<text>`, and no axis is ever given a `label` (an empty one skips `Text` entirely).
  */
 
 export interface StepPoint {
@@ -48,6 +53,15 @@ export interface StepLineProps {
 const WIDTH = 640;
 const HEIGHT = 160;
 const MARGIN = { top: 8, right: 8, bottom: 22, left: 44 };
+
+/** A tick label as a bare `<text>`: what `@visx/text` would draw, minus the `style` attribute. */
+export function ChartTickLabel({ x, y, dx, dy, textAnchor, formattedValue }: TickRendererProps) {
+  return (
+    <text x={x} y={y} dx={dx} dy={dy} textAnchor={textAnchor} className="ui-chart-tick-label">
+      {formattedValue}
+    </text>
+  );
+}
 
 /** `2026-10-11 08:00 UTC` — the axis and every title speak UTC, like the rest of the view. */
 function utcMinute(at: number): string {

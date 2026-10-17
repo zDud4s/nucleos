@@ -7,17 +7,7 @@
  */
 export { AreaChart, type AreaChartProps } from "./AreaChart";
 export { Badge, type BadgeProps, type BadgeTone } from "./Badge";
-export {
-  BarChart,
-  ChartTickLabel,
-  seriesClass,
-  stackDay,
-  type BarChartProps,
-  type BarDatum,
-  type BarKey,
-  type BarPart,
-} from "./BarChart";
-export { type ChartDatum, type ChartKey, type ChartPart } from "./chart-series";
+export { seriesClass, type ChartDatum, type ChartKey, type ChartPart } from "./chart-series";
 export { Button, type ButtonIntent, type ButtonProps, type ButtonVariant } from "./Button";
 export { ConfirmButton, type ConfirmButtonProps } from "./ConfirmButton";
 export { CopyButton, type CopyButtonProps } from "./CopyButton";
