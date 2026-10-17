@@ -440,6 +440,26 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	}
 	target := struct{ TargetID string }{TargetID: targetID}
 
+	// Every way out of here that does not hand the caller a usable session takes the tab with it: an
+	// error return carries no id, so nobody else could ever close it. registered is set once the
+	// session is in the driver's maps, and then the ordinary Close does the whole teardown.
+	var registered browser.SessionID
+	keep := false
+	defer func() {
+		if keep {
+			return
+		}
+		closing, cancel := context.WithTimeout(context.Background(), fenceCallTimeout)
+		defer cancel()
+		if registered != "" {
+			_ = d.Close(closing, registered)
+			return
+		}
+		_, _ = d.conn.Call(closing, cdp.BrowserSession, "Target.closeTarget", map[string]any{
+			"targetId": target.TargetID,
+		})
+	}()
+
 	if _, err := d.conn.Call(ctx, cdpSession, "Page.enable", nil); err != nil {
 		return browser.Session{}, fmt.Errorf("enabling page domain: %w", err)
 	}
@@ -484,17 +504,13 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		// A person was handed the browser while this target was being made. The sole-session check
 		// did not see it, so it is refused here, before anything navigates with the fence lifted.
 		d.mu.Unlock()
-		closing, cancel := context.WithTimeout(context.Background(), fenceCallTimeout)
-		defer cancel()
-		_, _ = d.conn.Call(closing, cdp.BrowserSession, "Target.closeTarget", map[string]any{
-			"targetId": target.TargetID,
-		})
 		return browser.Session{}, browser.ErrPersonIsDriving
 	}
 	d.sessions[id] = entry
 	d.targets[target.TargetID] = id
 	d.cdpToSession[cdpSession] = id
 	d.mu.Unlock()
+	registered = id
 	if visible {
 		d.adoptPanelWorlds(cdpSession)
 	}
@@ -524,6 +540,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 			// The session exists and is empty. Reported as a value rather than an error because it
 			// is an ANSWER: the agent asked for a url this profile does not admit, and the useful
 			// next move is to ask for it in an ephemeral one — not to retry.
+			keep = true
 			return browser.Session{
 				ID:           id,
 				Mode:         entry.mode,
@@ -537,6 +554,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	stillLoading := d.awaitReady(ctx, ready, entry)
 	d.readTargetInfo(ctx, entry)
 	final, title := d.placeOf(entry)
+	keep = true
 	return browser.Session{
 		ID:           id,
 		Mode:         entry.mode,

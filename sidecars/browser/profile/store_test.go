@@ -181,6 +181,32 @@ func TestTheDiskBudgetSweepsBeforeItRefuses(t *testing.T) {
 	}
 }
 
+// TestTheAdmitSweepSparesAProfileInUse. Admit sweeps while this process has browsers open, so the
+// "every run-* directory is a leftover" premise of the startup sweep does not hold there.
+func TestTheAdmitSweepSparesAProfileInUse(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root, InUse: func(name string) bool { return name == "run-live" }}
+	for _, id := range []string{"live", "dead"} {
+		dir, err := store.Prepare(Ref{Kind: Ephemeral, ID: id})
+		if err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "Cache"), make([]byte, 4000), 0o600); err != nil {
+			t.Fatalf("writing: %v", err)
+		}
+	}
+
+	if err := store.Admit(Ref{Kind: Project, ID: "new"}, Limits{DiskBudget: 5000}); err != nil {
+		t.Fatalf("Admit = %v, want the leftover's sweep to make room", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "run-live")); err != nil {
+		t.Errorf("the sweep deleted a profile a browser is using: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "run-dead")); !os.IsNotExist(err) {
+		t.Errorf("the leftover was not swept: %v", err)
+	}
+}
+
 // TestNoLimitsMeansNoCeiling. The zero Limits is what a Store built before configuration arrives
 // gets, and it must not refuse everything: a ceiling of zero read as "zero allowed" would make the
 // pillar unable to open anything at all, in a way that looks exactly like the ceiling working.
