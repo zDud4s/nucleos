@@ -445,6 +445,14 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
 /// share this door, and the partition between them is held by the parameter TYPES at the tool
 /// boundary rather than by the transport. A transport-level partition would be worth having if this
 /// were reachable by the agent the tools serve; it is not, because of the line above.
+///
+/// `POST /assistant/message` is deliberately absent, though it reads like a sibling of `/runs`: it
+/// does not buy a run, it buys a turn of the ORCHESTRATOR. An `McpOnly` turn is spawned holding the
+/// daemon's control token (`assistant::chat_key::turn_env`) and therefore the tools that approve
+/// proposals, queue merges and send mail; and the body names its own `origin`, so `"shell"` buys a
+/// rooted turn with Bash and Write in the project. A run-creating key that could post here would hold
+/// Control by one hop. Every legitimate caller — the shell and the Telegram sidecar — already holds
+/// the control token, so speaking to the assistant is Control's (and Admin's).
 const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/runs"),
     // A job is several runs over one worktree, so it belongs to the scope that buys runs rather
@@ -456,7 +464,6 @@ const RUN_CREATING_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/jobs"),
     (Method::POST, "/webhooks/push"),
     (Method::POST, "/presets/{id}/run"),
-    (Method::POST, "/assistant/message"),
     (Method::POST, "/email/triage"),
 ];
 
@@ -2479,13 +2486,7 @@ mod tests {
         let token = stored_api_token(&state, "launcher", ApiTokenLevel::RunCreating).await;
         let app = protected_router(state);
 
-        for uri in [
-            "/runs",
-            "/webhooks/push",
-            "/presets/7/run",
-            "/assistant/message",
-            "/email/triage",
-        ] {
+        for uri in ["/runs", "/webhooks/push", "/presets/7/run", "/email/triage"] {
             assert_eq!(
                 status_of(&app, "POST", uri, &token).await,
                 StatusCode::OK,
@@ -2497,6 +2498,8 @@ mod tests {
             ("POST", "/autopilot/budget"),
             ("POST", "/autopilot/state"),
             ("POST", "/proposals/7/approve"),
+            // An orchestrator turn holds the control token: see `RUN_CREATING_ROUTES`'s doc.
+            ("POST", "/assistant/message"),
             ("POST", "/backups/snapshot.db/restore"),
             ("POST", "/api-tokens"),
             ("GET", "/api-tokens"),
@@ -2849,6 +2852,42 @@ mod tests {
                 "{method} {path} must stay reachable by the control token"
             );
         }
+    }
+
+    /// An assistant turn is the orchestrator: an `McpOnly` turn is spawned with the control token,
+    /// and the body's `origin` can ask for a rooted one with Bash. So a key narrower than Control
+    /// must not be able to start one — asserted as membership, the way the test above is, because
+    /// the mistake it catches is somebody filing this route beside `/runs` again.
+    #[test]
+    fn no_key_narrower_than_control_can_speak_to_the_assistant() {
+        let (method, path) = (Method::POST, "/assistant/message");
+        assert!(
+            !route_is_listed(READ_ONLY_ROUTES, &method, path)
+                && !route_is_listed(RUN_CREATING_ROUTES, &method, path)
+                && !route_is_listed(TEAM_ROUTES, &method, path)
+                && !route_is_listed(EMAIL_ROUTES, &method, path)
+                && !route_is_listed(COUNCIL_ROUTES, &method, path),
+            "{method} {path} must stay out of every scope table"
+        );
+        for scope in [
+            Scope::Run(7),
+            Scope::TeamRun("team-1".to_owned()),
+            Scope::Service(Service::Email),
+            Scope::Service(Service::Council),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+        ] {
+            assert!(
+                !permits_route(&scope, &method, path),
+                "{scope:?} must not reach {method} {path}"
+            );
+        }
+        assert!(permits_route(&Scope::Control, &method, path));
+        assert!(permits_route(
+            &Scope::ApiToken(ApiTokenLevel::Admin),
+            &method,
+            path
+        ));
     }
 
     /// Downloading a model is the person's decision, and the agent must not be able to make it.

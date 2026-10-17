@@ -18764,6 +18764,63 @@ mod tests {
         assert!(parsed["turn_id"].is_number());
     }
 
+    /// A run-creating key must not reach Control through the assistant. An orchestrator turn is
+    /// spawned holding the control token, and `origin: "shell"` asks for a rooted turn with Bash —
+    /// either one is the control token by one hop. Asserted against the real router and on the
+    /// rows as well as the status: a refusal that still wrote a turn would have spawned it.
+    #[tokio::test]
+    async fn a_run_creating_key_cannot_start_an_assistant_turn_whatever_origin_it_names() {
+        let state = test_state().await;
+        let run_creating =
+            store_api_token_at_level(&state, "launcher", ApiTokenLevel::RunCreating).await;
+
+        for origin in [Some("shell"), Some("telegram"), None] {
+            let mut body = serde_json::json!({ "chat_id": "chat-1", "text": "hello" });
+            if let Some(origin) = origin {
+                body["origin"] = serde_json::json!(origin);
+            }
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/assistant/message")
+                        .header("Authorization", format!("Bearer {run_creating}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "origin {origin:?} must be refused to a run-creating key"
+            );
+        }
+
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE mode = 'assistant'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(turns, 0, "a refused message must not have started a turn");
+
+        // The control token, on the very same body, still opens a turn exactly as it did.
+        let body = serde_json::json!({ "chat_id": "chat-1", "text": "hello", "origin": "shell" });
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/assistant/message")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn assistant_message_rejects_without_bearer_token() {
         let app = build_router(test_state().await);
