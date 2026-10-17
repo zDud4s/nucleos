@@ -130,6 +130,11 @@ where
     .bind(i64::from(from_resolution))
     .execute(executor)
     .await?;
+    // Fired even when `executor` is an open transaction that has not committed yet: the worker then
+    // finds nothing on this pass and the 30s fallback picks the row up, which is late, not lost.
+    if status == "queued" {
+        wake_worker();
+    }
     Ok(result.last_insert_rowid())
 }
 /// A request the caller now holds: its row is already `running`, so nothing else for the same

@@ -344,6 +344,7 @@ pub async fn approve_for_owner(pool: &sqlx::SqlitePool, id: i64) -> Result<(), D
     .bind(id)
     .execute(pool)
     .await?;
+    wake_worker();
     owner_decided(pool, id, approved.rows_affected()).await
 }
 /// The `failure_reason` `refuse_for_owner` records; the session hook matches on it to tell the

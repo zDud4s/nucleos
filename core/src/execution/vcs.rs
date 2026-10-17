@@ -3587,7 +3587,8 @@ mod tests {
         // worker that never started at all is told apart from one that started and stopped.
         drained_once.expect("the worker's first pass should drain what was queued for it");
 
-        // Submitted only now: the pass above is over, so nothing but a later poll can find this.
+        // Submitted only now: the pass above is over, so nothing but the wake from `submit` (or the
+        // 30s fallback, far past the budget below) can find this.
         let second = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
             .await
             .unwrap();
@@ -3605,6 +3606,49 @@ mod tests {
         settled.expect(
             "the worker must keep polling; one that stops after its first pass would drain nothing \
              the daemon is ever actually asked to do",
+        );
+    }
+
+    /// The worker sleeps up to `WORKER_POLL_INTERVAL` (30s) when idle, so a request that arrives in
+    /// that sleep must be found because `submit` woke the worker, not because a poll came round. The
+    /// budget is a fraction of the fallback, so a missing wake fails here instead of passing late.
+    #[tokio::test]
+    async fn an_enqueue_wakes_an_idle_worker_well_before_the_fallback_poll() {
+        let pool = test_pool().await;
+        let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
+        let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
+
+        // Precondition: one request drained proves the worker is past its first pass and idle.
+        let first = submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        let wait_until = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                loop {
+                    if status_of(&pool, id).await == "succeeded" {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait_until(first))
+            .await
+            .expect("the worker's first pass should drain what was queued for it");
+
+        let started = std::time::Instant::now();
+        let second = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        let settled =
+            tokio::time::timeout(std::time::Duration::from_secs(5), wait_until(second)).await;
+        worker.abort();
+
+        settled.expect("an enqueue must wake the idle worker; the fallback poll is 30s away");
+        assert!(
+            started.elapsed() < WORKER_POLL_INTERVAL / 2,
+            "found by the fallback poll rather than the wake"
         );
     }
 
