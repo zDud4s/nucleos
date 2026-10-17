@@ -1254,9 +1254,19 @@ fn classify_segment(
     // branch through the run path, which never consults the session gate's refusal and so had only
     // this to stop it. Whether a segment is the queue's business is asked of the queue's own
     // function, so the two cannot come to disagree about it.
+    //
+    // That function reads raw words, and the shell runs them dequoted: `"git" push --force` and
+    // `g\it push --force` are git to the shell and not to it. So it is asked of both spellings,
+    // and either one claiming the segment keeps it off this path.
+    //
+    // **Nor onto a self-governing file.** Confinement asks only where a command points, and
+    // `.claude/hooks/ask_daemon.py` is inside the workspace. A `Write` there asks the owner
+    // (`self-governing-file`); a `cp` onto it may not be allowed for pointing nowhere else.
     if unrecognized == Unrecognized::MayBeConfined
         && shell_form_is_readable(&normalized)
         && crate::execution::vcs::unqueueable_but_shared(segment).is_none()
+        && crate::execution::vcs::unqueueable_but_shared(&flag_words(segment).join(" ")).is_none()
+        && !segment_names_self_governing(segment, cwd)
         && confined_to_workspace(segment, cwd, shell)
     {
         return Segment::Confined;
@@ -4206,6 +4216,188 @@ mod tests {
                     .decision,
                 "allow",
                 "{command}"
+            );
+        }
+    }
+
+    /// The queue's check read raw words, and a shell reads them after removing quotes and
+    /// backslash escapes: `"git"` and `g\it` both run git. Spelled that way, the forced push
+    /// below was not git to the check and came back `confined-to-workspace`.
+    #[test]
+    fn confinement_reads_a_git_operation_as_the_shell_will_run_it() {
+        let workspace = Path::new(r"C:\work\repo");
+        let widened: Vec<&str> = [
+            r#""git" -C . push --force origin master"#,
+            r"g\it -C . push --force origin master",
+            r#"git -C . "push" --force origin master"#,
+            r"git -C . p\ush --force origin master",
+            r#"'git' -C ./core branch -D fix/x"#,
+            r#""git" -C . merge fix/x"#,
+        ]
+        .into_iter()
+        .filter(|command| {
+            classify_asked_for(command, Some(workspace))
+                .decision
+                .decision
+                == "allow"
+        })
+        .collect();
+        assert!(
+            widened.is_empty(),
+            "confinement widened a quoted git operation the queue owns: {widened:?}"
+        );
+
+        // Quoted arguments to a program that is not git still confine: the second reading is
+        // the queue's question, and the queue has no opinion about `jq`.
+        assert_eq!(
+            classify_asked_for(r#"jq ".name" "./package.json""#, Some(workspace)).action_class,
+            "confined-to-workspace"
+        );
+    }
+
+    /// A command confined to its workspace is still a write into it, and some files in the
+    /// workspace are the policy itself. A direct `Write` to any of these asks the owner
+    /// (`self-governing-file`); a `cp` that lands on the same file must not be waved through
+    /// for pointing inside.
+    #[test]
+    fn confinement_never_widens_a_command_that_names_a_self_governing_file() {
+        let workspace = Path::new(r"C:\work\repo");
+        let widened: Vec<&str> = [
+            "cp ./payload.py ./.claude/hooks/ask_daemon.py",
+            "cp ./payload.py .claude/hooks/ask_daemon.py",
+            r"cp .\payload.py .\.claude\hooks\ask_daemon.py",
+            r#"cp ./payload.py ".claude/hooks/ask_daemon.py""#,
+            r"cp ./payload.py C:\work\repo\.claude\hooks\ask_daemon.py",
+            // The directory itself, so the file lands inside it under its own name.
+            "cp ./ask_daemon.py ./.claude/hooks",
+            "cp ./ask_daemon.py ./.claude/hooks/",
+            "cp ./settings.json ./.claude",
+            "cp ./autopilot.yaml ./.ai/",
+            "mv ./.claude ./old",
+            "cp ./x.json ./.claude/settings.json",
+            "cp ./x.json ./.claude/settings.local.json",
+            "cp ./x.md ./.claude/skills/orchestrate/SKILL.md",
+            "cp ./x.md ./.claude/agents/wf-executor.md",
+            "cp ./x.md ./.agents/skills/orchestrate/SKILL.md",
+            "cp ./x.yaml ./.ai/autopilot.yaml",
+            "cp ./x.yaml ./core/../.ai/voice.yaml",
+            // Bare, with no separator: confinement does not read it as a path, but it is one.
+            "cp ./x.yaml nucleos.tests.yaml",
+            // Carried on a flag.
+            "./tool --target=./.claude/settings.json ./a",
+            "./tool -o./.claude/hooks/x.py ./a",
+        ]
+        .into_iter()
+        .filter(|command| {
+            classify_asked_for(command, Some(workspace))
+                .decision
+                .decision
+                == "allow"
+        })
+        .collect();
+        assert!(
+            widened.is_empty(),
+            "confinement widened a write onto a self-governing file: {widened:?}"
+        );
+
+        // Neighbours that only look alike still confine.
+        for command in [
+            "cp ./a.txt ./b.txt",
+            "cp ./x.json ./docs/claude/settings.json",
+            "cp ./x.py ./scripts/hooks/ask_daemon.py",
+        ] {
+            assert_eq!(
+                classify_asked_for(command, Some(workspace)).action_class,
+                "confined-to-workspace",
+                "{command}"
+            );
+        }
+    }
+
+    /// pytest REMOVES its `--basetemp` before it runs, so `--basetemp=.` empties the workspace
+    /// and `--basetemp=/c/Users/x` a home directory. Go's profile and trace flags each write a
+    /// file wherever their value points. Every one of them arrived as an allowed test run.
+    /// Only a RELATIVE value that stays strictly inside the workspace is ordinary again; the
+    /// workspace root itself (`.`, `./`, empty, `tmp/..`) still pends for `--basetemp`.
+    #[test]
+    fn a_test_runner_flag_that_writes_or_deletes_a_path_stays_pending() {
+        let workspace = Path::new(r"C:\work\repo");
+        for command in [
+            "pytest --basetemp=/c/Users/x",
+            "pytest --basetemp /c/Users/x",
+            "pytest --basetemp=.",
+            "pytest --basetemp=./",
+            r#"pytest --basetemp="""#,
+            "pytest --basetemp ''",
+            "pytest --basetemp=tmp/..",
+            "pytest --basetemp=../x",
+            "pytest --basetemp=~/x",
+            "pytest --basetemp=$HOME/x",
+            "pytest --basetemp",
+            r#"pytest "--basetemp=/c/Users/x""#,
+            r"pytest --base\temp=/c/Users/x",
+            "pytest -q tests/ --basetemp=C:/Users/x",
+            "python -m pytest --basetemp=/c/Users/x",
+            "python3 -m pytest --basetemp /c/Users/x",
+            "py -m pytest --basetemp=/c/Users/x",
+            "go test -coverprofile=/c/Users/x/cover.out ./...",
+            "go test -coverprofile /c/Users/x/cover.out ./...",
+            "go test --coverprofile=/c/Users/x/cover.out ./...",
+            r#"go test "-coverprofile=/c/Users/x/cover.out" ./..."#,
+            "go test -coverprofile=../x ./...",
+            "go test -coverprofile ../x ./...",
+            "go test -coverprofile=~/x ./...",
+            "go test -coverprofile=$HOME/x ./...",
+            "go test -coverprofile=sub/../../x ./...",
+            "go test -o cover.out ./...",
+            "go test -cpuprofile=/c/Users/x/cpu.out ./...",
+            "go test -memprofile /c/Users/x/mem.out ./...",
+            "go test -blockprofile=/c/Users/x/b.out ./...",
+            "go test -mutexprofile=/c/Users/x/m.out ./...",
+            "go test -trace=/c/Users/x/trace.out ./...",
+            "go test -outputdir=/c/Users/x ./...",
+            "go test ./... -args -test.coverprofile=/c/Users/x/cover.out",
+            "go test -test.gocoverdir=/c/Users/x ./...",
+            "go build -debug-trace=/c/Users/x/t.json ./cmd/echo",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({ "command": command }), None),
+                "pending_approval",
+                "unrecognized",
+            );
+            assert_ne!(
+                classify_asked_for(command, Some(workspace))
+                    .decision
+                    .decision,
+                "allow",
+                "widened by confinement: {command}"
+            );
+        }
+
+        // The ordinary forms are untouched.
+        for command in [
+            "pytest",
+            "pytest -q tests/",
+            "pytest -k basetemp",
+            // Relative and strictly inside the workspace: ordinary again.
+            "pytest --basetemp=tmp",
+            "pytest --basetemp .pytest-tmp/x",
+            "pytest --basetemp=./tmp/../tmp2",
+            "python -m pytest --basetemp=tmp",
+            "go test -coverprofile=cover.out ./...",
+            "go test -coverprofile cover.out ./...",
+            "go test -cpuprofile=prof/cpu.out ./...",
+            "go test ./... -args -test.coverprofile=cover.out",
+            "python -m pytest -x",
+            "go test ./...",
+            "go test -cover ./...",
+            "go test -coverpkg=./... ./...",
+            "go test -run TestX -v ./...",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({ "command": command }), None),
+                "allow",
+                "read-local",
             );
         }
     }
