@@ -24,6 +24,7 @@ import {
   Boxes,
   Brain,
   Calendar,
+  ChartColumnStacked,
   Contact,
   Files,
   FolderKanban,
@@ -120,6 +121,8 @@ export const NAV: NavGroup[] = [
       { id: "autopilot", label: "Autopilot", path: "/autopilot", icon: Gauge },
       { id: "waiting", label: "Waiting", path: "/waiting", icon: Hourglass, badge: "proposals" },
       { id: "runs", label: "Runs", path: "/runs", icon: Activity },
+      /** Trends over the runs above: cost, tokens, gate, deliveries, quota — by UTC day (spec analytics-fundacao). */
+      { id: "analytics", label: "Analytics", path: "/analytics", icon: ChartColumnStacked },
       { id: "feed", label: "Feed", path: "/feed", icon: Rss },
       /**
        * The owner's own thinking and what the agent has been taught, in one list: notes typed or

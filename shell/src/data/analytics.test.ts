@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { DEFAULT_DAYS, WINDOWS, analyticsPath, parseDays, quotaPath } from "./analytics";
+import { DEFAULT_DAYS, WINDOWS, analyticsPath, parseDays, quotaPath, validateAnalyticsSearch } from "./analytics";
 import { keys } from "./keys";
 
 describe("parseDays", () => {
@@ -30,5 +30,14 @@ describe("analytics paths and keys", () => {
     expect(keys.projects.analytics("nucleos", 30)).toEqual(["projects", "nucleos", "analytics", 30]);
     expect(keys.analytics.global(7)).toEqual(["analytics", "global", 7]);
     expect(keys.analytics.quota(7)).toEqual(["analytics", "quota", 7]);
+  });
+});
+
+describe("validateAnalyticsSearch", () => {
+  it("keeps a window the route serves and drops anything else, so the page falls back to 30", () => {
+    expect(validateAnalyticsSearch({ days: "7" })).toEqual({ days: 7 });
+    expect(validateAnalyticsSearch({ days: 90 })).toEqual({ days: 90 });
+    expect(validateAnalyticsSearch({ days: "14" })).toEqual({});
+    expect(validateAnalyticsSearch({})).toEqual({});
   });
 });

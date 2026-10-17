@@ -51,6 +51,8 @@ describe("the nav table", () => {
       "Autopilot",
       "Waiting",
       "Runs",
+      // Trends over the runs above it (spec analytics-fundacao §9.9), after the list it summarises.
+      "Analytics",
       "Feed",
       // The owner's notes and the knowledge store in one place; `/learned` redirects here.
       "Brain",

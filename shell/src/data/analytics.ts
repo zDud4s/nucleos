@@ -225,3 +225,12 @@ export function useQuotaHistory(days: AnalyticsDays, enabled: boolean) {
     enabled,
   });
 }
+
+/**
+ * The `/analytics` page's search params: `?days=` when it is a window the route serves, nothing
+ * otherwise. Here rather than in the page so `router.tsx` can import it without loading the page.
+ */
+export function validateAnalyticsSearch(search: Record<string, unknown>): { days?: AnalyticsDays } {
+  const days = parseDays(search.days);
+  return days === undefined ? {} : { days };
+}

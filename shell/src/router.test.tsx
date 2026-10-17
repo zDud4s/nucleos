@@ -214,6 +214,22 @@ describe("the app router", () => {
     expect(links[4].getAttribute("href")).toBe("/projects/nucleos/authority");
   });
 
+  it("resolves /analytics with its window, and falls back to 30 for one the núcleo does not serve", async () => {
+    const { router } = await renderApp({ initialPath: "/analytics?days=7" });
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Analytics" })).toBeDefined();
+    expect((router.state.location.search as { days?: number }).days).toBe(7);
+    await waitFor(() =>
+      expect(daemon.apiFetch.mock.calls.map(([path]) => String(path))).toContain("/analytics?days=7"),
+    );
+
+    daemon.apiFetch.mockClear();
+    await router.navigate({ to: "/analytics", search: { days: 14 } as never });
+    await waitFor(() =>
+      expect(daemon.apiFetch.mock.calls.map(([path]) => String(path))).toContain("/analytics?days=30"),
+    );
+  });
+
   it("opens on Home", async () => {
     await renderApp();
 
