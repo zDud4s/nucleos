@@ -175,13 +175,17 @@ impl CommandRunner for ClaudeCliRunner {
                 .take()
                 .expect("stdin piped above when steerable");
             let opening = user_message_line(&request.prompt, &request.images);
+            // A process started ahead of its first message (a conversation opened in the window):
+            // nothing to say yet, so no opening line is written and the CLI waits on its stdin for
+            // the first turn to arrive down `messages`.
+            let warmed = request.prompt.is_empty() && request.images.is_empty();
             let mut messages = request.messages.take();
             steering_task = Some(tokio::spawn(async move {
                 // `ChildStdin` writes straight to the OS pipe, so a completed `write_all` has
                 // already been handed over — there is no buffer left to flush. A failed one means
                 // the CLI is gone, which the exit code and stderr below already report; there is
                 // nothing this task could add and nobody awaiting it to tell.
-                if stdin.write_all(opening.as_bytes()).await.is_err() {
+                if !warmed && stdin.write_all(opening.as_bytes()).await.is_err() {
                     return;
                 }
                 let Some(messages) = messages.as_mut() else {

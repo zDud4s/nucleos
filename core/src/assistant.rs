@@ -3971,22 +3971,18 @@ mod tests {
         // stopped, and here it is whatever the test wants said.
         let (why_stopped, stopped_because) = tokio::sync::watch::channel(None);
         (
-            LiveChat {
+            LiveChat::new(
                 messages,
                 events,
-                session_id: std::sync::Arc::new(std::sync::Mutex::new(Some("s-1".to_owned()))),
+                std::sync::Arc::new(std::sync::Mutex::new(Some("s-1".to_owned()))),
                 // Nothing to stop, but the field is what stops a real one, so it is not optional.
-                abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                tokio::spawn(std::future::pending::<()>()).abort_handle(),
                 stopped_because,
-                permission: crate::execution::runner::Permission::Default,
-                cwd: None,
-                idle_since: std::time::Instant::now(),
-                idle_for: LIVE_IDLE,
-                _counted: LiveCount::start(),
-                carried: Default::default(),
-                background: HashSet::new(),
-                watcher: 0,
-            },
+                crate::execution::runner::Permission::Default,
+                None,
+                String::new(),
+                None,
+            ),
             said,
             events_tx,
             why_stopped,
@@ -4126,16 +4122,21 @@ mod tests {
             ),
         ] {
             let chat = a_chat(prefix);
-            let (live, _said, events, _why) = live_chat_for_testing();
+            let (live, mut said, events, _why) = live_chat_for_testing();
             LIVE_CHATS.lock().unwrap().insert(chat.clone(), live);
-            events
-                .send(crate::execution::runner::TurnEvent::Line(line))
-                .unwrap();
-            events
-                .send(crate::execution::runner::TurnEvent::Ended(
-                    crate::execution::runner::TurnOutcome::default(),
-                ))
-                .unwrap();
+            // The process answers only once the message is written: an answer queued before it
+            // would be one begun before the message, which is set aside as spontaneous.
+            let responder = tokio::spawn(async move {
+                said.recv().await.expect("the message was never written");
+                events
+                    .send(crate::execution::runner::TurnEvent::Line(line))
+                    .unwrap();
+                events
+                    .send(crate::execution::runner::TurnEvent::Ended(
+                        crate::execution::runner::TurnOutcome::default(),
+                    ))
+                    .unwrap();
+            });
             let runner: Arc<dyn crate::execution::runner::CommandRunner> =
                 Arc::new(FakeCommandRunner::default());
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4153,10 +4154,12 @@ mod tests {
                 },
                 true,
                 None,
+                "",
             )
             .await;
             let kept_for = LIVE_CHATS.lock().unwrap().get(&chat).map(|l| l.idle_for);
             evict_live(&chat);
+            responder.await.unwrap();
 
             served.expect("in time").expect("the process answered");
             assert_eq!(kept_for, Some(expected));
@@ -4702,6 +4705,7 @@ mod tests {
             },
             true,
             None,
+            "",
         )
         .await
         .expect("the turn should not have timed out")
@@ -4733,6 +4737,7 @@ mod tests {
             },
             true,
             None,
+            "",
         )
         .await
         .expect("the second turn should not have timed out")
@@ -4850,21 +4855,17 @@ mod tests {
         let (messages, _said) = tokio::sync::mpsc::unbounded_channel();
         let (_events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let running = tokio::spawn(std::future::pending::<()>());
-        let live = LiveChat {
+        let live = LiveChat::new(
             messages,
             events,
-            session_id: std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
-            abort: running.abort_handle(),
-            stopped_because: tokio::sync::watch::channel(None).1,
-            permission: crate::execution::runner::Permission::Default,
-            cwd: None,
-            idle_since: std::time::Instant::now(),
-            idle_for: LIVE_IDLE,
-            _counted: LiveCount::start(),
-            carried: Default::default(),
-            background: HashSet::new(),
-            watcher: 0,
-        };
+            std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
+            running.abort_handle(),
+            tokio::sync::watch::channel(None).1,
+            crate::execution::runner::Permission::Default,
+            None,
+            String::new(),
+            None,
+        );
 
         drop(live);
 
@@ -4889,21 +4890,17 @@ mod tests {
         let (messages, _said) = tokio::sync::mpsc::unbounded_channel();
         let (_events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let running = tokio::spawn(std::future::pending::<()>());
-        let live = LiveChat {
+        let live = LiveChat::new(
             messages,
             events,
-            session_id: std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
-            abort: running.abort_handle(),
-            stopped_because: tokio::sync::watch::channel(None).1,
-            permission: crate::execution::runner::Permission::Default,
-            cwd: None,
-            idle_since: std::time::Instant::now(),
-            idle_for: LIVE_IDLE,
-            _counted: LiveCount::start(),
-            carried: Default::default(),
-            background: HashSet::new(),
-            watcher: 0,
-        };
+            std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
+            running.abort_handle(),
+            tokio::sync::watch::channel(None).1,
+            crate::execution::runner::Permission::Default,
+            None,
+            String::new(),
+            None,
+        );
         note_served(
             live.process_key(),
             "drop-vouch-chat",
@@ -6263,6 +6260,275 @@ mod tests {
         assert_eq!(key2, format!("chat:rekeyed.{stored}"));
     }
 
+    /// A kept process is replaced when the chat denies a tool after it was spawned.
+    ///
+    /// The denial is a spawn-time flag: a process started without it would go on using the tool for
+    /// as long as it was kept, whatever the chat now says.
+    #[tokio::test]
+    async fn a_kept_process_is_replaced_when_the_chat_denies_a_tool() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "deny-kept").await;
+
+        let first = send_message(&state, "deny-kept", "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        assert_eq!(*fake.calls.lock().unwrap(), 1);
+
+        crate::chats::set_denied_tools(&state.pool, "deny-kept", &["Bash".to_owned()])
+            .await
+            .unwrap();
+        let second = send_message(&state, "deny-kept", "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            2,
+            "the turn was answered by a process that still had the tool the chat now denies"
+        );
+        assert_eq!(
+            *fake.last_denied_tools.lock().unwrap(),
+            Some(vec!["Bash".to_owned()])
+        );
+    }
+
+    /// A kept process is replaced when the chat's effort changes after it was spawned.
+    #[tokio::test]
+    async fn a_kept_process_is_replaced_when_the_effort_changes() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "effort-kept").await;
+
+        let first = send_message(&state, "effort-kept", "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        assert_eq!(*fake.calls.lock().unwrap(), 1);
+
+        crate::chats::set_effort(&state.pool, "effort-kept", Some("high"))
+            .await
+            .unwrap();
+        let second = send_message(&state, "effort-kept", "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            2,
+            "the turn was answered by a process started at the old effort"
+        );
+        assert_eq!(
+            *fake.last_effort.lock().unwrap(),
+            Some(Some("high".to_owned()))
+        );
+    }
+
+    /// Opening a rooted chat starts its process before the first message, and that message is
+    /// then served by it instead of by a second one.
+    #[tokio::test]
+    async fn opening_a_rooted_chat_warms_its_process_before_the_first_turn() {
+        let fake = std::sync::Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "warm-open").await;
+        upsert_session(
+            &state.pool,
+            "warm-open",
+            "sess-warm",
+            "2026-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        prewarm_open_chat(&state, "warm-open");
+
+        let mut kept = false;
+        for _ in 0..500 {
+            kept = *fake.calls.lock().unwrap() == 1
+                && LIVE_CHATS.lock().unwrap().contains_key("warm-open");
+            if kept {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(kept, "opening the chat did not leave a kept process behind");
+        assert_eq!(
+            fake.last_prompt.lock().unwrap().as_deref(),
+            Some(""),
+            "a warmed process is started with no opening message"
+        );
+        assert_eq!(
+            fake.last_resume.lock().unwrap().as_deref(),
+            Some("sess-warm"),
+            "a warmed process resumes the conversation it was opened for"
+        );
+
+        let id = send_message(&state, "warm-open", "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            1,
+            "the first turn started a second process instead of using the warmed one"
+        );
+        let later = fake.later_turns.lock().unwrap().clone();
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].text, "primeiro");
+    }
+
+    /// Warming is only for a rooted chat that could resume, is idle, has no process, is not already
+    /// being warmed, and leaves room under the cap.
+    #[test]
+    fn warming_is_declined_for_unrooted_busy_kept_or_already_warming_chats() {
+        use crate::execution::runner::ToolPolicy;
+        // rooted, cli, policy, has_session, busy, kept, warming, alive
+        assert!(should_prewarm(
+            true,
+            "claude",
+            ToolPolicy::Unrestricted,
+            true,
+            false,
+            false,
+            false,
+            0
+        ));
+        assert!(!should_prewarm(
+            false,
+            "claude",
+            ToolPolicy::Unrestricted,
+            true,
+            false,
+            false,
+            false,
+            0
+        ));
+        assert!(!should_prewarm(
+            true,
+            "codex",
+            ToolPolicy::Unrestricted,
+            true,
+            false,
+            false,
+            false,
+            0
+        ));
+        assert!(!should_prewarm(
+            true,
+            "claude",
+            ToolPolicy::McpOnly,
+            true,
+            false,
+            false,
+            false,
+            0
+        ));
+        assert!(!should_prewarm(
+            true,
+            "claude",
+            ToolPolicy::Unrestricted,
+            false,
+            false,
+            false,
+            false,
+            0
+        ));
+        assert!(!should_prewarm(
+            true,
+            "claude",
+            ToolPolicy::Unrestricted,
+            true,
+            true,
+            false,
+            false,
+            0
+        ));
+        assert!(!should_prewarm(
+            true,
+            "claude",
+            ToolPolicy::Unrestricted,
+            true,
+            false,
+            true,
+            false,
+            0
+        ));
+        assert!(!should_prewarm(
+            true,
+            "claude",
+            ToolPolicy::Unrestricted,
+            true,
+            false,
+            false,
+            true,
+            0
+        ));
+        assert!(!should_prewarm(
+            true,
+            "claude",
+            ToolPolicy::Unrestricted,
+            true,
+            false,
+            false,
+            false,
+            LIVE_CAP
+        ));
+    }
+
+    /// A turn a kept process will serve skips the briefing: the process would discard it, since the
+    /// block travels as a per-spawn system flag.
+    #[test]
+    fn a_turn_a_kept_process_will_serve_skips_the_briefing() {
+        assert!(briefing_wanted("claude", false));
+        assert!(!briefing_wanted("claude", true));
+        assert!(!briefing_wanted("codex", false));
+    }
+
+    /// A finished turn is unregistered before the message that waited for it starts, so Stop on the
+    /// waiting one never finds the finished one's handle.
+    #[tokio::test]
+    async fn a_finished_turn_is_unregistered_before_what_waited_starts() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(FakeCommandRunner {
+            delay: Mutex::new(Some(Duration::from_millis(300))),
+            ..Default::default()
+        });
+        let chat_id = "unregistered-before-drain";
+
+        let first = send_message(&state, chat_id, "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        assert_eq!(
+            send_or_queue(&state, chat_id, "segundo", &[], Origin::Shell).await,
+            Ok(Sent::Queued)
+        );
+
+        let mut second_row = None;
+        for _ in 0..5000 {
+            second_row = sqlx::query_scalar::<_, i64>("SELECT id FROM runs WHERE id > ? LIMIT 1")
+                .bind(first)
+                .fetch_optional(&state.pool)
+                .await
+                .unwrap();
+            if second_row.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(second_row.is_some(), "what waited never started");
+        assert!(
+            !state.run_handles.lock().unwrap().contains_key(&first),
+            "the finished turn was still registered when what waited began"
+        );
+    }
+
     /// A turn carrying nothing keeps the argument vector it has always used.
     #[tokio::test]
     async fn a_turn_sent_with_nothing_keeps_the_argument_vector() {
@@ -6630,6 +6896,7 @@ mod tests {
             deadlines,
             true,
             None,
+            "",
         )
         .await;
         let elapsed = started.elapsed();
@@ -6677,6 +6944,7 @@ mod tests {
             deadlines,
             true,
             None,
+            "",
         )
         .await;
         let elapsed = started.elapsed();
@@ -6730,6 +6998,7 @@ mod tests {
             deadlines,
             true,
             None,
+            "",
         )
         .await;
         let elapsed = started.elapsed();
@@ -6764,6 +7033,7 @@ mod tests {
             deadlines,
             false,
             None,
+            "",
         )
         .await
         .expect("a turn that keeps streaming is not past any deadline")
@@ -6791,6 +7061,7 @@ mod tests {
             deadlines,
             false,
             None,
+            "",
         )
         .await
         .expect("silence is the runner's outcome, not the ceiling elapsing")
@@ -6822,6 +7093,7 @@ mod tests {
             deadlines,
             false,
             None,
+            "",
         )
         .await;
 
@@ -6853,6 +7125,7 @@ mod tests {
             deadlines,
             false,
             None,
+            "",
         )
         .await;
 

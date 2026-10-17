@@ -15,24 +15,62 @@ pub(super) static BUSY_CHATS: LazyLock<Mutex<HashSet<String>>> =
 /// until the daemon restarts — "the bot stopped answering" points nowhere near either cause.
 pub(super) struct ChatSlot {
     pub(super) chat_id: String,
+    /// Armed by [`ChatSlot::drain_on_release`]: when the slot is released, what waited for this chat
+    /// is sent from a task of its own.
+    drain: Option<crate::state::AppState>,
+}
+
+/// Takes a lock a panic poisoned anyway: the data is still there and the next caller needs it.
+pub(super) fn relock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Chats whose waiting messages must not be sent on their own: after a Stop, or after a send that
+/// failed. Cleared when the person sends again.
+static HELD_QUEUES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Stops the chat's queue draining by itself until [`release_queue`].
+pub(super) fn hold_queue(chat_id: &str) {
+    relock(&HELD_QUEUES).insert(chat_id.to_string());
+}
+
+/// Lets the chat's queue drain again.
+pub(super) fn release_queue(chat_id: &str) {
+    relock(&HELD_QUEUES).remove(chat_id);
+}
+
+/// Whether the chat's queue is held.
+pub(super) fn queue_is_held(chat_id: &str) -> bool {
+    relock(&HELD_QUEUES).contains(chat_id)
 }
 
 impl ChatSlot {
     /// Claims the chat, or returns None if a turn is already in flight for it.
     pub(super) fn acquire(chat_id: &str) -> Option<Self> {
-        BUSY_CHATS
-            .lock()
-            .unwrap()
+        relock(&BUSY_CHATS)
             .insert(chat_id.to_string())
             .then(|| Self {
                 chat_id: chat_id.to_string(),
+                drain: None,
             })
+    }
+
+    /// Arms the slot: once released, it sends what waited for the chat, in a detached task of its
+    /// own (never inside a registered run task, whose abort would cut it short).
+    pub(super) fn drain_on_release(&mut self, state: &crate::state::AppState) {
+        self.drain = Some(state.clone());
     }
 }
 
 impl Drop for ChatSlot {
     fn drop(&mut self) {
-        BUSY_CHATS.lock().unwrap().remove(&self.chat_id);
+        relock(&BUSY_CHATS).remove(&self.chat_id);
+        if let Some(state) = self.drain.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let chat = self.chat_id.clone();
+            runtime.spawn(async move { drain_queued(&state, &chat).await });
+        }
     }
 }
 
@@ -52,15 +90,12 @@ pub(super) static SEEN_CHATS: LazyLock<Mutex<HashMap<String, std::time::Instant>
 
 /// Records that a visible view just read this chat's transcript.
 pub fn mark_open(chat_id: &str) {
-    SEEN_CHATS
-        .lock()
-        .unwrap()
-        .insert(chat_id.to_owned(), std::time::Instant::now());
+    relock(&SEEN_CHATS).insert(chat_id.to_owned(), std::time::Instant::now());
 }
 
 /// Whether a visible view polled this chat within [`OPEN_WINDOW`].
 pub fn chat_is_open(chat_id: &str) -> bool {
-    let seen = SEEN_CHATS.lock().unwrap().get(chat_id).copied();
+    let seen = relock(&SEEN_CHATS).get(chat_id).copied();
     is_open(seen, std::time::Instant::now())
 }
 
@@ -91,10 +126,7 @@ impl SteerGuard {
         chat_id: &str,
         messages: &tokio::sync::mpsc::UnboundedSender<crate::execution::runner::LaterTurn>,
     ) -> Self {
-        STEERING
-            .lock()
-            .unwrap()
-            .insert(chat_id.to_owned(), messages.clone());
+        relock(&STEERING).insert(chat_id.to_owned(), messages.clone());
         Self {
             chat_id: chat_id.to_owned(),
         }
@@ -103,20 +135,20 @@ impl SteerGuard {
 
 impl Drop for SteerGuard {
     fn drop(&mut self) {
-        STEERING.lock().unwrap().remove(&self.chat_id);
+        relock(&STEERING).remove(&self.chat_id);
     }
 }
 
 /// Writes a line into the process running a chat's turn, if one is. False when nothing is steerable.
 pub(super) fn steer(chat_id: &str, turn: crate::execution::runner::LaterTurn) -> bool {
     // Cloned out so the lock is not held across the send.
-    let sender = STEERING.lock().unwrap().get(chat_id).cloned();
+    let sender = relock(&STEERING).get(chat_id).cloned();
     sender.is_some_and(|sender| sender.send(turn).is_ok())
 }
 
 /// Whether a turn is running in this chat's process right now, so a line written would land in it.
 pub(super) fn is_steerable(chat_id: &str) -> bool {
-    STEERING.lock().unwrap().contains_key(chat_id)
+    relock(&STEERING).contains_key(chat_id)
 }
 
 /// How long an interrupt is waited on before the kill path runs.
@@ -157,17 +189,25 @@ pub(super) async fn stop_turn_within(
     else {
         return Stopped::NotRunning;
     };
+    // A turn that already ended has nothing to stop; finalizing it would abort whatever handle is
+    // registered under its id.
+    if status != "running" {
+        return Stopped::NotRunning;
+    }
+    // Stop means "and do not carry on with what waited": the queue stays put until the person sends.
+    if let Some(chat) = chat_id.as_deref() {
+        hold_queue(chat);
+    }
 
-    let interrupted = status == "running"
-        && chat_id.as_deref().is_some_and(|chat| {
-            steer(
-                chat,
-                crate::execution::runner::LaterTurn {
-                    interrupt: true,
-                    ..Default::default()
-                },
-            )
-        });
+    let interrupted = chat_id.as_deref().is_some_and(|chat| {
+        steer(
+            chat,
+            crate::execution::runner::LaterTurn {
+                interrupt: true,
+                ..Default::default()
+            },
+        )
+    });
     if interrupted {
         let deadline = tokio::time::Instant::now() + grace;
         loop {
@@ -344,7 +384,7 @@ pub fn take_the_slot_for_testing(chat_id: &str) -> impl Drop {
 /// row still marked `running` after the daemon was killed says busy when nothing is, and the window
 /// between `ChatSlot::acquire` and the INSERT says free when the chat is already taken.
 pub fn is_busy(chat_id: &str) -> bool {
-    BUSY_CHATS.lock().unwrap().contains(chat_id)
+    relock(&BUSY_CHATS).contains(chat_id)
 }
 
 /// Owns a turn's chat slot and its temp MCP config for the length of the turn, releasing both when

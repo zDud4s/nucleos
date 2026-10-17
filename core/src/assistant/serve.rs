@@ -13,6 +13,9 @@ use super::*;
 /// process is keyed when it is SPAWNED and a kept process keeps the key it was spawned with, so a
 /// turn written down a kept process must not rotate `chat_tokens` (that rotation was the 401 on
 /// turn two): the key is minted only on the path that starts a process.
+///
+/// `fingerprint` is [`spawn_fingerprint`] of the turn: a kept process is spoken to only when it was
+/// spawned with the same one.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn serve_turn(
     runner: &std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
@@ -23,6 +26,7 @@ pub(super) async fn serve_turn(
     deadlines: TurnDeadlines,
     may_live: bool,
     fresh_key: Option<&sqlx::SqlitePool>,
+    fingerprint: &str,
 ) -> Result<std::io::Result<crate::execution::runner::RunOutcome>, tokio::time::error::Elapsed> {
     if !may_live {
         request.progress_timeout = deadlines.silence;
@@ -40,14 +44,22 @@ pub(super) async fn serve_turn(
         //
         // A process that never said is one whose `init` never arrived, which is not a process worth
         // speaking to; it falls through and is dropped on the way out.
-        let known = live.session_id.lock().unwrap().clone();
+        let known = relock(&live.session_id).clone();
         // Everything a process fixed when it was spawned and cannot be told to change: where it is
-        // standing, and which conversation it is having. Both are resolved per turn — a fresh context abandons the session — so a process that no
-        // longer matches this turn is not a process this turn may be answered by. It falls through
-        // and is dropped, which stops it, and a new one is started to the turn's own shape.
-        let same_ground = live.cwd == request.cwd && live.permission == request.permission;
-        let same_conversation = known.is_some() && request.resume_session_id == known;
-        if let Some(session_id) = known.filter(|_| same_ground && same_conversation) {
+        // standing, which mode it acts under, how it was configured (the fingerprint: model, effort,
+        // denied tools, directories, instructions...) and which conversation it is having. All are
+        // resolved per turn — a fresh context abandons the session — so a process that no longer
+        // matches this turn is not a process this turn may be answered by. It falls through and is
+        // dropped, which stops it, and a new one is started to the turn's own shape.
+        let same_ground = live.cwd == request.cwd
+            && live.permission == request.permission
+            && live.spawned_with == fingerprint;
+        let same_conversation = conversation_of(
+            known.as_deref(),
+            live.resumed.as_deref(),
+            request.resume_session_id.as_deref(),
+        );
+        if let Some(session_id) = same_conversation.filter(|_| same_ground) {
             let _ = session_tx.send(session_id.clone());
             // Bound before the match, not inside its scrutinee: a temporary there would hold the
             // borrow of `live` through every arm, and one of them has to hand it back.
@@ -114,19 +126,76 @@ pub(super) async fn serve_turn(
         chat_key::rekey(&mut request.env, pool, chat_id).await;
     }
 
-    start_live_chat(runner, request, session_tx, transcript, chat_id, deadlines).await
+    start_live_chat(
+        runner,
+        request,
+        session_tx,
+        transcript,
+        chat_id,
+        deadlines,
+        fingerprint,
+    )
+    .await
 }
 
-/// Starts a conversation's process, gathers the turn it was started with, and keeps it for the next.
-pub(super) async fn start_live_chat(
+/// The session a kept process is having, when it is the one `wanted` asks for.
+///
+/// `known` is what the process announced. A process warmed ahead of its first message has announced
+/// nothing yet — the CLI says nothing until it is spoken to — so it is accepted on the session it was
+/// spawned to resume (`resumed`) instead, which is the one thing that tells it apart from a process
+/// whose `init` never arrived.
+fn conversation_of(
+    known: Option<&str>,
+    resumed: Option<&str>,
+    wanted: Option<&str>,
+) -> Option<String> {
+    match (known, resumed) {
+        (Some(id), _) => (wanted == Some(id)).then(|| id.to_owned()),
+        (None, Some(resumed)) => (wanted == Some(resumed)).then(|| resumed.to_owned()),
+        (None, None) => None,
+    }
+}
+
+/// Whether the conversation has a kept process of any kind.
+pub(super) fn has_kept_process(chat_id: &str) -> bool {
+    relock(&LIVE_CHATS).contains_key(chat_id)
+}
+
+/// Whether the process the conversation has kept would serve a turn with these facts: the same rules
+/// [`serve_turn`] applies before it speaks down one, asked without taking it.
+///
+/// Used before the turn builds its request, to skip what a kept process would discard.
+pub(super) fn kept_process_fits(
+    chat_id: &str,
+    fingerprint: &str,
+    cwd: Option<&std::path::Path>,
+    permission: crate::execution::runner::Permission,
+    resume: Option<&str>,
+) -> bool {
+    let kept = relock(&LIVE_CHATS);
+    kept.get(chat_id).is_some_and(|live| {
+        let known = relock(&live.session_id).clone();
+        live.cwd.as_deref() == cwd
+            && live.permission == permission
+            && live.spawned_with == fingerprint
+            && conversation_of(known.as_deref(), live.resumed.as_deref(), resume).is_some()
+    })
+}
+
+/// Spawns a conversation's process and returns it, with nothing asked of it yet.
+///
+/// The half of starting a conversation that does not depend on there being a turn to carry: a
+/// process warmed ahead of its first message is made here, and so is the one a turn starts. The
+/// request's prompt is the opening line; empty, the CLI is left waiting for the first one.
+///
+/// Must run inside the runtime: the process lives in tasks this spawns.
+pub(super) fn spawn_live_process(
     runner: &std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
     mut request: crate::execution::runner::RunRequest,
     session_tx: tokio::sync::mpsc::UnboundedSender<String>,
-    transcript: &std::sync::Arc<Mutex<String>>,
     chat_id: &str,
-    deadlines: TurnDeadlines,
-) -> Result<std::io::Result<crate::execution::runner::RunOutcome>, tokio::time::error::Elapsed> {
-    let began = std::time::Instant::now();
+    fingerprint: &str,
+) -> LiveChat {
     let (messages, incoming) =
         tokio::sync::mpsc::unbounded_channel::<crate::execution::runner::LaterTurn>();
     let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
@@ -135,9 +204,11 @@ pub(super) async fn start_live_chat(
 
     // Read before the request is handed over, because that is what carries it, and kept so a later
     // turn wanting a different directory — or a different mode — can be told this process is the
-    // wrong one.
+    // wrong one. `resumed` is the session the process was told to continue, which is how a process
+    // that has not spoken yet is still known for the conversation it was started for.
     let started_in = request.cwd.clone();
     let was_permission = request.permission;
+    let resumed = request.resume_session_id.clone();
 
     // stdin IS the channel a later turn arrives on, so a process meant to serve more than one has to
     // take that door whether or not this turn carries anything that could only fit through it.
@@ -217,7 +288,7 @@ pub(super) async fn start_live_chat(
         let known = std::sync::Arc::clone(&session_id);
         tokio::spawn(async move {
             if let Some(id) = process_session_rx.recv().await {
-                *known.lock().unwrap() = Some(id.clone());
+                *relock(&known) = Some(id.clone());
                 // Onward to the turn's own recorder, which writes it to this turn's row and to the
                 // chat's resumable session — the two writes that let the conversation survive the
                 // process it is being answered by.
@@ -226,21 +297,32 @@ pub(super) async fn start_live_chat(
         });
     }
 
-    let mut live = LiveChat {
+    LiveChat::new(
         messages,
         events,
-        session_id: std::sync::Arc::clone(&session_id),
-        abort: supervisor.abort_handle(),
+        session_id,
+        supervisor.abort_handle(),
         stopped_because,
-        permission: was_permission,
-        cwd: started_in,
-        idle_since: std::time::Instant::now(),
-        idle_for: LIVE_IDLE,
-        _counted: LiveCount::start(),
-        carried: Default::default(),
-        background: HashSet::new(),
-        watcher: 0,
-    };
+        was_permission,
+        started_in,
+        fingerprint.to_owned(),
+        resumed,
+    )
+}
+
+/// Starts a conversation's process, gathers the turn it was started with, and keeps it for the next.
+pub(super) async fn start_live_chat(
+    runner: &std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
+    request: crate::execution::runner::RunRequest,
+    session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    transcript: &std::sync::Arc<Mutex<String>>,
+    chat_id: &str,
+    deadlines: TurnDeadlines,
+    fingerprint: &str,
+) -> Result<std::io::Result<crate::execution::runner::RunOutcome>, tokio::time::error::Elapsed> {
+    let began = std::time::Instant::now();
+    let mut live = spawn_live_process(runner, request, session_tx, chat_id, fingerprint);
+    let session_id = std::sync::Arc::clone(&live.session_id);
 
     // Open while the opening turn is gathered, exactly as in `serve_turn`.
     let steer = SteerGuard::open(chat_id, &live.messages);
@@ -257,7 +339,7 @@ pub(super) async fn start_live_chat(
                 .map(|held| held.clone())
                 .unwrap_or_default();
             let idle_for = idle_for_turn(&stdout, began.elapsed());
-            let known = session_id.lock().unwrap().clone().unwrap_or_default();
+            let known = relock(&session_id).clone().unwrap_or_default();
             let gathered = gathered(outcome, stdout, known);
             keep_live(chat_id, live, idle_for);
             Ok(Ok(gathered))
@@ -274,7 +356,7 @@ pub(super) async fn start_live_chat(
         Ok(LiveTurn::WentSilent(after)) => Ok(Ok(went_silent(
             transcript,
             after,
-            session_id.lock().unwrap().clone(),
+            relock(&session_id).clone(),
         ))),
         Err(elapsed) => Err(elapsed),
     }

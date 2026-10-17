@@ -6,8 +6,10 @@ import { BLURRED_CADENCE, dueWhileBlurred } from "./pacing";
 function query(
   observers: Array<Record<string, unknown>>,
   state: Partial<Query["state"]> = {},
+  meta?: Record<string, unknown>,
 ): Query {
   return {
+    meta,
     observers: observers.map((options) => ({ options })),
     state: { dataUpdatedAt: 0, errorUpdatedAt: 0, fetchStatus: "idle", ...state },
   } as unknown as Query;
@@ -44,6 +46,23 @@ describe("dueWhileBlurred", () => {
     expect(
       dueWhileBlurred(query([{ refetchInterval: 3000, refetchIntervalInBackground: true }]), 1e9),
     ).toBe(false);
+  });
+});
+
+describe("dueWhileBlurred, urgent conversations", () => {
+  it("a conversation with a live turn or a pending ask keeps its own cadence while blurred", () => {
+    const urgent = query([{ refetchInterval: 1500 }], { dataUpdatedAt: 1000 }, {
+      urgentWhileBlurred: () => true,
+    });
+    expect(dueWhileBlurred(urgent, 1000 + 1499)).toBe(false);
+    expect(dueWhileBlurred(urgent, 1000 + 1500)).toBe(true);
+
+    // Not urgent (meta answers false, or says nothing): the blurred floor still applies.
+    const calm = query([{ refetchInterval: 1500 }], { dataUpdatedAt: 1000 }, {
+      urgentWhileBlurred: () => false,
+    });
+    expect(dueWhileBlurred(calm, 1000 + 1500)).toBe(false);
+    expect(dueWhileBlurred(calm, 1000 + BLURRED_CADENCE)).toBe(true);
   });
 });
 

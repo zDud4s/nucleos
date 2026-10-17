@@ -753,11 +753,34 @@ pub(super) async fn get_assistant_chat(
     Query(query): Query<TranscriptQuery>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<TranscriptOut>, StatusCode> {
+    // 404 for an id nothing ever used: a `200` with an empty transcript reads as a conversation
+    // that exists and is quiet. A `chats` row, an assistant run OR a queued message is enough, so
+    // an archived chat (its row stays), a Telegram chat (it never had one) and a chat whose only
+    // trace is a message still waiting all stay readable.
+    let known: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM chats WHERE chat_id = ?)
+             OR EXISTS (SELECT 1 FROM runs WHERE chat_id = ? AND mode = 'assistant')
+             OR EXISTS (SELECT 1 FROM chat_queue WHERE chat_id = ?)",
+    )
+    .bind(&chat_id)
+    .bind(&chat_id)
+    .bind(&chat_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "looking up an assistant chat failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if !known {
+        return Err(StatusCode::NOT_FOUND);
+    }
     // Only the visible transcript poll sends this header (`useChatTranscript`); voice reads and
     // `?before=` pages do not, so a read that is not somebody looking at the chat never keeps its
     // process alive.
     if headers.get("x-nucleos-chat-open").is_some_and(|v| v == "1") {
         crate::assistant::mark_open(&chat_id);
+        // Warm the opened chat's process so the first turn does not pay the spawn.
+        crate::assistant::prewarm_open_chat(&state, &chat_id);
     }
     // `?` on a missing bound reads as no bound: `i64::MAX` is above every id this table will ever
     // hold, so one query serves both the recent end and a page above it. Two queries differing by
@@ -815,9 +838,30 @@ pub(super) async fn get_assistant_chat(
         .unwrap_or_default();
     // Empty on a failure, for the same trade: losing the note about what was said mid-turn is a
     // smaller loss than a conversation that will not open.
-    let said = crate::assistant::said_during(&state.pool, &chat_id)
+    //
+    // Bounded to the page: only what was said into a turn at or above the page's lowest one can
+    // belong to a turn this response carries, and this route is polled while a turn is live.
+    let said = match turns.first() {
+        Some(oldest) => sqlx::query_as::<_, crate::assistant::SaidDuring>(
+            "SELECT run_id, text, created_at FROM chat_said_now
+              WHERE chat_id = ? AND run_id >= ? ORDER BY id",
+        )
+        .bind(&chat_id)
+        .bind(oldest.id)
+        .fetch_all(&state.pool)
         .await
-        .unwrap_or_default();
+        .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    // The notices from the page's own time onward, or all of them when the page is the whole
+    // history — a notice older than the oldest turn shown has nothing on the page to sit beside.
+    let notices = match turns.first() {
+        Some(oldest) if more => {
+            crate::chats::notices::for_chat_since(&state.pool, &chat_id, &oldest.created_at).await
+        }
+        _ => crate::chats::notices::for_chat(&state.pool, &chat_id).await,
+    }
+    .unwrap_or_default();
     // Read through `assistant::handed_over` rather than parsed here: that function is already the
     // one reader of the column's shape, and a second one is a second thing to change the day the
     // shape does. A chat that was handed nothing comes back empty, which is the honest answer for
@@ -847,9 +891,7 @@ pub(super) async fn get_assistant_chat(
         // Empty on a failure rather than a 500, the same trade the two reads above make: a
         // transcript is the point of this request, and losing a department's aside is a smaller loss
         // than a conversation that will not open.
-        notices: crate::chats::notices::for_chat(&state.pool, &chat_id)
-            .await
-            .unwrap_or_default(),
+        notices,
         turns: turns
             .into_iter()
             .map(|turn| {
@@ -1086,12 +1128,65 @@ pub(super) async fn post_chat_restore(
 pub(super) async fn delete_chat(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
+    let failed = |error: sqlx::Error| {
+        tracing::warn!(%error, "archiving a chat failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+
+    // `204` for an archive that matched nothing is the API saying "done" about something it did
+    // not do.
+    if crate::chats::get(&state.pool, &chat_id)
+        .await
+        .map_err(failed)?
+        .is_none()
+    {
+        return Ok(refusal_with_detail(
+            StatusCode::NOT_FOUND,
+            "chat_not_found",
+            "There is no such conversation, or it is already archived.".to_string(),
+        )
+        .into_response());
+    }
+
+    // Putting away a conversation that is answering would hide a turn that is still being paid
+    // for, and its answer would land in a chat nobody can see.
+    let answering: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM runs
+                         WHERE chat_id = ? AND mode = 'assistant'
+                           AND status IN ('running', 'pending'))",
+    )
+    .bind(&chat_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(failed)?;
+    if answering || crate::assistant::is_busy(&chat_id) {
+        return Ok(refusal_with_detail(
+            StatusCode::CONFLICT,
+            "chat_busy",
+            "This conversation is answering right now. Stop it or wait for the answer, then archive it."
+                .to_string(),
+        )
+        .into_response());
+    }
+
+    // Messages still waiting would be sent into a conversation nobody can see.
+    if !crate::chats::queued(&state.pool, &chat_id)
+        .await
+        .map_err(failed)?
+        .is_empty()
+    {
+        return Ok(refusal_with_detail(
+            StatusCode::CONFLICT,
+            "chat_queued",
+            "This conversation has messages waiting to be sent. Remove them or let them go, then archive it."
+                .to_string(),
+        )
+        .into_response());
+    }
+
     crate::chats::archive(&state.pool, &chat_id)
         .await
-        .map(|()| StatusCode::NO_CONTENT)
-        .map_err(|error| {
-            tracing::warn!(%error, "archiving a chat failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+        .map_err(failed)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }

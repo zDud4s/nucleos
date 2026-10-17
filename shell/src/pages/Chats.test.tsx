@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { act } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import {
   Outlet,
@@ -85,7 +87,30 @@ beforeEach(() => {
   dictation.trouble = null;
   localStorage.clear();
   resetHeld();
+  return forgetDrafts();
 });
+
+/**
+ * Drafts are module state (`chats/drafts.ts`), so one test's half-typed words would open the next
+ * test's conversation of the same id with the box already full. There is no "forget all" on the
+ * module, only `clearDraft(id)`, so the ids this file uses are cleared one by one.
+ *
+ * Imported by a computed specifier and under a `try`, so that a build that does not have the module
+ * yet fails the tests that are ABOUT drafts and not every test in the file.
+ */
+async function forgetDrafts() {
+  const spec = "../chats/drafts";
+  try {
+    const drafts = (await import(/* @vite-ignore */ spec)) as {
+      clearDraft?: (chatId: string) => void;
+    };
+    for (const id of ["c-1", "c-2", "c-3", "new-1", "0d2b-a-uuid-9f1", "d-1", "d-2"]) {
+      drafts.clearDraft?.(id);
+    }
+  } catch {
+    // The module is not there yet; nothing to forget.
+  }
+}
 
 /* ------------------------------------------------------------ fixtures -- */
 
@@ -4946,7 +4971,7 @@ describe("stopping a turn", () => {
     );
   });
 
-  it("puts Stop in send's place while the box is empty, and gives send back on typing", async () => {
+  it("puts Stop in send's place while the box is empty, and gives send back beside it on typing", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1" })], {
         "c-1": [turnRow({ id: 1, status: "running", answer: null })],
@@ -4964,7 +4989,7 @@ describe("stopping a turn", () => {
 
     fireEvent.change(screen.getByLabelText("Message"), { target: { value: "also this" } });
     expect(screen.getByRole("button", { name: "Send" })).toBeDefined();
-    expect(screen.queryByRole("button", { name: /^stop$/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^stop$/i })).not.toBeNull();
   });
 
   it("offers nothing to stop on a turn that has landed", async () => {
@@ -6318,5 +6343,535 @@ describe("Chats - the cache and agent chips", () => {
     expect(await screen.findByRole("button", { name: /2 agents$/ })).toBeTruthy();
     // The subagent's own call is not listed in the transcript's "What it did".
     expect(screen.queryByText("Grep")).toBeNull();
+  });
+});
+
+/* ------------------------------------------- chats review: composer and page -- */
+
+/** The calls the page made to one path with one method, in order. */
+function callsTo(path: string, method: string) {
+  return daemon.apiFetch.mock.calls.filter(
+    (call) => String(call[0]) === path && (call[1] as RequestInit | undefined)?.method === method,
+  );
+}
+
+/** A moment of real time, for asserting that something did NOT happen. */
+function aMoment(ms = 120): Promise<void> {
+  return act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  });
+}
+
+describe("Chats - the composer on send", () => {
+  it("the composer clears on send and gives the words back if the send fails", async () => {
+    let refuse!: (error: unknown) => void;
+    const answer = new Promise<never>((_, reject) => {
+      refuse = reject;
+    });
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }, { onMessage: () => answer }),
+    );
+
+    await renderChats("/chats/c-1");
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "are you still there?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    // The daemon has not answered, and the box is already empty: the person is not made to look at
+    // their own words sitting in a box that has already let them go.
+    await waitFor(() => expect(callsTo("/assistant/message", "POST")).toHaveLength(1));
+    expect(textarea.value).toBe("");
+
+    await act(async () => {
+      refuse(new ApiRefusal(409, "turn_in_progress", "turn_in_progress"));
+      await answer.catch(() => undefined);
+    });
+
+    // Refused, so they are given back exactly as they were typed.
+    await waitFor(() => expect(textarea.value).toBe("are you still there?"));
+    expect(await screen.findByText("turn_in_progress")).toBeDefined();
+  });
+
+  it("a draft and its scroll position survive switching to another conversation and back", async () => {
+    const undo = withLayout(2000, 500);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch([chatSummary({ chat_id: "d-1" }), chatSummary({ chat_id: "d-2" })], {
+          "d-1": [turnRow({ id: 1, answer: "one answer" })],
+          "d-2": [turnRow({ id: 2, answer: "two answer" })],
+        }),
+      );
+      const { container, router } = await renderChats("/chats/d-1");
+      await screen.findByText("one answer");
+
+      fireEvent.change(await screen.findByLabelText("Message"), {
+        target: { value: "half a thought" },
+      });
+      // Read away from the end, so the position is one a reader chose and not the end that every
+      // conversation opens at.
+      const first = theBox(container);
+      first.scrollTop = 300;
+      fireEvent.scroll(first);
+
+      await act(async () => {
+        await router.navigate({ to: "/chats/$chatId", params: { chatId: "d-2" } });
+      });
+      await screen.findByText("two answer");
+      // The other conversation has its own box, and nothing of the first one's in it.
+      await waitFor(() =>
+        expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe(""),
+      );
+
+      await act(async () => {
+        await router.navigate({ to: "/chats/$chatId", params: { chatId: "d-1" } });
+      });
+      await screen.findByText("one answer");
+      await waitFor(() =>
+        expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe(
+          "half a thought",
+        ),
+      );
+      await waitFor(() => expect(theBox(container).scrollTop).toBe(300));
+    } finally {
+      undo();
+    }
+  });
+});
+
+describe("Chats - keeping up with the end of a conversation", () => {
+  it("an opened conversation follows its end when its content grows", async () => {
+    const undo = withLayout(2000, 500);
+    const observed: Array<{ target: Element; fire: () => void }> = [];
+    class FakeResizeObserver {
+      private readonly callback: ResizeObserverCallback;
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback;
+      }
+      observe(target: Element) {
+        observed.push({
+          target,
+          fire: () => this.callback([], this as unknown as ResizeObserver),
+        });
+      }
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch([chatSummary({ chat_id: "c-1" })], {
+          "c-1": [turnRow({ id: 1, answer: "isto foi o fim" })],
+        }),
+      );
+      const { container } = await renderChats("/chats/c-1");
+      await screen.findByText("isto foi o fim");
+      const box = theBox(container);
+      await waitFor(() => expect(box.scrollTop).toBe(2000));
+
+      // Something inside grows with no render of the page: an image decoding, a code block
+      // wrapping after a resize, a tool's output opening. Nothing but the box's own content
+      // resizing can say so.
+      const watching = observed.filter((entry) => box.contains(entry.target));
+      expect(watching.length).toBeGreaterThan(0);
+
+      undo.grewTo(3000);
+      act(() => {
+        for (const entry of watching) entry.fire();
+      });
+      expect(box.scrollTop).toBe(3000);
+    } finally {
+      vi.unstubAllGlobals();
+      undo();
+    }
+  });
+
+  it("a search highlight fades even when a turn lands meanwhile", async () => {
+    const transcripts: Record<string, AssistantTurnRow[]> = {
+      "c-1": [
+        turnRow({ id: 1, asked: "why 29 February?", answer: "the year rule has three parts" }),
+        turnRow({ id: 2, asked: "and the tests?", answer: "1900, 2000 and 2024" }),
+      ],
+    };
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", title: "the date parser" })], transcripts),
+    );
+    const { queryClient } = await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Transcript" });
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "three parts" } });
+    fireEvent.click(await within(palette).findByText(/the year rule has three parts/));
+    await waitFor(() => {
+      expect(document.getElementById("turn-1")?.className).toContain("chats-turn-lit");
+    });
+
+    // A turn lands while the turn is lit. The row count changes, and the fade used to be tied to
+    // it: the timer was cancelled by the re-render and never set again, so the turn stayed lit for
+    // as long as the page was open.
+    transcripts["c-1"] = [
+      ...transcripts["c-1"],
+      turnRow({ id: 3, asked: "and later?", answer: "it landed meanwhile" }),
+    ];
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: keys.chats.detail("c-1") });
+    });
+    expect(await screen.findByText("it landed meanwhile")).toBeDefined();
+
+    await waitFor(
+      () => expect(document.getElementById("turn-1")?.className).not.toContain("chats-turn-lit"),
+      { timeout: 4500 },
+    );
+  }, 12_000);
+});
+
+describe("Chats - stopping and typing", () => {
+  it("a refused stop says why", async () => {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], {
+      "c-1": [turnRow({ id: 1, status: "running", answer: null })],
+    });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/assistant/turns/1/stop" && init?.method === "POST") {
+        throw new ApiRefusal(
+          409,
+          "turn_gone",
+          "that turn has already ended, so there is nothing to stop",
+        );
+      }
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+    fireEvent.click(await screen.findByRole("button", { name: /^stop$/i }));
+
+    // The daemon's own sentence, beside the box: a Stop that does nothing and says nothing reads
+    // as a button that is broken.
+    expect(
+      await screen.findByText(/that turn has already ended, so there is nothing to stop/),
+    ).toBeDefined();
+  });
+
+  it("Enter while an IME is composing does not start a conversation or rename", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([], {}));
+    await renderChats("/chats");
+    const start = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(start, { target: { value: "にほんご" } });
+    // The Enter that commits a candidate in an input method is not the person sending.
+    fireEvent.keyDown(start, { key: "Enter", isComposing: true });
+    await aMoment();
+    expect(callsTo("/assistant/chats", "POST")).toHaveLength(0);
+    expect(start.value).toBe("にほんご");
+
+    cleanup();
+    daemon.apiFetch.mockReset();
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", title: "old name" })], { "c-1": [] }),
+    );
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Rename" }));
+    const dialog = await screen.findByRole("dialog", { name: "Rename conversation" });
+    const title = within(dialog).getByRole("textbox", { name: "Conversation title" });
+    fireEvent.change(title, { target: { value: "にほんご" } });
+    fireEvent.keyDown(title, { key: "Enter", isComposing: true });
+    await aMoment();
+    expect(callsTo("/assistant/chats/c-1", "PATCH")).toHaveLength(0);
+  });
+
+  it("pressing Enter twice on a rename sends one rename", async () => {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1", title: "old name" })], { "c-1": [] });
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/assistant/chats/c-1" && init?.method === "PATCH") {
+        await slow;
+        return undefined;
+      }
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Rename" }));
+    const dialog = await screen.findByRole("dialog", { name: "Rename conversation" });
+    const title = within(dialog).getByRole("textbox", { name: "Conversation title" });
+    fireEvent.change(title, { target: { value: "new name" } });
+
+    fireEvent.keyDown(title, { key: "Enter" });
+    await waitFor(() => expect(callsTo("/assistant/chats/c-1", "PATCH")).toHaveLength(1));
+    // The first is still in flight; the second Enter is a person who is not sure the first took.
+    fireEvent.keyDown(title, { key: "Enter" });
+    await aMoment();
+    expect(callsTo("/assistant/chats/c-1", "PATCH")).toHaveLength(1);
+
+    await act(async () => {
+      release();
+      await slow;
+    });
+  });
+});
+
+describe("Chats - what a turn costs the page", () => {
+  it("a settled turn reads the conversation list only when its forward panel opens", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch(
+        [
+          chatSummary({ chat_id: "c-1", title: "aqui" }),
+          chatSummary({ chat_id: "c-2", title: "o planeamento" }),
+        ],
+        {
+          "c-1": [
+            turnRow({ id: 1, answer: "first answer" }),
+            turnRow({ id: 2, answer: "second answer" }),
+            turnRow({ id: 3, answer: "third answer" }),
+          ],
+        },
+      ),
+    );
+    const { queryClient } = await renderChats("/chats/c-1");
+    await screen.findByText("third answer");
+    const observers = () =>
+      queryClient
+        .getQueryCache()
+        .find({ queryKey: keys.chats.all, exact: true })
+        ?.getObserversCount() ?? 0;
+
+    const buttons = await screen.findAllByRole("button", { name: "hand to another conversation" });
+    expect(buttons).toHaveLength(3);
+    const before = observers();
+    expect(before).toBeGreaterThan(0);
+
+    // Three closed panels watch the list as little as none: every one of them used to subscribe to
+    // the list (and its poll) from the moment its turn was drawn, hundreds of subscriptions on a
+    // long transcript, to fill a menu nobody had opened.
+    fireEvent.click(buttons[0]);
+    const targets = await screen.findByRole("list", { name: "Hand it to" });
+    expect(await within(targets).findByRole("button", { name: "o planeamento" })).toBeDefined();
+    expect(observers()).toBe(before + 1);
+  });
+
+  it("a long transcript's turns are skipped by layout when off screen", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [turnRow({ id: 1, answer: "an answer" })],
+      }),
+    );
+    await renderChats("/chats/c-1");
+    await screen.findByText("an answer");
+    // The stylesheet is not loaded under jsdom, so the claim is made of the file and of the class
+    // the turns wear.
+    expect(document.getElementById("turn-1")?.className.split(" ")).toContain("chats-turn");
+
+    const css = readFileSync(resolve(process.cwd(), "src/pages/chats.css"), "utf8").replace(
+      /\/\*[\s\S]*?\*\//g,
+      "",
+    );
+    const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].filter(([, selector]) =>
+      /(^|,)\s*\.chats-turn(?![\w-])/.test(selector),
+    );
+    const skipped = rules.some(
+      ([, , body]) =>
+        /content-visibility:\s*auto/.test(body) && /contain-intrinsic-size:\s*auto\s/.test(body),
+    );
+    expect(skipped).toBe(true);
+  });
+
+  it("the chat zoom survives a storage that throws", async () => {
+    const getItem = Storage.prototype.getItem;
+    const setItem = Storage.prototype.setItem;
+    const get = vi
+      .spyOn(Storage.prototype, "getItem")
+      .mockImplementation(function (this: Storage, key: string) {
+        if (key === "chats.zoom") throw new Error("storage is denied");
+        return getItem.call(this, key);
+      });
+    const set = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(function (this: Storage, key: string, value: string) {
+        if (key === "chats.zoom") throw new Error("storage is full");
+        return setItem.call(this, key, value);
+      });
+    try {
+      daemon.apiFetch.mockImplementation(
+        chatsFetch([chatSummary({ chat_id: "c-1" })], {
+          "c-1": [turnRow({ id: 1, answer: "uma resposta" })],
+        }),
+      );
+      const { container } = await renderChats("/chats/c-1");
+      await screen.findByText("uma resposta");
+      // Opens at the page's own size rather than taking the whole conversation down with it.
+      expect(theBox(container).className).toContain("chats-zoom-100");
+
+      fireEvent.keyDown(window, { key: "+", ctrlKey: true });
+      await waitFor(() => expect(theBox(container).className).toContain("chats-zoom-110"));
+    } finally {
+      get.mockRestore();
+      set.mockRestore();
+    }
+  });
+});
+
+describe("Chats - refusals and failures that used to say nothing", () => {
+  it("an archive refused because a turn is running says why", async () => {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/assistant/chats/c-1" && init?.method === "DELETE") {
+        throw new ApiRefusal(
+          409,
+          "chat_busy",
+          "a turn is still running here; stop it before archiving",
+        );
+      }
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("button", { name: "Archive" }));
+    const confirm = await screen.findByRole("button", { name: /^keep holding to archive$/i });
+    await afterDwell();
+    fireEvent.click(confirm);
+
+    expect(
+      await screen.findByText(/a turn is still running here; stop it before archiving/),
+    ).toBeDefined();
+  });
+
+  it("a picture that cannot be read is reported rather than thrown", async () => {
+    class UnreadableReader {
+      onerror: (() => void) | null = null;
+      onload: (() => void) | null = null;
+      result: string | null = null;
+      readAsDataURL() {
+        queueMicrotask(() => this.onerror?.());
+      }
+    }
+    vi.stubGlobal("FileReader", UnreadableReader);
+    try {
+      daemon.apiFetch.mockImplementation(chatsFetch([], {}));
+      await renderChats("/chats");
+      const input = await pictureInput();
+      fireEvent.change(input, {
+        target: { files: [new File(["x"], "broken.png", { type: "image/png" })] },
+      });
+
+      // Said, and the page still standing: an unhandled rejection out of an event handler is a
+      // picture that vanished with no word about why.
+      expect(await screen.findByText(/could not read broken\.png/)).toBeDefined();
+      expect(screen.queryByRole("list", { name: "Attached pictures" })).toBeNull();
+      expect(screen.getByLabelText("Message")).toBeDefined();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("Chats - a live answer and a pending change", () => {
+  it("a live answer redraws at most once per animation frame", async () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const nextFrame = () =>
+      act(async () => {
+        for (const callback of frames.splice(0)) callback(performance.now());
+      });
+    const drawn = () => document.querySelector(".chats-turn-writing")?.textContent ?? "";
+    try {
+      const live = { 1: { text: "first", doing: null as string | null } };
+      daemon.apiFetch.mockImplementation(
+        chatsFetch(
+          [chatSummary({ chat_id: "c-1" })],
+          { "c-1": [turnRow({ id: 1, status: "running", answer: null })] },
+          { live },
+        ),
+      );
+      const { queryClient } = await renderChats("/chats/c-1");
+      await waitFor(async () => {
+        await nextFrame();
+        expect(drawn()).toBe("first");
+      });
+
+      // Three chunks inside one frame: the stream can deliver far more than the screen can show,
+      // and each of them used to re-parse the whole answer so far.
+      frames.length = 0;
+      act(() => {
+        for (const text of [
+          "first, second",
+          "first, second, third",
+          "first, second, third, fourth",
+        ]) {
+          live[1].text = text;
+          queryClient.setQueryData(keys.chats.live(1), {
+            text,
+            doing: null,
+            did: [],
+            thought: [],
+            thought_tokens: null,
+          });
+        }
+      });
+      expect(frames.length).toBeLessThanOrEqual(1);
+      expect(drawn()).not.toBe("first, second, third, fourth");
+
+      await waitFor(async () => {
+        await nextFrame();
+        expect(drawn()).toBe("first, second, third, fourth");
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("the permission picker stays usable while a change is in flight", async () => {
+    const base = chatsFetch(
+      [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
+      { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
+      {
+        projects: {
+          "c-1": {
+            cwd: "C:/Projects/nucleos",
+            tools: true,
+            session: null,
+            permission_mode: "auto",
+          },
+        },
+      },
+    );
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/assistant/chats/c-1" && init?.method === "PATCH") {
+        await slow;
+        return undefined;
+      }
+      return base(path, init);
+    });
+    await renderChats("/chats/c-1");
+
+    await openPermissionMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /Manual/ }));
+    await waitFor(() => expect(callsTo("/assistant/chats/c-1", "PATCH")).toHaveLength(1));
+
+    // The first change has not been answered. The picker is still a picker: somebody who picked the
+    // wrong rung is not made to wait for the daemon before picking the right one.
+    const trigger = screen.getByRole("button", { name: /^Permissions:/ }) as HTMLButtonElement;
+    expect(trigger.disabled).toBe(false);
+    await openPermissionMenu();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: /^Plan/ }));
+    await waitFor(() => expect(callsTo("/assistant/chats/c-1", "PATCH")).toHaveLength(2));
+    const second = callsTo("/assistant/chats/c-1", "PATCH")[1][1] as RequestInit;
+    expect(JSON.parse(String(second.body))).toEqual({ permission_mode: "plan" });
+
+    await act(async () => {
+      release();
+      await slow;
+    });
   });
 });

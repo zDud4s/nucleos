@@ -420,7 +420,7 @@ pub async fn permission_mode_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Resul
 
 /// Moves a conversation to another rung.
 pub async fn set_permission_mode(
-    pool: &SqlitePool,
+    pool: impl sqlx::SqliteExecutor<'_>,
     chat_id: &str,
     mode: PermissionMode,
 ) -> sqlx::Result<()> {
@@ -628,7 +628,11 @@ pub async fn ambient_mcp_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<bo
 }
 
 /// Turns the ambient MCP servers on or off for this conversation.
-pub async fn set_ambient_mcp(pool: &SqlitePool, chat_id: &str, on: bool) -> sqlx::Result<()> {
+pub async fn set_ambient_mcp(
+    pool: impl sqlx::SqliteExecutor<'_>,
+    chat_id: &str,
+    on: bool,
+) -> sqlx::Result<()> {
     sqlx::query("UPDATE chats SET ambient_mcp = ? WHERE chat_id = ?")
         .bind(on)
         .bind(chat_id)
@@ -675,7 +679,11 @@ pub async fn widen_window(pool: &SqlitePool, chat_id: &str, tokens: i64) -> sqlx
 }
 
 /// Sets who answers when the chosen model is unavailable. Empty clears it.
-pub async fn set_fallback(pool: &SqlitePool, chat_id: &str, names: &[String]) -> sqlx::Result<()> {
+pub async fn set_fallback(
+    pool: impl sqlx::SqliteExecutor<'_>,
+    chat_id: &str,
+    names: &[String],
+) -> sqlx::Result<()> {
     let joined = names.join(",");
     sqlx::query("UPDATE chats SET fallback_model = ? WHERE chat_id = ?")
         .bind((!joined.is_empty()).then_some(joined))
@@ -690,7 +698,11 @@ pub async fn set_fallback(pool: &SqlitePool, chat_id: &str, names: &[String]) ->
 /// The caller has already checked that each is an absolute directory. Here they are strings going
 /// into a column, and a second check would be a second answer to a question the filesystem can
 /// change between them — the same reasoning `set_cwd` gives.
-pub async fn set_extra_dirs(pool: &SqlitePool, chat_id: &str, dirs: &[String]) -> sqlx::Result<()> {
+pub async fn set_extra_dirs(
+    pool: impl sqlx::SqliteExecutor<'_>,
+    chat_id: &str,
+    dirs: &[String],
+) -> sqlx::Result<()> {
     let encoded = serde_json::to_string(dirs).unwrap_or_else(|_| "[]".to_string());
     sqlx::query("UPDATE chats SET extra_dirs = ? WHERE chat_id = ?")
         .bind((!dirs.is_empty()).then_some(encoded))
@@ -729,7 +741,7 @@ pub async fn clear_context(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()>
 /// Blank stored as NULL rather than as an empty string, so "nobody wrote instructions" and
 /// "somebody wrote nothing" are one state instead of two that read identically everywhere above.
 pub async fn set_system_prompt(
-    pool: &SqlitePool,
+    pool: impl sqlx::SqliteExecutor<'_>,
     chat_id: &str,
     instructions: Option<&str>,
 ) -> sqlx::Result<()> {
@@ -747,7 +759,7 @@ pub async fn set_system_prompt(
 /// The caller has already checked that each is a name this daemon knows how to deny. Here they are
 /// strings going into a column, for the reason `set_extra_dirs` gives.
 pub async fn set_denied_tools(
-    pool: &SqlitePool,
+    pool: impl sqlx::SqliteExecutor<'_>,
     chat_id: &str,
     names: &[String],
 ) -> sqlx::Result<()> {
@@ -768,7 +780,7 @@ pub async fn set_denied_tools(
 /// name safe here: two helpers called `reviewer` would collapse into one on the way into the map,
 /// and a person would watch one of them vanish without being told.
 pub async fn set_agents(
-    pool: &SqlitePool,
+    pool: impl sqlx::SqliteExecutor<'_>,
     chat_id: &str,
     agents: &[crate::execution::runner::Subagent],
 ) -> sqlx::Result<()> {
@@ -783,7 +795,7 @@ pub async fn set_agents(
 
 /// Sets the most one turn of this conversation may spend, or clears the ceiling.
 pub async fn set_turn_budget(
-    pool: &SqlitePool,
+    pool: impl sqlx::SqliteExecutor<'_>,
     chat_id: &str,
     ceiling: Option<f64>,
 ) -> sqlx::Result<()> {
@@ -801,7 +813,11 @@ pub async fn set_turn_budget(
 /// naming a cloud model on the local route would be routed to Ollama under a name it has never
 /// heard — but they are set by two calls, because this file's job is to write columns and not to
 /// decide which columns belong together.
-pub async fn set_model(pool: &SqlitePool, chat_id: &str, model: Option<&str>) -> sqlx::Result<()> {
+pub async fn set_model(
+    pool: impl sqlx::SqliteExecutor<'_>,
+    chat_id: &str,
+    model: Option<&str>,
+) -> sqlx::Result<()> {
     sqlx::query("UPDATE chats SET model = ? WHERE chat_id = ?")
         .bind(model)
         .bind(chat_id)
@@ -816,7 +832,7 @@ pub async fn set_model(pool: &SqlitePool, chat_id: &str, model: Option<&str>) ->
 /// for the reason 0110 gives: a level this daemon cannot STORE is worse than one the CLI refuses,
 /// because the first loses what somebody said and the second says so loudly.
 pub async fn set_effort(
-    pool: &SqlitePool,
+    pool: impl sqlx::SqliteExecutor<'_>,
     chat_id: &str,
     effort: Option<&str>,
 ) -> sqlx::Result<()> {
@@ -836,7 +852,11 @@ pub async fn set_effort(
 ///
 /// The caller has already checked that this is a directory. Here it is a string going into a column,
 /// and a second check would be a second answer to a question the filesystem can change between them.
-pub async fn set_cwd(pool: &SqlitePool, chat_id: &str, cwd: &str) -> sqlx::Result<()> {
+pub async fn set_cwd(
+    pool: impl sqlx::SqliteExecutor<'_>,
+    chat_id: &str,
+    cwd: &str,
+) -> sqlx::Result<()> {
     sqlx::query("UPDATE chats SET cwd = ? WHERE chat_id = ?")
         .bind(cwd)
         .bind(chat_id)
@@ -1109,7 +1129,7 @@ macro_rules! list_select {
                 c.extra_dirs, c.turn_budget_usd, c.agents, c.system_prompt, c.denied_tools,
                 c.cleared_after_run_id, c.context_window, c.created_at, c.cwd, c.ide_session_id,
                 c.group_id, c.archived_at,
-                (SELECT r.prompt FROM runs r
+                (SELECT substr(r.prompt, 1, 200) FROM runs r
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
                   ORDER BY r.id ASC LIMIT 1) AS first_message,
                 (SELECT r.created_at FROM runs r
@@ -1141,9 +1161,12 @@ macro_rules! list_select {
                 (SELECT COUNT(*) FROM chat_notices n
                   WHERE n.chat_id = c.chat_id
                     AND n.id > COALESCE(c.last_seen_notice_id, 0)) AS notices_waiting,
-                EXISTS (SELECT 1 FROM runs r
-                         WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
-                           AND r.status IN ('running', 'pending')) AS working,
+                -- A chat with messages waiting in its queue is working too: the next turn
+                -- starts by itself, so the list must not show it as idle.
+                (EXISTS (SELECT 1 FROM runs r
+                          WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
+                            AND r.status IN ('running', 'pending'))
+                 OR EXISTS (SELECT 1 FROM chat_queue q WHERE q.chat_id = c.chat_id)) AS working,
                 -- The newest turn, if it has settled and its tools include AskUserQuestion: the
                 -- model stopped to ask the person something.
                 COALESCE((SELECT r.status NOT IN ('running', 'pending')
@@ -1175,14 +1198,16 @@ fn list_where(archived: bool) -> &'static str {
 
 /// One conversation, or `None` when it is not one of the app's — never opened here, or archived.
 ///
-/// Read through `list` rather than with a query of its own, so there is exactly one definition of
-/// what a listed chat is and of where its fallback title comes from. A second SELECT saying almost
-/// the same thing is how the two drift.
+/// Read with the list's own SELECT (`list_select!`) narrowed to one id, so there is still exactly
+/// one definition of what a listed chat is, without reading every chat to answer for one.
 pub async fn get(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<ChatSummary>> {
-    Ok(list(pool)
-        .await?
-        .into_iter()
-        .find(|chat| chat.chat_id == chat_id))
+    sqlx::query_as::<_, ChatSummary>(concat!(
+        list_select!(),
+        " WHERE c.chat_id = ? AND c.archived_at IS NULL"
+    ))
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Every conversation had in the editor that this daemon has already picked up.
@@ -1225,7 +1250,11 @@ pub async fn brain_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<B
 ///
 /// Says nothing about the session the previous model left behind — that is `http.rs`'s to forget,
 /// because it is a decision about the conversation and not about this row.
-pub async fn set_brain(pool: &SqlitePool, chat_id: &str, brain: Brain) -> sqlx::Result<()> {
+pub async fn set_brain(
+    pool: impl sqlx::SqliteExecutor<'_>,
+    chat_id: &str,
+    brain: Brain,
+) -> sqlx::Result<()> {
     sqlx::query("UPDATE chats SET brain = ? WHERE chat_id = ?")
         .bind(brain.as_str())
         .bind(chat_id)
@@ -1274,7 +1303,11 @@ pub async fn mark_seen(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
 
 /// Names a conversation. A blank name clears it rather than storing whitespace, putting the
 /// first-message fallback back.
-pub async fn rename(pool: &SqlitePool, chat_id: &str, title: Option<&str>) -> sqlx::Result<()> {
+pub async fn rename(
+    pool: impl sqlx::SqliteExecutor<'_>,
+    chat_id: &str,
+    title: Option<&str>,
+) -> sqlx::Result<()> {
     let title = title.map(str::trim).filter(|t| !t.is_empty());
     sqlx::query("UPDATE chats SET title = ? WHERE chat_id = ?")
         .bind(title)
@@ -1571,6 +1604,78 @@ mod tests {
         assert_eq!(
             chat.last_activity.as_deref(),
             Some("2026-08-11T11:00:00+00:00")
+        );
+    }
+
+    /// Reading one chat answers the live one and nothing for an archived one or a stranger.
+    /// A regression guard for the single-query `get`: it must keep the same contract as the
+    /// list it replaces.
+    #[tokio::test]
+    async fn get_answers_one_live_chat_and_none_for_an_archived_one() {
+        let pool = test_pool().await;
+        let live = create(&pool, Brain::Cloud, None).await.unwrap();
+        let other = create(&pool, Brain::Cloud, None).await.unwrap();
+        let archived = create(&pool, Brain::Cloud, None).await.unwrap();
+        archive(&pool, &archived).await.unwrap();
+
+        let found = get(&pool, &live).await.unwrap().expect("the live chat");
+        assert_eq!(found.chat_id, live);
+        assert_ne!(found.chat_id, other);
+        assert!(get(&pool, &archived).await.unwrap().is_none());
+        assert!(get(&pool, "never-opened").await.unwrap().is_none());
+    }
+
+    /// A chat whose only activity is a message waiting its turn is working: the list shows the
+    /// spinner for it, or a person sees an idle chat that is about to answer.
+    #[tokio::test]
+    async fn a_chat_with_only_queued_messages_lists_as_working() {
+        let pool = test_pool().await;
+        let waiting = create(&pool, Brain::Cloud, None).await.unwrap();
+        let quiet = create(&pool, Brain::Cloud, None).await.unwrap();
+        enqueue(&pool, &waiting, "when you can", "shell", "[]")
+            .await
+            .unwrap();
+
+        let listed = list(&pool).await.unwrap();
+
+        assert!(
+            listed
+                .iter()
+                .find(|c| c.chat_id == waiting)
+                .unwrap()
+                .working
+        );
+        assert!(!listed.iter().find(|c| c.chat_id == quiet).unwrap().working);
+        assert!(get(&pool, &waiting).await.unwrap().unwrap().working);
+    }
+
+    /// The list carries a label's worth of the first message, not a whole pasted document, for
+    /// every chat in the sidebar on every poll.
+    #[tokio::test]
+    async fn the_list_carries_at_most_200_chars_of_the_first_message() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+        let long = "x".repeat(5000);
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, session_id, chat_id, created_at)
+             VALUES (?, 'completed', 'assistant', 's', ?, '2026-08-11T10:00:00+00:00')",
+        )
+        .bind(&long)
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let chat = list(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.chat_id == id)
+            .unwrap();
+
+        assert_eq!(
+            chat.first_message.as_deref().map(|m| m.chars().count()),
+            Some(200)
         );
     }
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useLiveTurn, useChatTasks, useStopTask, useTurnTools, type ChatTask } from "../data/chats";
+import { useLiveTurnSnapshot, useChatTasks, useStopTask, useTurnTools, type ChatTask } from "../data/chats";
 import { turnIsLive, type ToolCall, type Turn } from "../lib/turns";
 import { displayName } from "../lib/modelName";
 import { Modal } from "../ui/Modal";
@@ -483,13 +483,14 @@ export function ChatChips({
   const live = last !== undefined && turnIsLive(last.status);
   // A live turn's newest calls reach the live poll before the transcript; merge them in so a
   // subagent shows up while it is working.
-  const liveTurn = useLiveTurn(last?.id ?? 0, live);
+  // Read from the cache the page's own live poll fills; polling here too doubled the requests.
+  const liveSnapshot = useLiveTurnSnapshot(last?.id ?? 0);
   const merged = useMemo(() => {
     if (turns === undefined) return undefined;
-    const liveDid = liveTurn.data?.did;
+    const liveDid = live ? liveSnapshot?.did : undefined;
     if (!live || liveDid === undefined || liveDid.length === 0) return turns;
     return turns.map((t) => (t.id === last?.id && liveDid.length >= t.did.length ? { ...t, did: liveDid } : t));
-  }, [turns, liveTurn.data, live, last?.id]);
+  }, [turns, liveSnapshot, live, last?.id]);
 
   const cache = cacheState(merged, now);
   const base = useMemo(() => groupAgents(merged), [merged]);
