@@ -1,5 +1,5 @@
 # Which tests each change in this repository needs, read by the NucleOS daemon
-# (spec .ai/specs/2026-10-05-selecao-de-testes-design.md §3.1).
+# (test-selection design, §3.1).
 # Changing this file runs every group, and a direct edit by an agent asks the owner.
 version: 1
 tests:
@@ -41,6 +41,8 @@ tests:
         - scripts/heavy_classify.py
         - scripts/heavy_guard.py
         - scripts/heavy_cost.py
+        # Its test, heavy_tests/test_heavy_watch.py, is picked up by the same unittest discovery.
+        - scripts/heavy_watch.py
         - scripts/heavy_tests/
       command: bash scripts/gates.sh broker
   gate_entrypoints: [scripts/gates.sh, scripts/gate-diff.sh]
@@ -59,8 +61,6 @@ tests:
   no_test:
     # A measuring tool run by hand before and after a refactor; no gate calls it.
     - scripts/code_metrics.py
-    # Its tests live in the local workflow (.ai/), which is not versioned.
-    - scripts/heavy_watch.py
     - scripts/stage-bundle-bins.sh
     - scripts/css-contract.mjs
     - scripts/preview-shots.mjs
@@ -72,7 +72,20 @@ tests:
     - scripts/install-hooks.sh
     - scripts/leave-nothing-behind.mjs
     - scripts/update-shell.ps1
+    # Deletes regenerable build output on the owner's machine; run by hand.
+    - scripts/free-disk.ps1
+    # Serve the preview live for an agent-driven dev-browser window; run by hand.
+    - scripts/live-preview.mjs
+    - scripts/live-preview-agent.js
     - docs/
+    - design/
+    - .githooks/
+    - AGENTS.md
+    - CLAUDE.md
+    - DESIGN.md
+    - PRODUCT.md
+    - .impeccable.md
+    - .impeccable/
     - .gitignore
     - .gitattributes
     - .gitleaksignore
