@@ -57,12 +57,31 @@ pub(super) fn is_key_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
 }
 
-/// The end of an unquoted value: whitespace, a quote, or a delimiter that closes it in JSON/shell.
+/// A quote at `at` as it reads after any level of escaping: a run of backslashes, then `"` or `'`.
+/// Returns the run's length (backslashes plus the quote) and the quote.
+///
+/// The tool input reaches the judge JSON-serialized (`clean_tool_input`), so a shell `"` arrives
+/// as `\"`, and one inside a double-quoted shell string as `\\\"`. Reading only a bare `"` as a
+/// quote let `{\"api_key\": \"v\"}` and `KEY=\"v\"` through with the value intact.
+pub(super) fn quote_at(chars: &[char], at: usize) -> Option<(usize, char)> {
+    let mut end = at;
+    while chars.get(end) == Some(&'\\') {
+        end += 1;
+    }
+    match chars.get(end) {
+        Some(&quote) if quote == '"' || quote == '\'' => Some((end + 1 - at, quote)),
+        _ => None,
+    }
+}
+
+/// The end of an unquoted value: whitespace, a quote (escaped or not), or a delimiter that closes
+/// it in JSON/shell.
 pub(super) fn bare_value_end(chars: &[char], from: usize) -> usize {
     let mut end = from;
     while end < chars.len()
         && !chars[end].is_whitespace()
         && !matches!(chars[end], '"' | '\'' | ',' | ';' | '}' | ')' | '&')
+        && !(chars[end] == '\\' && quote_at(chars, end).is_some())
     {
         end += 1;
     }
@@ -71,17 +90,29 @@ pub(super) fn bare_value_end(chars: &[char], from: usize) -> usize {
 
 /// The end (exclusive) of the value starting at `from`: a quoted string including its quotes, or a
 /// bare run.
+///
+/// A quote opened as `\"` closes at a `"` behind exactly as many backslashes or fewer; a quote
+/// behind more is escaped one level deeper and belongs to the value. Unclosed, the value runs to the
+/// end of the text: redacting too much costs the judge context, too little leaks.
 pub(super) fn value_end(chars: &[char], from: usize) -> usize {
-    match chars.get(from) {
-        Some(&quote) if quote == '"' || quote == '\'' => {
-            let mut end = from + 1;
-            while end < chars.len() && chars[end] != quote {
-                end += 1;
-            }
-            (end + 1).min(chars.len())
+    let Some((open, quote)) = quote_at(chars, from) else {
+        return bare_value_end(chars, from);
+    };
+    let slashes = open - 1;
+    let body = from + open;
+    for (end, &character) in chars.iter().enumerate().skip(body) {
+        if character != quote {
+            continue;
         }
-        _ => bare_value_end(chars, from),
+        let mut run = end;
+        while run > body && chars[run - 1] == '\\' {
+            run -= 1;
+        }
+        if end - run <= slashes {
+            return end + 1;
+        }
     }
+    chars.len()
 }
 
 pub(super) fn skip_ws(chars: &[char], mut at: usize) -> usize {
@@ -122,8 +153,8 @@ pub(super) fn redact_assignments(text: &str) -> String {
             continue;
         }
         let mut at = i;
-        if matches!(chars.get(at), Some('"' | '\'')) {
-            at += 1;
+        if let Some((quote, _)) = quote_at(&chars, at) {
+            at += quote;
         }
         let value_start = match chars.get(at) {
             Some('=' | ':') => Some(skip_ws(&chars, at + 1)),
@@ -161,12 +192,16 @@ pub(super) fn redact_auth_headers(text: &str) -> String {
     while i < chars.len() {
         if lower[i..].starts_with(&name) {
             let mut at = i + name.len();
-            if matches!(chars.get(at), Some('"' | '\'')) {
-                at += 1;
+            if let Some((quote, _)) = quote_at(&chars, at) {
+                at += quote;
             }
             at = skip_ws(&chars, at);
             if matches!(chars.get(at), Some(':' | '=')) {
-                let word_start = skip_ws(&chars, at + 1);
+                let mut word_start = skip_ws(&chars, at + 1);
+                // `{\"Authorization\": \"Bearer x\"}`: the value's own opening quote, escaped.
+                if let Some((quote, _)) = quote_at(&chars, word_start) {
+                    word_start += quote;
+                }
                 let word_end = bare_value_end(&chars, word_start);
                 let word: String = chars[word_start..word_end].iter().collect();
                 let secret_start = if AUTH_SCHEMES.contains(&word.to_ascii_lowercase().as_str()) {
