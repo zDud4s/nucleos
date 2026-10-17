@@ -239,6 +239,10 @@ pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<
         }
     };
 
+    // One transaction for the queue and the status that says the queue exists. Written apart, a
+    // crash after some of the items left a `planning` job holding half a queue: the next pass
+    // read the same plan again and wrote it a second time on top of the first.
+    let mut tx = pool.begin().await?;
     for (ordinal, item) in planned.items.iter().enumerate() {
         // NULL rather than `[]`: the column that says nothing reads downstream as "the planner did
         // not say", where an empty array would read as "the planner said no files". A hint that
@@ -258,10 +262,12 @@ pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<
         .bind(files)
         .bind(edges(&item.depends_on))
         .bind(item.agent_id.as_deref())
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
-    if !set_live_status(pool, job.id, "implementing").await? {
+    let moved = set_live_status(&mut *tx, job.id, "implementing").await?;
+    tx.commit().await?;
+    if !moved {
         // Ended while its plan was being read. The queue stays written — it is what the job meant
         // to do, and reads as such — but nothing announces it as a job about to do it.
         return Ok(());
@@ -477,10 +483,15 @@ pub(super) async fn open_the_next_round(
 ) -> sqlx::Result<()> {
     let pool = &state.pool;
     let round = job.round + 1;
+    // One transaction from the ordinal read to the status, so the round opens whole or not at all.
+    // `jobs.replan_run_id` is the marker that says this replan was taken, and it is written last:
+    // a crash between the items and the marker left the items queued and the replan untaken, and
+    // the next pass opened the same round a second time.
+    let mut tx = pool.begin().await?;
     let next_ordinal: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(ordinal) + 1, 0) FROM job_items WHERE job_id = ?")
             .bind(job.id)
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await?;
 
     for (offset, item) in planned.items.iter().enumerate() {
@@ -503,7 +514,7 @@ pub(super) async fn open_the_next_round(
         .bind(files)
         .bind(edges(&item.depends_on))
         .bind(item.agent_id.as_deref())
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
 
@@ -519,7 +530,7 @@ pub(super) async fn open_the_next_round(
         .bind(job.id)
         .bind(*ordinal as i64)
         .bind(round)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
 
@@ -537,10 +548,12 @@ pub(super) async fn open_the_next_round(
     .bind(dry)
     .bind(run_id)
     .bind(job.id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
-    if !dry && !set_live_status(pool, job.id, "implementing").await? {
+    let moved = dry || set_live_status(&mut *tx, job.id, "implementing").await?;
+    tx.commit().await?;
+    if !moved {
         // Ended while the replan was being read; see `ingest_plan`.
         return Ok(());
     }
