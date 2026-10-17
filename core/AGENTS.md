@@ -115,6 +115,7 @@ the contract, not a snapshot.
 | `http/map.rs` | The project map (`/projects/{id}/map/*`). |
 | `http/map_states.rs` | The state machines a project's code draws (`/projects/{id}/map/states`). |
 | `http/projects.rs` | The roster: adding, reading and removing projects (`/projects*`). |
+| `http/analytics.rs` | The analytics routes (`/analytics`, `/analytics/quota`, `/projects/{id}/analytics`): read `days`, refuse anything but 7/30/90 with a 400 rather than clamping, 404 a project off the roster, and hand the window to `analytics.rs`. |
 | `http/proposals.rs` | Proposals and the waiting queue (`/proposals/*`, `/waiting/*`). |
 | `http/relay.rs` | Notifications, PII, voice, web and browser seats (`/notifications/*`, `/pii`, `/voice/*`, `/web/*`, `/browser/*`). |
 | `http/repo.rs` | Reading and writing a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`, `/write`…). |
