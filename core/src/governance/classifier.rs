@@ -1214,6 +1214,15 @@ fn classify_segment(
     if segment_names_machine_settings(segment) {
         return Segment::Unrecognized;
     }
+    // The same for the governance files inside the workspace, and for every widening below rather
+    // than for confinement alone, where it first lived. A `Write` to `.claude/settings.json` asks
+    // the owner (`self-governing-file`) whatever the project declared, and the shell door has to
+    // say the same: a project that declared `cp` must not get `cp x .claude/hooks/ask_daemon.py`,
+    // nor an owner's `gh` list a read that names one. A project allow rule is a widening the
+    // project wrote, and the governance it would widen onto is the one thing it may not author.
+    if segment_names_self_governing(segment, cwd) {
+        return Segment::Unrecognized;
+    }
     // Decision #3's widening half. After every compiled permission, so it only ever changes the
     // answer for a command this file had no opinion about; after `shell_form_is_readable`, so a
     // declared prefix clears the same shape guards a compiled entry does. The compiled REFUSALS are
@@ -1261,12 +1270,12 @@ fn classify_segment(
     //
     // **Nor onto a self-governing file.** Confinement asks only where a command points, and
     // `.claude/hooks/ask_daemon.py` is inside the workspace. A `Write` there asks the owner
-    // (`self-governing-file`); a `cp` onto it may not be allowed for pointing nowhere else.
+    // (`self-governing-file`); a `cp` onto it may not be allowed for pointing nowhere else. That
+    // refusal is asked above, ahead of every widening, so it binds this one too.
     if unrecognized == Unrecognized::MayBeConfined
         && shell_form_is_readable(&normalized)
         && crate::execution::vcs::unqueueable_but_shared(segment).is_none()
         && crate::execution::vcs::unqueueable_but_shared(&flag_words(segment).join(" ")).is_none()
-        && !segment_names_self_governing(segment, cwd)
         && confined_to_workspace(segment, cwd, shell)
     {
         return Segment::Confined;
@@ -4402,6 +4411,70 @@ mod tests {
         }
     }
 
+    /// pytest's report flags write a file wherever their value points — the JUnit XML, the result
+    /// and report logs, pytest-html's page, pytest-json-report's file, and a `--cov-report` in its
+    /// `<type>:<path>` form. The same rule as Go's `-coverprofile`: a relative path that stays
+    /// inside the workspace is ordinary, anything else pends.
+    #[test]
+    fn a_pytest_report_flag_that_writes_outside_the_workspace_stays_pending() {
+        let workspace = Path::new(r"C:\work\repo");
+        for command in [
+            "pytest --junitxml=/c/Users/x/j.xml",
+            "pytest --junitxml /c/Users/x/j.xml",
+            "pytest --junit-xml=../j.xml",
+            "pytest --junitx=/c/Users/x/j.xml",
+            "pytest --junitxml",
+            "pytest --resultlog=~/r.log",
+            "pytest --report-log=$HOME/r.jsonl",
+            "pytest --html=C:/Users/x/report.html",
+            "pytest --json-report --json-report-file=/c/Users/x/r.json",
+            "pytest --cov=src --cov-report=xml:/c/Users/x/cov.xml",
+            "pytest --cov=src --cov-report xml:../cov.xml",
+            r"pytest --cov-report=html:C:\Users\x\htmlcov",
+            "pytest --cov-report=json:~/cov.json",
+            "pytest --cov-report=lcov:sub/../../cov.info",
+            "python -m pytest --junitxml=/c/Users/x/j.xml",
+            "py -m pytest --cov-report=xml:/c/Users/x/cov.xml",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({ "command": command }), None),
+                "pending_approval",
+                "unrecognized",
+            );
+            assert_ne!(
+                classify_asked_for(command, Some(workspace))
+                    .decision
+                    .decision,
+                "allow",
+                "widened by confinement: {command}"
+            );
+        }
+
+        // Relative and inside, a bare report type, a term modifier, and the switch that only
+        // shares a prefix with a file flag: all ordinary.
+        for command in [
+            "pytest --junitxml=reports/junit.xml",
+            "pytest --junit-xml junit.xml",
+            "pytest --resultlog=out/r.log",
+            "pytest --report-log=r.jsonl",
+            "pytest --html=report.html",
+            "pytest --json-report",
+            "pytest --json-report --json-report-file=out/r.json",
+            "pytest --cov=src --cov-report=xml",
+            "pytest --cov=src --cov-report=html",
+            "pytest --cov=src --cov-report=xml:out/cov.xml",
+            "pytest --cov=src --cov-report html:htmlcov",
+            "pytest --cov=src --cov-report=term-missing:skip-covered",
+            "python -m pytest --junitxml=reports/junit.xml",
+        ] {
+            assert_classification(
+                classify("Bash", &json!({ "command": command }), None),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
     /// The two git reads that cost job 21 two of its four items, in the exact spelling the run
     /// wrote them, plus the destroying spellings that keep the new entries honest.
     #[test]
@@ -5319,6 +5392,41 @@ mod tests {
         }
     }
 
+    /// pflag bundles short flags, so a refused one can hide behind a valueless one in the same
+    /// word: `-dL5` is `--draft --limit 5`. Reading only the group's first letter let all of these
+    /// through as `github-read`.
+    #[test]
+    fn a_refused_short_flag_inside_a_bundled_group_takes_the_allow_away() {
+        let policy = owner_policy();
+        for command in [
+            "gh pr list -dL5",
+            "gh pr list -dL 1000",
+            "gh pr list -dq.[].body",
+            "gh pr list -wS x",
+        ] {
+            assert_classification(
+                classify_under(&policy, command),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+    }
+
+    /// The near miss: after a flag that takes a value, the rest of the word is that value, so a
+    /// capital `L` inside a label is not `--limit`.
+    #[test]
+    fn a_refused_letter_inside_a_short_flags_value_is_not_a_flag() {
+        let policy = owner_policy();
+        for command in [
+            "gh pr list -lLabel",
+            "gh pr list -Rowner/Lrepo",
+            "gh pr list -d",
+            "gh pr list -Aocto-L",
+        ] {
+            assert_classification(classify_under(&policy, command), "allow", "github-read");
+        }
+    }
+
     /// `shell_segments` already closed this; the test fixes that the new policy does not reopen it.
     /// The second half is on the approval list, and the approval list is matched over the WHOLE
     /// line, before any of this.
@@ -5416,6 +5524,58 @@ mod tests {
             classify_with_rules(&declared, "bash scripts/gates.sh all"),
             "allow",
             "project-declared",
+        );
+    }
+
+    /// A project's `allow` is a widening the project wrote, and the governance files are the one
+    /// thing it may not widen onto: a `Write` to `.claude/settings.json` asks whatever the project
+    /// declared, so a declared `cp` landing on the same file asks too. Before this the confinement
+    /// door was the only one that asked `segment_names_self_governing`, and a declared prefix went
+    /// straight past it to `project-declared`.
+    #[test]
+    fn a_project_allow_never_authorises_editing_the_governance() {
+        let declared = shell_rules(&["cp"], &[]);
+        for command in [
+            "cp ./x.json .claude/settings.json",
+            "cp ./payload.py ./.claude/hooks/ask_daemon.py",
+            "cp ./x.md ./.claude/skills/orchestrate/SKILL.md",
+            "cp ./x.yaml ./.ai/autopilot.yaml",
+            "cp ./ask_daemon.py ./.claude/hooks",
+        ] {
+            assert_classification(
+                classify_with_rules(&declared, command),
+                "pending_approval",
+                "unrecognized",
+            );
+        }
+        // The near miss: the same declared `cp`, onto files that only share a name with one.
+        for command in [
+            "cp ./x.json ./notes/settings.json",
+            "cp ./x.yaml ./config/autopilot.yaml",
+        ] {
+            assert_classification(
+                classify_with_rules(&declared, command),
+                "allow",
+                "project-declared",
+            );
+        }
+    }
+
+    /// The same for the owner's `gh` list, the other door whose membership is decided outside this
+    /// file: a listed read whose arguments name a governance path asks, and the same read naming an
+    /// ordinary branch is still `github-read`.
+    #[test]
+    fn a_github_read_naming_a_governance_path_still_asks() {
+        let policy = owner_policy();
+        assert_classification(
+            classify_under(&policy, "gh run list --branch .claude/skills/x"),
+            "pending_approval",
+            "unrecognized",
+        );
+        assert_classification(
+            classify_under(&policy, "gh run list --branch fix/claude-skills"),
+            "allow",
+            "github-read",
         );
     }
 

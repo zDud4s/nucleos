@@ -286,5 +286,43 @@ pub(super) fn word_is_flag(word: &str, flag: &str) -> bool {
     // A short flag takes its value glued on (`-L1000`, `-qEXPR`, `-S"x"`): pflag reads everything
     // after the letter as the value, so the word is still that flag.
     let short = flag.len() == 2 && flag.starts_with('-') && !flag.starts_with("--");
-    word == flag || word.starts_with(&format!("{flag}=")) || (short && word.starts_with(flag))
+    word == flag
+        || word.starts_with(&format!("{flag}="))
+        || (short && word.starts_with(flag))
+        || (short && in_a_bundled_group(word, flag.as_bytes()[1]))
+}
+
+/// Short flags `gh` reads a VALUE after, in every subcommand that has them: everything after one
+/// of these letters in a bundled group is its value, not more flags (`-lLabel` is `--label
+/// Label`, not `-l -L -a ...`).
+///
+/// Deliberately short. A letter that takes a value in one subcommand and none in another (`-s` is
+/// `--state` to `pr list` and `--squash` to `pr merge`; `-e`, `-w`, `-m` likewise) is left out, so
+/// the scan below reads past it and keeps looking — and for both callers of `word_is_flag` reading
+/// one flag too many only ever refuses more: `read_is_autonomous` takes the allow away, and
+/// `op_kind_of_gh_command` declines to name an operation.
+const VALUE_TAKING_SHORT_FLAGS: &[u8] = b"qtLSRlABHb";
+
+/// PURE: whether `letter` appears as a flag inside a bundled short-flag group (`-dL5`), the way
+/// pflag reads one: letters left to right, each a flag, until one that takes a value swallows the
+/// rest of the word.
+///
+/// Added because `word_is_flag` used to read only the group's FIRST letter, so `gh pr list -dL5`
+/// — `--draft` and `--limit 5` in one word — passed `REFUSED_READ_FLAGS` untouched.
+fn in_a_bundled_group(word: &str, letter: u8) -> bool {
+    let Some(group) = word.strip_prefix('-') else {
+        return false;
+    };
+    if group.starts_with('-') {
+        return false;
+    }
+    for &character in group.as_bytes() {
+        if character == letter {
+            return true;
+        }
+        if VALUE_TAKING_SHORT_FLAGS.contains(&character) {
+            return false;
+        }
+    }
+    false
 }
