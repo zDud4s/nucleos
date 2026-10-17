@@ -2245,6 +2245,120 @@ ol.ui-well {
   border: 0;
 }
 
+/* ----------------------------------------------------------------- charts -- */
+
+/*
+  `BarChart` and `StepLine`. Colour reaches a mark through ONE custom property, `--series`, set by
+  a series class and read by the mark: a bar fills with it, a line strokes with it, a legend swatch
+  paints its background with it. One class per series therefore colours all three, and no colour
+  is ever written inline — `style=` is what the CSP gate refuses.
+*/
+.ui-chart {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  min-width: 0;
+}
+
+.ui-chart-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.ui-chart-axis line,
+.ui-chart-tick line {
+  stroke: var(--border-strong);
+}
+
+.ui-chart-tick-label {
+  fill: var(--text-faint);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* An empty window still draws its axes; this line says why there is nothing on them. */
+.ui-chart-empty {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.ui-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.ui-chart-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.ui-chart-swatch {
+  display: inline-block;
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: var(--radius-sm);
+  background-color: var(--series, var(--border-strong));
+}
+
+.ui-bar {
+  fill: var(--series, var(--border-strong));
+}
+
+/* Today, which is not over: same colour, hollowed and dashed, so it never reads as a whole day. */
+.ui-bar-partial .ui-bar {
+  fill-opacity: 0.45;
+  stroke: var(--text-muted);
+  stroke-width: 1px;
+  stroke-dasharray: 2 2;
+}
+
+.ui-step-line {
+  fill: none;
+  stroke: var(--series, var(--border-strong));
+  stroke-width: 1.5px;
+}
+
+.ui-step-dot {
+  fill: var(--series, var(--border-strong));
+}
+
+/* A reading the provider marked stale: hollow, so it is visibly not a fresh measurement. */
+.ui-step-stale .ui-step-dot {
+  fill: var(--surface);
+  stroke: var(--series, var(--border-strong));
+  stroke-width: 1.5px;
+}
+
+.ui-chart-s1 { --series: var(--chart-1); }
+.ui-chart-s2 { --series: var(--chart-2); }
+.ui-chart-s3 { --series: var(--chart-3); }
+.ui-chart-s4 { --series: var(--chart-4); }
+.ui-chart-s5 { --series: var(--chart-5); }
+.ui-chart-s6 { --series: var(--chart-6); }
+.ui-chart-s7 { --series: var(--chart-7); }
+.ui-chart-s8 { --series: var(--chart-8); }
+.ui-chart-judge { --series: var(--chart-judge); }
+.ui-chart-other { --series: var(--chart-other); }
+.ui-chart-estimated { --series: var(--chart-estimated); }
+
+/* Gate states keep the tones `ModeState`'s gauge already gives them: failed and errored never share a red. */
+.ui-chart-passed { --series: var(--tone-active-fg); }
+.ui-chart-failed { --series: var(--tone-danger-fg); }
+.ui-chart-errored { --series: var(--tone-paused-fg); }
+.ui-chart-ungated { --series: var(--tone-off-fg); }
+.ui-chart-unknown { --series: var(--border-strong); }
+
 /* ------------------------------------------------------------------ tabs -- */
 
 /**

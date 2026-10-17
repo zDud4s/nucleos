@@ -142,6 +142,24 @@
   --tone-info-bg: rgba(102, 181, 240, 0.12);
   --tone-info-border: rgba(102, 181, 240, 0.3);
 
+  /* ------------------------------------------------------ chart series -- */
+  /* Categorical, for series that are identities (a project, a mode, a token type) and carry no
+     verdict. Never a tone (those mean a state) and never the accent (that means a link). */
+  --chart-1: #6ea8fe;
+  --chart-2: #f4a259;
+  --chart-3: #8bd17c;
+  --chart-4: #b892ff;
+  --chart-5: #f2709c;
+  --chart-6: #5ccfb0;
+  --chart-7: #a3b86c;
+  --chart-8: #c98b6b;
+  /* The judge's spend: always its own segment, never one of the eight. */
+  --chart-judge: #ffd166;
+  /* Everything past the eighth project, folded by the núcleo into `__other__`. */
+  --chart-other: #6b7586;
+  /* Cost estimated from elapsed time: drawn, but never passed off as measured. */
+  --chart-estimated: #98a1b2;
+
   /**
    * The soft cut at both ends of a scrolling column.
    *
@@ -311,6 +329,18 @@
     --tone-info-fg: #175f9e;
     --tone-info-bg: rgba(23, 95, 158, 0.09);
     --tone-info-border: rgba(23, 95, 158, 0.26);
+
+    --chart-1: #2f6fd6;
+    --chart-2: #c4661f;
+    --chart-3: #3d8f33;
+    --chart-4: #7a4fd1;
+    --chart-5: #c2386b;
+    --chart-6: #1f8f74;
+    --chart-7: #6f7f2e;
+    --chart-8: #9a5a3c;
+    --chart-judge: #a07800;
+    --chart-other: #8b94a3;
+    --chart-estimated: #57606e;
 
     --shadow-sm: 0 1px 2px rgba(18, 21, 27, 0.08);
     --shadow-md: 0 4px 14px rgba(18, 21, 27, 0.1);
