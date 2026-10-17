@@ -371,7 +371,7 @@ fn basic_auth_tokens(input: &str) -> Vec<Finding> {
                 || matches!(b, b'+' | b'/' | b'=')
                 || (index > 0 && b.is_ascii_uppercase())
         });
-        if boundary && tail_len >= 12 && looks_encoded {
+        if boundary && tail_len >= 8 && looks_encoded {
             findings.push(Finding {
                 start: tail_start,
                 end: tail_start + tail_len,
