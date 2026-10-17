@@ -95,6 +95,7 @@ export { Sparkline, type SparklineProps } from "./Sparkline";
 export { StaleNote, type StaleNoteProps } from "./StaleNote";
 export { StatCard, type StatCardProps } from "./StatCard";
 export { StateBadge, type StateBadgeProps } from "./StateBadge";
+export { StepLine, type StepLineProps, type StepPoint, type StepSeries } from "./StepLine";
 export { Teach, type TeachProps } from "./Teach";
 export { Well, type WellProps } from "./Well";
 export { Who, type WhoProps } from "./Who";
