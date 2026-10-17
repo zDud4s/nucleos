@@ -367,7 +367,9 @@ fn basic_auth_tokens(input: &str) -> Vec<Finding> {
                 .next_back()
                 .is_some_and(is_token_character);
         let looks_encoded = tail[..tail_len].iter().enumerate().any(|(index, b)| {
-            b.is_ascii_digit() || matches!(b, b'+' | b'/' | b'=') || (index > 0 && b.is_ascii_uppercase())
+            b.is_ascii_digit()
+                || matches!(b, b'+' | b'/' | b'=')
+                || (index > 0 && b.is_ascii_uppercase())
         });
         if boundary && tail_len >= 12 && looks_encoded {
             findings.push(Finding {
@@ -389,7 +391,7 @@ fn url_credentials(input: &str) -> Vec<Finding> {
     while let Some(relative) = input[from..].find("://") {
         let authority_start = from + relative + 3;
         let authority_len = input[authority_start..]
-            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '''))
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '\''))
             .unwrap_or(input.len() - authority_start);
         let authority = &input[authority_start..authority_start + authority_len];
         if let Some(at) = authority.rfind('@')
@@ -937,10 +939,7 @@ mod tests {
     #[test]
     fn newer_issuer_prefixes_are_redacted() {
         for (input, marker) in [
-            (
-                "hf_abcdefghijklmnopqrstuvwxyzABCD",
-                "[SECRET:huggingface]",
-            ),
+            ("hf_abcdefghijklmnopqrstuvwxyzABCD", "[SECRET:huggingface]"),
             ("npm_abcdefghijklmnopqrstuvwxyzABCDEF0123", "[SECRET:npm]"),
             ("glpat-abcdefghij0123456789", "[SECRET:gitlab]"),
         ] {
@@ -959,7 +958,10 @@ mod tests {
     #[test]
     fn a_telegram_bot_token_is_redacted_bare_and_inside_a_url() {
         let token = "123456789:AAHabcdefghijklmnopqrstuvwxyz012345";
-        assert_eq!(redact_secrets(&format!("t {token} x")), "t [SECRET:telegram] x");
+        assert_eq!(
+            redact_secrets(&format!("t {token} x")),
+            "t [SECRET:telegram] x"
+        );
         let redacted = redact_secrets(&format!("https://api.telegram.org/bot{token}/getMe"));
         assert!(redacted.contains("[SECRET:telegram]"), "{redacted:?}");
         assert!(!redacted.contains("AAHabc"), "{redacted:?}");
@@ -984,7 +986,10 @@ mod tests {
         assert_eq!(redacted, "Authorization: Basic [SECRET:basic-auth]");
         let plain = "a basic understanding of the matter";
         assert_eq!(redact_secrets(plain), plain);
-        assert_eq!(redact_secrets("Basic dXNlcjpw"), "Basic [SECRET:basic-auth]");
+        assert_eq!(
+            redact_secrets("Basic dXNlcjpw"),
+            "Basic [SECRET:basic-auth]"
+        );
     }
 
     #[test]
