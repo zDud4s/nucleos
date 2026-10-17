@@ -211,8 +211,64 @@ fn cwd_in(path: &Path) -> Option<String> {
     }
 }
 
-fn find_cwd(paths: &[PathBuf]) -> Option<String> {
-    paths.iter().find_map(|path| cwd_in(path))
+/// What a past scan of one transcript's head learned. A found `cwd` never changes, so it is kept
+/// for good; a miss is only valid for the file length it was made at (the file may grow a `cwd`).
+#[derive(Clone)]
+enum CwdMemo {
+    Found(String),
+    Missing { len: u64 },
+}
+
+/// Process-level memory of the head scans, so an idle cycle does not reopen and re-parse up to a
+/// megabyte of every transcript it walks past.
+#[derive(Default)]
+struct CwdCache {
+    memo: std::sync::Mutex<HashMap<PathBuf, CwdMemo>>,
+    /// How many head scans actually ran; the tests read it.
+    scans: std::sync::atomic::AtomicUsize,
+}
+
+impl CwdCache {
+    fn global() -> &'static CwdCache {
+        static CACHE: std::sync::OnceLock<CwdCache> = std::sync::OnceLock::new();
+        CACHE.get_or_init(CwdCache::default)
+    }
+
+    /// The first `cwd` among the candidates, scanning one only when the cache cannot answer for it.
+    fn find(&self, paths: &[PathBuf]) -> Option<String> {
+        for path in paths {
+            let len = std::fs::metadata(path).map_or(0, |m| m.len());
+            let known = self
+                .memo
+                .lock()
+                .ok()
+                .and_then(|memo| memo.get(path).cloned());
+            match known {
+                Some(CwdMemo::Found(cwd)) => return Some(cwd),
+                Some(CwdMemo::Missing { len: seen }) if seen == len => continue,
+                _ => {}
+            }
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let found = cwd_in(path);
+            if let Ok(mut memo) = self.memo.lock() {
+                let entry = match &found {
+                    Some(cwd) => CwdMemo::Found(cwd.clone()),
+                    None => CwdMemo::Missing { len },
+                };
+                memo.insert(path.clone(), entry);
+            }
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+}
+
+/// True when the stored state says this transcript was fully ingested at exactly this size and
+/// mtime, so nothing in it can have changed since.
+fn is_unchanged(state: &devtime_store::FileState, size: i64, mtime: &str) -> bool {
+    state.status == "ok" && state.size == size && state.mtime.as_deref() == Some(mtime)
 }
 
 // ---- reading ---------------------------------------------------------------------------------
@@ -669,7 +725,7 @@ async fn ingest_file(
 
     let state = devtime_store::file_state(pool, &key).await?;
     if let Some(state) = &state {
-        if state.status == "ok" && state.size == size && state.mtime.as_deref() == Some(&mtime) {
+        if is_unchanged(state, size, &mtime) {
             return Ok(());
         }
         if size < state.offset {
@@ -781,11 +837,30 @@ pub async fn ingest_cycle(
     let vocab = Arc::new(ParseVocab::from_config(&cfg.rules.vocab));
 
     for file in &found {
+        // Cheapest check first: a file already ingested at this size and mtime needs neither its
+        // head scanned for a cwd nor anything else. An agent file with a launch link still goes
+        // on, because `ingest_file` records that link before it looks at the state.
+        let has_link = file
+            .meta
+            .as_ref()
+            .is_some_and(|link| link.tool_use_id.is_some());
+        if !has_link
+            && let Ok(meta) = std::fs::metadata(&file.path)
+            && let Ok(modified) = meta.modified()
+            && let Ok(Some(state)) = devtime_store::file_state(pool, &path_key(&file.path)).await
+            && is_unchanged(
+                &state,
+                i64::try_from(meta.len()).unwrap_or(i64::MAX),
+                &mtime_text(modified),
+            )
+        {
+            continue;
+        }
         let mapping = match mappings.get(&file.main) {
             Some(known) => known.clone(),
             None => {
                 let candidates = [file.main.clone(), file.path.clone()];
-                let cwd = tokio::task::spawn_blocking(move || find_cwd(&candidates))
+                let cwd = tokio::task::spawn_blocking(move || CwdCache::global().find(&candidates))
                     .await
                     .unwrap_or(None);
                 let resolved = match cwd {
@@ -951,6 +1026,50 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     const ROOT: &str = "C:/fixture/proj";
+
+    #[test]
+    fn a_found_cwd_is_scanned_once_and_a_miss_until_the_file_grows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let with_cwd = dir.path().join("a.jsonl");
+        std::fs::write(&with_cwd, "{\"type\":\"x\"}\n{\"cwd\":\"C:/p\"}\n").unwrap();
+        let cache = CwdCache::default();
+        let paths = [with_cwd.clone()];
+        assert_eq!(cache.find(&paths).as_deref(), Some("C:/p"));
+        assert_eq!(cache.find(&paths).as_deref(), Some("C:/p"));
+        assert_eq!(cache.scans.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let bare = dir.path().join("b.jsonl");
+        std::fs::write(&bare, "{\"type\":\"x\"}\n").unwrap();
+        let paths = [bare.clone()];
+        assert_eq!(cache.find(&paths), None);
+        assert_eq!(cache.find(&paths), None);
+        assert_eq!(cache.scans.load(std::sync::atomic::Ordering::Relaxed), 2);
+        std::fs::write(&bare, "{\"type\":\"x\"}\n{\"cwd\":\"C:/q\"}\n").unwrap();
+        assert_eq!(cache.find(&paths).as_deref(), Some("C:/q"));
+        assert_eq!(cache.scans.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn only_an_ok_file_at_the_same_size_and_mtime_counts_as_unchanged() {
+        let state = |status: &str| devtime_store::FileState {
+            path: "p".into(),
+            session_id: None,
+            lane: None,
+            offset: 10,
+            size: 10,
+            mtime: Some("t1".into()),
+            status: status.into(),
+            lines_read: 0,
+            lines_failed: 0,
+            unknown_records: 0,
+            parser_version: 1,
+            updated_at: String::new(),
+        };
+        assert!(is_unchanged(&state("ok"), 10, "t1"));
+        assert!(!is_unchanged(&state("ok"), 11, "t1"));
+        assert!(!is_unchanged(&state("ok"), 10, "t2"));
+        assert!(!is_unchanged(&state("unmapped"), 10, "t1"));
+    }
 
     async fn test_pool() -> SqlitePool {
         let pool = crate::testdb::fresh_pool().await;
