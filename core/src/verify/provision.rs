@@ -5,7 +5,7 @@
 //! Claude Code approval (`enabledMcpjsonServers`) into each of its IDE worktrees and hides both
 //! through `info/exclude`; with it off, [`reconcile`] removes exactly that and nothing else.
 //!
-//! The switch is on by default (migration 0200, plan 2026-10-17 F1): the final verification of a
+//! The switch is on by default (migration 0203, plan 2026-10-17 F1): the final verification of a
 //! task goes through `verify`, so every session in a rostered project needs the box, the main
 //! checkout's included. [`run_reconcile_loop`] therefore reconciles every project whose switch is
 //! on at startup and every [`RECONCILE_EVERY`], which is what reaches a worktree somebody added by
