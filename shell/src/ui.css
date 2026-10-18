@@ -527,6 +527,23 @@ a.ui-button:not(.ui-button-link):is(:hover, :focus-visible) {
   border-color: var(--tone-active-fg);
 }
 
+.ui-button-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
+
+.ui-button-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.ui-button-primary:disabled {
+  background: var(--surface-raised);
+  border-color: var(--border);
+  color: var(--text-faint);
+}
+
 .ui-button-danger {
   background: none;
   border-color: var(--tone-danger-border);
@@ -1750,6 +1767,7 @@ ol.ui-well {
 }
 
 .ui-gauge-track {
+  position: relative;
   display: block;
   overflow: hidden;
   height: 6px;
@@ -1786,6 +1804,21 @@ ol.ui-well {
 
 .ui-gauge-over .ui-gauge-fill {
   background: var(--tone-danger-fg);
+}
+
+/* A per-task threshold is a tick on the track, not a fill state. */
+.ui-gauge-threshold {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--text);
+}
+
+/* Past the threshold but under the 80% rule: same tone as "near". */
+.ui-gauge-past-threshold .ui-gauge-fill {
+  background: var(--tone-pending-fg);
 }
 
 .ui-gauge-cue {
@@ -3580,6 +3613,193 @@ ol.ui-well {
   border-radius: var(--radius-md);
 }
 
+/* ---------------------------------------------------------- section-nav -- */
+.ui-section-nav {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  background: var(--bg);
+  border-bottom: var(--hairline) solid var(--border);
+  padding: var(--space-2) 0;
+}
+.ui-section-nav-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ui-section-nav-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--hit-min);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-decoration: none;
+}
+.ui-section-nav-link:hover {
+  color: var(--text);
+}
+.ui-section-nav-link[aria-current="location"] {
+  color: var(--text);
+  font-weight: var(--weight-semibold);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.ui-section-nav-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* ----------------------------------------------------------- disclosure -- */
+.ui-disclosure-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--hit-min);
+  padding: 0 var(--space-2);
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+.ui-disclosure-toggle::before {
+  content: "\25B8";
+  transition: transform var(--dur-quick) var(--ease);
+}
+.ui-disclosure-toggle[aria-expanded="true"]::before {
+  transform: rotate(90deg);
+}
+.ui-disclosure-toggle:hover {
+  color: var(--text);
+}
+.ui-disclosure-toggle:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+.ui-disclosure-region {
+  padding-top: var(--space-2);
+}
+.ui-disclosure-region[hidden] {
+  display: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-disclosure-toggle::before {
+    transition: none;
+  }
+}
+
+/* ------------------------------------------------------------ undo-toast -- */
+.ui-undo-toast {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-md);
+  font-size: var(--text-sm);
+  max-width: var(--measure-prose);
+}
+.ui-undo-toast-message {
+  flex: 1 1 auto;
+}
+
+/* ------------------------------------------------------------------ chip -- */
+.ui-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ui-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 1.75rem;
+  padding: 0 0.625rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.ui-chip:hover:not(:disabled) {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.ui-chip[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+/* A pressed chip is never colour alone: it also draws a check. */
+.ui-chip[aria-pressed="true"]::before {
+  content: "\2713";
+}
+
+.ui-chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ui-chip-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+
+.ui-list-filter-input {
+  flex: 1 1 14rem;
+  min-width: 10rem;
+  min-height: 1.75rem;
+  padding: 0 0.625rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.375rem;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.ui-list-filter-count {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* -------------------------------------------------------------- awaiting -- */
+/* "N waiting". The --tone-awaiting-* tokens alias --tone-pending-* in tokens.css. */
+.ui-awaiting {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--tone-awaiting-border);
+  border-radius: 999px;
+  background: var(--tone-awaiting-bg);
+  color: var(--tone-awaiting-fg);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Not colour alone: a dot precedes the text. */
+.ui-awaiting::before {
+  content: "";
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+
 /* --------------------------------------------------------- forced colours -- */
 
 /* Windows high-contrast replaces every colour, and a tone carried only by background or fill
@@ -3674,6 +3894,11 @@ ol.ui-well {
     fill: Highlight;
   }
 
+  .ui-gauge-threshold {
+    forced-color-adjust: none;
+    background: CanvasText;
+  }
+
   .ui-switch-seg[aria-pressed="true"] {
     forced-color-adjust: none;
     background: Highlight;
@@ -3709,6 +3934,27 @@ ol.ui-well {
   color: var(--text-faint);
   font-size: var(--text-sm);
   max-width: var(--measure-prose);
+}
+
+/* Card-shaped variant: a column of block placeholders instead of one padded line. */
+.ui-skeleton-cards {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-3);
+  max-width: none;
+  background: none;
+  padding: 0;
+}
+.ui-skeleton-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+  gap: var(--space-3);
+}
+.ui-skeleton-card {
+  display: block;
+  min-height: 6rem;
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
 }
 
 /* A value that is not known is not zero: a dash in the faint tone. */
