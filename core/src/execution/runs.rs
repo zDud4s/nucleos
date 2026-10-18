@@ -11277,7 +11277,7 @@ tests:
             );
         }
         // Newest first: 4s, 3s, then the two runs at 2s by id descending, then 1s.
-        let expected = vec![ids[4], ids[3], ids[2], ids[1], ids[0]];
+        let expected = [ids[4], ids[3], ids[2], ids[1], ids[0]];
 
         let first = search(
             &pool,
