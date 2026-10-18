@@ -4,6 +4,7 @@ import { cloneElement, useId, type ReactElement, type ReactNode } from "react";
 interface ControlProps {
   id?: string;
   "aria-describedby"?: string;
+  "aria-label"?: string;
 }
 
 /**
@@ -49,12 +50,16 @@ export function Field({ label, labelHidden = false, helper, children }: FieldPro
     helper === undefined
       ? own["aria-describedby"]
       : [own["aria-describedby"], helperId].filter((part) => part !== undefined && part !== "").join(" ");
+  // The visible label is the control's name. An `aria-label` that merely repeats it is dropped
+  // (the same name, said twice); a different one is kept so existing names do not change, and
+  // `ui/label-authorship.test.ts` holds the pages that still carry one until they are cleaned.
+  const ownName = own["aria-label"]?.trim().toLowerCase() === label.trim().toLowerCase() ? undefined : own["aria-label"];
   return (
     <div className="ui-field">
       <label htmlFor={controlId} className={labelHidden ? "ui-field-label ui-field-said" : "ui-field-label"}>
         {label}
       </label>
-      {cloneElement(children, { id: controlId, "aria-describedby": describedBy })}
+      {cloneElement(children, { id: controlId, "aria-describedby": describedBy, "aria-label": ownName })}
       {helper === undefined ? null : (
         <span id={helperId} className="ui-field-helper">
           {helper}

@@ -54,4 +54,20 @@ describe("Field", () => {
     expect(ids[0]).toBe("elsewhere");
     expect(document.getElementById(ids[1])?.textContent).toBe("blank is the daemon's default");
   });
+
+  it("drops an aria-label that only repeats the visible label, and keeps a different one", () => {
+    const { rerender } = render(
+      <Field label="Prompt">
+        <input aria-label="Prompt" />
+      </Field>,
+    );
+    expect(screen.getByRole("textbox", { name: "Prompt" }).hasAttribute("aria-label")).toBe(false);
+
+    rerender(
+      <Field label="Prompt">
+        <input aria-label="Run prompt" />
+      </Field>,
+    );
+    expect(screen.getByRole("textbox", { name: "Run prompt" }).getAttribute("aria-label")).toBe("Run prompt");
+  });
 });

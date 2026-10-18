@@ -142,6 +142,15 @@
   --tone-info-bg: rgba(102, 181, 240, 0.12);
   --tone-info-border: rgba(102, 181, 240, 0.3);
 
+  /* awaiting — "N waiting on you". The pending amber under its own name, so a page that asks
+     for the owner's answer says so in one place; the light theme inherits the pending override. */
+  --tone-awaiting-fg: var(--tone-pending-fg);
+  --tone-awaiting-bg: var(--tone-pending-bg);
+  --tone-awaiting-border: var(--tone-pending-border);
+
+  /* Minimum hit target for a button, switch, icon button or tab. Defined here; applied per page. */
+  --hit-min: 2rem;
+
   /* ------------------------------------------------------ chart series -- */
   /* Categorical, for series that are identities (a project, a mode, a token type) and carry no
      verdict. Never a tone (those mean a state) and never the accent (that means a link).
@@ -329,6 +338,12 @@
     --tone-paused-fg: #a04a20;
     --tone-paused-bg: rgba(169, 78, 34, 0.1);
     --tone-paused-border: rgba(169, 78, 34, 0.28);
+
+    /* awaiting: the pending amber, one step darker — pending's #8a5c00 reads 4.39:1 on the
+       sunken ground, and a count of decisions waiting on the owner may not be the quiet one. */
+    --tone-awaiting-fg: #7a5200;
+    --tone-awaiting-bg: rgba(138, 92, 0, 0.1);
+    --tone-awaiting-border: rgba(138, 92, 0, 0.28);
 
     --tone-danger-fg: #bd2b33;
     --tone-danger-bg: rgba(189, 43, 51, 0.09);

@@ -318,3 +318,34 @@ describe("the light theme clears AA where it is read", () => {
     }
   });
 });
+
+/**
+ * Two tokens defined ahead of their adoption (W3/W4): the minimum hit target and the
+ * "waiting on you" amber. Defined once here, applied by the pages that need them.
+ */
+describe("--hit-min and --tone-awaiting", () => {
+  const css = read("tokens.css");
+  const root = declarations(css.slice(0, css.indexOf("@media")));
+  const light = declarations(css.slice(css.indexOf("@media")));
+
+  it("--hit-min is the 32px target (WCAG 2.5.8 asks 24px; 32px is the chosen floor)", () => {
+    expect(root.get("--hit-min")).toBe("2rem");
+  });
+
+  it("--tone-awaiting is the pending amber on dark and a darker amber on light", () => {
+    for (const part of ["fg", "bg", "border"]) {
+      expect(root.get(`--tone-awaiting-${part}`), `dark ${part}`).toBe(`var(--tone-pending-${part})`);
+      expect(light.has(`--tone-awaiting-${part}`), `light ${part}`).toBe(true);
+    }
+  });
+
+  it("light awaiting text clears 4.5:1 on its own fill over bg, surface and sunken", () => {
+    const token = (name: string) => colour(light.get(name));
+    const fg = token("--tone-awaiting-fg");
+    const fill = token("--tone-awaiting-bg");
+    for (const groundName of ["--bg", "--surface", "--surface-sunken"]) {
+      const ratio = contrast(fg, over(fill, token(groundName)));
+      expect(ratio, `awaiting on ${groundName}: ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+});
