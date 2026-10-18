@@ -70,7 +70,10 @@ export interface WorkLost {
 export interface Conflicts {
   count: number;
   rate: number | null;
+  /** Settled `resolved` through a landing the daemon filed, no person's verdict; counted only from when landings record their origin. */
   auto_resolved: number;
+  /** Settled merged, superseded, or resolved but not by the daemon alone. */
+  settled_otherwise: number;
   work_lost: WorkLost;
 }
 
@@ -177,7 +180,7 @@ export interface Postgate {
   red_s_daily: RedDay[];
 }
 
-export interface Waiting {
+export interface WaitingReasons {
   slot: number;
   budget: number;
   quota: number;
@@ -199,7 +202,13 @@ export interface Stuck {
   rounds_exhausted: number;
   gate_retry_loop: number;
   item_stuck: number;
-  waiting: Waiting;
+  /** At most ten. */
+  jobs: StuckJob[];
+}
+
+/** Jobs held back for a reason; they are not stuck. */
+export interface Waiting {
+  by_reason: WaitingReasons;
   /** At most ten. */
   jobs: StuckJob[];
 }
@@ -223,6 +232,7 @@ export interface Jobs {
   /** Exactly `days` points. */
   daily: JobDay[];
   stuck: Stuck;
+  waiting: Waiting;
 }
 
 export interface ClassAgreement {

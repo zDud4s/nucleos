@@ -867,7 +867,10 @@ export function pipelineReport(overrides: Partial<PipelineReport> = {}): Pipelin
         rounds_exhausted: 0,
         gate_retry_loop: 0,
         item_stuck: 0,
-        waiting: { slot: 0, budget: 0, quota: 0, disk: 0, excluded: 0, "kill-switch": 0, attention: 0, other: 0 },
+        jobs: [],
+      },
+      waiting: {
+        by_reason: { slot: 0, budget: 0, quota: 0, disk: 0, excluded: 0, "kill-switch": 0, attention: 0, other: 0 },
         jobs: [],
       },
     },

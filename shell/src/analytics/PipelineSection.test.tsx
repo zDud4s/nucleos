@@ -191,7 +191,7 @@ describe("PipelineSection", () => {
         ...report,
         landing: {
           ...landing,
-          conflicts: { count: 3, rate: 0.12, auto_resolved: 2, work_lost: { nothing: 2, lost: 1 } },
+          conflicts: { count: 3, rate: 0.12, auto_resolved: 2, settled_otherwise: 4, work_lost: { nothing: 2, lost: 1 } },
           owner_blocked: { count: 2, oldest_age_s: 7200, median_age_s: 600 },
         },
       }),
@@ -201,6 +201,35 @@ describe("PipelineSection", () => {
     const conflicts = screen.getByRole("list", { name: "Conflicts" });
     expect(within(conflicts).getByText("12% · 3 conflicts")).toBeTruthy();
     expect(within(conflicts).getByText("Work lost: lost")).toBeTruthy();
+    expect(within(conflicts).getByText("Settled otherwise")).toBeTruthy();
+    expect(within(conflicts).getByText("4")).toBeTruthy();
+    expect(screen.getByText(/counted since landings record who filed them/)).toBeTruthy();
+  });
+
+  it("lists a job that only waits under Waiting and never under Stuck", async () => {
+    const report = busyReport();
+    const jobs = report.jobs as Jobs;
+    await mount(
+      withPipeline({
+        ...report,
+        jobs: {
+          ...jobs,
+          stuck: { ...jobs.stuck, item_stuck: 0, jobs: [] },
+          waiting: {
+            by_reason: { ...jobs.waiting.by_reason, slot: 1, attention: 1 },
+            jobs: [{ id: 33, project_id: "nucleos" }],
+          },
+        },
+      }),
+    );
+    await section();
+    fireEvent.click(card("Jobs"));
+    expect(screen.queryByRole("list", { name: "Stuck jobs" })).toBeNull();
+    expect(screen.queryByRole("list", { name: "Stuck jobs, by signal" })).toBeNull();
+    const waiting = screen.getByRole("list", { name: "Waiting jobs" });
+    expect(within(waiting).getByText("Job 33")).toBeTruthy();
+    const reasons = screen.getByRole("list", { name: "Waiting jobs, by reason" });
+    expect(within(reasons).getByText("Your attention")).toBeTruthy();
   });
 
   it("leaves the conflicts, cache and bypass pairs out when the block has none", async () => {

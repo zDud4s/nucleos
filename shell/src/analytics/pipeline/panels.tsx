@@ -183,10 +183,16 @@ function landingPanel(landing: Landing, report: PipelineReport): PanelContent {
             rows={[
               ["Conflict rate", `${percentOr(landing.conflicts.rate)} · ${landing.conflicts.count} conflicts`],
               ["Auto-resolved", String(landing.conflicts.auto_resolved)],
+              ["Settled otherwise", String(landing.conflicts.settled_otherwise)],
               ["Work lost: nothing", String(landing.conflicts.work_lost.nothing)],
               ["Work lost: lost", String(landing.conflicts.work_lost.lost)],
             ]}
           />
+        )}
+        {landing.conflicts === null ? null : (
+          <p className="an-note">
+            Auto-resolved: closed by the daemon alone; counted since landings record who filed them.
+          </p>
         )}
       </>
     ),
@@ -277,7 +283,7 @@ function gatePanel(gate: Gate, report: PipelineReport): PanelContent {
 
 /* -------------------------------------------------------------------- jobs -- */
 
-const WAITING_LABELS: Array<[keyof Jobs["stuck"]["waiting"], string]> = [
+const WAITING_LABELS: Array<[keyof Jobs["waiting"]["by_reason"], string]> = [
   ["slot", "A slot"],
   ["budget", "Budget"],
   ["quota", "Quota"],
@@ -292,8 +298,8 @@ function jobsPanel(jobs: Jobs, report: PipelineReport): PanelContent {
   const key: ChartKey = { key: "created", label: "Jobs created" };
   const data = series(jobs.daily, key, (day) => day.created);
   const { stuck } = jobs;
-  const waiting = WAITING_LABELS.filter(([reason]) => stuck.waiting[reason] > 0).map(
-    ([reason, name]) => [name, String(stuck.waiting[reason])] as [string, string],
+  const waiting = WAITING_LABELS.filter(([reason]) => jobs.waiting.by_reason[reason] > 0).map(
+    ([reason, name]) => [name, String(jobs.waiting.by_reason[reason])] as [string, string],
   );
   return {
     title: "Jobs created per day",
@@ -324,24 +330,32 @@ function jobsPanel(jobs: Jobs, report: PipelineReport): PanelContent {
             { key: "live", label: "Still live", value: jobs.live, className: "ui-chart-ungated" },
           ]}
         />
-        {stuckCount(jobs) === 0 && waiting.length === 0 ? null : (
-          <>
-            <Pairs
-              label="Stuck jobs, by signal"
-              rows={[
-                ["Past their lifetime", String(stuck.age_over_lifetime)],
-                ["Dry rounds at the limit", String(stuck.dry_rounds_at_limit)],
-                ["Rounds exhausted", String(stuck.rounds_exhausted)],
-                ["Retrying the gate", String(stuck.gate_retry_loop)],
-                ["Item stuck", String(stuck.item_stuck)],
-              ]}
-            />
-            <Pairs label="Waiting on" rows={waiting} />
-          </>
+        {stuckCount(jobs) === 0 ? null : (
+          <Pairs
+            label="Stuck jobs, by signal"
+            rows={[
+              ["Past their lifetime", String(stuck.age_over_lifetime)],
+              ["Dry rounds at the limit", String(stuck.dry_rounds_at_limit)],
+              ["Rounds exhausted", String(stuck.rounds_exhausted)],
+              ["Retrying the gate", String(stuck.gate_retry_loop)],
+              ["Item stuck", String(stuck.item_stuck)],
+            ]}
+          />
         )}
         {stuck.jobs.length === 0 ? null : (
           <Rows label="Stuck jobs">
             {stuck.jobs.map((one) => (
+              <li key={one.id} className="an-row">
+                <ProjectLink projectId={one.project_id}>{`Job ${one.id}`}</ProjectLink>
+                <span className="an-row-figures">{one.project_id}</span>
+              </li>
+            ))}
+          </Rows>
+        )}
+        <Pairs label="Waiting jobs, by reason" rows={waiting} />
+        {jobs.waiting.jobs.length === 0 ? null : (
+          <Rows label="Waiting jobs">
+            {jobs.waiting.jobs.map((one) => (
               <li key={one.id} className="an-row">
                 <ProjectLink projectId={one.project_id}>{`Job ${one.id}`}</ProjectLink>
                 <span className="an-row-figures">{one.project_id}</span>
