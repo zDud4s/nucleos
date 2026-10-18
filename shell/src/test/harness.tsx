@@ -945,6 +945,7 @@ export function devtimeFindings(overrides: Partial<DevtimeFindings> = {}): Devti
               count: 2, cost_ms: 91_000, feedback: null, rule }],
     next_cursor: null,
     rules: [rule],
+    thresholds_source: "file",
     ...overrides,
   };
 }

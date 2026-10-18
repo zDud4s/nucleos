@@ -3431,6 +3431,87 @@ cycle_seconds: 30
         }
     }
 
+    fn burst_of(resolved: &(DevtimeConfig, ThresholdsSource)) -> u32 {
+        resolved.0.rules.thresholds.d3_search_burst
+    }
+
+    #[test]
+    fn a_cached_devtime_file_follows_edits_and_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devtime.yaml");
+        let cache = Default::default();
+        // No file: the defaults, and the page is told so.
+        let absent = cached_devtime_config(&path, &cache);
+        assert_eq!(absent, (DevtimeConfig::default(), ThresholdsSource::Default));
+        std::fs::write(&path, "rules:
+  thresholds:
+    d3_search_burst: 8
+").unwrap();
+        let first = cached_devtime_config(&path, &cache);
+        assert_eq!((burst_of(&first), first.1), (8, ThresholdsSource::File));
+        // Unchanged file: the cached parse comes back equal.
+        assert_eq!(cached_devtime_config(&path, &cache), first);
+        // A different length is a different file, whatever the mtime tick says.
+        std::fs::write(&path, "rules:
+  thresholds:
+    d3_search_burst: 12
+").unwrap();
+        let edited = cached_devtime_config(&path, &cache);
+        assert_eq!((burst_of(&edited), edited.1), (12, ThresholdsSource::File));
+        // Deleted: the defaults, not the old content.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            cached_devtime_config(&path, &cache),
+            (DevtimeConfig::default(), ThresholdsSource::Default)
+        );
+    }
+
+    #[test]
+    fn an_invalid_devtime_edit_keeps_the_last_good_thresholds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devtime.yaml");
+        let cache = Default::default();
+        std::fs::write(&path, "rules:
+  thresholds:
+    d3_search_burst: 8
+").unwrap();
+        assert_eq!(burst_of(&cached_devtime_config(&path, &cache)), 8);
+        // A typo does not drop the page back to the defaults: the last good file keeps applying,
+        // and is labelled as such, on this call and the unchanged ones after it.
+        std::fs::write(&path, "rules:
+  thresholds:
+    nope: 1
+").unwrap();
+        for _ in 0..2 {
+            let kept = cached_devtime_config(&path, &cache);
+            assert_eq!((burst_of(&kept), kept.1), (8, ThresholdsSource::LastGood));
+        }
+        // Fixing the file makes it the file again.
+        std::fs::write(&path, "rules:
+  thresholds:
+    d3_search_burst: 9
+").unwrap();
+        let fixed = cached_devtime_config(&path, &cache);
+        assert_eq!((burst_of(&fixed), fixed.1), (9, ThresholdsSource::File));
+    }
+
+    #[test]
+    fn a_devtime_file_invalid_from_the_start_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("devtime.yaml");
+        let cache = Default::default();
+        std::fs::write(&path, "rules:
+  thresholds:
+    thrash_repeats: 0
+").unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                cached_devtime_config(&path, &cache),
+                (DevtimeConfig::default(), ThresholdsSource::Default)
+            );
+        }
+    }
+
     /// Embeddings are always local (spec 5.4, D6): the key names an Ollama model, and a file that
     /// predates it must keep working, so absence is the small default rather than an error.
     #[test]

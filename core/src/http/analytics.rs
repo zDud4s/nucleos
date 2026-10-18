@@ -206,31 +206,44 @@ async fn devtime_findings(
             .await
             .map_err(IntoResponse::into_response)?;
     }
-    let rules = devtime_rules(state);
+    let (rules, source) = devtime_rules(state);
     let query = crate::analytics::devtime::FindingsQuery {
         rule_id: params.rule_id.as_deref(),
         order,
         limit,
         cursor,
     };
-    crate::analytics::devtime::devtime_findings(&state.pool, &rules, scope, window, now, &query)
-        .await
-        .map(Json)
-        .map_err(|error| failed(error, "devtime findings").into_response())
+    crate::analytics::devtime::devtime_findings(
+        &state.pool,
+        &rules,
+        source,
+        scope,
+        window,
+        now,
+        &query,
+    )
+    .await
+    .map(Json)
+    .map_err(|error| failed(error, "devtime findings").into_response())
 }
 
-/// The precision thresholds, read from `~/.nucleos/devtime.yaml` per request — the file `main.rs`
-/// loads at startup, from the same root. Not an `AppState` field: that struct has ~70 literal
-/// constructors, and only these routes need it. No root (every test state) is the defaults.
-fn devtime_rules(state: &AppState) -> crate::config::DevtimeRulesConfig {
-    state
-        .machine_config_root
-        .as_deref()
-        .map(|root| {
-            crate::config::load_devtime_config(&root.join(crate::machine_config::DEVTIME_FILE))
-                .rules
-        })
-        .unwrap_or_default()
+/// The precision thresholds from `~/.nucleos/devtime.yaml` — the file `main.rs` loads at startup,
+/// from the same root — and where they came from. Read per request through the stat cache, so an
+/// edit applies without a restart and an invalid one keeps the last good thresholds, labelled.
+/// (Ingestion still runs on the startup copy.) Not an `AppState` field: that struct has ~70
+/// literal constructors, and only these routes need it. No root (every test state) is the defaults.
+fn devtime_rules(
+    state: &AppState,
+) -> (crate::config::DevtimeRulesConfig, crate::config::ThresholdsSource) {
+    match state.machine_config_root.as_deref() {
+        Some(root) => {
+            let (config, source) = crate::config::devtime_config_now(
+                &root.join(crate::machine_config::DEVTIME_FILE),
+            );
+            (config.rules, source)
+        }
+        None => Default::default(),
+    }
 }
 
 pub(super) async fn get_devtime_findings(
@@ -266,7 +279,7 @@ pub(super) async fn post_devtime_mark(
 ) -> Result<Json<crate::analytics::devtime::MarkOutcome>, Response> {
     use crate::devtime::precision::MarkError;
     let window = window_of(&query, chrono::Utc::now()).map_err(IntoResponse::into_response)?;
-    let rules = devtime_rules(&state);
+    let (rules, _) = devtime_rules(&state);
     let verdict = body.verdict.as_str();
     let cause = body.cause.as_deref();
     crate::analytics::devtime::mark_finding(&state.pool, &rules, window, &key, verdict, cause)
