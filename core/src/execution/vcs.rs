@@ -5097,6 +5097,47 @@ mod tests {
     }
 
     /// The Waiting card's grounds for a decision: which branches, git's output, and the resolution.
+    /// Requests 688/689/699 in production: each resolution run `completed`, but its gate went red
+    /// (or its worktree was gone), so the resolver never handed it to the queue — and the card
+    /// still said "the queue lands it and this clears on its own". The card can only tell the
+    /// truth if the listing carries the two facts the resolver refuses on.
+    #[tokio::test]
+    async fn waiting_on_a_person_says_why_a_finished_resolution_will_not_land() {
+        let pool = test_pool().await;
+        let escalated = merge_in_status(&pool, "master", "feat/x", "escalated").await;
+        hand_to_resolution(&pool, escalated, 901, "alpha/run-901").await;
+        insert_run(&pool, 901, "completed").await;
+        sqlx::query("UPDATE runs SET gate_status = 'failed' WHERE id = 901")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let row = |waiting: Vec<RequestSummary>| {
+            waiting
+                .into_iter()
+                .find(|r| r.id == escalated)
+                .expect("listed")
+        };
+        let listed = row(waiting_on_a_person(&pool).await.unwrap());
+        assert_eq!(listed.resolution_gate_status.as_deref(), Some("failed"));
+        assert!(
+            !listed.resolution_worktree_gone,
+            "its worktree is still there"
+        );
+
+        sqlx::query(
+            "UPDATE worktrees SET removed_at = '2026-10-10T00:00:00Z' WHERE owner_id = 901",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let listed = row(waiting_on_a_person(&pool).await.unwrap());
+        assert!(
+            listed.resolution_worktree_gone,
+            "the resolver only reads runs whose worktree is live; a removed one is never landed"
+        );
+    }
+
     #[tokio::test]
     async fn waiting_on_a_person_carries_what_a_decision_needs() {
         let pool = test_pool().await;
@@ -5119,6 +5160,8 @@ mod tests {
             row.resolution_status, None,
             "no such run row: absent, not an error"
         );
+        assert_eq!(row.resolution_gate_status, None);
+        assert!(!row.resolution_worktree_gone);
         assert!(!row.from_resolution);
 
         let history = list(&pool, None).await.unwrap();

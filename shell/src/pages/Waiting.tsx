@@ -2421,7 +2421,26 @@ export function gitNextStep(
       return { before: "", run, after: " is resolving it — nothing to do yet", yours: false };
     case "awaiting_approval":
       return { before: "", run, after: " is resolving it and waits on your approval", yours: true };
-    case "completed":
+    case "completed": {
+      // The resolver hands a finished resolution to the queue only when its gate passed (or never
+      // ran) and its worktree is still there (`resolver::land_finished`); otherwise nothing lands
+      // it, and the row is the person's.
+      const gate = row.resolution_gate_status;
+      if (gate != null && gate !== "passed")
+        return {
+          before: "",
+          run,
+          after: ` finished its resolution but its gate ${gate}, so the queue will not land it — open the run, land it by hand, or put it away if the merge no longer matters`,
+          yours: true,
+        };
+      if (row.resolution_worktree_gone === true)
+        return {
+          before: "",
+          run,
+          after:
+            " finished its resolution but its worktree is gone, so the queue cannot land it — resolve it by hand, or put it away if the merge no longer matters",
+          yours: true,
+        };
       return {
         before: "",
         run,
@@ -2429,6 +2448,7 @@ export function gitNextStep(
           " finished its resolution; the queue lands it and this clears on its own — if it stays, open the run to see why",
         yours: false,
       };
+    }
     case "failed":
     case "cancelled":
     case "interrupted":
