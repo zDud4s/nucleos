@@ -270,9 +270,15 @@ mod tests {
         let global = window_read(&pool, None).await.classifier;
         assert_eq!(global.len(), 2);
         let (fs, net) = (&global[0], &global[1]);
-        assert_eq!((fs.action_class.as_str(), fs.n, fs.pending), ("fs.write", 3, 1));
+        assert_eq!(
+            (fs.action_class.as_str(), fs.n, fs.pending),
+            ("fs.write", 3, 1)
+        );
         assert!(close(fs.agree.unwrap(), 2.0 / 3.0), "{fs:?}");
-        assert_eq!((net.action_class.as_str(), net.n, net.pending), ("net", 1, 0));
+        assert_eq!(
+            (net.action_class.as_str(), net.n, net.pending),
+            ("net", 1, 0)
+        );
         assert_eq!(net.agree, Some(1.0));
 
         let only_a = window_read(&pool, Some("a")).await.classifier;
@@ -290,8 +296,26 @@ mod tests {
         let b = run(&pool, "b").await;
         let created = "2026-10-16T10:00:00Z";
         let rows: [Verdict; 4] = [
-            (a, Some("allow"), Some("approve"), Some(100), Some(10), 0.1, None, 0),
-            (a, Some("deny"), Some("approve"), Some(300), Some(20), 0.2, None, 0),
+            (
+                a,
+                Some("allow"),
+                Some("approve"),
+                Some(100),
+                Some(10),
+                0.1,
+                None,
+                0,
+            ),
+            (
+                a,
+                Some("deny"),
+                Some("approve"),
+                Some(300),
+                Some(20),
+                0.2,
+                None,
+                0,
+            ),
             (b, Some("allow"), None, Some(200), Some(30), 0.3, None, 1),
             (b, None, None, None, None, 0.0, Some("timeout"), 0),
         ];
@@ -299,12 +323,25 @@ mod tests {
             verdict(&pool, created, row).await;
         }
         // Outside the window: not counted.
-        let old = (a, Some("allow"), Some("approve"), Some(999), Some(999), 9.0, None, 1);
+        let old = (
+            a,
+            Some("allow"),
+            Some("approve"),
+            Some(999),
+            Some(999),
+            9.0,
+            None,
+            1,
+        );
         verdict(&pool, "2026-09-01T10:00:00Z", old).await;
 
         let judge = window_read(&pool, None).await.judge;
         assert_eq!((judge.n, judge.reviewed), (4, 2));
-        let latency = (judge.latency_ms.p50, judge.latency_ms.p95, judge.latency_ms.n);
+        let latency = (
+            judge.latency_ms.p50,
+            judge.latency_ms.p95,
+            judge.latency_ms.n,
+        );
         assert_eq!(latency, (Some(200), None, 3));
         assert_eq!(judge.input_tokens, 60);
         assert!(close(judge.cost_usd, 0.6), "{judge:?}");

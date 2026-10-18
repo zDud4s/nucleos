@@ -11,9 +11,9 @@ use sqlx::SqlitePool;
 use super::stats::{self, Dist};
 use crate::analytics::Window;
 use crate::execution::job::{
-    commissioned_with_an_allowance, item_state_from, ItemState, COMMISSIONED_JOB_LIFETIME,
-    DRY_ROUNDS_TO_STOP, MAX_JOB_LIFETIME, STATUS_CANCELLED, STATUS_EXPIRED, STATUS_INTERRUPTED,
-    STATUS_STOPPED,
+    COMMISSIONED_JOB_LIFETIME, DRY_ROUNDS_TO_STOP, ItemState, MAX_JOB_LIFETIME, STATUS_CANCELLED,
+    STATUS_EXPIRED, STATUS_INTERRUPTED, STATUS_STOPPED, commissioned_with_an_allowance,
+    item_state_from,
 };
 
 /// Both windows in one read: `[previous.from, window.to)`.
@@ -165,8 +165,7 @@ fn stuck_block(jobs: &[LiveJob], items: &[(i64, String, i64)], now: DateTime<Utc
 
     let mut stuck = Stuck::default();
     for job in jobs {
-        let lifetime = if commissioned_with_an_allowance(job.rule_name.as_deref(), job.budget_usd)
-        {
+        let lifetime = if commissioned_with_an_allowance(job.rule_name.as_deref(), job.budget_usd) {
             COMMISSIONED_JOB_LIFETIME
         } else {
             MAX_JOB_LIFETIME
@@ -180,7 +179,10 @@ fn stuck_block(jobs: &[LiveJob], items: &[(i64, String, i64)], now: DateTime<Utc
             .into_iter()
             .flatten()
             .map(|(status, attempts)| {
-                (*attempts, item_state_from(status, *attempts, job.gate_retries))
+                (
+                    *attempts,
+                    item_state_from(status, *attempts, job.gate_retries),
+                )
             })
             .collect();
         // On its last allowed retry: `gate_retries` is the limit `start` copied from the rule's

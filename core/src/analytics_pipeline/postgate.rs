@@ -107,12 +107,7 @@ impl Project {
         }
     }
 
-    fn red_s(
-        &self,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
-        since: Option<DateTime<Utc>>,
-    ) -> i64 {
+    fn red_s(&self, from: DateTime<Utc>, to: DateTime<Utc>, since: Option<DateTime<Utc>>) -> i64 {
         red_seconds(&self.changes, self.red_now, from, to, since)
     }
 }
@@ -242,7 +237,7 @@ pub(crate) async fn read(
 mod tests {
     use super::*;
     use crate::analytics::tests::{at, now};
-    use crate::analytics_pipeline::landing::tests::{merged, request, Req};
+    use crate::analytics_pipeline::landing::tests::{Req, merged, request};
 
     /// Spec §11: a red is clipped to the window, an open one counts until `to`, one that began
     /// before the window counts from its start.

@@ -335,12 +335,36 @@ mod tests {
             &pool,
             &[
                 ("p", "a", Some("core"), "passed", "gate", Some(1000), day),
-                ("p", "b", Some("core"), "passed", "postgate", Some(3000), day),
+                (
+                    "p",
+                    "b",
+                    Some("core"),
+                    "passed",
+                    "postgate",
+                    Some(3000),
+                    day,
+                ),
                 ("p", "c", Some("core"), "failed", "gate", Some(2000), day),
                 ("p", "d", Some("core"), "errored", "gate", None, day),
-                ("p", "e", Some("core"), "skipped_cached", "gate", Some(0), day),
+                (
+                    "p",
+                    "e",
+                    Some("core"),
+                    "skipped_cached",
+                    "gate",
+                    Some(0),
+                    day,
+                ),
                 ("p", "f", Some("core"), "running", "gate", None, day),
-                ("p", "c", Some("core"), "failed", "flake-check", Some(2000), day),
+                (
+                    "p",
+                    "c",
+                    Some("core"),
+                    "failed",
+                    "flake-check",
+                    Some(2000),
+                    day,
+                ),
                 ("p", "c", Some("core"), "failed", "bisect", Some(2000), day),
             ],
         )
@@ -372,15 +396,55 @@ mod tests {
             &pool,
             &[
                 // retry of the next row
-                ("p", "a", Some("core"), "passed", "gate", Some(1), "2026-10-16T11:00:00+00:00"),
+                (
+                    "p",
+                    "a",
+                    Some("core"),
+                    "passed",
+                    "gate",
+                    Some(1),
+                    "2026-10-16T11:00:00+00:00",
+                ),
                 // first, red
-                ("p", "a", Some("core"), "failed", "gate", Some(1), "2026-10-16T10:00:00+00:00"),
+                (
+                    "p",
+                    "a",
+                    Some("core"),
+                    "failed",
+                    "gate",
+                    Some(1),
+                    "2026-10-16T10:00:00+00:00",
+                ),
                 // first, green
-                ("p", "a", Some("shell"), "passed", "gate", Some(1), "2026-10-16T10:00:00+00:00"),
+                (
+                    "p",
+                    "a",
+                    Some("shell"),
+                    "passed",
+                    "gate",
+                    Some(1),
+                    "2026-10-16T10:00:00+00:00",
+                ),
                 // previous window
-                ("p", "z", Some("core"), "failed", "gate", Some(1), "2026-10-08T10:00:00+00:00"),
+                (
+                    "p",
+                    "z",
+                    Some("core"),
+                    "failed",
+                    "gate",
+                    Some(1),
+                    "2026-10-08T10:00:00+00:00",
+                ),
                 // retry here
-                ("p", "z", Some("core"), "passed", "gate", Some(1), "2026-10-12T10:00:00+00:00"),
+                (
+                    "p",
+                    "z",
+                    Some("core"),
+                    "passed",
+                    "gate",
+                    Some(1),
+                    "2026-10-12T10:00:00+00:00",
+                ),
             ],
         )
         .await;

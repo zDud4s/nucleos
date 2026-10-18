@@ -8,7 +8,10 @@ use super::*;
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/analytics/pipeline", get(get_pipeline))
-        .route("/projects/{id}/analytics/pipeline", get(get_project_pipeline))
+        .route(
+            "/projects/{id}/analytics/pipeline",
+            get(get_project_pipeline),
+        )
 }
 
 async fn get_pipeline(
@@ -18,13 +21,8 @@ async fn get_pipeline(
     let now = chrono::Utc::now();
     let window = window_of(&query, now)?;
     Ok(Json(
-        crate::analytics_pipeline::build(
-            &state.pool,
-            crate::analytics::Scope::Global,
-            window,
-            now,
-        )
-        .await,
+        crate::analytics_pipeline::build(&state.pool, crate::analytics::Scope::Global, window, now)
+            .await,
     ))
 }
 
