@@ -192,7 +192,7 @@ describe("PipelineSection", () => {
         landing: {
           ...landing,
           conflicts: { count: 3, rate: 0.12, auto_resolved: 2, work_lost: { nothing: 2, lost: 1 } },
-          owner_blocked: { count: 2, oldest_age_s: 7200, median_age_s: 600, rate: null, suspect: false },
+          owner_blocked: { count: 2, oldest_age_s: 7200, median_age_s: 600 },
         },
       }),
     );
