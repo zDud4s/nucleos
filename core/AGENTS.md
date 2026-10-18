@@ -317,6 +317,7 @@ the contract, not a snapshot.
 | `devtime/parse/strip.rs` | Stripping a transcript line to its structure, for fixtures (`strip_to_structure`). |
 | `devtime/store.rs` | Parent of `devtime/store/`. The devtime tables' only SQL: files/offsets, cwd map, sessions, turns, messages (usage deduped by message id), attempts, spans, markers, ingest status. Knows no transcript format and no lane rule. Also the rule engine's tables (migration 0171): findings, attempt marks, turn stats and the owner's feedback. |
 | `devtime/store/rules.rs` | The rules read/write model: findings, cross-session comparisons, feedback, rates and turn statistics. |
+| `devtime/store/reads.rs` | The analytics reads of the devtime tables: span time clipped to a window and split at UTC midnight, tokens and turns per day, session and finding counts, the findings page with its standing mark. Read-only. |
 | `devtime/lanes.rs` | PURE: a session's devtime rows → spans per lane (main, agent:<id>, bg:<id>) that partition each lane's wall time, with the gap precedence wait_background > wait_human (≤ idle) > idle. No I/O. |
 | `devtime/map.rs` | Which rostered project a transcript's cwd belongs to: roster root, linked worktree via git common dir, persisted; daemon run/job worktrees recognised and skipped; never guesses. |
 | `devtime.rs` | The devtime ingestion cycle: walks ~/.claude/projects read-only, streams each transcript from its stored offset, applies parsed events through devtime_store, rebuilds lanes for touched sessions, and runs the periodic loop. Owns no SQL and no parse rule. |
