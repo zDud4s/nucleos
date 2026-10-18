@@ -56,3 +56,4 @@ c9fb1541066017314be860777604b2b4f40c4051:core/src/redact.rs:jwt:648
 # ladders, not keys. Not quoted here, or this file would become the next finding.
 f764d37de65f460b702ea97a2a8ef8867162e1c9:core/src/capture.rs:stripe-access-token:720
 4954af647b459583e54dde6dfecc2fde78ccd8ea:core/src/distill.rs:github-pat:2023
+69ea3ae7d876c26044f0d0abdca6863ee2a9f58f:core/src/governance/redact.rs:gitlab-pat:945

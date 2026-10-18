@@ -123,7 +123,6 @@ const LANE_OF: Record<string, FeedLane> = {
   "web.read": "mail",
 
   config_written: "machine",
-  config_migrated: "machine",
   project_onboarded: "machine",
   health_breach_intent: "machine",
   workflow_changed: "machine",
