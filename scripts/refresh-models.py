@@ -75,7 +75,7 @@ PRICING_DOC = f"{DOCS}/about-claude/pricing.md"
 # refused whole (exit 1) rather than read by position and priced from the wrong column.
 PRICING_COLUMNS = ["Base input tokens", "5m cache writes", "1h cache writes",
                    "Cache hits and refreshes", "Output tokens"]
-PRICE_FIELDS = ("input", "output", "cache_read", "cache_write")
+PRICE_FIELDS = ("input", "output", "cache_read", "cache_write", "cache_write_1h")
 
 # The same endpoint `capabilities.rs::discover_openrouter` already reads at runtime for a model's
 # context window. Public: no key, no account, no rate limit worth a retry.
@@ -218,11 +218,12 @@ def per_million(cell: str) -> float | None:
 
 
 def anthropic_prices(markdown: str):
-    """`(prices, tiered, problems)` from the pricing page, or `None` when its shape changed.
+    """`(prices, problems)` from the pricing page, or `None` when its shape changed.
 
-    `prices` maps a normalised id to `{input, output, cache_read, cache_write, source}`; a row whose
-    cells do not all parse is written with every price `None` and adds a problem (exit 1). A model
-    the page prices in tiers ("for prompts up to …") gets NO entry and is listed in `tiered`.
+    `prices` maps a normalised id to `{input, output, cache_read, cache_write, cache_write_1h, source}`;
+    a row whose cells do not all parse is written with every price `None` and adds a problem (exit 1).
+    A model the page prices by prompt length ("for prompts up to N tokens" / "over N tokens") is one
+    entry: the "up to" row is its base, and each "over N" row a tier from N + 1 prompt tokens on.
     """
     start = markdown.find("## Model pricing")
     if start < 0:
@@ -232,30 +233,46 @@ def anthropic_prices(markdown: str):
     if rows.get("Model") != PRICING_COLUMNS:
         return None
     prices: dict[str, dict] = {}
-    tiered: set[str] = set()
+    tiers: dict[str, list[dict]] = {}
+    unreadable: set[str] = set()
     problems: list[str] = []
     for name, cells in rows.items():
         if name == "Model":
             continue
         bare = re.sub(r"\s*\(\[.*?\]\(.*?\)\)", "", name).strip()   # "([retired…](…))"
         tier = re.search(r"\s*\(for prompts [^)]*\)", bare)
-        # Unpriced on purpose (owner, 2026-10-18, open decision 1): a tiered model such as Claude
-        # Haiku 5.5 gets no price rather than a base-tier one, because a wrong cost is worse than
-        # none. A known gap to revisit (TODO in F2's closing report); OpenRouter `overrides` likewise.
-        if tier:
-            tiered.add(normalise_id(slug(bare[: tier.start()])))
-            continue
-        model_id = normalise_id(slug(bare))
-        base, write_5m, _write_1h, hits, out = (per_million(cell) for cell in cells[:5])
-        entry = {"input": base, "output": out, "cache_read": hits, "cache_write": write_5m,
-                 "source": "anthropic"}
+        model_id = normalise_id(slug(bare[: tier.start()] if tier else bare))
+        base, write_5m, write_1h, hits, out = (per_million(cell) for cell in cells[:5])
+        rates = {"input": base, "output": out, "cache_read": hits, "cache_write": write_5m,
+                 "cache_write_1h": write_1h}
         if None in (base, write_5m, hits, out):
             problems.append(f"anthropic: could not read the price of {model_id} — written without price")
-            entry = {field: None for field in PRICE_FIELDS} | {"source": "anthropic"}
-        prices[model_id] = entry
-    for model_id in tiered:
-        prices.pop(model_id, None)
-    return prices, tiered, problems
+            unreadable.add(model_id)
+            continue
+        if not tier:
+            prices[model_id] = rates | {"source": "anthropic"}
+            continue
+        # The tier applies to the WHOLE request once its prompt (input + cache reads + cache writes)
+        # passes N, so "over N" is the daemon's `min_prompt_tokens: N + 1`.
+        phrase = re.fullmatch(r"\(for prompts (up to|over) ([0-9][0-9,]*) tokens\)", tier.group(0).strip())
+        if phrase is None:
+            problems.append(f"anthropic: could not read the tier {tier.group(0).strip()!r} of {model_id}"
+                            " — written without price")
+            unreadable.add(model_id)
+        elif phrase.group(1) == "up to":
+            prices[model_id] = rates | {"source": "anthropic"}
+        else:
+            threshold = int(phrase.group(2).replace(",", "")) + 1
+            tiers.setdefault(model_id, []).append({"min_prompt_tokens": threshold} | rates)
+    for model_id, above in tiers.items():
+        if model_id not in prices:
+            problems.append(f"anthropic: {model_id} has a tier but no base price — written without price")
+            unreadable.add(model_id)
+        elif model_id not in unreadable:
+            prices[model_id]["tiers"] = sorted(above, key=lambda tier: tier["min_prompt_tokens"])
+    for model_id in unreadable:
+        prices[model_id] = {field: None for field in PRICE_FIELDS} | {"source": "anthropic"}
+    return prices, problems
 
 
 def claude_effort_support() -> tuple[set[str], set[str], set[str]]:
@@ -430,7 +447,8 @@ def openrouter_catalogue() -> dict[str, dict] | None:
 
 
 OPENROUTER_PRICE_FIELDS = {"prompt": "input", "completion": "output",
-                           "input_cache_read": "cache_read", "input_cache_write": "cache_write"}
+                           "input_cache_read": "cache_read", "input_cache_write": "cache_write",
+                           "input_cache_write_1h": "cache_write_1h"}
 
 
 def per_token_to_million(raw) -> float | None:
@@ -444,36 +462,66 @@ def per_token_to_million(raw) -> float | None:
     return round(value * 1_000_000, 6)
 
 
+def openrouter_tiers(overrides) -> list[dict] | None:
+    """`pricing.overrides` as the daemon's `tiers`, or `None` when any override is one it cannot price.
+
+    Only the prompt-length shape is understood: `min_prompt_tokens` plus rates, the same meaning as a
+    tier's `min_prompt_tokens` (the tier from that many prompt tokens on). An override keyed on the
+    time of day (`utc_days` / `utc_start` / `utc_end`), or on anything else, makes the whole model
+    unsupported: its price depends on when the request ran, and guessing which would be a wrong cost.
+    A tier carries only the rates its override names; the rest stay the base ones.
+    """
+    if not isinstance(overrides, list):
+        return None
+    tiers: list[dict] = []
+    for override in overrides:
+        if not isinstance(override, dict) or set(override) - {"min_prompt_tokens", *OPENROUTER_PRICE_FIELDS}:
+            return None
+        threshold = override.get("min_prompt_tokens")
+        if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 0:
+            return None
+        tier: dict = {"min_prompt_tokens": threshold}
+        for name, field in OPENROUTER_PRICE_FIELDS.items():
+            if name in override:
+                rate = per_token_to_million(override[name])
+                if rate is None:
+                    return None
+                tier[field] = rate
+        tiers.append(tier)
+    return sorted(tiers, key=lambda tier: tier["min_prompt_tokens"])
+
+
 def openrouter_prices(served: dict[str, dict]):
-    """`(openai, tiered, anthropic)` from the catalogue `openrouter_catalogue` returned.
+    """`(openai, unsupported, anthropic)` from the catalogue `openrouter_catalogue` returned.
 
     `openai` prices every `openai/*` id (no `:variant`) under its bare, normalised id. `anthropic` is
-    the same for `anthropic/*`, used only to cross-check the vendor page and never written. A model
-    with `overrides` (prices that change past a prompt size) is tiered: named, never priced.
+    the same for `anthropic/*`, used only to cross-check the vendor page and never written. Overrides
+    by prompt length become `tiers`; a model with any override `openrouter_tiers` cannot read gets
+    no price and is named in `unsupported`.
     """
     openai: dict[str, dict] = {}
     anthropic: dict[str, dict] = {}
-    tiered: set[str] = set()
+    unsupported: set[str] = set()
     for model_id, entry in served.items():
         vendor, _, bare = model_id.partition("/")
         if vendor not in ("openai", "anthropic") or ":" in bare or not bare:
             continue
         pricing = entry.get("pricing") if isinstance(entry.get("pricing"), dict) else {}
         key = normalise_id(bare)
-        # Unpriced on purpose (owner, 2026-10-18, open decision 1): OpenRouter `overrides` (most
-        # `openai/*`, `anthropic/claude-haiku-5.5`) mean a tiered price, so no price is written rather
-        # than the base tier's. A known gap to revisit (TODO in F2's closing report).
-        if pricing.get("overrides"):
-            if vendor == "openai":
-                tiered.add(key)
-            continue
         row = {field: per_token_to_million(pricing.get(name))
                for name, field in OPENROUTER_PRICE_FIELDS.items()}
+        if pricing.get("overrides"):
+            tiers = openrouter_tiers(pricing["overrides"])
+            if tiers is None:
+                if vendor == "openai":
+                    unsupported.add(key)
+                continue
+            row["tiers"] = tiers
         if vendor == "openai":
             openai[key] = row | {"source": "openrouter"}
         else:
             anthropic[key] = row
-    return openai, tiered, anthropic
+    return openai, unsupported, anthropic
 
 
 def crosscheck(vendor: dict[str, dict], other: dict[str, dict]):
@@ -735,16 +783,28 @@ def splice(text: str, key: str, block: str) -> str:
 PRICE_BANNER = """# ─────────────────────────────────────────────────────────────
 # Escrito por `scripts/refresh-models.py`: preços publicados pelos fornecedores, USD por milhão de
 # tokens, lidos em `prices_as_of`. O daemon usa-os só para o custo ESTIMADO do devtime; nunca é a
-# fatura. Um modelo sem preço legível fica com `null` e o script sai com 1; um modelo com preço por
-# escalões (Haiku 5.5, a maioria dos `openai/*`) não é escrito. Editar à mão é desfeito na próxima passagem.
+# fatura. Um modelo sem preço legível fica com `null` e o script sai com 1. Um preço por tamanho do
+# prompt (Haiku 5.5, muitos `openai/*`) vai em `tiers`: cada escalão vale a partir de
+# `min_prompt_tokens` tokens de prompt e traz só as tarifas que muda. Um preço por hora do dia não é
+# escrito. Editar à mão é desfeito na próxima passagem.
 # ─────────────────────────────────────────────────────────────"""
 
 
+def render_number(value) -> str:
+    return "null" if value is None else repr(float(value))
+
+
+def render_tier(tier: dict) -> str:
+    """One tier, flow-style: its threshold, then only the rates it carries (absent = the base rate)."""
+    rates = [f"{field}: {render_number(tier[field])}" for field in PRICE_FIELDS if tier.get(field) is not None]
+    return "{ " + ", ".join([f"min_prompt_tokens: {int(tier['min_prompt_tokens'])}", *rates]) + " }"
+
+
 def render_price_row(model_id: str, price: dict) -> str:
-    def number(value):
-        return "null" if value is None else repr(float(value))
-    fields = ", ".join(f"{field}: {number(price.get(field))}" for field in PRICE_FIELDS)
-    return f"  {model_id}: {{ {fields}, source: {price['source']} }}"
+    fields = [f"{field}: {render_number(price.get(field))}" for field in PRICE_FIELDS]
+    if price.get("tiers"):
+        fields.append("tiers: [" + ", ".join(render_tier(tier) for tier in price["tiers"]) + "]")
+    return f"  {model_id}: {{ {', '.join(fields)}, source: {price['source']} }}"
 
 
 def render_prices(prices: dict[str, dict], as_of: str) -> dict[str, str]:
@@ -764,16 +824,17 @@ def refresh_prices(today: str):
         if page is not None:
             fail(f"{PRICING_DOC} no longer has the expected pricing table — prices unchanged")
         return None, True
-    vendor, tiered, problems = parsed
+    vendor, problems = parsed
     served = openrouter_catalogue()
     if served is None:
         return None, True
-    openai, openai_tiered, anthropic_mirror = openrouter_prices(served)
+    openai, unsupported, anthropic_mirror = openrouter_prices(served)
     vendor, warnings = crosscheck(vendor, anthropic_mirror)
     for warning in warnings:
         print(f"prices: {warning}")
-    for model_id in sorted(tiered | openai_tiered):
-        print(f"prices: {model_id} is priced in tiers — written without price")
+    for model_id in sorted(unsupported):
+        print(f"prices: {model_id} has an override by time of day (or of a shape this script does not read)"
+              " — unsupported, written without price")
     for problem in problems:
         fail(problem)
     prices = {**openai, **vendor}   # a vendor id never collides with an openai id; vendor wins anyway
