@@ -1,4 +1,5 @@
 import { createContext, useContext, useId, useState, type ReactNode } from "react";
+import { Tip } from "./Tip";
 
 export interface QuietProps {
   /** What is there, in the fewest words that are still true. It sits on the heading's line. */
@@ -53,7 +54,6 @@ export const QuietTips = createContext(false);
  */
 export function Quiet({ says, children, action, announce }: QuietProps) {
   const [why, setWhy] = useState(false);
-  const [peek, setPeek] = useState(false);
   const tips = useContext(QuietTips);
   // Seven `why?` buttons on `03-waiting` whose accessible name was "why?" and nothing else.
   // The line beside it is the only description this component owns, and it is the right one:
@@ -76,32 +76,24 @@ export function Quiet({ says, children, action, announce }: QuietProps) {
     );
 
   if (tips && children !== undefined) {
-    const shown = why || peek;
     return (
       <div className="ui-quiet" role={announce === true ? "status" : undefined}>
         <p id={saidId}>{says}</p>
-        {/*
-          The tip lives inside the anchor, so moving the pointer from the ⓘ onto the tip is still
-          hovering the anchor and the tip stays up long enough to be read.
-        */}
-        <div
-          className="ui-quiet-anchor"
-          onMouseEnter={() => setPeek(true)}
-          onMouseLeave={() => setPeek(false)}
-          onFocus={() => setPeek(true)}
-          onBlur={() => setPeek(false)}
-          onKeyDown={(event) => {
-            if (event.key === "Escape" && shown) {
-              setWhy(false);
-              setPeek(false);
-            }
-          }}
-        >
-          {ask}
-          <div className="ui-quiet-tip" id={whyId} role="tooltip" hidden={!shown}>
-            {shown ? <div className="ui-quiet-tip-box">{children}</div> : null}
-          </div>
-        </div>
+        {/* The shared tip owns hover, focus, touch and Escape; this keeps the "why?" button. */}
+        <Tip tip={children} className="ui-quiet-anchor">
+          {({ tipId, pinned, toggle }) => (
+            <button
+              type="button"
+              className="ui-quiet-ask"
+              aria-expanded={pinned}
+              aria-controls={tipId}
+              aria-describedby={saidId}
+              onClick={toggle}
+            >
+              {pinned ? "less" : "why?"}
+            </button>
+          )}
+        </Tip>
         {action === undefined ? null : <div className="ui-quiet-action">{action}</div>}
       </div>
     );
