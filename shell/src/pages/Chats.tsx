@@ -47,6 +47,7 @@ import {
   GitCompareArrows,
   LoaderCircle,
   SquarePen,
+  X,
 } from "lucide-react";
 import { isApiRefusal } from "../data/client";
 import {
@@ -159,6 +160,7 @@ import { ProjectPicker } from "../chats/ProjectPicker";
 import { holdMessage, takeHeld, useHeldMessage } from "../chats/held";
 import { clearDraft, readDraft, readScroll, saveDraft, saveScroll } from "../chats/drafts";
 import { useChatTabs } from "../chats/tabs";
+import { DAEMON_NAME } from "../copy";
 
 import "./chats.css";
 
@@ -199,7 +201,11 @@ export function Chats() {
    * be able to find a conversation without knowing a shortcut. Closed, the transcript
    * gets the whole width, which is what a page made of prose wants.
    */
-  const [railOpen, setRailOpen] = useState(true);
+  // Shut when the window is narrow enough for the list to fold into a drawer (`chats.css`), or it
+  // would open covering the conversation. The 960px threshold is the app's own breakpoint.
+  const [railOpen, setRailOpen] = useState(
+    () => typeof window === "undefined" || window.innerWidth >= 960,
+  );
   /**
    * The editor conversation being considered, if any.
    *
@@ -503,7 +509,7 @@ function ListError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
     <ErrorNote>
-      the núcleo did not answer — nothing is known about your conversations
+      The {DAEMON_NAME} is not responding — nothing is known about your conversations
     </ErrorNote>
   );
 }
@@ -734,7 +740,7 @@ function WireRefusal({ error, cwd }: { error: unknown; cwd: string }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        the núcleo did not answer — the folder was left alone
+        The {DAEMON_NAME} is not responding — the folder was left alone
       </ErrorNote>
     );
   }
@@ -752,7 +758,7 @@ function WireRefusal({ error, cwd }: { error: unknown; cwd: string }) {
 function CreateRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
-      <ErrorNote>the núcleo did not answer — nothing was opened</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} is not responding — nothing was opened</ErrorNote>
     );
   return (
     <RefusalNote
@@ -1326,7 +1332,7 @@ function StartBox({
                     setAttached((was) => was.filter((_, at) => at !== index))
                   }
                 >
-                  ×
+                  <X className="chats-tool-icon" aria-hidden="true" />
                 </button>
               </li>
             ))}
@@ -1527,7 +1533,9 @@ function DictateToggle({ dictation }: { dictation: DictationView }) {
       type="button"
       className={listening ? "chats-handsfree chats-handsfree-on" : "chats-handsfree"}
       aria-pressed={listening}
-      aria-label={listening ? "Stop dictating" : "Dictate"}
+      /* A fixed name: `aria-pressed` carries the state, and a name that also flips is announced as
+         "Stop dictating, toggle button, pressed". */
+      aria-label="Dictate"
       // Disabled only while the last sentence is being written down. Two recordings racing two
       // transcripts into one box is the state this forecloses.
       disabled={writing}
@@ -1543,8 +1551,16 @@ function DictateToggle({ dictation }: { dictation: DictationView }) {
       ) : (
         <Mic className="chats-tool-icon" aria-hidden="true" />
       )}
-      {listening && <span className="chats-handsfree-phase">listening</span>}
-      {writing && <span className="chats-handsfree-phase">writing it down</span>}
+      {listening && (
+        <span className="chats-handsfree-phase" role="status">
+          listening
+        </span>
+      )}
+      {writing && (
+        <span className="chats-handsfree-phase" role="status">
+          writing it down
+        </span>
+      )}
     </button>
   );
 }
@@ -1621,10 +1637,15 @@ function ChatMenu({ chatId }: { chatId: string }) {
           {/* The name was a click on the page's heading; with the header gone it is asked for
               here, beside the conversation's other settings. A dialog for `ChatHelpers`' reason:
               a field inside a menu closes the menu on the first keystroke. */}
+          <DropdownMenuLabel>This conversation</DropdownMenuLabel>
           <DropdownMenuItem onSelect={() => setRenaming(true)}>Rename</DropdownMenuItem>
-          <ChatReach chatId={chatId} />
-          <ChatCeiling chatId={chatId} />
-          <ChatFallback chatId={chatId} />
+          {/* Written rather than picked, and for the same reason a dialog. */}
+          <DropdownMenuItem onSelect={() => setInstructions(true)}>
+            Standing instructions
+            <span className="chats-tool-why">
+              {instructed ? "set" : "none"}
+            </span>
+          </DropdownMenuItem>
           {/* A menu ITEM and not a submenu: helpers are written, not picked. Three text fields and
               two selects do not fit in a menu — and a Radix menu closes on the first keystroke that
               looks like typeahead, which is every keystroke. */}
@@ -1634,15 +1655,16 @@ function ChatMenu({ chatId }: { chatId: string }) {
               {helperCount === 0 ? "none" : `${helperCount}`}
             </span>
           </DropdownMenuItem>
-          {/* Also written rather than picked, and for the same reason a dialog. */}
-          <DropdownMenuItem onSelect={() => setInstructions(true)}>
-            Standing instructions
-            <span className="chats-tool-why">
-              {instructed ? "set" : "none"}
-            </span>
-          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          {/* Folders and the web live here and nowhere else: the "+" menu only adds to a message. */}
+          <DropdownMenuLabel>Limits and access</DropdownMenuLabel>
+          <ChatReach chatId={chatId} />
+          <ChatCeiling chatId={chatId} />
+          <ChatFallback chatId={chatId} />
           <ChatDenials chatId={chatId} />
           <AmbientMcpToggle chatId={chatId} />
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel>Context</DropdownMenuLabel>
           {/* The way back to a terminal, moved in here from the top of the transcript. It is
               a fact about this conversation that never changes and is wanted about twice in
               its life, and it was a line of mono text above every reading of every chat that
@@ -1652,7 +1674,6 @@ function ChatMenu({ chatId }: { chatId: string }) {
           {cwd !== null && project.data?.session != null && (
             <CarryOn cwd={cwd} session={project.data.session} />
           )}
-          <DropdownMenuSeparator />
           {/* Content and not items, like `ArchiveControl` below: the stronger of the two is a
               `ConfirmButton`, whose two-click interlock a menu item would collapse into one. */}
           <ContextControls chatId={chatId} />
@@ -1818,7 +1839,10 @@ function PermissionPicker({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        className="chats-tool"
+        className="chats-tool chats-tool-mode"
+        /* Only the exceptions carry a mode: "the exceptions dominate, the normal disappears". The
+           stylesheet raises them above the faint ground the other triggers share. */
+        data-mode={mode === "bypass" || mode === "dont_ask" || mode === "plan" ? mode : undefined}
         /* Spelled out: the visible text is a mode's NAME, and a control whose whole accessible name
            is "Manual" announces a fact rather than something you can press. */
         aria-label={`Permissions: ${shown} — change what this conversation may do without asking`}
@@ -2063,7 +2087,7 @@ function SeedRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        the núcleo did not answer — the worktree was left as it was
+        The {DAEMON_NAME} is not responding — the worktree was left as it was
       </ErrorNote>
     );
   }
@@ -2072,7 +2096,7 @@ function SeedRefusal({ error }: { error: unknown }) {
       refusal={error}
       sentences={{
         bad_request:
-          "the núcleo wants an explicit confirmation before it writes anything",
+          "The background service wants an explicit confirmation before it writes anything",
         conflict:
           "this folder is not a worktree of a project with a pinned workflow — nothing was written",
         not_found: "that conversation is no longer here",
@@ -2085,7 +2109,7 @@ function ProjectRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        the núcleo did not answer — the conversation was left as it was
+        The {DAEMON_NAME} is not responding — the conversation was left as it was
       </ErrorNote>
     );
   }
@@ -2113,7 +2137,7 @@ function TranscriptError({ error }: { error: unknown }) {
     );
   return (
     <ErrorNote>
-      the núcleo did not answer — nothing is known about this conversation
+      The {DAEMON_NAME} is not responding — nothing is known about this conversation
     </ErrorNote>
   );
 }
@@ -2215,7 +2239,7 @@ function TitleRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
       <ErrorNote>
-        the núcleo did not answer — the name was not changed
+        The {DAEMON_NAME} is not responding — the name was not changed
       </ErrorNote>
     );
   return (
@@ -2232,7 +2256,7 @@ function TitleRefusal({ error }: { error: unknown }) {
 function AutoTitleRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
-      <ErrorNote>the núcleo did not answer — no name was proposed</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} is not responding — no name was proposed</ErrorNote>
     );
   return (
     <RefusalNote
@@ -2398,7 +2422,7 @@ function MissingModelRow({
                  knows. */
               (pull.error ?? "the download failed")
             : refused
-              ? "the núcleo would not start the download"
+              ? "The background service would not start the download"
               : armed
                 ? /* Still leads with the weight, because the second click is the one that spends
                      it and this is the last moment it can be reconsidered. */
@@ -2527,7 +2551,7 @@ function ModelMenu({
         <DropdownMenuLabel>Which model answers</DropdownMenuLabel>
         {catalogue.isError && (
           <DropdownMenuItem disabled>
-            the núcleo did not say which models it has
+            The {DAEMON_NAME} did not say which models it has
           </DropdownMenuItem>
         )}
         {/* One row per company, and its models only on hover. The vendor is the first thing a
@@ -2789,7 +2813,7 @@ function ModelRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
       <ErrorNote>
-        the núcleo did not answer — the model was not changed
+        The {DAEMON_NAME} is not responding — the model was not changed
       </ErrorNote>
     );
   return (
@@ -2849,7 +2873,7 @@ function ChatReach({ chatId }: { chatId: string }) {
         Also reaches
         <span className="chats-tool-why">
           {known.length === 0
-            ? "no other folders known"
+            ? "none yet — open a folder in your editor"
             : granted.length === 0
               ? "only its own folder"
               : `${granted.length} more`}
@@ -3547,7 +3571,7 @@ function HelperRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
       <ErrorNote>
-        the núcleo did not answer — the helpers were not saved
+        The {DAEMON_NAME} is not responding — the helpers were not saved
       </ErrorNote>
     );
   return <RefusalNote refusal={error} />;
@@ -3581,7 +3605,7 @@ function ArchiveRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
       <ErrorNote>
-        the núcleo did not answer — the conversation was not archived
+        The {DAEMON_NAME} is not responding — the conversation was not archived
       </ErrorNote>
     );
   return <RefusalNote refusal={error} />;
@@ -3989,7 +4013,7 @@ function plural(count: number, noun: string): string {
 function ChangedRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>the núcleo did not answer — nothing could be read</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} is not responding — nothing could be read</ErrorNote>
     );
   }
   return (
@@ -4220,6 +4244,16 @@ function Transcript({
           )}
         </div>
       )}
+      {/* A log, so a reply that lands while the transcript is not focused is announced once, as an
+          addition. A wrapper and not the list itself: the list keeps its role (and its tests), and
+          `display: contents` keeps the wrapper out of the layout. */}
+      <div
+        className="chats-log"
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions"
+        aria-label="Conversation"
+      >
       <ul className="chats-turns" aria-label="Transcript">
         {entries.map((entry, index) =>
           entry.kind === "notice" ? (
@@ -4252,6 +4286,7 @@ function Transcript({
           ),
         )}
       </ul>
+      </div>
     </KeepsUp.Provider>
   );
 }
@@ -4589,7 +4624,7 @@ function useStopControl(
 /** Why the daemon would not stop the turn, in its own sentence when it gave one. */
 function StopRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
-    return <ErrorNote>the núcleo did not answer — the turn was not stopped</ErrorNote>;
+    return <ErrorNote>The {DAEMON_NAME} is not responding — the turn was not stopped</ErrorNote>;
   return <RefusalNote refusal={error} />;
 }
 
@@ -5773,7 +5808,7 @@ ${was}`));
                   setAttached((was) => was.filter((_, at) => at !== index))
                 }
               >
-                ×
+                <X className="chats-tool-icon" aria-hidden="true" />
               </button>
             </li>
           ))}
@@ -5940,6 +5975,6 @@ function Choices({
 
 function MessageRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
-    return <ErrorNote>the núcleo did not answer — nothing was sent</ErrorNote>;
+    return <ErrorNote>The {DAEMON_NAME} is not responding — nothing was sent</ErrorNote>;
   return <RefusalNote refusal={error} sentences={MESSAGE_SENTENCES} />;
 }

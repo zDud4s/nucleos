@@ -1214,3 +1214,92 @@ describe("Autopilot - map-authored readings", () => {
     expect(within(team).queryByText("running")).toBeNull();
   });
 });
+
+/* ------------------------------------------------- the critique's follow-ups -- */
+
+describe("Autopilot - agreement, the project in focus, and the page order", () => {
+  it("shows each class's agreement against the bar, and a dash when nothing is reviewed", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({ action_class: "read-local", reviewed: 20, agree: 20 }),
+        tally({ action_class: "push-merge-deploy", reviewed: 10, agree: 5 }),
+        tally({ action_class: "vcs-local", reviewed: 0, agree: 0 }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const table = await screen.findByRole("table", { name: "Shadow evidence" });
+    expect(within(table).getByRole("columnheader", { name: "agreement" })).toBeDefined();
+    const rowOf = (name: string) => within(table).getByRole("rowheader", { name }).closest("tr")!;
+    expect(within(rowOf("read-local")).getByText("100%")).toBeDefined();
+    expect(within(rowOf("read-local")).getByText("ready")).toBeDefined();
+    expect(within(rowOf("push-merge-deploy")).getByText("50%")).toBeDefined();
+    expect(within(rowOf("push-merge-deploy")).getByText("below the bar")).toBeDefined();
+    expect(within(rowOf("vcs-local")).getByText("—", { selector: ".ap-agree-none" })).toBeDefined();
+  });
+
+  it("names the shadow verdict buttons by their verb, with the decision id as the subject", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      decisions: [decision({ id: 301 })],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const list = await screen.findByRole("list", { name: "Shadow decisions" });
+    expect(within(list).getByRole("button", { name: "Allow" })).toBeDefined();
+    expect(within(list).getByRole("button", { name: "Block" })).toBeDefined();
+    expect(within(list).queryByText("Allow #301")).toBeNull();
+  });
+
+  it("keeps the project in focus in a bar, and puts the trigger brakes before the evidence", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      decisions: [decision()],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const bar = await screen.findByRole("group", { name: "Project in focus" });
+    expect(within(bar).getByText("alpha")).toBeDefined();
+
+    const brakes = await screen.findByRole("list", { name: "Trigger brakes" });
+    const evidence = await screen.findByRole("list", { name: "Shadow decisions" });
+    // The brakes come first in the document, as the page's own doc-comment promises.
+    expect(brakes.compareDocumentPosition(evidence) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("draws no project-dependent panel, and no 'choose a project above', when the roster is empty", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+
+    await renderCockpit();
+
+    expect(await screen.findByText("No project is under autopilot")).toBeDefined();
+    expect(screen.queryByText("Choose a project above.")).toBeNull();
+    expect(screen.queryByRole("group", { name: "Project in focus" })).toBeNull();
+  });
+
+  it("lists every project by urgency as buttons, and can hide the fan", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({ project_id: "alpha", mode: "shadow" }),
+        project({ project_id: "bravo", mode: "active" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const roster = await screen.findByRole("list", { name: "All projects by urgency" });
+    expect(within(roster).getAllByRole("button")).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide the fan" }));
+    expect(document.querySelector(".ap-fan-nofan")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Show the fan" })).toBeDefined();
+  });
+});

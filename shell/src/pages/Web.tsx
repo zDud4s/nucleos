@@ -3,6 +3,7 @@ import { useEffect, useId, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { Search } from "lucide-react";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { useBrowserHealth } from "../data/browser";
 import {
   useWebPage,
   useWebPages,
@@ -72,13 +73,26 @@ export function Web({ embedded = false }: { embedded?: boolean } = {}) {
           <p>Paste an address above to read it now. Every page read stays here, indexed and searchable.</p>
         </Teach>
       ) : (
-        <div className="web-layout">
-          <ArchiveList rows={rows} loading={loading} q={q} selected={pageId} />
+        // Below 60rem the layout is one column, and with a page open only the reader shows: a list
+        // stacked above it made a click on a row look as if nothing had happened.
+        <div className={pageId === null ? "web-layout" : "web-layout web-layout-reading"}>
+          <div className="web-list">
+            <ArchiveList rows={rows} loading={loading} q={q} selected={pageId} />
+          </div>
 
           <div className="web-detail">
+            {pageId !== null && (
+              <Link className="web-back" to="/web/archive">
+                Back to archive
+              </Link>
+            )}
             {pageId === null && (
-              <Teach title="Nothing is open">
-                <p>Pick a page from the archive to read it here.</p>
+              <Teach title={rawId === undefined ? "Nothing is open" : "No such page"}>
+                <p>
+                  {rawId === undefined
+                    ? "Pick a page from the archive to read it here."
+                    : "There is no page with that number. Pick one from the archive."}
+                </p>
               </Teach>
             )}
             {pageId !== null && <ReaderView key={pageId} id={pageId} />}
@@ -103,7 +117,17 @@ export function Web({ embedded = false }: { embedded?: boolean } = {}) {
  * It reads the whole archive, so the count no longer follows the filter box.
  */
 export function WebHeader() {
-  return <PageHeader title="Web" headline={headline(useWebPages(undefined).data)} />;
+  const health = useBrowserHealth();
+  const subsystem = health.data?.subsystem ?? null;
+  // The sidecar's state is the pillar's, not the Sessions tab's: with the archive open a down
+  // browser would otherwise be invisible.
+  return (
+    <PageHeader
+      title="Web"
+      headline={headline(useWebPages(undefined).data)}
+      actions={subsystem === null ? undefined : <StateBadge domain="pillar" state={subsystem.status} />}
+    />
+  );
 }
 
 function headline(rows: Hit[] | undefined): string | undefined {
@@ -214,7 +238,7 @@ function WebBar({ onFilter }: { onFilter: (q: string | undefined) => void }) {
       </form>
       <p id={hintId} className="web-bar-hint">
         {isUrl || trimmed === ""
-          ? "Pages from outside the allowlist are summarised by the local model before any agent reads them."
+          ? "Paste an address to read it. Type words to filter the archive; Enter also searches the web."
           : "Filtering the archive as you type. Press Enter to search the web as well."}
       </p>
 

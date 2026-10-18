@@ -3,7 +3,8 @@ import { Link } from "@tanstack/react-router";
 import { TriangleAlert } from "lucide-react";
 import type { AnalyticsReport, QuotaHistory } from "../data/analytics";
 import { compactTokens, humanMinutes } from "../data/project-readings";
-import { AreaChart, ErrorNote, ShareBar, StaleNote, StepLine, usd, type ChartDatum, type ChartKey } from "../ui";
+import { DAEMON_NAME } from "../copy";
+import { AreaChart, ErrorNote, ShareBar, Skeleton, StaleNote, StepLine, usd, type ChartDatum, type ChartKey } from "../ui";
 import {
   DELIVERED_KEYS,
   ESTIMATED_KEY,
@@ -153,6 +154,11 @@ export function metrics(report: AnalyticsReport): Metric[] {
   ];
 }
 
+/** A failed read, with the cause a person can act on: the service behind the page is not running. */
+export function unreachable(what: string): string {
+  return `Could not read ${what}: the ${DAEMON_NAME} may be stopped.`;
+}
+
 export interface MetricCardProps {
   metric: Metric<string>;
   open: boolean;
@@ -172,7 +178,7 @@ export function MetricCard({ metric, open, controls, onOpen }: MetricCardProps) 
   const classes = ["an-metric", open ? "an-metric-open" : "", metric.alert === true ? "an-metric-alert" : ""];
   return (
     <div className={classes.filter((name) => name !== "").join(" ")}>
-      <button type="button" className="an-metric-button" aria-expanded={open} aria-controls={controls} onClick={onOpen}>
+      <button type="button" className="an-metric-button" aria-pressed={open} aria-controls={controls} onClick={onOpen}>
         <span className="an-metric-top">
           <span className="an-metric-label">{metric.label}</span>
           <span className="an-metric-hint" aria-hidden="true">
@@ -182,7 +188,7 @@ export function MetricCard({ metric, open, controls, onOpen }: MetricCardProps) 
         <span className="an-metric-value">
           {metric.alert === true && !failed ? (
             // Text and icon, never colour alone: the icon is named after the word beside it.
-            <TriangleAlert className="an-metric-icon" role="img" aria-hidden={false} aria-label={String(metric.value)} />
+            <TriangleAlert className="an-metric-icon" role="img" aria-hidden={false} aria-label="Needs attention" />
           ) : null}
           {failed ? "Could not compute" : metric.value === undefined ? <Unread /> : metric.value}
         </span>
@@ -473,6 +479,8 @@ export interface QuotaSectionProps extends SectionProps {
   failed: boolean;
   /** When the quota read last succeeded; set only when a refetch failed over cached data. */
   staleSince?: number;
+  /** Reads the quota history again; offered beside the error. */
+  onRetry?: () => void;
 }
 
 /**
@@ -482,20 +490,20 @@ export interface QuotaSectionProps extends SectionProps {
  * A step line, not an area: each reading holds until the next, and a curve between them would claim
  * values nobody read.
  */
-export function QuotaSection({ report, history, failed, staleSince }: QuotaSectionProps) {
+export function QuotaSection({ report, history, failed, staleSince, onRetry }: QuotaSectionProps) {
   return (
     <Card label="Quota">
-      <QuotaBody report={report} history={history} failed={failed} staleSince={staleSince} />
+      <QuotaBody report={report} history={history} failed={failed} staleSince={staleSince} onRetry={onRetry} />
     </Card>
   );
 }
 
-function QuotaBody({ report, history, failed, staleSince }: QuotaSectionProps) {
+function QuotaBody({ report, history, failed, staleSince, onRetry }: QuotaSectionProps) {
   if (history === undefined) {
     return failed ? (
-      <ErrorNote>The núcleo did not answer for the quota history.</ErrorNote>
+      <ErrorNote onRetry={onRetry}>{unreachable("the quota history")}</ErrorNote>
     ) : (
-      <p className="an-note">reading…</p>
+      <Skeleton label="Loading the quota history" lines={4} />
     );
   }
   const since = history.since === null ? null : history.since.slice(0, 10);

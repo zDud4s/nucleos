@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import { routeTriple } from "../data/route";
 import {
@@ -94,7 +95,11 @@ function KnownRun({ id }: { id: number }) {
       <>
         <Crumb />
         <PageHeader title={`Run ${id}`} />
-        {run.isError ? <DetailError error={run.error} /> : <Quiet says={`reading run ${id}…`} />}
+        {run.isError ? (
+          <DetailError error={run.error} onRetry={() => void run.refetch()} />
+        ) : (
+          <Quiet says={`reading run ${id}…`} />
+        )}
       </>
     );
   }
@@ -165,6 +170,8 @@ function KnownRun({ id }: { id: number }) {
           second badge beside it and an exit code four blocks down. */}
       <RunPipeline run={detail} alive={alive} />
 
+      <Outcome run={detail} />
+
       <Instruments run={detail} />
 
       {blocks}
@@ -174,6 +181,41 @@ function KnownRun({ id }: { id: number }) {
           run listen — a greyed-out box would be an invitation to try. */}
       {detail.steerable && <SteeringBox id={id} running={detail.status === "running"} />}
     </>
+  );
+}
+
+/* --------------------------------------------------------------- outcome -- */
+
+/**
+ * The run's exit code, said once, and where it went next.
+ *
+ * The exit code used to be written in the facts, again in the stop explanation, and a third
+ * time (the gate's own) beside the suite output, each with its own wording; and the two links
+ * that matter most for a run that is over, the run that continued it and the conversation it
+ * belongs to, sat at the foot of the facts in muted small text. This strip is the one place for
+ * both. The gate's exit code stays in the test gate panel because it is a different number,
+ * the suite's and not the run's. Absent is not zero: a run killed before it reported has no
+ * exit code, which is not the same as exiting 0.
+ */
+function Outcome({ run }: { run: Run }) {
+  return (
+    <section className="runs-outcome" aria-label="Outcome">
+      <span className="runs-outcome-exit">
+        {run.exit_code === null ? "No exit code recorded" : `Exit code ${run.exit_code}`}
+      </span>
+      {run.successor_run_id !== null && (
+        <span className="runs-outcome-link">
+          This run handed its context on.{" "}
+          <Link to={`/runs/${run.successor_run_id}`}>Run {run.successor_run_id} continued it</Link>.
+        </span>
+      )}
+      {run.chat_id != null && (
+        <span className="runs-outcome-link">
+          This run is one turn of a conversation.{" "}
+          <Link to={`/chats/${run.chat_id}`}>See the conversation</Link>.
+        </span>
+      )}
+    </section>
   );
 }
 
@@ -229,9 +271,6 @@ function FactsPanel({ run }: { run: Run }) {
       <dl className="runs-facts">
         <Fact label="Project">{run.project_id ?? "no project"}</Fact>
         <Fact label="Session">{run.session_id ?? "none recorded"}</Fact>
-        {/* Absent is not zero. A run killed before it reported has no exit code,
-            which is a different fact from exiting 0. */}
-        <Fact label="Exit code">{run.exit_code === null ? "none recorded" : String(run.exit_code)}</Fact>
         <Fact label="Turns">{run.num_turns === null ? "none recorded" : String(run.num_turns)}</Fact>
         <Fact label="Steerable">{run.steerable ? "yes — it accepts more turns" : "no"}</Fact>
       </dl>
@@ -242,24 +281,6 @@ function FactsPanel({ run }: { run: Run }) {
           fact of how the run was built, not watched like the cost and the context fill. */}
       <PromptBudget authored={run.authored_prompt_estimate} cliOwn={run.cli_own_estimate} />
 
-      {/*
-        The handoff link. The núcleo has recorded it since handoffs existed and
-        the old shell never had the field, so a run that ran out of context and
-        continued somewhere else looked, on screen, like a run that simply
-        stopped — the continuation was reachable only by reading the database.
-      */}
-      {run.successor_run_id !== null && (
-        <p className="runs-successor">
-          This run handed its context on.{" "}
-          <Link to={`/runs/${run.successor_run_id}`}>Run {run.successor_run_id} continued it</Link>.
-        </p>
-      )}
-      {run.chat_id != null && (
-        <p className="runs-successor">
-          This run is one turn of a conversation.{" "}
-          <Link to={`/chats/${run.chat_id}`}>See the conversation</Link>.
-        </p>
-      )}
     </Panel>
   );
 }
@@ -402,7 +423,7 @@ function Fact({ label, children }: { label: string; children: ReactNode }) {
 function GateBlock({ run }: { run: Run }) {
   const measured = run.gate_status !== null && run.gate_status.trim() !== "";
   return (
-    <Panel title="Gate">
+    <Panel title="Test gate">
       {/* The VERDICT is the second instrument in the strip above — it is a reading, and a
           reading belongs where the other three are. What stays here is the evidence
           behind it, which is not a badge: the exit code, the sentence for a run nothing
@@ -410,7 +431,7 @@ function GateBlock({ run }: { run: Run }) {
       {measured && (
         <p className="runs-gate-line">
           <span className="runs-gate-exit">
-            {run.gate_exit_code === null ? "no exit code recorded" : `exit ${run.gate_exit_code}`}
+            {run.gate_exit_code === null ? "no gate exit code recorded" : `Test gate exit ${run.gate_exit_code}`}
           </span>
         </p>
       )}
@@ -434,7 +455,7 @@ function GateBlock({ run }: { run: Run }) {
  * above answers.
  *
  * **The two titles carry the whole distinction and neither may say just "gate".**
- * "Gate" above is the DETERMINISTIC gate: a test suite that ran and returned an
+ * "Test gate" above is the DETERMINISTIC gate: a test suite that ran and returned an
  * exit code, a verdict about the code. This is the TOOL gate: the classifier
  * deciding, call by call, whether the run was allowed to do a thing — and its
  * `kind: "gate"` means the run stopped waiting for a person to say yes. Two
@@ -480,16 +501,8 @@ function StopBlock({ id, alive }: { id: number; alive: boolean }) {
 
       {data.gate !== null && <StopDecisionLine decision={data.gate} highlight />}
 
-      {data.exit_code !== null && <p className="runs-gate-note">{`Exit code ${data.exit_code}.`}</p>}
       {data.stderr_tail !== null && data.stderr_tail !== "" && (
         <pre className="runs-pre">{data.stderr_tail}</pre>
-      )}
-      {data.successor_run_id !== null && (
-        <p className="runs-gate-note">
-          <Link to="/runs/$runId" params={{ runId: String(data.successor_run_id) }}>
-            {`Continued as run ${data.successor_run_id}`}
-          </Link>
-        </p>
       )}
 
       {data.leading_up !== null && data.leading_up.length > 0 && (
@@ -660,7 +673,7 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
   }, [chunk]);
 
   const [raw, setRaw] = useState(false);
-  const events = useMemo(() => readRunStream(text), [text]);
+  const events = useRunEvents(text);
 
   /**
    * Follows the bottom while the reader is at the bottom, and stays put once they scroll up to
@@ -668,6 +681,8 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
    */
   const well = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+  // The same fact as `pinned`, as state, because "Jump to latest" is drawn from it.
+  const [following, setFollowing] = useState(true);
   useEffect(() => {
     const element = well.current;
     if (element !== null && pinned.current) element.scrollTop = element.scrollHeight;
@@ -676,6 +691,13 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
     const element = well.current;
     if (element === null) return;
     pinned.current = element.scrollHeight - element.scrollTop - element.clientHeight < 24;
+    setFollowing(pinned.current);
+  };
+  const jumpToLatest = () => {
+    const element = well.current;
+    pinned.current = true;
+    setFollowing(true);
+    if (element !== null) element.scrollTop = element.scrollHeight;
   };
 
   return (
@@ -684,14 +706,18 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
       aside={
         text !== "" && (
           <Button aria-pressed={raw} onClick={() => setRaw(!raw)}>
-            {raw ? "Readable" : "Raw"}
+            Raw output
           </Button>
         )
       }
     >
       {/* A read that failed says nothing about where the output is — unlike the
           204 below, which says exactly where it is. */}
-      {tail.isError && <ErrorNote>the live tail is unreachable — the núcleo did not answer</ErrorNote>}
+      {tail.isError && (
+        <ErrorNote onRetry={() => void tail.refetch()}>
+          Could not read the live tail — the {DAEMON_NAME} is not answering.
+        </ErrorNote>
+      )}
       {chunk === RECORDED && (
         <p className="runs-tail-note">
           recorded — this run has no live tail; what it wrote is in the stored output below
@@ -700,11 +726,26 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
       )}
       {text !== "" &&
         (raw ? (
-          <div ref={well} onScroll={onScroll} className="runs-pre runs-tail">
+          <div
+            ref={well}
+            onScroll={onScroll}
+            className="runs-pre runs-tail"
+            // A scrolling box the keyboard cannot reach cannot be read by a keyboard.
+            tabIndex={0}
+            role="log"
+            aria-label="Live output"
+          >
             {text}
           </div>
         ) : (
-          <div ref={well} onScroll={onScroll} className="runs-events-well">
+          <div
+            ref={well}
+            onScroll={onScroll}
+            className="runs-events-well"
+            tabIndex={0}
+            role="log"
+            aria-label="Live output"
+          >
             {events.length === 0 ? (
               <p className="runs-tail-note">nothing to read yet — the agent is working</p>
             ) : (
@@ -712,11 +753,66 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
             )}
           </div>
         ))}
+      {text !== "" && !following && (
+        <p className="runs-jump">
+          <Button variant="quiet" onClick={jumpToLatest}>
+            Jump to latest
+          </Button>
+        </p>
+      )}
       {text === "" && chunk !== RECORDED && !tail.isError && (
         <p className="runs-tail-note">{alive ? "nothing written yet" : "no live output was captured"}</p>
       )}
     </Panel>
   );
+}
+
+/**
+ * The tail as events, parsed once per line instead of once per poll.
+ *
+ * `readRunStream(text)` re-read the whole of a buffer that can hold two megabytes on every
+ * chunk. The tail only grows at its end, so the finished lines (everything up to the last
+ * newline) are parsed once and kept, each poll parses only the lines added since, and the
+ * unfinished last line is read on its own every time. A raw run that straddles two reads is
+ * joined back into one event, which is what a single parse of the whole text would have made.
+ * When the head of the text changes (`capTail` dropped the oldest lines) the cache is thrown
+ * away and the text is read afresh. Event objects the cache holds keep their identity, so the
+ * memoised rows beneath do not redraw.
+ */
+function useRunEvents(text: string): RunEvent[] {
+  const cache = useRef<{ done: number; guard: string; events: RunEvent[] }>({
+    done: 0,
+    guard: "",
+    events: [],
+  });
+  return useMemo(() => {
+    const finished = text.lastIndexOf("\n") + 1;
+    const state = cache.current;
+    const intact =
+      state.done <= finished && text.slice(Math.max(0, state.done - GUARD), state.done) === state.guard;
+    if (!intact) cache.current = { done: 0, guard: "", events: [] };
+    const held = cache.current;
+    if (finished > held.done) {
+      held.events = joinEvents(held.events, readRunStream(text.slice(held.done, finished)));
+      held.done = finished;
+      held.guard = text.slice(Math.max(0, finished - GUARD), finished);
+    }
+    return finished < text.length ? joinEvents(held.events, readRunStream(text.slice(finished))) : held.events;
+  }, [text]);
+}
+
+/** How much of the parsed head is compared to tell that the text has only grown at its end. */
+const GUARD = 64;
+
+/** Appends `next` to `head`, merging two raw runs that met at the seam into the one a whole parse makes. */
+function joinEvents(head: RunEvent[], next: RunEvent[]): RunEvent[] {
+  const last = head[head.length - 1];
+  const first = next[0];
+  if (last?.kind === "raw" && first?.kind === "raw") {
+    return [...head.slice(0, -1), { kind: "raw", text: `${last.text}
+${first.text}` }, ...next.slice(1)];
+  }
+  return [...head, ...next];
 }
 
 /** The small label in front of an event: who is speaking, or what kind of thing this is. */
@@ -749,7 +845,7 @@ function RunEventList({ events }: { events: RunEvent[] }) {
   );
 }
 
-function RunEventRow({ event }: { event: RunEvent }) {
+const RunEventRow = memo(function RunEventRow({ event }: { event: RunEvent }) {
   const tone = event.kind === "result" || event.kind === "done" ? (event.error ? " runs-event-error" : "") : "";
   return (
     <li className={`runs-event runs-event-${event.kind}${tone}`}>
@@ -770,7 +866,7 @@ function RunEventRow({ event }: { event: RunEvent }) {
       </div>
     </li>
   );
-}
+});
 
 /* -------------------------------------------------------------- streams -- */
 
@@ -790,7 +886,7 @@ function StdStreams({ run }: { run: Run }) {
         <>
           {open && run.stdout !== null && (
             <Button aria-pressed={raw} onClick={() => setRaw(!raw)}>
-              {raw ? "Readable" : "Raw"}
+              Raw output
             </Button>
           )}
           <Button aria-expanded={open} onClick={() => setOpen(!open)}>
@@ -807,7 +903,7 @@ function StdStreams({ run }: { run: Run }) {
           ) : raw ? (
             <pre className="runs-pre">{run.stdout}</pre>
           ) : (
-            <div className="runs-events-well">
+            <div className="runs-events-well" tabIndex={0} role="region" aria-label="Stored output">
               {events.length === 0 ? (
                 <p className="runs-tail-note">nothing a person reads — Raw shows the wire</p>
               ) : (
@@ -844,14 +940,44 @@ function SteeringBox({ id, running }: { id: number; running: boolean }) {
   const end = useEndTurns(id);
   const [message, setMessage] = useState("");
 
+  // A run that is over has no channel left, so the box is not offered at all: a textarea and a
+  // dead Send turn invite a message that can only be refused. What stays is the one control that
+  // is still true of it, closing its input.
+  if (!running) {
+    return (
+      <Panel title="Speak to this run">
+        <div className="runs-steer">
+          <p className="runs-tail-note">
+            This run is no longer running, so it cannot take another turn. Ending the turns is still
+            safe, and it is how one is closed.
+          </p>
+          <div className="runs-steer-actions">
+            <ConfirmButton
+              label="End the turns"
+              confirmLabel="Stop accepting turns"
+              variant="danger"
+              disabled={end.isPending}
+              onConfirm={() => end.mutate()}
+            />
+          </div>
+          {end.isError && <MutationNote error={end.error} what="its turns could not be closed" />}
+        </div>
+      </Panel>
+    );
+  }
+
+  const send = () => {
+    if (message.trim() === "" || steer.isPending) return;
+    steer.mutate(message.trim(), { onSuccess: () => setMessage("") });
+  };
+
   return (
     <Panel title="Speak to this run">
       <form
         className="runs-steer"
         onSubmit={(event) => {
           event.preventDefault();
-          if (message.trim() === "" || steer.isPending) return;
-          steer.mutate(message.trim(), { onSuccess: () => setMessage("") });
+          send();
         }}
       >
         <label className="runs-field">
@@ -861,26 +987,26 @@ function SteeringBox({ id, running }: { id: number; running: boolean }) {
             value={message}
             aria-label="Say something to this run"
             onChange={(event) => setMessage(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                event.preventDefault();
+                send();
+              }
+            }}
           />
         </label>
         <div className="runs-steer-actions">
-          <Button type="submit" intent="go" disabled={!running || steer.isPending}>
+          <Button type="submit" intent="go" disabled={steer.isPending}>
             Send turn
           </Button>
           <ConfirmButton
             label="End the turns"
-            confirmLabel="Close its input"
+            confirmLabel="Stop accepting turns"
             variant="danger"
             disabled={end.isPending}
             onConfirm={() => end.mutate()}
           />
         </div>
-        {!running && (
-          <p className="runs-tail-note">
-            this run is no longer running, so it has no channel left to reach — ending the turns is
-            still safe and still the way to close one
-          </p>
-        )}
         {steer.isError && <SteerRefusal error={steer.error} />}
         {end.isError && <MutationNote error={end.error} what="its turns could not be closed" />}
       </form>
@@ -898,7 +1024,11 @@ function SteeringBox({ id, running }: { id: number; running: boolean }) {
  */
 function SteerRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — the turn was not delivered</ErrorNote>;
+    return (
+      <ErrorNote>
+        Could not reach the {DAEMON_NAME} — the turn was not delivered.
+      </ErrorNote>
+    );
   }
   return (
     <RefusalNote
@@ -914,7 +1044,7 @@ function SteerRefusal({ error }: { error: unknown }) {
 
 /* --------------------------------------------------------------- notes -- */
 
-function DetailError({ error }: { error: unknown }) {
+function DetailError({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
   if (isApiRefusal(error)) {
     return (
       <RefusalNote
@@ -923,12 +1053,20 @@ function DetailError({ error }: { error: unknown }) {
       />
     );
   }
-  return <ErrorNote>the núcleo did not answer — nothing is known about this run</ErrorNote>;
+  return (
+    <ErrorNote onRetry={onRetry}>
+      Could not reach the {DAEMON_NAME} — nothing is known about this run.
+    </ErrorNote>
+  );
 }
 
 function MutationNote({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
+  return (
+    <ErrorNote>
+      Could not reach the {DAEMON_NAME} — {what}.
+    </ErrorNote>
+  );
 }
 
 function daemonProse(refusal: ApiRefusal): Record<string, string> {

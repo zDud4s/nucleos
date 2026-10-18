@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   RUN_LIST_LIMIT,
@@ -31,6 +32,7 @@ import {
   Quiet,
   RefusalNote,
   Section,
+  Skeleton,
   RelativeTime,
   Row,
   Rows,
@@ -153,15 +155,11 @@ export function Runs() {
     <>
       <PageHeader
         title="Runs"
-        // A status region, so a failure that lands while somebody is reading
-        // the page is said rather than only drawn. It is always mounted: a live
-        // region that appears together with its first sentence is not
-        // announced.
-        headline={
-          <span role="status" aria-live="polite">
-            {headline(rows, filters)}
-          </span>
-        }
+        // Plain text, not a live region: the index refetches on a timer and a
+        // region around this sentence read every changed count aloud. What is
+        // announced is the failure itself, through the stale and error notes
+        // below, which carry their own roles.
+        headline={headline(rows, filters)}
         actions={
           <Button
             id={openerId}
@@ -191,14 +189,18 @@ export function Runs() {
       />
 
       {stale && <StaleNote dataUpdatedAt={runs.dataUpdatedAt} />}
-      {runs.isError && rows === undefined && <ListError error={runs.error} />}
+      {runs.isError && rows === undefined && (
+        <ListError error={runs.error} onRetry={() => void runs.refetch()} />
+      )}
 
-      <RunList
-        rows={rows}
-        filtered={isFiltered(filters)}
-        filters={filters}
-        onCompose={composing ? undefined : () => setComposing(true)}
-      />
+      {(rows !== undefined || !runs.isError) && (
+        <RunList
+          rows={rows}
+          filtered={isFiltered(filters)}
+          filters={filters}
+          onCompose={composing ? undefined : () => setComposing(true)}
+        />
+      )}
     </>
   );
 }
@@ -247,12 +249,18 @@ function RunFilterBar({
   onChange: (patch: Partial<RunSearch>) => void;
 }) {
   const moreId = useId();
-  // Open on arrival when a filter it holds is in force: a mode, or a status the
-  // scope control has no segment for. Otherwise the list would be narrowed by a
-  // control nobody can see.
+  // Open on arrival when a filter it holds is in force: a project, a mode, chat
+  // turns shown, or a status the scope control has no segment for. Otherwise the
+  // list would be narrowed by a control nobody can see.
+  const otherStatus =
+    filters.status !== undefined && !SCOPE_STATUSES.has(filters.status)
+      ? filters.status
+      : undefined;
   const needsMore =
+    filters.project !== undefined ||
     filters.mode !== undefined ||
-    (filters.status !== undefined && !SCOPE_STATUSES.has(filters.status));
+    showChats ||
+    otherStatus !== undefined;
   const [more, setMore] = useState(needsMore);
   // Adjusted during render rather than in an effect, so there is no frame in
   // which a filter that just came into force is hidden.
@@ -287,39 +295,25 @@ function RunFilterBar({
         ))}
       </div>
 
+      {otherStatus !== undefined && (
+        // A status the four segments cannot show, kept in sight and removable,
+        // so the list is never narrowed by something that is not on screen.
+        <Button
+          variant="quiet"
+          aria-label={`Remove status filter: ${readState("run", otherStatus)?.label ?? otherStatus}`}
+          onClick={() => onChange({ status: undefined })}
+        >
+          status: {readState("run", otherStatus)?.label ?? otherStatus}{" "}
+          <span aria-hidden="true">×</span>
+        </Button>
+      )}
+
       <div className="runs-search">
         <Field label="Search prompts">
           <input name="q" defaultValue={filters.q ?? ""} key={filters.q ?? ""} />
         </Field>
         <Button type="submit">Search</Button>
       </div>
-
-      <Field label="Project">
-        <select
-          value={filters.project ?? ""}
-          aria-label="Filter by project"
-          onChange={(event) => onChange({ project: event.target.value })}
-        >
-          <option value="">any project</option>
-          {(projects ?? []).map((project) => (
-            <option key={project.project_id} value={project.project_id}>
-              {project.project_id}
-            </option>
-          ))}
-        </select>
-      </Field>
-
-      <label className="runs-check">
-        <input
-          type="checkbox"
-          checked={showChats}
-          disabled={filters.mode === "assistant"}
-          onChange={(event) =>
-            onChange({ chats: event.target.checked ? "show" : undefined })
-          }
-        />
-        Show chat turns
-      </label>
 
       <span className="runs-filters-aside">
         <Button
@@ -348,12 +342,25 @@ function RunFilterBar({
       </span>
 
       <div id={moreId} className="runs-more" hidden={!more}>
+        <Field label="Project">
+          <select
+            value={filters.project ?? ""}
+            onChange={(event) => onChange({ project: event.target.value })}
+          >
+            <option value="">any project</option>
+            {(projects ?? []).map((project) => (
+              <option key={project.project_id} value={project.project_id}>
+                {project.project_id}
+              </option>
+            ))}
+          </select>
+        </Field>
+
         <Field label="Mode">
           {/* `assistant` is offered here and not in the new-run form: the daemon
               writes that mode, so runs carry it, but nobody may ask for one. */}
           <select
             value={filters.mode ?? ""}
-            aria-label="Filter by mode"
             onChange={(event) => onChange({ mode: event.target.value })}
           >
             <option value="">any mode</option>
@@ -365,23 +372,34 @@ function RunFilterBar({
           </select>
         </Field>
 
-        <Field label="Status">
-          {/* The badge's own words, from the one table: a filter that says
-              `timed_out` above a list that says "timed out" is two vocabularies
-              for one fact. */}
+        <Field label="Other status">
+          {/* Only the statuses the four scopes above do not already offer, in
+              the badge's own words from the one table: choosing "failed" has one
+              place to be done, not two. */}
           <select
-            value={filters.status ?? ""}
-            aria-label="Filter by status"
+            value={otherStatus ?? ""}
             onChange={(event) => onChange({ status: event.target.value })}
           >
-            <option value="">any status</option>
-            {RUN_STATUSES.map((status) => (
+            <option value="">none</option>
+            {RUN_STATUSES.filter((status) => !SCOPE_STATUSES.has(status)).map((status) => (
               <option key={status} value={status}>
                 {readState("run", status)?.label ?? status}
               </option>
             ))}
           </select>
         </Field>
+
+        <label className="runs-check">
+          <input
+            type="checkbox"
+            checked={showChats}
+            disabled={filters.mode === "assistant"}
+            onChange={(event) =>
+              onChange({ chats: event.target.checked ? "show" : undefined })
+            }
+          />
+          Show chat turns
+        </label>
       </div>
     </form>
   );
@@ -407,7 +425,7 @@ function RunList({
   /** Opens the New run panel; absent while it is already open. */
   onCompose: (() => void) | undefined;
 }) {
-  if (rows === undefined) return <Quiet says="reading the index…" />;
+  if (rows === undefined) return <Skeleton label="Loading runs" lines={3} />;
 
   if (rows.length === 0) {
     return (
@@ -423,16 +441,16 @@ function RunList({
       >
         {filtered ? (
           <p>
-            The núcleo has runs, but none of them match. Clear the filters above
-            to see the whole index — an empty filtered list is not an empty
+            The {DAEMON_NAME} has runs, but none of them match. Clear the filters
+            above to see the whole index — an empty filtered list is not an empty
             machine.
           </p>
         ) : (
           <p>
-            A run is one call to the CLI. Start one with New run at the top of
-            the page, or save a request as a preset and start it from there.
-            Jobs and the autopilot create runs too, and they appear here
-            alongside the ones you ask for.
+            A run is one task handed to the AI tool. Start one with New run, or
+            save a request as a preset and start it from there. Jobs and the
+            autopilot create runs too, and they appear here alongside the ones
+            you ask for.
           </p>
         )}
       </Teach>
@@ -452,8 +470,8 @@ function RunList({
       </Rows>
       {rows.length >= RUN_LIST_LIMIT && (
         <p className="runs-ceiling">
-          showing the newest {RUN_LIST_LIMIT} — there may be more behind these;
-          narrow the filters to reach them
+          showing the newest {RUN_LIST_LIMIT} — older runs are not listed here;
+          narrow the filters or search to reach them
         </p>
       )}
     </>
@@ -783,6 +801,7 @@ function NewRunForm({
   const [draft, setDraft] = useState<RunDraft>(EMPTY_DRAFT);
   const hintId = useId();
   const killId = useId();
+  const realId = useId();
   const modeName = useId();
 
   function patch(next: Partial<RunDraft>) {
@@ -810,6 +829,21 @@ function NewRunForm({
   const unwatched =
     chosen !== undefined && chosen.mode === "off" && draft.mode !== "real";
 
+  const isReal = draft.mode === "real";
+
+  function start() {
+    if (blank || create.isPending) return;
+    create.mutate(
+      { ...body, steerable: draft.steerable },
+      {
+        onSuccess: (answer) => {
+          setDraft(EMPTY_DRAFT);
+          onStarted(answer.id);
+        },
+      },
+    );
+  }
+
   const describedBy =
     [blank ? hintId : null, engaged ? killId : null]
       .filter((part) => part !== null)
@@ -821,16 +855,10 @@ function NewRunForm({
         className="runs-new"
         onSubmit={(event) => {
           event.preventDefault();
-          if (blank || create.isPending) return;
-          create.mutate(
-            { ...body, steerable: draft.steerable },
-            {
-              onSuccess: (answer) => {
-                setDraft(EMPTY_DRAFT);
-                onStarted(answer.id);
-              },
-            },
-          );
+          // A real run is started by the hold below and by nothing else, so an
+          // Enter in a field cannot be the one click that acts on files.
+          if (isReal) return;
+          start();
         }}
       >
         {/* The inner id is Start run's: the button points at the same
@@ -838,7 +866,7 @@ function NewRunForm({
             the box by its label and describes it by the helper. */}
         <Field
           label="Prompt"
-          helper={<span id={hintId}>Start run waits until this says what the run should do.</span>}
+          helper={<span id={hintId}>Describe what the run should do.</span>}
         >
           <textarea
             ref={promptRef}
@@ -850,10 +878,9 @@ function NewRunForm({
         </Field>
 
         <div className="runs-new-where">
-          <Field label="Project">
+          <Field label="Project for this run">
             <select
               value={draft.project}
-              aria-label="Project for the new run"
               onChange={(event) => patch({ project: event.target.value })}
             >
               <option value="">no project</option>
@@ -868,8 +895,7 @@ function NewRunForm({
           <Field label="Working directory">
             <input
               value={draft.cwd}
-              placeholder="the daemon's default"
-              aria-label="Working directory for the new run"
+              placeholder="the default directory"
               onChange={(event) => patch({ cwd: event.target.value })}
             />
           </Field>
@@ -881,11 +907,19 @@ function NewRunForm({
           onChange={(mode) => patch({ mode })}
         />
 
+        {isReal && (
+          <p className="runs-hold runs-real" id={realId}>
+            A real run acts on the files in{" "}
+            {draft.cwd.trim() === "" ? "the default directory" : draft.cwd.trim()}{" "}
+            as they are, with nothing to undo it. Hold Start run to confirm.
+          </p>
+        )}
+
         {unwatched && (
           <p className="runs-hold">
             {chosen.project_id} is off, and a {draft.mode} run is one nobody is
-            watching — the núcleo refuses it until the project is in shadow or
-            active.
+            watching — the {DAEMON_NAME} refuses it until the project is in
+            shadow or active.
           </p>
         )}
 
@@ -902,20 +936,32 @@ function NewRunForm({
 
         {engaged && (
           <p className="runs-hold" id={killId}>
-            The kill switch is engaged — the núcleo will refuse this run until
-            it is released.
+            {`The kill switch is engaged — the ${DAEMON_NAME} will refuse this run until it is released.`}
           </p>
         )}
 
         <div className="runs-new-actions">
-          <Button
-            type="submit"
-            intent="go"
-            disabled={blank || create.isPending}
-            aria-describedby={describedBy}
-          >
-            Start run
-          </Button>
+          {isReal ? (
+            <ConfirmButton
+              label="Start run"
+              confirmLabel="Start in real mode"
+              sayAs="starts a real run, acting on the files in the working directory as they are"
+              variant="approve"
+              intent="go"
+              disabled={blank || create.isPending}
+              describedBy={[describedBy, realId].filter(Boolean).join(" ")}
+              onConfirm={start}
+            />
+          ) : (
+            <Button
+              type="submit"
+              intent="go"
+              disabled={blank || create.isPending}
+              aria-describedby={describedBy}
+            >
+              Start run
+            </Button>
+          )}
         </div>
 
         {create.isError && (
@@ -1001,6 +1047,14 @@ function ModePicker({
                   choice.mode
                 )}
               </label>
+              {/* Said beside the name, in Held Ember: the one mode with
+                  nothing between the run and the files. Not in the label, so
+                  the radio keeps its name. */}
+              {choice.mode === "real" && (
+                <span className="runs-mode-tag" aria-hidden="true">
+                  acts on your files
+                </span>
+              )}
             </span>
             <p id={saysId} className="runs-mode-says">
               {choice.says}
@@ -1155,19 +1209,22 @@ function PresetRow({
 const START_SENTENCES: Record<string, string> = {
   conflict:
     "the kill switch is engaged, or this worktree run's project has no free slot — nothing was started",
-  unavailable:
-    "the kill switch or the project's autopilot mode could not be read, so the núcleo refused rather than start something either may have forbidden",
+  unavailable: `the kill switch or the project's autopilot mode could not be read, so the ${DAEMON_NAME} refused rather than start something either may have forbidden`,
   unprocessable:
     "that project is off, and a shadow or worktree run is one nobody is watching — put the project in shadow or active first",
   bad_request:
-    "the núcleo would not accept that request — check the mode against the directory",
+    `the ${DAEMON_NAME} would not accept that request — check the mode against the directory`,
   internal:
-    "the núcleo failed to prepare the run — a worktree or the database, not your request",
+    `the ${DAEMON_NAME} failed to prepare the run — a worktree or the database, not your request`,
 };
 
 function StartRefusal({ error, what }: { error: unknown; what: string }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
+    return (
+      <ErrorNote>
+        Could not reach the {DAEMON_NAME} — {what}.
+      </ErrorNote>
+    );
   }
   return (
     <RefusalNote
@@ -1182,7 +1239,7 @@ function PresetRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        the núcleo did not answer — the preset was not saved
+        Could not reach the {DAEMON_NAME} — the preset was not saved.
       </ErrorNote>
     );
   }
@@ -1197,12 +1254,12 @@ function PresetRefusal({ error }: { error: unknown }) {
   );
 }
 
-function ListError({ error }: { error: unknown }) {
+function ListError({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
   if (isApiRefusal(error))
     return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
-    <ErrorNote>
-      the núcleo did not answer — nothing is known about the index
+    <ErrorNote onRetry={onRetry}>
+      Could not reach the {DAEMON_NAME} — nothing is known about the index.
     </ErrorNote>
   );
 }
@@ -1210,7 +1267,11 @@ function ListError({ error }: { error: unknown }) {
 function MutationNote({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error))
     return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
+  return (
+    <ErrorNote>
+      Could not reach the {DAEMON_NAME} — {what}.
+    </ErrorNote>
+  );
 }
 
 function daemonProse(refusal: ApiRefusal): Record<string, string> {

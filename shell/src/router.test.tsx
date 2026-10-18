@@ -210,7 +210,7 @@ describe("the app router", () => {
     // Read by position rather than by name because two of the tabs carry a count beside their
     // label once the query behind them has answered.
     expect(links).toHaveLength(6);
-    expect(links[4].textContent).toContain("Authority");
+    expect(links[4].textContent).toContain("Permissions");
     expect(links[4].getAttribute("href")).toBe("/projects/nucleos/authority");
     expect(links[5].textContent).toContain("Analytics");
     expect(links[5].getAttribute("href")).toBe("/projects/nucleos/analytics");

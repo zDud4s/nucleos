@@ -534,9 +534,15 @@ export function VoiceRoom({
     };
 
     const loop = (now: number) => {
+      const { phase, level, threshold, tap } = inputRef.current;
+      // The sand is the page's heaviest loop (about 31 000 grains a frame). With nobody speaking it
+      // runs at about 30fps, and a hidden window skips it altogether.
+      if (document.hidden || ((phase === "off" || phase === "thinking") && now - anim.last < 30)) {
+        frame = requestAnimationFrame(loop);
+        return;
+      }
       const dt = Math.min((now - anim.last) / 1000, 0.1);
       anim.last = now;
-      const { phase, level, threshold, tap } = inputRef.current;
       // The room hears you: your microphone, measured against the bar that opens a turn.
       anim.mic += (micTarget(phase, level, threshold) - anim.mic) * Math.min(dt * 6, 1);
       // The orb is nucleos's voice: it moves when nucleos speaks, and holds still to listen.

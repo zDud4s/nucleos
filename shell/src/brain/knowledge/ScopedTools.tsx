@@ -5,7 +5,7 @@ import {
   useRevokeLoadoutTool,
   type LoadoutTool,
 } from "../../data/loadout-tools";
-import { Button, ErrorNote, Quiet, RefusalNote, RelativeTime, Row, Rows } from "../../ui";
+import { Button, ErrorNote, Quiet, RefusalNote, RelativeTime, Row, Rows, Skeleton } from "../../ui";
 import "./knowledge.css";
 
 export interface ScopedToolsProps {
@@ -26,9 +26,11 @@ export function ScopedTools({ ownerKind, ownerId }: ScopedToolsProps) {
 
   let body: ReactNode;
   if (active.isError) {
-    body = <Quiet says="the núcleo did not answer — these tools are unknown" />;
+    body = (
+      <ErrorNote onRetry={() => void active.refetch()}>the núcleo did not answer — these tools are unknown</ErrorNote>
+    );
   } else if (active.data === undefined) {
-    body = <Quiet says="Loading…" />;
+    body = <Skeleton label="Loading tools…" lines={2} />;
   } else {
     const rows = active.data.filter((row) => row.owner_kind === ownerKind && row.owner_id === ownerId);
     const waitingCount = (waiting.data ?? []).length;

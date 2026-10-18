@@ -16,6 +16,7 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 beforeEach(() => {
+  window.sessionStorage.clear();
   daemon.apiFetch.mockReset();
 });
 
@@ -100,6 +101,20 @@ describe("UnifiedList", () => {
     fireEvent.click(within(type).getByRole("button", { name: "Knowledge" }));
     await waitFor(() => expect(screen.queryByRole("button", { name: /Rust owns the state/ })).toBeNull());
     expect(screen.getByRole("button", { name: /Suite needs PATH/ })).toBeTruthy();
+  });
+
+  it("keeps its filters when it is mounted again", async () => {
+    daemonHolding([note({ id: 1 })], [known({ id: 5, title: "Suite needs PATH" })]);
+    const first = await renderWithRouter(<UnifiedList onSelect={vi.fn()} />);
+    await screen.findByRole("button", { name: /Suite needs PATH/ });
+    fireEvent.click(within(screen.getByRole("group", { name: "Type" })).getByRole("button", { name: "Knowledge" }));
+    first.unmount();
+
+    await renderWithRouter(<UnifiedList onSelect={vi.fn()} />);
+    await screen.findByRole("button", { name: /Suite needs PATH/ });
+    const type = screen.getByRole("group", { name: "Type" });
+    expect(within(type).getByRole("button", { name: "Knowledge" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryByRole("button", { name: /Rust owns the state/ })).toBeNull();
   });
 
   it("lists closed captures under Over, titled by the first line of the question", async () => {

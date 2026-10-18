@@ -51,6 +51,7 @@ import {
   PageHeader,
   Quiet,
   RefusalNote,
+  Skeleton,
   StaleNote,
   StateBadge,
   Teach,
@@ -149,6 +150,8 @@ const GRAVITY_WORDS: Record<Exclude<FeedGravity, "routine">, [string, string]> =
   held: ["held", "held"],
   asks: ["asks for you", "ask for you"],
 };
+/** How long the "Marked … seen" line offers its Undo. */
+const UNDO_MS = 8000;
 const EXCEPTIONS: Exclude<FeedGravity, "routine">[] = ["wrong", "held", "asks"];
 
 export function Feed() {
@@ -276,19 +279,44 @@ export function Feed() {
   const unseenExists =
     !searching && newestAll !== null && (snapshot?.through === null || snapshot === null || newestAll > (snapshot?.through ?? -1));
 
+  /**
+   * What "Mark everything seen" just did, held for a few seconds so it can be taken back: the
+   * marker as this visit had it, and how many lines the mark covered. The daemon clamps its marker
+   * monotonic, so Undo restores the shading of THIS visit and cannot move the stored marker back —
+   * the label says so.
+   */
+  const [undo, setUndo] = useState<{ before: FeedSeen | null; count: number } | null>(null);
+  useEffect(() => {
+    if (undo === null) return;
+    const timer = window.setTimeout(() => setUndo(null), UNDO_MS);
+    return () => window.clearTimeout(timer);
+  }, [undo]);
+
   async function markEverythingSeen() {
     if (newestAll === null) return;
+    const before = snapshot ?? null;
+    const floor = before?.through ?? -1;
+    const count = allEntries.filter((entry) => entry.id > floor).length;
     posted.current = newestAll;
     try {
       const answer = await markFeedSeen(newestAll);
       client.setQueryData(keys.feed.seen, answer);
       setSnapshot(answer);
       if (preset === "seen") setRange(resolveWindow("seen", Date.now(), answer));
-      setSaid("everything in this window is marked seen");
+      setUndo({ before, count });
+      setSaid(`${count === 1 ? "1 line" : `${count} lines`} marked seen`);
     } catch {
       posted.current = null;
       setSaid("the núcleo did not take the mark — nothing changed");
     }
+  }
+
+  function undoMarkSeen() {
+    if (undo === null) return;
+    setSnapshot(undo.before);
+    if (preset === "seen") setRange(resolveWindow("seen", Date.now(), undo.before));
+    setUndo(null);
+    setSaid("mark undone for this visit");
   }
 
   /* --------------------------------------------------------- the trace -- */
@@ -397,6 +425,14 @@ export function Feed() {
           <Button variant="quiet" onClick={() => void markEverythingSeen()}>
             Mark everything seen
           </Button>
+        )}
+        {undo !== null && (
+          <span className="feed-undo">
+            Marked {undo.count === 1 ? "1 line" : `${undo.count} lines`} seen.
+            <Button variant="quiet" onClick={undoMarkSeen} title="Restores the shading for this visit; the stored marker stays put">
+              Undo
+            </Button>
+          </span>
         )}
         <FeedSearchForm filters={filters} projects={projects.data} onChange={applyFilters} />
       </div>
@@ -551,10 +587,11 @@ function searchHeadline(rows: FeedEntry[] | undefined, filters: FeedFilters): st
  * They open by themselves when the route already carries one, so a shared link never hides the
  * filter that shaped it.
  *
- * Typed fields commit on Enter and chosen ones commit on change, which is the split a person
- * expects and also the one that matters here: every keystroke in the text box would otherwise be
- * a navigation *and* a new query key, and while you typed `worktree` the page would ask the
- * daemon eight questions and freeze itself on the first letter.
+ * Every field commits together, on Enter or on "Apply", and nothing commits on change. This was
+ * a split (typed fields on submit, chosen ones on change) and the split was the defect: a
+ * `datetime-local` fires `onChange` as soon as any segment completes, so the page froze and
+ * navigated half-way through typing a date, while the button beside it ignored those same
+ * fields. One model: the form is read whole.
  *
  * The form is `display: contents`, so the field sits in the toolbar's row and the panel opens
  * across the whole width under it — while every control is still one form, submitted together.
@@ -569,6 +606,7 @@ function FeedSearchForm({
   onChange: (patch: Partial<FeedSearch>) => void;
 }) {
   const panelId = useId();
+  const fieldId = useId();
   const carries =
     filters.kind !== undefined ||
     filters.project !== undefined ||
@@ -587,7 +625,14 @@ function FeedSearchForm({
           const value = form.get(name);
           return typeof value === "string" ? value : undefined;
         };
-        onChange({ q: read("q"), kind: read("kind"), limit: read("limit") });
+        onChange({
+          q: read("q"),
+          kind: read("kind"),
+          project: read("project"),
+          since: boundToRfc3339(read("since") ?? ""),
+          until: boundToRfc3339(read("until") ?? ""),
+          limit: read("limit"),
+        });
       }}
     >
       <div className="feed-search-bar" role="search" aria-label="Search the feed">
@@ -613,32 +658,33 @@ function FeedSearchForm({
       </div>
 
       <div className="feed-filters" id={panelId} hidden={!open}>
-        <label className="feed-filter">
-          <span>Kind</span>
+        <div className="feed-filter">
+          <label htmlFor={`${fieldId}-kind`}>Kind</label>
           {/* A `datalist` and not a `select`: the núcleo writes kinds this shell
               has never heard of — `email_<class>` is configuration — so the list
               has to suggest without refusing anything. */}
           <input
+            id={`${fieldId}-kind`}
             name="kind"
             list="feed-kind-options"
             defaultValue={filters.kind ?? ""}
             key={filters.kind ?? ""}
             placeholder="any kind"
-            aria-label="Filter by kind"
           />
           <datalist id="feed-kind-options">
             {FEED_KIND_NAMES.map((kind) => (
               <option key={kind} value={kind} />
             ))}
           </datalist>
-        </label>
+        </div>
 
-        <label className="feed-filter">
-          <span>Project</span>
+        <div className="feed-filter">
+          <label htmlFor={`${fieldId}-project`}>Project</label>
           <select
-            value={filters.project ?? ""}
-            aria-label="Filter by project"
-            onChange={(event) => onChange({ project: event.target.value })}
+            id={`${fieldId}-project`}
+            name="project"
+            defaultValue={filters.project ?? ""}
+            key={filters.project ?? ""}
           >
             <option value="">every scope</option>
             {(projects ?? []).map((project) => (
@@ -647,34 +693,37 @@ function FeedSearchForm({
               </option>
             ))}
           </select>
-        </label>
+        </div>
 
-        <label className="feed-filter">
-          <span>Since</span>
+        <div className="feed-filter">
+          <label htmlFor={`${fieldId}-since`}>Since</label>
           <input
+            id={`${fieldId}-since`}
+            name="since"
             type="datetime-local"
             /** The browser's date placeholder follows the element language, for both bounds. */
             lang={UI_LOCALE}
-            value={rfc3339ToBoundInput(filters.since)}
-            aria-label="Only lines after"
-            onChange={(event) => onChange({ since: boundToRfc3339(event.target.value) })}
+            defaultValue={rfc3339ToBoundInput(filters.since)}
+            key={filters.since ?? ""}
           />
-        </label>
+        </div>
 
-        <label className="feed-filter">
-          <span>Until</span>
+        <div className="feed-filter">
+          <label htmlFor={`${fieldId}-until`}>Until</label>
           <input
+            id={`${fieldId}-until`}
+            name="until"
             type="datetime-local"
             lang={UI_LOCALE}
-            value={rfc3339ToBoundInput(filters.until)}
-            aria-label="Only lines before"
-            onChange={(event) => onChange({ until: boundToRfc3339(event.target.value) })}
+            defaultValue={rfc3339ToBoundInput(filters.until)}
+            key={filters.until ?? ""}
           />
-        </label>
+        </div>
 
-        <label className="feed-filter feed-filter-narrow">
-          <span>Limit</span>
+        <div className="feed-filter feed-filter-narrow">
+          <label htmlFor={`${fieldId}-limit`}>Limit</label>
           <input
+            id={`${fieldId}-limit`}
             name="limit"
             type="number"
             min={1}
@@ -682,12 +731,11 @@ function FeedSearchForm({
             defaultValue={filters.limit ?? ""}
             key={filters.limit ?? ""}
             placeholder={String(FEED_LIST_LIMIT)}
-            aria-label="How many lines at most"
           />
-        </label>
+        </div>
 
         <div className="feed-filter-submit">
-          <Button type="submit">Search</Button>
+          <Button type="submit">Apply</Button>
         </div>
       </div>
     </form>
@@ -733,8 +781,10 @@ function SearchResults({
       </p>
 
       {query.isError && rows !== undefined && <StaleNote dataUpdatedAt={query.dataUpdatedAt} />}
-      {query.isError && rows === undefined && <FeedError error={query.error} />}
-      {rows === undefined && !query.isError && <p className="feed-loading">searching the feed…</p>}
+      {query.isError && rows === undefined && (
+        <FeedError error={query.error} onRetry={() => void query.refetch()} />
+      )}
+      {rows === undefined && !query.isError && <Skeleton label="Searching the feed…" lines={3} />}
       {rows !== undefined && rows.length === 0 && (
         <Quiet says="Nothing matches this search. The núcleo has lines — none of them match; clear a filter to widen it." />
       )}
@@ -798,8 +848,10 @@ function LiveView(props: LiveViewProps) {
     [entries, seenThrough, lookedAt, ownerFiltered],
   );
 
-  if (timeline.isError && data === undefined) return <FeedError error={timeline.error} />;
-  if (range === null || data === undefined) return <p className="feed-loading">reading the feed…</p>;
+  if (timeline.isError && data === undefined) {
+    return <FeedError error={timeline.error} onRetry={() => void timeline.refetch()} />;
+  }
+  if (range === null || data === undefined) return <Skeleton label="Reading the feed…" lines={4} />;
 
   if (empty && !ownerFiltered && history.data !== undefined && history.data.length === 0) {
     return (
@@ -1182,14 +1234,14 @@ const FeedLine = memo(function FeedLine({
 function LineLink({ entry }: { entry: FeedEntry }) {
   if (entry.kind === "promotion_ready") {
     return (
-      <Link to="/autopilot" className="feed-link">
+      <Link to="/autopilot" className="feed-link feed-link-action">
         Review in Autopilot
       </Link>
     );
   }
   if (entry.kind === "email_urgent") {
     return (
-      <Link to="/mail" className="feed-link">
+      <Link to="/mail" className="feed-link feed-link-action">
         Open Mail
       </Link>
     );
@@ -1278,7 +1330,7 @@ function Owner({
 
 /* ------------------------------------------------------------------ errors -- */
 
-function FeedError({ error }: { error: unknown }) {
+function FeedError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) {
     return (
       <RefusalNote
@@ -1291,7 +1343,7 @@ function FeedError({ error }: { error: unknown }) {
       />
     );
   }
-  return <ErrorNote>the núcleo did not answer — nothing is known about the feed</ErrorNote>;
+  return <ErrorNote onRetry={onRetry}>the núcleo did not answer — nothing is known about the feed</ErrorNote>;
 }
 
 /* ----------------------------------------------------------------- helpers -- */

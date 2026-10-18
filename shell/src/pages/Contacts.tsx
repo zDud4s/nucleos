@@ -1,5 +1,5 @@
 // §spec correspondent-contacts
-import { useId, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   mergeVerdictsConflict,
@@ -11,6 +11,7 @@ import {
   type MergeSide,
   type MergeSuggestion,
 } from "../data/contacts";
+import { DAEMON_NAME } from "../copy";
 import { useDecideContactMerge, type ApprovalOutcome } from "../data/waiting";
 import {
   Badge,
@@ -19,6 +20,7 @@ import {
   ConflictNote,
   Count,
   ErrorNote,
+  Field,
   PageHeader,
   Panel,
   RefusalNote,
@@ -26,6 +28,7 @@ import {
   Row,
   Rows,
   Section,
+  Skeleton,
   StaleNote,
 } from "../ui";
 import "./contacts.css";
@@ -55,7 +58,7 @@ function headline(rows: Correspondent[] | undefined): string | undefined {
   // Count addresses and not contacts: the number sits beside the address total, and
   // "2 sharing" next to "7 addresses" read as two addresses when it was two people.
   const sharing = rows.filter((row) => shared.has(row.contact_id)).length;
-  return sharing === 0 ? first : `${first}, ${sharing} belonging to someone with another address`;
+  return sharing === 0 ? first : `${first}, ${sharing} shared with another address`;
 }
 
 export function Contacts() {
@@ -80,7 +83,7 @@ export function Contacts() {
         <Panel title="People" aside={<Count n={rows?.length} />}>
           {stale && <StaleNote dataUpdatedAt={contacts.dataUpdatedAt} />}
           {contacts.isError && rows === undefined && <RosterError error={contacts.error} />}
-          {rows === undefined && !contacts.isError && <p className="contacts-loading">reading the roster…</p>}
+          {rows === undefined && !contacts.isError && <Skeleton label="Loading the roster" lines={3} />}
           {rows !== undefined && <PeopleRoster rows={rows} />}
         </Panel>
       )}
@@ -101,37 +104,19 @@ function mergedContactIds(rows: Correspondent[]): Set<number> {
 
 function RosterError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the roster</ErrorNote>;
+  return <ErrorNote>The {DAEMON_NAME} is not responding — nothing is known about the roster</ErrorNote>;
 }
 
 /**
- * A run of text whose reasoning is drawn as a tip under it on hover or focus.
- * No "why?" button and no paragraph unfolding beside it — the owner's call
- * (2026-10-09). The tip stays in the document as the text's description, so a
- * screen reader still hears it. Escape drops focus, which is how a keyboard
- * user dismisses it.
+ * An empty section's one line: the state, then its reason, both in view.
+ * The reason used to sit in a hover tip; touch has no hover and keyboard
+ * users found it by accident, so it is plain text now (critique #19).
  */
-function Tip({ says, children }: { says: ReactNode; children: ReactNode }) {
-  const tipId = useId();
-  const dismiss = (event: KeyboardEvent<HTMLSpanElement>) => {
-    if (event.key === "Escape") event.currentTarget.blur();
-  };
-  return (
-    <span className="contacts-quiet-says" tabIndex={0} aria-describedby={tipId} onKeyDown={dismiss}>
-      {says}
-      <span className="contacts-quiet-tip" role="tooltip" id={tipId}>
-        <span className="contacts-quiet-tip-box">{children}</span>
-      </span>
-    </span>
-  );
-}
-
-/** An empty section's one line, with its reasoning in a {@link Tip}. */
 function QuietLine({ says, children }: { says: string; children: ReactNode }) {
   return (
     <div className="ui-quiet">
       <p>
-        <Tip says={says}>{children}</Tip>
+        {says}. {children}
       </p>
     </div>
   );
@@ -151,13 +136,16 @@ function QuietLine({ says, children }: { says: string; children: ReactNode }) {
  */
 function IdentityQuestions({ view }: { view: ReturnType<typeof useContactMerges> }) {
   const decide = useDecideContactMerge();
+  // Who the last decision was about: the outcome itself carries no names. A new
+  // decision resets `decide.data`, which clears the receipt below.
+  const [decided, setDecided] = useState<string | null>(null);
   const rows = view.data ?? [];
 
   if (view.data !== undefined && rows.length === 0) {
     return (
       <Section label="Identity questions">
         <QuietLine says="nothing looks like the same person">
-          The heuristic sweeps the roster on its own; an empty list is it finding no match, not a
+          The matcher sweeps the roster on its own; an empty list is it finding no match, not a
           sign anything here is stuck.
         </QuietLine>
       </Section>
@@ -167,7 +155,7 @@ function IdentityQuestions({ view }: { view: ReturnType<typeof useContactMerges>
   if (view.data === undefined && !view.isError) {
     return (
       <Panel title="Identity questions" aside={<Count n={undefined} />}>
-        <p className="contacts-loading">reading the suggestions…</p>
+        <Skeleton label="Loading the suggestions" lines={2} />
       </Panel>
     );
   }
@@ -182,41 +170,53 @@ function IdentityQuestions({ view }: { view: ReturnType<typeof useContactMerges>
       {rows.length > 0 && (
         <Rows label="Identity questions" className="contacts-questions">
           {rows.map((suggestion) => (
-            <IdentityQuestion key={suggestion.proposal_id} suggestion={suggestion} decide={decide} />
+            <IdentityQuestion
+              key={suggestion.proposal_id}
+              suggestion={suggestion}
+              decide={decide}
+              onDecide={setDecided}
+            />
           ))}
         </Rows>
       )}
-      <DecisionNotes outcome={decide.data} error={decide.isError ? decide.error : null} />
+      <DecisionNotes outcome={decide.data} who={decided} error={decide.isError ? decide.error : null} />
     </Panel>
   );
 }
 
 function MergesError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the suggested merges</ErrorNote>;
+  return <ErrorNote>The {DAEMON_NAME} is not responding — nothing is known about the suggested merges</ErrorNote>;
 }
 
 function IdentityQuestion({
   suggestion,
   decide,
+  onDecide,
 }: {
   suggestion: MergeSuggestion;
   decide: ReturnType<typeof useDecideContactMerge>;
+  onDecide: (who: string) => void;
 }) {
   const conflict = mergeVerdictsConflict(suggestion);
   const noteId = useId();
+  const who = `${sideName(suggestion.keep)} and ${sideName(suggestion.absorb)}`;
+  const send = (verdict: "approve" | "reject") => {
+    onDecide(who);
+    decide.mutate({ proposalId: suggestion.proposal_id, verdict });
+  };
   return (
     <Row className="contacts-question">
       <div className="contacts-question-head">
         <span className="contacts-question-who">
-          {sideName(suggestion.keep)} ↔ {sideName(suggestion.absorb)}
+          {sideName(suggestion.keep)} (stays) + {sideName(suggestion.absorb)} (merged in)
         </span>
         <RelativeTime at={suggestion.created_at} />
       </div>
       <p className="contacts-reasoning">{suggestion.reasoning}</p>
       <div className="contacts-merge">
-        <MergeSideView side={suggestion.keep} role="kept" />
-        <MergeSideView side={suggestion.absorb} role="absorbed" />
+        <MergeSideView side={suggestion.keep} role="Stays" />
+        <MergeSideView side={suggestion.absorb} role="Merged in" />
       </div>
       {conflict && (
         <div id={noteId}>
@@ -234,14 +234,14 @@ function IdentityQuestion({
           disabled={decide.isPending}
           unavailable={conflict}
           describedBy={conflict ? noteId : undefined}
-          onConfirm={() => decide.mutate({ proposalId: suggestion.proposal_id, verdict: "approve" })}
+          onConfirm={() => send("approve")}
         />
         <ConfirmButton
           label="No, different people"
           confirmLabel="Refuse permanently"
           variant="ghost"
           disabled={decide.isPending}
-          onConfirm={() => decide.mutate({ proposalId: suggestion.proposal_id, verdict: "reject" })}
+          onConfirm={() => send("reject")}
         />
       </div>
     </Row>
@@ -256,7 +256,7 @@ function sideName(side: MergeSide): string {
 /**
  * One side of a suggested merge, under the word for what happens to it.
  *
- * `kept` and `absorbed` are a heading and not a field label — the whole point
+ * "Stays" and "Merged in" are a heading and not a field label — the whole point
  * of showing both sides is that the merge is not symmetrical, and which of the
  * two survives is the first thing a reader has to know. `Section` is the
  * heading rank; the label rank it used to be written in is what a `dt` gets,
@@ -293,8 +293,8 @@ function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
 const IDENTITY_SENTENCES: Record<string, string> = {
   conflict: "someone already answered this — the list clears it on the next read",
   not_found: "that question is gone; there is nothing left to decide",
-  unprocessable: "the núcleo found nothing usable in this suggestion to act on",
-  internal: "the núcleo failed while recording the decision — nothing changed",
+  unprocessable: `the ${DAEMON_NAME} found nothing usable in this suggestion to act on`,
+  internal: `the ${DAEMON_NAME} failed while recording the decision — nothing changed`,
 };
 
 /**
@@ -310,12 +310,23 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
   return { [refusal.code]: detail };
 }
 
-function DecisionNotes({ outcome, error }: { outcome: ApprovalOutcome | undefined; error: unknown }) {
+function DecisionNotes({
+  outcome,
+  who,
+  error,
+}: {
+  outcome: ApprovalOutcome | undefined;
+  who: string | null;
+  error: unknown;
+}) {
+  const names = who ?? "the two";
   return (
     <>
       {outcome !== undefined && (
         <p className="contacts-outcome" role="status">
-          {outcome.merged === true ? "the two are one person now" : "refused — this pair won't be suggested again"}
+          {outcome.merged === true
+            ? `${names} are one person now. To undo it, use "Not the same person" on the address in People below.`
+            : `Refused: ${names} won't be suggested again.`}
         </p>
       )}
       {error !== null && <IdentityRefusal error={error} />}
@@ -324,22 +335,20 @@ function DecisionNotes({ outcome, error }: { outcome: ApprovalOutcome | undefine
 }
 
 function IdentityRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — nothing was decided</ErrorNote>;
+  if (!isApiRefusal(error)) return <ErrorNote>The {DAEMON_NAME} is not responding — nothing was decided</ErrorNote>;
   const sentences = { ...IDENTITY_SENTENCES, ...daemonProse(error) };
   return <RefusalNote refusal={error} sentences={sentences} />;
 }
 
 /* --------------------------------------------------------------- roster -- */
 
-/** A mutation that failed on one card: whose address, and the note that says why. */
-type Problem = { address: string; node: ReactNode };
-
 /**
- * Tells the roster a card's mutation failed (`node`) or went through (`null`).
- * The note is drawn once above the grid, never inside the card, so a refusal
- * cannot grow one card and break the equal heights.
+ * Tells the card that a mutation on it failed (`node`) or went through (`null`).
+ * Each card owns its own note, drawn inside it, so the person who pressed Mute
+ * sees the refusal where they pressed and a second failure elsewhere cannot
+ * overwrite it (critique #17).
  */
-type ReportProblem = (address: string, node: ReactNode | null) => void;
+type ReportProblem = (node: ReactNode | null) => void;
 
 /** Rows with the addresses of one contact side by side, each contact where it first appears. */
 function groupByContact(rows: Correspondent[]): Correspondent[] {
@@ -352,32 +361,107 @@ function groupByContact(rows: Correspondent[]): Correspondent[] {
   return [...groups.values()].flat();
 }
 
+type RosterFilter = "all" | "urgent" | "noise" | "merged" | "writeback";
+
+const ROSTER_FILTERS: ReadonlyArray<{ key: RosterFilter; label: string }> = [
+  { key: "all", label: "All" },
+  { key: "urgent", label: "Urgent" },
+  { key: "noise", label: "Noise" },
+  { key: "merged", label: "Merged" },
+  { key: "writeback", label: "You write back" },
+];
+
+/** Cards drawn before "Show more": the roster only grows, and every card is a tree of controls. */
+const PAGE_SIZE = 48;
+
+function matchesFilter(row: Correspondent, filter: RosterFilter, merged: Set<number>): boolean {
+  switch (filter) {
+    case "urgent":
+      return row.verdict === "pin";
+    case "noise":
+      return row.verdict === "mute";
+    case "merged":
+      return merged.has(row.contact_id);
+    case "writeback":
+      return row.outbound_ever === 1;
+    default:
+      return true;
+  }
+}
+
 function PeopleRoster({ rows }: { rows: Correspondent[] }) {
-  const [problem, setProblem] = useState<Problem | null>(null);
-  const report: ReportProblem = (address, node) => setProblem(node === null ? null : { address, node });
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<RosterFilter>("all");
+  const [shown, setShown] = useState(PAGE_SIZE);
   const ordered = groupByContact(rows);
+  const merged = mergedContactIds(rows);
+  const needle = query.trim().toLowerCase();
+  const visible = ordered.filter(
+    (row) =>
+      matchesFilter(row, filter, merged) &&
+      (needle === "" ||
+        row.address.toLowerCase().includes(needle) ||
+        (row.display_name ?? "").toLowerCase().includes(needle)),
+  );
+  const drawn = visible.slice(0, shown);
   // A grid of profile cards, one per address — the owner's call (2026-10-02):
   // the roster is browsed for people, not scanned down like the mail queue.
   // Each card is the inset rank, the one card a Panel is allowed to hold.
   return (
     <>
-      {problem !== null && (
-        <div role="status" className="contacts-problem">
-          {problem.address} — {problem.node}
+      <div className="contacts-tools" role="search" aria-label="Find people">
+        <Field label="Search people" labelHidden>
+          <input
+            className="contacts-search"
+            type="search"
+            value={query}
+            placeholder="Search by name or address"
+            onChange={(event) => {
+              setQuery(event.target.value);
+              setShown(PAGE_SIZE);
+            }}
+          />
+        </Field>
+        <div className="contacts-actions">
+          {ROSTER_FILTERS.map(({ key, label }) => (
+            <Button
+              key={key}
+              aria-pressed={filter === key}
+              onClick={() => {
+                setFilter(key);
+                setShown(PAGE_SIZE);
+              }}
+            >
+              {label}
+            </Button>
+          ))}
+        </div>
+      </div>
+      {visible.length === 0 ? (
+        <p className="contacts-note" role="status">
+          No one matches{needle === "" ? "" : ` "${query.trim()}"`}
+          {filter === "all" ? "" : ` under ${ROSTER_FILTERS.find((f) => f.key === filter)?.label}`}.
+        </p>
+      ) : (
+        <ul className="contacts-cards" aria-label="People">
+          {drawn.map((row) => (
+            <PersonCard
+              key={row.address}
+              row={row}
+              sameAs={ordered
+                .filter((other) => other.contact_id === row.contact_id && other.address !== row.address)
+                .map((other) => other.address)}
+            />
+          ))}
+        </ul>
+      )}
+      {visible.length > drawn.length && (
+        <div className="contacts-more">
+          <Button onClick={() => setShown(shown + PAGE_SIZE)}>
+            Show more ({visible.length - drawn.length} left)
+          </Button>
         </div>
       )}
-      <ul className="contacts-cards" aria-label="People">
-        {ordered.map((row) => (
-          <PersonCard
-            key={row.address}
-            row={row}
-            sameAs={ordered
-              .filter((other) => other.contact_id === row.contact_id && other.address !== row.address)
-              .map((other) => other.address)}
-            onProblem={report}
-          />
-        ))}
-      </ul>
     </>
   );
 }
@@ -393,14 +477,14 @@ function initials(row: Correspondent): string {
 function PersonCard({
   row,
   sameAs,
-  onProblem,
 }: {
   row: Correspondent;
   /** The other addresses of this contact — empty unless the row is merged. */
   sameAs: string[];
-  onProblem: ReportProblem;
 }) {
   const merged = sameAs.length > 0;
+  const [problem, setProblem] = useState<ReactNode | null>(null);
+  const onProblem: ReportProblem = setProblem;
   return (
     <li className="ui-panel-inset contacts-card">
       <div className="contacts-card-head">
@@ -424,14 +508,11 @@ function PersonCard({
           {row.verdict === "pin" && <Badge tone="pending">urgent</Badge>}
           {row.verdict === "mute" && <Badge tone="off">noise</Badge>}
           {row.outbound_ever === 1 && <Badge tone="info">you write back</Badge>}
-          {merged && (
-            <Badge tone="shadow">
-              <Tip says="merged">same person as {sameAs.join(", ")}</Tip>
-            </Badge>
-          )}
+          {merged && <Badge tone="shadow">merged</Badge>}
           <UnmergeButton address={row.address} linkedBy={row.linked_by} onProblem={onProblem} />
         </div>
       )}
+      {merged && <p className="contacts-sameas">Same person as {sameAs.join(", ")}</p>}
       <p className="contacts-meta">
         {row.messages_in} message{row.messages_in === 1 ? "" : "s"} in · last seen{" "}
         <RelativeTime at={row.last_seen} /> · first seen{" "}
@@ -440,6 +521,7 @@ function PersonCard({
       <div className="contacts-card-actions">
         <SenderVerdictToggles address={row.address} verdict={row.verdict} onProblem={onProblem} />
       </div>
+      {problem !== null && <div className="contacts-problem">{problem}</div>}
     </li>
   );
 }
@@ -460,8 +542,8 @@ function SenderVerdictToggles({
     mutate.mutate(
       { address, verdict: next },
       {
-        onSuccess: () => onProblem(address, null),
-        onError: (error) => onProblem(address, <VerdictError error={error} />),
+        onSuccess: () => onProblem(null),
+        onError: (error) => onProblem(<VerdictError error={error} />),
       },
     );
   // `aria-pressed` and not a variant swap: a button that changes weight when pressed
@@ -485,7 +567,7 @@ function VerdictError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ not_found: "no mail has ever arrived from that address" }} />;
   }
-  return <ErrorNote>the núcleo did not answer — that verdict was not recorded</ErrorNote>;
+  return <ErrorNote>The {DAEMON_NAME} is not responding — that verdict was not recorded</ErrorNote>;
 }
 
 /* ------------------------------------------------------------- unmerge -- */
@@ -521,8 +603,8 @@ function UnmergeButton({
         disabled={unmerge.isPending}
         onConfirm={() =>
           unmerge.mutate(address, {
-            onSuccess: () => onProblem(address, null),
-            onError: (error) => onProblem(address, <UnmergeError error={error} />),
+            onSuccess: () => onProblem(null),
+            onError: (error) => onProblem(<UnmergeError error={error} />),
           })
         }
       />
@@ -534,5 +616,5 @@ function UnmergeError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ not_found: "that address is no longer in the roster" }} />;
   }
-  return <ErrorNote>the núcleo did not answer — that address was not pulled apart</ErrorNote>;
+  return <ErrorNote>The {DAEMON_NAME} is not responding — that address was not pulled apart</ErrorNote>;
 }

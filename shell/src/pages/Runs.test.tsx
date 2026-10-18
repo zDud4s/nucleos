@@ -174,6 +174,11 @@ function runsFetch(state: RunsWorld): (path: string, init?: RequestInit) => Prom
   };
 }
 
+/** The page header's headline sentence, which is plain text and not a live region. */
+function headlineText(): string | null {
+  return document.querySelector(".ui-page-headline")?.textContent ?? null;
+}
+
 /* -------------------------------------------------------------- filters -- */
 
 describe("Runs - the filters live in the route", () => {
@@ -187,7 +192,7 @@ describe("Runs - the filters live in the route", () => {
     expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?group=chat&chat_turns=hide&limit=50");
 
     fireEvent.click(screen.getByRole("button", { name: "More filters" }));
-    fireEvent.change(await screen.findByLabelText("Filter by status"), {
+    fireEvent.change(await screen.findByLabelText("Other status"), {
       target: { value: "timed_out" },
     });
 
@@ -215,12 +220,12 @@ describe("Runs - the filters live in the route", () => {
 
     const { router } = await renderRuns();
     fireEvent.click(await screen.findByRole("button", { name: "More filters" }));
-    fireEvent.change(await screen.findByLabelText("Filter by mode"), {
+    fireEvent.change(await screen.findByLabelText("Mode"), {
       target: { value: "worktree" },
     });
     await waitFor(() => expect(searchOf(router)).toEqual({ mode: "worktree" }));
 
-    fireEvent.change(screen.getByLabelText("Filter by mode"), { target: { value: "" } });
+    fireEvent.change(screen.getByLabelText("Mode"), { target: { value: "" } });
 
     // `?mode=` would ask the daemon for runs whose mode is the empty string and
     // get an empty list, which reads on screen as "there are no runs".
@@ -261,11 +266,15 @@ describe("Runs - the filters live in the route", () => {
     const more = await screen.findByRole("button", { name: "More filters" });
     expect(more.getAttribute("aria-expanded")).toBe("true");
     // In the badge's words, not the daemon's literal.
-    const status = screen.getByLabelText("Filter by status") as HTMLSelectElement;
+    const status = screen.getByLabelText("Other status") as HTMLSelectElement;
     expect(status.selectedOptions[0]?.textContent).toBe("cancelled");
+    // The four scopes already offer these; a second place to pick them is the
+    // duplicate the filter bar was cut down to remove.
     expect(
       Array.from(status.options).some((option) => option.textContent === "awaiting approval"),
-    ).toBe(true);
+    ).toBe(false);
+    // And the filter in force is in sight, with a way to take it off.
+    expect(screen.getByRole("button", { name: "Remove status filter: cancelled" })).toBeDefined();
   });
 });
 
@@ -370,7 +379,7 @@ describe("Runs - the index", () => {
     // fifty".
     expect(screen.getByText(/showing the newest 50/)).toBeDefined();
     // And the headline counts the page, not the index.
-    expect(screen.getByRole("status").textContent).toBe("the newest 50; none of them still moving");
+    expect(headlineText()).toBe("the newest 50; none of them still moving");
   });
 
   it("keeps an empty filtered list apart from an empty machine", async () => {
@@ -388,8 +397,7 @@ describe("Runs - the index", () => {
     await renderRuns();
 
     const teach = (await screen.findByText(/No runs yet/)).parentElement as HTMLElement;
-    expect(teach.textContent).toMatch(/New run at the top of the page/);
-    expect(teach.textContent).not.toMatch(/beside this list/);
+    expect(teach.textContent).toMatch(/Start one with New run/);
     fireEvent.click(within(teach).getByRole("button", { name: "New run" }));
     expect((await newRunButton()).getAttribute("aria-expanded")).toBe("true");
   });
@@ -501,8 +509,9 @@ describe("Runs - the index", () => {
     expect(link.closest("p")?.textContent).toBe(
       "3 in the index; 1 still moving; 1 run awaiting approval",
     );
-    // A status region, so a change is said and not only drawn.
-    expect(link.closest("[role='status']")).not.toBeNull();
+    // Not a live region: the index refetches on a timer, and a region around the
+    // headline read every changed count aloud. Failures have their own roles.
+    expect(link.closest("[role='status']")).toBeNull();
   });
 
   it("only a running run is still moving", async () => {
@@ -535,7 +544,7 @@ describe("Runs - the index", () => {
     await renderRuns();
 
     await waitFor(() =>
-      expect(screen.getByRole("status").textContent).toBe(
+      expect(headlineText()).toBe(
         "3 in the index; none of them still moving; 2 failed",
       ),
     );
@@ -633,6 +642,31 @@ describe("Runs - New run", () => {
     });
   });
 
+  it("choosing real says what it acts on and swaps Start run for a hold, so one click cannot start it", async () => {
+    daemon.apiFetch.mockImplementation(runsFetch(world()));
+
+    await renderRuns();
+    await openNewRun();
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
+    fireEvent.change(screen.getByLabelText("Working directory"), { target: { value: "C:/Projects/alpha" } });
+
+    expect(screen.queryByText(/A real run acts on the files/)).toBeNull();
+    fireEvent.click(within(screen.getByRole("group", { name: "Mode" })).getByRole("radio", { name: "real" }));
+
+    const warning = screen.getByText(/A real run acts on the files in C:\/Projects\/alpha as they are/);
+    const start = screen.getByRole("button", { name: "Start run" });
+    expect(start.getAttribute("type")).toBe("button");
+    expect(start.getAttribute("aria-describedby")?.split(" ")).toContain(warning.id);
+
+    // A plain click, or Enter in a field, starts nothing.
+    fireEvent.click(start);
+    fireEvent.submit(start.closest("form") as HTMLFormElement);
+    const posted = daemon.apiFetch.mock.calls.find(
+      ([path, init]) => path === "/runs" && (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(posted).toBeUndefined();
+  });
+
   it("says the kill switch will refuse the run, and leaves the button to the daemon", async () => {
     daemon.apiFetch.mockImplementation(runsFetch(world({ killEngaged: true })));
 
@@ -641,7 +675,7 @@ describe("Runs - New run", () => {
     fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
 
     const note = await screen.findByText(
-      "The kill switch is engaged — the núcleo will refuse this run until it is released.",
+      "The kill switch is engaged — the background service will refuse this run until it is released.",
     );
     const start = screen.getByRole("button", { name: "Start run" }) as HTMLButtonElement;
     // Still pressable: the reading here can be a poll behind the switch.
@@ -923,6 +957,7 @@ describe("Runs - chat turns", () => {
     // The default is not a filter: nothing offers to clear it.
     expect(screen.queryByRole("button", { name: "Clear filters" })).toBeNull();
 
+    fireEvent.click(screen.getByRole("button", { name: "More filters" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Show chat turns" }));
     await waitFor(() => {
       expect(searchOf(router)).toEqual({ chats: "show" });

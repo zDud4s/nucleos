@@ -258,7 +258,8 @@ describe("Bench - the shell", () => {
   it("names the team the núcleo says it has never heard of", async () => {
     await renderBench({ team: null }, "nao-existe");
 
-    expect(await screen.findByText("there is no team with that id")).toBeDefined();
+    expect(await screen.findByText("There is no team with that id.")).toBeDefined();
+    expect(screen.getByRole("link", { name: "Back to teams" })).toBeDefined();
   });
 });
 
@@ -444,6 +445,35 @@ describe("Bench - Work", () => {
   });
 });
 
+describe("Bench - honest status and deep links", () => {
+  it("says unknown, not idle, until the task and decision reads have answered", async () => {
+    await renderBench({ team: teamView() });
+    const head = (await screen.findByRole("heading", { level: 1 })).closest("header");
+    if (head === null) throw new Error("no bench head");
+    // Once both reads have answered with nothing, the department really is idle.
+    expect(await within(head).findByText("idle")).toBeDefined();
+  });
+
+  it("offers a way into Decisions when something may be waiting, and opens the tab from the address", async () => {
+    const run = teamRun({ state: "working" });
+    const action: TeamAction = { id: 1, team_run_id: run.id, ordinal: null, kind: "send_email", payload: "{}", why: "needs a reply", proposal_id: 1, state: "pending", error: null, created_at: "2026-08-24T09:10:00Z", executed_at: null };
+    await renderBench({ team: teamView(), runs: [run], actions: [action] });
+
+    fireEvent.click(await screen.findByRole("button", { name: /1 decision is waiting/ }));
+    expect(await screen.findByRole("tab", { name: /Decisions/, selected: true })).toBeDefined();
+  });
+
+  it("keeps Delete away from the title and unavailable while a task is running", async () => {
+    const run = teamRun({ state: "working" });
+    await renderBench({ team: teamView(), runs: [run] });
+
+    const remove = await screen.findByRole("button", { name: "Delete team" });
+    expect(remove.closest("header")).toBeNull();
+    await waitFor(() => expect(remove.getAttribute("aria-disabled")).toBe("true"));
+    expect(screen.getByText(/1 task is still running/)).toBeDefined();
+  });
+});
+
 describe("Bench - map-authored readings", () => {
   it("an armed routine is a setting, not work in flight", async () => {
     await renderBench({ team: teamView(), triggers: [teamTrigger({ enabled: 1 })] });
@@ -458,7 +488,7 @@ describe("Bench - map-authored readings", () => {
     await renderBench({ team: teamView(), runs: [run], actions: [action] });
     const head = (await screen.findByRole("heading", { level: 1 })).closest("header");
     if (head === null) throw new Error("no bench head");
-    const badge = within(head).getByText("waiting");
+    const badge = await within(head).findByText("waiting");
     expect(badge.textContent).toBe("waiting");
     expect(within(head).queryByText("waiting on you")).toBeNull();
   });

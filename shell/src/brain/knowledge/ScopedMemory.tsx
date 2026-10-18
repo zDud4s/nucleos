@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { useScopedKnowledge } from "../../data/knowledge";
-import { Quiet, Rows } from "../../ui";
+import { ErrorNote, Quiet, Rows, Skeleton } from "../../ui";
 import { KnownRow } from "./KnownRow";
 import "./knowledge.css";
 
@@ -20,9 +20,11 @@ export function ScopedMemory({ scopeKind, scopeId }: ScopedMemoryProps) {
 
   let body: ReactNode;
   if (knowledge.isError) {
-    body = <Quiet says="the núcleo did not answer — this memory is unknown" />;
+    body = (
+      <ErrorNote onRetry={() => void knowledge.refetch()}>the núcleo did not answer — this memory is unknown</ErrorNote>
+    );
   } else if (knowledge.data === undefined) {
-    body = <Quiet says="Loading…" />;
+    body = <Skeleton label="Loading memory…" lines={2} />;
   } else {
     const inScope = knowledge.data.filter(
       (row) => row.scope_kind === scopeKind && row.scope_id === scopeId,

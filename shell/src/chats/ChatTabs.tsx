@@ -8,6 +8,10 @@ import { dotFor } from "./sessions";
 /**
  * The conversations held open, one tab each.
  *
+ * Semantically a `<nav>` of real links with `aria-current="page"` on the open one, not a
+ * `role="tablist"`: there is no tabpanel, no arrow-key roving, and a close button inside a tablist is
+ * invalid ARIA. The visual is a tab strip; the contract is navigation.
+ *
  * A tab is a `<Link>` and not a button with a handler, for the reason the column's rows are: the
  * routing stays the router's, so middle-click and copy-link keep working. Closing is its own button
  * beside it, never inside it — a button in an anchor is an interactive element in an interactive
@@ -30,7 +34,7 @@ export function ChatTabs({
   onOpenChat: () => void;
   onClose: (id: string) => void;
 }) {
-  const strip = useRef<HTMLDivElement | null>(null);
+  const strip = useRef<HTMLElement | null>(null);
   // The open conversation's tab is brought into view, or opening one from the list could leave it
   // selected somewhere past the strip's edge.
   useEffect(() => {
@@ -41,10 +45,9 @@ export function ChatTabs({
   const byId = new Map(rows.map((row) => [row.chat_id, row]));
 
   return (
-    <div
+    <nav
       ref={strip}
       className="chats-tabs"
-      role="tablist"
       aria-label="Open conversations"
       /* The strip draws no scrollbar, so a mouse wheel — which only scrolls up and down — is turned
          sideways here, or tabs past the edge could only be reached by a trackpad. */
@@ -60,7 +63,7 @@ export function ChatTabs({
           row !== undefined && active && selectedLive && row.working !== true
             ? { ...row, working: true, activity: "working" as const }
             : row;
-        const name = row === undefined ? "New session" : sessionTitle(row);
+        const name = row === undefined ? "New conversation" : sessionTitle(row);
         return (
           <div
             key={id}
@@ -68,8 +71,7 @@ export function ChatTabs({
           >
             <Link
               to={`/chats/${id}`}
-              role="tab"
-              aria-selected={active}
+              aria-current={active ? "page" : undefined}
               className="chats-tab-link"
               onClick={onOpenChat}
             >
@@ -88,6 +90,6 @@ export function ChatTabs({
           </div>
         );
       })}
-    </div>
+    </nav>
   );
 }

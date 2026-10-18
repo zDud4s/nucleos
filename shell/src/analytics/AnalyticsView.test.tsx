@@ -163,7 +163,7 @@ describe("AnalyticsView, global", () => {
     await screen.findByRole("region", { name: "Spend per day" });
 
     const cards = (["Spent", "Runs", "Delivered", "Tokens"] as const).map(card);
-    expect(cards.map((button) => button.getAttribute("aria-expanded"))).toEqual(["true", "false", "false", "false"]);
+    expect(cards.map((button) => button.getAttribute("aria-pressed"))).toEqual(["true", "false", "false", "false"]);
     const controls = new Set(cards.map((button) => button.getAttribute("aria-controls")));
     expect(controls.size).toBe(1);
     const panel = document.getElementById([...controls][0] ?? "");
@@ -175,14 +175,14 @@ describe("AnalyticsView, global", () => {
     await screen.findByRole("region", { name: "Spend per day" });
 
     fireEvent.click(card("Runs"));
-    expect(card("Runs").getAttribute("aria-expanded")).toBe("true");
-    expect(card("Spent").getAttribute("aria-expanded")).toBe("false");
+    expect(card("Runs").getAttribute("aria-pressed")).toBe("true");
+    expect(card("Spent").getAttribute("aria-pressed")).toBe("false");
     expect(screen.getByRole("region", { name: "Runs per day" })).toBeTruthy();
     expect(screen.queryByRole("region", { name: "Spend per day" })).toBeNull();
 
     // There is no "none": the open card stays open, so the page never loses its chart.
     fireEvent.click(card("Runs"));
-    expect(card("Runs").getAttribute("aria-expanded")).toBe("true");
+    expect(card("Runs").getAttribute("aria-pressed")).toBe("true");
     expect(screen.getByRole("region", { name: "Runs per day" })).toBeTruthy();
   });
 
@@ -411,9 +411,27 @@ describe("what the cards say", () => {
 });
 
 describe("refused and stale", () => {
-  it("says once that the núcleo did not answer", async () => {
+  it("says what failed and offers a retry", async () => {
     await mount(busy(), undefined, new Set(["/analytics"]));
-    expect(await screen.findByText("The núcleo did not answer for analytics.")).toBeTruthy();
+    expect(await screen.findByText("Could not read analytics: the background service may be stopped.")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: "Retry" }).length).toBeGreaterThan(0);
+  });
+
+  it("reserves the page's height while reading, instead of one card that jumps", async () => {
+    daemon.apiFetch.mockImplementation(() => new Promise(() => {}));
+    await renderWithRouter(<AnalyticsView />);
+    expect(screen.getAllByText(/Loading analytics/).length).toBeGreaterThan(0);
+  });
+
+  it("links the three sections and gives the first a heading of its own", async () => {
+    await mount(busy());
+    const nav = await screen.findByRole("navigation", { name: "Sections" });
+    expect(within(nav).getAllByRole("button").map((button) => button.textContent)).toEqual([
+      "Summary",
+      "Pipeline",
+      "Development time",
+    ]);
+    expect(screen.getByRole("heading", { level: 2, name: "Summary" })).toBeTruthy();
   });
 
   it("keeps the last good read and dates it when a refetch fails", async () => {
@@ -449,7 +467,7 @@ describe("development time", () => {
   it("shows development time under the run analytics, and survives their failure", async () => {
     await mount(busy(), undefined, new Set(["/analytics?", "/analytics/quota"]));
     expect(await screen.findByRole("region", { name: "Development time" })).toBeTruthy();
-    expect(await screen.findByText("The núcleo did not answer for analytics.")).toBeTruthy();
+    expect(await screen.findByText("Could not read analytics: the background service may be stopped.")).toBeTruthy();
     expect(asked().some((path) => path.startsWith("/analytics/devtime?days=30"))).toBe(true);
   });
 

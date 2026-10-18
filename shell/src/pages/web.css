@@ -21,9 +21,28 @@
   align-items: start;
 }
 
+/* The way back from the reader, shown only where the list is hidden behind it. */
+.web-back {
+  display: none;
+  margin-bottom: var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.web-list {
+  min-width: 0;
+}
+
 @media (max-width: 60rem) {
   .web-layout {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .web-layout-reading .web-list {
+    display: none;
+  }
+
+  .web-layout-reading .web-back {
+    display: inline-block;
   }
 }
 

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import {
   DIFF_LINE_CAP,
@@ -465,13 +466,13 @@ function InspectAbsence({
   what: string;
 }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — nothing is known about {what}</ErrorNote>;
+    return <ErrorNote>Could not read {what}: the {DAEMON_NAME} is not responding.</ErrorNote>;
   }
   if (error.status === 404) {
     const said =
       projectRoot === null
         ? "This project has no folder recorded, so there is nothing to look inside. A folder is named when the project is put into shadow or acting, on the Autopilot page."
-        : `Not found — and the núcleo answers the same way for two different things: that path is not there, or the folder recorded for this project (${projectRoot}) is gone from the disk. Check the folder before hunting for the file.`;
+        : `Not found — and the ${DAEMON_NAME} answers the same way for two different things: that path is not there, or the folder recorded for this project (${projectRoot}) is gone from the disk. Check the folder before hunting for the file.`;
     return (
       <>
         <RefusalNote refusal={error} sentences={{ [error.code]: said }} />
@@ -487,8 +488,8 @@ function InspectAbsence({
     <RefusalNote
       refusal={error}
       sentences={{
-        bad_request: "that path leaves the project's folder, which the núcleo will not follow",
-        internal: "the núcleo could not read that from the disk",
+        bad_request: `that path leaves the project's folder, which the ${DAEMON_NAME} will not follow`,
+        internal: `the ${DAEMON_NAME} could not read that from the disk`,
       }}
     />
   );
@@ -521,7 +522,13 @@ function BrowsePanel({ projectId, projectRoot }: { projectId: string; projectRoo
 
   // Directories first, then files, each alphabetically: a listing sorted only by
   // name buries the folders among the files and makes a deep tree unwalkable.
-  const ordered = [...entries].sort(compareEntries);
+  const [filter, setFilter] = useState("");
+  const filterField = useRef<HTMLInputElement>(null);
+  useSlashFocus(filterField);
+  const needle = filter.trim().toLowerCase();
+  const ordered = [...entries]
+    .filter((entry) => needle === "" || entry.name.toLowerCase().includes(needle))
+    .sort(compareEntries);
 
   const go = (next: InspectSearch, replace: boolean) =>
     void navigate({ to: inspectPath(projectId, "browse"), search: next, replace });
@@ -533,7 +540,7 @@ function BrowsePanel({ projectId, projectRoot }: { projectId: string; projectRoo
         aside={
           <span className="pj-aside">
             <ReadAt at={listing.dataUpdatedAt} />
-            <Count n={listing.data?.length} />
+            <Count n={listing.data?.length} noun="item" />
           </span>
         }
       >
@@ -547,10 +554,33 @@ function BrowsePanel({ projectId, projectRoot }: { projectId: string; projectRoo
           <InspectAbsence error={listing.error} projectRoot={projectRoot} what="that folder" />
         )}
         {!listing.isError && listing.data === undefined && (
-          <p className="pj-loading">reading the folder…</p>
+          <p className="pj-loading" role="status">
+            Reading the folder…
+          </p>
         )}
-        {listing.data !== undefined && ordered.length === 0 && (
+        {listing.data !== undefined && entries.length > 0 && (
+          <input
+            ref={filterField}
+            className="pj-field-input pj-filter"
+            type="search"
+            value={filter}
+            placeholder="Filter this folder (press / to focus)"
+            aria-label="Filter this folder by name"
+            spellCheck={false}
+            onChange={(event) => setFilter(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape" && filter !== "") {
+                event.stopPropagation();
+                setFilter("");
+              }
+            }}
+          />
+        )}
+        {listing.data !== undefined && entries.length === 0 && (
           <Quiet says="this folder is empty." />
+        )}
+        {listing.data !== undefined && entries.length > 0 && ordered.length === 0 && (
+          <Quiet says="nothing in this folder is named like that." />
         )}
         {ordered.length > 0 && (
           <ul className="pj-listing" aria-label="Folder contents">
@@ -611,6 +641,31 @@ function lineOf(raw: unknown): number | null {
 function compareEntries(a: InspectEntry, b: InspectEntry): number {
   if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
   return a.name.localeCompare(b.name);
+}
+
+/** Whether a key press landed in something the person is typing into. */
+function inTextField(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))
+  );
+}
+
+/**
+ * `/` focuses a field from anywhere that is not already a field — the reader's search key.
+ * Modifier chords are left to the browser and the OS.
+ */
+function useSlashFocus(field: { current: HTMLInputElement | null }) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (inTextField(event.target)) return;
+      event.preventDefault();
+      field.current?.focus();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [field]);
 }
 
 /**
@@ -693,6 +748,16 @@ function FileView({
 }) {
   const file = useProjectCat(projectId, path);
 
+  // Escape closes the file, as the Close button does — unless the key was spent clearing a field.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || inTextField(event.target)) return;
+      onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   return (
     <Panel
       title={path}
@@ -710,7 +775,7 @@ function FileView({
       {file.isError && file.data === undefined && (
         <InspectAbsence error={file.error} projectRoot={projectRoot} what="that file" />
       )}
-      {!file.isError && file.data === undefined && <p className="pj-loading">reading the file…</p>}
+      {!file.isError && file.data === undefined && <p className="pj-loading" role="status">Reading the file…</p>}
       {file.data !== undefined && file.data === "" && (
         <Quiet says="that file is empty — a real answer, not a failed read." />
       )}
@@ -781,6 +846,19 @@ function GrepPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
      produced what they are looking at rather than an empty box over it. */
   const [draftQ, setDraftQ] = useState(asked ?? "");
   const [draftUnder, setDraftUnder] = useState(under);
+  const qField = useRef<HTMLInputElement>(null);
+  useSlashFocus(qField);
+
+  /* Re-seeded whenever the location's query or folder changes under the form — Back, Forward, or a
+     link followed with another `q`. Seeding once left the box showing the old text over new
+     results. Adjusted during render rather than in an effect, so there is no frame with stale text. */
+  const seed = `${asked ?? ""}\u0000${under}`;
+  const [seeded, setSeeded] = useState(seed);
+  if (seeded !== seed) {
+    setSeeded(seed);
+    setDraftQ(asked ?? "");
+    setDraftUnder(under);
+  }
 
   const matches = useProjectGrep(projectId, asked ?? "", under, asked !== null);
   const groups = groupMatches(matches.data ?? []);
@@ -791,13 +869,13 @@ function GrepPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
       aside={
         <span className="pj-aside">
           {asked !== null && <ReadAt at={matches.dataUpdatedAt} />}
-          <Count n={matches.data?.length} />
+          <Count n={matches.data?.length} noun="match" plural="matches" />
         </span>
       }
     >
       <Why lead="Plain text, over the files under the folder you name.">
         <p>
-          The núcleo does the walking, so this reaches files no editor has open — and it reads, only
+          The {DAEMON_NAME} does the walking, so this reaches files no editor has open — and it reads, only
           ever reads.
         </p>
       </Why>
@@ -817,6 +895,7 @@ function GrepPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
         </label>
         <input
           id="pj-grep-q"
+          ref={qField}
           className="pj-field-input"
           type="text"
           value={draftQ}
@@ -851,7 +930,7 @@ function GrepPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
         <InspectAbsence error={matches.error} projectRoot={projectRoot} what="that search" />
       )}
       {asked !== null && !matches.isError && matches.data === undefined && (
-        <p className="pj-loading">searching…</p>
+        <p className="pj-loading" role="status">Searching…</p>
       )}
       {matches.data !== undefined && groups.length === 0 && (
         <Quiet says="nothing in that folder contains it." />
@@ -934,7 +1013,7 @@ function DiffPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
       {diff.isError && diff.data === undefined && (
         <InspectAbsence error={diff.error} projectRoot={projectRoot} what="the diff" />
       )}
-      {!diff.isError && diff.data === undefined && <p className="pj-loading">reading the tree…</p>}
+      {!diff.isError && diff.data === undefined && <p className="pj-loading" role="status">Reading the tree…</p>}
       {diff.data !== undefined && diff.data.trim() === "" && (
         <Quiet says="nothing is uncommitted — the tree is clean." />
       )}

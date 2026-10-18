@@ -302,9 +302,18 @@ async function pageHeader(): Promise<HTMLElement> {
   });
 }
 
-/** The status region inside the page header — the sentence the page leads with. */
+/**
+ * The whole headline sentence. The page draws two clauses and a "+N more" button for the rest;
+ * this opens it (once) and reads everything but the button, so a test asserts the full ladder.
+ */
 async function headlineText(): Promise<string> {
-  return within(await pageHeader()).getByRole("status").textContent ?? "";
+  const status = within(await pageHeader()).getByRole("status");
+  const wrap = status.closest<HTMLElement>(".fleet-headline")!;
+  const more = within(wrap).queryByRole("button");
+  if (more !== null && more.getAttribute("aria-expanded") === "false") fireEvent.click(more);
+  const copy = wrap.cloneNode(true) as HTMLElement;
+  copy.querySelectorAll("button").forEach((button) => button.remove());
+  return (copy.textContent ?? "").trim();
 }
 
 /** The interlock's 300ms dwell, which swallows a click arriving as the tail of a double-click. */
@@ -1037,7 +1046,7 @@ describe("Fleet — the slot rack", () => {
     expect(document.querySelectorAll("form.fleet-new-job")).toHaveLength(1);
     expect(screen.getByRole("button", { name: "New job" }).getAttribute("aria-expanded")).toBe("true");
     // The entry's project, and not the roomiest, which is bravo.
-    const select = screen.getByLabelText("Project for the new job") as HTMLSelectElement;
+    const select = screen.getByLabelText("Project") as HTMLSelectElement;
     expect(select.value).toBe("alpha");
     const prompt = screen.getByLabelText("Prompt");
     await waitFor(() => expect(document.activeElement).toBe(prompt));
@@ -1099,7 +1108,7 @@ describe("Fleet — the slot rack", () => {
     // One answer at two lengths: each option says in full what its entry says short, or leaves to
     // the badge beside it.
     fireEvent.click(screen.getByRole("button", { name: "New job" }));
-    const select = screen.getByLabelText("Project for the new job") as HTMLSelectElement;
+    const select = screen.getByLabelText("Project") as HTMLSelectElement;
     const option = (value: string) => select.querySelector(`option[value="${value}"]`)?.textContent;
     expect(option("charlie")).toBe("charlie — in shadow — jobs start only when the autopilot is active");
     expect(option("delta")).toBe("delta — no folder recorded");
@@ -1184,7 +1193,7 @@ describe("Fleet — the slot rack", () => {
 
     // The panel is where the refusal is said, beside the button it disables.
     fireEvent.click(screen.getByRole("button", { name: "New job in alpha" }));
-    expect(screen.getByText(/the núcleo refuses every new job until it is released/)).toBeDefined();
+    expect(screen.getByText(/the background service refuses every new job until it is released/)).toBeDefined();
   });
 
   it("is the page's body when nothing is in flight anywhere, with no columns and one list of idle projects", async () => {
@@ -1285,8 +1294,8 @@ describe("Fleet — the headline", () => {
 
     await waitFor(async () =>
       expect(await headlineText()).toBe(
-        "1 slot held by nothing, awaiting reconciliation; 1 observed overlap between trees; " +
-          "1 item did not merge; 1 job awaiting approval; 1 job held by an exclusion; " +
+        "1 slot stuck with no job, being cleaned up; 1 pair of jobs changing the same files; " +
+          "1 item did not merge; 1 job awaiting approval; 1 job paused by a rule; " +
           "the kill switch is engaged — no new job starts; " +
           // Room in the house is not a project that takes a job: alpha is full, bravo is full and
           // has no summary, so the sentence says none can start.
@@ -1298,11 +1307,48 @@ describe("Fleet — the headline", () => {
     // The faults wear the wrong-fact colour and the item that did not merge does not: it was put
     // down, not failed (`core/src/execution/job.rs`, `ItemState::Conflicted`).
     expect([...header.querySelectorAll(".ui-wrong")].map((node) => node.textContent)).toEqual([
-      "1 slot held by nothing, awaiting reconciliation",
-      "1 observed overlap between trees",
+      "1 slot stuck with no job, being cleaned up",
+      "1 pair of jobs changing the same files",
     ]);
     expect(within(header).getByRole("link", { name: "1 job awaiting approval" }).getAttribute("href")).toBe("/waiting");
     expect((await headlineText()).toLowerCase()).not.toContain("waiting on you");
+  });
+
+  it("draws two clauses and a count for the rest, and only the worst is the status region", async () => {
+    // Same house as the ladder above: seven clauses are true at once.
+    daemon.apiFetch.mockImplementation(
+      fleetFetch(
+        fleetState({
+          kill: true,
+          concurrency: {
+            house: { limit: 8, held: 3 },
+            projects: [
+              column({
+                limit: 3,
+                slots: [slot({ slot: 0, owner_id: 60 }), slot({ slot: 1, owner_id: 61 }), slot({ slot: 2, owner_id: 62 })],
+              }),
+            ],
+          },
+          jobs: [],
+        }),
+      ),
+    );
+
+    await renderWithRouter(<Fleet />);
+    const header = await pageHeader();
+    const status = await waitFor(() => within(header).getByRole("status"));
+    await waitFor(() => expect(status.textContent).toContain("stuck with no job"));
+
+    const wrap = status.closest<HTMLElement>(".fleet-headline")!;
+    // The status region holds the worst clause alone; the kill switch and the capacity are not in it.
+    expect(status.textContent).not.toContain("kill switch");
+    const more = within(wrap).getByRole("button", { name: /^\+\d+ more$/ });
+    expect(more.getAttribute("aria-expanded")).toBe("false");
+    expect(wrap.textContent).not.toContain("in flight of");
+
+    fireEvent.click(more);
+    expect(wrap.textContent).toContain("in flight of");
+    expect(within(wrap).getByRole("button", { name: "Show less" }).getAttribute("aria-expanded")).toBe("true");
   });
 
   it("says the capacity alone when nothing is wrong", async () => {
@@ -1419,7 +1465,7 @@ describe("Fleet — asking for a job", () => {
     const start = screen.getByRole("button", { name: "Start job" }) as HTMLButtonElement;
     expect(start.disabled).toBe(true);
     const hint = document.getElementById(start.getAttribute("aria-describedby")!.split(" ")[0])!;
-    expect(hint.textContent).toMatch(/waits until this says what the job should work on/);
+    expect(hint.textContent).toMatch(/Describe the work to enable Start job/);
 
     fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
     expect(start.disabled).toBe(false);
@@ -1459,7 +1505,7 @@ describe("Fleet — asking for a job", () => {
     await renderWithRouter(<Fleet />);
     await openComposer();
 
-    const select = screen.getByLabelText("Project for the new job") as HTMLSelectElement;
+    const select = screen.getByLabelText("Project") as HTMLSelectElement;
     // Off is not offered at all rather than offered disabled: once `/projects` says so, delta goes.
     await waitFor(() => expect(select.querySelector('option[value="delta"]')).toBeNull());
     const options = Object.fromEntries([...select.options].map((option) => [option.value, option]));
@@ -1500,7 +1546,7 @@ describe("Fleet — asking for a job", () => {
 
     const start = screen.getByRole("button", { name: "Start job" }) as HTMLButtonElement;
     expect(start.disabled).toBe(true);
-    const note = screen.getByText(/the núcleo refuses every new job until it is released/);
+    const note = screen.getByText(/the background service refuses every new job until it is released/);
     expect(start.getAttribute("aria-describedby")).toContain(note.id);
   });
 
@@ -1546,7 +1592,7 @@ describe("Fleet — asking for a job", () => {
 
     await renderWithRouter(<Fleet />);
     await openComposer();
-    const picker = await screen.findByLabelText("Team to direct the job");
+    const picker = await screen.findByLabelText("Team");
     // The ceiling is on the option and not only the name, because it is the
     // whole difference between the two choices: a team is what the job runs
     // items *at once* with, and the number is how many.
@@ -1587,7 +1633,7 @@ describe("Fleet — asking for a job", () => {
     await renderWithRouter(<Fleet />);
     await openComposer();
     expect(screen.getByLabelText("Prompt")).toBeDefined();
-    expect(screen.queryByLabelText("Team to direct the job")).toBeNull();
+    expect(screen.queryByLabelText("Team")).toBeNull();
   });
 });
 
@@ -1971,5 +2017,60 @@ describe("Fleet — a job's items", () => {
     expect(screen.queryByText(/waiting for a decision/)).toBeNull();
     // And a pair already joined is not offered again.
     expect(within(low).queryByLabelText("Never at the same time as")).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------ critique W3a-2 -- */
+
+describe("Fleet — loading, retry and the headline's reach", () => {
+  it("shows a busy skeleton, not a blank page, while the first reading is on its way", async () => {
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) =>
+      path === "/concurrency" ? new Promise(() => {}) : fleetFetch(fleetState())(path, init),
+    );
+
+    await renderWithRouter(<Fleet />);
+
+    expect(await screen.findByText("Loading the fleet")).toBeDefined();
+    expect(document.querySelector(".ui-skeleton")?.getAttribute("aria-busy")).toBe("true");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("offers Try again on a failed reading and asks the route once more", async () => {
+    const state = fleetState();
+    let failing = true;
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/concurrency" && failing) throw new Error("Failed to fetch");
+      return await fleetFetch(state)(path, init);
+    });
+
+    await renderWithRouter(<Fleet />);
+    const note = await screen.findByRole("alert");
+    expect(note.textContent).not.toContain("did not answer");
+    expect(note.textContent).not.toContain("núcleo");
+
+    const calls = () => daemon.apiFetch.mock.calls.filter(([path]) => path === "/concurrency").length;
+    const before = calls();
+    failing = false;
+    fireEvent.click(within(note).getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(calls()).toBeGreaterThan(before));
+  });
+
+  it("names the Fields' controls with their visible labels and no aria-label of their own", async () => {
+    daemon.apiFetch.mockImplementation(fleetFetch(fleetState({ concurrency: { house: { limit: 4, held: 0 }, projects: [column()] } })));
+    await renderWithRouter(<Fleet />);
+    fireEvent.click(await screen.findByRole("button", { name: "New job" }));
+
+    for (const label of ["Prompt", "Project", "Budget $", "Rounds"]) {
+      expect(screen.getByLabelText(label).hasAttribute("aria-label")).toBe(false);
+    }
+  });
+
+  it("starts a project's job from a button that says New job, and says which project after", async () => {
+    daemon.apiFetch.mockImplementation(fleetFetch(fleetState({ concurrency: { house: { limit: 4, held: 0 }, projects: [column()] } })));
+    await renderWithRouter(<Fleet />);
+
+    const button = await screen.findByRole("button", { name: "New job in alpha" });
+    expect(button.textContent).toContain("New job");
+    expect(button.hasAttribute("aria-label")).toBe(false);
   });
 });

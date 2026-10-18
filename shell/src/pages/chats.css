@@ -120,6 +120,20 @@
 @container chats (max-width: 54rem) {
   .chats-layout {
     grid-template-columns: minmax(0, 1fr);
+    position: relative;
+  }
+
+  /* Below the fold the list is a drawer over the conversation, not a second row under it: stacked,
+     it took the composer's height. The conversation keeps the whole width and the list is one
+     toggle away (`railOpen` also starts shut here — see the page). */
+  .chats-layout > .chats-rail {
+    position: absolute;
+    inset-block: 0;
+    inset-inline-end: 0;
+    width: min(calc(19rem + var(--space-4)), 100%);
+    z-index: var(--z-overlay);
+    background: var(--bg);
+    box-shadow: var(--shadow-lg);
   }
 }
 
@@ -1315,8 +1329,8 @@
   flex: none;
   align-items: center;
   justify-content: center;
-  width: 1.75rem;
-  height: 1.75rem;
+  width: var(--hit-min);
+  height: var(--hit-min);
   border: 1px solid transparent;
   border-radius: var(--radius-md);
   background: none;
@@ -2232,6 +2246,9 @@
 
 .chats-composer-actions {
   display: flex;
+  /* Wraps instead of squeezing Send out of its corner: on a narrow window or with a long model name
+     the secondary controls drop to a second line and Send stays reachable. */
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-1);
 }
@@ -2279,6 +2296,9 @@
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   line-height: 1.6;
+  min-height: var(--hit-min);
+  min-width: var(--hit-min);
+  justify-content: center;
   cursor: pointer;
 }
 
@@ -2345,7 +2365,24 @@
   font-family: var(--font-body);
   font-size: var(--text-xs);
   line-height: 1.6;
+  /* A fingertip-sized box without growing the glyphs, and a cap so a long model name wraps the row
+     rather than pushing Send off it. */
+  min-height: var(--hit-min);
+  min-width: 0;
+  max-width: 100%;
   cursor: pointer;
+}
+
+/* The permission mode decides whether a turn runs commands unasked, so when it is not the default
+   it is read at a glance: full text colour, and amber for the two that stop asking. The default
+   stays on the faint ground the other triggers share. */
+.chats-tool-mode[data-mode] {
+  color: var(--text);
+}
+
+.chats-tool-mode[data-mode="bypass"],
+.chats-tool-mode[data-mode="dont_ask"] {
+  color: var(--tone-awaiting-fg);
 }
 
 .chats-tool:hover:not(:disabled),
@@ -2629,8 +2666,8 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.875rem;
-  height: 1.875rem;
+  width: var(--hit-min);
+  height: var(--hit-min);
   flex: none;
   padding: 0;
   border: none;
@@ -3338,10 +3375,10 @@
 
 .chats-attached-drop {
   position: absolute;
-  top: -0.4rem;
-  right: -0.4rem;
-  width: 1.25rem;
-  height: 1.25rem;
+  top: -0.5rem;
+  right: -0.5rem;
+  width: 1.5rem;
+  height: 1.5rem;
   padding: 0;
   border: 1px solid var(--border);
   border-radius: 50%;
@@ -3774,8 +3811,14 @@
   background: transparent;
 }
 
+/* Amber is what DESIGN.md reserves for "waiting on you". The ring (a hollow, slightly larger dot)
+   is the second signal that is not a hue: the other states are solid. */
 .chats-dot-needs_input {
-  color: var(--tone-info-fg);
+  width: 0.625rem;
+  height: 0.625rem;
+  color: var(--tone-awaiting-fg);
+  background: transparent;
+  box-shadow: inset 0 0 0 2px currentColor;
 }
 
 .chats-dot-working {
@@ -4118,11 +4161,14 @@
   display: inline-flex;
   flex: none;
   align-items: center;
+  justify-content: center;
+  min-width: 1.5rem;
+  min-height: 1.5rem;
   padding: var(--space-1);
   border: 0;
   border-radius: var(--radius-sm);
   background: none;
-  color: var(--text-faint);
+  color: var(--text-muted);
   cursor: pointer;
 }
 
@@ -4566,4 +4612,32 @@ button.agent-card:hover {
   color: var(--text-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* A touch screen has no hover to find a small target with, so the composer's controls grow. */
+@media (hover: none) {
+  .chats-tool,
+  .chats-attach,
+  .chats-handsfree,
+  .chats-meta-more,
+  .chats-send {
+    min-height: 2.75rem;
+  }
+
+  .chats-handsfree,
+  .chats-send,
+  .chats-meta-more {
+    min-width: 2.75rem;
+  }
+
+  .chats-attached-drop,
+  .chats-tab-close {
+    min-width: 2rem;
+    min-height: 2rem;
+  }
+}
+
+/* The live-region wrapper around the transcript list adds no box of its own. */
+.chats-log {
+  display: contents;
 }

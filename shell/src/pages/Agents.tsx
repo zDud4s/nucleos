@@ -30,6 +30,7 @@ import {
   Panel,
   RefusalNote,
   RelativeTime,
+  Skeleton,
   StaleNote,
   Teach,
 } from "../ui";
@@ -118,13 +119,13 @@ export function Agents() {
       />
 
       {stale && <StaleNote dataUpdatedAt={agents.dataUpdatedAt} />}
-      {agents.isError && !answered && <ListError error={agents.error} />}
+      {agents.isError && !answered && <ListError error={agents.error} onRetry={() => void agents.refetch()} />}
 
       {/* Closed by default. The old page opened six fields above a catalogue
           nobody had read yet — the very thing the console rewrite undid. */}
       {creating && <NewAgentForm onDone={() => setCreating(false)} />}
 
-      {!answered && !agents.isError && <p className="agents-loading">reading the catalogue…</p>}
+      {!answered && !agents.isError && <Skeleton label="Reading the catalogue…" lines={3} />}
 
       {answered && rows.length === 0 && (
         <Teach title="No agent has been hired yet">
@@ -133,8 +134,9 @@ export function Agents() {
             tool policy — add one to start the catalogue.
           </p>
           <p>
-            This catalogue records no recruitment link: nothing on an agent&rsquo;s row says which
-            recruitment run asked for it, because nothing in the núcleo stores that.
+            <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog">
+              New agent
+            </Button>
           </p>
         </Teach>
       )}
@@ -198,9 +200,11 @@ function headlineFor(
   return parts.join(" · ");
 }
 
-function ListError({ error }: { error: unknown }) {
+function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the catalogue</ErrorNote>;
+  return (
+    <ErrorNote onRetry={onRetry}>the núcleo did not answer — nothing is known about the catalogue</ErrorNote>
+  );
 }
 
 /**
@@ -350,7 +354,7 @@ function CatalogueRow({
           The name is the control. There is no separate Edit button per row: the
           row IS the way in, and the editor it opens is the only one on the page.
         */}
-        <button type="button" className="agents-name" onClick={onSelect} aria-expanded={open}>
+        <button type="button" className="agents-name" onClick={onSelect} aria-haspopup="dialog">
           {agent.name}
         </button>
         <Called agent={agent} />
@@ -621,18 +625,18 @@ function requestFromDraft(draft: AgentDraft): AgentRequest {
  */
 function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: Partial<AgentDraft>) => void }) {
   const modelRequired = draft.engine === "local";
+  const fieldId = useId();
 
   return (
     <>
       <label className="agents-field">
         <span>Name</span>
-        <input aria-label="Name" value={draft.name} onChange={(event) => onChange({ name: event.target.value })} />
+        <input value={draft.name} onChange={(event) => onChange({ name: event.target.value })} />
       </label>
 
       <label className="agents-field agents-field-sentence">
         <span>Speciality</span>
         <input
-          aria-label="Speciality"
           value={draft.speciality}
           onChange={(event) => onChange({ speciality: event.target.value })}
         />
@@ -642,7 +646,6 @@ function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: 
         <span>Prompt</span>
         <textarea
           rows={5}
-          aria-label="Prompt"
           value={draft.prompt}
           onChange={(event) => onChange({ prompt: event.target.value })}
         />
@@ -651,7 +654,6 @@ function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: 
       <label className="agents-field">
         <span>Engine</span>
         <select
-          aria-label="Engine"
           value={draft.engine}
           onChange={(event) => onChange({ engine: event.target.value as AgentEngine })}
         >
@@ -661,20 +663,25 @@ function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: 
         </select>
       </label>
 
-      <label className="agents-field agents-field-half">
-        <span>{modelRequired ? "Model (required for a local engine)" : "Model (blank is the engine's default)"}</span>
+      <div className="agents-field agents-field-half">
+        <label htmlFor={`${fieldId}-model`}>
+          <span>Model</span>
+        </label>
         <input
-          aria-label="Model"
+          id={`${fieldId}-model`}
           aria-required={modelRequired}
+          aria-describedby={`${fieldId}-model-hint`}
           value={draft.model}
           onChange={(event) => onChange({ model: event.target.value })}
         />
-      </label>
+        <small className="agents-hint" id={`${fieldId}-model-hint`}>
+          {modelRequired ? "Required for a local engine." : "Blank uses the engine's default."}
+        </small>
+      </div>
 
       <label className="agents-field">
         <span>Tool policy</span>
         <select
-          aria-label="Tool policy"
           value={draft.tool_policy}
           onChange={(event) => onChange({ tool_policy: event.target.value as AgentToolPolicy })}
         >
@@ -711,8 +718,11 @@ function NewAgentForm({ onDone }: { onDone: () => void }) {
           <Button variant="ghost" onClick={onDone}>
             Cancel
           </Button>
+          <span className="agents-save-status" role="status">
+            {create.isPending ? "Adding…" : !valid ? invalidReason(draft) : ""}
+          </span>
           <Button type="submit" form={formId} intent="go" disabled={!valid || create.isPending}>
-            Add agent
+            {create.isPending ? "Adding…" : "Add agent"}
           </Button>
         </>
       }
@@ -768,12 +778,17 @@ function AgentEditor({
   onClose: () => void;
 }) {
   const [draft, setDraft] = useState<AgentDraft>(() => draftFromAgent(agent));
+  const [tab, setTab] = useState<EditorTab>("definition");
+  const [saved, setSaved] = useState(false);
   const update = useUpdateAgent();
   const del = useDeleteAgent();
   const valid = draftIsValid(draft);
   const formId = useId();
+  const tabsId = useId();
+  const dirty = JSON.stringify(draft) !== JSON.stringify(draftFromAgent(agent));
 
   function patch(next: Partial<AgentDraft>) {
+    setSaved(false);
     setDraft((current) => ({ ...current, ...next }));
   }
 
@@ -786,76 +801,162 @@ function AgentEditor({
       title={`Editing ${agent.name}`}
       size="md"
       footer={
-        <>
+        tab === "definition" ? (
+          <>
+            <span className="agents-save-status" role="status">
+              {update.isPending
+                ? "Saving…"
+                : saved
+                  ? "Saved"
+                  : !valid
+                    ? invalidReason(draft)
+                    : dirty
+                      ? "Unsaved changes"
+                      : ""}
+            </span>
+            <Button variant="ghost" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button type="submit" form={formId} intent="go" disabled={!valid || update.isPending}>
+              {update.isPending ? "Saving…" : "Save changes"}
+            </Button>
+          </>
+        ) : (
           <Button variant="ghost" onClick={onClose}>
-            Cancel
+            Close
           </Button>
-          <Button type="submit" form={formId} intent="go" disabled={!valid || update.isPending}>
-            Save changes
-          </Button>
-        </>
+        )
       }
     >
-      <form
-        id={formId}
-        className="agents-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (!valid || update.isPending) return;
-          /*
-            Stays open and reseeds from the daemon's answer, the way the charter
-            editor does. Two things come of it: what you see next is what the
-            núcleo stored rather than what you typed — trimmed, and a blank model
-            turned back into the engine's default — and the row above changes
-            under you, which is the acknowledgement that a form closing itself
-            used to be standing in for.
-          */
-          update.mutate(
-            { id: agent.id, request: requestFromDraft(draft) },
-            { onSuccess: (saved) => setDraft(draftFromAgent(saved)) },
-          );
-        }}
-      >
-        <AgentFields draft={draft} onChange={patch} />
-        {/*
-          Said here rather than nowhere, because it is the one consequence of
-          this form that is not obvious: `job::persona_for` reads an agent's
-          prompt when an item is DISPATCHED and does not store it on the row,
-          so saving reaches work that was planned before the edit.
-        */}
-        <p className="agents-aside">
-          Saving reaches work that is already queued — an item reads its agent&rsquo;s prompt when
-          it is dispatched, not when it was planned.
-        </p>
-      </form>
-      {update.isError && <SaveRefusal error={update.error} />}
-
-      <ContextRefs ownerKind="agent" ownerId={agent.id} />
-      <ScopedMemory scopeKind="agent" scopeId={agent.id} />
-      <ScopedTools ownerKind="agent" ownerId={agent.id} />
-      <LoadoutPreview agentId={agent.id} />
-
-      {/*
-        The delete, and what this page can see standing on it — before the
-        confirmation rather than after the refusal. Never disabled from that
-        reading: the daemon is the authority, rosters move underneath, and a
-        button greyed out by a stale reading is worse than a refusal that tells
-        the truth.
-      */}
-      <div className="agents-remove">
-        <p className="agents-holds">{holdSentence(agent, employment, employmentKnown)}</p>
-        <ConfirmButton
-          label="Delete"
-          confirmLabel={`Delete ${agent.name}`}
-          variant="danger"
-          intent="stop"
-          disabled={del.isPending}
-          onConfirm={() => del.mutate(agent.id, { onSuccess: onClose })}
-        />
+      <div className="agents-tabs" role="tablist" aria-label="Agent sections">
+        {EDITOR_TABS.map(([key, text]) => (
+          <button
+            key={key}
+            type="button"
+            role="tab"
+            id={`${tabsId}-${key}`}
+            aria-selected={tab === key}
+            aria-controls={`${tabsId}-panel`}
+            tabIndex={tab === key ? 0 : -1}
+            className="agents-tab"
+            onClick={() => setTab(key)}
+            onKeyDown={(event) => {
+              const at = EDITOR_TABS.findIndex(([k]) => k === tab);
+              const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+              if (step === 0) return;
+              event.preventDefault();
+              const next = EDITOR_TABS[(at + step + EDITOR_TABS.length) % EDITOR_TABS.length]![0];
+              setTab(next);
+              document.getElementById(`${tabsId}-${next}`)?.focus();
+            }}
+          >
+            {text}
+          </button>
+        ))}
       </div>
-      {del.isError && <DeleteRefusal error={del.error} />}
+      <div role="tabpanel" id={`${tabsId}-panel`} aria-labelledby={`${tabsId}-${tab}`} className="agents-tabpanel">
+        {tab === "definition" && (
+          <>
+            <form
+              id={formId}
+              className="agents-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (!valid || update.isPending) return;
+                /*
+                  Stays open and reseeds from the daemon's answer, the way the charter
+                  editor does. Two things come of it: what you see next is what the
+                  núcleo stored rather than what you typed — trimmed, and a blank model
+                  turned back into the engine's default — and the row above changes
+                  under you, which is the acknowledgement that a form closing itself
+                  used to be standing in for. The footer says "Saved" as well, because
+                  that row sits behind the overlay.
+                */
+                setSaved(false);
+                update.mutate(
+                  { id: agent.id, request: requestFromDraft(draft) },
+                  {
+                    onSuccess: (savedAgent) => {
+                      setDraft(draftFromAgent(savedAgent));
+                      setSaved(true);
+                    },
+                  },
+                );
+              }}
+            >
+              <AgentFields draft={draft} onChange={patch} />
+              {/*
+                Said here rather than nowhere, because it is the one consequence of
+                this form that is not obvious: `job::persona_for` reads an agent's
+                prompt when an item is DISPATCHED and does not store it on the row,
+                so saving reaches work that was planned before the edit.
+              */}
+              <p className="agents-aside">
+                Saving reaches work that is already queued — an item reads its agent&rsquo;s prompt
+                when it is dispatched, not when it was planned.
+              </p>
+            </form>
+            {update.isError && <SaveRefusal error={update.error} />}
+          </>
+        )}
+
+        {tab === "memory" && (
+          <>
+            <ContextRefs ownerKind="agent" ownerId={agent.id} />
+            <ScopedMemory scopeKind="agent" scopeId={agent.id} />
+          </>
+        )}
+
+        {tab === "tools" && (
+          <>
+            <ScopedTools ownerKind="agent" ownerId={agent.id} />
+            <LoadoutPreview agentId={agent.id} />
+          </>
+        )}
+
+        {/*
+          The delete, and what this page can see standing on it — before the
+          confirmation rather than after the refusal. Never disabled from that
+          reading: the daemon is the authority, rosters move underneath, and a
+          button greyed out by a stale reading is worse than a refusal that tells
+          the truth.
+        */}
+        {tab === "remove" && (
+          <>
+            <div className="agents-remove">
+              <p className="agents-holds">{holdSentence(agent, employment, employmentKnown)}</p>
+              <ConfirmButton
+                label="Delete"
+                confirmLabel={`Delete ${agent.name}`}
+                variant="danger"
+                intent="stop"
+                disabled={del.isPending}
+                onConfirm={() => del.mutate(agent.id, { onSuccess: onClose })}
+              />
+            </div>
+            {del.isError && <DeleteRefusal error={del.error} />}
+          </>
+        )}
+      </div>
     </Modal>
   );
+}
+
+type EditorTab = "definition" | "memory" | "tools" | "remove";
+
+/** The editor's sections: only the first is "editing the agent"; the rest are what hangs off it. */
+const EDITOR_TABS: readonly (readonly [EditorTab, string])[] = [
+  ["definition", "Definition"],
+  ["memory", "Memory and context"],
+  ["tools", "Tools and loadout"],
+  ["remove", "Remove"],
+];
+
+/** Why Save is not available, in the footer beside it rather than only as a greyed button. */
+function invalidReason(draft: AgentDraft): string {
+  if (draft.name.trim() === "") return "Needs a name";
+  if (draft.speciality.trim() === "") return "Needs a speciality";
+  return "A local engine needs a model";
 }
 
 /**

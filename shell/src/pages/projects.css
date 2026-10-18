@@ -378,6 +378,17 @@
     grid-template-columns: 20rem minmax(0, 1fr);
     align-items: start;
   }
+
+  /* The file stays in view while the listing beside it is scrolled, so the page has one scroll and
+     the file box is bounded by the window rather than by a fixed 32rem of its own. */
+  .pj-browse-split > :last-child {
+    position: sticky;
+    top: var(--space-4);
+  }
+}
+
+.pj-filter {
+  margin-bottom: var(--space-3);
 }
 
 .pj-crumbs {
@@ -510,9 +521,8 @@
   gap: var(--space-3);
   margin: 0;
   padding: var(--space-3);
-  max-height: 32rem;
+  max-height: max(20rem, calc(100vh - 14rem));
   overflow: auto;
-  overscroll-behavior: none;
   background: var(--surface-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -695,9 +705,8 @@
 .pj-diff {
   margin: 0;
   padding: var(--space-3);
-  max-height: 32rem;
+  max-height: max(20rem, calc(100vh - 14rem));
   overflow: auto;
-  overscroll-behavior: none;
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   line-height: 1.45;
@@ -1250,8 +1259,24 @@
 
 .rs-card-reasons li {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   gap: var(--space-2);
+}
+
+/* The fact behind a reason (when the gate last ran, which folder is gone), on a line of its own so
+   it is read, not hovered. */
+.rs-reason-detail {
+  flex-basis: 100%;
+  padding-left: calc(0.45rem + var(--space-2));
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.rs-filter {
+  max-width: 24rem;
 }
 
 /* The reason's tone, as a small square: a dot is the mode's shape, and the two

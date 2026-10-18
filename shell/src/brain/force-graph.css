@@ -65,10 +65,6 @@
   touch-action: none;
 }
 
-.brain-force-canvas:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
-}
 
 .brain-force-canvas.is-hovering {
   cursor: pointer;
