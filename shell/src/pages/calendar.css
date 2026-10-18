@@ -122,6 +122,12 @@
 
 /* ============================================================ the heading == */
 
+/* Prev / Today / Next read as one stepper. */
+.calendar-step {
+  display: flex;
+  gap: var(--space-2);
+}
+
 .calendar-nav {
   display: flex;
   flex-wrap: wrap;
@@ -780,6 +786,9 @@
 /* The modal's footer: one line to name it and add it, one line for when. */
 .calendar-draft {
   flex: 1 1 100%;
+  /* Bounded, so a refusal plus the repeat row on a short window cannot eat the list above. */
+  max-height: 40vh;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
@@ -829,6 +838,7 @@
 .calendar-draft select,
 .calendar-move input {
   padding: 0.34rem var(--space-2);
+  min-height: var(--hit-min);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--surface-sunken);
@@ -842,11 +852,24 @@
 }
 
 @media (prefers-color-scheme: light) {
-  .calendar-draft input:not([type="checkbox"]),
-  .calendar-draft select,
-  .calendar-move input {
+  :root:not([data-theme="dark"]) .calendar-draft input:not([type="checkbox"]),
+  :root:not([data-theme="dark"]) .calendar-draft select,
+  :root:not([data-theme="dark"]) .calendar-move input {
     color-scheme: light;
   }
+}
+
+/* An explicit choice of the light theme wins over the system's preference. */
+:root[data-theme="light"] .calendar-draft input:not([type="checkbox"]),
+:root[data-theme="light"] .calendar-draft select,
+:root[data-theme="light"] .calendar-move input {
+  color-scheme: light;
+}
+
+.calendar-draft-hint {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
 .calendar-draft input::placeholder {

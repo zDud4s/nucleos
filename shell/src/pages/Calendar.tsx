@@ -17,6 +17,7 @@ import {
 import { moveFromDrop } from "../calendar/drag";
 import { isHeld, usePendingNotifications, type PendingNotification } from "../data/feed";
 import { dayBounds, monthMatrix, weekOf } from "../lib/calendar-grid";
+import { DAEMON_NAME } from "../copy";
 import { UI_LOCALE } from "../lib/locale";
 import {
   Badge,
@@ -30,6 +31,8 @@ import {
   Row,
   Rows,
   Section,
+  Skeleton,
+  StaleNote,
 } from "../ui";
 import "./calendar.css";
 
@@ -286,6 +289,9 @@ export function Calendar() {
    */
   function goTo(next: Date, nextView: View = view) {
     setAnchor(next);
+    // The sheet belongs to the day it was opened on; paging would leave it over another period.
+    setSheetOpen(false);
+    move.reset();
     const days = nextView === "week" ? weekOf(next) : monthMatrix(next).flat();
     const today = days.find((day) => dateKeyOf(day) === dateKeyOf(now));
     const first =
@@ -297,6 +303,7 @@ export function Calendar() {
 
   function switchTo(nextView: View) {
     setView(nextView);
+    setSheetOpen(false);
     setAnchor(nextView === "week" ? selected.day : startOfMonth(selected.day));
     publish(nextView, selected.day);
   }
@@ -350,25 +357,35 @@ export function Calendar() {
                 Week
               </button>
             </div>
-            <Button title={view === "week" ? "Previous week" : "Previous month"} onClick={() => step(-1)}>
-              ‹ Prev
-            </Button>
-            <Button
-              title="Back to today"
-              onClick={() => goTo(view === "week" ? new Date() : startOfMonth(new Date()))}
-            >
-              Today
-            </Button>
-            <Button title={view === "week" ? "Next week" : "Next month"} onClick={() => step(1)}>
-              Next ›
-            </Button>
+            <div className="calendar-step" role="group" aria-label="Change period">
+              {/* aria-label and not title: a title is no accessible name. Each one still
+                  contains its visible word, so the spoken name matches what is on screen. */}
+              <Button aria-label={view === "week" ? "Previous week" : "Previous month"} onClick={() => step(-1)}>
+                ‹ Prev
+              </Button>
+              <Button
+                aria-label="Today"
+                onClick={() => goTo(view === "week" ? new Date() : startOfMonth(new Date()))}
+              >
+                Today
+              </Button>
+              <Button aria-label={view === "week" ? "Next week" : "Next month"} onClick={() => step(1)}>
+                Next ›
+              </Button>
+            </div>
           </div>
         }
       />
 
       <Panel>
-        {events.isError && rows.length === 0 && <EventsError error={events.error} />}
-        {events.data === undefined && !events.isError && <p className="calendar-loading">reading the month…</p>}
+        {events.isError && rows.length === 0 && (
+          <EventsError error={events.error} onRetry={() => void events.refetch()} />
+        )}
+        {/* Last good data stays up when a refetch fails, but now says how old it is. */}
+        {events.isError && rows.length > 0 && <StaleNote dataUpdatedAt={events.dataUpdatedAt} />}
+        {events.data === undefined && !events.isError && (
+          <Skeleton label={view === "week" ? "Loading the week…" : "Loading the month…"} lines={8} />
+        )}
         {events.data !== undefined &&
           (view === "week" ? (
             <WeekGrid
@@ -393,7 +410,7 @@ export function Calendar() {
               drag={drag}
             />
           ))}
-        {move.isError && <MoveError error={move.error} />}
+        {move.isError && <MoveError error={move.error} onDismiss={() => move.reset()} />}
       </Panel>
 
       <DaySheet
@@ -422,9 +439,13 @@ function weekLabel(days: Date[]): string {
   return `${head}–${tail}`;
 }
 
-function EventsError({ error }: { error: unknown }) {
+function EventsError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about this month</ErrorNote>;
+  return (
+    <ErrorNote onRetry={onRetry}>
+      Could not reach the {DAEMON_NAME} — nothing is known about this period
+    </ErrorNote>
+  );
 }
 
 /**
@@ -436,9 +457,19 @@ function EventsError({ error }: { error: unknown }) {
  * cell the person was no longer looking at. The `DaySheet` reports the same
  * write beside its own control, where there IS something to attach it to.
  */
-function MoveError({ error }: { error: unknown }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing was moved</ErrorNote>;
+function MoveError({ error, onDismiss }: { error: unknown; onDismiss: () => void }) {
+  return (
+    <>
+      {isApiRefusal(error) ? (
+        <RefusalNote refusal={error} />
+      ) : (
+        <ErrorNote>Could not reach the {DAEMON_NAME} — nothing was moved</ErrorNote>
+      )}
+      <Button type="button" onClick={onDismiss}>
+        Dismiss
+      </Button>
+    </>
+  );
 }
 
 /* ------------------------------------------------------------------ busy -- */
@@ -472,8 +503,8 @@ export function HeldNotifications() {
   return (
     <Panel title="Held notifications" variant="dim">
       <p className="calendar-note">
-        calendar.rs fails OPEN by design — a database it cannot read answers "not busy" rather than
-        staying silent, since silence here is a message that never arrived.
+        If the calendar cannot be read, you count as free, so a notification is never held back by
+        mistake.
       </p>
       {pending.isError && rows.length === 0 && <NotificationsError error={pending.error} />}
       {pending.data !== undefined && rows.length === 0 && <Quiet says="nothing has been held." />}
@@ -508,7 +539,7 @@ export function HeldNotifications() {
 
 function NotificationsError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about held notifications</ErrorNote>;
+  return <ErrorNote>Could not reach the {DAEMON_NAME} — nothing is known about held notifications</ErrorNote>;
 }
 
 function NotificationRow({ row }: { row: PendingNotification }) {
