@@ -551,6 +551,15 @@ describe("Feed - taking a mark back, and one model for the filters", () => {
     expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
   });
 
+  it("names the filters in force as chips that each switch one off", async () => {
+    useLines([entry()]);
+    await renderFeed("/feed?kind=job_failed");
+    const group = await screen.findByRole("group", { name: "Active filters" });
+    expect(group).toBeDefined();
+    expect(await screen.findByRole("button", { name: "kind: job_failed" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Clear 1 filter" })).toBeDefined();
+  });
+
   it("applies every filter together on Apply, and none of them on change", async () => {
     useLines([entry()]);
     await renderFeed();

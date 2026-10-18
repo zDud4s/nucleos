@@ -46,7 +46,9 @@ import { useProjects, type ProjectSummary } from "../data/system";
 import {
   Badge,
   Button,
+  Chip,
   ErrorNote,
+  FilterBar,
   FEED_LANES,
   PageHeader,
   Quiet,
@@ -615,6 +617,15 @@ function FeedSearchForm({
     filters.until !== undefined ||
     filters.limit !== undefined;
   const [open, setOpen] = useState(carries);
+  /** The filters in force, one chip each, so a closed panel still says what shaped the page. */
+  const active: { key: keyof FeedSearch; label: string }[] = [];
+  if (filters.kind !== undefined) active.push({ key: "kind", label: `kind: ${filters.kind}` });
+  if (filters.project !== undefined) active.push({ key: "project", label: `project: ${filters.project}` });
+  if (filters.since !== undefined)
+    active.push({ key: "since", label: `since ${rfc3339ToBoundInput(filters.since).replace("T", " ")}` });
+  if (filters.until !== undefined)
+    active.push({ key: "until", label: `until ${rfc3339ToBoundInput(filters.until).replace("T", " ")}` });
+  if (filters.limit !== undefined) active.push({ key: "limit", label: `limit ${filters.limit}` });
 
   return (
     <form
@@ -657,6 +668,24 @@ function FeedSearchForm({
           <ChevronDown className="feed-search-chevron" size={14} aria-hidden="true" />
         </button>
       </div>
+
+      {active.length > 0 ? (
+        <div className="feed-active-filters">
+        <FilterBar
+          label="Active filters"
+          activeCount={active.length}
+          onClear={() =>
+            onChange({ kind: undefined, project: undefined, since: undefined, until: undefined, limit: undefined })
+          }
+        >
+          {active.map((item) => (
+            <Chip key={item.key} pressed onToggle={() => onChange({ [item.key]: undefined })}>
+              {item.label}
+            </Chip>
+          ))}
+        </FilterBar>
+        </div>
+      ) : null}
 
       <div className="feed-filters" id={panelId} hidden={!open}>
         <div className="feed-filter">
