@@ -2,6 +2,7 @@ import {
   useEffect,
   useId,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type FocusEvent,
@@ -61,6 +62,7 @@ import {
   Section,
   StaleNote,
   StateBadge,
+  Tip,
 } from "../ui";
 import "./waiting.css";
 
@@ -269,11 +271,11 @@ export function Waiting() {
  * six absences made the page longest on the morning nothing was wrong. What an absence
  * needs is to be a fact and not a gap — "nothing has asked for browser access" alone reads as a
  * list that failed to load — so the names are one sentence. The reasoning behind each rides on
- * its name: shown on hover, and read out as the name's description. It was a disclosure under
+ * its name: a `Tip`, shown on hover, focus or press, closed by Escape, and read out as the
+ * name's description. It was a disclosure under
  * the line, dropped at the owner's call (2026-10-09).
  */
 function NothingWaiting({ queues }: { queues: QueueText[] }) {
-  const base = useId();
   if (queues.length === 0) return null;
   return (
     <p className="waiting-quiet-line">
@@ -281,19 +283,12 @@ function NothingWaiting({ queues }: { queues: QueueText[] }) {
       {queues.map((queue, index) => (
         <span key={queue.title}>
           {index > 0 && ", "}
-          {/* A drawn tip, not `title`: the native one waits a second and a half, does not
-              open on focus at all, and in this webview often never shows — a dotted word that
-              did nothing. The tip is the name's description, so it is also read out. */}
-          <span
-            className="waiting-quiet-name"
-            tabIndex={0}
-            aria-describedby={`${base}-${index}`}
-          >
+          {/* A `Tip`, not `title` and not a CSS-only hover: it opens on focus and on a press
+              (touch), Escape closes it, and it is the name's description, so it is also read
+              out. `persist` keeps the text in the document while closed. */}
+          <Tip className="waiting-quiet-name" tip={queue.why} persist>
             {queue.title}
-            <span className="waiting-quiet-tip" role="tooltip" id={`${base}-${index}`}>
-              {queue.why}
-            </span>
-          </span>
+          </Tip>
         </span>
       ))}
     </p>
@@ -1260,7 +1255,7 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
                   onConfirm={() => approve.mutate(proposal.id)}
                 />
                 <ConfirmButton
-                  label="Decline action"
+                  label="Decline, run continues"
                   confirmLabel="Decline action and keep the run going"
                   variant="ghost"
                   disabled={deciding}
@@ -1268,7 +1263,7 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
                   onConfirm={() => decline.mutate(proposal.id)}
                 />
                 <ConfirmButton
-                  label="Decline and stop run"
+                  label="Decline, stop run"
                   confirmLabel="Decline and end the run"
                   variant="ghost"
                   disabled={deciding}
@@ -1349,7 +1344,7 @@ function ApprovalContext({ proposal }: { proposal: Proposal }) {
         </p>
       )}
       {status !== null && status !== "awaiting_approval" && (
-        <p className="waiting-hint waiting-hint-yours">
+        <p className="waiting-notice" role="status">
           The run is {status.replace(/_/g, " ")}, not waiting on this — approving resumes nothing.
         </p>
       )}
@@ -1721,10 +1716,25 @@ function RecruitmentCard({
   // Seed once: a poll tick landing mid-edit must not overwrite what the person
   // has already typed, so the effect only ever sets the form while it is null.
   const [form, setForm] = useState<AgentRequest | null>(null);
+  // The proposal text the form was seeded from. A later poll can bring a different one (the
+  // director revised the request); the form stays as typed, and this is what says it is behind.
+  const [seededFrom, setSeededFrom] = useState<string | null>(null);
   useEffect(() => {
     if (form !== null) return;
     setForm(seedRecruitForm(proposal.tool_input));
+    setSeededFrom(proposal.tool_input);
   }, [form, proposal.tool_input]);
+  const proposalChanged = form !== null && proposal.tool_input !== seededFrom;
+  const proposed = useMemo(() => seedRecruitForm(seededFrom), [seededFrom]);
+
+  function loadChangedProposal() {
+    setForm(seedRecruitForm(proposal.tool_input));
+    setSeededFrom(proposal.tool_input);
+    // The reader asked for the new values: put them where the edit starts.
+    window.requestAnimationFrame(() =>
+      document.getElementById(`recruit-${proposal.id}-name`)?.focus(),
+    );
+  }
 
   function field<K extends keyof AgentRequest>(key: K, value: AgentRequest[K]) {
     setForm((current) =>
@@ -1737,6 +1747,10 @@ function RecruitmentCard({
   // every card, all the time. It is help for two fields, so it belongs to those two fields:
   // read out when either takes focus, and on hover for anybody with a pointer.
   const carefulId = idFor("careful");
+  const carefulChanged =
+    form !== null &&
+    proposed !== null &&
+    (form.engine !== proposed.engine || form.tool_policy !== proposed.tool_policy);
   const careful =
     "Engine and tool policy are the two fields a director gets wrong most often — they are also what costs money per turn and what widens what this agent can reach.";
 
@@ -1760,6 +1774,15 @@ function RecruitmentCard({
         // The one card in this queue that is a form. The inset is what says the
         // fields are a thing standing on the row rather than more of the row.
         <Inset>
+          {proposalChanged && (
+            <p className="waiting-notice waiting-recruit-changed" role="status">
+              The director changed this proposal after you opened it. The fields below still hold
+              the earlier values.{" "}
+              <Button variant="quiet" onClick={loadChangedProposal}>
+                Load the new proposal
+              </Button>
+            </p>
+          )}
           <div className="waiting-recruit">
             <div className="waiting-recruit-form">
               <div className="waiting-recruit-field">
@@ -1796,9 +1819,6 @@ function RecruitmentCard({
                   onChange={(event) => field("prompt", event.target.value)}
                 />
               </div>
-              <span className="sr-only" id={carefulId}>
-                {careful}
-              </span>
               <div className="waiting-recruit-field">
                 <label className="waiting-recruit-label" htmlFor={idFor("engine")}>
                   Engine
@@ -1807,7 +1827,6 @@ function RecruitmentCard({
                   className="waiting-recruit-input waiting-recruit-input-careful"
                   id={idFor("engine")}
                   aria-describedby={carefulId}
-                  title={careful}
                   value={form.engine}
                   onChange={(event) => field("engine", event.target.value)}
                 >
@@ -1839,13 +1858,26 @@ function RecruitmentCard({
                   className="waiting-recruit-input waiting-recruit-input-careful"
                   id={idFor("tool_policy")}
                   aria-describedby={carefulId}
-                  title={careful}
                   value={form.tool_policy}
                   onChange={(event) => field("tool_policy", event.target.value)}
                 >
                   <OptionsWith current={form.tool_policy} known={RECRUIT_TOOL_POLICIES} />
                 </select>
               </div>
+              {/* Visible, not a `title`: this is what costs money per turn, and a tooltip waits,
+                  never shows on touch and is not read by most readers. It is also the two
+                  fields' description. */}
+              <p
+                className={
+                  carefulChanged
+                    ? "waiting-recruit-careful waiting-recruit-careful-changed waiting-recruit-span-all"
+                    : "waiting-recruit-careful waiting-recruit-span-all"
+                }
+                id={carefulId}
+              >
+                {careful}
+                {carefulChanged && " Changed from what the director proposed."}
+              </p>
             </div>
           </div>
         </Inset>
