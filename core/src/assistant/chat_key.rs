@@ -131,6 +131,7 @@ mod tests {
             stopped_rx,
             crate::execution::runner::Permission::Default,
             None,
+            super::super::live::SpawnShape::blank(),
             String::new(),
             None,
         );
