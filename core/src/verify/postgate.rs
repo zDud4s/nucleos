@@ -320,9 +320,108 @@ pub async fn start(
     Ok(done.rows_affected() > 0)
 }
 
+/// A project's post-merge gate colour, as `postgate_transitions.to_state` spells it.
+///
+/// Red means `red_groups` is not empty: the same reading `State::red_groups` gives, and the one
+/// thing every write below already sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Colour {
+    Red,
+    Green,
+}
+
+impl Colour {
+    fn as_str(self) -> &'static str {
+        match self {
+            Colour::Red => "red",
+            Colour::Green => "green",
+        }
+    }
+}
+
+/// `postgate_transitions.reason` values (spec §10).
+const REASON_GATE: &str = "gate";
+const REASON_FLAKE: &str = "flake";
+const REASON_COVERED: &str = "covered";
+
+/// What a colour-changing write reads inside its transaction, before its UPDATE.
+struct Before {
+    red: bool,
+    /// The red being closed ended with the daemon's revert of its culprit published: a revert
+    /// was started for exactly the culprit (`revert_merge_sha = culprit_sha`) and the queue
+    /// recorded its commit (`revert_sha`). Only read by the writes that turn a project green.
+    reverted: bool,
+}
+
+/// `postgate_state`: red_groups, culprit_sha, revert_merge_sha, revert_sha.
+type BeforeRow = (String, Option<String>, Option<String>, Option<String>);
+
+async fn read_before(conn: &mut sqlx::SqliteConnection, project_id: &str) -> sqlx::Result<Before> {
+    let row: Option<BeforeRow> = sqlx::query_as(
+        "SELECT red_groups, culprit_sha, revert_merge_sha, revert_sha \
+         FROM postgate_state WHERE project_id = ?",
+    )
+    .bind(project_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(match row {
+        // No row yet: a project the gate never judged is green.
+        None => Before {
+            red: false,
+            reverted: false,
+        },
+        Some((groups, culprit, revert_merge, revert_sha)) => Before {
+            red: !decode_list::<String>(project_id, "red_groups", &groups).is_empty(),
+            reverted: revert_sha.is_some() && culprit.is_some() && culprit == revert_merge,
+        },
+    })
+}
+
+/// Appends the change to `postgate_transitions` when the colour moved, inside the caller's
+/// transaction (spec analytics-pipeline §5.4). `Ok(false)`, nothing written, when it did not.
+///
+/// Called only after the caller's compare-and-set UPDATE affected a row, so a refused or
+/// repeated call never reaches it and cannot duplicate a row.
+// Eight plain columns of one row; a struct used once would only rename them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_transition(
+    conn: &mut sqlx::SqliteConnection,
+    project_id: &str,
+    was_red: bool,
+    to: Colour,
+    sha: Option<&str>,
+    groups: &[String],
+    reason: &str,
+    reverted: bool,
+) -> sqlx::Result<bool> {
+    if was_red == (to == Colour::Red) {
+        return Ok(false);
+    }
+    let encoded = serde_json::to_string(groups).unwrap_or_else(|_| "[]".to_owned());
+    sqlx::query(
+        "INSERT INTO postgate_transitions \
+             (project_id, at, to_state, sha, red_groups, reason, reverted) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(project_id)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(to.as_str())
+    .bind(sha)
+    .bind(encoded)
+    .bind(reason)
+    .bind(i64::from(reverted))
+    .execute(&mut *conn)
+    .await?;
+    Ok(true)
+}
+
 /// The gate running for `sha` passed. A finish for a sha that is not the running one changes
-/// nothing and returns `false`, so a late finish cannot overwrite newer state.
+/// nothing and returns `false`, so a late finish cannot overwrite newer state. Writes the
+/// `→ green` transition in the same transaction when the project was red (spec
+/// analytics-pipeline §5.4).
 pub async fn finish_green(pool: &SqlitePool, project_id: &str, sha: &str) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let before = read_before(&mut tx, project_id).await?;
     let done = sqlx::query(
         "UPDATE postgate_state SET \
              last_green_sha = ?, \
@@ -337,14 +436,32 @@ pub async fn finish_green(pool: &SqlitePool, project_id: &str, sha: &str) -> sql
     .bind(sha)
     .bind(project_id)
     .bind(sha)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(done.rows_affected() > 0)
+    if done.rows_affected() == 0 {
+        // Dropping `tx` rolls back the (read-only) transaction.
+        return Ok(false);
+    }
+    record_transition(
+        &mut tx,
+        project_id,
+        before.red,
+        Colour::Green,
+        Some(sha),
+        &[],
+        REASON_GATE,
+        before.reverted,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// The gate running for `sha` failed in `groups`. `red_since_sha` keeps the first red sha until a
 /// green clears it. Opens the flake-check phase: `red_sha` is `sha` and `red_base_sha` the last
-/// green sha, so the range to bisect is fixed now. Same compare-and-set as `finish_green`.
+/// green sha, so the range to bisect is fixed now. Same compare-and-set as `finish_green`. Writes
+/// the `→ red` transition in the same transaction when the project was green (spec
+/// analytics-pipeline §5.4).
 pub async fn finish_red(
     pool: &SqlitePool,
     project_id: &str,
@@ -352,6 +469,8 @@ pub async fn finish_red(
     groups: &[String],
 ) -> sqlx::Result<bool> {
     let encoded = serde_json::to_string(groups).unwrap_or_else(|_| "[]".to_owned());
+    let mut tx = pool.begin().await?;
+    let before = read_before(&mut tx, project_id).await?;
     let done = sqlx::query(
         "UPDATE postgate_state SET \
              running_sha = NULL, running_request_id = NULL, running_started_at = NULL, \
@@ -368,9 +487,31 @@ pub async fn finish_red(
     .bind(sha)
     .bind(project_id)
     .bind(sha)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(done.rows_affected() > 0)
+    if done.rows_affected() == 0 {
+        // Dropping `tx` rolls back the (read-only) transaction.
+        return Ok(false);
+    }
+    // An empty group list stores `red_groups = '[]'`: the colour stays green.
+    let to = if groups.is_empty() {
+        Colour::Green
+    } else {
+        Colour::Red
+    };
+    record_transition(
+        &mut tx,
+        project_id,
+        before.red,
+        to,
+        Some(sha),
+        groups,
+        REASON_GATE,
+        false,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Stores the verify ticket of the gate running for `sha`. Refused (`false`) when `sha` is not
@@ -411,13 +552,16 @@ pub async fn abandon(pool: &SqlitePool, project_id: &str, sha: &str) -> sqlx::Re
 
 /// Marks `sha` green without running a gate (`verify_batch`'s `MarkCovered`: the full gate
 /// already passed on exactly that sha before it was published). Starts nothing and leaves a
-/// running gate untouched.
+/// running gate untouched. Writes the `→ green` transition in the same transaction when the
+/// project was red (spec analytics-pipeline §5.4).
 pub async fn mark_covered(
     pool: &SqlitePool,
     project_id: &str,
     target: &str,
     sha: &str,
 ) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    let before = read_before(&mut tx, project_id).await?;
     sqlx::query(
         "INSERT INTO postgate_state (project_id, target, last_green_sha) VALUES (?, ?, ?) \
          ON CONFLICT(project_id) DO UPDATE SET \
@@ -433,8 +577,21 @@ pub async fn mark_covered(
     .bind(project_id)
     .bind(target)
     .bind(sha)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    // The upsert always affects one row; `record_transition` skips green to green itself.
+    record_transition(
+        &mut tx,
+        project_id,
+        before.red,
+        Colour::Green,
+        Some(sha),
+        &[],
+        REASON_COVERED,
+        before.reverted,
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -541,8 +698,11 @@ pub async fn seconds_since_last_start(
 
 /// The recheck on `red_sha` passed: the red was not the target's, so `red_sha` counts as green and
 /// everything about the red is cleared. Nobody is told (§6.2 step 1). Refused (`false`) unless the
-/// project is in the flake-check phase for exactly that sha.
+/// project is in the flake-check phase for exactly that sha. Writes the `→ green` transition in
+/// the same transaction when the project was red (spec analytics-pipeline §5.4).
 pub async fn flake_green(pool: &SqlitePool, project_id: &str, red_sha: &str) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let before = read_before(&mut tx, project_id).await?;
     let done = sqlx::query(
         "UPDATE postgate_state SET \
              last_green_sha = ?, \
@@ -556,9 +716,24 @@ pub async fn flake_green(pool: &SqlitePool, project_id: &str, red_sha: &str) -> 
     .bind(red_sha)
     .bind(project_id)
     .bind(red_sha)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(done.rows_affected() > 0)
+    if done.rows_affected() == 0 {
+        return Ok(false);
+    }
+    record_transition(
+        &mut tx,
+        project_id,
+        before.red,
+        Colour::Green,
+        Some(red_sha),
+        &[],
+        REASON_FLAKE,
+        before.reverted,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// The recheck on `red_sha` did not clear it: move to the bisection with no probes recorded.
@@ -1601,5 +1776,238 @@ mod tests {
             seconds_since_last_start(&pool, "other").await.unwrap(),
             None
         );
+    }
+
+    /* --------------------------------------------- transitions (analytics F3) -- */
+
+    /// `(to_state, sha, red_groups, reason, reverted)`.
+    type TransitionRow = (String, Option<String>, String, Option<String>, i64);
+
+    /// The transitions in the order they were written.
+    async fn transitions(pool: &SqlitePool) -> Vec<TransitionRow> {
+        sqlx::query_as(
+            "SELECT to_state, sha, red_groups, reason, reverted \
+             FROM postgate_transitions ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Spec §11: a red on a green project is one transition; a red on a red project is none.
+    #[tokio::test]
+    async fn finish_red_records_one_transition_only_when_the_project_was_green() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(
+            finish_red(&pool, "p", "a1", &["core".to_owned()])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            transitions(&pool).await,
+            vec![(
+                "red".into(),
+                Some("a1".into()),
+                r#"["core"]"#.into(),
+                Some("gate".into()),
+                0
+            )]
+        );
+
+        // Still red: the second red keeps the colour, so it records nothing.
+        end_red(&pool, "a1").await;
+        start(&pool, "p", "master", "b2", None).await.unwrap();
+        assert!(
+            finish_red(&pool, "p", "b2", &["shell".to_owned()])
+                .await
+                .unwrap()
+        );
+        assert_eq!(transitions(&pool).await.len(), 1);
+    }
+
+    /// A retried call is refused by the compare-and-set, so it cannot write a second row.
+    #[tokio::test]
+    async fn a_repeated_finish_red_does_not_duplicate_the_transition() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(
+            finish_red(&pool, "p", "a1", &["core".to_owned()])
+                .await
+                .unwrap()
+        );
+        assert!(
+            !finish_red(&pool, "p", "a1", &["core".to_owned()])
+                .await
+                .unwrap()
+        );
+        assert_eq!(transitions(&pool).await.len(), 1);
+    }
+
+    /// Spec §11: exactly one row on a real change, none on a refused (no-op) call.
+    #[tokio::test]
+    async fn finish_red_writes_exactly_one_transition_and_none_on_a_no_op() {
+        let pool = crate::testdb::fresh_pool().await;
+        // No row, wrong sha: refused, nothing written.
+        assert!(
+            !finish_red(&pool, "p", "zzz", &["core".to_owned()])
+                .await
+                .unwrap()
+        );
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(
+            !finish_red(&pool, "p", "zzz", &["core".to_owned()])
+                .await
+                .unwrap()
+        );
+        assert!(transitions(&pool).await.is_empty());
+        assert!(
+            finish_red(&pool, "p", "a1", &["core".to_owned()])
+                .await
+                .unwrap()
+        );
+        assert_eq!(transitions(&pool).await.len(), 1);
+    }
+
+    /// Spec §11: the transition and the state UPDATE commit together or not at all. A trigger
+    /// makes the transition INSERT fail; the state must be exactly as before the call.
+    #[tokio::test]
+    async fn the_transition_and_the_state_update_commit_together() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        let before = load(&pool, "p").await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_transitions BEFORE INSERT ON postgate_transitions \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            finish_red(&pool, "p", "a1", &["core".to_owned()])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            load(&pool, "p").await.unwrap(),
+            before,
+            "the UPDATE was rolled back"
+        );
+        assert!(transitions(&pool).await.is_empty());
+    }
+
+    /// Spec §11: each of the three green writes closes an open red with one `→ green` row.
+    #[tokio::test]
+    async fn finish_green_flake_green_and_mark_covered_each_close_an_open_red() {
+        // finish_green
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        finish_red(&pool, "p", "a1", &["core".to_owned()])
+            .await
+            .unwrap();
+        end_red(&pool, "a1").await;
+        start(&pool, "p", "master", "b2", None).await.unwrap();
+        assert!(finish_green(&pool, "p", "b2").await.unwrap());
+        let rows = transitions(&pool).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1],
+            (
+                "green".into(),
+                Some("b2".into()),
+                "[]".into(),
+                Some("gate".into()),
+                0
+            )
+        );
+
+        // flake_green
+        let pool = crate::testdb::fresh_pool().await;
+        red_project(&pool, "g0", "r1").await;
+        assert!(flake_green(&pool, "p", "r1").await.unwrap());
+        let rows = transitions(&pool).await;
+        assert_eq!(rows.last().unwrap().0, "green");
+        assert_eq!(rows.last().unwrap().3.as_deref(), Some("flake"));
+
+        // mark_covered on a red project
+        let pool = crate::testdb::fresh_pool().await;
+        red_project(&pool, "g0", "r1").await;
+        mark_covered(&pool, "p", "master", "c9").await.unwrap();
+        let rows = transitions(&pool).await;
+        assert_eq!(rows.last().unwrap().0, "green");
+        assert_eq!(rows.last().unwrap().1.as_deref(), Some("c9"));
+        assert_eq!(rows.last().unwrap().3.as_deref(), Some("covered"));
+    }
+
+    #[tokio::test]
+    async fn finish_green_writes_exactly_one_transition_and_none_on_a_no_op() {
+        let pool = crate::testdb::fresh_pool().await;
+        // Green to green: a passing gate on a green project changes no colour.
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(finish_green(&pool, "p", "a1").await.unwrap());
+        // Refused: nothing running.
+        assert!(!finish_green(&pool, "p", "a1").await.unwrap());
+        assert!(transitions(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flake_green_writes_exactly_one_transition_and_none_on_a_no_op() {
+        let pool = crate::testdb::fresh_pool().await;
+        red_project(&pool, "g0", "r1").await; // one `→ red`
+        assert!(!flake_green(&pool, "p", "zzz").await.unwrap());
+        assert_eq!(transitions(&pool).await.len(), 1);
+        assert!(flake_green(&pool, "p", "r1").await.unwrap());
+        assert!(!flake_green(&pool, "p", "r1").await.unwrap());
+        assert_eq!(transitions(&pool).await.len(), 2);
+    }
+
+    /// Spec §12.2 (conservative): a cover is `→ green` only when there was a red.
+    #[tokio::test]
+    async fn mark_covered_writes_exactly_one_transition_and_none_on_a_no_op() {
+        let pool = crate::testdb::fresh_pool().await;
+        mark_covered(&pool, "p", "master", "c1").await.unwrap(); // inserts a green row
+        mark_covered(&pool, "p", "master", "c2").await.unwrap(); // green to green
+        assert!(transitions(&pool).await.is_empty());
+        red_project(&pool, "c2", "r1").await;
+        mark_covered(&pool, "p", "master", "c3").await.unwrap();
+        mark_covered(&pool, "p", "master", "c4").await.unwrap();
+        let colours: Vec<String> = transitions(&pool)
+            .await
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
+        assert_eq!(colours, ["red", "green"]);
+    }
+
+    /// Spec §5.4: `settle_covered` never moves the colour, so it never writes a transition.
+    #[tokio::test]
+    async fn settle_covered_never_records_a_transition() {
+        let pool = crate::testdb::fresh_pool().await;
+        mark_covered(&pool, "p", "main", "g").await.unwrap();
+        assert!(
+            settle_covered(&pool, "p", "main", "c1", "g", "covered c1")
+                .await
+                .unwrap()
+        );
+        assert!(transitions(&pool).await.is_empty());
+    }
+
+    /// The green that follows a published revert of the red's culprit is marked `reverted`.
+    #[tokio::test]
+    async fn the_green_after_a_published_revert_is_marked_reverted() {
+        let pool = crate::testdb::fresh_pool().await;
+        red_project(&pool, "g0", "r1").await;
+        // The state a published revert leaves: culprit known, revert started and committed for it.
+        sqlx::query(
+            "UPDATE postgate_state SET culprit_sha = 'm1', revert_merge_sha = 'm1', \
+             revert_sha = 'v1', red_phase = NULL WHERE project_id = 'p'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        start(&pool, "p", "master", "v1", None).await.unwrap();
+        assert!(finish_green(&pool, "p", "v1").await.unwrap());
+        assert_eq!(transitions(&pool).await.last().unwrap().4, 1);
     }
 }

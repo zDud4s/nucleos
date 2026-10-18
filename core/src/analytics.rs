@@ -43,7 +43,7 @@ pub enum Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
-    fn project(self) -> Option<&'a str> {
+    pub(crate) fn project(self) -> Option<&'a str> {
         match self {
             Scope::Global => None,
             Scope::Project(id) => Some(id),

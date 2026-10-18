@@ -71,6 +71,10 @@ const PROJECT_SCOPED: &[&str] = &[
     // Derived per-project state like `verify_cache`; a re-added folder must start with no gate
     // verdict inherited from a repository the user no longer has on record.
     "postgate_state",
+    // Every change of that gate's colour (migration 0207). The table has no foreign key, so a plain
+    // removal keeps a project's health history; forgetting the history is the one act that should
+    // take it, and a re-added folder must not show red streaks from a repository nobody has now.
+    "postgate_transitions",
     "project_commands",
     // The same species as its neighbours, and the resurrection argument below bites hardest here:
     // a row in this table is a standing grant to perform a git operation — a push, a merge — for an
@@ -91,6 +95,10 @@ const PROJECT_SCOPED: &[&str] = &[
     "run_presets",
     "runs",
     "scheduler_state",
+    // Slot occupancy over time (migrations 0205, 0206): the project's rows are its history. The
+    // house's rows (`project_id` NULL raw, '' daily) never match a project id, so they stay.
+    "slot_samples",
+    "slot_samples_daily",
     "vcs_requests",
     // What a project's verification asked, cached, did and observed is its history.
     "verification_observations",

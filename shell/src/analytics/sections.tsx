@@ -1,5 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
+import { TriangleAlert } from "lucide-react";
 import type { AnalyticsReport, QuotaHistory } from "../data/analytics";
 import { compactTokens, humanMinutes } from "../data/project-readings";
 import { AreaChart, ErrorNote, ShareBar, StaleNote, StepLine, usd, type ChartDatum, type ChartKey } from "../ui";
@@ -91,6 +92,10 @@ export interface Metric<K extends string = MetricKey> {
   sub: string;
   /** Absent draws no sparkline (a metric with no series, e.g. devtime cost with no priced day). */
   spark?: { data: ChartDatum[]; keys: ChartKey[]; tone: string; apart?: string; format: (value: number) => string };
+  /** The card is in a state that needs attention: drawn with the danger border, the words say why. */
+  alert?: boolean;
+  /** The block behind the card could not be computed: it says so and shows nothing else. */
+  error?: boolean;
 }
 
 /** The tokens the window measured, or `null` when no session reported usage — absent, never 0. */
@@ -163,8 +168,10 @@ export interface MetricCardProps {
  */
 export function MetricCard({ metric, open, controls, onOpen }: MetricCardProps) {
   const { spark } = metric;
+  const failed = metric.error === true;
+  const classes = ["an-metric", open ? "an-metric-open" : "", metric.alert === true ? "an-metric-alert" : ""];
   return (
-    <div className={open ? "an-metric an-metric-open" : "an-metric"}>
+    <div className={classes.filter((name) => name !== "").join(" ")}>
       <button type="button" className="an-metric-button" aria-expanded={open} aria-controls={controls} onClick={onOpen}>
         <span className="an-metric-top">
           <span className="an-metric-label">{metric.label}</span>
@@ -172,10 +179,16 @@ export function MetricCard({ metric, open, controls, onOpen }: MetricCardProps) 
             {open ? "showing" : "show chart"}
           </span>
         </span>
-        <span className="an-metric-value">{metric.value === undefined ? <Unread /> : metric.value}</span>
-        <span className="an-metric-sub">{metric.sub}</span>
+        <span className="an-metric-value">
+          {metric.alert === true && !failed ? (
+            // Text and icon, never colour alone: the icon is named after the word beside it.
+            <TriangleAlert className="an-metric-icon" role="img" aria-hidden={false} aria-label={String(metric.value)} />
+          ) : null}
+          {failed ? "Could not compute" : metric.value === undefined ? <Unread /> : metric.value}
+        </span>
+        {failed ? null : <span className="an-metric-sub">{metric.sub}</span>}
       </button>
-      {spark === undefined ? null : (
+      {spark === undefined || failed ? null : (
         <AreaChart
           data={spark.data}
           keys={spark.keys}
@@ -219,7 +232,7 @@ export function Card({ label, aside, id, className, children }: CardProps) {
 
 /* --------------------------------------------------------- the detail panel -- */
 
-interface PanelContent {
+export interface PanelContent {
   title: string;
   aside: string;
   body: ReactNode;

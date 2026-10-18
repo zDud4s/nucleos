@@ -11,6 +11,7 @@ import {
 } from "../data/analytics";
 import { ErrorNote, StaleNote, StatCard } from "../ui";
 import { DetailPanel, MetricCard, QuotaSection, TopRunsSection, metrics, type MetricKey } from "./sections";
+import { PipelineSection } from "./PipelineSection";
 import { DevtimeSection } from "./DevtimeSection";
 import "./analytics.css";
 
@@ -101,7 +102,9 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange }: Analytic
         open={open}
         onOpen={setOpen}
       />
-      {/* Its own query and its own failure: development time never goes down with the run analytics. */}
+      {/* Its own query and its own failure: the pipeline never goes down with the run analytics. */}
+      <PipelineSection projectId={projectId} days={days} />
+      {/* Likewise development time. */}
       <DevtimeSection projectId={projectId} days={days} />
     </div>
   );

@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED, RESOLVE_MIN_REVIEWED } from "../data/autopilot";
-import { judgeResolveFixture, JUDGE_RESOLUTIONS, JUDGE_RESOLVE_STATUS, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOTES_GRAPH, NOW, OWNER_NOTES, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import { previewPipeline, judgeResolveFixture, JUDGE_RESOLUTIONS, JUDGE_RESOLVE_STATUS, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOTES_GRAPH, NOW, OWNER_NOTES, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
 import { readEfficiencySignal, readFeedKind, waitReasonFromSummary } from "../data/feed";
 import { LANE_FOLD_ABOVE, buildSequences, traceLanes } from "../lib/sequences";
 import { quietGaps } from "../lib/timeline";
@@ -19,6 +19,28 @@ import { feedGravityOf, feedLaneOf } from "../ui";
  * a legitimate state — so the claim has to be made here, out loud.
  */
 describe("the preview fixtures", () => {
+  it("the pipeline answer fills every block, every window, with one project red in the global view", () => {
+    for (const raw of ["7", "30", "90", null]) {
+      const days = raw === null ? 30 : Number(raw);
+      const report = previewPipeline(null, raw);
+      expect(report.days).toBe(days);
+      if ("error" in report.landing || "error" in report.gate || "error" in report.postgate) throw new Error("block");
+      if ("error" in report.jobs || report.pressure === null || "error" in report.pressure) throw new Error("block");
+      expect(report.landing.daily).toHaveLength(days);
+      expect(report.gate.duration_ms_daily).toHaveLength(days);
+      expect(report.postgate.red_s_daily).toHaveLength(days);
+      expect(report.jobs.daily).toHaveLength(days);
+      expect(report.pressure.daily).toHaveLength(days);
+      expect(report.postgate.red_now).toBe(true);
+      expect(report.postgate.per_project.some((row) => row.red_now)).toBe(true);
+      expect(report.landing.conflicts).not.toBeNull();
+      expect(report.gate.cache).not.toBeNull();
+    }
+    const scoped = previewPipeline("alpha", "7");
+    expect(scoped.scope).toBe("project");
+    expect("error" in scoped.postgate ? true : scoped.postgate.red_now).toBe(false);
+  });
+
   it("the feed serves lines across kinds, and exactly one the shell cannot read", () => {
     expect(FEED.length).toBeGreaterThanOrEqual(14);
     expect(FEED.filter((row) => readFeedKind(row.kind) === null).map((row) => row.kind)).toEqual(["map_stamp_recorded"]);

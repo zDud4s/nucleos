@@ -18,6 +18,7 @@
 
 pub use nucleos_base::agent;
 pub mod analytics;
+pub mod analytics_pipeline;
 pub mod assistant;
 pub mod assistants;
 pub mod attention;

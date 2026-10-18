@@ -429,6 +429,22 @@ describe("refused and stale", () => {
   });
 });
 
+describe("pipeline", () => {
+  it("draws the pipeline section under the readout, sharing the window", async () => {
+    await mount(busy());
+    expect(await screen.findByRole("region", { name: "Pipeline" })).toBeTruthy();
+    expect(asked()).toContain("/analytics/pipeline?days=30");
+    fireEvent.click(screen.getByRole("button", { name: "7 days" }));
+    await waitFor(() => expect(asked()).toContain("/analytics/pipeline?days=7"));
+  });
+
+  it("asks a project's pipeline in a project's view", async () => {
+    await mount(busy("project"), "nucleos");
+    await screen.findByRole("region", { name: "Pipeline" });
+    expect(asked()).toContain("/projects/nucleos/analytics/pipeline?days=30");
+  });
+});
+
 describe("development time", () => {
   it("shows development time under the run analytics, and survives their failure", async () => {
     await mount(busy(), undefined, new Set(["/analytics?", "/analytics/quota"]));

@@ -462,7 +462,7 @@ pub(super) async fn gate_the_merge(
 /// A red gate on a merge. Says WHERE the failure lives, because the asker's first instinct will be
 /// that their branch is fine - and it may well be. What was measured is the junction, which is a
 /// tree neither side had ever built.
-pub(super) fn merge_gate_failed(exit_code: i32, output: String) -> Outcome {
+pub(crate) fn merge_gate_failed(exit_code: i32, output: String) -> Outcome {
     Outcome::Failed {
         reason: "the merge does not pass this project's gate, so nothing was published. What \
                  was measured is the two branches TOGETHER: each can be green on its own and \

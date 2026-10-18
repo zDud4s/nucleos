@@ -332,6 +332,10 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/analytics"),
     (Method::GET, "/analytics"),
     (Method::GET, "/analytics/quota"),
+    // Pipeline and autopilot health: counts, ids, group names and shas over tables this key
+    // already reads elsewhere; no free text and no command output (spec analytics-pipeline §9).
+    (Method::GET, "/projects/{id}/analytics/pipeline"),
+    (Method::GET, "/analytics/pipeline"),
     // The owner's own development time (spec analytics-devtime §8): aggregates of the devtime spans,
     // turns and messages, and the findings list with each rule's precision — ids, counts and closed
     // vocabularies only, never prompt text, commands or file paths, nothing changed. Marking a finding
@@ -3535,6 +3539,16 @@ mod tests {
     fn analytics_reads_are_open_to_a_read_only_key() {
         let reader = Scope::ApiToken(ApiTokenLevel::ReadOnly);
         for path in ["/analytics", "/analytics/quota", "/projects/7/analytics"] {
+            assert!(permits(&reader, &Method::GET, path), "GET {path}");
+            assert!(!permits(&reader, &Method::POST, path), "POST {path}");
+        }
+    }
+
+    /// Spec §9 and §11: both pipeline reads are reads, GET only.
+    #[test]
+    fn analytics_pipeline_is_on_the_read_only_allowlist() {
+        let reader = Scope::ApiToken(ApiTokenLevel::ReadOnly);
+        for path in ["/analytics/pipeline", "/projects/7/analytics/pipeline"] {
             assert!(permits(&reader, &Method::GET, path), "GET {path}");
             assert!(!permits(&reader, &Method::POST, path), "POST {path}");
         }

@@ -519,6 +519,10 @@ async fn settle_moot(pool: &sqlx::SqlitePool) {
     }
 }
 
+/// How `vcs_requests.discarded` starts when the loss could not be worked out: neither `'nothing'`
+/// nor a list of what is missing. The analytics page counts such a row as neither (metric 2).
+pub(crate) const DISCARDED_UNKNOWN: &str = "could not be worked out: ";
+
 /// Works out what ONE published resolution left behind, and writes it on the row.
 ///
 /// **Separate from the merge that published it, and not for tidiness.** The queue's contract is that
@@ -578,7 +582,7 @@ async fn record_discards(pool: &sqlx::SqlitePool) {
                 %reason,
                 "resolver: what a published resolution discarded could not be worked out"
             );
-            format!("could not be worked out: {reason}")
+            format!("{DISCARDED_UNKNOWN}{reason}")
         }
     };
 

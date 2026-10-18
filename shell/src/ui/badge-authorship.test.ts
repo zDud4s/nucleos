@@ -15,6 +15,7 @@ const TONES = "active|shadow|off|pending|paused|danger|info";
 const LITERAL = new RegExp(`tone=(?:"(?:${TONES})"|\\{[^}]*"(?:${TONES})"[^}]*\\})`);
 const ALLOWED = new Map<string, { literals: number; tables?: string[]; reason: string }>([
   ["analytics/DevtimeSection.tsx", { literals: 2, reason: "`estimated` marks a cost the shell derived from tokens and `unreliable rule` a low-precision rule the analytics read reports; both are facts about a figure's quality, not a lifecycle state of anything, and no núcleo state machine writes either." }],
+  ["analytics/pipeline/panels.tsx", { literals: 1, reason: "`suspect` flags an owner-wait figure the analytics read reports as low-confidence; it is a fact about the figure's quality, not a lifecycle state of anything, and no núcleo state machine writes it." }],
   ["calendar/DaySheet.tsx", { literals: 5, reason: "facts about a day — today, not a working day, a short or long one, a proposed occurrence. No núcleo state machine writes any of them." }],
   ["pages/Autopilot.tsx", { literals: 1, reason: "a shadow decision's action class is an identifier, not a domain state." }],
   ["pages/AutopilotJudge.tsx", { literals: 2, reason: "a verdict's action class is an identifier, and the judge's band is its opinion about one action (would allow, would refuse), not a lifecycle state of anything." }],

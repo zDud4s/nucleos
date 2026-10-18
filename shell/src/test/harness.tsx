@@ -37,6 +37,7 @@ import type { Detected } from "../data/detect";
 import type { Onboarding } from "../data/onboarding";
 import type { ProjectReadings } from "../data/project-readings";
 import type { AnalyticsDays, AnalyticsReport, QuotaHistory } from "../data/analytics";
+import type { Dist, PipelineReport } from "../data/analytics-pipeline";
 import type { DevtimeDay, DevtimeFindings, DevtimeOverview, RuleView, Verdict as DevtimeVerdict } from "../data/devtime";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
 
@@ -118,6 +119,11 @@ export interface DaemonState {
   analytics: AnalyticsReport;
   /** `GET /analytics/quota`. Empty by default: a history that has not started (`since: null`). */
   analyticsQuota: QuotaHistory;
+  /**
+   * `GET /analytics/pipeline` and `GET /projects/{id}/analytics/pipeline`, one payload for both, as
+   * `analytics`: the project route rewrites `scope` and `project_id` and 404s an unknown project.
+   */
+  analyticsPipeline: PipelineReport;
   /** `GET /analytics/devtime` and `/projects/{id}/analytics/devtime` — one payload for both, like `analytics`. */
   devtime: DevtimeOverview;
   /** `GET …/analytics/devtime/findings` — one page; the fake ignores `order`/`cursor`. */
@@ -370,6 +376,7 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     readings: readings(),
     analytics: analyticsReport(),
     analyticsQuota: quotaHistory(),
+    analyticsPipeline: pipelineReport(),
     devtime: devtimeOverview(),
     devtimeFindings: devtimeFindings({ items: [] }),
     devtimeMarks: [],
@@ -777,6 +784,118 @@ export function analyticsReport(overrides: Partial<AnalyticsReport> = {}): Analy
       series: list.map((day, index) => ({ day, partial: partial(index), landed: 0 })),
     },
     top_runs: [],
+    ...overrides,
+  };
+}
+
+const NO_DIST: Dist = { p50: null, p95: null, n: 0 };
+
+/**
+ * A pipeline answer from an empty machine: every block present, counts zero, every ratio and
+ * percentile `null`, every daily series `days` long (the last day partial), `conflicts`,
+ * `owner_blocked`, `cache` and `bypass` `null` (nothing recorded to measure them from), and the
+ * pressure block as the núcleo sends it with no samples. Overrides replace whole blocks.
+ */
+export function pipelineReport(overrides: Partial<PipelineReport> = {}): PipelineReport {
+  const days = overrides.days ?? 30;
+  const both = analyticsDays(days * 2);
+  const list = both.slice(days);
+  const partial = (index: number) => index === days - 1;
+  return {
+    scope: "global",
+    project_id: null,
+    days,
+    timezone: "UTC",
+    now: `${list[days - 1]}T09:41:00Z`,
+    window: { from: list[0], to: list[days - 1] },
+    previous: { from: both[0], to: both[days - 1] },
+    history: { postgate_since: null, slots_since: null },
+    landing: {
+      total: 0,
+      prev_total: 0,
+      wait_s: NO_DIST,
+      wait_s_machine: NO_DIST,
+      run_s: NO_DIST,
+      status_mix: { succeeded: 0, failed: 0, escalated: 0, blocked: 0, cancelled: 0, other: 0 },
+      unexecutable: 0,
+      bad_share: null,
+      prev_bad_share: null,
+      failure_buckets: { conflict: 0, gate: 0, blocked: 0, interrupted: 0, other: 0 },
+      daily: list.map((day, index) => ({ day, partial: partial(index), total: 0, bad: 0 })),
+      conflicts: null,
+      owner_blocked: null,
+    },
+    gate: {
+      pass_rate: null,
+      prev_pass_rate: null,
+      terminal: 0,
+      first_pass_rate: null,
+      retry_share: null,
+      duration_ms_daily: list.map((day, index) => ({ day, partial: partial(index), p50: null, n: 0 })),
+      most_red: [],
+      legacy_runs: 0,
+      flaky: [],
+      cache: null,
+      bypass: null,
+    },
+    postgate: {
+      red_now: false,
+      red_since: null,
+      red_phase: null,
+      red_groups: [],
+      culprit_sha: null,
+      red_s_in_window: 0,
+      prev_red_s: 0,
+      red_events: 0,
+      reverts: 0,
+      per_project: [],
+      red_s_daily: list.map((day, index) => ({ day, partial: partial(index), red_s: 0 })),
+    },
+    jobs: {
+      total: 0,
+      completed: 0,
+      failed: 0,
+      interrupted: 0,
+      live: 0,
+      completion_rate: null,
+      prev_completion_rate: null,
+      duration_s: NO_DIST,
+      daily: list.map((day, index) => ({ day, partial: partial(index), created: 0, completed: 0 })),
+      stuck: {
+        age_over_lifetime: 0,
+        dry_rounds_at_limit: 0,
+        rounds_exhausted: 0,
+        gate_retry_loop: 0,
+        item_stuck: 0,
+        waiting: { slot: 0, budget: 0, quota: 0, disk: 0, excluded: 0, "kill-switch": 0, attention: 0, other: 0 },
+        jobs: [],
+      },
+    },
+    autopilot: {
+      classifier: [],
+      judge: {
+        n: 0,
+        reviewed: 0,
+        latency_ms: NO_DIST,
+        input_tokens: 0,
+        cost_usd: 0,
+        error_rate: null,
+        enforced_share: null,
+        agree: null,
+      },
+      refused_actions: { total: 0, by_status: {} },
+    },
+    pressure: {
+      at_limit_share: null,
+      prev_at_limit_share: null,
+      peak_in_use: null,
+      prev_peak_in_use: null,
+      limit: null,
+      daily_p95: null,
+      daily: list.map((day, index) => ({ day, partial: partial(index), avg_in_use: null, max_in_use: null })),
+      slot_wait_share: null,
+      slot_wait_share_is_lower_bound: false,
+    },
     ...overrides,
   };
 }
@@ -1290,6 +1409,15 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       return projectId === undefined ? state.devtime : { ...state.devtime, scope: "project", project_id: projectId };
     }
     if (path.startsWith("/analytics/quota")) return state.analyticsQuota;
+    if (/^\/analytics\/pipeline(?:\?|$)/.test(path)) return state.analyticsPipeline;
+    const projectPipeline = /^\/projects\/([^/?]+)\/analytics\/pipeline(?:\?|$)/.exec(path);
+    if (projectPipeline !== null) {
+      const projectId = decodeURIComponent(projectPipeline[1]);
+      if (!state.projects.some((row) => row.project_id === projectId)) {
+        throw new ApiRefusal(404, "not_found", "no such project");
+      }
+      return { ...state.analyticsPipeline, scope: "project", project_id: projectId };
+    }
     if (path === "/analytics" || path.startsWith("/analytics?")) return state.analytics;
     const projectAnalytics = /^\/projects\/([^/?]+)\/analytics(?:\?|$)/.exec(path);
     if (projectAnalytics !== null) {
