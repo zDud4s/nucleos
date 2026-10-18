@@ -780,8 +780,14 @@ pub(super) async fn continue_paused_run(
     // depends on the refusal — the slot is HANDED OVER further down rather than competed for — but
     // the sentence outlived the mechanism, which is how a guard comes to be believed in and not
     // written.
+    //
+    // `completed_at` keeps the pause time `finalize_termination` wrote: that is when the process
+    // ended. Overwriting it with the approval time billed an unmeasured run for every hour the
+    // owner took to answer (run 900428: paused after 4 minutes, approved 30.9 hours later). The
+    // approval time is `proposals.decided_at`. `now` is only the fallback for a lost pause write.
     let superseded = sqlx::query(
-        "UPDATE runs SET status='superseded', completed_at=? WHERE id=? AND status='awaiting_approval'",
+        "UPDATE runs SET status='superseded', completed_at=COALESCE(completed_at, ?)
+         WHERE id=? AND status='awaiting_approval'",
     )
     .bind(&now)
     .bind(original_run_id)
