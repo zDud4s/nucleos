@@ -11,6 +11,7 @@ import {
 } from "../data/analytics";
 import { ErrorNote, StaleNote, StatCard } from "../ui";
 import { DetailPanel, MetricCard, QuotaSection, TopRunsSection, metrics, type MetricKey } from "./sections";
+import { DevtimeSection } from "./DevtimeSection";
 import "./analytics.css";
 
 /**
@@ -100,6 +101,8 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange }: Analytic
         open={open}
         onOpen={setOpen}
       />
+      {/* Its own query and its own failure: development time never goes down with the run analytics. */}
+      <DevtimeSection projectId={projectId} days={days} />
     </div>
   );
 }
