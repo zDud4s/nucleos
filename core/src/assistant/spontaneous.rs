@@ -276,8 +276,7 @@ async fn record_preempted(state: &crate::state::AppState, chat_id: &str, aside: 
     let prompt = spontaneous_prompt(&lines);
     // No rung to compare: the process that began this answer may be gone, and the answer is already
     // whole — there is nothing left to stop.
-    let Some((id, mode)) =
-        open_task_run(state, chat_id, &prompt, &session_id, barrier, None).await
+    let Some((id, mode)) = open_task_run(state, chat_id, &prompt, &session_id, barrier, None).await
     else {
         return;
     };
