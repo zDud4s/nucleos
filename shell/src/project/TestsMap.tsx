@@ -1,3 +1,4 @@
+import { DAEMON_NAME } from "../copy";
 import { useProjectTestsMap } from "../data/project-tests-map";
 import { CopyButton } from "../ui/CopyButton";
 import { ErrorNote } from "../ui";
@@ -20,7 +21,7 @@ export function TestsMap({ projectId }: TestsMapProps) {
 
   if (map.data === undefined) {
     return map.isError ? (
-      <ErrorNote>The núcleo did not say what this project's test map is.</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} did not say what this project's test map is.</ErrorNote>
     ) : (
       <p className="text-sm text-text-faint">Reading the test map…</p>
     );

@@ -277,7 +277,7 @@ describe("the workflows mode", () => {
    * A failure that is not a refusal was dropped: with the núcleo gone, "use here" did nothing and
    * said nothing. It is said now, in the error's own words.
    */
-  it("says so when the núcleo does not answer a change", async () => {
+  it("says so when the background service gives no reply to a change", async () => {
     const { ApiUnavailable } = await import("../data/client");
     const state = daemonState({
       projects: [project({ project_id: "nucleos", mode: "shadow" })],

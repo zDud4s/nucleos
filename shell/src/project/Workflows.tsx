@@ -1,4 +1,5 @@
 // §spec motor-de-workflows
+import { DAEMON_NAME } from "../copy";
 import { useEffect, useId, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { isApiRefusal } from "../data/client";
@@ -237,7 +238,7 @@ function Unreadable({ error, onRetry }: { error: unknown; onRetry: () => void })
   if (!isApiRefusal(error)) {
     return (
       <div className="flex flex-col items-start gap-2">
-        <ErrorNote>The núcleo did not answer about this project's workflows{said(error)}</ErrorNote>
+        <ErrorNote>The {DAEMON_NAME} gave no reply about this project's workflows{said(error)}</ErrorNote>
         <Button onClick={onRetry}>Try again</Button>
       </div>
     );
@@ -254,7 +255,7 @@ function Unreadable({ error, onRetry }: { error: unknown; onRetry: () => void })
       <div className="max-w-prose rounded-lg border border-tone-paused-border bg-tone-paused-bg p-4">
         <p className="text-sm text-text">
           This project&rsquo;s <span className="font-mono">workflows.yaml</span> does not parse, so
-          the núcleo cannot say what this project uses.
+          the {DAEMON_NAME} cannot say what this project uses.
         </p>
         <p className="mt-1 font-mono text-xs text-text-muted">{error.detail}</p>
       </div>
@@ -460,7 +461,7 @@ function InstalledRow({
       {failed === undefined ? null : isApiRefusal(failed.error) ? (
         <RefusalNote refusal={failed.error} sentences={REFUSALS} />
       ) : (
-        <ErrorNote>The núcleo did not answer, so this may not have happened{said(failed.error)}</ErrorNote>
+        <ErrorNote>The {DAEMON_NAME} gave no reply, so this may not have happened{said(failed.error)}</ErrorNote>
       )}
 
       {diffOpen ? <Diff projectId={projectId} name={row.name} /> : null}
@@ -488,13 +489,13 @@ function InstalledRow({
 
 const REFUSALS: Record<string, string> = {
   kill_switch: "the emergency stop is engaged, and this writes into the project's folder.",
-  no_project_root: "the núcleo has no folder recorded for this project.",
+  no_project_root: `the ${DAEMON_NAME} has no folder recorded for this project.`,
   no_library: "this machine has no workflow library.",
   no_such_bundle: "the library has no bundle at that version.",
   not_installed: "this project does not use that workflow.",
   already_ejected: "this project already has its own copy — the diff is the thing to look at.",
   bad_name: "that is not a usable workflow name.",
-  internal: "the núcleo hit an error of its own.",
+  internal: `the ${DAEMON_NAME} hit an error of its own.`,
 };
 
 /**
@@ -578,7 +579,7 @@ function Diff({ projectId, name }: { projectId: string; name: string }) {
     return isApiRefusal(diff.error) ? (
       <RefusalNote refusal={diff.error} sentences={REFUSALS} />
     ) : (
-      <ErrorNote>The núcleo could not compare the two copies{said(diff.error)}</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} could not compare the two copies{said(diff.error)}</ErrorNote>
     );
   }
   if (diff.data === undefined) {
@@ -647,7 +648,7 @@ function Library({
     // A refusal here was already said above when the project's own listing failed for the same
     // reason; saying it twice would be the page arguing with itself. A failure was not.
     return isApiRefusal(library.error) ? null : (
-      <ErrorNote>The núcleo did not answer about the library{said(library.error)}</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} gave no reply about the library{said(library.error)}</ErrorNote>
     );
   }
   if (library.data === undefined) {
@@ -701,7 +702,7 @@ function Library({
         isApiRefusal(install.error) ? (
           <RefusalNote refusal={install.error} sentences={REFUSALS} />
         ) : (
-          <ErrorNote>The núcleo did not answer, so nothing was installed{said(install.error)}</ErrorNote>
+          <ErrorNote>The {DAEMON_NAME} gave no reply, so nothing was installed{said(install.error)}</ErrorNote>
         )
       ) : null}
     </Section>
@@ -766,7 +767,7 @@ export function WorkflowSummary({ projectId }: { projectId: string }) {
     return (
       <p className="text-sm text-text-faint">
         {installed.isError
-          ? "The núcleo did not say which workflows this project uses."
+          ? `The ${DAEMON_NAME} did not say which workflows this project uses.`
           : "Reading this project's workflows…"}
       </p>
     );

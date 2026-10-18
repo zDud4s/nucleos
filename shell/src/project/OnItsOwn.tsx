@@ -1,3 +1,4 @@
+import { DAEMON_NAME } from "../copy";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
@@ -76,7 +77,7 @@ export function OnItsOwn({ projectId }: OnItsOwnProps) {
             <RefusalNote refusal={rules.error} />
           ) : (
             <ErrorNote>
-              the núcleo did not answer — nothing is known about this project&apos;s rules
+              the {DAEMON_NAME} gave no reply — nothing is known about this project&apos;s rules
             </ErrorNote>
           )}
         </Panel>
@@ -246,10 +247,10 @@ function RulesFileState({
       {rules.rules_file === "unreadable" && (
         <div className="pj-rules-error" role="alert">
           <p className="pj-rules-error-title">
-            The núcleo could not read this project&apos;s rules, so it is doing nothing on its own.
+            The {DAEMON_NAME} could not read this project&apos;s rules, so it is doing nothing on its own.
           </p>
           <pre className="pj-rules-error-detail">
-            <code>{rules.rules_error ?? "the núcleo reported no detail"}</code>
+            <code>{rules.rules_error ?? `the ${DAEMON_NAME} reported no detail`}</code>
           </pre>
           <p className="pj-note">
             The file is parsed strictly on purpose: an unknown key is an error rather than a silently
@@ -850,10 +851,10 @@ function JudgePanel({
         (isApiRefusal(name.error) ? (
           <RefusalNote refusal={name.error} />
         ) : (
-          <ErrorNote>the núcleo did not answer — the judge is unchanged</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} gave no reply — the judge is unchanged</ErrorNote>
         ))}
       {clear.isError && !isApiRefusal(clear.error) && (
-        <ErrorNote>the núcleo did not answer — the judge is unchanged</ErrorNote>
+        <ErrorNote>the {DAEMON_NAME} gave no reply — the judge is unchanged</ErrorNote>
       )}
     </Panel>
   );
@@ -1024,7 +1025,7 @@ function WipPanel({
 
       {draft.trim() !== "" && !valid && (
         <p className="pj-note">
-          A ceiling is a whole number, zero or more. The núcleo refuses a negative one outright — it
+          A ceiling is a whole number, zero or more. The {DAEMON_NAME} refuses a negative one outright — it
           would read like a number somebody chose and mean &ldquo;never start anything again&rdquo;.
         </p>
       )}
@@ -1035,13 +1036,13 @@ function WipPanel({
 
 function WipError({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — the ceiling is unchanged</ErrorNote>;
+    return <ErrorNote>the {DAEMON_NAME} gave no reply — the ceiling is unchanged</ErrorNote>;
   }
   return (
     <RefusalNote
       refusal={error}
       sentences={{
-        not_found: "the núcleo has no row for this project, so there is no ceiling to set on it",
+        not_found: `the ${DAEMON_NAME} has no row for this project, so there is no ceiling to set on it`,
         bad_request: "a ceiling cannot be negative",
       }}
     />
