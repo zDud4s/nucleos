@@ -242,6 +242,23 @@ class WatchTests(unittest.TestCase):
         self.assertIn("frame error: RuntimeError: boom", out[-1])
         self.assertTrue(all(W.visible_len(line) <= 80 for line in out), out)
 
+    def test_prune_primed_drops_exited_processes_and_keeps_live_ones(self) -> None:
+        class Gone:
+            def is_running(self) -> bool:
+                return False
+
+        class Raises:
+            def is_running(self) -> bool:
+                raise RuntimeError("no such process")
+
+        class Live:
+            def is_running(self) -> bool:
+                return True
+
+        primed = {1: Gone(), 2: Raises(), 3: Live()}
+        W.prune_primed(primed)
+        self.assertEqual(list(primed), [3])
+
 
 if __name__ == "__main__":
     unittest.main()

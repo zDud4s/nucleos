@@ -100,7 +100,8 @@ func waitForPort(marker string, wait time.Duration) (int, error) {
 // it through the fence's own proxy would either fail or, worse, make the proxy the thing that decides
 // whether the driver can talk to its browser.
 func DebuggerURL(port int, timeout time.Duration) (string, error) {
-	client := &http.Client{Timeout: timeout, Transport: &http.Transport{Proxy: nil}}
+	// One-shot call: keep-alives off so the connection is not left idle in a discarded transport.
+	client := &http.Client{Timeout: timeout, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}}
 	response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
 	if err != nil {
 		return "", fmt.Errorf("asking the browser for its debugger url: %w", err)

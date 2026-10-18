@@ -549,25 +549,31 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
     // Selected as two columns and added in Rust, rather than summed in SQL: the parts are what the
     // shell needs to point at a screen, and deriving the total from them is one fewer expression
     // that could go out of step with itself.
+    // The shadow-decisions term is computed ONCE per row, in a MATERIALIZED CTE, and `pending` /
+    // `open_shadow_decisions` are derived from that column. Written as a plain subquery SQLite
+    // flattens it and pastes the expression back into both places (measured with EXPLAIN QUERY
+    // PLAN: the term ran twice per row), and that term is the expensive one.
     let projects: Vec<RosterRow> = sqlx::query_as(concat!(
-        "SELECT state.project_id, state.mode, state.project_root,
-                ",
-        open_shadow_decisions_term!("state.project_id"),
-        "
-                +
-                (SELECT COUNT(*)
-                 FROM runs
-                 WHERE runs.project_id = state.project_id
-                   AND runs.status = 'awaiting_approval') AS pending,
-                ",
-        open_proposals_term!("state.project_id"),
-        " AS open_proposals,
-                ",
+        "WITH s AS MATERIALIZED (
+            SELECT state.project_id AS project_id, state.mode AS mode,
+                   state.project_root AS project_root,
+                   ",
         open_shadow_decisions_term!("state.project_id"),
         " AS open_shadow_decisions,
-                state.wip_limit AS wip_limit
-         FROM autopilot_state AS state
-         ORDER BY state.project_id"
+                   (SELECT COUNT(*)
+                    FROM runs
+                    WHERE runs.project_id = state.project_id
+                      AND runs.status = 'awaiting_approval') AS awaiting,
+                   ",
+        open_proposals_term!("state.project_id"),
+        " AS open_proposals,
+                   state.wip_limit AS wip_limit
+            FROM autopilot_state AS state)
+         SELECT project_id, mode, project_root,
+                open_shadow_decisions + awaiting AS pending,
+                open_proposals, open_shadow_decisions, wip_limit
+         FROM s
+         ORDER BY project_id"
     ))
     .fetch_all(pool)
     .await?;
@@ -843,12 +849,28 @@ fn matcher_covers_governed_tools(matcher: Option<&serde_json::Value>) -> bool {
 /// is intact until its `.claude/settings.json` happens to be rewritten. Do not "complete" this
 /// check without re-reading this paragraph first.
 pub fn classifier_hook_is_wired(dir: &Path) -> bool {
-    let Ok(settings) = std::fs::read_to_string(dir.join(".claude/settings.json")) else {
-        return false;
+    // Claude Code merges the project's `.claude/settings.json` with its project-local
+    // `.claude/settings.local.json`, so the answer comes from both: the wiring may live in either,
+    // and `disableAllHooks` in either one switches every hook off. A missing or unparsable file
+    // contributes nothing (it neither wires the hook nor disables it).
+    let read = |name: &str| -> Option<serde_json::Value> {
+        let text = std::fs::read_to_string(dir.join(".claude").join(name)).ok()?;
+        serde_json::from_str(&text).ok()
     };
-    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&settings) else {
+    let files: Vec<serde_json::Value> = ["settings.json", "settings.local.json"]
+        .into_iter()
+        .filter_map(read)
+        .collect();
+
+    // Hooks switched off wholesale classify nothing, whatever is registered.
+    if files.iter().any(|settings| {
+        settings
+            .get("disableAllHooks")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    }) {
         return false;
-    };
+    }
     // "Some PreToolUse hook exists" was never the property worth checking: a formatter satisfied it
     // just as well as ours, and activation then let a project act autonomously with nothing
     // classifying its actions. What has to be true is that OUR hook script is the one wired up,
@@ -858,33 +880,27 @@ pub fn classifier_hook_is_wired(dir: &Path) -> bool {
     // Matching on the script's path rather than the whole command line, because the invocation
     // around it is the user's business (`python`, `py -3`, a venv, extra flags) and only the
     // script identifies the hook as this daemon's.
-    // Hooks switched off wholesale classify nothing, whatever is registered.
-    if settings
-        .get("disableAllHooks")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
-        return false;
-    }
-    let registered = settings
-        .get("hooks")
-        .and_then(|hooks| hooks.get("PreToolUse"))
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                matcher_covers_governed_tools(entry.get("matcher"))
-                    && entry
-                        .get("hooks")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|inner| {
-                            inner.iter().any(|hook| {
-                                hook.get("command")
-                                    .and_then(serde_json::Value::as_str)
-                                    .is_some_and(|command| command.contains(HOOK_SCRIPT))
+    let registered = files.iter().any(|settings| {
+        settings
+            .get("hooks")
+            .and_then(|hooks| hooks.get("PreToolUse"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    matcher_covers_governed_tools(entry.get("matcher"))
+                        && entry
+                            .get("hooks")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|inner| {
+                                inner.iter().any(|hook| {
+                                    hook.get("command")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_some_and(|command| command.contains(HOOK_SCRIPT))
+                                })
                             })
-                        })
+                })
             })
-        });
+    });
 
     registered && dir.join(HOOK_SCRIPT).is_file()
 }
@@ -3149,6 +3165,34 @@ pub mod tests {
 
         let root = TempDir::new().unwrap();
         wire_with(&root, Some("*"), r#""disableAllHooks":false,"#);
+        assert!(classifier_hook_is_wired(root.path()));
+    }
+
+    #[test]
+    fn settings_local_json_is_merged_into_the_answer() {
+        let local = r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""}]}]}}"#;
+
+        // Wiring that lives only in the project-local file counts.
+        let root = TempDir::new().unwrap();
+        let claude = root.path().join(".claude");
+        fs::create_dir_all(claude.join("hooks")).unwrap();
+        fs::write(claude.join("hooks/ask_daemon.py"), "# hook").unwrap();
+        fs::write(claude.join("settings.local.json"), local).unwrap();
+        assert!(classifier_hook_is_wired(root.path()));
+
+        // `disableAllHooks` in the local file switches off wiring from settings.json.
+        let root = TempDir::new().unwrap();
+        wire_with(&root, Some("*"), "");
+        assert!(classifier_hook_is_wired(root.path()));
+        fs::write(
+            root.path().join(".claude/settings.local.json"),
+            r#"{"disableAllHooks":true}"#,
+        )
+        .unwrap();
+        assert!(!classifier_hook_is_wired(root.path()));
+
+        // An unparsable local file neither wires nor disables.
+        fs::write(root.path().join(".claude/settings.local.json"), "{not json").unwrap();
         assert!(classifier_hook_is_wired(root.path()));
     }
 }

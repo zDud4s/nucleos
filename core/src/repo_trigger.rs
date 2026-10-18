@@ -63,16 +63,63 @@ fn git_bin() -> String {
     std::env::var("NUCLEOS_GIT_BIN").unwrap_or_else(|_| "git".into())
 }
 
-pub async fn current_branch_sha(repo: &Path, git_ref: &str, fetch: bool) -> Option<String> {
-    if fetch {
-        // Best-effort: an offline / remoteless fetch failure must not block reading the local ref.
+/// True when the repo has at least one remote. A repo without one has nothing to fetch, so the
+/// poller skips the `git fetch` spawn entirely. Unknown (git failed) counts as "has one": the
+/// best-effort fetch is then attempted as before.
+async fn repo_has_remote(repo: &Path) -> bool {
+    match tokio::process::Command::new(git_bin())
+        .arg("-C")
+        .arg(repo)
+        .arg("remote")
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => !output.stdout.iter().all(u8::is_ascii_whitespace),
+        _ => true,
+    }
+}
+
+/// Remembers which repo roots were already fetched during one poll tick, so a project with N
+/// triggers (or several projects on one root) pays for one network fetch, not N.
+#[derive(Default)]
+struct TickFetches {
+    seen: std::collections::HashSet<std::path::PathBuf>,
+}
+
+impl TickFetches {
+    /// True the first time `root` is asked about in this tick, false afterwards.
+    fn first_visit(&mut self, root: &Path) -> bool {
+        self.seen.insert(root.to_path_buf())
+    }
+
+    /// Fetch `root` at most once per tick, and not at all when it has no remote.
+    async fn fetch_once(&mut self, root: &Path) {
+        if !self.first_visit(root) || !repo_has_remote(root).await {
+            return;
+        }
+        // Best-effort: an offline fetch failure must not block reading the local ref.
         let _ = tokio::process::Command::new(git_bin())
             .arg("-C")
-            .arg(repo)
+            .arg(root)
             .arg("fetch")
             .arg("--quiet")
             .output()
             .await;
+    }
+}
+
+pub async fn current_branch_sha(repo: &Path, git_ref: &str, fetch: bool) -> Option<String> {
+    if fetch {
+        // Best-effort: an offline / remoteless fetch failure must not block reading the local ref.
+        if repo_has_remote(repo).await {
+            let _ = tokio::process::Command::new(git_bin())
+                .arg("-C")
+                .arg(repo)
+                .arg("fetch")
+                .arg("--quiet")
+                .output()
+                .await;
+        }
     }
     // A branch name comes from the project's `autopilot.yaml`, so it is configuration rather than a
     // constant,
@@ -280,6 +327,7 @@ pub async fn run_repo_poller(state: crate::state::AppState) {
 /// arm first-seen triggers without firing, and fire a run for any trigger whose branch SHA changed —
 /// gated by the same global/scoped kill switches and budget as the scheduler.
 pub async fn poll_tick(state: &crate::state::AppState, now: chrono::DateTime<chrono::Utc>) {
+    let mut fetches = TickFetches::default();
     let projects = match crate::governance::autopilot::autopilot_projects(&state.pool).await {
         Ok(projects) => projects,
         Err(error) => {
@@ -324,10 +372,12 @@ pub async fn poll_tick(state: &crate::state::AppState, now: chrono::DateTime<chr
             .await
             .unwrap_or_default();
 
+        // One fetch per repo root per tick, then a local rev-parse per watched branch.
+        fetches.fetch_once(Path::new(&project_root)).await;
         let mut current_shas = HashMap::new();
         for trigger in &triggers {
             if let Some(sha) =
-                current_branch_sha(Path::new(&project_root), &trigger.branch, true).await
+                current_branch_sha(Path::new(&project_root), &trigger.branch, false).await
             {
                 current_shas.insert(trigger.name.clone(), sha);
             }
@@ -554,6 +604,25 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_root_is_fetched_once_per_tick() {
+        let mut fetches = TickFetches::default();
+        assert!(fetches.first_visit(Path::new("/repo/a")));
+        assert!(!fetches.first_visit(Path::new("/repo/a")));
+        assert!(fetches.first_visit(Path::new("/repo/b")));
+    }
+
+    #[tokio::test]
+    async fn a_repo_without_a_remote_is_detected() {
+        let repo = init_repo();
+        assert!(!repo_has_remote(repo.path()).await);
+        assert!(git_ok(
+            repo.path(),
+            &["remote", "add", "origin", "https://example.invalid/x.git"]
+        ));
+        assert!(repo_has_remote(repo.path()).await);
     }
 
     fn ts(value: &str) -> chrono::DateTime<chrono::Utc> {

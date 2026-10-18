@@ -224,6 +224,20 @@ pub fn spec_card(slug: &str, source: &str) -> Spec {
     }
 }
 
+/// The most a file read for the map may weigh. A source or spec is text a person wrote; anything
+/// past this is not one, and reading it whole would put it all in memory for nothing.
+const MAX_READ_BYTES: u64 = 1024 * 1024;
+
+/// Reads a file for the map, or nothing: a missing, oversized or non-regular file (a symlink
+/// included, since it could point outside the project) is treated exactly like a missing one.
+fn read_capped(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_READ_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// Every document of a project, read once.
 ///
 /// Reads through [`crate::map::intent::specs_in`] rather than walking folders of its own, because
@@ -239,7 +253,7 @@ pub fn catalogue(root: &Path) -> Vec<Spec> {
     crate::map::intent::specs_in(root)
         .into_iter()
         .filter_map(|relative| {
-            let source = std::fs::read_to_string(root.join(&relative)).ok()?;
+            let source = read_capped(&root.join(&relative))?;
             Some(spec_card(
                 &crate::map::intent::spec_slug(&relative),
                 &source,
@@ -1463,7 +1477,7 @@ async fn put(
     around: &Neighbourhood,
     into: &mut Sweep,
 ) {
-    let source = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+    let source = read_capped(&root.join(path)).unwrap_or_default();
     let about = match question(path, &source, specs) {
         Ok(about) => about,
         Err(why) => {
@@ -1712,6 +1726,26 @@ mod tests {
         BTreeMap::new()
     }
     use super::*;
+
+    #[test]
+    fn a_file_over_the_cap_or_behind_a_link_reads_as_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let small = dir.path().join("small.rs");
+        std::fs::write(&small, "fn a() {}").unwrap();
+        assert_eq!(read_capped(&small).as_deref(), Some("fn a() {}"));
+
+        let big = dir.path().join("big.rs");
+        std::fs::write(&big, vec![b'a'; MAX_READ_BYTES as usize + 1]).unwrap();
+        assert_eq!(read_capped(&big), None);
+        assert_eq!(read_capped(&dir.path().join("absent.rs")), None);
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.rs");
+            std::os::unix::fs::symlink(&small, &link).unwrap();
+            assert_eq!(read_capped(&link), None);
+        }
+    }
 
     /// Two real documents of this repository, because the one rejection left in this module is a
     /// check against documents that actually exist.

@@ -125,3 +125,106 @@ func TestReleaseDoesNotRetireABrowserAnotherOpenIsUsing(t *testing.T) {
 		t.Fatalf("browser shut down %d time(s) although the second session is open", got)
 	}
 }
+
+// blockedInstance holds every Open until released and counts the sessions it was told to close.
+type blockedInstance struct {
+	*fakeInstance
+	mu      sync.Mutex
+	closes  int
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (b *blockedInstance) Open(ctx context.Context, req browser.OpenRequest) (browser.Session, error) {
+	close(b.entered)
+	<-b.proceed
+	return b.fakeInstance.Open(ctx, req)
+}
+
+func (b *blockedInstance) Close(ctx context.Context, id browser.SessionID) error {
+	b.mu.Lock()
+	b.closes++
+	b.mu.Unlock()
+	return b.fakeInstance.Close(ctx, id)
+}
+
+type blockedLauncher struct {
+	*fakeLauncher
+	instance *blockedInstance
+}
+
+func (l *blockedLauncher) Launch(ctx context.Context, dir string, policy fence.Policy) (Instance, error) {
+	inner, err := l.fakeLauncher.Launch(ctx, dir, policy)
+	if err != nil {
+		return nil, err
+	}
+	l.instance = &blockedInstance{
+		fakeInstance: inner.(*fakeInstance),
+		entered:      make(chan struct{}),
+		proceed:      make(chan struct{}),
+	}
+	return l.instance, nil
+}
+
+// TestForgetWhileOpeningWins. A Forget that lands while an Open on the profile is still navigating
+// must win: the open, once released, closes what it started, reports ErrForgotten and registers
+// nothing.
+func TestForgetWhileOpeningWins(t *testing.T) {
+	launcher := &blockedLauncher{fakeLauncher: &fakeLauncher{}}
+	pool, _ := testPool(t, launcher.fakeLauncher, 4)
+	pool.launcher = launcher
+
+	placement := project("acme", "https://jira.example.org")
+	opened := make(chan error, 1)
+	go func() {
+		_, err := pool.Open(context.Background(), browser.OpenRequest{
+			URL:       "https://jira.example.org/",
+			Placement: placement,
+		})
+		opened <- err
+	}()
+	blocked := func() *blockedInstance {
+		deadline := time.After(5 * time.Second)
+		for {
+			pool.mu.Lock()
+			entry := pool.running[placement.Profile]
+			pool.mu.Unlock()
+			if entry != nil {
+				<-entry.ready
+				if inst, ok := entry.driver.(*blockedInstance); ok {
+					return inst
+				}
+			}
+			select {
+			case <-deadline:
+				t.Fatal("the open never produced a browser")
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}()
+	select {
+	case <-blocked.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the open never reached the driver")
+	}
+
+	if _, err := pool.Forget(context.Background(), placement.Profile); err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+	close(blocked.proceed)
+
+	if err := <-opened; !errors.Is(err, ErrForgotten) {
+		t.Fatalf("open after a forget = %v, want ErrForgotten", err)
+	}
+	blocked.mu.Lock()
+	closes := blocked.closes
+	blocked.mu.Unlock()
+	if closes != 1 {
+		t.Fatalf("the forgotten open closed %d session(s), want 1", closes)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if len(pool.running) != 0 || len(pool.sessions) != 0 || pool.pending != 0 {
+		t.Fatalf("state left behind: running=%d sessions=%d pending=%d", len(pool.running), len(pool.sessions), pool.pending)
+	}
+}
