@@ -1056,6 +1056,10 @@ impl CommandRunner for RoutedRunner {
         self.inner.authored_prompt(request)
     }
 
+    fn honours_max_budget(&self) -> bool {
+        self.inner.honours_max_budget()
+    }
+
     fn router(&self) -> Option<Arc<Router>> {
         Some(Arc::clone(&self.router))
     }

@@ -164,15 +164,22 @@ pub(super) async fn append_run_events(pool: &sqlx::SqlitePool, run_id: i64, stdo
 
         // Observability must stay best-effort: a missing or temporarily unavailable history table
         // cannot turn successfully completed work into a failed run.
+        //
+        // A seq the run already has is skipped, not appended again: a cancel that lands while the
+        // gate runs finds `stdout` still NULL and records the cut stream, after this body already
+        // appended the same events — every row of the trajectory twice, before this guard.
         let _ = sqlx::query(
             "INSERT INTO run_events (run_id, seq, kind, payload, created_at)
-             VALUES (?, ?, ?, ?, ?)",
+             SELECT ?, ?, ?, ?, ?
+             WHERE NOT EXISTS (SELECT 1 FROM run_events WHERE run_id = ? AND seq = ?)",
         )
         .bind(run_id)
         .bind(seq as i64)
         .bind(kind)
         .bind(payload)
         .bind(&created_at)
+        .bind(run_id)
+        .bind(seq as i64)
         .execute(pool)
         .await;
     }

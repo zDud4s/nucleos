@@ -104,20 +104,7 @@ async fn ceiling_reached(
         return Some(("stopped", reason));
     }
 
-    // `Option<f64>` spelled out, and the two `flatten`s are not noise: the outer one is "is there a
-    // team row", the inner is "did that row name a ceiling". Decoding straight into `f64` read a
-    // NULL as 0.00, so a team with NO ceiling was stopped before its first round with the message
-    // "the team's ceiling of $0.00 is spent" — the whole pillar dead on arrival for every team the
-    // owner did not put a number on, which is the default.
-    let ceiling: Option<f64> =
-        sqlx::query_scalar::<_, Option<f64>>("SELECT budget_usd FROM teams WHERE id = ?")
-            .bind(&run.team_id)
-            .fetch_optional(&state.pool)
-            .await
-            .ok()
-            .flatten()
-            .flatten();
-    if let Some(ceiling) = ceiling {
+    if let Some(ceiling) = team_ceiling(&state.pool, &run.team_id).await {
         let spent = spend_of(&state.pool, &run.id).await;
         if spent >= ceiling {
             return Some((
@@ -135,32 +122,92 @@ async fn ceiling_reached(
     // because the root allowed it, and a chain does not get to spend without end because each link
     // is cheap. For a run a person asked for the two are the same question, since it is its own
     // root and its own tree.
-    if run.root_id != run.id {
-        let root_ceiling: Option<f64> = sqlx::query_scalar::<_, Option<f64>>(
-            "SELECT teams.budget_usd FROM team_runs
-               JOIN teams ON teams.id = team_runs.team_id
-              WHERE team_runs.id = ?",
-        )
-        .bind(&run.root_id)
-        .fetch_optional(&state.pool)
-        .await
-        .ok()
-        .flatten()
-        .flatten();
-        if let Some(root_ceiling) = root_ceiling {
-            let spent = spend_of_tree(&state.pool, &run.root_id).await;
-            if spent >= root_ceiling {
-                return Some((
-                    "stopped",
-                    format!(
-                        "this chain has spent ${spent:.2} of the ${root_ceiling:.2} its first run \
-                         was given"
-                    ),
-                ));
-            }
+    if run.root_id != run.id
+        && let Some(root_ceiling) = tree_ceiling(&state.pool, &run.root_id).await
+    {
+        let spent = spend_of_tree(&state.pool, &run.root_id).await;
+        if spent >= root_ceiling {
+            return Some((
+                "stopped",
+                format!(
+                    "this chain has spent ${spent:.2} of the ${root_ceiling:.2} its first run \
+                     was given"
+                ),
+            ));
         }
     }
     None
+}
+
+/// The ceiling a team names, or `None` when it names none (or there is no such team).
+///
+/// `Option<f64>` spelled out, and the two `flatten`s are not noise: the outer one is "is there a
+/// team row", the inner is "did that row name a ceiling". Decoding straight into `f64` read a NULL
+/// as 0.00, so a team with NO ceiling was stopped before its first round with the message "the
+/// team's ceiling of $0.00 is spent" — the whole pillar dead on arrival for every team the owner
+/// did not put a number on, which is the default.
+async fn team_ceiling(pool: &sqlx::SqlitePool, team_id: &str) -> Option<f64> {
+    sqlx::query_scalar::<_, Option<f64>>("SELECT budget_usd FROM teams WHERE id = ?")
+        .bind(team_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+}
+
+/// The ceiling the team of a chain's FIRST run names: the one the whole tree is held to.
+async fn tree_ceiling(pool: &sqlx::SqlitePool, root_id: &str) -> Option<f64> {
+    sqlx::query_scalar::<_, Option<f64>>(
+        "SELECT teams.budget_usd FROM team_runs
+           JOIN teams ON teams.id = team_runs.team_id
+          WHERE team_runs.id = ?",
+    )
+    .bind(root_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+}
+
+/// The smallest ceiling `--max-budget-usd` is handed. The CLI reads `0` as "no limit", so a seat
+/// launched with nothing left must be given a cent rather than an unbounded run.
+pub(super) const MIN_SEAT_BUDGET_USD: f64 = 0.01;
+
+/// PURE: what one seat may spend, from the `(ceiling, spent)` of the run and of its tree.
+///
+/// The tighter of the two remainders, never below `MIN_SEAT_BUDGET_USD`; `None` when neither names
+/// a ceiling. The same two questions `ceiling_reached` asks between nodes, asked of the node
+/// itself: between nodes the run stops once a ceiling is spent, but a node already launched would
+/// otherwise spend whatever it likes until it ends.
+pub(super) fn seat_budget(run: Option<(f64, f64)>, tree: Option<(f64, f64)>) -> Option<f64> {
+    [run, tree]
+        .into_iter()
+        .flatten()
+        .map(|(ceiling, spent)| ceiling - spent)
+        .reduce(f64::min)
+        .map(|left| left.max(MIN_SEAT_BUDGET_USD))
+}
+
+/// What a seat of `run` may spend now: `seat_budget` over this run's ceiling and its tree's.
+///
+/// The tree's only for a run another run started, exactly as `ceiling_reached` does — for a run a
+/// person asked for, the two are the same question. Nodes in flight report no cost until they end,
+/// so seats launched side by side are each told the whole remainder; the between-node check is
+/// still what stops the run.
+pub(super) async fn seat_budget_of(state: &AppState, run: &TeamRun) -> Option<f64> {
+    let mut own = None;
+    if let Some(ceiling) = team_ceiling(&state.pool, &run.team_id).await {
+        own = Some((ceiling, spend_of(&state.pool, &run.id).await));
+    }
+    let mut tree = None;
+    if run.root_id != run.id
+        && let Some(ceiling) = tree_ceiling(&state.pool, &run.root_id).await
+    {
+        tree = Some((ceiling, spend_of_tree(&state.pool, &run.root_id).await));
+    }
+    seat_budget(own, tree)
 }
 
 /// What a whole chain has cost, every run in it and every director node of each.
@@ -273,4 +320,40 @@ async fn advance_round(state: &AppState, run: &TeamRun) -> Result<(), sqlx::Erro
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod seat_budget_tests {
+    use super::{MIN_SEAT_BUDGET_USD, seat_budget};
+
+    #[test]
+    fn no_ceiling_anywhere_caps_nothing() {
+        assert_eq!(seat_budget(None, None), None);
+    }
+
+    #[test]
+    fn a_seat_gets_the_tighter_of_the_two_remainders() {
+        assert_eq!(seat_budget(Some((5.0, 1.0)), None), Some(4.0));
+        assert_eq!(seat_budget(None, Some((10.0, 7.5))), Some(2.5));
+        assert_eq!(seat_budget(Some((5.0, 1.0)), Some((10.0, 7.5))), Some(2.5));
+        assert_eq!(seat_budget(Some((2.0, 1.5)), Some((10.0, 1.0))), Some(0.5));
+    }
+
+    /// The CLI reads `--max-budget-usd 0` as no limit at all, so a spent ceiling hands a seat a
+    /// cent and never zero or a negative number.
+    #[test]
+    fn a_spent_ceiling_still_caps_the_seat_at_a_cent() {
+        assert_eq!(
+            seat_budget(Some((1.0, 1.0)), None),
+            Some(MIN_SEAT_BUDGET_USD)
+        );
+        assert_eq!(
+            seat_budget(Some((1.0, 3.0)), None),
+            Some(MIN_SEAT_BUDGET_USD)
+        );
+        assert_eq!(
+            seat_budget(None, Some((0.0, 0.0))),
+            Some(MIN_SEAT_BUDGET_USD)
+        );
+    }
 }

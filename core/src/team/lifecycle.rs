@@ -215,17 +215,7 @@ pub async fn start_with(
 /// Terminates every subprocess a team run still has running, and sweeps the rows that no abort
 /// handle covers. Shared by `cancel` and by `ingest::finish`, so no ending leaves a run spending.
 pub(super) async fn terminate_in_flight(state: &AppState, id: &str) -> Result<(), sqlx::Error> {
-    let in_flight: Vec<i64> =
-        sqlx::query_scalar("SELECT id FROM runs WHERE team_run_id = ? AND status = 'running'")
-            .bind(id)
-            .fetch_all(&state.pool)
-            .await?;
-    for run_id in in_flight {
-        // `finalize_termination` rather than the `/runs/{id}/cancel` handler beside it: that one is
-        // an axum extractor signature, and reaching it would mean a loopback HTTP call to a
-        // function already in scope. This is the same body that handler runs.
-        crate::execution::runs::finalize_termination(state, run_id, "cancelled").await;
-    }
+    kill_in_flight(state, id).await?;
 
     // And then the sweep, which is not belt-and-braces but a second case: `finalize_termination`
     // writes a status only for a run it holds an ABORT HANDLE for, and there is a window between
@@ -244,13 +234,36 @@ pub(super) async fn terminate_in_flight(state: &AppState, id: &str) -> Result<()
     Ok(())
 }
 
+/// Kills every node of a team run that holds an abort handle, and writes nothing else.
+async fn kill_in_flight(state: &AppState, id: &str) -> Result<(), sqlx::Error> {
+    let in_flight: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM runs WHERE team_run_id = ? AND status = 'running'")
+            .bind(id)
+            .fetch_all(&state.pool)
+            .await?;
+    for run_id in in_flight {
+        // `finalize_termination` rather than the `/runs/{id}/cancel` handler beside it: that one is
+        // an axum extractor signature, and reaching it would mean a loopback HTTP call to a
+        // function already in scope. This is the same body that handler runs.
+        crate::execution::runs::finalize_termination(state, run_id, "cancelled").await;
+    }
+    Ok(())
+}
+
 /// Cancels a run and everything it has in flight.
 ///
 /// The runs are terminated BEFORE the row is marked, so there is no window in which the run reads
 /// terminal while its subprocesses are still spending. A cancelled run that left an orphan is the
 /// one failure `core/AGENTS.md` §*Cancellation safety* names.
+///
+/// The first pass only kills, and the sweep waits for the second, after the mark. A tick that read
+/// this run as live before the cancel can still be launching a node: one it registered before the
+/// mark is `running` with a handle, which the second pass kills; one it registers after the mark is
+/// stopped by the launch itself (`launch::stop_if_the_run_ended`). Sweeping in the first pass would
+/// break that: it can write `cancelled` on a node whose handle is registered a moment later, and
+/// the second pass looks only for `running` rows, so that node would run on with nobody to stop it.
 pub async fn cancel(state: &AppState, id: &str) -> Result<(), TeamError> {
-    terminate_in_flight(state, id).await?;
+    kill_in_flight(state, id).await?;
 
     let now = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
@@ -264,6 +277,7 @@ pub async fn cancel(state: &AppState, id: &str) -> Result<(), TeamError> {
     .bind(id)
     .execute(&state.pool)
     .await?;
+    terminate_in_flight(state, id).await?;
     if result.rows_affected() == 0 {
         return Err(TeamError::NotFound);
     }
