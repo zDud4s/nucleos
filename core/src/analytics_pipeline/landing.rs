@@ -1,16 +1,18 @@
 //! Metric 1, the landing queue (spec analytics-pipeline §6.1 "1. Fila", §6.2), over
-//! `vcs_requests` windowed by `created_at`. Metrics 2 and 3 join this block in the follow-up
-//! (`conflicts`, `owner_blocked`, `null` until then).
+//! `vcs_requests` windowed by `created_at`; metric 2, conflicts, over the rows that ended in the
+//! window; metric 3, what waits for a person now.
 //!
-//! `failure_reason` is free text — paths, command output — and is read here only to choose a
-//! bucket. It never leaves this module: the JSON carries buckets and counts.
+//! `failure_reason` and `discarded` are free text — paths, command output, the files a resolution
+//! dropped — and are read here only to choose a bucket. They never leave this module: the JSON
+//! carries buckets and counts.
 
 use serde::Serialize;
 use sqlx::SqlitePool;
 
 use super::stats::{self, Dist};
 use crate::analytics::Window;
-use crate::execution::vcs::MERGE_KIND;
+use crate::execution::vcs::{MERGE_KIND, OWNER_DECISION_SQL, WANTS_A_PERSON_SQL};
+use crate::resolver::DISCARDED_UNKNOWN;
 
 /// Both windows in one read: `[previous.from, window.to)`. `unexecutable` is the structural marker
 /// `Outcome::Unexecutable` writes (migration 0208); the 8 KiB `output_tail` is never loaded, and a
@@ -20,6 +22,27 @@ pub(crate) const LANDING_ROWS_SQL: &str = "SELECT status, op, origin, created_at
    FROM vcs_requests
   WHERE created_at >= ?1 AND created_at < ?2 AND (?3 IS NULL OR project_id = ?3)
   ORDER BY id";
+
+/// Metric 2's read, windowed by when a row stopped mattering (spec §6.1, 2): `settled_at` when the
+/// person it waited for was let off, else `finished_at`. A row with neither is still open and is
+/// not in it. Current window only: conflicts carry no previous figure.
+pub(crate) const LANDING_SETTLED_SQL: &str = "SELECT status, op, origin, created_at, started_at,
+        finished_at, unexecutable, failure_reason, settled_reason, discarded
+   FROM vcs_requests
+  WHERE COALESCE(settled_at, finished_at) >= ?1 AND COALESCE(settled_at, finished_at) < ?2
+    AND (?3 IS NULL OR project_id = ?3)
+  ORDER BY id";
+
+/// Metric 3's read (spec §6.1, 3): the ticket module's own predicates for "wants a person",
+/// interpolated and never copied, plus the merges a person has yet to approve. No window: it is
+/// the queue now.
+pub(crate) fn owner_blocked_sql() -> String {
+    format!(
+        "SELECT created_at FROM vcs_requests
+          WHERE (({WANTS_A_PERSON_SQL}) OR {OWNER_DECISION_SQL} OR status = 'awaiting_approval')
+            AND (?1 IS NULL OR project_id = ?1)"
+    )
+}
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct Row {
@@ -31,6 +54,11 @@ pub(crate) struct Row {
     pub finished_at: Option<String>,
     pub unexecutable: bool,
     failure_reason: Option<String>,
+    /// Only `LANDING_SETTLED_SQL` selects these two.
+    #[sqlx(default)]
+    settled_reason: Option<String>,
+    #[sqlx(default)]
+    discarded: Option<String>,
 }
 
 pub(crate) async fn rows(
@@ -132,10 +160,40 @@ pub struct Landing {
     pub prev_bad_share: Option<f64>,
     pub failure_buckets: FailureBuckets,
     pub daily: Vec<LandingDay>,
-    /// Metric 2 (follow-up). `null` until then.
-    pub conflicts: Option<serde_json::Value>,
-    /// Metric 3 (follow-up). `null` until then.
-    pub owner_blocked: Option<serde_json::Value>,
+    /// Filled by `read`, from reads of their own.
+    pub conflicts: Option<Conflicts>,
+    pub owner_blocked: Option<OwnerBlocked>,
+}
+
+/// What published resolutions left behind (`vcs_requests.discarded`, migration 0083).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WorkLost {
+    /// Worked out, and every line the incoming branch added was published.
+    pub nothing: i64,
+    /// Worked out, and something is missing. A row whose loss could not be worked out is neither.
+    pub lost: i64,
+}
+
+/// Metric 2 over the rows that ended in the window.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Conflicts {
+    /// Rows in the conflict bucket of §6.2 (escalated, or failed on git's CONFLICT).
+    pub count: i64,
+    /// `count` over the rows that ended in the window.
+    pub rate: Option<f64>,
+    /// Conflicts that stopped wanting a person without one: a resolution landed them
+    /// (`resolved`) or their source reached the target (`merged`).
+    pub auto_resolved: i64,
+    pub work_lost: WorkLost,
+}
+
+/// Metric 3: requests waiting for a person now, aged from `created_at` (no column says when a
+/// row entered its state).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OwnerBlocked {
+    pub count: i64,
+    pub oldest_age_s: Option<i64>,
+    pub median_age_s: Option<i64>,
 }
 
 fn in_window(row: &Row, window: Window) -> bool {
@@ -247,16 +305,79 @@ pub(crate) fn landing_block(rows: &[Row], window: Window) -> Landing {
     }
 }
 
+/// Settlement reasons that mean the conflict went away by itself (`vcs::tickets`).
+const AUTO_SETTLED: [&str; 2] = ["resolved", "merged"];
+
+/// PURE: metric 2 from the rows that ended in the window.
+pub(crate) fn conflicts_block(rows: &[Row]) -> Conflicts {
+    let conflicts: Vec<&Row> = rows
+        .iter()
+        .filter(|row| bucket(row) == Some(Bucket::Conflict))
+        .collect();
+    let auto_resolved = conflicts
+        .iter()
+        .filter(|row| {
+            row.settled_reason
+                .as_deref()
+                .is_some_and(|reason| AUTO_SETTLED.contains(&reason))
+        })
+        .count() as i64;
+    let mut work_lost = WorkLost::default();
+    for discarded in rows.iter().filter_map(|row| row.discarded.as_deref()) {
+        if discarded == "nothing" {
+            work_lost.nothing += 1;
+        } else if !discarded.starts_with(DISCARDED_UNKNOWN) {
+            work_lost.lost += 1;
+        }
+    }
+    Conflicts {
+        count: conflicts.len() as i64,
+        rate: stats::ratio(conflicts.len() as i64, rows.len() as i64),
+        auto_resolved,
+        work_lost,
+    }
+}
+
+/// PURE: metric 3 from the waiting rows' `created_at`. A stamp that does not parse is counted and
+/// not aged.
+pub(crate) fn owner_blocked_block(
+    created: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> OwnerBlocked {
+    let ages: Vec<i64> = created
+        .iter()
+        .filter_map(|at| stats::parse_at(at.as_str()))
+        .map(|at| (now - at).num_seconds().max(0))
+        .collect();
+    let oldest_age_s = ages.iter().copied().max();
+    OwnerBlocked {
+        count: created.len() as i64,
+        oldest_age_s,
+        median_age_s: stats::dist(ages).p50,
+    }
+}
+
 pub(crate) async fn read(
     pool: &SqlitePool,
     project: Option<&str>,
     window: Window,
-    // Unused since owner decision 1 (unexecutable is a column, no retention cut-off to compute);
-    // kept so every block's `read` has the same shape for Task 3.3.
-    _now: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> sqlx::Result<Landing> {
     let rows = rows(pool, project, window).await?;
-    Ok(landing_block(&rows, window))
+    let mut landing = landing_block(&rows, window);
+    let ended: Vec<Row> = sqlx::query_as(LANDING_SETTLED_SQL)
+        .bind(window.from_bound())
+        .bind(window.to_bound())
+        .bind(project)
+        .fetch_all(pool)
+        .await?;
+    landing.conflicts = Some(conflicts_block(&ended));
+    let waiting: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(owner_blocked_sql()))
+        .bind(project)
+        .fetch_all(pool)
+        .await?;
+    landing.owner_blocked = Some(owner_blocked_block(&waiting, now));
+    Ok(landing)
 }
 
 #[cfg(test)]
@@ -540,5 +661,143 @@ pub(crate) mod tests {
         request(&pool, leaky).await;
         let json = serde_json::to_string(&block_of(&pool).await).unwrap();
         assert!(!json.contains("secret") && !json.contains(".ssh"), "{json}");
+    }
+
+    /// What `vcs::settle` writes when a row stops wanting a person.
+    async fn settle(pool: &SqlitePool, id: i64, at: &str, reason: &str) {
+        sqlx::query("UPDATE vcs_requests SET settled_at = ?, settled_reason = ? WHERE id = ?")
+            .bind(at)
+            .bind(reason)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// What the resolver writes once it has worked out what a published resolution dropped.
+    async fn discard(pool: &SqlitePool, id: i64, what: &str) {
+        sqlx::query("UPDATE vcs_requests SET from_resolution = 1, discarded = ? WHERE id = ?")
+            .bind(what)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Spec §6.1, 2: a conflict is an escalation or a failure on git's CONFLICT; it resolved
+    /// itself when settled as `resolved` or `merged`; work lost splits `nothing` from a list of
+    /// what is missing. The window is `settled_at`, else `finished_at`.
+    #[tokio::test]
+    async fn conflicts_count_escalated_and_conflict_failures_auto_resolved_and_work_lost() {
+        let pool = crate::testdb::fresh_pool().await;
+        let long_ago = Req {
+            created: "2026-10-01T10:00:00+00:00",
+            started: Some("2026-10-01T10:00:12+00:00"),
+            finished: Some("2026-10-01T10:00:53+00:00"),
+            ..ended("escalated", "conflict")
+        };
+        let today = "2026-10-17T11:00:00+00:00";
+        // Finished before the window, settled inside it: in.
+        let id = request(&pool, long_ago.clone()).await;
+        settle(&pool, id, "2026-10-16T10:00:00+00:00", "resolved").await;
+        let conflict_text = "CONFLICT (content): Merge conflict in a.rs";
+        request(&pool, ended("failed", conflict_text)).await;
+        let id = request(&pool, ended("escalated", "x")).await;
+        settle(&pool, id, today, "merged").await;
+        let id = request(&pool, ended("escalated", "x")).await;
+        settle(&pool, id, today, "dismissed").await;
+        // Settled by itself, but blocked is not a conflict.
+        let id = request(&pool, ended("blocked", "x")).await;
+        settle(&pool, id, today, "resolved").await;
+        let unknown = format!("{DISCARDED_UNKNOWN}timed out");
+        for what in [
+            "nothing",
+            "a.rs: 4 lines of the incoming side",
+            unknown.as_str(),
+        ] {
+            let id = request(&pool, merged()).await;
+            discard(&pool, id, what).await;
+        }
+        // Settled before the window: out. Still queued, with neither stamp: out.
+        let id = request(&pool, long_ago).await;
+        settle(&pool, id, "2026-10-05T10:00:00+00:00", "resolved").await;
+        let queued = Req {
+            status: "queued",
+            started: None,
+            finished: None,
+            ..merged()
+        };
+        request(&pool, queued).await;
+
+        let conflicts = block_of(&pool).await.conflicts.unwrap();
+        assert_eq!(conflicts.count, 4, "{conflicts:?}");
+        assert_eq!(conflicts.rate, Some(0.5), "four of eight ended rows");
+        assert_eq!(conflicts.auto_resolved, 2, "not the dismissed one");
+        let lost = WorkLost {
+            nothing: 1,
+            lost: 1,
+        };
+        assert_eq!(conflicts.work_lost, lost, "an unknown loss is neither");
+        let json = serde_json::to_string(&conflicts).unwrap();
+        assert!(!json.contains("a.rs"), "{json}");
+    }
+
+    /// Spec §6.1, 3: what the Waiting page counts (`WANTS_A_PERSON_SQL`, `OWNER_DECISION_SQL`,
+    /// interpolated) plus `awaiting_approval`, with no window, aged from `created_at` to now.
+    #[tokio::test]
+    async fn owner_blocked_reuses_the_ticket_predicates_and_ages_from_created_at() {
+        let sql = owner_blocked_sql();
+        assert!(sql.contains(WANTS_A_PERSON_SQL));
+        assert!(sql.contains(OWNER_DECISION_SQL));
+        let pool = crate::testdb::fresh_pool().await;
+        let waiting = |status: &'static str, created: &'static str| Req {
+            status,
+            created,
+            started: None,
+            finished: None,
+            ..merged()
+        };
+        for (status, created) in [
+            ("escalated", "2026-10-17T13:03:11+00:00"),      // 3600 s
+            ("blocked", "2026-10-17T14:02:11+00:00"),        // 60 s
+            ("awaiting_owner", "2026-10-17T13:53:11+00:00"), // 600 s
+            // Long before any window, and still waiting: 77 days and 14:03:11.
+            ("awaiting_owner", "2026-08-01T00:00:00+00:00"),
+        ] {
+            request(&pool, waiting(status, created)).await;
+        }
+        // 7200 s, in another project.
+        let approval = Req {
+            project: "q",
+            ..waiting("awaiting_approval", "2026-10-17T12:03:11+00:00")
+        };
+        request(&pool, approval).await;
+        // Settled, queued and failed rows want nobody.
+        let settled = request(&pool, waiting("escalated", "2026-10-17T10:00:00+00:00")).await;
+        settle(&pool, settled, "2026-10-17T11:00:00+00:00", "dismissed").await;
+        request(&pool, waiting("queued", "2026-10-17T10:00:00+00:00")).await;
+        request(&pool, ended("failed", "x")).await;
+
+        let global = block_of(&pool).await.owner_blocked.unwrap();
+        let badge = crate::execution::vcs::count_waiting_on_a_person(&pool)
+            .await
+            .unwrap() as i64;
+        assert_eq!(global.count, badge + 1, "the badge plus the approval");
+        let oldest = 77 * 86_400 + 14 * 3600 + 3 * 60 + 11;
+        let expected = OwnerBlocked {
+            count: 5,
+            oldest_age_s: Some(oldest),
+            median_age_s: Some(3600),
+        };
+        assert_eq!(global, expected);
+
+        let window = Window::new(7, now()).unwrap();
+        let project = read(&pool, Some("p"), window, now()).await.unwrap();
+        let expected = OwnerBlocked {
+            count: 4,
+            oldest_age_s: Some(oldest),
+            median_age_s: Some(600),
+        };
+        assert_eq!(project.owner_blocked, Some(expected), "not q's approval");
     }
 }

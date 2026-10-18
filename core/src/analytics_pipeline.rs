@@ -9,6 +9,7 @@ pub mod gate;
 pub mod jobs;
 pub mod landing;
 pub mod postgate;
+pub mod pressure;
 pub mod sampler;
 pub mod stats;
 
@@ -68,8 +69,8 @@ pub struct PipelineReport {
     pub postgate: Block<postgate::Postgate>,
     pub jobs: Block<jobs::Jobs>,
     pub autopilot: Block<autopilot::Autopilot>,
-    /// Metric 10 (follow-up). `null` until then.
-    pub pressure: Option<Block<serde_json::Value>>,
+    /// Metric 10. An `Option` from when it was not built yet; always present now.
+    pub pressure: Option<Block<pressure::Pressure>>,
 }
 
 fn rfc3339(at: DateTime<Utc>) -> String {
@@ -162,7 +163,7 @@ pub async fn build(
         ),
         jobs: block("jobs", jobs::read(pool, project, window, now).await),
         autopilot: block("autopilot", autopilot::read(pool, project, window).await),
-        pressure: None,
+        pressure: Some(block("pressure", pressure::read(pool, project, window).await)),
     }
 }
 
@@ -249,39 +250,56 @@ pub(crate) mod tests {
         let json = report(&pool, Scope::Global, 30).await;
         let failed = serde_json::json!({ "error": "query_failed" });
         assert_eq!(json["autopilot"], failed, "{json}");
-        for ok in ["landing", "gate", "postgate", "jobs"] {
+        for ok in ["landing", "gate", "postgate", "jobs", "pressure"] {
             assert!(json[ok].get("error").is_none(), "{ok} failed too: {json}");
         }
-        assert!(json["pressure"].is_null(), "metric 10 is not in the MVP");
+        assert!(json["pressure"].is_object(), "metric 10 is built: {json}");
     }
 
-    /// Spec §12.6: the MVP's window reads search an index, globally and per project. Exempt, on
+    /// Spec §12.6: the pipeline's reads search an index, globally and per project. Exempt, on
     /// purpose: `postgate_state` (one row per project) and `postgate_transitions` (a few rows per
     /// incident, read whole up to the window's end); `flaky::history` uses the existing
-    /// `(project_id, started_at)` index.
+    /// `(project_id, started_at)` index, and `observe::deviation` (per project, for the bypass)
+    /// `verification_observations_project` and `verify_runs_origin`.
     #[tokio::test]
     async fn the_pipeline_window_reads_search_an_index_instead_of_scanning() {
         let pool = crate::testdb::fresh_pool().await;
         let classifier = autopilot::classifier_sql();
-        let reads: [(&str, &str); 6] = [
+        // `(from, to, project)`: every read with a window.
+        let windowed: [(&str, &str); 10] = [
             ("landing", landing::LANDING_ROWS_SQL),
+            ("landing settled", landing::LANDING_SETTLED_SQL),
             ("gate", gate::GATE_ROWS_SQL),
             ("jobs", jobs::JOB_ROWS_SQL),
             ("classifier", &classifier),
             ("judge", autopilot::JUDGE_SQL),
             ("refused", autopilot::REFUSED_SQL),
+            ("pressure raw", pressure::RAW_SAMPLES_SQL),
+            ("pressure daily", pressure::DAILY_SAMPLES_SQL),
+            ("pressure slot wait", pressure::SLOT_WAIT_SQL),
         ];
+        // `(project)` only: the reads of the present.
+        let owner_blocked = landing::owner_blocked_sql();
+        let present: [(&str, &str); 2] = [
+            ("owner blocked", &owner_blocked),
+            ("pressure limit", pressure::LATEST_LIMIT_SQL),
+        ];
+        type Plan = (i64, i64, i64, String);
         let mut scans = Vec::new();
-        for (name, sql) in reads {
+        let reads = windowed
+            .into_iter()
+            .map(|(name, sql)| (name, sql, true))
+            .chain(present.into_iter().map(|(name, sql)| (name, sql, false)));
+        for (name, sql, has_window) in reads {
             for project in [None, Some("p")] {
-                let plan: Vec<(i64, i64, i64, String)> =
-                    sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
-                        .bind("2026-09-01")
-                        .bind("2026-10-01")
-                        .bind(project)
-                        .fetch_all(&pool)
-                        .await
-                        .unwrap();
+                let explain = format!("EXPLAIN QUERY PLAN {sql}");
+                let query = sqlx::query_as::<sqlx::Sqlite, Plan>(sqlx::AssertSqlSafe(explain));
+                let query = if has_window {
+                    query.bind("2026-09-01").bind("2026-10-01").bind(project)
+                } else {
+                    query.bind(project)
+                };
+                let plan = query.fetch_all(&pool).await.unwrap();
                 scans.extend(
                     plan.into_iter()
                         .map(|row| row.3)

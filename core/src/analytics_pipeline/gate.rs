@@ -1,5 +1,6 @@
-//! Metrics 4 and 5 (and 6 in the follow-up): the gate over `verify_runs` windowed by
-//! `started_at`, and the flaky/suspect snapshot from `verify::flaky` (spec §6.1).
+//! Metrics 4, 5 and 6: the gate over `verify_runs` windowed by `started_at`, the flaky/suspect
+//! snapshot from `verify::flaky`, the cache hit rate and the bypass ratio from
+//! `verify::observe::deviation` (spec §6.1).
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -8,8 +9,10 @@ use sqlx::SqlitePool;
 
 use super::stats::{self, ratio};
 use crate::analytics::Window;
+use crate::verify::observe::{Deviation, deviation};
 use crate::verify::runs::{
     REQUESTED_BY_BISECT, REQUESTED_BY_FLAKE_CHECK, STATUS_ERRORED, STATUS_FAILED, STATUS_PASSED,
+    STATUS_SKIPPED_CACHED,
 };
 
 /// Both windows in one read: `[previous.from, window.to)`. A queued row has no `started_at`, so
@@ -80,6 +83,22 @@ pub struct FlakyGroup {
     pub suspect: bool,
 }
 
+/// Metric 6: cached units over the terminal ones plus the cached (non-probe), both windows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Cache {
+    pub hit_rate: Option<f64>,
+    pub prev_hit_rate: Option<f64>,
+}
+
+/// Metric 6: verification commands runs executed themselves over the `verify` units, summed over
+/// the projects in scope and then divided, never an average of per-project ratios.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Bypass {
+    pub observed: i64,
+    pub verify_units: i64,
+    pub ratio: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Gate {
     pub pass_rate: Option<f64>,
@@ -91,9 +110,9 @@ pub struct Gate {
     pub most_red: Vec<RedGroup>,
     pub legacy_runs: i64,
     pub flaky: Vec<FlakyGroup>,
-    /// Metric 6 (follow-up). `null` until then.
-    pub cache: Option<serde_json::Value>,
-    pub bypass: Option<serde_json::Value>,
+    pub cache: Option<Cache>,
+    /// Filled by `read`; the rows here cannot see it.
+    pub bypass: Option<Bypass>,
 }
 
 fn pass_rate(rows: &[&Row]) -> Option<f64> {
@@ -102,6 +121,31 @@ fn pass_rate(rows: &[&Row]) -> Option<f64> {
         .filter(|row| row.status == STATUS_PASSED)
         .count() as i64;
     ratio(passed, rows.len() as i64)
+}
+
+/// Cached over terminal-or-cached, over the non-probe rows of `window`.
+fn hit_rate(rows: &[Row], window: Window) -> Option<f64> {
+    let counted: Vec<&Row> = rows
+        .iter()
+        .filter(|row| !is_probe(row) && in_window(row, window))
+        .filter(|row| is_terminal(row) || row.status == STATUS_SKIPPED_CACHED)
+        .collect();
+    let cached = counted
+        .iter()
+        .filter(|row| row.status == STATUS_SKIPPED_CACHED)
+        .count() as i64;
+    ratio(cached, counted.len() as i64)
+}
+
+/// PURE: the projects' deviations, summed and then divided.
+pub(crate) fn bypass_of(deviations: &[Deviation]) -> Bypass {
+    let observed: i64 = deviations.iter().map(|d| d.observed).sum();
+    let verify_units: i64 = deviations.iter().map(|d| d.verify_units).sum();
+    Bypass {
+        observed,
+        verify_units,
+        ratio: ratio(observed, verify_units),
+    }
 }
 
 /// PURE: metrics 4 and 5's window half. The flaky snapshot has no window and is filled by `read`.
@@ -202,7 +246,10 @@ pub(crate) fn gate_block(rows: &[Row], window: Window) -> Gate {
         most_red,
         legacy_runs,
         flaky: Vec::new(),
-        cache: None,
+        cache: Some(Cache {
+            hit_rate: hit_rate(rows, window),
+            prev_hit_rate: hit_rate(rows, window.previous()),
+        }),
         bypass: None,
     }
 }
@@ -257,6 +304,29 @@ async fn flaky(pool: &SqlitePool, project: Option<&str>) -> sqlx::Result<Vec<Fla
     Ok(groups)
 }
 
+/// One `deviation` per project in scope over the window's whole days. Globally, every project that
+/// has an observation or a `verify` ticket: a project with units and no observation lowers the
+/// ratio and must be counted.
+async fn bypass(pool: &SqlitePool, project: Option<&str>, window: Window) -> sqlx::Result<Bypass> {
+    let projects: Vec<String> = match project {
+        Some(id) => vec![id.to_owned()],
+        None => {
+            sqlx::query_scalar(
+                "SELECT project_id FROM verification_observations
+                 UNION SELECT project_id FROM verify_requests ORDER BY 1",
+            )
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    let (from, to) = (window.from_bound(), window.to_bound());
+    let mut deviations = Vec::with_capacity(projects.len());
+    for id in &projects {
+        deviations.push(deviation(pool, id, &from, Some(to.as_str())).await?);
+    }
+    Ok(bypass_of(&deviations))
+}
+
 pub(crate) async fn rows(
     pool: &SqlitePool,
     project: Option<&str>,
@@ -278,6 +348,7 @@ pub(crate) async fn read(
     let rows = rows(pool, project, window).await?;
     let mut gate = gate_block(&rows, window);
     gate.flaky = flaky(pool, project).await?;
+    gate.bypass = Some(bypass(pool, project, window).await?);
     Ok(gate)
 }
 
@@ -385,6 +456,15 @@ mod tests {
         );
         assert_eq!(block.duration_ms_daily.len(), 7);
         assert!(block.duration_ms_daily.last().unwrap().partial);
+        let cache = Cache {
+            hit_rate: Some(0.2),
+            prev_hit_rate: None,
+        };
+        assert_eq!(
+            block.cache,
+            Some(cache),
+            "one cached over four terminal plus the cached; running and probes outside"
+        );
     }
 
     /// Spec §11: per (project, sha, group) the oldest row is the first try, by `started_at`;
@@ -536,5 +616,72 @@ mod tests {
                 suspect: true,
             }]
         );
+    }
+
+    /// Spec §6.1, 6: the bypass ratio sums `observed` and `verify_units` over the projects and
+    /// divides once. Two projects at 1/1 and 0/9 are 0.1, not the 0.5 an average would say.
+    #[tokio::test]
+    async fn bypass_ratio_is_summed_then_divided_not_averaged() {
+        let pool = crate::testdb::fresh_pool().await;
+        let at = "2026-10-16T10:00:00+00:00";
+        for (project, observed, units) in [("p", 1, 1), ("q", 0, 9)] {
+            for _ in 0..observed {
+                sqlx::query(
+                    "INSERT INTO verification_observations (project_id, run_id, tool_name,
+                                                            command, kind, name, segment,
+                                                            decision, created_at)
+                     VALUES (?, 7, 'Bash', 'cargo test', 'tool', 'cargo', 'cargo test',
+                             'allow', ?)",
+                )
+                .bind(project)
+                .bind(at)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let ticket: i64 = sqlx::query_scalar(
+                "INSERT INTO verify_requests (project_id, worktree, kind, scope, priority, caller,
+                                              created_at)
+                 VALUES (?, '/w', 'test', 'changed', 1, 'agent', ?) RETURNING id",
+            )
+            .bind(project)
+            .bind(at)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            for _ in 0..units {
+                sqlx::query(
+                    "INSERT INTO verify_runs (project_id, worktree, scope, origin, origin_id,
+                                              requested_by, argv, status, started_at,
+                                              finished_at)
+                     VALUES (?, '/w', 'full', 'verify', ?, 'gate', '[]', 'passed', ?, ?)",
+                )
+                .bind(project)
+                .bind(ticket)
+                .bind(at)
+                .bind(at)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+        let summed = Bypass {
+            observed: 1,
+            verify_units: 10,
+            ratio: Some(0.1),
+        };
+        assert_eq!(gate(&pool).await.bypass, Some(summed));
+        let window = Window::new(7, now()).unwrap();
+        let p = read(&pool, Some("p"), window).await.unwrap();
+        assert_eq!(p.bypass.and_then(|b| b.ratio), Some(1.0), "p alone");
+        // Outside the window counts for nothing.
+        let earlier = Window::new(7, now() - chrono::Duration::days(30)).unwrap();
+        let none = read(&pool, None, earlier).await.unwrap().bypass;
+        let empty = Bypass {
+            observed: 0,
+            verify_units: 0,
+            ratio: None,
+        };
+        assert_eq!(none, Some(empty));
     }
 }

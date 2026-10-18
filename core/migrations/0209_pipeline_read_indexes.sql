@@ -13,9 +13,17 @@
 --                                 walk of the index: `(status, kind)` cannot serve `kind = ?`)
 -- `judge_verdicts_by_time` already exists. `postgate_state` (one row per project) and
 -- `postgate_transitions` (a few rows per incident, read whole up to the window's end) are exempt.
+--
+-- Two more for the reads metrics 2 and 3 added (still SCAN vcs_requests without them): the
+-- conflicts read windows by `COALESCE(settled_at, finished_at)`, which only an index on that exact
+-- expression serves, and the owner-blocked read is an OR of `status` terms with no window, which
+-- SQLite answers as a multi-index OR once `status` leads an index.
 
 CREATE INDEX IF NOT EXISTS vcs_requests_by_created ON vcs_requests (created_at);
 CREATE INDEX IF NOT EXISTS verify_runs_by_started ON verify_runs (started_at);
 CREATE INDEX IF NOT EXISTS jobs_by_created ON jobs (created_at);
 CREATE INDEX IF NOT EXISTS shadow_decisions_by_created ON shadow_decisions (created_at);
 CREATE INDEX IF NOT EXISTS proposals_by_kind_created ON proposals (kind, created_at);
+CREATE INDEX IF NOT EXISTS vcs_requests_by_ended
+    ON vcs_requests (COALESCE(settled_at, finished_at));
+CREATE INDEX IF NOT EXISTS vcs_requests_by_status ON vcs_requests (status);

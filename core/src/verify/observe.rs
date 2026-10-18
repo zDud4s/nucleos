@@ -56,31 +56,39 @@ pub struct Deviation {
     pub ratio: Option<f64>,
 }
 
-/// The deviation for `project_id` from `since` (inclusive) to now.
+/// The deviation for `project_id` from `since` (inclusive) to `until` (exclusive), or to now when
+/// `until` is `None`. A bounded window is what the analytics page needs: a previous window is its
+/// own call, never a difference of two open-ended ones.
 ///
 /// Every timestamp compared here is a chrono `to_rfc3339()` string in UTC, so the text order of
-/// two of them is their time order and `>=` on the column is a window.
+/// two of them is their time order and `>=` on the column is a window. A bare `YYYY-MM-DD` bound
+/// sorts before every instant of its day, so it bounds by whole days.
 pub async fn deviation(
     pool: &SqlitePool,
     project_id: &str,
     since: &str,
+    until: Option<&str>,
 ) -> sqlx::Result<Deviation> {
     let observed: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM verification_observations WHERE project_id = ? AND created_at >= ?",
+        "SELECT COUNT(*) FROM verification_observations \
+         WHERE project_id = ?1 AND created_at >= ?2 AND (?3 IS NULL OR created_at < ?3)",
     )
     .bind(project_id)
     .bind(since)
+    .bind(until)
     .fetch_one(pool)
     .await?;
     // A unit belongs to the window of the ticket that asked for it, and only `verify` rows carry a
     // ticket id in `origin_id` (a gate row's points at a run).
     let verify_units: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM verify_runs vr JOIN verify_requests rq ON vr.origin_id = rq.id \
-         WHERE vr.origin = ? AND rq.project_id = ? AND rq.created_at >= ?",
+         WHERE vr.origin = ?1 AND rq.project_id = ?2 AND rq.created_at >= ?3 \
+           AND (?4 IS NULL OR rq.created_at < ?4)",
     )
     .bind(ORIGIN_VERIFY)
     .bind(project_id)
     .bind(since)
+    .bind(until)
     .fetch_one(pool)
     .await?;
     let ratio = (verify_units > 0).then(|| observed as f64 / verify_units as f64);
@@ -243,7 +251,7 @@ mod tests {
         let other_project = observe(&pool, "p2", &hit).await;
         stamp_observation(&pool, other_project, "2026-10-02T10:00:00+00:00").await;
 
-        let d: Deviation = deviation(&pool, "p1", "2026-10-01T10:00:00+00:00")
+        let d: Deviation = deviation(&pool, "p1", "2026-10-01T10:00:00+00:00", None)
             .await
             .unwrap();
         assert_eq!(d.observed, 1, "only the in-window row of this project");
@@ -266,7 +274,7 @@ mod tests {
         // A gate row whose origin_id happens to equal the ticket's id is not a `verify` unit.
         unit(&pool, "p1", ORIGIN_RUN, inside).await;
 
-        let d = deviation(&pool, "p1", since).await.unwrap();
+        let d = deviation(&pool, "p1", since, None).await.unwrap();
         assert_eq!(d.verify_units, 2);
         assert_eq!(d.observed, 0);
         assert_eq!(d.ratio, Some(0.0));
@@ -282,15 +290,58 @@ mod tests {
         for _ in 0..3 {
             observe(&pool, "p1", &hit).await;
         }
-        let none = deviation(&pool, "p1", since).await.unwrap();
+        let none = deviation(&pool, "p1", since, None).await.unwrap();
         assert_eq!((none.observed, none.verify_units), (3, 0));
         assert_eq!(none.ratio, None);
 
         let ticket = request(&pool, "p1", "2026-10-02T10:00:00+00:00").await;
         unit(&pool, "p1", ORIGIN_VERIFY, ticket).await;
         unit(&pool, "p1", ORIGIN_VERIFY, ticket).await;
-        let some = deviation(&pool, "p1", since).await.unwrap();
+        let some = deviation(&pool, "p1", since, None).await.unwrap();
         assert_eq!((some.observed, some.verify_units), (3, 2));
         assert_eq!(some.ratio, Some(1.5));
+    }
+
+    /// Seeds, for `p1`, an observation and a `verify` ticket with one unit at each of three
+    /// instants: inside `[since, until)`, exactly at `until`, and after it.
+    async fn seed_around_the_bound(pool: &sqlx::SqlitePool) {
+        let hit = a_hit();
+        for at in [
+            "2026-10-02T10:00:00+00:00",
+            "2026-10-03T10:00:00+00:00",
+            "2026-10-04T10:00:00+00:00",
+        ] {
+            let id = observe(pool, "p1", &hit).await;
+            stamp_observation(pool, id, at).await;
+            let ticket = request(pool, "p1", at).await;
+            unit(pool, "p1", ORIGIN_VERIFY, ticket).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn deviation_with_until_excludes_rows_at_or_after_the_bound() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_around_the_bound(&pool).await;
+        let since = "2026-10-01T10:00:00+00:00";
+        let d = deviation(&pool, "p1", since, Some("2026-10-03T10:00:00+00:00"))
+            .await
+            .unwrap();
+        assert_eq!((d.observed, d.verify_units), (1, 1), "the bound is out");
+        // A bare day bounds by whole days, as the analytics window passes it.
+        let days = deviation(&pool, "p1", "2026-10-01", Some("2026-10-04"))
+            .await
+            .unwrap();
+        assert_eq!((days.observed, days.verify_units), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn deviation_without_until_is_unchanged() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_around_the_bound(&pool).await;
+        let d = deviation(&pool, "p1", "2026-10-01T10:00:00+00:00", None)
+            .await
+            .unwrap();
+        assert_eq!((d.observed, d.verify_units), (3, 3), "as before");
+        assert_eq!(d.ratio, Some(1.0));
     }
 }
