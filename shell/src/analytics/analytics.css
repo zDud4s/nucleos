@@ -420,3 +420,83 @@
     border-color: Highlight;
   }
 }
+
+/* ------------------------------------------------------------ the pipeline -- */
+
+.an-pipeline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-6);
+}
+
+.an-pipeline-title {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+/* Five cards and a sixth to come: three to a row, so neither count leaves a lone card hanging at four. */
+.an-pipeline .an-metrics {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+@container analytics (max-width: 46rem) {
+  .an-pipeline .an-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container analytics (max-width: 24rem) {
+  .an-pipeline .an-metrics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* A card that needs attention: the danger surface, plus the icon and the word inside it. */
+.an-metric-alert,
+.an-metric-alert:hover {
+  border-color: var(--tone-danger-border);
+  background: var(--tone-danger-bg);
+}
+
+.an-metric-icon {
+  width: 1em;
+  height: 1em;
+  margin-right: var(--space-2);
+  vertical-align: -0.1em;
+  color: var(--tone-danger-fg);
+}
+
+/* A block that could not be computed, or a panel in that state. */
+.an-block-error {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* A short list of groups or jobs: a name on the left, its figures on the right. */
+.an-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+}
+
+.an-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
+}
+
+.an-row-figures {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}

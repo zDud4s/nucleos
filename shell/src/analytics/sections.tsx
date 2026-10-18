@@ -1,5 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
+import { TriangleAlert } from "lucide-react";
 import type { AnalyticsReport, QuotaHistory } from "../data/analytics";
 import { compactTokens, humanMinutes } from "../data/project-readings";
 import { AreaChart, ErrorNote, ShareBar, StaleNote, StepLine, usd, type ChartDatum, type ChartKey } from "../ui";
@@ -48,7 +49,7 @@ const percent = (fraction: number) => `${Math.round(fraction * 100)}%`;
  * part named by `apart` (the estimate) is never folded into the total or the peak: it is stated on
  * its own.
  */
-function summary(data: ChartDatum[], format: (value: number) => string, apart?: string): ReactNode {
+export function summary(data: ChartDatum[], format: (value: number) => string, apart?: string): ReactNode {
   const days = data.map((datum) => ({
     day: datum.day,
     total: datum.parts.reduce((sum, part) => (part.key === apart ? sum : sum + part.value), 0),
@@ -62,17 +63,17 @@ function summary(data: ChartDatum[], format: (value: number) => string, apart?: 
   return <p className="sr-only">{`${head}; peak ${format(peak.total)} on ${peak.day}.`}</p>;
 }
 
-function plural(n: number, one: string, many: string): string {
+export function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
 /** The clauses of a line, the empty ones dropped. */
-function joined(parts: string[]): string {
+export function joined(parts: string[]): string {
   return parts.filter((part) => part !== "").join(" · ");
 }
 
 /** An em dash for a figure nobody read — never a zero standing in for it (`StatCard`'s reading). */
-function Unread() {
+export function Unread() {
   return (
     <>
       <span aria-hidden="true">—</span>
@@ -83,13 +84,18 @@ function Unread() {
 
 /* --------------------------------------------------------------- the cards -- */
 
-export interface Metric {
-  key: MetricKey;
+export interface Metric<K extends string = MetricKey> {
+  key: K;
   label: string;
   /** `undefined` is absent, drawn as an em dash. */
   value: ReactNode | undefined;
   sub: string;
-  spark: { data: ChartDatum[]; keys: ChartKey[]; tone: string; apart?: string; format: (value: number) => string };
+  /** Absent draws no sparkline (a metric with no series). */
+  spark?: { data: ChartDatum[]; keys: ChartKey[]; tone: string; apart?: string; format: (value: number) => string };
+  /** The card is in a state that needs attention: drawn with the danger border, the words say why. */
+  alert?: boolean;
+  /** The block behind the card could not be computed: it says so and shows nothing else. */
+  error?: boolean;
 }
 
 /** The tokens the window measured, or `null` when no session reported usage — absent, never 0. */
@@ -148,7 +154,7 @@ export function metrics(report: AnalyticsReport): Metric[] {
 }
 
 export interface MetricCardProps {
-  metric: Metric;
+  metric: Metric<string>;
   open: boolean;
   /** The detail panel's id: every card controls the same one. */
   controls: string;
@@ -162,8 +168,10 @@ export interface MetricCardProps {
  */
 export function MetricCard({ metric, open, controls, onOpen }: MetricCardProps) {
   const { spark } = metric;
+  const failed = metric.error === true;
+  const classes = ["an-metric", open ? "an-metric-open" : "", metric.alert === true ? "an-metric-alert" : ""];
   return (
-    <div className={open ? "an-metric an-metric-open" : "an-metric"}>
+    <div className={classes.filter((name) => name !== "").join(" ")}>
       <button type="button" className="an-metric-button" aria-expanded={open} aria-controls={controls} onClick={onOpen}>
         <span className="an-metric-top">
           <span className="an-metric-label">{metric.label}</span>
@@ -171,19 +179,27 @@ export function MetricCard({ metric, open, controls, onOpen }: MetricCardProps) 
             {open ? "showing" : "show chart"}
           </span>
         </span>
-        <span className="an-metric-value">{metric.value === undefined ? <Unread /> : metric.value}</span>
-        <span className="an-metric-sub">{metric.sub}</span>
+        <span className="an-metric-value">
+          {metric.alert === true && !failed ? (
+            // Text and icon, never colour alone: the icon is named after the word beside it.
+            <TriangleAlert className="an-metric-icon" role="img" aria-hidden={false} aria-label={String(metric.value)} />
+          ) : null}
+          {failed ? "Could not compute" : metric.value === undefined ? <Unread /> : metric.value}
+        </span>
+        {failed ? null : <span className="an-metric-sub">{metric.sub}</span>}
       </button>
-      <AreaChart
-        data={spark.data}
-        keys={spark.keys}
-        label={metric.label}
-        format={spark.format}
-        empty=""
-        tone={spark.tone}
-        apart={spark.apart}
-        compact
-      />
+      {spark === undefined || failed ? null : (
+        <AreaChart
+          data={spark.data}
+          keys={spark.keys}
+          label={metric.label}
+          format={spark.format}
+          empty=""
+          tone={spark.tone}
+          apart={spark.apart}
+          compact
+        />
+      )}
     </div>
   );
 }
@@ -199,7 +215,7 @@ interface CardProps {
 }
 
 /** A titled card; its title is its region's name, so a screen reader can jump to it by that name. */
-function Card({ label, aside, id, className, children }: CardProps) {
+export function Card({ label, aside, id, className, children }: CardProps) {
   const titleId = `an-card-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
   return (
     <section id={id} className={className === undefined ? "an-card" : `an-card ${className}`} aria-labelledby={titleId}>
@@ -216,7 +232,7 @@ function Card({ label, aside, id, className, children }: CardProps) {
 
 /* --------------------------------------------------------- the detail panel -- */
 
-interface PanelContent {
+export interface PanelContent {
   title: string;
   aside: string;
   body: ReactNode;
