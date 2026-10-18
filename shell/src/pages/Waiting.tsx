@@ -320,7 +320,7 @@ function has(rows: unknown[] | undefined): boolean {
 function headlineFor(decisions: number | undefined): ReactNode {
   if (decisions === undefined) return undefined;
   if (decisions === 0) return "nothing is waiting on a decision";
-  // The system's "waiting on you" tone, so the one count that asks for a person is not neutral.
+  // The system's awaiting tone, so the one count that asks for a person is not neutral.
   return <span className="ui-awaiting">{decisions} waiting on a decision</span>;
 }
 

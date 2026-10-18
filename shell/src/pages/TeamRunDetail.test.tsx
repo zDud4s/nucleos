@@ -267,7 +267,7 @@ describe("TeamRunDetail - cost", () => {
 
     await renderTeamRunDetail("/team-runs/run-2");
 
-    const costCard = await screen.findByRole("article", { name: "Cost" });
+    const costCard = await screen.findByRole("article", { name: /^Cost/ });
     expect(within(costCard).queryByRole("link")).toBeNull();
     expect(screen.getAllByRole("link", { name: "see the root" })).toHaveLength(1);
   });

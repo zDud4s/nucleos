@@ -1329,7 +1329,9 @@ describe("Autopilot - the page map and the advanced panels", () => {
   });
 
   it("keeps the records and the advanced evidence shut until asked", async () => {
-    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+    daemon.apiFetch.mockImplementation(
+      cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
+    );
 
     await renderCockpit();
 

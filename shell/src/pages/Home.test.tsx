@@ -290,7 +290,8 @@ describe("Home", () => {
     await renderWithRouter(<Home />);
 
     expect(await screen.findByText("1 acting, 2 in shadow; nothing waiting on you")).toBeDefined();
-    expect(screen.queryByRole("link", { name: /subsystem/ })).toBeNull();
+    // The healthy card is itself a link to /system now, so it is the sentence that must offer no door.
+    expect(screen.queryByRole("link", { name: / down| degraded/ })).toBeNull();
 
     // And the cards do not recede. A card that appeared only when something was wrong
     // would teach the reader that an absent card is an absent fact.

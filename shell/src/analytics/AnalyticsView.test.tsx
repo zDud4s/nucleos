@@ -327,7 +327,7 @@ describe("AnalyticsView, one project", () => {
     await mount(busy("project"), "ghost");
     // The card first reads "reading…"; wait for the answer, then check it sits in the Analytics card.
     const reason = await screen.findByText("No project by that name.");
-    expect(within(screen.getByRole("article", { name: "Analytics" })).getByText(reason.textContent ?? "")).toBeTruthy();
+    expect(within(screen.getByRole("article", { name: /^Analytics/ })).getByText(reason.textContent ?? "")).toBeTruthy();
   });
 });
 

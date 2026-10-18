@@ -126,7 +126,7 @@ describe("leaving the roster, from inside the project", () => {
     const panel = await openRemove("spent");
     expect(await panel.findByText(/312 runs, 8 proposals and 40 stamps on record/)).toBeTruthy();
     fireEvent.click(panel.getByRole("checkbox"));
-    expect(panel.getByText(/will be deleted from the núcleo and cannot be brought back/)).toBeTruthy();
+    expect(panel.getByText(/and cannot be brought back; adding it again starts with no history/)).toBeTruthy();
 
     fireEvent.click(panel.getByRole("button", { name: "remove and forget" }));
     expect(state.removed).toEqual([]);

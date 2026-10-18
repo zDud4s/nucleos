@@ -14,7 +14,7 @@ export interface ListFilterProps {
   query: string;
   onQueryChange: (query: string) => void;
   /** Optional chips; `selected` holds the ids that are on. */
-  chips?: ListFilterChip[];
+  chips?: readonly ListFilterChip[];
   selected?: readonly string[];
   onToggleChip?: (id: string) => void;
   /** How many rows survive the current filters. Drives Enter and the live count. */

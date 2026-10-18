@@ -160,7 +160,8 @@ describe("Courtroom", () => {
     renderSession(v);
     const first = screen.getByRole("button", { name: "Seat 1, A, thinking" });
     expect(first.getAttribute("title")).toBe("gpt-5");
-    expect(first.getAttribute("data-masked")).toBe("true");
+    // The accessible name stays masked; the mask flag lives on the aria-hidden drawing, not the button.
+    expect(document.querySelector(".council-court-seat")?.getAttribute("data-masked")).toBe("true");
   });
 
   it("is made of real buttons that Space also selects", () => {

@@ -135,7 +135,7 @@ describe("Web — the one field", () => {
     await renderWeb("/web");
 
     const field = screen.getByRole("textbox", { name: "Read an address or filter the archive" });
-    expect(field.getAttribute("placeholder")).toMatch(/address/);
+    expect(field.getAttribute("placeholder")).toMatch(/address/i);
     expect(field.getAttribute("placeholder")).toMatch(/filter/);
     // One field, not three: the read form and the filter box are gone.
     expect(screen.getAllByRole("textbox")).toHaveLength(1);

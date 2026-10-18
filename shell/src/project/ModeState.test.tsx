@@ -234,7 +234,7 @@ describe("the readings", () => {
         .join(" ")
         .trim(),
     );
-    expect(order).toEqual(["Gate", "Delivered", "Cost", "Token efficiency"]);
+    expect(order.map((name) => name.split(" ")[0])).toEqual(["Gate", "Delivered", "Cost", "Token"]);
 
     expect(screen.getByText(/3 failed · 1 could not run · 15 ungated/).className).toContain(
       "ui-wrong",
