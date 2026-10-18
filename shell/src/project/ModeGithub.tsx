@@ -1,5 +1,5 @@
 // §spec alcada-por-projecto
-import { useId, useState, type FormEvent, type ReactNode } from "react";
+import { useState, type FormEvent, type ReactNode } from "react";
 import type { UseQueryResult } from "@tanstack/react-query";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
@@ -42,6 +42,7 @@ import {
   Quiet,
   RefusalNote,
   Section,
+  Tip,
   Well,
 } from "../ui";
 import { DAEMON_NAME } from "../copy";
@@ -700,38 +701,14 @@ const NO_SUCH_PROJECT = `the ${DAEMON_NAME} has no project by this name.`;
  * one rank under the section title so the two do not read as siblings.
  */
 function GroupTitle({ children, about }: { children: ReactNode; about?: ReactNode }) {
-  const tipId = useId();
   // The tip sits beside the heading and not in it, so the heading's name stays the group's name.
   return (
     <div className="ws-subhead">
       <h3 className="ws-subtitle">{children}</h3>
       {about === undefined ? null : (
-        <Tip id={tipId} name={`About ${String(children).trim()}`}>
-          {about}
-        </Tip>
+        <Tip name={`About ${String(children).trim()}`} tip={about} persist />
       )}
     </div>
-  );
-}
-
-/**
- * A group's one-sentence caption, behind an ⓘ beside its title.
- *
- * The owner's words for the inline captions were "fdd de ler": every group opened with a small grey
- * paragraph before its first row. The sentence is kept — tests and screen readers still find it,
- * because it is always in the document and the mark is described by it — and it shows on hover or
- * focus, floating over the page so nothing moves. Pure CSS: there is no state to keep.
- */
-function Tip({ id, name, children }: { id: string; name: string; children: ReactNode }) {
-  return (
-    <span className="ws-tip">
-      <button type="button" className="ws-tip-mark" aria-label={name} aria-describedby={id}>
-        i
-      </button>
-      <span className="ws-tip-box" role="tooltip" id={id}>
-        {children}
-      </span>
-    </span>
   );
 }
 

@@ -142,7 +142,15 @@ export function System() {
         {view === "backups" && <BackupsView />}
         {view === "tokens" && <TokensView />}
         {view === "notifications" && <NotificationsView />}
-        {view === "settings" && <MachineSettings />}
+        {view === "settings" && (
+          <>
+            <MachineSettings />
+            {/* A preference of this screen, not a limit: it lives with the machine's own settings. */}
+            <Section label="Appearance">
+              <NotchProviders />
+            </Section>
+          </>
+        )}
       </div>
     </>
   );
@@ -529,7 +537,7 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
     <Row dense className="sy-sidecar-row">
       <div className="sy-sidecar-head">
         <span className="sy-sidecar-name">{sidecar.name}</span>
-        <StateBadge domain="pillar" state={sidecar.state === "running" ? "ok" : sidecar.state} />
+        <StateBadge domain="sidecar" state={sidecar.state} />
       </div>
       <dl className="sy-sidecar-facts">
         {sidecar.started_at !== null && (
@@ -768,6 +776,27 @@ function BudgetPanel() {
       setQuotaBrakeForm(formFromQuotaBrake(quotaBrake.data));
     }
   }, [quotaBrake.data, quotaBrakeForm]);
+
+  // Leaving with an edit that was never saved loses it silently; the browser's own prompt
+  // is the only guard a window close or reload offers.
+  const budgetDirty =
+    form !== null &&
+    budget.data !== undefined &&
+    JSON.stringify(form) !== JSON.stringify(formFromBudget(budget.data));
+  const quotaDirty =
+    quotaBrakeForm !== null &&
+    quotaBrake.data !== undefined &&
+    JSON.stringify(quotaBrakeForm) !== JSON.stringify(formFromQuotaBrake(quotaBrake.data));
+  const unsaved = budgetDirty || quotaDirty;
+  useEffect(() => {
+    if (!unsaved) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [unsaved]);
 
   return (
     <Panel title="Limits">
@@ -1027,7 +1056,6 @@ function BudgetPanel() {
             )}
           </section>
         )}
-        <NotchProviders />
       </div>
     </Panel>
   );
