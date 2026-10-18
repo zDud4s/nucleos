@@ -314,6 +314,25 @@ pub async fn enqueue(pool: &SqlitePool, request: &Request, now_ms: i64) -> sqlx:
     Ok(Submitted { id, joined: false })
 }
 
+/// Records the workflow task on the unit rows one `verify` request created: the rows it queued and
+/// the cache hits it recorded, all of which carry the request as their `origin_id`.
+///
+/// A unit the request JOINED is another request's row and keeps that request's task (or none) —
+/// the same v1 limitation `enqueue` notes for the joined request's origin. A row already tagged is
+/// left alone, so a retry cannot move a unit from one task to another.
+pub async fn tag_task(pool: &SqlitePool, request_id: i64, task_id: &str) -> sqlx::Result<u64> {
+    Ok(sqlx::query(
+        "UPDATE verify_runs SET task_id = ? \
+         WHERE origin = ? AND origin_id = ? AND task_id IS NULL",
+    )
+    .bind(task_id)
+    .bind(ORIGIN_VERIFY)
+    .bind(request_id)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 /// Every queued row, oldest first, for the scheduler to choose from.
 pub async fn queued(pool: &SqlitePool) -> sqlx::Result<Vec<Queued>> {
     // The tuple is the `SELECT`'s own shape and lives only until the `map` below builds `Queued`;

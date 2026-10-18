@@ -55,6 +55,7 @@ use crate::verify::runs::{
     self as verify_runs, ORIGIN_VERIFY, PRIORITY_AUTONOMOUS, PRIORITY_INTERACTIVE,
 };
 use crate::verify::store::{self as verify_store, CacheKey, NewRequest, PlannedUnit};
+use crate::workflow_records;
 
 pub(crate) use self::resolve::*;
 pub(crate) use self::scope_gate::*;
@@ -96,6 +97,11 @@ pub struct VerifyArgs {
     /// a unit exists.
     #[serde(default)]
     pub cover: bool,
+    /// The workflow task this verification is for, stored on every unit row the request itself
+    /// queues or answers from the cache (`verify_runs.task_id`), so "how many verifications did
+    /// this task run" is a GROUP BY. Absent for the daemon's own gates.
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 /// The body of `POST /verify/status`.
@@ -316,6 +322,18 @@ async fn submit_checked(
     args: &VerifyArgs,
 ) -> Result<(i64, bool), VerifyError> {
     let pool = &executor.pool;
+    // The same bound the workflow ledger holds a task id to, so a task that verifies can be joined
+    // to the records it filed.
+    if args
+        .task_id
+        .as_deref()
+        .is_some_and(|task_id| task_id.trim().chars().count() > workflow_records::LABEL_LIMIT)
+    {
+        return Err(VerifyError::BadRequest(format!(
+            "task_id is longer than {} characters",
+            workflow_records::LABEL_LIMIT
+        )));
+    }
     let deadline = Instant::now() + OPERATION_TIMEOUT;
     let (root, project_id) =
         resolve_worktree(pool, caller, args.worktree.as_deref(), deadline).await?;
@@ -645,6 +663,16 @@ async fn submit_checked(
     verify_store::set_plan(pool, id, &units)
         .await
         .map_err(internal)?;
+    if let Some(task_id) = args
+        .task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|task_id| !task_id.is_empty())
+        && let Err(error) = verify_runs::tag_task(pool, id, task_id).await
+    {
+        // The task is bookkeeping for the workflow's ledgers; the verdict does not depend on it.
+        tracing::warn!(%error, request = id, "verify: cannot record the task on the units");
+    }
     if let Some(failure) = failure {
         return Err(failure);
     }
@@ -1195,6 +1223,7 @@ tests:
             base: base.map(str::to_owned),
             wait: true,
             cover: false,
+            task_id: None,
         }
     }
 
@@ -1799,6 +1828,61 @@ tests:
         // Files named by the caller need no base: nothing is diffed.
         assert_eq!(ticket.base, None);
         assert_eq!(ticket.kind, "check");
+    }
+
+    /// A request that names its task stores it on every unit it queued, and one that names none
+    /// leaves the column empty, so the per-task count never picks up an untagged call.
+    #[tokio::test]
+    async fn a_named_task_is_stored_on_the_units_the_request_queued() {
+        let f = fixture(Some(&plain_map()), None, false).await;
+        let tagged = VerifyArgs {
+            task_id: Some(" t-7 ".to_owned()),
+            ..own_core(&f)
+        };
+        let id = submit(&f.ex, Caller::Owner, &tagged).await.unwrap();
+        let untagged = submit(&f.ex, Caller::Owner, &py_only(&f)).await.unwrap();
+
+        let tasks = |request: i64| {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT task_id FROM verify_runs WHERE origin = ? AND origin_id = ?",
+            )
+            .bind(ORIGIN_VERIFY)
+            .bind(request)
+            .fetch_all(&f.pool)
+        };
+        let tagged_units = tasks(id).await.unwrap();
+        assert!(!tagged_units.is_empty(), "the request queued no unit");
+        assert!(
+            tagged_units
+                .iter()
+                .all(|task| task.as_deref() == Some("t-7")),
+            "{tagged_units:?}"
+        );
+        let untagged_units = tasks(untagged).await.unwrap();
+        assert!(!untagged_units.is_empty(), "the request queued no unit");
+        assert!(
+            untagged_units.iter().all(Option::is_none),
+            "{untagged_units:?}"
+        );
+
+        // Over the bound is refused before anything is queued.
+        let long = VerifyArgs {
+            task_id: Some("t".repeat(workflow_records::LABEL_LIMIT + 1)),
+            ..own_core(&f)
+        };
+        let error = submit(&f.ex, Caller::Owner, &long).await.unwrap_err();
+        assert!(matches!(error, VerifyError::BadRequest(_)), "{error:?}");
+    }
+
+    /// The `py` group alone, so a second request does not join the first one's `core` unit.
+    fn py_only(f: &Fixture) -> VerifyArgs {
+        args(
+            Kind::Check,
+            ScopeArg::Own,
+            f.repo.path(),
+            Some(&["py/b.py"]),
+            None,
+        )
     }
 
     #[tokio::test]

@@ -25,6 +25,11 @@ pub(super) fn routes() -> Router<AppState> {
             "/hooks/session-git-decision",
             post(crate::hooks::session_git_decision),
         )
+        // The hooks a pinned workflow bundle declares (`workflows::hooks`), forwarded by the same
+        // script for the session events. In no scope's table either, for the reason given above
+        // `session-git-decision`: it runs library scripts in a directory the body names, and the
+        // run token's six routes are a list somebody has to widen on purpose, not by a new route.
+        .route("/hooks/bundle", post(crate::workflows::hooks::bundle_hooks))
 }
 
 /// What the hook says while it waits.

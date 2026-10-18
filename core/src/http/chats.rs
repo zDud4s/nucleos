@@ -460,8 +460,8 @@ pub(super) struct ChatProjectOut {
     /// Whether this conversation's turns use the user's ambient MCP servers. Off until somebody
     /// opts in.
     pub(super) ambient_mcp: bool,
-    /// Whether `cwd` is a linked worktree the AI workflow was never copied into while its main
-    /// checkout has it — the case "Set up workflow" answers.
+    /// Whether `cwd` is a linked worktree of a project that pins a workflow which was never
+    /// materialized into it — the case "Set up workflow" answers.
     pub(super) workflow_missing: bool,
 }
 
@@ -504,15 +504,16 @@ pub(super) async fn read_chat_project(
         }));
     };
 
-    // An unreadable roster offers nothing: the setup runs a script, so it fails closed.
-    let roots = crate::governance::autopilot::rostered_roots(&state.pool)
+    // An unreadable roster offers nothing: the setup writes files, so it fails closed.
+    let roster = crate::governance::autopilot::rostered_projects(&state.pool)
         .await
         .unwrap_or_default();
     let dir = std::path::PathBuf::from(&cwd);
+    let machine_root = state.machine_config_root.clone();
     let (wired, workflow_missing) = tokio::task::spawn_blocking(move || {
         (
             crate::governance::autopilot::classifier_hook_is_wired(&dir),
-            crate::governance::autopilot::workflow_missing(&dir, &roots),
+            crate::governance::autopilot::workflow_missing(&dir, &roster, machine_root.as_deref()),
         )
     })
     .await
@@ -575,8 +576,8 @@ pub(super) struct SeedWorkflowIn {
     pub(super) confirm: bool,
 }
 
-/// Copies the AI workflow into a conversation's worktree from its main checkout, then wires the
-/// hook. Overwrites the worktree's workflow core, so it runs only on an explicit `confirm: true`.
+/// Materializes the project's pinned workflows into a conversation's worktree, then wires the
+/// hook. Writes into the worktree, so it runs only on an explicit `confirm: true`.
 pub(super) async fn seed_chat_workflow(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
@@ -595,18 +596,25 @@ pub(super) async fn seed_chat_workflow(
         .ok_or(StatusCode::NOT_FOUND)?
         .ok_or(StatusCode::CONFLICT)?;
 
-    let roots = crate::governance::autopilot::rostered_roots(&state.pool)
+    let roster = crate::governance::autopilot::rostered_projects(&state.pool)
         .await
         .map_err(|error| {
             tracing::warn!(%error, "reading the project roster failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    match crate::governance::autopilot::seed_workflow(std::path::Path::new(&cwd), &roots).await {
+    match crate::governance::autopilot::seed_workflow(
+        std::path::Path::new(&cwd),
+        &roster,
+        state.machine_config_root.as_deref(),
+        state.workflow_library.as_deref(),
+    )
+    .await
+    {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(
             crate::governance::autopilot::SeedRefusal::NotAWorktree
-            | crate::governance::autopilot::SeedRefusal::NoWorkflowInMain
+            | crate::governance::autopilot::SeedRefusal::NoPinnedWorkflow
             | crate::governance::autopilot::SeedRefusal::MainNotRostered,
         ) => Err(StatusCode::CONFLICT),
         // Same answer `wire_chat_tools` gives when the hook cannot be written.

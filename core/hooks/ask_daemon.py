@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Production hook for NucleOS sessions — launched by the daemon or opened by hand.
 
-Registered under three events (`autopilot.rs`'s `wire_classifier_hook`), told apart by the
+Registered under six events (`autopilot.rs`'s `wire_classifier_hook`), told apart by the
 payload's own `hook_event_name` rather than by anything the invocation says, because the same
-command is wired to all three:
+command is wired to all six. `Stop`, `SubagentStop` and `UserPromptSubmit` only forward to the
+hooks a pinned workflow bundle declares (`bundle_hooks`), and fail open; the three tool events
+are what follows:
 
 A run (NUCLEOS_RUN_ID present) gets the full safety gate on `PreToolUse`: allows emit the
 recognized hookSpecificOutput approval contract, while denials and pending approvals emit the
@@ -776,6 +778,84 @@ def interactive_session(payload: dict) -> None:
     deny(reason + ("\n\n" + notice if notice else ""))
 
 
+# The events that are not about a tool call. Wired so a pinned workflow bundle can hang its own
+# hooks on them (`core/src/workflows/hooks.rs`); this script only forwards them.
+SESSION_EVENTS = ("Stop", "SubagentStop", "UserPromptSubmit")
+
+# Longer than the daemon's own fifty-second budget for running every hook of one event, so the
+# daemon is what stops a slow hook and says so, rather than this giving up first.
+BUNDLE_HOOKS_TIMEOUT = 55
+
+
+def merged_stdout(outputs):
+    """What to print for the hooks that produced output, in the order they ran.
+
+    Claude Code reads a hook's stdout as ONE document: a JSON object when the whole of it parses
+    as one, plain text otherwise. Two JSON objects printed one after the other parse as neither,
+    so they cannot simply be concatenated. The rule: the first output that is a JSON object is
+    printed alone (it is a decision or structured context, and a second one could only contradict
+    it); when none is, the plain texts are joined, one per paragraph, as context.
+    """
+    for out in outputs:
+        try:
+            if isinstance(json.loads(out), dict):
+                return out
+        except ValueError:
+            pass
+    return "\n\n".join(out.strip() for out in outputs)
+
+
+def bundle_hooks(payload: dict) -> None:
+    """Runs the hooks the project's pinned workflow bundles declare for this session event.
+
+    The daemon runs them, from its library, and hands back what each did; this reproduces Claude
+    Code's own reading of a hook. The first one that exited 2 blocks: its stderr is printed and
+    this exits 2. Otherwise the stdout of those that printed something is printed (`merged_stdout`)
+    and this exits 0.
+
+    **Fails open, every way.** No token, no daemon, an error, an answer it cannot read, no project,
+    no pins: exit 0 with nothing printed. These events are not a tool call this daemon governs;
+    they are a workflow's own guards, and a guard that cannot be reached must not leave a session
+    that can never stop, or a prompt that can never be sent.
+    """
+    try:
+        cwd = payload.get("cwd") or os.getcwd()
+        token, _why = read_control_token(cwd, 2, 3)
+        if not token:
+            no_opinion()
+        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
+        request = urllib.request.Request(
+            f"{daemon_url}/hooks/bundle",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=BUNDLE_HOOKS_TIMEOUT) as response:
+            answer = json.loads(response.read())
+        results = answer.get("results") if isinstance(answer, dict) else None
+        if not isinstance(results, list):
+            no_opinion()
+    except Exception:
+        no_opinion()
+
+    outputs = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        if result.get("exit_code") == 2:
+            sys.stderr.write(str(result.get("stderr") or ""))
+            sys.exit(2)
+        out = result.get("stdout")
+        if isinstance(out, str) and out.strip():
+            outputs.append(out)
+    if outputs:
+        print(merged_stdout(outputs))
+    sys.exit(0)
+
+
 def main() -> None:
     # Read exactly ONCE — stdin cannot be read twice — and keep the parse error rather than
     # acting on it: which of the three branches below owns this call is decided next, and each
@@ -796,6 +876,11 @@ def main() -> None:
     if event in ("PostToolUse", "PostToolUseFailure"):
         report_outcome(payload)
         return
+
+    # Before the run branch, which would otherwise send a `Stop` to the tool gate: these events
+    # carry no tool call, and they fail open whoever's session fired them.
+    if event in SESSION_EVENTS:
+        bundle_hooks(payload)
 
     run_id_raw = os.environ.get("NUCLEOS_RUN_ID")
     if run_id_raw is None:

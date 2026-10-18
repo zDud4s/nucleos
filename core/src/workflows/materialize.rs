@@ -1075,6 +1075,8 @@ pub fn sync(
     let pins = workflows::read_pins(pins_file)?;
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
+    // The bundle that put `.nucleos/workflow/` here, and its outcome's index, for the pointer.
+    let mut workflow_owner: Option<(usize, PathBuf)> = None;
     for pin in pins.workflows {
         if only.is_some_and(|name| name != pin.name) {
             continue;
@@ -1090,7 +1092,12 @@ pub fn sync(
         match source_of(checkout, &pin, library_root) {
             Err(why) => outcome.skipped = Some(why),
             Ok(bundle) => match materialize(&bundle, checkout, record_path, mode) {
-                Ok(report) => outcome.report = Some(report),
+                Ok(report) => {
+                    if provided(&owns_entries(&bundle.owns), WORKFLOW_DIR) {
+                        workflow_owner = Some((out.len(), PathBuf::from(&bundle.path)));
+                    }
+                    outcome.report = Some(report);
+                }
                 Err(error) => outcome.error = Some(error),
             },
         }
@@ -1101,7 +1108,89 @@ pub fn sync(
     {
         return Err(format!("this project does not use {name}"));
     }
+    if mode == Mode::Apply
+        && let Some((index, bundle_dir)) = workflow_owner
+        && let Some(state_dir) = pins_file.parent()
+        && let Err(error) = place_project_pointer(checkout, state_dir, &bundle_dir)
+    {
+        // The pin's files are in place, and without the pointer none of them can find the
+        // project's state: that is this workflow missing, the way `into_worktree` reports it.
+        out[index].error = Some(error);
+    }
     Ok(out)
+}
+
+/* ---------------------------------------------------------------- pointer -- */
+
+/// The directory a workflow bundle materializes its own rules into. A bundle owning it is a
+/// bundle whose scripts and text need [`PROJECT_POINTER`] beside them.
+pub const WORKFLOW_DIR: &str = ".nucleos/workflow";
+
+/// Where a materialized workflow learns which project it is in: `{id, state_dir, bundle_dir}`.
+///
+/// The workflow's state (plans, specs, loops, memory) lives in `~/.nucleos/projects/<id>/`, outside
+/// every checkout so it can never enter git, and its scripts live in the library. Neither path can
+/// be written into the bundle — it is the same bytes for every project on every machine — so the
+/// daemon writes it here, per checkout, every time it materializes. Not in the record: it is not
+/// the bundle's file, and recording it would make every sync see its own pointer as an edit.
+pub const PROJECT_POINTER: &str = ".nucleos/workflow/project.json";
+
+/// The directories a workflow writes its task instances into, made under the state directory so
+/// the first plan a phase writes does not depend on that phase knowing to make them.
+pub const STATE_SUBDIRS: &[&str] = &["plans", "specs", "loops"];
+
+/// Write [`PROJECT_POINTER`] into `checkout`, make the state directory's subdirectories, and keep
+/// `.nucleos/` out of the repository's status.
+///
+/// `state_dir` is the project's (`~/.nucleos/projects/<id>/`, the parent of its pins file), so
+/// the id is its last segment — the one spelling `project::state::dir` built it from. The pointer
+/// is rewritten only when it would change, so an unchanged sync touches nothing.
+///
+/// Hiding is best effort: a checkout that is not a repository (or git not there) has no status to
+/// keep clean, and failing the workflow over it would be failing the run for a cosmetic.
+fn place_project_pointer(
+    checkout: &Path,
+    state_dir: &Path,
+    bundle_dir: &Path,
+) -> Result<(), String> {
+    let absolute = |path: &Path| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let state_dir = absolute(state_dir);
+    let Some(id) = state_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return Err(format!("{} names no project", state_dir.display()));
+    };
+    for sub in STATE_SUBDIRS {
+        let dir = state_dir.join(sub);
+        std::fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    }
+    let pointer = serde_json::json!({
+        "id": id,
+        "state_dir": state_dir.to_string_lossy(),
+        "bundle_dir": absolute(bundle_dir).to_string_lossy(),
+    });
+    let text = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&pointer).map_err(|error| error.to_string())?
+    );
+    let target = checkout.join(PROJECT_POINTER);
+    if std::fs::read_to_string(&target).ok().as_deref() != Some(text.as_str()) {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("{}: {error}", parent.display()))?;
+        }
+        crate::project::state::write_atomically(&target, &text)
+            .map_err(|error| format!("{}: {error}", target.display()))?;
+    }
+    if let Err(error) = crate::execution::worktree::exclude_artifacts_dir_blocking(checkout) {
+        tracing::debug!(
+            %error,
+            checkout = %checkout.display(),
+            "`.nucleos/` was not hidden from git"
+        );
+    }
+    Ok(())
 }
 
 /* --------------------------------------------------------------- worktrees -- */
@@ -1599,6 +1688,93 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("feature-")
         );
+    }
+
+    /// A bundle that owns `.nucleos/workflow/` is told, beside its files, which project it is in
+    /// and where it lives; the project's state gets its task-instance folders; and `.nucleos/`
+    /// stays out of the repository's status.
+    #[test]
+    fn a_workflow_dir_owner_gets_the_project_pointer_and_its_state_dirs() {
+        let (temp, checkout, _) = setup(
+            &[(".nucleos/workflow/workflow.md", "rules")],
+            &[".nucleos/workflow/"],
+        );
+        let state = temp.path().join("home").join("projects").join("alpha");
+        let pins = state.join(crate::project::state::PINS_FILE);
+        let record = state.join(crate::project::state::MATERIALIZED_FILE);
+        let library = temp.path().join("lib");
+        workflows::install(&pins, &bundle(temp.path(), "1.0")).unwrap();
+        let repo = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&checkout)
+            .status()
+            .is_ok_and(|status| status.success());
+
+        // A plan writes nothing, the pointer included.
+        sync(&checkout, &pins, &library, &record, None, Mode::Preview).unwrap();
+        assert!(!checkout.join(PROJECT_POINTER).exists());
+
+        let outcomes = sync(&checkout, &pins, &library, &record, None, Mode::Apply).unwrap();
+        assert_eq!(outcomes[0].error, None);
+        let pointer: serde_json::Value =
+            serde_json::from_str(&read(&checkout.join(PROJECT_POINTER))).unwrap();
+        let absolute = |path: &Path| std::path::absolute(path).unwrap();
+        assert_eq!(pointer["id"], "alpha");
+        assert_eq!(
+            Path::new(pointer["state_dir"].as_str().unwrap()),
+            absolute(&state)
+        );
+        assert_eq!(
+            Path::new(pointer["bundle_dir"].as_str().unwrap()),
+            absolute(&library.join("dev").join("1.0"))
+        );
+        for sub in STATE_SUBDIRS {
+            assert!(state.join(sub).is_dir(), "{sub}");
+        }
+        // Not the bundle's file, so not in the record, and a second sync sees no edit in it.
+        assert!(
+            !read_record(&record).unwrap().bundles["dev"]
+                .files
+                .contains_key(PROJECT_POINTER)
+        );
+        let outcomes = sync(&checkout, &pins, &library, &record, None, Mode::Apply).unwrap();
+        assert!(outcomes[0].report.as_ref().unwrap().conflicts.is_empty());
+        assert_eq!(outcomes[0].error, None);
+
+        if repo {
+            let status = std::process::Command::new("git")
+                .args(["status", "--porcelain", "--untracked-files=all"])
+                .current_dir(&checkout)
+                .output()
+                .unwrap();
+            let status = String::from_utf8_lossy(&status.stdout);
+            assert!(!status.contains(".nucleos"), "{status}");
+        }
+    }
+
+    /// Only a bundle that owns the workflow directory gets a pointer: one placing other files has
+    /// nothing that would read it.
+    #[test]
+    fn a_bundle_not_owning_the_workflow_dir_gets_no_pointer() {
+        let (temp, checkout, _) = setup(&[("a.md", "one")], &["a.md"]);
+        let state = temp.path().join("home").join("projects").join("alpha");
+        let pins = state.join(crate::project::state::PINS_FILE);
+        let record = state.join(crate::project::state::MATERIALIZED_FILE);
+        workflows::install(&pins, &bundle(temp.path(), "1.0")).unwrap();
+
+        let outcomes = sync(
+            &checkout,
+            &pins,
+            &temp.path().join("lib"),
+            &record,
+            None,
+            Mode::Apply,
+        )
+        .unwrap();
+        assert_eq!(outcomes[0].error, None);
+        assert!(checkout.join("a.md").is_file());
+        assert!(!checkout.join(".nucleos").exists());
+        assert!(!state.join("plans").exists());
     }
 
     /// The pins decide what is synced: a drifted bundle is not, an ejected one comes from the

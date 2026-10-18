@@ -19,7 +19,7 @@ pub use self::paths::*;
 pub use self::shell_shape::*;
 use self::write_guards::*;
 
-pub const CLASSIFIER_VERSION: u32 = 22;
+pub const CLASSIFIER_VERSION: u32 = 23;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -64,7 +64,7 @@ const READ_LOCAL_TOOLS: &[&str] = &[
 /// that it was outside every list here, so it classified as `unrecognized-tool` and every call
 /// asked a person -- or, on an unattended run, was refused outright. That is conservative and it
 /// is also wrong in the way an unread rule is wrong: a notebook write was the one file write this
-/// file had no opinion about, so `.ai/autopilot.yaml` and the workspace boundary were enforced
+/// file had no opinion about, so `.claude/settings.json` and the workspace boundary were enforced
 /// against `Edit` and `Write` and not against the third tool that does the same thing.
 ///
 /// The order of the two halves of that change is the whole of its safety. `written_path` had to
@@ -102,34 +102,15 @@ const SUBAGENT_TOOLS: &[&str] = &["Agent", "Task"];
 
 /// Files whose CONTENTS are the policy, matched as a path suffix wherever they sit.
 ///
-/// The four `.ai/<machine setting>` entries below predate the move of this machine's settings to
-/// `~/.nucleos/` and are kept for the reasons each gives. `names_machine_settings` now covers all
-/// nine of those files in both places, so they are no longer the whole of that guard — they are
-/// where the argument for each file is written down.
+/// This machine's settings (`voice.yaml`'s `stt_command`, a string the daemon spawns on a hotkey
+/// press; `web.yaml`'s `trusted_hosts`; `browser.yaml`'s `enabled`; `github.yaml`'s lists of `gh`
+/// invocations that run unwatched) and each project's state (`autopilot.yaml`'s `gate_command`,
+/// the pins, the onboarding marker) are the same shape — a run that could append a line would be
+/// writing its own permission slip — and are guarded by name however they are rooted, by
+/// `names_machine_settings` and `names_project_state`. They used to be listed here as `.ai/<file>`
+/// too, for the copies the daemon once read or migrated from a checkout's `.ai/`; it reads nothing
+/// there any more, so those entries guarded nothing and were removed.
 const SELF_GOVERNING_FILES: &[&str] = &[
-    ".ai/autopilot.yaml",
-    // Holds `stt_command`, a string the daemon spawns on a hotkey press. That is the same shape as
-    // `.ai/autopilot.yaml`'s `gate_command`, and it is worse in one respect: the command runs outside
-    // any tool call this classifier ever sees, so nothing downstream would get a second look at it.
-    ".ai/voice.yaml",
-    // Holds `trusted_hosts`, the list deciding whose text may reach an agent as written
-    // (`trust.rs`). Adding a line to it is not a file write, it is granting trust — an autonomous
-    // run that could append a host it controls would be writing its own permission slip, and the
-    // next page from that host would arrive unmediated. Same shape as `gate_command` and
-    // `stt_command` above: what makes the file dangerous is that its CONTENTS are the policy.
-    ".ai/web.yaml",
-    // Holds the browser pillar's ceilings and its enabled switch. It does NOT hold the site lists —
-    // those live in `browser_sites`, and spec §5.2 lets them grow only by a person logging in — but
-    // it does hold `enabled`, and a run that could turn the pillar on would be granting itself a
-    // browser. Same shape as the three above: what makes the file dangerous is that its CONTENTS are
-    // the policy.
-    ".ai/browser.yaml",
-    // Holds the two lists that decide which `gh` invocations run with nobody watching. Same shape as
-    // the four above and the most literal instance of it yet: the file does not configure a policy,
-    // its CONTENTS ARE the policy, and every entry the ceilings admit is an action a run performs
-    // without asking. A run that could append a line here would be signing its own permission slip,
-    // and the next line would execute unseen.
-    ".ai/github.yaml",
     ".claude/settings.json",
     ".claude/settings.local.json",
     // The project's test map: which tests a change needs and which tools only the daemon runs. An
@@ -152,6 +133,10 @@ const SELF_GOVERNING_FILES: &[&str] = &[
 /// of them would have been half a trade. `.claude/agents/` and `.claude/commands/` were the same gap
 /// already open, and are closed here rather than left for the next person to find twice.
 const SELF_GOVERNING_DIRS: &[&str] = &[
+    // A project's ejected workflow copies (`workflows::EJECTED_DIR`): what the daemon materializes
+    // into every worktree in place of the library's bundle, so an agent that edits one is editing
+    // the rules the next run is given — the same reason `.claude/skills/` is here.
+    ".nucleos/workflows/",
     ".claude/hooks/",
     ".claude/skills/",
     ".claude/agents/",
@@ -627,10 +612,10 @@ pub fn classify(
     // `("allow", "read-local")`, so everything a write `allow` could reach is either the compiled
     // `outside-workspace` deny above or one of the three governance prompts below —
     // `self-governing-file`, `executes-on-next-command`, `no-workspace`. A project that could
-    // `allow Edit .ai/` would be waiving the guard over its own autopilot files, using the very
-    // mechanism that guard exists to keep honest. The shell side's rule is the same and is stated
-    // on `classify` itself: an `allow` widens what this file would have ASKED about and lifts
-    // nothing that was refused.
+    // `allow Edit .claude/` would be waiving the guard over its own governance files, using the
+    // very mechanism that guard exists to keep honest. The shell side's rule is the same and is
+    // stated on `classify` itself: an `allow` widens what this file would have ASKED about and
+    // lifts nothing that was refused.
     if WRITE_TOOLS.contains(&tool_name)
         && write_denied_by_project(tool_name, tool_input, cwd, rules)
     {
@@ -1210,7 +1195,7 @@ fn classify_segment(
     // the workspace — and none of them may widen a command onto this machine's own settings. A
     // compiled read above (`cat`, `grep`) still reads them; what cannot happen is a project that
     // declared `cp` getting `cp x ~/.nucleos/github.yaml` for free, or a job node's `cp x
-    // .ai/github.yaml` counting as confined to its workspace. See `names_machine_settings`.
+    // .nucleos/github.yaml` counting as confined to its workspace. See `names_machine_settings`.
     if segment_names_machine_settings(segment) {
         return Segment::Unrecognized;
     }
@@ -2758,7 +2743,7 @@ mod tests {
         assert_classification(
             classify(
                 "Edit",
-                &json!({"file_path": ".ai/autopilot.yaml"}),
+                &json!({"file_path": ".claude/settings.json"}),
                 Some(Path::new(r"C:\work\repo")),
             ),
             "pending_approval",
@@ -2766,7 +2751,7 @@ mod tests {
         );
     }
 
-    /// `.ai/voice.yaml` holds `stt_command`, which the daemon spawns when a hotkey is pressed.
+    /// `voice.yaml` holds `stt_command`, which the daemon spawns when a hotkey is pressed.
     ///
     /// Without this entry the chain is green end to end: editing the file is an ordinary allowed write,
     /// and the command it plants then runs outside any tool call the classifier ever sees — so unlike
@@ -2778,7 +2763,7 @@ mod tests {
             assert_classification(
                 classify(
                     tool,
-                    &json!({"file_path": ".ai/voice.yaml"}),
+                    &json!({"file_path": ".nucleos/voice.yaml"}),
                     Some(Path::new(r"C:\work\repo")),
                 ),
                 "pending_approval",
@@ -2977,7 +2962,7 @@ mod tests {
                 (r"C:\elsewhere\notes.ipynb", "deny", "outside-workspace"),
                 // The agent's own governance. A person decides, always.
                 (
-                    r"C:\work\repo\.ai\autopilot.yaml",
+                    r"C:\work\repo\.claude\settings.json",
                     "pending_approval",
                     "self-governing-file",
                 ),
@@ -3136,7 +3121,7 @@ mod tests {
                 Some(Path::new(r"C:\work\repo")),
             ),
             (
-                r"C:\work\repo\src\..\.ai\autopilot.yaml",
+                r"C:\work\repo\src\..\.claude\settings.json",
                 Some(Path::new(r"C:\work\repo")),
             ),
             ("nested/../.claude/hooks/check.py", None),
@@ -4281,15 +4266,15 @@ mod tests {
             "cp ./ask_daemon.py ./.claude/hooks",
             "cp ./ask_daemon.py ./.claude/hooks/",
             "cp ./settings.json ./.claude",
-            "cp ./autopilot.yaml ./.ai/",
+            "cp ./graph.yaml ./.nucleos/workflows/",
             "mv ./.claude ./old",
             "cp ./x.json ./.claude/settings.json",
             "cp ./x.json ./.claude/settings.local.json",
             "cp ./x.md ./.claude/skills/orchestrate/SKILL.md",
             "cp ./x.md ./.claude/agents/wf-executor.md",
             "cp ./x.md ./.agents/skills/orchestrate/SKILL.md",
-            "cp ./x.yaml ./.ai/autopilot.yaml",
-            "cp ./x.yaml ./core/../.ai/voice.yaml",
+            "cp ./x.yaml ./.nucleos/workflows/dev/graph.yaml",
+            "cp ./x.yaml ./core/../.nucleos/voice.yaml",
             // Bare, with no separator: confinement does not read it as a path, but it is one.
             "cp ./x.yaml nucleos.tests.yaml",
             // Carried on a flag.
@@ -4822,7 +4807,7 @@ mod tests {
     /// is a `self-governing-file`, and no project `allow` or workspace confinement widens a shell
     /// command that names one — a tightening only. 15 followed each project's own state there too:
     /// `autopilot.yaml` and `workflows.yaml` under any `.nucleos/projects/<id>/`, however that
-    /// directory is rooted, and the old `.ai/workflows.yaml` a startup migration still copies from,
+    /// directory is rooted, and the old `.ai/workflows.yaml` a startup migration then copied from,
     /// are `self-governing-file` — a tightening only. (A home-spelled path was already refused by
     /// 14; what 15 adds is the absolute spelling and the legacy pins file.) 16 adds the onboarding
     /// marker, `onboarded.yaml`, to that set: it is what lets a project be activated at all, so an
@@ -4848,7 +4833,12 @@ mod tests {
     /// simple commands: substitutions, loop and branch bodies and subshells are judged command by
     /// command where they used to ask whole, and an assigned literal is spelled out by scope inside
     /// an area; eval, source, functions, case, process substitution and `[[ ]]` still ask. A
-    /// loosening on shape, not on any rule.
+    /// loosening on shape, not on any rule. 23 (2026-10-17) stops guarding the old `.ai/` copies —
+    /// `.ai/autopilot.yaml`, `.ai/workflows.yaml` and the nine `.ai/<setting>` files — because the
+    /// daemon no longer reads or migrates anything from `.ai/`, so a write there decides nothing (a
+    /// loosening on names nothing reads), and guards a project's ejected workflow copies under
+    /// `.nucleos/workflows/` the way `.claude/skills/` is guarded, since those are what every new
+    /// worktree is given (a tightening).
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -4863,7 +4853,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 22);
+        assert_eq!(CLASSIFIER_VERSION, 23);
     }
 
     /// `(decision, action_class)` of a Bash line, with the cwd every test in this group uses.
@@ -5124,13 +5114,13 @@ mod tests {
     /// workspace before this branch is ever reached — a containment failure wearing a governance
     /// test's name.
     #[test]
-    fn writing_ai_github_yaml_asks_for_approval() {
+    fn writing_github_yaml_asks_for_approval() {
         let cwd = Some(Path::new(r"C:\work\repo"));
         for path in [
-            ".ai/github.yaml",
-            r".ai\github.yaml",
-            r"C:\work\repo\.ai\github.yaml",
-            r"C:\work\repo\src\..\.ai\github.yaml",
+            ".nucleos/github.yaml",
+            r".nucleos\github.yaml",
+            r"C:\work\repo\.nucleos\github.yaml",
+            r"C:\work\repo\src\..\.nucleos\github.yaml",
         ] {
             assert_classification(
                 classify("Write", &json!({ "file_path": path }), cwd),
@@ -5147,9 +5137,9 @@ mod tests {
     /// is matched against a path glued onto the workspace, so before `names_machine_settings` they
     /// landed "inside" it and were allowed. The absolute form is refused one step earlier, as a
     /// write outside the workspace, and with no workspace at all it still asks.
-    /// A project's rules and pins moved to `~/.nucleos/projects/<id>/`, and an agent may no more
-    /// write them there than it could in the project's `.ai/`. Home-spelled, absolute, and in the
-    /// shell — plus the old `.ai/workflows.yaml`, which startup still migrates from.
+    /// A project's rules and pins live in `~/.nucleos/projects/<id>/`, and an agent may not write
+    /// them there. Home-spelled, absolute, and in the shell. The old `.ai/` copies are nobody's
+    /// state any more — nothing reads or migrates them — so writing one is an ordinary write.
     #[test]
     fn writing_a_projects_state_in_its_new_home_asks_for_approval() {
         let cwd = Some(Path::new(r"C:\work\repo"));
@@ -5161,8 +5151,6 @@ mod tests {
                 "~/.nucleos/projects/alpha/onboarded.yaml",
                 "~/.nucleos/projects/alpha/materialized.yaml",
                 "~/.nucleos/projects/alpha/materialized/job-12-0a1b2c3d.yaml",
-                ".ai/workflows.yaml",
-                ".ai/autopilot.yaml",
             ] {
                 assert_classification(
                     classify(tool, &json!({ "file_path": path }), cwd),
@@ -5204,18 +5192,25 @@ mod tests {
             "cp marker.yaml C:/Users/someone/.nucleos/projects/alpha/onboarded.yaml",
             "cp record.yaml C:/Users/someone/.nucleos/projects/alpha/materialized.yaml",
             "cp record.yaml C:/Users/someone/.nucleos/projects/alpha/materialized/job-3-aa.yaml",
-            "cp evil.yaml .ai/workflows.yaml",
         ] {
             let asked = classify("Bash", &json!({ "command": command }), cwd);
             assert_eq!(asked.decision.decision, "pending_approval", "{command}");
         }
-        // A file of the same name that is not in a project's state directory stays ordinary.
-        assert_eq!(
-            classify("Write", &json!({ "file_path": "docs/autopilot.yaml" }), cwd)
-                .decision
-                .decision,
-            "allow"
-        );
+        // A file of the same name that is not in a project's state directory stays ordinary — and
+        // so does the old `.ai/` spelling, which the daemon no longer reads.
+        for path in [
+            "docs/autopilot.yaml",
+            ".ai/autopilot.yaml",
+            ".ai/workflows.yaml",
+        ] {
+            assert_eq!(
+                classify("Write", &json!({ "file_path": path }), cwd)
+                    .decision
+                    .decision,
+                "allow",
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -5256,21 +5251,30 @@ mod tests {
         }
     }
 
-    /// The old `.ai/<file>` is guarded for all nine files, not only the four that were listed before
-    /// the move: the daemon copies any of them into `~/.nucleos/` at startup when the new one is
-    /// missing, so writing one in the daemon's checkout is writing the owner's settings later.
+    /// Every settings file is guarded by name under `.nucleos/`, however it is rooted — and the old
+    /// `.ai/<file>` copies are not: the daemon no longer reads or migrates them, so a write there
+    /// decides nothing and stays an ordinary write.
     #[test]
-    fn every_legacy_settings_file_in_a_project_asks_for_approval() {
+    fn every_settings_file_under_dot_nucleos_asks_and_its_old_ai_copy_does_not() {
         let cwd = Some(Path::new(r"C:\work\repo"));
         for setting in crate::machine_config::SETTINGS {
+            assert_classification(
+                classify(
+                    "Write",
+                    &json!({ "file_path": format!(".nucleos/{}", setting.path) }),
+                    cwd,
+                ),
+                "pending_approval",
+                "self-governing-file",
+            );
             assert_classification(
                 classify(
                     "Write",
                     &json!({ "file_path": format!(".ai/{}", setting.path) }),
                     cwd,
                 ),
-                "pending_approval",
-                "self-governing-file",
+                "allow",
+                "read-local",
             );
         }
     }
@@ -5301,7 +5305,7 @@ mod tests {
             "echo x > ~/.nucleos/nucleos-models.yaml",
             "echo x >> $HOME/.nucleos/github.yaml",
             "cp evil.yaml ~/.nucleos/github.yaml",
-            "cp evil.yaml .ai/github.yaml",
+            "cp evil.yaml .nucleos/github.yaml",
             "cp --target-directory=~/.nucleos evil.yaml",
         ] {
             let asked = classify("Bash", &json!({ "command": command }), cwd);
@@ -5539,7 +5543,7 @@ mod tests {
             "cp ./x.json .claude/settings.json",
             "cp ./payload.py ./.claude/hooks/ask_daemon.py",
             "cp ./x.md ./.claude/skills/orchestrate/SKILL.md",
-            "cp ./x.yaml ./.ai/autopilot.yaml",
+            "cp ./x.yaml ./.nucleos/workflows/dev/graph.yaml",
             "cp ./ask_daemon.py ./.claude/hooks",
         ] {
             assert_classification(
@@ -5981,18 +5985,18 @@ mod tests {
     /// underneath it are the proof.
     ///
     /// The first half is what a rule that names something else does to them: nothing. The second is
-    /// the direction that IS available — a project may refuse `.ai/` outright, turning the prompt
-    /// into a refusal — and the direction that is not: there is no `allow` to declare, so no rule
-    /// in this table can turn `self-governing-file` or `executes-on-next-command` into an `allow`.
-    /// A project that could waive the guard over its own autopilot files would be using the
-    /// mechanism that guard exists to keep honest.
+    /// the direction that IS available — a project may refuse `.claude/` outright, turning the
+    /// prompt into a refusal — and the direction that is not: there is no `allow` to declare, so no
+    /// rule in this table can turn `self-governing-file` or `executes-on-next-command` into an
+    /// `allow`. A project that could waive the guard over its own governance files would be using
+    /// the mechanism that guard exists to keep honest.
     #[test]
     fn a_project_rule_never_lifts_the_governance_prompt_it_sits_above() {
         let cwd = Some(Path::new(r"C:\work\repo"));
         let elsewhere = write_rules(&[("Edit", "core/migrations")]);
 
         assert_classification(
-            classify_writes(&elsewhere, "Edit", ".ai/autopilot.yaml", cwd),
+            classify_writes(&elsewhere, "Edit", ".claude/settings.json", cwd),
             "pending_approval",
             "self-governing-file",
         );
@@ -6004,9 +6008,9 @@ mod tests {
 
         // Downwards is the only way this table can move a prompt, and the class it lands on is the
         // project's own — the scoreboard should say who refused.
-        let governing = write_rules(&[("Edit", ".ai")]);
+        let governing = write_rules(&[("Edit", ".claude")]);
         assert_classification(
-            classify_writes(&governing, "Edit", ".ai/autopilot.yaml", cwd),
+            classify_writes(&governing, "Edit", ".claude/settings.json", cwd),
             "deny",
             "project-denied",
         );
@@ -6050,7 +6054,7 @@ mod tests {
             ("Write", "ls", cwd, "allow", "read-local"),
             (
                 "Edit",
-                ".ai/autopilot.yaml",
+                ".claude/settings.json",
                 cwd,
                 "pending_approval",
                 "self-governing-file",
@@ -6425,7 +6429,7 @@ mod tests {
     #[test]
     fn python_script_help_is_a_read_and_nothing_else_about_python_is() {
         let composed =
-            "python .ai/scripts/spec_loop.py --help 2>&1 | head -30; ls .ai/specs | tail -5";
+            "python scripts/spec_loop.py --help 2>&1 | head -30; ls docs/specs | tail -5";
         assert_eq!(
             decision_in_workspace(composed),
             "allow",

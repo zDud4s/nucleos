@@ -52,7 +52,7 @@
 //! - **`referenced`** — the library has the pinned bundle and it hashes to what was pinned.
 //! - **`drifted`** — the library has it, and it does not. Somebody edited the bundle in place under
 //!   a pin that claims to know what it says.
-//! - **`ejected`** — this project has its own copy under `.ai/workflows/<name>/`. It is never
+//! - **`ejected`** — this project has its own copy under `.nucleos/workflows/<name>/`. It is never
 //!   `missing`, whatever the library holds: the project has the bundle in its hands.
 //! - **`missing`** — pinned, and the library has nothing at that coordinate.
 //!
@@ -61,6 +61,7 @@
 //! pinned is not the 1.0 you have" are opposite facts that would send a person to opposite places.
 
 pub mod graph;
+pub mod hooks;
 pub mod materialize;
 pub mod package;
 
@@ -79,7 +80,7 @@ use sha2::{Digest, Sha256};
 ///
 /// Every function below that reads or writes pins therefore takes the pins FILE as its own
 /// argument, and only the ones that also touch a copy take the project root beside it.
-pub const EJECTED_DIR: &str = ".ai/workflows";
+pub const EJECTED_DIR: &str = ".nucleos/workflows";
 
 /// The one file in a bundle this module parses. Everything else is bytes to be hashed.
 pub const MANIFEST: &str = "bundle.yaml";
@@ -103,7 +104,7 @@ pub fn library_root() -> Option<PathBuf> {
 
 /* ------------------------------------------------------------------ names -- */
 
-/// Whether `name` may be used as a directory under the library or under `.ai/workflows/`.
+/// Whether `name` may be used as a directory under the library or under `.nucleos/workflows/`.
 ///
 /// Deliberately stricter than the filesystem. This name is joined onto a path **and** used to
 /// address a route, and it is the argument to the one operation in this module that deletes a
@@ -232,6 +233,26 @@ struct ManifestFile {
     /// A bundle-relative file whose text is the managed block of the project's `AGENTS.md`. See
     /// [`crate::workflows::materialize`]. Absent, and the bundle never touches `AGENTS.md`.
     agents_block: Option<String>,
+    /// Claude Code hooks this workflow runs, from the library, for any project that pins it: a
+    /// list of [`hooks::HookDecl`]. See [`crate::workflows::hooks`], the only reader and the place
+    /// they are parsed and validated.
+    ///
+    /// Kept as raw YAML here on purpose. `read_bundle` falls back to an empty manifest when this
+    /// struct does not parse, so a typed field would let one mistyped hook key erase the bundle's
+    /// `owns:` and `agents_block` from every listing and materialization — a broken hook would
+    /// take the whole workflow with it. Parsed late, it costs only the hooks.
+    #[serde(default)]
+    hooks: serde_yaml::Value,
+}
+
+/// Whether `text` parses as a manifest, field types included.
+///
+/// [`read_bundle`] is lenient on purpose — a manifest that does not parse lists as an empty one —
+/// so packaging asks this instead: a mistyped field there would ship a bundle that owns nothing.
+pub fn parse_manifest(text: &str) -> Result<(), String> {
+    serde_yaml::from_str::<Option<ManifestFile>>(text)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// One bundle in the library, as it is on disk right now.
@@ -403,7 +424,7 @@ pub struct Pin {
     /// says the app must not ask somebody to recreate the harness they already have — this
     /// repository's `.ai/` built NucleOS — so adopting it points the pin at the folder that is
     /// there and touches nothing inside it. `None` is the ordinary case: an ejected copy lives at
-    /// `.ai/workflows/<name>/` and does not need saying.
+    /// `.nucleos/workflows/<name>/` and does not need saying.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -754,7 +775,7 @@ pub fn install(pins_file: &Path, bundle: &Bundle) -> Result<(), Refused> {
         origin: bundle.origin.clone(),
         hash: bundle.hash.clone(),
         // Cleared, because installing from the library is the opposite of holding your own copy.
-        // The folder under `.ai/workflows/` is left alone — deleting a project's files is not
+        // The folder under `.nucleos/workflows/` is left alone — deleting a project's files is not
         // something an install may do quietly — and `installed` reads the disk, so it will keep
         // reporting `ejected` until somebody removes it. That is the truth of the situation.
         ejected_at: None,
@@ -773,7 +794,7 @@ pub fn install(pins_file: &Path, bundle: &Bundle) -> Result<(), Refused> {
 
 /// Stop using a workflow. Removes the pin; never removes an ejected copy.
 ///
-/// Deleting `.ai/workflows/<name>/` here would be this app deleting somebody's files as a side
+/// Deleting `.nucleos/workflows/<name>/` here would be this app deleting somebody's files as a side
 /// effect of a list operation. The copy is theirs — that is what ejecting means — and it is under
 /// version control where they put it.
 pub fn uninstall(pins_file: &Path, name: &str) -> Result<(), Refused> {
@@ -802,7 +823,8 @@ pub fn eject(
         return Err(Refused::AlreadyEjected);
     }
     // The pin is looked up before anything is copied. A project that does not use this workflow
-    // must not end up with its files in `.ai/workflows/` and nothing recording why they are there.
+    // must not end up with its files in `.nucleos/workflows/` and nothing recording why they are
+    // there.
     let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
     let Some(index) = pins
         .workflows
@@ -812,7 +834,7 @@ pub fn eject(
         return Err(Refused::NotInstalled);
     };
     // An adopted workflow is already the project's own folder. Ejecting on top of it would copy a
-    // library bundle into `.ai/workflows/` while the pin went on naming somewhere else — two
+    // library bundle into `.nucleos/workflows/` while the pin went on naming somewhere else — two
     // copies, one of them unreferenced, and a page that could not say which was running.
     if pins.workflows[index].path.is_some() {
         return Err(Refused::Adopted);
@@ -1069,6 +1091,25 @@ mod tests {
         assert!(before.starts_with("sha256:"));
     }
 
+    /// A mistyped hook costs the hooks and nothing else: the bundle still lists with the files it
+    /// owns, which is what every materialization of it reads.
+    #[test]
+    fn a_broken_hook_declaration_does_not_erase_the_rest_of_the_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = shelf(temp.path(), "harness", "1.0", &[]);
+        let dir = root.join("harness/1.0");
+        std::fs::write(
+            dir.join(MANIFEST),
+            "description: a workflow\nowns:\n  - .ai/workflow/\nhooks:\n  - event: Stop\n    scirpt: x.py\n",
+        )
+        .unwrap();
+
+        let bundle = bundle_at(&root, "harness", "1.0");
+        assert_eq!(bundle.owns, vec![".ai/workflow/".to_string()]);
+        assert_eq!(bundle.description.as_deref(), Some("a workflow"));
+        assert!(hooks::manifest_hooks(&dir).is_err());
+    }
+
     #[test]
     fn two_files_whose_names_run_together_do_not_hash_alike() {
         let mut left = BTreeMap::new();
@@ -1250,7 +1291,7 @@ mod tests {
 
         assert!(
             project
-                .join(".ai/workflows/harness/skills/plan.md")
+                .join(".nucleos/workflows/harness/skills/plan.md")
                 .is_file()
         );
         let rows = installed(&project, &pins_of(&project), &lib).unwrap();
@@ -1276,13 +1317,13 @@ mod tests {
         install(&pins_of(&project), &bundle).unwrap();
         eject(&project, &pins_of(&project), &bundle, now()).unwrap();
 
-        std::fs::write(project.join(".ai/workflows/harness/g.yaml"), "mine").unwrap();
+        std::fs::write(project.join(".nucleos/workflows/harness/g.yaml"), "mine").unwrap();
         assert_eq!(
             eject(&project, &pins_of(&project), &bundle, now()),
             Err(Refused::AlreadyEjected)
         );
         assert_eq!(
-            std::fs::read_to_string(project.join(".ai/workflows/harness/g.yaml")).unwrap(),
+            std::fs::read_to_string(project.join(".nucleos/workflows/harness/g.yaml")).unwrap(),
             "mine"
         );
     }
@@ -1301,7 +1342,7 @@ mod tests {
         let bundle = bundle_at(&lib, "harness", "1.0");
         install(&pins_of(&project), &bundle).unwrap();
         eject(&project, &pins_of(&project), &bundle, now()).unwrap();
-        std::fs::remove_dir_all(project.join(".ai/workflows/harness")).unwrap();
+        std::fs::remove_dir_all(project.join(".nucleos/workflows/harness")).unwrap();
 
         // The field still says it was ejected; the disk decides, and the disk says there is no copy.
         assert_eq!(
@@ -1325,7 +1366,7 @@ mod tests {
         install(&pins_of(&project), &bundle).unwrap();
         eject(&project, &pins_of(&project), &bundle, now()).unwrap();
 
-        let mine_dir = project.join(".ai/workflows/harness");
+        let mine_dir = project.join(".nucleos/workflows/harness");
         std::fs::write(mine_dir.join("a.md"), "one, changed").unwrap();
         std::fs::write(mine_dir.join("c.md"), "new").unwrap();
         std::fs::remove_file(mine_dir.join("b.md")).unwrap();
@@ -1390,7 +1431,7 @@ mod tests {
         let old = bundle_at(&lib, "harness", "1.0");
         install(&pins_of(&project), &old).unwrap();
         eject(&project, &pins_of(&project), &old, now()).unwrap();
-        std::fs::write(project.join(".ai/workflows/harness/g.yaml"), "mine").unwrap();
+        std::fs::write(project.join(".nucleos/workflows/harness/g.yaml"), "mine").unwrap();
 
         shelf(&lib, "harness", "1.1", &[("g.yaml", "b")]);
         let later = now() + chrono::Duration::days(30);
@@ -1403,7 +1444,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(project.join(".ai/workflows/harness/g.yaml")).unwrap(),
+            std::fs::read_to_string(project.join(".nucleos/workflows/harness/g.yaml")).unwrap(),
             "b"
         );
         let rows = installed(&project, &pins_of(&project), &lib).unwrap();
@@ -1607,7 +1648,7 @@ mod tests {
 
         uninstall(&pins_of(&project), "harness").unwrap();
         assert!(read_pins(&pins_of(&project)).unwrap().workflows.is_empty());
-        assert!(project.join(".ai/workflows/harness/g.yaml").is_file());
+        assert!(project.join(".nucleos/workflows/harness/g.yaml").is_file());
         assert_eq!(
             uninstall(&pins_of(&project), "harness"),
             Err(Refused::NotInstalled)
@@ -1635,6 +1676,6 @@ mod tests {
             ),
             Err(Refused::NotInstalled)
         );
-        assert!(!project.join(".ai/workflows/harness").exists());
+        assert!(!project.join(".nucleos/workflows/harness").exists());
     }
 }

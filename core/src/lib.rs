@@ -107,6 +107,7 @@ pub use nucleos_base::verify_sched;
 pub use nucleos_base::warm;
 pub use nucleos_base::web_client;
 pub mod wip;
+pub mod workflow_records;
 pub mod workflows;
 
 // The module-map check only reads files, so it runs inside this library's test binary. As an

@@ -259,6 +259,9 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // a file the core wrote out the other, and authority to act on the day that authority exists.
     ("read_team_file", ToolEffect::ReadsUntrusted),
     ("recall", ToolEffect::ReadsOwn),
+    // `WritesOwn`, like `verify`: one row in this machine's own workflow ledger, filed against the
+    // caller's own worktree; nothing leaves the machine and nothing is acted on.
+    ("record", ToolEffect::WritesOwn),
     ("reject_proposal", ToolEffect::Acts),
     // `Acts`, and this one is the barrier itself rather than a label on it. Every other tool on
     // this table is classified so that `permitted_after_untrusted` can decide whether to let it

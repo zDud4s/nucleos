@@ -119,6 +119,7 @@ impl DaemonClient {
         worktree: Option<&str>,
         files: Option<&[String]>,
         base: Option<&str>,
+        task_id: Option<&str>,
     ) -> Result<Value, String> {
         self.verify_request(
             "/verify",
@@ -128,10 +129,17 @@ impl DaemonClient {
                 "worktree": worktree,
                 "files": files,
                 "base": base,
+                "task_id": task_id,
                 "wait": true,
             }),
         )
         .await
+    }
+
+    /// File one workflow ledger record (`POST /workflow/records`). The body is the `record` tool's
+    /// arguments as the box resolved them; the daemon validates it and picks the project.
+    pub async fn record(&self, body: &Value) -> Result<Value, String> {
+        self.verify_request("/workflow/records", body).await
     }
 
     /// Ask the daemon for a covered verification of a worktree (F3-13): `cover` makes the daemon
@@ -174,7 +182,8 @@ impl DaemonClient {
         .await
     }
 
-    /// The one request every verify call makes (`verify`, `verify_status`, `verify_box_beat`). A
+    /// The one request every verify call makes (`verify`, `verify_status`, `verify_box_beat`, and
+    /// `record`, which shares their keys and their refusal shape). A
     /// refusal carries its reason in the body (the handlers answer `(StatusCode, String)`), so the
     /// body is read first and the status is only the fallback, as in `github_request`.
     async fn verify_request(&self, path: &str, body: &Value) -> Result<Value, String> {

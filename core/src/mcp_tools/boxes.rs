@@ -163,13 +163,16 @@ pub const TEAM_TOOLS: &[&str] = &[
 ///
 /// `verify` and `verify_status` are listed too, so a job node can verify its own worktree (they are
 /// in `--allowedTools` through this list) — but, unlike `note_finding`, they are also offered to
-/// every other box: see `EVERY_BOX_TOOLS`.
-pub const JOB_NODE_TOOLS: &[&str] = &["note_finding", "verify", "verify_status"];
+/// every other box: see `EVERY_BOX_TOOLS`. `record` rides with them: a job node files its workflow
+/// ledger records against the same worktree it verifies.
+pub const JOB_NODE_TOOLS: &[&str] = &["note_finding", "record", "verify", "verify_status"];
 
 /// The members of `JOB_NODE_TOOLS` that `McpBox::All` serves as well. A chat or a plain run has a
 /// worktree of its own to verify and the daemon is the only thing that may run verification, so
-/// these two are not a job node's privilege the way a finding is.
-pub const EVERY_BOX_TOOLS: &[&str] = &["verify", "verify_status"];
+/// these are not a job node's privilege the way a finding is. `record` is served wherever `verify`
+/// is, because the workflow that verifies is the one that keeps the ledger, in whichever box it
+/// runs.
+pub const EVERY_BOX_TOOLS: &[&str] = &["record", "verify", "verify_status"];
 
 /// What a team agent's box serves by default: today's `TEAM_TOOLS` plus the door that asks for more
 /// and `read_context`, the door onto the context files the agent was given.
@@ -196,7 +199,7 @@ pub const TEAM_BASE: &[&str] = &[
 ///   teams design and pinned by tests;
 /// - `github_read` rides the owner's Control door (decisions 2026-08-20);
 /// - `browser_*` need a `project_id` a team lacks;
-/// - `verify`/`verify_status` need a worktree;
+/// - `verify`/`verify_status`/`record` need a worktree;
 /// - `vcs_ticket` needs a `vcs_request`;
 /// - `recall` is the first candidate once knowledge scoping is agent/team-aware.
 pub const TEAM_EXTRAS: &[&str] = &[];
@@ -206,6 +209,7 @@ pub const TEAM_EXTRAS: &[&str] = &[];
 pub const JOB_NODE_BASE: &[&str] = &[
     "note_finding",
     "read_context",
+    "record",
     "request_tool",
     "verify",
     "verify_status",

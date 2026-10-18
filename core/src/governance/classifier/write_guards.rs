@@ -75,9 +75,9 @@ pub(super) fn segment_names_self_governing(segment: &str, cwd: Option<&Path>) ->
 }
 
 /// PURE: whether `path` IS a directory a self-governing file or directory sits in — `.claude`,
-/// `.claude/hooks`, `.ai`, `.agents/skills` — rather than something under one. A copy or a move
-/// into it lands the file underneath under its own name (`cp ./settings.json ./.claude`), and a
-/// move of it takes everything inside along.
+/// `.claude/hooks`, `.nucleos/workflows`, `.agents/skills` — rather than something under one. A
+/// copy or a move into it lands the file underneath under its own name (`cp ./settings.json
+/// ./.claude`), and a move of it takes everything inside along.
 fn is_a_self_governing_dir(path: &str, cwd: Option<&Path>) -> bool {
     let normalized = fold_for_match(&normalize_path(path, cwd));
     let parents = SELF_GOVERNING_FILES
@@ -101,7 +101,7 @@ pub(super) const HOME_SPELLINGS: &[&str] =
     &["~/", "$home/", "${home}/", "%userprofile%/", "%homepath%/"];
 
 /// PURE: whether `raw` names this machine's own settings — `~/.nucleos/`, where the daemon reads
-/// them, or the old `.ai/<file>` it copies them from once.
+/// them.
 ///
 /// **Why this is its own check rather than nine more lines in `SELF_GOVERNING_FILES`.** Those files
 /// moved out of the project and into the home directory, and a suffix list is matched against a
@@ -119,10 +119,9 @@ pub(super) const HOME_SPELLINGS: &[&str] =
 ///   one without is otherwise only `no-workspace`. Derived from [`crate::machine_config::SETTINGS`]
 ///   so a tenth file cannot be added there and forgotten here.
 ///
-/// **The old `.ai/<file>` is still guarded, and that is not nostalgia.** At every start the daemon
-/// copies `<working directory>/.ai/<file>` into `~/.nucleos/` for any file the latter lacks, so a
-/// run that could write `.ai/github.yaml` in the daemon's own checkout would, on a machine that
-/// never had one, be writing the owner's GitHub policy one restart later.
+/// The old `.ai/<file>` copies are not guarded any more: the startup migration that copied them
+/// into `~/.nucleos/` is gone, so the daemon never reads one again and a write there decides
+/// nothing.
 ///
 /// **Each project's own state, by name, however it is rooted.** `autopilot.yaml` (the gate
 /// command, and so what *green* means), `workflows.yaml`, `onboarded.yaml` (the marker
@@ -131,9 +130,7 @@ pub(super) const HOME_SPELLINGS: &[&str] =
 /// files it may overwrite) live in `~/.nucleos/projects/<id>/`
 /// (`project/state.rs`). The home spelling is covered by the first answer above; the absolute one
 /// is matched here as `.nucleos/projects/<any id>/<file>`, which a job worktree
-/// (`.nucleos/worktrees/...`) never is. The old `.ai/workflows.yaml` is guarded for the reason the
-/// old settings files are: startup copies it into a project's state directory when that has none.
-/// (`.ai/autopilot.yaml` was always in [`SELF_GOVERNING_FILES`].)
+/// (`.nucleos/worktrees/...`) never is.
 pub(super) fn names_machine_settings(raw: &str) -> bool {
     let folded = fold_for_match(&raw.replace('\\', "/"));
     let under_home_settings = HOME_SPELLINGS.iter().any(|home| {
@@ -143,16 +140,14 @@ pub(super) fn names_machine_settings(raw: &str) -> bool {
     });
     let normalized = normalize_path(&folded, None);
     under_home_settings
-        || crate::machine_config::SETTINGS.iter().any(|setting| {
-            path_has_suffix(&normalized, &format!(".nucleos/{}", setting.path))
-                || path_has_suffix(&normalized, &format!(".ai/{}", setting.path))
-        })
+        || crate::machine_config::SETTINGS
+            .iter()
+            .any(|setting| path_has_suffix(&normalized, &format!(".nucleos/{}", setting.path)))
         || names_project_state(&normalized)
 }
 
 /// PURE: whether an already-normalised, case-folded path is one project's state file — under
-/// `.nucleos/projects/<id>/` — or the old `.ai/workflows.yaml` it is migrated from. See
-/// [`names_machine_settings`].
+/// `.nucleos/projects/<id>/`. See [`names_machine_settings`].
 pub(super) fn names_project_state(normalized: &str) -> bool {
     let parts: Vec<&str> = normalized.split('/').collect();
     let in_state_dir = crate::project::state::ALL_FILES.iter().any(|file| {
@@ -168,12 +163,7 @@ pub(super) fn names_project_state(normalized: &str) -> bool {
                 && *dir == crate::project::state::WORKTREE_RECORDS_DIR
                 && !name.is_empty()
     );
-    in_state_dir
-        || worktree_record
-        || path_has_suffix(
-            normalized,
-            &format!(".ai/{}", crate::project::state::PINS_FILE),
-        )
+    in_state_dir || worktree_record
 }
 
 /// PURE: whether any word of one shell command names this machine's settings. See

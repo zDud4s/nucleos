@@ -552,11 +552,9 @@ use std::path::Path;
 /// this repository and the two tools that write specs into it, and a project matching none of them
 /// gets §11's sentence instead of a wrong answer.
 ///
-/// `.ai/specs` is first and is also the folder [`crate::map::structure`] deliberately never
-/// walks. That is not a contradiction: the structure layer is about the product, and working
-/// material is not product. The intention layer is about what was decided, and that is exactly
-/// where the decisions are written down.
-const SPEC_FOLDERS: &[&str] = &[".ai/specs", "docs/specs", "docs/superpowers/specs"];
+/// No folder of an AI workflow's own is here: NucleOS reads no workflow's working material, so a
+/// project that keeps its specs inside one gets §11's sentence until they live somewhere above.
+const SPEC_FOLDERS: &[&str] = &["docs/specs", "docs/superpowers/specs"];
 
 /// Every spec of a project, by path from the root, sorted.
 ///
@@ -755,6 +753,7 @@ mod tests {
     fn the_specs_of_a_project_are_found_where_projects_actually_keep_them() {
         let root = scratch("specs");
         write(&root, ".ai/specs/2026-08-22-alfa-design.md", "# Alfa");
+        write(&root, "docs/specs/2026-08-22-delta-design.md", "# Delta");
         write(&root, "docs/specs/beta.md", "# Beta");
         write(&root, "docs/superpowers/specs/gama.md", "# Gama");
         write(&root, "docs/specs/notes.txt", "not a spec");
@@ -765,11 +764,11 @@ mod tests {
         assert_eq!(
             found,
             vec![
-                ".ai/specs/2026-08-22-alfa-design.md".to_string(),
+                "docs/specs/2026-08-22-delta-design.md".to_string(),
                 "docs/specs/beta.md".to_string(),
                 "docs/superpowers/specs/gama.md".to_string(),
             ],
-            "sorted, so two reads of an unchanged project agree"
+            "sorted, so two reads of an unchanged project agree, and `.ai/specs` is not read"
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -793,7 +792,7 @@ mod tests {
         // specs in different folders must produce the same name for the same document.
         assert_eq!(spec_slug("docs/specs/beta.md"), "beta");
         assert_eq!(
-            spec_slug(".ai/specs/2026-08-22-alfa-design.md"),
+            spec_slug("docs/superpowers/specs/2026-08-22-alfa-design.md"),
             "2026-08-22-alfa-design"
         );
         assert_eq!(spec_slug("beta.md"), "beta");

@@ -540,36 +540,63 @@ async fn exclude_artifacts_dir(repo_path: &Path) -> io::Result<()> {
         .arg("--git-common-dir")
         .output()
         .await?;
+    add_artifacts_entry(&common_git_dir(repo_path, output)?)
+}
+
+/// [`exclude_artifacts_dir`] for a caller already on a blocking thread, which cannot await.
+///
+/// Workflow materialization is one (`workflows::materialize::sync`, always run inside
+/// `spawn_blocking`): it writes `.nucleos/workflow/` into the project's own checkout, which no
+/// worktree creation may ever have hidden — a project that never ran a job has no exclude entry
+/// at all. The same git flags as [`git`], so a hostile repository config gets no further here.
+pub fn exclude_artifacts_dir_blocking(repo_path: &Path) -> io::Result<()> {
+    let output = std::process::Command::new(git_bin())
+        .arg("-c")
+        .arg("core.fsmonitor=")
+        .env(crate::execution::git_exec::QUEUE_MARKER, "1")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .output()?;
+    add_artifacts_entry(&common_git_dir(repo_path, output)?)
+}
+
+/// The common git directory `rev-parse --git-common-dir` answered with, made absolute.
+fn common_git_dir(repo_path: &Path, output: std::process::Output) -> io::Result<PathBuf> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(io::Error::other(format!(
             "could not resolve the repository's common git directory: {stderr}"
         )));
     }
-    // Older git answers relatively, and relative to the `-C` directory above.
+    // Older git answers relatively, and relative to the `-C` directory.
     let reported = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    let git_dir = if reported.is_absolute() {
+    Ok(if reported.is_absolute() {
         reported
     } else {
         repo_path.join(reported)
-    };
+    })
+}
 
+/// Appends `/ARTIFACTS_DIR/` to `git_dir`'s `info/exclude` unless a line already says it.
+///
+/// Plain blocking file IO for both doors: the file is a few lines, and one implementation is what
+/// keeps the async and the blocking door from ever writing two different entries.
+fn add_artifacts_entry(git_dir: &Path) -> io::Result<()> {
     let info = git_dir.join("info");
-    tokio::fs::create_dir_all(&info).await?;
+    std::fs::create_dir_all(&info)?;
     let exclude = info.join("exclude");
     let entry = format!("/{ARTIFACTS_DIR}/");
-    let mut contents = tokio::fs::read_to_string(&exclude)
-        .await
-        .unwrap_or_default();
+    let mut contents = std::fs::read_to_string(&exclude).unwrap_or_default();
     if !contents.lines().any(|line| line.trim() == entry) {
         if !contents.is_empty() && !contents.ends_with('\n') {
             contents.push('\n');
         }
         contents.push_str(&entry);
         contents.push('\n');
-        tokio::fs::write(&exclude, contents).await?;
+        std::fs::write(&exclude, contents)?;
     }
-
     Ok(())
 }
 

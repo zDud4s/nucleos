@@ -125,16 +125,11 @@ async fn main() {
     // home directory) reads every file as absent, which is what an absent file has always meant:
     // each pillar starts on its defaults.
     let machine_config_root = machine_config::root();
-    match &machine_config_root {
-        Some(root) => {
-            migrate_machine_settings(&pool, root).await;
-            migrate_project_state(&pool, root).await;
-            migrate_onboarding(&pool, root).await;
-        }
-        None => tracing::warn!(
+    if machine_config_root.is_none() {
+        tracing::warn!(
             "no home directory, so {} cannot be read; every pillar starts on its defaults",
             machine_config::ROOT_DISPLAY
-        ),
+        );
     }
     let machine_file = |file: &str| machine_config_root.as_ref().map(|root| root.join(file));
 
@@ -942,6 +937,9 @@ async fn main() {
     tokio::spawn(team::trigger::run_team_trigger_loop(state.clone()));
     tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
     tokio::spawn(execution::worktree::run_gc(state.pool.clone()));
+    // Plan 2026-10-17 F1: every session in a rostered project gets the `verify` box, the main
+    // checkout's and a worktree added by hand included, unless the owner switched it off.
+    tokio::spawn(verify::provision::run_reconcile_loop(state.pool.clone()));
     // The worktree GC's counterpart inside the database. It collects the directories a finished run
     // leaves on disk; this expires the transcript it leaves in `runs`, the events it leaves in
     // `run_events`, and eventually its line in the feed. Nothing removed any of those, so all three
@@ -1373,13 +1371,32 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.0, "dev");
         assert_eq!(parsed.1, "1.0.0");
-        assert_eq!(parsed.2, std::path::PathBuf::from("/p"));
-        assert_eq!(parsed.3, std::path::PathBuf::from("m.yaml"));
+        assert_eq!(
+            parsed.2,
+            PackageFrom::Project {
+                root: std::path::PathBuf::from("/p"),
+                manifest: std::path::PathBuf::from("m.yaml"),
+            }
+        );
+
+        let parsed = workflow_package_args(&words(
+            "nucleos-core --workflow-package nucleos-dev 2.0.0 --source core/assets/nucleos-dev",
+        ))
+        .unwrap();
+        assert_eq!(parsed.0, "nucleos-dev");
+        assert_eq!(
+            parsed.2,
+            PackageFrom::Source(std::path::PathBuf::from("core/assets/nucleos-dev"))
+        );
 
         for line in [
             "nucleos-core --workflow-package dev --from /p --manifest m.yaml",
             "nucleos-core --workflow-package dev 1.0.0 --from /p",
             "nucleos-core --workflow-package dev 1.0.0 --from --manifest m.yaml",
+            "nucleos-core --workflow-package dev 1.0.0 --source",
+            // Two sources at once is a mistake, not a choice to be made for the caller.
+            "nucleos-core --workflow-package dev 1.0.0 --source /s --manifest m.yaml",
+            "nucleos-core --workflow-package dev 1.0.0 --source /s --from /p --manifest m.yaml",
         ] {
             assert!(workflow_package_args(&words(line)).is_err(), "{line}");
         }

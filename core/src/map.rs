@@ -376,11 +376,11 @@ pub fn ts_test_sibling(path: &str) -> String {
 
 /// Folders that are never walked.
 ///
-/// `target/` alone is 11.7 GB on this machine and nothing inside it was written by anybody.
-/// `.ai/` is out because it is working material, not product.
+/// `target/` alone is 11.7 GB on this machine and nothing inside it was written by anybody. Every
+/// dot-folder is out anyway (the walk skips any name starting with `.`); the ones named here are
+/// only the ones worth naming.
 const SKIP: &[&str] = &[
     ".git",
-    ".ai",
     ".claude",
     ".agents",
     "target",
@@ -403,10 +403,10 @@ const SKIP: &[&str] = &[
 /// **`.md` is absent on purpose, and must stay absent.** A design spec cites its own sections
 /// constantly — a heading *is* a citation — so reading specs for citations would report every
 /// decision as claimed by the very document that decided it. That is not a performance choice; it
-/// is the difference between a map and a mirror. The specs in `.ai/` are already out of the walk,
-/// so what this actually keeps out today is `AGENTS.md`, `THREAT_MODEL.md` and their kin: prose
-/// *about* the code, citing sections it discusses rather than implements. Both readings say the
-/// same thing — a document that talks about a section is not code that implements one.
+/// is the difference between a map and a mirror. Specs inside a dot-folder are already out of the
+/// walk, so what this actually keeps out today is `AGENTS.md`, `THREAT_MODEL.md` and their kin:
+/// prose *about* the code, citing sections it discusses rather than implements. Both readings say
+/// the same thing — a document that talks about a section is not code that implements one.
 const FOREIGN: &[&str] = &[
     ".go", ".sql", ".css", ".sh", ".py", ".toml", ".yaml", ".yml", ".js", ".mjs", ".cjs", ".jsx",
 ];

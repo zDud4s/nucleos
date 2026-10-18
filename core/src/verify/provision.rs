@@ -3,9 +3,14 @@
 //!
 //! With a project's `ide_verify` switch on, [`reconcile`] writes a daemon-owned `.mcp.json` and the
 //! Claude Code approval (`enabledMcpjsonServers`) into each of its IDE worktrees and hides both
-//! through `info/exclude`; with it off, [`reconcile`] removes exactly that and nothing else. It only
-//! runs when `POST /projects/{id}/ide-verify` is called: with the switch off the daemon does not
-//! even walk worktrees on its own.
+//! through `info/exclude`; with it off, [`reconcile`] removes exactly that and nothing else.
+//!
+//! The switch is on by default (migration 0203, plan 2026-10-17 F1): the final verification of a
+//! task goes through `verify`, so every session in a rostered project needs the box, the main
+//! checkout's included. [`run_reconcile_loop`] therefore reconciles every project whose switch is
+//! on at startup and every [`RECONCILE_EVERY`], which is what reaches a worktree somebody added by
+//! hand since. A project switched off is reconciled once, by `POST /projects/{id}/ide-verify`, and
+//! after that the daemon does not walk its worktrees on its own.
 //!
 //! What was written is recorded in `<absolute-git-dir>/nucleos-ide-verify.json`, the worktree's
 //! private git directory, so the record never enters the tree and dies with the worktree. It is
@@ -44,6 +49,10 @@ const SERVER_NAME: &str = "nucleos";
 const PROVENANCE_FILE: &str = "nucleos-ide-verify.json";
 const BLOCK_START: &str = "# nucleos ide-verify: daemon-owned, removed when the switch goes off";
 const BLOCK_END: &str = "# end nucleos ide-verify";
+
+/// How often [`run_reconcile_loop`] brings the switched-on projects in line: a worktree added by
+/// hand gets the box within this long.
+pub const RECONCILE_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// One reconcile at a time: two overlapping passes would race on the same provenance and exclude
 /// files.
@@ -600,6 +609,55 @@ pub(crate) async fn reconcile(
     Ok(reports)
 }
 
+/// Reconciles every project whose switch is on, now and then every [`RECONCILE_EVERY`]. Best
+/// effort: a project that cannot be reconciled is logged and retried on the next pass.
+pub async fn run_reconcile_loop(pool: SqlitePool) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe.to_string_lossy().into_owned(),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "IDE verify: could not resolve the daemon executable; nothing is provisioned"
+            );
+            return;
+        }
+    };
+    let mut interval = tokio::time::interval(RECONCILE_EVERY);
+    loop {
+        interval.tick().await;
+        reconcile_switched_on(&pool, &exe).await;
+    }
+}
+
+/// One pass of [`run_reconcile_loop`].
+async fn reconcile_switched_on(pool: &SqlitePool, exe: &str) {
+    let projects = match autopilot::ide_verify_projects(pool).await {
+        Ok(projects) => projects,
+        Err(error) => {
+            tracing::warn!(%error, "IDE verify: could not list the switched-on projects");
+            return;
+        }
+    };
+    for project in projects {
+        match reconcile(pool, &project, exe).await {
+            Ok(reports) => {
+                for refused in reports
+                    .iter()
+                    .filter(|r| r.state != ProvisionState::Provisioned)
+                {
+                    tracing::debug!(
+                        %project,
+                        path = %refused.path,
+                        reason = ?refused.reason,
+                        "IDE verify: worktree not provisioned"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(%project, %error, "IDE verify: reconcile failed"),
+        }
+    }
+}
+
 /// Sets the switch and reconciles. Owner only: the check comes before any database or file work.
 pub(crate) async fn switch(
     pool: &SqlitePool,
@@ -733,11 +791,11 @@ mod tests {
     async fn pool_with(repo: &Path, ide_verify: bool) -> SqlitePool {
         let pool = crate::testdb::fresh_pool().await;
         sqlx::query(
-            "INSERT INTO autopilot_state (project_id, mode, project_root, ide_verify) \
+            "INSERT INTO autopilot_state (project_id, mode, project_root, ide_verify_off) \
              VALUES ('alpha', 'active', ?, ?)",
         )
         .bind(repo.to_string_lossy().into_owned())
-        .bind(i64::from(ide_verify))
+        .bind(i64::from(!ide_verify))
         .execute(&pool)
         .await
         .unwrap();
@@ -831,6 +889,51 @@ mod tests {
         assert!(!repo.path().join(MCP).exists());
         assert!(!wt.join(MCP).exists());
         assert!(!switch_is(&pool).await);
+    }
+
+    /// Plan 2026-10-17 F1: a project rostered with nothing said about the switch is on, so the
+    /// background pass provisions it, worktree added by hand included; a project switched off is
+    /// not walked at all.
+    #[tokio::test]
+    async fn the_background_pass_provisions_a_default_project_and_skips_one_switched_off() {
+        let on = repo();
+        let (_keep_on, on_wt) = linked(on.path(), "wt");
+        let off = repo();
+        let (_keep_off, off_wt) = linked(off.path(), "wt");
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) \
+             VALUES ('alpha', 'active', ?)",
+        )
+        .bind(on.path().to_string_lossy().into_owned())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root, ide_verify_off) \
+             VALUES ('beta', 'active', ?, 1)",
+        )
+        .bind(off.path().to_string_lossy().into_owned())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let status_off = status(off.path());
+        let off_before = walk(off.path());
+        let off_wt_before = walk(&off_wt);
+
+        reconcile_switched_on(&pool, EXE).await;
+
+        for dir in [on.path(), on_wt.as_path()] {
+            let entry = json_of(&dir.join(MCP));
+            assert_eq!(entry["mcpServers"]["nucleos"]["command"], EXE, "{dir:?}");
+        }
+        assert_eq!(
+            walk(off.path()),
+            off_before,
+            "switched-off main tree and git dir"
+        );
+        assert_eq!(walk(&off_wt), off_wt_before, "switched-off linked worktree");
+        assert_eq!(status(off.path()), status_off);
     }
 
     #[test]

@@ -201,8 +201,8 @@ export interface ChatProject {
    */
   permission_mode: PermissionMode;
   /**
-   * Whether `cwd` is a linked worktree the AI workflow was never copied into while its main
-   * checkout has it. Optional: an older daemon omits it, and that reads as false.
+   * Whether `cwd` is a worktree of a project with a pinned workflow bundle that was never
+   * materialized into it. Optional: an older daemon omits it, and that reads as false.
    */
   workflow_missing?: boolean;
   /** Whether this rooted conversation's turns keep the user's own MCP servers. Absent reads as false. */
@@ -1820,7 +1820,7 @@ export function useWireChatTools(chatId: string) {
 }
 
 /**
- * Copy the AI workflow from the main checkout into this conversation's worktree.
+ * Materialize the project's pinned workflow bundle into this conversation's worktree.
  *
  * Always sends `confirm: true`: the daemon refuses anything else, and the window only reaches this
  * through a `ConfirmButton`.
