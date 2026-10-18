@@ -80,7 +80,7 @@ export function TeamRunDetail() {
           the screen that tells this run from the last one. The words that WERE the title
           are the crumb above, which is where a page's kind belongs.
         */
-        title={detail.request}
+        title={shortRequest(detail.request)}
         headline={
           <>
             {detail.team_id} · started <RelativeTime at={detail.created_at} />
@@ -114,6 +114,9 @@ export function TeamRunDetail() {
           ) : undefined
         }
       />
+
+      {/* The title is cut so it cannot take four lines beside Cancel; the whole sentence is here. */}
+      {detail.request.length > REQUEST_TITLE_MAX && <p className="teams-run-request">{detail.request}</p>}
 
       {cancel.isPending && (
         <p className="teams-note" role="status">
@@ -341,6 +344,12 @@ function RoundsPanel({ items }: { items: TeamItem[] }) {
       ))}
     </Panel>
   );
+}
+
+const REQUEST_TITLE_MAX = 120;
+
+function shortRequest(request: string): string {
+  return request.length > REQUEST_TITLE_MAX ? `${request.slice(0, REQUEST_TITLE_MAX - 1).trimEnd()}…` : request;
 }
 
 function groupByRound(items: TeamItem[]): [number, TeamItem[]][] {
