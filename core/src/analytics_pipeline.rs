@@ -4,8 +4,11 @@
 //! `{"error": ...}` and the others still come (spec D5). Write side lives in `sampler` (slot
 //! samples) and in `verify::postgate::record_transition` (colour changes).
 
+pub mod autopilot;
 pub mod gate;
+pub mod jobs;
 pub mod landing;
+pub mod postgate;
 pub mod sampler;
 pub mod stats;
 
@@ -62,6 +65,11 @@ pub struct PipelineReport {
     pub history: History,
     pub landing: Block<landing::Landing>,
     pub gate: Block<gate::Gate>,
+    pub postgate: Block<postgate::Postgate>,
+    pub jobs: Block<jobs::Jobs>,
+    pub autopilot: Block<autopilot::Autopilot>,
+    /// Metric 10 (follow-up). `null` until then.
+    pub pressure: Option<Block<serde_json::Value>>,
 }
 
 fn rfc3339(at: DateTime<Utc>) -> String {
@@ -131,6 +139,8 @@ pub async fn build(
     now: DateTime<Utc>,
 ) -> PipelineReport {
     let project = scope.project();
+    let history = history(pool).await;
+    let postgate_since = history.postgate_since.as_deref().and_then(stats::parse_at);
     PipelineReport {
         scope: if project.is_some() {
             "project"
@@ -143,9 +153,16 @@ pub async fn build(
         now: rfc3339(now),
         window: window.span(),
         previous: window.previous().span(),
-        history: history(pool).await,
+        history,
         landing: block("landing", landing::read(pool, project, window, now).await),
         gate: block("gate", gate::read(pool, project, window).await),
+        postgate: block(
+            "postgate",
+            postgate::read(pool, project, window, now, postgate_since).await,
+        ),
+        jobs: block("jobs", jobs::read(pool, project, window, now).await),
+        autopilot: block("autopilot", autopilot::read(pool, project, window).await),
+        pressure: None,
     }
 }
 
@@ -219,6 +236,63 @@ pub(crate) mod tests {
             serde_json::to_value(failed).unwrap(),
             serde_json::json!({ "error": "query_failed" })
         );
+    }
+
+    /// Spec §11 and D5: a block whose query fails answers `{"error"}` and the rest still render.
+    #[tokio::test]
+    async fn a_failing_block_returns_its_error_and_the_others_still_render() {
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query("DROP TABLE judge_verdicts")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let json = report(&pool, Scope::Global, 30).await;
+        let failed = serde_json::json!({ "error": "query_failed" });
+        assert_eq!(json["autopilot"], failed, "{json}");
+        for ok in ["landing", "gate", "postgate", "jobs"] {
+            assert!(json[ok].get("error").is_none(), "{ok} failed too: {json}");
+        }
+        assert!(json["pressure"].is_null(), "metric 10 is not in the MVP");
+    }
+
+    /// Spec §12.6: the MVP's window reads search an index, globally and per project. Exempt, on
+    /// purpose: `postgate_state` (one row per project) and `postgate_transitions` (a few rows per
+    /// incident, read whole up to the window's end); `flaky::history` uses the existing
+    /// `(project_id, started_at)` index.
+    #[tokio::test]
+    async fn the_pipeline_window_reads_search_an_index_instead_of_scanning() {
+        let pool = crate::testdb::fresh_pool().await;
+        let classifier = autopilot::classifier_sql();
+        let reads: [(&str, &str); 6] = [
+            ("landing", landing::LANDING_ROWS_SQL),
+            ("gate", gate::GATE_ROWS_SQL),
+            ("jobs", jobs::JOB_ROWS_SQL),
+            ("classifier", &classifier),
+            ("judge", autopilot::JUDGE_SQL),
+            ("refused", autopilot::REFUSED_SQL),
+        ];
+        let mut scans = Vec::new();
+        for (name, sql) in reads {
+            for project in [None, Some("p")] {
+                let plan: Vec<(i64, i64, i64, String)> =
+                    sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                        .bind("2026-09-01")
+                        .bind("2026-10-01")
+                        .bind(project)
+                        .fetch_all(&pool)
+                        .await
+                        .unwrap();
+                scans.extend(
+                    plan.into_iter()
+                        .map(|row| row.3)
+                        .filter(|detail| {
+                            detail.starts_with("SCAN ") && !detail.starts_with("SCAN CONSTANT")
+                        })
+                        .map(|detail| format!("{name} ({project:?}): {detail}")),
+                );
+            }
+        }
+        assert!(scans.is_empty(), "full scans: {scans:#?}");
     }
 
     /// Spec §10: the three history tables exist with the columns and constraints it names.

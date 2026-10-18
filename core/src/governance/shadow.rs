@@ -251,7 +251,9 @@ pub async fn set_verdict(pool: &SqlitePool, id: i64, verdict: &str) -> sqlx::Res
 /// ACTIONS (see `REVIEWED_DISTINCT`), because ten reviews of one command are ten data points about
 /// the same thing. Same rule for what counts as agreement, applied to different units, and the
 /// scoreboard's column headings are what tell the two apart on screen.
-const AGREE_CASE: &str = "CASE
+///
+/// Also read by `analytics_pipeline::autopilot`, which aggregates it across projects.
+pub(crate) const AGREE_CASE: &str = "CASE
     WHEN shadow_decisions.human_verdict = 'approve'
          AND shadow_decisions.decision = 'allow' THEN 1
     WHEN shadow_decisions.human_verdict = 'reject'
