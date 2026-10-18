@@ -116,8 +116,8 @@ pub struct ShellRules {
     /// **Deny-only, and there is deliberately no `allow_writes` beside it.** The write chain in
     /// `classifier::classify` ends at `("allow", "read-local")`, so the only things a write `allow`
     /// could reach are the compiled `outside-workspace` refusal and the three governance prompts —
-    /// and a project that could allow `Edit .ai/` would be waiving the guard over its own autopilot
-    /// files. The shell side's rule is the same one said about commands: an `allow` widens what
+    /// and a project that could allow `Edit .claude/` would be waiving the guard over its own
+    /// governance files. The shell side's rule is the same one said about commands: an `allow` widens what
     /// this file would have ASKED about, and lifts nothing that was refused.
     ///
     /// A `Vec` of pairs rather than a map keyed by tool, because `hooks.rs`'s `NO_SHELL_RULES` is a

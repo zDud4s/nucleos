@@ -210,9 +210,9 @@ pub(super) fn pins_file(
 /// first, in the same order, for the reasons `POST /write` sets out at length.
 ///
 /// **The kill switch first.** These write the project's `workflows.yaml`, and one of them copies a
-/// whole bundle into `.ai/workflows/` — bytes in the project's folder, which §7.5 says must go the
-/// way an agent's write goes. That is the line `POST /commands` sits on the other side of: that one
-/// writes a database row and touches nothing on disk.
+/// whole bundle into `.nucleos/workflows/` — bytes in the project's folder, which §7.5 says must go
+/// the way an agent's write goes. That is the line `POST /commands` sits on the other side of: that
+/// one writes a database row and touches nothing on disk.
 ///
 /// Answers the project root (where an ejected copy goes), the pins file (in the project's state
 /// directory, never in the project) and the library.

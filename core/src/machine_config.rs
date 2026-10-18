@@ -15,8 +15,8 @@
 //! meant a machine with twenty worktrees had twenty candidate copies of every setting, of which the
 //! daemon read whichever one it happened to be started beside. [`root`] is one directory per
 //! person, the same one the council's roster and the workflow library already used, and every row
-//! below is a file name relative to it. [`migrate_legacy`] copies the old files over once, at
-//! startup, and never deletes one.
+//! below is a file name relative to it. The old files are neither read nor copied any more: a file
+//! still there is somebody's leftover.
 //!
 //! Everything that made the project registry work is kept, because the reasons are unchanged:
 //!
@@ -49,7 +49,7 @@
 //! `nucleos-models.yaml` is the one with a nuance rather than a flat answer, and it gets a
 //! sentence of its own below.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::ownership::Validator;
 
@@ -276,70 +276,6 @@ pub static SETTINGS: &[Setting] = &[
 pub fn setting_for(rel: &str) -> Option<&'static Setting> {
     let path = crate::ownership::normalise(rel)?;
     SETTINGS.iter().find(|setting| setting.path == path)
-}
-
-/* --------------------------------------------------------------- migration -- */
-
-/// Where [`SETTINGS`] used to live, relative to the daemon's working directory.
-const LEGACY_DIR: &str = ".ai";
-
-/// Copies each settings file from where it used to live into [`root`], once, and never over one
-/// that is already there. Returns the files it copied, in table order.
-///
-/// `legacy_base` is the directory the daemon was started from — the only place the old relative
-/// `.ai/<file>` could have meant anything — and both directories are arguments so a test can point
-/// them at temporary ones rather than at a real home.
-///
-/// **Copy, never move.** The old file is left where it was: it may be tracked in a checkout, and a
-/// daemon that deleted a file out of somebody's working tree at startup would be making a change to
-/// a repository nobody asked for. After the copy the old one is simply no longer read.
-///
-/// **Never overwrite.** A file already in the root is somebody's current settings, and the copy is
-/// opened with `create_new` so that holds even against a writer racing this one.
-///
-/// **The council is skipped.** Its roster moved to `~/.nucleos/council.yaml` long before the rest,
-/// deliberately without a migration, and every daemon since has ignored `.ai/council.yaml` — so one
-/// found there now is a roster nobody has been running, and copying it would resurrect it.
-///
-/// Failures are logged and skipped, file by file: an optional pillar that stays on its defaults is
-/// the same outcome a missing file has always had, and it must not stop the daemon from starting.
-pub fn migrate_legacy(root: &Path, legacy_base: &Path) -> Vec<&'static str> {
-    let mut copied = Vec::new();
-    for setting in SETTINGS {
-        if setting.path == COUNCIL_FILE {
-            continue;
-        }
-        let target = root.join(setting.path);
-        let source = legacy_base.join(LEGACY_DIR).join(setting.path);
-        if target.exists() || !source.is_file() {
-            continue;
-        }
-        let copy = || -> std::io::Result<()> {
-            let contents = std::fs::read(&source)?;
-            std::fs::create_dir_all(root)?;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)?;
-            std::io::Write::write_all(&mut file, &contents)
-        };
-        match copy() {
-            Ok(()) => {
-                tracing::info!(
-                    file = setting.path,
-                    to = %display_path(setting.path),
-                    "copied a settings file from the working directory's .ai/ into this machine's settings; the old file was left where it was and is no longer read"
-                );
-                copied.push(setting.path);
-            }
-            Err(error) => tracing::warn!(
-                %error,
-                file = setting.path,
-                "could not copy a settings file from the working directory's .ai/; the pillar starts on its defaults"
-            ),
-        }
-    }
-    copied
 }
 
 /* ------------------------------------------------------------ the other half -- */
@@ -742,87 +678,5 @@ url: http://example.com:8080
         if let (Some(root), Some(council)) = (root(), crate::council::config_path()) {
             assert_eq!(council, root.join(COUNCIL_FILE));
         }
-    }
-
-    /// Two temporary directories standing in for the home root and the directory the daemon was
-    /// started from, so no test here ever touches a real `~/.nucleos`.
-    fn migration_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("home").join(".nucleos");
-        let cwd = temp.path().join("checkout");
-        std::fs::create_dir_all(cwd.join(".ai")).unwrap();
-        (temp, root, cwd)
-    }
-
-    /// A file only the old place has is copied, the root is created for it, and the old one stays.
-    #[test]
-    fn a_legacy_file_is_copied_into_the_root_and_left_where_it_was() {
-        let (_temp, root, cwd) = migration_dirs();
-        std::fs::write(cwd.join(".ai/email.yaml"), "enabled: true\n").unwrap();
-        std::fs::write(cwd.join(".ai/nucleos-models.yaml"), "claude_model: x\n").unwrap();
-
-        let copied = migrate_legacy(&root, &cwd);
-
-        assert_eq!(copied, vec![EMAIL_FILE, crate::config::MODELS_CONFIG_FILE]);
-        assert_eq!(
-            std::fs::read_to_string(root.join("email.yaml")).unwrap(),
-            "enabled: true\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.join("nucleos-models.yaml")).unwrap(),
-            "claude_model: x\n"
-        );
-        assert!(
-            cwd.join(".ai/email.yaml").exists(),
-            "copy, never move: the old file may be tracked in a checkout"
-        );
-        assert!(
-            !root.join("voice.yaml").exists(),
-            "nothing is invented for a file the old place did not have"
-        );
-    }
-
-    /// A file already in the root is somebody's current settings, and it wins.
-    #[test]
-    fn a_file_already_in_the_root_is_never_overwritten() {
-        let (_temp, root, cwd) = migration_dirs();
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("web.yaml"), "enabled: false\n").unwrap();
-        std::fs::write(cwd.join(".ai/web.yaml"), "enabled: true\n").unwrap();
-
-        assert!(migrate_legacy(&root, &cwd).is_empty());
-        assert_eq!(
-            std::fs::read_to_string(root.join("web.yaml")).unwrap(),
-            "enabled: false\n"
-        );
-    }
-
-    /// The council's `.ai/` roster is a file every daemon since the move has ignored, so it is not
-    /// resurrected. See [`migrate_legacy`].
-    #[test]
-    fn the_councils_old_roster_is_not_migrated() {
-        let (_temp, root, cwd) = migration_dirs();
-        std::fs::write(cwd.join(".ai/council.yaml"), "members: []\n").unwrap();
-
-        assert!(migrate_legacy(&root, &cwd).is_empty());
-        assert!(
-            !root.exists(),
-            "with nothing to copy, the root is not even created"
-        );
-    }
-
-    /// A second start copies nothing: the first copy is now the file that wins.
-    #[test]
-    fn migrating_twice_copies_once() {
-        let (_temp, root, cwd) = migration_dirs();
-        std::fs::write(cwd.join(".ai/github.yaml"), "enabled: true\n").unwrap();
-
-        assert_eq!(migrate_legacy(&root, &cwd), vec![GITHUB_FILE]);
-        std::fs::write(cwd.join(".ai/github.yaml"), "enabled: false\n").unwrap();
-        assert!(migrate_legacy(&root, &cwd).is_empty());
-        assert_eq!(
-            std::fs::read_to_string(root.join("github.yaml")).unwrap(),
-            "enabled: true\n"
-        );
     }
 }

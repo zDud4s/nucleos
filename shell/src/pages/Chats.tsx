@@ -1960,7 +1960,7 @@ function WorkflowMissing({
       </p>
       <ConfirmButton
         label="Set up workflow"
-        confirmLabel="Set up workflow — copy it from the main checkout, overwriting this worktree's copy"
+        confirmLabel="Set up workflow — write the project's pinned workflow into this worktree, overwriting its copy"
         variant="ghost"
         disabled={seed.isPending}
         onConfirm={() => seed.mutate()}
@@ -1983,9 +1983,9 @@ function SeedRefusal({ error }: { error: unknown }) {
       refusal={error}
       sentences={{
         bad_request:
-          "the núcleo wants an explicit confirmation before it copies anything",
+          "the núcleo wants an explicit confirmation before it writes anything",
         conflict:
-          "this folder is not a worktree whose main checkout has the workflow — nothing was copied",
+          "this folder is not a worktree of a project with a pinned workflow — nothing was written",
         not_found: "that conversation is no longer here",
       }}
     />

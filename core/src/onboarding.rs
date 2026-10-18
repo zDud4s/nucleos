@@ -1,11 +1,11 @@
 //! Whether a project was onboarded to NucleOS, and the one act that onboards it.
 //!
-//! # Why a marker, and not `.ai/workflow/workflow.md`
+//! # Why a marker, and not a workflow's own file
 //!
 //! Autopilot activation used to require the AI dev workflow's own file inside the project: a
 //! project "was onboarded" when it had adopted that workflow. That tied a harness to one way of
-//! developing. NucleOS sits a layer above however a project is developed, and whether the project
-//! uses the `.ai` workflow is none of its business. What activation actually needs to know is that
+//! developing. NucleOS sits a layer above however a project is developed, and which workflow the
+//! project uses is none of its business. What activation actually needs to know is that
 //! a PERSON brought the project in: looked at what is in it, confirmed which command decides
 //! *green*, and had the classifier hook installed. That is a decision, so it is recorded, as
 //! [`MARKER_FILE`] in the project's state directory (`project/state.rs`), keyed by `project_id` and
@@ -31,19 +31,14 @@
 //! is `autopilot.yaml`'s, and editing `gate_command` there later does not make the marker wrong —
 //! the marker records what was confirmed WHEN the project was onboarded.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 /// The marker's name, in the project's state directory. Named once, in `project/state.rs`.
 pub const MARKER_FILE: &str = crate::project::state::ONBOARDED_FILE;
 
-/// What "onboarded" meant before the marker existed, relative to the project root. Read by
-/// [`migrate_legacy`] and nothing else, so no project that was activatable yesterday stops being so.
-const LEGACY_MARKER: &str = ".ai/workflow/workflow.md";
-
-/// The feed line both writers of a marker leave in the project's feed: the route when a person
-/// onboards it, and the startup migration when it passed the old check.
+/// The feed line the route leaves in the project's feed when a person onboards it.
 pub const FEED_KIND: &str = "project_onboarded";
 
 /// The longest gate command this stores. A gate is one command line; anything longer is a paste
@@ -62,15 +57,16 @@ pub struct Marker {
     /// `autopilot.yaml`'s; see the module header.
     #[serde(default)]
     pub gate_command: Option<String>,
-    /// The harness folders detection found (`.ai`, `.claude`, ...), relative to the root.
+    /// The harness folders detection found (`.claude`, `.agents`, ...), relative to the root.
     #[serde(default)]
     pub harnesses: Vec<String>,
     /// Whether onboarding installed the classifier hook. `false` on a migrated marker: nothing was
     /// installed, the project merely passed the old check.
     #[serde(default)]
     pub hook_installed: bool,
-    /// Written by [`migrate_legacy`] for a project that passed the old `.ai/workflow/workflow.md`
-    /// check, rather than by a person onboarding it.
+    /// Set on a marker an earlier daemon's startup migration wrote for a project that passed the
+    /// old check, rather than by a person onboarding it. Nothing writes it any more; it is still
+    /// read so such a marker keeps parsing.
     #[serde(default)]
     pub migrated: bool,
 }
@@ -254,78 +250,6 @@ pub fn onboard(
     Ok(marker)
 }
 
-/* --------------------------------------------------------------- migration -- */
-
-/// Writes a `migrated: true` marker for every rostered project that passes the OLD check — it has
-/// `.ai/workflow/workflow.md` — and has no marker yet. Returns the ids it wrote one for.
-///
-/// So that nobody loses autopilot on update: a project that could be activated yesterday can be
-/// today, without anybody having to onboard it again. The rules are [`crate::project::state::
-/// migrate_legacy`]'s: never over an existing marker (opened `create_new`, so that holds even
-/// against the route racing this), the old file is only read, and a failure is logged and skipped,
-/// project by project — such a project simply reads as not onboarded until somebody onboards it.
-///
-/// Both directories are arguments and `projects` is the roster as `(project_id, project_root)`, so
-/// a test points all of it at temporary directories.
-pub fn migrate_legacy(
-    machine_root: &Path,
-    projects: &[(String, PathBuf)],
-    now: &str,
-) -> Vec<String> {
-    let mut written = Vec::new();
-    for (project_id, project_root) in projects {
-        if !project_root.join(LEGACY_MARKER).is_file() {
-            continue;
-        }
-        let Some(dir) = crate::project::state::dir(machine_root, project_id) else {
-            tracing::warn!(
-                project_id = %project_id,
-                "this project's id cannot name a directory, so it was not marked onboarded and \
-                 cannot be activated until its id is changed"
-            );
-            continue;
-        };
-        let target = dir.join(MARKER_FILE);
-        if target.exists() {
-            continue;
-        }
-        let marker = Marker {
-            onboarded_at: now.to_string(),
-            project_root: project_root.to_string_lossy().into_owned(),
-            gate_command: None,
-            harnesses: Vec::new(),
-            hook_installed: false,
-            migrated: true,
-        };
-        let write = || -> std::io::Result<()> {
-            let text = render(&marker)?;
-            std::fs::create_dir_all(&dir)?;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)?;
-            std::io::Write::write_all(&mut file, text.as_bytes())
-        };
-        match write() {
-            Ok(()) => {
-                tracing::info!(
-                    project_id = %project_id,
-                    to = %crate::project::state::display_path(project_id, MARKER_FILE),
-                    "marked a project onboarded because it had .ai/workflow/workflow.md, which is \
-                     what onboarded meant before the marker"
-                );
-                written.push(project_id.clone());
-            }
-            Err(error) => tracing::warn!(
-                %error,
-                project_id = %project_id,
-                "could not mark a project onboarded; it cannot be activated until it is onboarded"
-            ),
-        }
-    }
-    written
-}
-
 /// The workflow a project brought in for the first time is pinned to, when the library has it.
 pub const DEFAULT_WORKFLOW: &str = "nucleos-dev";
 
@@ -368,6 +292,7 @@ pub fn pin_default_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// A library holding `nucleos-dev` at `versions`, under `root/lib`.
     fn library_with(root: &Path, versions: &[&str]) -> PathBuf {
@@ -609,57 +534,5 @@ mod tests {
         ));
         assert!(!is_onboarded(Some(home.path()), "alpha"));
         assert!(!rules_path(home.path(), "alpha").exists());
-    }
-
-    /// The migration's whole contract: old check passed and no marker is a `migrated` marker; an
-    /// existing marker is never overwritten; no old file is nothing; a second start writes nothing.
-    #[test]
-    fn a_project_that_passed_the_old_check_is_marked_once() {
-        let home = tempfile::tempdir().unwrap();
-        let old = tempfile::tempdir().unwrap();
-        let onboarded = tempfile::tempdir().unwrap();
-        let plain = tempfile::tempdir().unwrap();
-        write(&old.path().join(LEGACY_MARKER), "# Workflow");
-        write(&onboarded.path().join(LEGACY_MARKER), "# Workflow");
-        let existing = onboard(home.path(), "beta", onboarded.path(), None, "earlier").unwrap();
-
-        let roster = vec![
-            ("alpha".to_string(), old.path().to_path_buf()),
-            ("beta".to_string(), onboarded.path().to_path_buf()),
-            ("gamma".to_string(), plain.path().to_path_buf()),
-        ];
-        assert_eq!(migrate_legacy(home.path(), &roster, NOW), vec!["alpha"]);
-
-        let alpha = read_marker(Some(home.path()), "alpha").unwrap();
-        assert!(alpha.migrated && !alpha.hook_installed);
-        assert_eq!(alpha.onboarded_at, NOW);
-        assert_eq!(
-            read_marker(Some(home.path()), "beta"),
-            Some(existing),
-            "a marker already there is never overwritten"
-        );
-        assert!(!is_onboarded(Some(home.path()), "gamma"));
-        assert!(
-            old.path().join(LEGACY_MARKER).is_file(),
-            "the old file is read, never moved"
-        );
-
-        assert!(migrate_legacy(home.path(), &roster, NOW).is_empty());
-    }
-
-    #[test]
-    fn an_id_that_cannot_name_a_directory_is_not_migrated() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write(&project.path().join(LEGACY_MARKER), "# Workflow");
-        assert!(
-            migrate_legacy(
-                home.path(),
-                &[("../escape".to_string(), project.path().to_path_buf())],
-                NOW
-            )
-            .is_empty()
-        );
-        assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
     }
 }

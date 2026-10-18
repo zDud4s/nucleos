@@ -2,15 +2,15 @@
 //!
 //! [`crate::machine_config`] moved this machine's settings out of the daemon's working directory
 //! and into `~/.nucleos/`. This module is the same move for the two files the núcleo keeps per
-//! project — the autopilot rules and the workflow pins — which used to sit in the project's own
-//! `.ai/` folder, and for the marker that says the project was onboarded (`crate::onboarding`).
+//! project — the autopilot rules and the workflow pins — and for the marker that says the project
+//! was onboarded (`crate::onboarding`).
 //!
-//! # Why not the project's `.ai/`
+//! # Why not a folder of the project's AI workflow
 //!
-//! `.ai/` belongs to the AI dev workflow, not to this product. A project that does not use that
-//! workflow has no reason to grow one, and a project that does has its own files there that this
-//! app must not be confused with — the same confusion `ownership.rs`'s header describes for
-//! `.ai/models.yaml`.
+//! They used to sit in the project's own `.ai/` folder. That folder belongs to an AI dev workflow,
+//! not to this product: a project that does not use one has no reason to grow it, and a project
+//! that does has its own files there that this app must not be confused with. NucleOS no longer
+//! reads or copies anything from it.
 //!
 //! # Why not a `.nucleos/` folder inside the project either
 //!
@@ -60,7 +60,7 @@ pub const MATERIALIZED_FILE: &str = "materialized.yaml";
 /// above.
 pub const WORKTREE_RECORDS_DIR: &str = "materialized";
 
-/// Every file this module places, in the order [`migrate_legacy`] copies them.
+/// The two files this module places that hold a project's configuration.
 pub const FILES: &[&str] = &[AUTOPILOT_FILE, PINS_FILE];
 
 /// Every file a project's state directory holds: [`FILES`] plus the onboarding marker. What the
@@ -69,9 +69,6 @@ pub const FILES: &[&str] = &[AUTOPILOT_FILE, PINS_FILE];
 /// The materialization record is here too: an agent that could rewrite it could make the next
 /// materialization overwrite a file a person edited, by recording that edit as the app's own.
 pub const ALL_FILES: &[&str] = &[AUTOPILOT_FILE, PINS_FILE, ONBOARDED_FILE, MATERIALIZED_FILE];
-
-/// Where every row of [`FILES`] used to live, relative to the project's root.
-const LEGACY_DIR: &str = ".ai";
 
 /// Whether `project_id` can name a directory without meaning something else.
 ///
@@ -164,83 +161,6 @@ pub fn write_bytes_atomically(target: &std::path::Path, contents: &[u8]) -> std:
     std::fs::rename(&temp, target)
 }
 
-/* --------------------------------------------------------------- migration -- */
-
-/// Copies each project's state files from its old `<project root>/.ai/` into its directory under
-/// `machine_root`, once, and never over one that is already there. Returns `(project_id, file)`
-/// for every file it copied.
-///
-/// The same three rules as [`crate::machine_config::migrate_legacy`], and for the same reasons:
-///
-/// - **Copy, never move.** The old file may be tracked in the project's repository, and a daemon
-///   that deleted a file out of somebody's working tree at startup would be changing a repository
-///   nobody asked it to change. After the copy the old one is simply no longer read.
-/// - **Never overwrite.** A file already in the state directory is the project's current state,
-///   and the copy is opened with `create_new` so that holds even against a writer racing this one.
-/// - **Failures are logged and skipped, file by file.** A project whose rules could not be copied
-///   behaves as a project with no rules, which is what an absent file has always meant, and it must
-///   not stop the daemon from starting.
-///
-/// Both directories are arguments, and `projects` is the roster as `(project_id, project_root)`,
-/// so a test can point all of it at temporary directories rather than at a real home.
-pub fn migrate_legacy(
-    machine_root: &Path,
-    projects: &[(String, PathBuf)],
-) -> Vec<(String, &'static str)> {
-    let mut copied = Vec::new();
-    for (project_id, project_root) in projects {
-        let Some(target_dir) = dir(machine_root, project_id) else {
-            if FILES
-                .iter()
-                .any(|name| project_root.join(LEGACY_DIR).join(name).is_file())
-            {
-                tracing::warn!(
-                    project_id = %project_id,
-                    "this project's id cannot name a directory, so its .ai/ state files were not \
-                     copied and it runs as though it had none"
-                );
-            }
-            continue;
-        };
-        for name in FILES {
-            let target = target_dir.join(name);
-            let source = project_root.join(LEGACY_DIR).join(name);
-            if target.exists() || !source.is_file() {
-                continue;
-            }
-            let copy = || -> std::io::Result<()> {
-                let contents = std::fs::read(&source)?;
-                std::fs::create_dir_all(&target_dir)?;
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&target)?;
-                std::io::Write::write_all(&mut file, &contents)
-            };
-            match copy() {
-                Ok(()) => {
-                    tracing::info!(
-                        project_id = %project_id,
-                        file = name,
-                        to = %display_path(project_id, name),
-                        "copied a project state file from the project's .ai/; the old file was left \
-                         where it was and is no longer read"
-                    );
-                    copied.push((project_id.clone(), *name));
-                }
-                Err(error) => tracing::warn!(
-                    %error,
-                    project_id = %project_id,
-                    file = name,
-                    "could not copy a project state file from the project's .ai/; the project runs \
-                     as though it had none"
-                ),
-            }
-        }
-    }
-    copied
-}
-
 /// Writes `contents` as `name` in `project_id`'s state directory under `machine_root`, creating
 /// the directories on the way. For tests, which point `machine_root` at a temporary directory
 /// standing in for `~/.nucleos` — never at a real home.
@@ -261,11 +181,6 @@ pub fn write_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn write(path: &Path, contents: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, contents).unwrap();
-    }
 
     /// The ids that would name some other directory have no state directory at all.
     #[test]
@@ -318,92 +233,5 @@ mod tests {
                     .join("workflows.yaml")
             )
         );
-    }
-
-    /// The whole contract of the migration, on injected directories: absent here and present there
-    /// is copied; present here is never overwritten; the source is never removed.
-    #[test]
-    fn the_old_files_are_copied_once_and_never_over_a_newer_one() {
-        let home = tempfile::tempdir().unwrap();
-        let alpha = tempfile::tempdir().unwrap();
-        let beta = tempfile::tempdir().unwrap();
-        write(
-            &alpha.path().join(".ai").join(AUTOPILOT_FILE),
-            "gate_command: old\n",
-        );
-        write(&alpha.path().join(".ai").join(PINS_FILE), "workflows: []\n");
-        write(
-            &beta.path().join(".ai").join(AUTOPILOT_FILE),
-            "gate_command: stale\n",
-        );
-        // Beta already has current rules in its state directory.
-        let beta_rules = home
-            .path()
-            .join("projects")
-            .join("beta")
-            .join(AUTOPILOT_FILE);
-        write(&beta_rules, "gate_command: current\n");
-
-        let roster = vec![
-            ("alpha".to_string(), alpha.path().to_path_buf()),
-            ("beta".to_string(), beta.path().to_path_buf()),
-        ];
-        let copied = migrate_legacy(home.path(), &roster);
-
-        assert_eq!(
-            copied,
-            vec![
-                ("alpha".to_string(), AUTOPILOT_FILE),
-                ("alpha".to_string(), PINS_FILE),
-            ]
-        );
-        let alpha_dir = home.path().join("projects").join("alpha");
-        assert_eq!(
-            std::fs::read_to_string(alpha_dir.join(AUTOPILOT_FILE)).unwrap(),
-            "gate_command: old\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&beta_rules).unwrap(),
-            "gate_command: current\n",
-            "a file already in the state directory is never overwritten"
-        );
-        assert!(
-            alpha.path().join(".ai").join(AUTOPILOT_FILE).is_file()
-                && beta.path().join(".ai").join(AUTOPILOT_FILE).is_file(),
-            "the old files are copied, never moved"
-        );
-
-        // A second start finds everything in place and copies nothing.
-        assert!(migrate_legacy(home.path(), &roster).is_empty());
-    }
-
-    /// A project with nothing to copy leaves nothing behind — not even an empty directory.
-    #[test]
-    fn a_project_with_no_old_files_creates_nothing() {
-        let home = tempfile::tempdir().unwrap();
-        let bare = tempfile::tempdir().unwrap();
-        let copied = migrate_legacy(
-            home.path(),
-            &[("bare".to_string(), bare.path().to_path_buf())],
-        );
-        assert!(copied.is_empty());
-        assert!(!home.path().join("projects").exists());
-    }
-
-    /// An id that cannot name a directory is skipped, and nothing is written anywhere for it.
-    #[test]
-    fn an_id_that_cannot_name_a_directory_is_not_migrated() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        write(
-            &project.path().join(".ai").join(AUTOPILOT_FILE),
-            "gate_command: x\n",
-        );
-        let copied = migrate_legacy(
-            home.path(),
-            &[("../escape".to_string(), project.path().to_path_buf())],
-        );
-        assert!(copied.is_empty());
-        assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
     }
 }

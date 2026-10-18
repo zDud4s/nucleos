@@ -3203,7 +3203,7 @@ describe("Chats - giving a conversation a project", () => {
     expect(seeded()).toBe(false);
 
     await afterDwell();
-    fireEvent.click(await screen.findByRole("button", { name: /copy it from the main checkout/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /write the project's pinned workflow/i }));
 
     await waitFor(() => expect(seeded()).toBe(true));
     const post = daemon.apiFetch.mock.calls.find(

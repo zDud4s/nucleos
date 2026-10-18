@@ -5463,9 +5463,9 @@ mod tests {
     async fn project_that_lost_a_citation(state: &AppState, id: &str) -> tempfile::TempDir {
         let dir = project_with_repo(state, id, "gate_command: x\n").await;
         let root = dir.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".ai").join("specs")).unwrap();
+        std::fs::create_dir_all(root.join("docs").join("specs")).unwrap();
         std::fs::write(
-            root.join(".ai").join("specs").join("a-spec-design.md"),
+            root.join("docs").join("specs").join("a-spec-design.md"),
             "## 7.1 Uma decisão\n\nO texto da decisão.\n",
         )
         .unwrap();
@@ -5568,7 +5568,7 @@ mod tests {
         seed_approved(&state, "alpha", "## 7.1 Uma decisão", 1, "A decisão.").await;
         std::fs::remove_file(
             dir.path()
-                .join(".ai")
+                .join("docs")
                 .join("specs")
                 .join("a-spec-design.md"),
         )
@@ -9048,7 +9048,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
-        let mine = dir.path().join(".ai/workflows/harness/graph.yaml");
+        let mine = dir.path().join(".nucleos/workflows/harness/graph.yaml");
         std::fs::write(&mine, "# mine now\n").unwrap();
 
         let (status, body) = workflow_call(
@@ -9198,7 +9198,7 @@ mod tests {
         // The project's copy is now the one that would run, so it is the one that is drawn — and a
         // change to it shows up while the library's is untouched.
         std::fs::write(
-            dir.path().join(".ai/workflows/harness/graph.yaml"),
+            dir.path().join(".nucleos/workflows/harness/graph.yaml"),
             "nodes:\n  - {id: only, type: agent}\n",
         )
         .unwrap();
@@ -9325,15 +9325,15 @@ mod tests {
 
     /// §9's second step, end to end: the app looks at a folder and reports what is already in it.
     ///
-    /// The harness is the half that matters. This repository's `.ai/` built NucleOS, and an app that
-    /// asked for it to be recreated in a graph editor before admitting the project exists would be
-    /// asking for a day's work to describe a thing that is sitting right there.
+    /// The harness is the half that matters: an app that asked for a project's way of working to
+    /// be recreated in a graph editor before admitting the project exists would be asking for a
+    /// day's work to describe a thing that is sitting right there.
     #[tokio::test]
     async fn a_folder_is_read_for_what_it_already_has_rather_than_interrogated() {
         let state = test_state().await;
         let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(temp.path().join(".ai")).unwrap();
-        std::fs::write(temp.path().join(".ai/workflow.md"), "the pipeline").unwrap();
+        std::fs::create_dir_all(temp.path().join(".claude")).unwrap();
+        std::fs::write(temp.path().join(".claude/settings.json"), "{}").unwrap();
         std::fs::write(
             temp.path().join("package.json"),
             r#"{"scripts": {"test": "vitest run"}}"#,
@@ -9351,7 +9351,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(found["harnesses"][0]["path"], ".ai");
+        assert_eq!(found["harnesses"][0]["path"], ".claude");
         assert_eq!(found["commands"][0]["name"], "test");
         assert_eq!(found["commands"][0]["command"], "npm run test");
         // Not a repository is a finding, not a refusal — the last step is what decides whether that
@@ -13698,40 +13698,43 @@ mod tests {
             .status()
     }
 
-    /// Puts the main checkout of the worktree `wt` on the project roster, as the daemon knows a
-    /// project it was told about.
+    /// Puts the main checkout of the worktree `wt` on the project roster under the fixture's
+    /// project id, as the daemon knows a project it was told about.
     async fn roster_main_of(state: &AppState, wt: &std::path::Path) {
         let main = crate::governance::autopilot::main_checkout_of(wt).unwrap();
-        let root = main.to_str().unwrap();
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
         )
-        .bind(root)
-        .bind(root)
+        .bind(crate::governance::autopilot::testkit::SEED_PROJECT)
+        .bind(main.to_str().unwrap())
         .execute(&state.pool)
         .await
         .unwrap();
     }
 
+    /// A test state whose machine root and workflow library are the fixture's.
+    async fn state_for(
+        fixture: &crate::governance::autopilot::testkit::UnseededWorktree,
+    ) -> AppState {
+        let mut state = test_state().await;
+        state.machine_config_root = Some(fixture.machine_root.clone());
+        state.workflow_library = Some(fixture.library.clone());
+        state
+    }
+
     /// A worktree whose main checkout the daemon has never heard of is not offered the workflow, and
-    /// the confirmed POST is refused with the main's script never run.
+    /// the confirmed POST is refused with nothing written.
     #[tokio::test]
     async fn a_worktree_whose_main_is_not_a_known_project_is_not_offered_the_workflow() {
-        let state = test_state().await;
-        let (_container, main, wt) =
-            crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
-                "nucleos-seed-",
-                true,
-            );
-        std::fs::write(
-            main.join(".ai/scripts/seed_worktree.py"),
-            "import sys\nfrom pathlib import Path\nPath(sys.argv[1], 'ran.marker').write_text('ran')\n",
-        )
-        .unwrap();
+        let fixture = crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
+            "nucleos-seed-",
+            true,
+        );
+        let state = state_for(&fixture).await;
         let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
-        crate::chats::set_cwd(&state.pool, &chat_id, wt.to_str().unwrap())
+        crate::chats::set_cwd(&state.pool, &chat_id, fixture.wt.to_str().unwrap())
             .await
             .unwrap();
 
@@ -13740,30 +13743,33 @@ mod tests {
 
         assert_eq!(body["workflow_missing"], false);
         assert_eq!(status, StatusCode::CONFLICT);
-        assert!(!wt.join("ran.marker").exists());
-        assert!(!wt.join(".ai").exists());
+        assert!(!fixture.wt.join(".claude").exists());
     }
 
-    /// The main's script exiting non-zero answers the failure status, and the project read still
+    /// A pin that cannot be materialized answers the failure status, and the project read still
     /// offers the workflow afterwards.
     #[tokio::test]
-    async fn a_failing_seed_script_answers_a_failure_and_the_workflow_stays_missing() {
-        let state = test_state().await;
-        let (_container, main, wt) =
-            crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
-                "nucleos-seed-",
-                true,
-            );
+    async fn a_pin_that_cannot_be_materialized_answers_a_failure_and_the_workflow_stays_missing() {
+        let fixture = crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
+            "nucleos-seed-",
+            true,
+        );
+        // Bytes nobody pinned: the library's copy drifted after the pin was taken.
         std::fs::write(
-            main.join(".ai/scripts/seed_worktree.py"),
-            "import sys\nsys.exit(3)\n",
+            fixture
+                .library
+                .join("dev")
+                .join("1.0")
+                .join(".claude/skills/orchestrate/SKILL.md"),
+            "# edited after pinning\n",
         )
         .unwrap();
-        roster_main_of(&state, &wt).await;
+        let state = state_for(&fixture).await;
+        roster_main_of(&state, &fixture.wt).await;
         let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
-        crate::chats::set_cwd(&state.pool, &chat_id, wt.to_str().unwrap())
+        crate::chats::set_cwd(&state.pool, &chat_id, fixture.wt.to_str().unwrap())
             .await
             .unwrap();
 
@@ -13774,27 +13780,26 @@ mod tests {
         assert_eq!(after["workflow_missing"], true);
     }
 
-    /// A conversation in a linked worktree that was never seeded says its workflow is missing —
-    /// the reason it has no tools — while one in the main checkout says nothing of the kind.
+    /// A conversation in a linked worktree that never had its workflow says it is missing — the
+    /// reason it has no tools — while one in the main checkout says nothing of the kind.
     #[tokio::test]
     async fn a_conversation_in_an_unseeded_worktree_is_told_its_workflow_is_missing() {
-        let state = test_state().await;
-        let (_container, main, wt) =
-            crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
-                "nucleos-seed-",
-                true,
-            );
-        roster_main_of(&state, &wt).await;
+        let fixture = crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
+            "nucleos-seed-",
+            true,
+        );
+        let state = state_for(&fixture).await;
+        roster_main_of(&state, &fixture.wt).await;
         let in_worktree = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
-        crate::chats::set_cwd(&state.pool, &in_worktree, wt.to_str().unwrap())
+        crate::chats::set_cwd(&state.pool, &in_worktree, fixture.wt.to_str().unwrap())
             .await
             .unwrap();
         let in_main = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
-        crate::chats::set_cwd(&state.pool, &in_main, main.to_str().unwrap())
+        crate::chats::set_cwd(&state.pool, &in_main, fixture.main.to_str().unwrap())
             .await
             .unwrap();
 
@@ -13806,44 +13811,44 @@ mod tests {
         assert_eq!(main_body["workflow_missing"], false);
     }
 
-    /// Seeding overwrites a worktree's workflow core, so it runs only on an explicit yes: anything
-    /// else is refused and nothing is written.
+    /// Setting up writes into the worktree, so it runs only on an explicit yes: anything else is
+    /// refused and nothing is written.
     #[tokio::test]
     async fn seeding_the_workflow_refuses_without_confirmation() {
-        let state = test_state().await;
-        let (_container, _main, wt) =
-            crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
-                "nucleos-seed-",
-                true,
-            );
+        let fixture = crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
+            "nucleos-seed-",
+            true,
+        );
+        let state = state_for(&fixture).await;
+        roster_main_of(&state, &fixture.wt).await;
         let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
-        crate::chats::set_cwd(&state.pool, &chat_id, wt.to_str().unwrap())
+        crate::chats::set_cwd(&state.pool, &chat_id, fixture.wt.to_str().unwrap())
             .await
             .unwrap();
 
         let status = seed_workflow_request(state.clone(), &chat_id, false).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(!wt.join(".ai").exists());
+        assert!(!fixture.wt.join(".claude").exists());
     }
 
-    /// A conversation in the main checkout has no worktree to seed, and one in a worktree whose main
-    /// checkout holds no workflow has nothing to seed it from: both are told so, and nothing is written.
+    /// A conversation in the main checkout has no worktree to set up, and one in a worktree whose
+    /// project pins no workflow has nothing to put in it: both are told so, and nothing is written.
     #[tokio::test]
     async fn seeding_the_workflow_refuses_a_conversation_without_a_worktree_and_a_workflow_behind_it()
      {
-        let state = test_state().await;
-        let (_container, main, _wt) =
-            crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
-                "nucleos-seed-",
-                true,
-            );
+        let fixture = crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
+            "nucleos-seed-",
+            true,
+        );
+        let state = state_for(&fixture).await;
+        roster_main_of(&state, &fixture.wt).await;
         let in_main = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
-        crate::chats::set_cwd(&state.pool, &in_main, main.to_str().unwrap())
+        crate::chats::set_cwd(&state.pool, &in_main, fixture.main.to_str().unwrap())
             .await
             .unwrap();
 
@@ -13852,48 +13857,53 @@ mod tests {
             StatusCode::CONFLICT
         );
 
-        let (_bare_container, _bare_main, bare_wt) =
-            crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
-                "nucleos-seed-",
-                false,
-            );
-        roster_main_of(&state, &bare_wt).await;
-        let in_bare = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+        let bare = crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
+            "nucleos-seed-",
+            false,
+        );
+        let bare_state = state_for(&bare).await;
+        roster_main_of(&bare_state, &bare.wt).await;
+        let in_bare = crate::chats::create(&bare_state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
-        crate::chats::set_cwd(&state.pool, &in_bare, bare_wt.to_str().unwrap())
+        crate::chats::set_cwd(&bare_state.pool, &in_bare, bare.wt.to_str().unwrap())
             .await
             .unwrap();
 
         assert_eq!(
-            seed_workflow_request(state.clone(), &in_bare, true).await,
+            seed_workflow_request(bare_state.clone(), &in_bare, true).await,
             StatusCode::CONFLICT
         );
-        assert!(!bare_wt.join(".ai").exists());
+        assert!(!bare.wt.join(".claude").exists());
     }
 
-    /// The end-to-end of "Set up workflow": after a confirmed seed the project read no longer says
+    /// The end-to-end of "Set up workflow": after a confirmed setup the project read no longer says
     /// the workflow is missing, and says the conversation has tools.
     #[tokio::test]
     async fn seeding_the_workflow_into_a_conversations_worktree_clears_the_flag_and_gives_it_tools()
     {
-        let state = test_state().await;
-        let (_container, _main, wt) =
-            crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
-                "nucleos-seed-",
-                true,
-            );
-        roster_main_of(&state, &wt).await;
+        let fixture = crate::governance::autopilot::testkit::repo_with_an_unseeded_worktree(
+            "nucleos-seed-",
+            true,
+        );
+        let state = state_for(&fixture).await;
+        roster_main_of(&state, &fixture.wt).await;
         let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
-        crate::chats::set_cwd(&state.pool, &chat_id, wt.to_str().unwrap())
+        crate::chats::set_cwd(&state.pool, &chat_id, fixture.wt.to_str().unwrap())
             .await
             .unwrap();
 
         let status = seed_workflow_request(state.clone(), &chat_id, true).await;
 
         assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            fixture
+                .wt
+                .join(".claude/skills/orchestrate/SKILL.md")
+                .is_file()
+        );
         let after = json_body(project_request(state.clone(), &chat_id).await).await;
         assert_eq!(after["workflow_missing"], false);
         assert_eq!(after["tools"], true);

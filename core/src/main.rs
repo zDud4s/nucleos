@@ -125,16 +125,11 @@ async fn main() {
     // home directory) reads every file as absent, which is what an absent file has always meant:
     // each pillar starts on its defaults.
     let machine_config_root = machine_config::root();
-    match &machine_config_root {
-        Some(root) => {
-            migrate_machine_settings(&pool, root).await;
-            migrate_project_state(&pool, root).await;
-            migrate_onboarding(&pool, root).await;
-        }
-        None => tracing::warn!(
+    if machine_config_root.is_none() {
+        tracing::warn!(
             "no home directory, so {} cannot be read; every pillar starts on its defaults",
             machine_config::ROOT_DISPLAY
-        ),
+        );
     }
     let machine_file = |file: &str| machine_config_root.as_ref().map(|root| root.join(file));
 

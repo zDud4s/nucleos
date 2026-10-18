@@ -3511,7 +3511,7 @@ mod tests {
 
         let app = test_router(state.clone());
         let body = format!(
-            r#"{{"run_id":{run_id},"tool_name":"Edit","tool_input":{{"file_path":".ai/autopilot.yaml"}}}}"#
+            r#"{{"run_id":{run_id},"tool_name":"Edit","tool_input":{{"file_path":".claude/settings.json"}}}}"#
         );
         let decision = decide(&app, &body).await;
         assert_eq!(decision.decision, "pending_approval");
@@ -6825,7 +6825,7 @@ mod tests {
             &serde_json::json!({
                 "run_id": run_id,
                 "tool_name": "Edit",
-                "tool_input": {"file_path": ".ai/autopilot.yaml"}
+                "tool_input": {"file_path": ".claude/settings.json"}
             })
             .to_string(),
         )
@@ -6898,7 +6898,7 @@ mod tests {
             &serde_json::json!({
                 "run_id": run_id,
                 "tool_name": "Edit",
-                "tool_input": {"file_path": ".ai/autopilot.yaml"}
+                "tool_input": {"file_path": ".claude/settings.json"}
             })
             .to_string(),
         )

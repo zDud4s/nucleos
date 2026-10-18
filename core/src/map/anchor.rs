@@ -2954,9 +2954,9 @@ mod tests {
         // the 40 the design counts: `docs/specs/` and `docs/superpowers/specs/` are read too.
         let root = std::env::temp_dir().join(format!("nucleos-anchor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".ai/specs")).expect("scratch");
+        std::fs::create_dir_all(root.join("docs/specs")).expect("scratch");
         std::fs::write(
-            root.join(".ai/specs/2026-01-01-alfa-design.md"),
+            root.join("docs/specs/2026-01-01-alfa-design.md"),
             "# Alfa (design)\n\n## 3. Beta\n",
         )
         .expect("write");
@@ -3058,7 +3058,7 @@ mod tests {
         let root = scratch(name);
         write(
             &root,
-            &format!(".ai/specs/{FIXTURE}.md"),
+            &format!("docs/specs/{FIXTURE}.md"),
             "# Documento de fixture\n\n## 7. Sete\n",
         );
         root
@@ -3310,9 +3310,11 @@ mod tests {
 
         // No corpus at all, which is a fact about the checkout and not about this table.
         //
-        // `.ai/` is gitignored by the owner's standing decision, so a git worktree and a fresh
-        // clone both start with an empty `.ai/specs/` -- and then every pair below fails on a slug
-        // the checkout cannot possibly hold. The first one reported wins, so the suite says "the
+        // A git worktree or a fresh clone may not carry the corpus (this repository kept it in a
+        // gitignored folder), and since the map stopped reading AI-workflow folders
+        // (`map::intent::SPEC_FOLDERS`) a corpus outside `docs/specs/` or `docs/superpowers/specs/`
+        // is not read at all -- and then every pair below fails on a slug the checkout cannot
+        // possibly hold. The first one reported wins, so the suite says "the
         // ground truth scores core/src/integrations/email.rs against 2026-07-28-email-pillar-design, which this
         // project does not have", which reads as a regression in a table nobody touched. It stopped
         // a `gates.sh all` in a worktree on 2026-08-31 and cost a bisection of 3,229 tests to
@@ -3331,9 +3333,8 @@ mod tests {
         if !GROUND_TRUTH.iter().any(|(_, slug)| slugs.contains(slug)) {
             eprintln!(
                 "skipped: {} holds none of the {} documents this table scores against, so there is \
-                 nothing here to check it with. `.ai/` is gitignored, so a worktree and a fresh \
-                 clone both start without the corpus; copy `.ai/specs/` in from the main checkout \
-                 to run this.",
+                 nothing here to check it with. The map reads specs from `docs/specs/` and \
+                 `docs/superpowers/specs/` only; put the corpus there to run this.",
                 root.display(),
                 GROUND_TRUTH.len()
             );

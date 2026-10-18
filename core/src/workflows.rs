@@ -52,7 +52,7 @@
 //! - **`referenced`** — the library has the pinned bundle and it hashes to what was pinned.
 //! - **`drifted`** — the library has it, and it does not. Somebody edited the bundle in place under
 //!   a pin that claims to know what it says.
-//! - **`ejected`** — this project has its own copy under `.ai/workflows/<name>/`. It is never
+//! - **`ejected`** — this project has its own copy under `.nucleos/workflows/<name>/`. It is never
 //!   `missing`, whatever the library holds: the project has the bundle in its hands.
 //! - **`missing`** — pinned, and the library has nothing at that coordinate.
 //!
@@ -80,7 +80,7 @@ use sha2::{Digest, Sha256};
 ///
 /// Every function below that reads or writes pins therefore takes the pins FILE as its own
 /// argument, and only the ones that also touch a copy take the project root beside it.
-pub const EJECTED_DIR: &str = ".ai/workflows";
+pub const EJECTED_DIR: &str = ".nucleos/workflows";
 
 /// The one file in a bundle this module parses. Everything else is bytes to be hashed.
 pub const MANIFEST: &str = "bundle.yaml";
@@ -104,7 +104,7 @@ pub fn library_root() -> Option<PathBuf> {
 
 /* ------------------------------------------------------------------ names -- */
 
-/// Whether `name` may be used as a directory under the library or under `.ai/workflows/`.
+/// Whether `name` may be used as a directory under the library or under `.nucleos/workflows/`.
 ///
 /// Deliberately stricter than the filesystem. This name is joined onto a path **and** used to
 /// address a route, and it is the argument to the one operation in this module that deletes a
@@ -424,7 +424,7 @@ pub struct Pin {
     /// says the app must not ask somebody to recreate the harness they already have — this
     /// repository's `.ai/` built NucleOS — so adopting it points the pin at the folder that is
     /// there and touches nothing inside it. `None` is the ordinary case: an ejected copy lives at
-    /// `.ai/workflows/<name>/` and does not need saying.
+    /// `.nucleos/workflows/<name>/` and does not need saying.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -775,7 +775,7 @@ pub fn install(pins_file: &Path, bundle: &Bundle) -> Result<(), Refused> {
         origin: bundle.origin.clone(),
         hash: bundle.hash.clone(),
         // Cleared, because installing from the library is the opposite of holding your own copy.
-        // The folder under `.ai/workflows/` is left alone — deleting a project's files is not
+        // The folder under `.nucleos/workflows/` is left alone — deleting a project's files is not
         // something an install may do quietly — and `installed` reads the disk, so it will keep
         // reporting `ejected` until somebody removes it. That is the truth of the situation.
         ejected_at: None,
@@ -794,7 +794,7 @@ pub fn install(pins_file: &Path, bundle: &Bundle) -> Result<(), Refused> {
 
 /// Stop using a workflow. Removes the pin; never removes an ejected copy.
 ///
-/// Deleting `.ai/workflows/<name>/` here would be this app deleting somebody's files as a side
+/// Deleting `.nucleos/workflows/<name>/` here would be this app deleting somebody's files as a side
 /// effect of a list operation. The copy is theirs — that is what ejecting means — and it is under
 /// version control where they put it.
 pub fn uninstall(pins_file: &Path, name: &str) -> Result<(), Refused> {
@@ -823,7 +823,8 @@ pub fn eject(
         return Err(Refused::AlreadyEjected);
     }
     // The pin is looked up before anything is copied. A project that does not use this workflow
-    // must not end up with its files in `.ai/workflows/` and nothing recording why they are there.
+    // must not end up with its files in `.nucleos/workflows/` and nothing recording why they are
+    // there.
     let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
     let Some(index) = pins
         .workflows
@@ -833,7 +834,7 @@ pub fn eject(
         return Err(Refused::NotInstalled);
     };
     // An adopted workflow is already the project's own folder. Ejecting on top of it would copy a
-    // library bundle into `.ai/workflows/` while the pin went on naming somewhere else — two
+    // library bundle into `.nucleos/workflows/` while the pin went on naming somewhere else — two
     // copies, one of them unreferenced, and a page that could not say which was running.
     if pins.workflows[index].path.is_some() {
         return Err(Refused::Adopted);
@@ -1290,7 +1291,7 @@ mod tests {
 
         assert!(
             project
-                .join(".ai/workflows/harness/skills/plan.md")
+                .join(".nucleos/workflows/harness/skills/plan.md")
                 .is_file()
         );
         let rows = installed(&project, &pins_of(&project), &lib).unwrap();
@@ -1316,13 +1317,13 @@ mod tests {
         install(&pins_of(&project), &bundle).unwrap();
         eject(&project, &pins_of(&project), &bundle, now()).unwrap();
 
-        std::fs::write(project.join(".ai/workflows/harness/g.yaml"), "mine").unwrap();
+        std::fs::write(project.join(".nucleos/workflows/harness/g.yaml"), "mine").unwrap();
         assert_eq!(
             eject(&project, &pins_of(&project), &bundle, now()),
             Err(Refused::AlreadyEjected)
         );
         assert_eq!(
-            std::fs::read_to_string(project.join(".ai/workflows/harness/g.yaml")).unwrap(),
+            std::fs::read_to_string(project.join(".nucleos/workflows/harness/g.yaml")).unwrap(),
             "mine"
         );
     }
@@ -1341,7 +1342,7 @@ mod tests {
         let bundle = bundle_at(&lib, "harness", "1.0");
         install(&pins_of(&project), &bundle).unwrap();
         eject(&project, &pins_of(&project), &bundle, now()).unwrap();
-        std::fs::remove_dir_all(project.join(".ai/workflows/harness")).unwrap();
+        std::fs::remove_dir_all(project.join(".nucleos/workflows/harness")).unwrap();
 
         // The field still says it was ejected; the disk decides, and the disk says there is no copy.
         assert_eq!(
@@ -1365,7 +1366,7 @@ mod tests {
         install(&pins_of(&project), &bundle).unwrap();
         eject(&project, &pins_of(&project), &bundle, now()).unwrap();
 
-        let mine_dir = project.join(".ai/workflows/harness");
+        let mine_dir = project.join(".nucleos/workflows/harness");
         std::fs::write(mine_dir.join("a.md"), "one, changed").unwrap();
         std::fs::write(mine_dir.join("c.md"), "new").unwrap();
         std::fs::remove_file(mine_dir.join("b.md")).unwrap();
@@ -1430,7 +1431,7 @@ mod tests {
         let old = bundle_at(&lib, "harness", "1.0");
         install(&pins_of(&project), &old).unwrap();
         eject(&project, &pins_of(&project), &old, now()).unwrap();
-        std::fs::write(project.join(".ai/workflows/harness/g.yaml"), "mine").unwrap();
+        std::fs::write(project.join(".nucleos/workflows/harness/g.yaml"), "mine").unwrap();
 
         shelf(&lib, "harness", "1.1", &[("g.yaml", "b")]);
         let later = now() + chrono::Duration::days(30);
@@ -1443,7 +1444,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(project.join(".ai/workflows/harness/g.yaml")).unwrap(),
+            std::fs::read_to_string(project.join(".nucleos/workflows/harness/g.yaml")).unwrap(),
             "b"
         );
         let rows = installed(&project, &pins_of(&project), &lib).unwrap();
@@ -1647,7 +1648,7 @@ mod tests {
 
         uninstall(&pins_of(&project), "harness").unwrap();
         assert!(read_pins(&pins_of(&project)).unwrap().workflows.is_empty());
-        assert!(project.join(".ai/workflows/harness/g.yaml").is_file());
+        assert!(project.join(".nucleos/workflows/harness/g.yaml").is_file());
         assert_eq!(
             uninstall(&pins_of(&project), "harness"),
             Err(Refused::NotInstalled)
@@ -1675,6 +1676,6 @@ mod tests {
             ),
             Err(Refused::NotInstalled)
         );
-        assert!(!project.join(".ai/workflows/harness").exists());
+        assert!(!project.join(".nucleos/workflows/harness").exists());
     }
 }

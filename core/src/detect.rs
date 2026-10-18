@@ -4,10 +4,9 @@
 //!
 //! §9's second step, and the one that decides whether the app is hostile to what exists. A project
 //! worth adding has been developed for a while: it has a git history, it has commands its people
-//! type every day, and — increasingly — it has a written-down way of working. **This repository has
-//! one, in `.ai/`, and it built NucleOS.** An app that asked for all of that to be recreated in its
-//! own forms before it would admit the project exists would be asking somebody to do a day's work
-//! to describe a thing that is sitting right there.
+//! type every day, and — increasingly — it has a written-down way of working. An app that asked for
+//! all of that to be recreated in its own forms before it would admit the project exists would be
+//! asking somebody to do a day's work to describe a thing that is sitting right there.
 //!
 //! So this reads and **proposes**. Nothing here is stored: what gets stored is what somebody ticked,
 //! which is the same rule §8 settled for commands. A list that changed by itself because a
@@ -22,8 +21,8 @@
 //!
 //! Two things bound it. The route is in no scope table, so `auth::permits` — default-deny — leaves
 //! it to Admin and Control, which is the key of the person sitting at the machine. And it reads
-//! **files by name**, never a tree: a `package.json`, a `Makefile`, a Cargo config, the
-//! project's own `.ai/project.yaml` when it has one, and the existence of four folders. It cannot be
+//! **files by name**, never a tree: a `package.json`, a `Makefile`, a Cargo config, and the
+//! existence of three folders. It cannot be
 //! pointed at a directory to have its contents enumerated, which is the capability worth not
 //! building.
 //!
@@ -121,11 +120,10 @@ pub struct Detected {
 /// Named individually rather than matched by a pattern, because each needs its own sentence and
 /// because a pattern would sweep in `.vscode` and `.idea`, which are editor settings and not a way
 /// of developing anything.
+///
+/// No folder of NucleOS's own workflow is here: the workflow is a bundle the daemon materializes
+/// (`crate::workflows`), not a folder a project is recognised by.
 const HARNESSES: &[(&str, &str)] = &[
-    (
-        ".ai",
-        "a written-down pipeline: which agent does what, in what order, and what has to pass",
-    ),
     (".claude", "skills, commands and settings for Claude Code"),
     (".agents", "agent definitions this project keeps with it"),
     (
@@ -153,7 +151,7 @@ pub fn inspect_folder(root: &Path) -> Detected {
     }
 
     let (commands, commands_omitted) = suggestions(root);
-    let gate = propose_gate(root, &commands);
+    let gate = propose_gate(&commands);
 
     Detected {
         root: root.to_string_lossy().into_owned(),
@@ -171,26 +169,10 @@ pub fn inspect_folder(root: &Path) -> Detected {
 
 /// The command a project's gate could be, from what the folder already says — or nothing.
 ///
-/// In order, and the order is who is best placed to know:
-///
-/// 1. **The project's own declared full suite**, `commands.test_full` in `.ai/project.yaml`, when
-///    the project keeps that file. It is the project writing down, in its own words, what *green*
-///    means, and a proposal cannot do better than repeat it. **Only a hint**: a project without the
-///    file, or with a `test_full` this cannot read as ONE command, simply falls through — nothing in
-///    NucleOS requires that file or the workflow it belongs to. One command and not a list, because
-///    a gate is spawned directly and never through a shell, so two entries could not be chained.
-/// 2. **A command called `test`**, then **one called `check`**, among the ones [`suggestions`]
-///    found. The conventional names for "run everything that has to pass".
-fn propose_gate(root: &Path, commands: &[Suggestion]) -> Option<GateProposal> {
-    if let Some(command) = read_bounded(&root.join(".ai").join("project.yaml"))
-        .as_deref()
-        .and_then(declared_full_suite)
-    {
-        return Some(GateProposal {
-            command,
-            source: ".ai/project.yaml (commands.test_full)".to_string(),
-        });
-    }
+/// **A command called `test`**, then **one called `check`**, among the ones [`suggestions`] found:
+/// the conventional names for "run everything that has to pass". (A project's AI-workflow file is
+/// not read for a hint: NucleOS reads no workflow's own files, see `crate::workflows`.)
+fn propose_gate(commands: &[Suggestion]) -> Option<GateProposal> {
     ["test", "check"].iter().find_map(|name| {
         commands
             .iter()
@@ -200,20 +182,6 @@ fn propose_gate(root: &Path, commands: &[Suggestion]) -> Option<GateProposal> {
                 source: suggestion.source.to_string(),
             })
     })
-}
-
-/// `commands.test_full` out of a `project.yaml`, when it is one command: a string, or a list of
-/// exactly one. Anything else — no key, a list of several, a file that is not YAML — is no hint.
-fn declared_full_suite(text: &str) -> Option<String> {
-    let value: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
-    let declared = value.get("commands")?.get("test_full")?;
-    let command = match declared {
-        serde_yaml::Value::String(command) => command.as_str(),
-        serde_yaml::Value::Sequence(entries) if entries.len() == 1 => entries[0].as_str()?,
-        _ => return None,
-    };
-    let command = command.trim();
-    (!command.is_empty() && !command.contains(['\n', '\r'])).then(|| command.to_string())
 }
 
 /// Files under a folder, stopping at a depth and a count.
@@ -963,31 +931,41 @@ mod tests {
         assert_eq!(found.commands[0].name, "ok");
     }
 
-    /// **The one that matters most.** This repository's own way of working is a folder, and the app
-    /// has to recognise it rather than ask for it to be described again.
+    /// A way of working a project keeps in a folder is recognised rather than asked for again — and
+    /// `.ai/` is not one of those folders: NucleOS's own workflow is a bundle, not a folder.
     #[test]
     fn the_written_down_way_of_working_a_project_already_has_is_recognised() {
         let temp = folder();
+        std::fs::create_dir_all(temp.path().join(".claude/skills")).unwrap();
+        std::fs::write(temp.path().join(".claude/skills/plan.md"), "plan").unwrap();
+        std::fs::write(temp.path().join(".claude/settings.json"), "{}").unwrap();
         std::fs::create_dir_all(temp.path().join(".ai/scripts")).unwrap();
         std::fs::write(temp.path().join(".ai/workflow.md"), "the pipeline").unwrap();
-        std::fs::write(temp.path().join(".ai/scripts/gate.py"), "print()").unwrap();
         std::fs::create_dir_all(temp.path().join(".vscode")).unwrap();
 
         let found = inspect_folder(temp.path());
         assert_eq!(found.harnesses.len(), 1);
-        assert_eq!(found.harnesses[0].path, ".ai");
+        assert_eq!(found.harnesses[0].path, ".claude");
         assert_eq!(found.harnesses[0].files, 2);
-        assert!(found.harnesses[0].what.contains("pipeline"));
     }
 
-    /// The project's own declared full suite wins over a guess from a script's name, and is only
-    /// ever a hint: a list of several, or no file, falls through to `test`, then `check`.
+    /// The gate is proposed from a conventional name, `test` before `check` — and never from a
+    /// workflow's own `.ai/project.yaml`, which NucleOS does not read.
     #[test]
-    fn the_gate_is_proposed_from_the_projects_own_word_first_and_a_conventional_name_after() {
+    fn the_gate_is_proposed_from_a_conventional_name() {
         let temp = folder();
         std::fs::write(
             temp.path().join("package.json"),
             r#"{"scripts": {"check": "tsc", "test": "vitest run"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join(".ai")).unwrap();
+        std::fs::write(
+            temp.path().join(".ai/project.yaml"),
+            "commands:
+  test_full:
+    - bash scripts/gates.sh all
+",
         )
         .unwrap();
         assert_eq!(
@@ -996,31 +974,6 @@ mod tests {
                 command: "npm run test".to_string(),
                 source: "package.json".to_string(),
             })
-        );
-
-        std::fs::create_dir_all(temp.path().join(".ai")).unwrap();
-        std::fs::write(
-            temp.path().join(".ai/project.yaml"),
-            "commands:\n  test_full:\n    - bash scripts/gates.sh all\n",
-        )
-        .unwrap();
-        assert_eq!(
-            inspect_folder(temp.path()).gate,
-            Some(GateProposal {
-                command: "bash scripts/gates.sh all".to_string(),
-                source: ".ai/project.yaml (commands.test_full)".to_string(),
-            })
-        );
-
-        // Two commands cannot be one gate, so the declaration is no hint and the name wins again.
-        std::fs::write(
-            temp.path().join(".ai/project.yaml"),
-            "commands:\n  test_full:\n    - a\n    - b\n",
-        )
-        .unwrap();
-        assert_eq!(
-            inspect_folder(temp.path()).gate.unwrap().command,
-            "npm run test"
         );
 
         assert_eq!(inspect_folder(folder().path()).gate, None);
