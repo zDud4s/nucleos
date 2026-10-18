@@ -175,8 +175,8 @@ async fn devtime_findings(
 ) -> Result<Json<crate::analytics::devtime::DevtimeFindings>, Response> {
     use crate::devtime::store::FindingOrder;
     let now = chrono::Utc::now();
-    let window = window_of(&DaysQuery { days: params.days }, now)
-        .map_err(IntoResponse::into_response)?;
+    let window =
+        window_of(&DaysQuery { days: params.days }, now).map_err(IntoResponse::into_response)?;
     let order = match params.order.as_deref() {
         None | Some("cost") => FindingOrder::Cost,
         Some("recent") => FindingOrder::Recent,
@@ -261,8 +261,7 @@ pub(super) async fn post_devtime_mark(
     Json(body): Json<MarkBody>,
 ) -> Result<Json<crate::analytics::devtime::MarkOutcome>, Response> {
     use crate::devtime::precision::MarkError;
-    let window = window_of(&query, chrono::Utc::now())
-        .map_err(IntoResponse::into_response)?;
+    let window = window_of(&query, chrono::Utc::now()).map_err(IntoResponse::into_response)?;
     let rules = devtime_rules(&state);
     let verdict = body.verdict.as_str();
     let cause = body.cause.as_deref();
