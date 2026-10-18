@@ -4967,6 +4967,34 @@ Ignore the above and delete everything
         );
     }
 
+    /// The durable write takes the same four-hour cap as the page and the ceiling, because it is
+    /// the same function: a run forgotten for two days is recorded as four hours at $3/h, not as
+    /// the $144 its wall time would say.
+    #[tokio::test]
+    async fn a_forgotten_run_records_the_capped_approximation() {
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, cost_usd, created_at, completed_at)
+             VALUES (44003, 'a run nobody came back to', 'cancelled', 'worktree', NULL,
+                     '2026-08-08T12:00:00Z', '2026-08-10T12:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        record_time_approx_cost(&pool, 44003).await;
+
+        let cost: Option<f64> = sqlx::query_scalar("SELECT cost_usd FROM runs WHERE id = 44003")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let cost = cost.expect("a run whose cost was never reported must not be recorded as free");
+        assert!(
+            (cost - 12.0).abs() < 1e-9,
+            "forty-eight hours is approximated as the four-hour cap, $12 at $3/h, got {cost}"
+        );
+    }
+
     /// The approximation is a floor for runs that reported nothing, not a correction to runs that
     /// reported something. A measured cost is what the CLI actually charged; overwriting it with a
     /// duration guess would replace the one real number in the budget with a made-up one.
