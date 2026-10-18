@@ -341,7 +341,7 @@ mod tests {
         assert_eq!(next, 4);
     }
 
-    /// Migration `0198` indexes the `runs` lookups that were full scans of a 229 MB table.
+    /// Migrations `0198` and `0202` index the `runs` lookups that were full scans of a 229 MB table.
     #[tokio::test]
     async fn the_runs_lookups_by_job_status_and_project_use_an_index() {
         let pool = crate::testdb::fresh_pool().await;
@@ -356,7 +356,7 @@ mod tests {
             ),
             (
                 "SELECT 1 FROM runs WHERE project_id = 'p' AND status = 'running'",
-                "idx_runs_project_status",
+                "runs_by_project_status",
             ),
         ] {
             // `EXPLAIN QUERY PLAN` has four columns; the detail is the last.
