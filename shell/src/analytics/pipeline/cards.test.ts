@@ -2,7 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { pipelineMetrics } from "./cards";
 import { pipelineReport } from "../../test/harness";
-import type { Gate, Jobs, Landing, Postgate } from "../../data/analytics-pipeline";
+import type { Gate, Jobs, Landing, Postgate, Pressure } from "../../data/analytics-pipeline";
 
 const byKey = (report: ReturnType<typeof pipelineReport>) =>
   Object.fromEntries(pipelineMetrics(report).map((metric) => [metric.key, metric]));
@@ -23,6 +23,7 @@ describe("pipelineMetrics", () => {
       "gate",
       "jobs",
       "autopilot",
+      "pressure",
     ]);
   });
 
@@ -89,5 +90,41 @@ describe("pipelineMetrics", () => {
     expect(cards.jobs.sub).toBe("3 of 4 completed · 3 stuck");
     expect(cards.gate.sub).toBe("first try 70%");
     expect(cards.autopilot.spark).toBeUndefined();
+  });
+
+  it("adds a waiting-on-you line to the landing card only when something waits", () => {
+    const base = pipelineReport().landing as Landing;
+    const owner = { count: 2, oldest_age_s: 7200, median_age_s: 600, rate: null, suspect: false };
+    const waiting = byKey(pipelineReport({ landing: { ...base, owner_blocked: owner } })).landing;
+    expect(waiting.sub).toBe("No activity in this window · 2 waiting on you · oldest 2 h");
+    const noAge = byKey(pipelineReport({ landing: { ...base, owner_blocked: { ...owner, oldest_age_s: null } } })).landing;
+    expect(noAge.sub).toBe("No activity in this window · 2 waiting on you");
+    const none = byKey(pipelineReport({ landing: { ...base, owner_blocked: { ...owner, count: 0 } } })).landing;
+    expect(none.sub).toBe("No activity in this window");
+    expect(byKey(pipelineReport()).landing.sub).toBe("No activity in this window");
+  });
+
+  it("reads slot pressure as the share at the limit and the peak", () => {
+    const base = pipelineReport().pressure as Pressure;
+    const card = byKey(
+      pipelineReport({ pressure: { ...base, at_limit_share: 0.22, peak_in_use: 4, limit: 4 } }),
+    ).pressure;
+    expect(card.label).toBe("Slot pressure");
+    expect(card.value).toBe("22%");
+    expect(card.sub).toBe("peak 4 of 4");
+    expect(card.spark?.data).toHaveLength(30);
+  });
+
+  it("says no samples, not zero, for pressure nobody recorded", () => {
+    const card = byKey(pipelineReport()).pressure;
+    expect(card.value).toBe("no data");
+    expect(card.sub).toBe("No samples in this window");
+    expect(card.error).toBeUndefined();
+  });
+
+  it("turns an errored pressure block into the failed card", () => {
+    const card = byKey(pipelineReport({ pressure: { error: "query_failed" } })).pressure;
+    expect(card.error).toBe(true);
+    expect(card.value).toBeUndefined();
   });
 });

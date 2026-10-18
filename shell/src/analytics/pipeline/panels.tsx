@@ -8,12 +8,13 @@ import {
   type Landing,
   type PipelineReport,
   type Postgate,
+  type Pressure,
 } from "../../data/analytics-pipeline";
 import { compactTokens } from "../../data/project-readings";
 import { AreaChart, Badge, ShareBar, usd, type ChartKey } from "../../ui";
 import { versus } from "../series";
 import { joined, plural, summary, type PanelContent } from "../sections";
-import { EMPTY, series, stuckCount, type PipelineKey } from "./cards";
+import { EMPTY, PRESSURE_KEY, series, stuckCount, type PipelineKey } from "./cards";
 import { NO_DATA, clauses, distLine, humanSeconds, percentOr } from "./format";
 
 /**
@@ -176,6 +177,17 @@ function landingPanel(landing: Landing, report: PipelineReport): PanelContent {
             ["Run", distLine(landing.run_s)],
           ]}
         />
+        {landing.conflicts === null ? null : (
+          <Pairs
+            label="Conflicts"
+            rows={[
+              ["Conflict rate", `${percentOr(landing.conflicts.rate)} · ${landing.conflicts.count} conflicts`],
+              ["Auto-resolved", String(landing.conflicts.auto_resolved)],
+              ["Work lost: nothing", String(landing.conflicts.work_lost.nothing)],
+              ["Work lost: lost", String(landing.conflicts.work_lost.lost)],
+            ]}
+          />
+        )}
       </>
     ),
   };
@@ -214,6 +226,35 @@ function gatePanel(gate: Gate, report: PipelineReport): PanelContent {
               </li>
             ))}
           </Rows>
+        )}
+        {gate.cache === null && gate.bypass === null ? null : (
+          <Pairs
+            label="Cache and bypass"
+            rows={[
+              ...(gate.cache === null
+                ? []
+                : [
+                    [
+                      "Cache hit rate",
+                      clauses([
+                        percentOr(gate.cache.hit_rate),
+                        gate.cache.prev_hit_rate === null ? "" : `before ${percentOr(gate.cache.prev_hit_rate)}`,
+                      ]),
+                    ] as [string, string],
+                  ]),
+              ...(gate.bypass === null
+                ? []
+                : [
+                    [
+                      "Bypass",
+                      clauses([
+                        `${gate.bypass.observed} of ${gate.bypass.verify_units} verify units`,
+                        percentOr(gate.bypass.ratio),
+                      ]),
+                    ] as [string, string],
+                  ]),
+            ]}
+          />
         )}
         {gate.legacy_runs > 0 ? <p className="an-note">{`${gate.legacy_runs} older runs without a group`}</p> : null}
         {gate.flaky.length === 0 ? null : (
@@ -355,6 +396,46 @@ function autopilotPanel(autopilot: Autopilot): PanelContent {
   };
 }
 
+/* ---------------------------------------------------------------- pressure -- */
+
+const tenth = (value: number) => value.toFixed(1);
+
+function pressurePanel(pressure: Pressure, report: PipelineReport): PanelContent {
+  const data = series(pressure.daily, PRESSURE_KEY, (day) => day.avg_in_use ?? 0);
+  return {
+    title: "Slots in use per day",
+    aside: joined([
+      pressure.limit === null ? "" : `limit ${pressure.limit}`,
+      versus(pressure.at_limit_share, pressure.prev_at_limit_share, report.days),
+    ]),
+    body: (
+      <>
+        {recordingNote(report.history.slots_since, report.window.from)}
+        <AreaChart
+          data={data}
+          keys={[PRESSURE_KEY]}
+          label={`Average slots in use per day, last ${report.days} days`}
+          format={tenth}
+          empty="No slot samples in this window"
+          tone="ui-chart-runs"
+          height={DETAIL_HEIGHT}
+        />
+        <Pairs
+          label="Slot pressure"
+          rows={[
+            ["At the limit", percentOr(pressure.at_limit_share)],
+            ["Peak in use", pressure.peak_in_use === null ? NO_DATA : String(pressure.peak_in_use)],
+            [
+              pressure.slot_wait_share_is_lower_bound ? "Waiting for a slot, at least" : "Waiting for a slot",
+              percentOr(pressure.slot_wait_share),
+            ],
+          ]}
+        />
+      </>
+    ),
+  };
+}
+
 /* ------------------------------------------------------------------ choose -- */
 
 const PANELS: Record<PipelineKey, (report: PipelineReport) => PanelContent> = {
@@ -363,6 +444,8 @@ const PANELS: Record<PipelineKey, (report: PipelineReport) => PanelContent> = {
   gate: (r) => (isBlockError(r.gate) ? failed("Gate") : gatePanel(r.gate, r)),
   jobs: (r) => (isBlockError(r.jobs) ? failed("Jobs") : jobsPanel(r.jobs, r)),
   autopilot: (r) => (isBlockError(r.autopilot) ? failed("Autopilot") : autopilotPanel(r.autopilot)),
+  pressure: (r) =>
+    r.pressure === null || isBlockError(r.pressure) ? failed("Slot pressure") : pressurePanel(r.pressure, r),
 };
 
 function failed(title: string): PanelContent {

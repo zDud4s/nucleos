@@ -9,7 +9,7 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 import { daemonFetch, daemonState, pipelineReport, project, renderWithRouter, type DaemonState } from "../test/harness";
-import type { Gate, Jobs, Landing, Postgate } from "../data/analytics-pipeline";
+import type { Gate, Jobs, Landing, Postgate, Pressure } from "../data/analytics-pipeline";
 import { AnalyticsView } from "./AnalyticsView";
 
 beforeEach(() => {
@@ -177,9 +177,101 @@ describe("PipelineSection", () => {
     const { container } = await mount(withPipeline(busyReport()));
     await section();
     expect(container.querySelector("[style]")).toBeNull();
-    for (const label of ["Post-merge gate", "Landing queue", "Gate", "Jobs", "Autopilot"]) {
+    for (const label of ["Post-merge gate", "Landing queue", "Gate", "Jobs", "Autopilot", "Slot pressure"]) {
       fireEvent.click(card(label));
       expect(container.querySelector("[style]")).toBeNull();
     }
+  });
+
+  it("shows conflicts in the landing panel and the owner-blocked line on its card", async () => {
+    const report = busyReport();
+    const landing = report.landing as Landing;
+    await mount(
+      withPipeline({
+        ...report,
+        landing: {
+          ...landing,
+          conflicts: { count: 3, rate: 0.12, auto_resolved: 2, work_lost: { nothing: 2, lost: 1 } },
+          owner_blocked: { count: 2, oldest_age_s: 7200, median_age_s: 600, rate: null, suspect: false },
+        },
+      }),
+    );
+    await section();
+    expect(card("Landing queue").textContent).toContain("2 waiting on you · oldest 2 h");
+    const conflicts = screen.getByRole("list", { name: "Conflicts" });
+    expect(within(conflicts).getByText("12% · 3 conflicts")).toBeTruthy();
+    expect(within(conflicts).getByText("Work lost: lost")).toBeTruthy();
+  });
+
+  it("leaves the conflicts, cache and bypass pairs out when the block has none", async () => {
+    await mount(withPipeline(busyReport()));
+    await section();
+    expect(screen.queryByRole("list", { name: "Conflicts" })).toBeNull();
+    fireEvent.click(card("Gate"));
+    expect(screen.queryByRole("list", { name: "Cache and bypass" })).toBeNull();
+  });
+
+  it("shows cache and bypass in the gate panel", async () => {
+    const report = busyReport();
+    const gate = report.gate as Gate;
+    await mount(
+      withPipeline({
+        ...report,
+        gate: {
+          ...gate,
+          cache: { hit_rate: 0.5, prev_hit_rate: 0.25 },
+          bypass: { observed: 1, verify_units: 10, ratio: 0.1 },
+        },
+      }),
+    );
+    await section();
+    fireEvent.click(card("Gate"));
+    const pairs = screen.getByRole("list", { name: "Cache and bypass" });
+    expect(within(pairs).getByText("50% · before 25%")).toBeTruthy();
+    expect(within(pairs).getByText("1 of 10 verify units · 10%")).toBeTruthy();
+  });
+
+  it("opens the slot pressure panel with the at-least wait and the recording note", async () => {
+    const report = busyReport();
+    const pressure = report.pressure as Pressure;
+    await mount(
+      withPipeline({
+        ...report,
+        history: { postgate_since: null, slots_since: `${report.window.to}T03:00:00Z` },
+        pressure: {
+          ...pressure,
+          at_limit_share: 0.22,
+          peak_in_use: 4,
+          limit: 4,
+          slot_wait_share: 0.18,
+          slot_wait_share_is_lower_bound: true,
+        },
+      }),
+    );
+    await section();
+    expect(card("Slot pressure").textContent).toContain("22%");
+    expect(card("Slot pressure").textContent).toContain("peak 4 of 4");
+    fireEvent.click(card("Slot pressure"));
+    expect(screen.getByRole("region", { name: "Slots in use per day" })).toBeTruthy();
+    expect(screen.getByText("Waiting for a slot, at least")).toBeTruthy();
+    expect(screen.getByText("18%")).toBeTruthy();
+    expect(screen.getByText(`Recording since ${report.window.to}. No data for earlier periods yet.`)).toBeTruthy();
+  });
+
+  it("reads empty pressure as no data and a failed pressure block as an error card", async () => {
+    await mount(withPipeline(pipelineReport()));
+    await section();
+    expect(within(card("Slot pressure")).getByText("No samples in this window")).toBeTruthy();
+    fireEvent.click(card("Slot pressure"));
+    expect(screen.queryByText(/Recording since/)).toBeNull();
+  });
+
+  it("a pressure block error leaves the other cards", async () => {
+    await mount(withPipeline({ ...busyReport(), pressure: { error: "query_failed" } }));
+    await section();
+    expect(within(card("Slot pressure")).getByText("Could not compute")).toBeTruthy();
+    fireEvent.click(card("Slot pressure"));
+    expect(screen.getByText("Could not compute this block.")).toBeTruthy();
+    expect(card("Jobs").textContent).toContain("75%");
   });
 });

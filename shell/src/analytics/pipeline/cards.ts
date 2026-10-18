@@ -1,5 +1,5 @@
 import type { ChartDatum, ChartKey } from "../../ui";
-import type { Autopilot, Gate, Jobs, Landing, PipelineReport, Postgate } from "../../data/analytics-pipeline";
+import type { Autopilot, Gate, Jobs, Landing, PipelineReport, Postgate, Pressure } from "../../data/analytics-pipeline";
 import { isBlockError } from "../../data/analytics-pipeline";
 import { versus } from "../series";
 import type { Metric } from "../sections";
@@ -10,15 +10,15 @@ import { NO_DATA, clauses, humanSeconds, percentOr } from "./format";
  * and a sparkline; a block that arrived as `{error}` is a card that says so (`error: true`) and
  * nothing more, so one failed read never takes the others down (D5).
  *
- * **Adding a card** (a sixth, e.g. slot pressure): extend `PipelineKey`, `ORDER`, `LABELS` and
- * `BUILDERS` here, then its panel in `panels.tsx`'s `PANELS`. Conflicts, owner-blocked, cache and
+ * **Adding a card** (a seventh): extend `PipelineKey`, `ORDER`, `LABELS` and
+ * `BUILDERS` here, then its panel in `panels.tsx`'s `PANELS`. Slot pressure is the sixth. Conflicts, owner-blocked, cache and
  * bypass are not cards: they are extra panel pairs of their block.
  */
 
-export type PipelineKey = "postgate" | "landing" | "gate" | "jobs" | "autopilot";
+export type PipelineKey = "postgate" | "landing" | "gate" | "jobs" | "autopilot" | "pressure";
 
 /** Spec §8 order: the post-merge gate first, because red is what matters most. */
-export const ORDER: PipelineKey[] = ["postgate", "landing", "gate", "jobs", "autopilot"];
+export const ORDER: PipelineKey[] = ["postgate", "landing", "gate", "jobs", "autopilot", "pressure"];
 
 export const LABELS: Record<PipelineKey, string> = {
   postgate: "Post-merge gate",
@@ -26,6 +26,7 @@ export const LABELS: Record<PipelineKey, string> = {
   gate: "Gate",
   jobs: "Jobs",
   autopilot: "Autopilot",
+  pressure: "Slot pressure",
 };
 
 export const EMPTY = "No activity in this window";
@@ -70,6 +71,14 @@ function postgateCard(postgate: Postgate, report: PipelineReport): Metric<Pipeli
   };
 }
 
+/** What waits on the owner right now (not windowed); nothing is said when nothing waits. */
+export function ownerBlockedLine(landing: Landing): string {
+  const blocked = landing.owner_blocked;
+  if (blocked === null || blocked.count <= 0) return "";
+  const oldest = blocked.oldest_age_s === null ? "" : `oldest ${humanSeconds(blocked.oldest_age_s)}`;
+  return clauses([`${blocked.count} waiting on you`, oldest]);
+}
+
 function landingCard(landing: Landing): Metric<PipelineKey> {
   const key: ChartKey = { key: "total", label: "Landings" };
   const wait = (p50: number | null) => (p50 === null ? NO_DATA : humanSeconds(p50));
@@ -77,7 +86,7 @@ function landingCard(landing: Landing): Metric<PipelineKey> {
     key: "landing",
     label: LABELS.landing,
     value: landing.total,
-    sub:
+    sub: clauses([
       landing.total === 0
         ? EMPTY
         : clauses([
@@ -85,6 +94,8 @@ function landingCard(landing: Landing): Metric<PipelineKey> {
             "last attempt",
             `${percentOr(landing.bad_share)} went wrong`,
           ]),
+      ownerBlockedLine(landing),
+    ]),
     spark: { data: series(landing.daily, key, (day) => day.total), keys: [key], tone: "ui-chart-runs", format: count },
   };
 }
@@ -144,6 +155,31 @@ function autopilotCard(autopilot: Autopilot): Metric<PipelineKey> {
   };
 }
 
+/** The one series the pressure card and panel draw: average slots in use (a day nobody sampled is 0). */
+export const PRESSURE_KEY: ChartKey = { key: "avg", label: "Average slots in use" };
+const tenth = (value: number) => value.toFixed(1);
+
+function pressureCard(pressure: Pressure, days: number): Metric<PipelineKey> {
+  return {
+    key: "pressure",
+    label: LABELS.pressure,
+    value: percentOr(pressure.at_limit_share),
+    sub:
+      pressure.peak_in_use === null
+        ? "No samples in this window"
+        : clauses([
+            `peak ${pressure.peak_in_use} of ${pressure.limit === null ? NO_DATA : pressure.limit}`,
+            versus(pressure.at_limit_share, pressure.prev_at_limit_share, days),
+          ]),
+    spark: {
+      data: series(pressure.daily, PRESSURE_KEY, (day) => day.avg_in_use ?? 0),
+      keys: [PRESSURE_KEY],
+      tone: "ui-chart-runs",
+      format: tenth,
+    },
+  };
+}
+
 function failed(key: PipelineKey): Metric<PipelineKey> {
   return { key, label: LABELS[key], value: undefined, sub: "", error: true };
 }
@@ -154,6 +190,8 @@ const BUILDERS: Record<PipelineKey, (report: PipelineReport) => Metric<PipelineK
   gate: (r) => (isBlockError(r.gate) ? failed("gate") : gateCard(r.gate, r.days)),
   jobs: (r) => (isBlockError(r.jobs) ? failed("jobs") : jobsCard(r.jobs, r.days)),
   autopilot: (r) => (isBlockError(r.autopilot) ? failed("autopilot") : autopilotCard(r.autopilot)),
+  pressure: (r) =>
+    r.pressure === null || isBlockError(r.pressure) ? failed("pressure") : pressureCard(r.pressure, r.days),
 };
 
 /** The row's cards, in order. */

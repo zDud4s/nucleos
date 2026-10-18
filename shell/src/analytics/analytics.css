@@ -437,7 +437,7 @@
   color: var(--text);
 }
 
-/* Five cards and a sixth to come: three to a row, so neither count leaves a lone card hanging at four. */
+/* Six cards: three to a row (two rows), two at the narrow step (three rows), so none hangs alone. */
 .an-pipeline .an-metrics {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
