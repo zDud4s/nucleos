@@ -25,7 +25,11 @@ use crate::warm;
 
 /// A project's warm-state ceiling when its `autopilot.yaml` sets none.
 pub const DEFAULT_PROJECT_DISK_CAP_GB: u64 = 30;
+/// Cadence while a unit is in flight (or a warm dir is being removed).
 const POLL: Duration = Duration::from_millis(500);
+/// Fallback cadence when nothing is in flight. Every enqueue (`submit`) and every unit finish
+/// (`Reservation::drop`) wakes the worker, so this only covers a missed wake.
+const IDLE_POLL: Duration = Duration::from_secs(30);
 const SWEEP_EVERY: Duration = Duration::from_secs(30 * 60);
 /// How often a unit looks again at a warm dir the sweep is removing.
 const REMOVING_POLL: Duration = Duration::from_millis(100);
@@ -434,15 +438,33 @@ async fn sweep_once(executor: Arc<Executor>, _running: Sweeping) {
     }
 }
 
-/// The worker: schedules on every wake and every `POLL`, sweeps warm state every `SWEEP_EVERY`.
+impl Executor {
+    /// How long the worker may sleep before looking again: `POLL` while anything is in flight or
+    /// being removed, `IDLE_POLL` otherwise.
+    fn poll_interval(&self) -> Duration {
+        let state = self.lock();
+        if state.used > 0 || !state.removing.is_empty() {
+            POLL
+        } else {
+            IDLE_POLL
+        }
+    }
+}
+
+/// The worker: schedules on every wake and every poll interval, sweeps warm state every
+/// `SWEEP_EVERY`.
 pub async fn run_executor(executor: Arc<Executor>) {
     let first_sweep = tokio::time::Instant::now() + SWEEP_EVERY;
     let mut sweep = tokio::time::interval_at(first_sweep, SWEEP_EVERY);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Rows queued before this worker existed (e.g. requeued after a restart) start now, not
+    // after the first idle poll.
+    executor.start_ready().await;
     loop {
+        let interval = executor.poll_interval();
         tokio::select! {
             _ = executor.wake.notified() => {}
-            _ = tokio::time::sleep(POLL) => {}
+            _ = tokio::time::sleep(interval) => {}
             _ = sweep.tick() => {
                 // A sweep still walking from the last tick is left to finish.
                 if let Some(running) = Sweeping::start(&executor) {
@@ -656,6 +678,36 @@ mod tests {
         ex.release_removal(&parked);
         let state = wait_terminal(&ex, submitted.id).await;
         assert_eq!(state.status, verify_runs::STATUS_PASSED);
+    }
+
+    #[tokio::test]
+    async fn the_idle_poll_is_slow_and_the_busy_poll_is_fast() {
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        assert_eq!(ex.poll_interval(), IDLE_POLL);
+        ex.lock().used = 1;
+        assert_eq!(ex.poll_interval(), POLL);
+        ex.lock().used = 0;
+        ex.lock().removing.insert(root.path().join("d"));
+        assert_eq!(ex.poll_interval(), POLL);
+    }
+
+    #[tokio::test]
+    async fn a_submit_is_started_by_the_wake_not_the_idle_poll() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        assert!(IDLE_POLL >= Duration::from_secs(30));
+        let worker = tokio::spawn(run_executor(Arc::clone(&ex)));
+        // Let the worker reach its (30 s) idle sleep before anything is queued.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 0))
+            .await
+            .unwrap();
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_PASSED);
+        worker.abort();
     }
 
     #[tokio::test]

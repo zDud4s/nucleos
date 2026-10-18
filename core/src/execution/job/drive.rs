@@ -857,8 +857,37 @@ pub async fn run_job_loop(state: AppState) {
     let mut interval = tokio::time::interval(JOB_TICK);
     loop {
         interval.tick().await;
-        job_tick(&state, Utc::now()).await;
+        let tick_state = state.clone();
+        survive_panic(async move { job_tick(&tick_state, Utc::now()).await }).await;
+    }
+}
+
+/// Runs one tick on its own task, so a panic inside it comes back as a logged value instead of
+/// ending the loop: the loop is spawned bare, and one panic would otherwise stop all job
+/// scheduling until the daemon restarted. A task is used instead of `catch_unwind` because it
+/// needs no extra dependency and also covers a panic on any await point of the tick.
+pub(super) async fn survive_panic<F>(tick: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match tokio::spawn(tick).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, "a job tick panicked; the loop carries on");
+            false
+        }
     }
 }
 
 pub(super) const JOB_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(test)]
+mod survive_panic_tests {
+    use super::survive_panic;
+
+    #[tokio::test]
+    async fn a_panicking_tick_is_reported_and_the_next_one_still_runs() {
+        assert!(!survive_panic(async { panic!("tick blew up") }).await);
+        assert!(survive_panic(async {}).await);
+    }
+}

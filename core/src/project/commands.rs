@@ -522,7 +522,7 @@ pub async fn finish(pool: &SqlitePool, id: i64, finished: Finished) -> sqlx::Res
     sqlx::query(
         "UPDATE project_commands
             SET last_ended_at = ?, last_outcome = ?, last_exit_code = ?, last_output = ?
-          WHERE id = ?",
+          WHERE id = ? AND last_outcome = 'running'",
     )
     .bind(&now)
     .bind(finished.outcome.as_db_str())
@@ -883,6 +883,49 @@ mod tests {
         .unwrap();
         // Finished, so it can go again.
         assert!(mark_running(&pool, "alpha", id).await.unwrap());
+    }
+
+    /// A late finish (the command was already reconciled, or has since been finished) must not
+    /// overwrite the outcome that is there.
+    #[tokio::test]
+    async fn a_finish_on_a_row_no_longer_running_leaves_it_unchanged() {
+        let pool = pool().await;
+        project(&pool, "alpha").await;
+        let id = declare(
+            &pool,
+            "alpha",
+            Declaration {
+                name: "gate".to_owned(),
+                command: "make check".to_owned(),
+                cwd: None,
+                is_gate: true,
+                pass_exit_code: 0,
+                runnable_by: RunnableBy::Person,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(mark_running(&pool, "alpha", id).await.unwrap());
+        let done = |outcome, output: &str| Finished {
+            outcome,
+            exit_code: Some(0),
+            output: Some(output.to_owned()),
+        };
+        finish(&pool, id, done(Outcome::Passed, "first"))
+            .await
+            .unwrap();
+        finish(&pool, id, done(Outcome::Failed, "late"))
+            .await
+            .unwrap();
+
+        let (outcome, output): (String, Option<String>) =
+            sqlx::query_as("SELECT last_outcome, last_output FROM project_commands WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(outcome, Outcome::Passed.as_db_str());
+        assert_eq!(output.as_deref(), Some("first"));
     }
 
     /// Another project's id does not reach this project's command — the guard that makes an integer

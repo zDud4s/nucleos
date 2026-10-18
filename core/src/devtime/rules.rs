@@ -1242,6 +1242,28 @@ mod tests {
         .await
     }
 
+    #[test]
+    fn a_project_cross_pass_waits_its_interval_unless_the_rules_change() {
+        let mut last = HashMap::new();
+        let t0 = std::time::Instant::now();
+        assert!(cross_due(&mut last, "p1", "fp1", t0));
+        assert!(!cross_due(
+            &mut last,
+            "p1",
+            "fp1",
+            t0 + std::time::Duration::from_secs(60)
+        ));
+        assert!(
+            cross_due(&mut last, "p2", "fp1", t0),
+            "another project has its own clock"
+        );
+        assert!(
+            cross_due(&mut last, "p1", "fp2", t0),
+            "a new fingerprint recomputes at once"
+        );
+        assert!(cross_due(&mut last, "p1", "fp1", t0 + CROSS_PASS_EVERY));
+    }
+
     #[tokio::test]
     async fn rules_pass_is_idempotent_and_recomputes_on_fingerprint_change() {
         let pool = test_pool().await;

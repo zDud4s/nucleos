@@ -125,3 +125,38 @@ func TestTopicsOfOneGroupDoNotBlockEachOther(t *testing.T) {
 	close(stuck)
 	dispatcher.Shutdown(time.Second)
 }
+
+func TestSupervisorBacksOffAndResetsAfterAHealthyRun(t *testing.T) {
+	var clock time.Time
+	now := func() time.Time { return clock }
+	var delays []time.Duration
+	sleep := func(d time.Duration) { delays = append(delays, d) }
+
+	runs := 0
+	// Panics 8 times in a row instantly, then once after a healthy 2 minutes, then twice
+	// instantly, then returns.
+	fn := func() {
+		runs++
+		if runs == 9 {
+			clock = clock.Add(2 * time.Minute)
+		}
+		if runs <= 11 {
+			panic("boom")
+		}
+	}
+	superviseWith("t", fn, sleep, now)
+
+	want := []time.Duration{
+		5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second,
+		80 * time.Second, 160 * time.Second, 300 * time.Second, 300 * time.Second,
+		5 * time.Second, 10 * time.Second,
+	}
+	if len(delays) != 11 {
+		t.Fatalf("delays = %v, want 11 restarts", delays)
+	}
+	for i, w := range want {
+		if delays[i] != w {
+			t.Errorf("delay[%d] = %v, want %v", i, delays[i], w)
+		}
+	}
+}

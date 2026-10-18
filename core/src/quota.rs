@@ -685,11 +685,25 @@ pub async fn record(
     providers: &[Provider],
     _now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), sqlx::Error> {
+    // What is already stored, read once. `GET /quota` is polled by the shell and the sidecar answers
+    // `cached: true` with the very same reading until its own refresh, so most calls re-write the
+    // row it already holds: an upsert and an fsync on the WAL for nothing. Comparing against the
+    // table itself, rather than against a process-level memo, stays right across a restart and
+    // across pools, and a read costs no fsync.
+    let existing: Vec<Row> = sqlx::query_as(
+        "SELECT provider, window_name, used_fraction, resets_at, fidelity, stale, read_at
+           FROM quota_readings",
+    )
+    .fetch_all(pool)
+    .await?;
     for provider in providers {
         if provider.fidelity == Fidelity::Unmeasured {
             continue;
         }
         for window in &provider.windows {
+            if reading_is_stored(&existing, provider, window) {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO quota_readings
                      (provider, window_name, used_fraction, resets_at, fidelity, stale, read_at)
@@ -716,6 +730,22 @@ pub async fn record(
         }
     }
     Ok(())
+}
+
+/// Whether `existing` already holds exactly what `record` would write for this window.
+///
+/// Every column `record` writes is compared, the figure after the same clamp, so a changed reading,
+/// reset, fidelity, staleness or read time is never skipped.
+fn reading_is_stored(existing: &[Row], provider: &Provider, window: &Window) -> bool {
+    existing.iter().any(|row| {
+        row.provider == provider.provider
+            && row.window_name == window.window
+            && row.used_fraction.to_bits() == window.used_fraction.clamp(0.0, 1.0).to_bits()
+            && row.resets_at.as_deref() == window.resets_at.as_deref()
+            && row.fidelity == provider.fidelity.as_db_str()
+            && (row.stale != 0) == window.stale
+            && row.read_at == provider.read_at
+    })
 }
 
 /// One row of `quota_readings`, named rather than read as a seven-place tuple: a tuple of three
@@ -2044,6 +2074,48 @@ mod tests {
             1,
             "the live reading was not stored"
         );
+    }
+
+    /// An unchanged reading must not be written again, and a changed one must be. A trigger counts
+    /// the writes that reach the row, since the stored values alone cannot tell a skip from a rewrite.
+    #[tokio::test]
+    async fn an_unchanged_reading_is_not_rewritten_and_a_changed_one_is() {
+        let pool = pool().await;
+        sqlx::query("CREATE TABLE quota_writes (n INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER count_quota_writes AFTER UPDATE ON quota_readings
+             BEGIN INSERT INTO quota_writes VALUES (1); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let writes = |pool: SqlitePool| async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM quota_writes")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+
+        record(&pool, &measured(0.56), noon()).await.unwrap();
+        record(&pool, &measured(0.56), noon()).await.unwrap();
+        record(&pool, &measured(0.56), noon()).await.unwrap();
+        assert_eq!(
+            writes(pool.clone()).await,
+            0,
+            "an identical reading was rewritten"
+        );
+
+        record(&pool, &measured(0.70), noon()).await.unwrap();
+        assert_eq!(
+            writes(pool.clone()).await,
+            1,
+            "a changed reading was not recorded"
+        );
+        let stored = stored(&pool, noon()).await.unwrap();
+        assert!((stored[0].windows[0].used_fraction - 0.70).abs() < f64::EPSILON);
     }
 
     /// The fallback is only worth having if it actually carries the figures across.

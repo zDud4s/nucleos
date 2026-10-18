@@ -231,20 +231,19 @@ pub async fn propose_action(
 
     // Only `propose` actions occupy the queue: an `allow` action is decided already and executes on
     // the next pass, so counting it would let a fast-clearing kind block a slow one.
-    if mode == "propose" {
-        let ceiling: i64 = sqlx::query_scalar("SELECT max_open_actions FROM teams WHERE id = ?")
-            .bind(&team_id)
-            .fetch_optional(&state.pool)
-            .await?
-            .unwrap_or(DEFAULT_MAX_OPEN_ACTIONS);
-        let open = open_actions_of(&state.pool, &team_id).await?;
-        if open >= ceiling {
-            return Err(ActionError::QueueFull(format!(
-                "this department already has {open} action(s) waiting for approval, and may hold \
-                 {ceiling}; the person deciding has not got to them yet"
-            )));
-        }
-    }
+    // The ceiling is read here, before the transaction (see the ordering note below); the COUNT that
+    // is held against it is taken inside the transaction, after its first write.
+    let ceiling: Option<i64> = if mode == "propose" {
+        Some(
+            sqlx::query_scalar("SELECT max_open_actions FROM teams WHERE id = ?")
+                .bind(&team_id)
+                .fetch_optional(&state.pool)
+                .await?
+                .unwrap_or(DEFAULT_MAX_OPEN_ACTIONS),
+        )
+    } else {
+        None
+    };
 
     // Attribution, not authority: every node of a run may ask, and this only records which did.
     // `None` for the director and for a node the run does not recognise — see `Caller`.
@@ -279,6 +278,21 @@ pub async fn propose_action(
     } else {
         None
     };
+    // The ceiling check, inside the write transaction. The proposal insert above took SQLite's write
+    // lock, so no other proposal can commit between this count and the action insert below — two
+    // concurrent proposals can no longer both pass at `ceiling - 1`. The proposal just created has
+    // no action row yet, so it is not counted. Returning drops the transaction: it rolls back.
+    if let Some(ceiling) = ceiling {
+        let open: i64 = sqlx::query_scalar(OPEN_ACTIONS_SQL)
+            .bind(&team_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        if open >= ceiling {
+            return Err(ActionError::QueueFull(format!(
+                "this department already has {open} action(s) waiting for approval, and may hold                  {ceiling}; the person deciding has not got to them yet"
+            )));
+        }
+    }
     let id = sqlx::query(
         "INSERT INTO team_actions
            (team_run_id, ordinal, kind, payload, why, proposal_id, state, created_at)
@@ -318,20 +332,13 @@ pub async fn propose_action(
 /// and the owner has one queue. It clears the moment somebody decides — the same self-limiting
 /// property `wip.rs` has, in the axis `wip.rs` cannot reach: that one counts
 /// `proposals WHERE project_id = ?`, and a department has no project.
-async fn open_actions_of(pool: &sqlx::SqlitePool, team_id: &str) -> sqlx::Result<i64> {
-    sqlx::query_scalar(
-        "SELECT COUNT(*)
+const OPEN_ACTIONS_SQL: &str = "SELECT COUNT(*)
            FROM team_actions
            JOIN team_runs ON team_runs.id = team_actions.team_run_id
            JOIN proposals ON proposals.id = team_actions.proposal_id
           WHERE team_runs.team_id = ?
             AND team_actions.state = 'pending'
-            AND proposals.status = 'pending'",
-    )
-    .bind(team_id)
-    .fetch_one(pool)
-    .await
-}
+            AND proposals.status = 'pending'";
 
 /// Everything decided and not yet done, oldest first.
 ///

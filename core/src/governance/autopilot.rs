@@ -560,25 +560,31 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
     // Selected as two columns and added in Rust, rather than summed in SQL: the parts are what the
     // shell needs to point at a screen, and deriving the total from them is one fewer expression
     // that could go out of step with itself.
+    // The shadow-decisions term is computed ONCE per row, in a MATERIALIZED CTE, and `pending` /
+    // `open_shadow_decisions` are derived from that column. Written as a plain subquery SQLite
+    // flattens it and pastes the expression back into both places (measured with EXPLAIN QUERY
+    // PLAN: the term ran twice per row), and that term is the expensive one.
     let projects: Vec<RosterRow> = sqlx::query_as(concat!(
-        "SELECT state.project_id, state.mode, state.project_root,
-                ",
-        open_shadow_decisions_term!("state.project_id"),
-        "
-                +
-                (SELECT COUNT(*)
-                 FROM runs
-                 WHERE runs.project_id = state.project_id
-                   AND runs.status = 'awaiting_approval') AS pending,
-                ",
-        open_proposals_term!("state.project_id"),
-        " AS open_proposals,
-                ",
+        "WITH s AS MATERIALIZED (
+            SELECT state.project_id AS project_id, state.mode AS mode,
+                   state.project_root AS project_root,
+                   ",
         open_shadow_decisions_term!("state.project_id"),
         " AS open_shadow_decisions,
-                state.wip_limit AS wip_limit
-         FROM autopilot_state AS state
-         ORDER BY state.project_id"
+                   (SELECT COUNT(*)
+                    FROM runs
+                    WHERE runs.project_id = state.project_id
+                      AND runs.status = 'awaiting_approval') AS awaiting,
+                   ",
+        open_proposals_term!("state.project_id"),
+        " AS open_proposals,
+                   state.wip_limit AS wip_limit
+            FROM autopilot_state AS state)
+         SELECT project_id, mode, project_root,
+                open_shadow_decisions + awaiting AS pending,
+                open_proposals, open_shadow_decisions, wip_limit
+         FROM s
+         ORDER BY project_id"
     ))
     .fetch_all(pool)
     .await?;

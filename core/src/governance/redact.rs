@@ -885,7 +885,32 @@ pub fn redact_url(input: &str) -> String {
 
     let tail = &remainder[authority_end..];
     let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
-    format!("{scheme}://{host}{}", &tail[..path_end])
+    format!("{scheme}://{host}{}", redact_path(&tail[..path_end]))
+}
+
+/// A URL path with the secrets a segment can carry masked: whatever the free-text redactors find
+/// (a `bot<id>:<token>` Telegram path, a prefixed key), and a segment that is one long unbroken
+/// mixed letter-and-digit run, which is the shape of a webhook secret. Ordinary paths pass.
+fn redact_path(path: &str) -> String {
+    redact_secrets(path)
+        .split('/')
+        .map(|segment| {
+            let long = segment.len() >= 32
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+            let mixed = segment.bytes().any(|b| b.is_ascii_digit())
+                && segment.bytes().any(|b| b.is_ascii_alphabetic());
+            // A commit SHA or a UUID is long and mixed too, and names an object, not a secret.
+            let hex = segment.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
+            if long && mixed && !hex {
+                "[SECRET:path]"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn is_url_scheme(scheme: &str) -> bool {
@@ -910,6 +935,29 @@ fn strip_userinfo_from_non_url(input: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_secret_in_a_url_path_is_masked_and_an_ordinary_path_is_kept() {
+        let telegram = format!(
+            "https://api.telegram.org/bot123456789:{}/sendMessage",
+            "A".repeat(35)
+        );
+        let masked = redact_url(&telegram);
+        assert!(masked.starts_with("https://api.telegram.org/"), "{masked}");
+        assert!(!masked.contains("AAAAA"), "{masked}");
+        assert!(masked.ends_with("/sendMessage"), "{masked}");
+
+        let hook = redact_url("https://host.example/hooks/q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8");
+        assert_eq!(hook, "https://host.example/hooks/[SECRET:path]");
+
+        let commit = "https://github.com/o/r/commit/0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(redact_url(commit), commit);
+
+        assert_eq!(
+            redact_url("https://host.example/api/v1/projects/alpha/runs?x=1"),
+            "https://host.example/api/v1/projects/alpha/runs"
+        );
+    }
+
     use super::{redact_secrets, redact_url};
     use std::fs;
     use std::path::Path;

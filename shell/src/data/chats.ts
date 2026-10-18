@@ -753,7 +753,7 @@ export const CHAT_OPEN_HEADER = "X-Nucleos-Chat-Open";
  * where `useSendMessage` puts a turn the instant the daemon answers with its
  * id, well before the next scheduled fetch.
  *
- * Cadence is 1.5 s while any turn is live and 3 s once the conversation has
+ * Cadence is 1.5 s while any turn is live and 5 s once the conversation has
  * settled — never off, because a turn can land from Telegram while this
  * window is simply sitting open on the conversation.
  *
@@ -817,8 +817,18 @@ export function useChatTranscript(chatId: string | null) {
       };
     },
     enabled: chatId !== null,
-    refetchInterval: (query) => (anyTurnLive(query.state.data?.turns) ? POLL.turn : POLL.fast),
+    refetchInterval: (query) => conversationInterval(anyTurnLive(query.state.data?.turns)),
   });
+}
+
+/**
+ * The open conversation's poll cadence: `POLL.turn` while a turn is live, `POLL.queue` once it has
+ * settled. Never off, because nothing else tells an open conversation about a turn that arrives from
+ * outside the shell (IDE, Telegram, the autopilot) — the list poll only refreshes the list, it does
+ * not invalidate this query — but a settled conversation does not need the 3 s `POLL.fast`.
+ */
+export function conversationInterval(turnLive: boolean): number {
+  return turnLive ? POLL.turn : POLL.queue;
 }
 
 /**

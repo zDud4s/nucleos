@@ -58,6 +58,123 @@ use self::revert::*;
 /// How often the loop looks at the roster.
 pub const POSTGATE_POLL: Duration = Duration::from_secs(30);
 
+/// A cached tip is re-read with git at least this often, whatever the ref files say.
+const TIP_RECHECK: Duration = Duration::from_secs(600);
+
+/// A ref file touched less than this long ago is not trusted as unchanged: a loose ref is always
+/// 41 bytes, so its mtime is the only signal and a second write inside one timestamp tick would
+/// be invisible.
+const TIP_SETTLE: Duration = Duration::from_secs(2);
+
+/// What `stat` says about the two files a branch tip can live in. `None` inside means the file is
+/// absent, which is normal (a packed ref has no loose file).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefFingerprint {
+    loose: Option<(std::time::SystemTime, u64)>,
+    packed: Option<(std::time::SystemTime, u64)>,
+}
+
+struct CachedTip {
+    fingerprint: RefFingerprint,
+    sha: String,
+    read_at: Instant,
+}
+
+static TIP_CACHE: LazyLock<Mutex<HashMap<(String, String), CachedTip>>> =
+    LazyLock::new(Default::default);
+
+fn stat_of(path: &Path) -> Result<Option<(std::time::SystemTime, u64)>, ()> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some((meta.modified().map_err(|_| ())?, meta.len()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// The fingerprint of `refs/heads/<target>` for a main checkout (`.git` is a directory). `None`
+/// when it cannot be taken cheaply and surely — a linked worktree (`.git` is a file), any stat
+/// error — and the caller then simply asks git.
+fn ref_fingerprint(project_root: &Path, target: &str) -> Option<RefFingerprint> {
+    let git_dir = project_root.join(".git");
+    if !git_dir.is_dir() {
+        return None;
+    }
+    Some(RefFingerprint {
+        loose: stat_of(&git_dir.join("refs").join("heads").join(target)).ok()?,
+        packed: stat_of(&git_dir.join("packed-refs")).ok()?,
+    })
+}
+
+/// Whether the cached sha may stand in for a `git rev-parse`: same fingerprint, read recently, and
+/// the files were already settled when it was read.
+fn tip_reusable(
+    cached: &RefFingerprint,
+    cached_age: Duration,
+    current: &RefFingerprint,
+    settled: bool,
+) -> bool {
+    settled && cached == current && cached_age < TIP_RECHECK
+}
+
+/// True when no file of the fingerprint was modified within `TIP_SETTLE` of `now`.
+fn fingerprint_settled(fingerprint: &RefFingerprint, now: std::time::SystemTime) -> bool {
+    [fingerprint.loose, fingerprint.packed]
+        .into_iter()
+        .flatten()
+        .all(|(modified, _)| {
+            now.duration_since(modified)
+                .map(|age| age >= TIP_SETTLE)
+                .unwrap_or(false)
+        })
+}
+
+/// The tip of the land target. The poll runs every 30 s per gated project, and most of the time
+/// the branch has not moved, so a stat of the ref files replaces the `git rev-parse` spawn while
+/// they are unchanged (and git is still asked at least every `TIP_RECHECK`).
+async fn target_tip(
+    project_root: &Path,
+    target: &str,
+    deadline: Instant,
+) -> Result<String, String> {
+    let key = (
+        project_root.to_string_lossy().into_owned(),
+        target.to_owned(),
+    );
+    let fingerprint = ref_fingerprint(project_root, target);
+    if let Some(current) = fingerprint.as_ref() {
+        let cache = TIP_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hit) = cache.get(&key)
+            && tip_reusable(
+                &hit.fingerprint,
+                hit.read_at.elapsed(),
+                current,
+                fingerprint_settled(current, std::time::SystemTime::now()),
+            )
+        {
+            return Ok(hit.sha.clone());
+        }
+    }
+    let tip =
+        verify::resolve_commit(project_root, &format!("refs/heads/{target}"), deadline).await?;
+    let mut cache = TIP_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    match fingerprint {
+        Some(fingerprint) => {
+            cache.insert(
+                key,
+                CachedTip {
+                    fingerprint,
+                    sha: tip.clone(),
+                    read_at: Instant::now(),
+                },
+            );
+        }
+        None => {
+            cache.remove(&key);
+        }
+    }
+    Ok(tip)
+}
+
 /// Names a failing unit that has no group: the project's `gate_command`.
 pub(crate) const GATE_UNIT: &str = "gate_command";
 
@@ -195,13 +312,7 @@ async fn tick_project(
         Ok(branch) => branch,
         Err(error) => return Step::Failed(format!("no land target: {error}")),
     };
-    let tip = match verify::resolve_commit(
-        project_root,
-        &format!("refs/heads/{}", target.as_str()),
-        deadline,
-    )
-    .await
-    {
+    let tip = match target_tip(project_root, target.as_str(), deadline).await {
         Ok(tip) => tip,
         Err(error) => return Step::Failed(format!("cannot read the target tip: {error}")),
     };
@@ -840,6 +951,51 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
+
+    fn fp(loose_len: u64) -> RefFingerprint {
+        RefFingerprint {
+            loose: Some((std::time::SystemTime::UNIX_EPOCH, loose_len)),
+            packed: None,
+        }
+    }
+
+    #[test]
+    fn an_unchanged_settled_fingerprint_reuses_the_cached_tip() {
+        assert!(tip_reusable(
+            &fp(41),
+            Duration::from_secs(30),
+            &fp(41),
+            true
+        ));
+    }
+
+    #[test]
+    fn a_changed_unsettled_or_stale_fingerprint_asks_git() {
+        assert!(!tip_reusable(
+            &fp(41),
+            Duration::from_secs(30),
+            &fp(42),
+            true
+        ));
+        assert!(!tip_reusable(
+            &fp(41),
+            Duration::from_secs(30),
+            &fp(41),
+            false
+        ));
+        assert!(!tip_reusable(&fp(41), TIP_RECHECK, &fp(41), true));
+    }
+
+    #[test]
+    fn a_recently_touched_ref_file_is_not_settled() {
+        let now = std::time::SystemTime::now();
+        let fresh = RefFingerprint {
+            loose: Some((now, 41)),
+            packed: None,
+        };
+        assert!(!fingerprint_settled(&fresh, now));
+        assert!(fingerprint_settled(&fp(41), now));
+    }
     use crate::config::VerifyConfig;
     use crate::execution::git_exec::tests::{WorktreeRootEnv, space_free_tempdir};
     use crate::verify::exec::{self as verify_exec, Executor};
