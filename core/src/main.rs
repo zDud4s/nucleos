@@ -1025,6 +1025,8 @@ async fn main() {
         Err(error) => tracing::warn!(%error, "could not flush held notifications on startup"),
     }
     tokio::spawn(integrations::notify::run_flush_loop(state.clone()));
+    // Messages a previous daemon left waiting are sent once, here; afterwards every slot release drains.
+    tokio::spawn(assistant::drain_waiting_queues(state.clone()));
 
     // The email pillar starts only after its hook barrier has been PROVEN, and the proof can only
     // be attempted once this listener is serving — the hook reaches the daemon over HTTP, and a

@@ -386,6 +386,477 @@ pub(super) fn system_prompt_with_knowledge(
     }
 }
 
+/// The request a conversation's CLI is launched with, built by the turn that asks for it and by the
+/// process warmed ahead of that turn, so the two cannot come to disagree about how a conversation is
+/// spawned (a kept process is compared against [`spawn_fingerprint`] of exactly these inputs).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn chat_run_request(
+    prompt: String,
+    images: Vec<crate::execution::runner::Attachment>,
+    env: Vec<(String, String)>,
+    cwd: Option<std::path::PathBuf>,
+    permission: crate::execution::runner::Permission,
+    resume: Option<String>,
+    session_id: String,
+    mcp_config: std::path::PathBuf,
+    tool_policy: crate::execution::runner::ToolPolicy,
+    answering: crate::chats::Answering,
+    doctrine: Option<String>,
+    cli: &str,
+    knowledge: Option<&str>,
+) -> crate::execution::runner::RunRequest {
+    // Read before `images` is moved into the request: this decides which door the run goes through.
+    let steerable = !images.is_empty();
+    crate::execution::runner::RunRequest {
+        prompt,
+        env,
+        // Set for every rooted conversation, elevated or not: this is how the CLI finds
+        // the session to resume in the first place. A conversation with no root keeps
+        // `None`, because one quietly given a working directory is one whose relative paths
+        // moved.
+        cwd,
+        permission,
+        resume_session_id: resume,
+        mcp_config: Some(mcp_config),
+        mcp_job: None,
+        mcp_team_run: None,
+        // Decided by `tool_policy_for`, which is where the rule is written out. The
+        // default remains what it always was — the orchestrator talks to NucleOS and to
+        // nothing else, and the MCP allowlist does not enforce that on its own, because
+        // an allowlist only grants.
+        tool_policy,
+        // Stays `None` in the request: `serve_turn` decides the silence rule per door (the
+        // runner's own deadline one-shot, a per-event timeout on a living process).
+        progress_timeout: None,
+        // No ceiling, and the only production `None`. A chat turn is
+        // watched by the person who asked for it, who can stop it — and a turn cut off
+        // mid-answer by a limit nobody set reads as the app breaking rather than as a
+        // brake working. The guard is the turn's deadlines: silence plus a 4 h ceiling for a rooted
+        // turn, the plain 600 s wall for an McpOnly one.
+        max_turns: None,
+        // Always set. `cli_args` reads this only when there is no `--resume`, which is
+        // exactly the first turn — the one that used to be launched with no session id
+        // at all.
+        session_id: Some(session_id),
+        fork_session: false,
+        // Asked for so the tail above carries the answer AS IT IS WRITTEN rather than a
+        // paragraph at a time. It costs nothing when nobody is watching: these are more
+        // events on a stream the daemon already reads line by line, and `extract_reply`
+        // takes the reply from the `result` event either way.
+        include_partial_messages: true,
+        // An orchestrator turn is one message answered and closed; the next one arrives
+        // as its own turn on the resumed session, which is where a Telegram reply
+        // already goes. Nothing here needs a stdin, so it keeps a closed one.
+        images,
+        // Bytes only fit on stdin: an argument vector holds a string and there is
+        // nowhere in it for a picture to go. So a turn carrying one takes the other
+        // door — which is the same one-turn run either way, because `messages` is None
+        // and stdin closes the moment the opening line is written.
+        steerable,
+
+        // An orchestrator turn is answered by a person watching a chat, so the CLI's
+        // own permission surface is the right one: there IS somebody to approve. It is
+        // `McpOnly` besides, so the surface being argued over is nearly empty.
+        classifier_governs_tools: false,
+        messages: None,
+        // The owner opts in per conversation (decision 2026-10-05), and only a turn that
+        // is not `McpOnly` can use it: `McpOnly` pushes the strict flag unconditionally,
+        // so an unrooted, Telegram or withheld relayed turn never gets the ambient servers.
+        ambient_mcp: ambient_mcp_for(tool_policy, answering.ambient_mcp),
+        // What the conversation was pinned to, or `None` for the runner's configured model.
+        //
+        // This was `None` unconditionally, with a comment saying an orchestrator turn has no
+        // role to route — true of JOB roles, and it read as though the field had no other use.
+        // It had: `cli_args` turns it into `--model`, so the one kind of run a person actually
+        // watches was the one kind that could not choose who answered it.
+        model: answering.model,
+        // `None` for every conversation that never asked, which leaves the CLI's own default in
+        // place — the behaviour every chat had before the column existed.
+        effort: answering.effort,
+        // Who answers when the chosen model is overloaded. Empty for every conversation that
+        // named nobody, which is the CLI's own behaviour: fail rather than quietly substitute.
+        fallback_model: answering.fallback_model,
+        // Beyond `cwd`, which is set just above and is where the turn actually runs. These only
+        // ever GRANT reach, so a conversation that named none is exactly as confined as before.
+        add_dirs: answering
+            .extra_dirs
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+        // A ceiling on THIS answer, not on the conversation. The CLI stops the invocation; the
+        // turn's deadlines around this call are still the other guard, and `max_turns` above is
+        // deliberately `None` here for the reason its own comment gives.
+        max_budget_usd: answering.turn_budget_usd,
+        // The helpers this conversation defined, ADDED to whatever the CLI finds in the
+        // project's own `.claude/agents/`. A conversation that defined none sends no flag, and
+        // that is not the same as sending an empty one — see `agents` on `RunRequest`.
+        agents: answering.agents.clone(),
+        // On EVERY turn, because the flag is per invocation and this daemon spawns one per
+        // turn. Instructions sent only on the first would govern the opening message and then
+        // quietly stop mattering — wrong in the way that is hardest to see, since the first
+        // answer is the right one.
+        //
+        // `.or(doctrine)`, not `.or_else`: the chat's own `system_prompt` — read moments ago
+        // from `chats::answering`, where `origin` no longer exists — always wins when it is
+        // there, and the configured Telegram doctrine only fills the slot when it is empty. A
+        // person's own instructions are never replaced, only completed.
+        append_system_prompt: system_prompt_with_knowledge(
+            cli,
+            answering.system_prompt.clone().or(doctrine),
+            knowledge,
+        ),
+        // What this conversation is called, so the session it mints is findable in the CLI's
+        // own `--resume` picker instead of being one more nameless timestamp there.
+        session_name: answering.session_name.clone(),
+        context_window: Some(crate::assistant::window_of(answering.context_window)),
+        // Merged with whatever `tool_policy` denies by `cli_args`, into one flag. This can only
+        // ever narrow: the allow-listing flag beside it grants rather than restricts, so there
+        // is no widening version of this to get wrong.
+        denied_tools: answering.denied_tools.clone(),
+        // The wildcard, on purpose: an orchestrator turn acts for the person watching
+        // the chat and carries the control token, so narrowing what it is offered would
+        // only take away tools it is entitled to call.
+        allowed_mcp_tools: None,
+        // A person is watching, so a background task is worth launching even on the one-shot
+        // path where it dies with the turn. The live path (`start_live_chat`) keeps its process
+        // between turns and would have kept them anyway.
+        background_tasks: true,
+    }
+}
+
+/// Everything about how a conversation's CLI is spawned that a kept process cannot be told to change.
+///
+/// A process takes its model, effort, tool denials, directories and instructions as arguments once,
+/// when it starts, so a conversation that changed any of them must get a new process rather than a
+/// wrong one. [`serve_turn_briefed`] compares this against what the process was spawned with
+/// (`LiveChat::spawned_with`).
+///
+/// Computed from the conversation's own settings and NEVER from the per-turn briefing: that block
+/// differs on every turn, and if it entered this string every turn would respawn the process it
+/// exists to keep.
+pub(super) fn spawn_fingerprint(
+    answering: &crate::chats::Answering,
+    doctrine: Option<&str>,
+    tool_policy: crate::execution::runner::ToolPolicy,
+    ambient_mcp: bool,
+) -> String {
+    serde_json::json!({
+        "model": answering.model,
+        "effort": answering.effort,
+        "fallback_model": answering.fallback_model,
+        "extra_dirs": answering.extra_dirs,
+        "turn_budget_usd": answering.turn_budget_usd,
+        "agents": answering.agents,
+        // The chat's own instructions win; the doctrine only fills the slot when it is empty, which
+        // is exactly the rule the request applies.
+        "system_prompt": answering.system_prompt.as_deref().or(doctrine),
+        "denied_tools": answering.denied_tools,
+        "context_window": answering.context_window,
+        "tool_policy": format!("{tool_policy:?}"),
+        "ambient_mcp": ambient_mcp,
+    })
+    .to_string()
+}
+
+/// Whether a turn should read the briefing: only a Claude turn that no kept process will serve. The
+/// block travels as a per-spawn system flag, so a process already standing would discard it.
+pub(super) fn briefing_wanted(cli: &str, kept: bool) -> bool {
+    cli == "claude" && !kept
+}
+
+/// Whether opening a chat should start its process ahead of the first message.
+///
+/// Only for a rooted conversation that may keep a process, has a session to resume (so the process
+/// starts where the conversation is), is idle and has no process yet, is not already being warmed
+/// (one at a time), and leaves room under the cap.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn should_prewarm(
+    rooted: bool,
+    cli: &str,
+    policy: crate::execution::runner::ToolPolicy,
+    has_session: bool,
+    busy: bool,
+    kept: bool,
+    warming: bool,
+    alive: usize,
+) -> bool {
+    rooted
+        && may_keep_process(policy, cli)
+        && has_session
+        && !busy
+        && !kept
+        && !warming
+        && alive < LIVE_CAP
+}
+
+/// Set while one chat's process is being warmed: opening several chats at once must not start
+/// several processes at once.
+static WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Clears [`WARMING`] on every way out of a warm-up, including a panic.
+struct Warming;
+
+impl Drop for Warming {
+    fn drop(&mut self) {
+        WARMING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// How long a chat [`warm_chat`] declined is left alone. `prewarm_open_chat` runs on every poll of
+/// an open transcript, and each declined attempt re-read the database and the settings file to come
+/// to the same answer. A chat whose state changes meanwhile (a session appears, a process is
+/// evicted) waits this out.
+const DECLINED_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Chats [`warm_chat`] recently declined, and when.
+static DECLINED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Whether `chat_id` was declined less than [`DECLINED_TTL`] before `now`.
+fn declined_within(
+    declined: &std::collections::HashMap<String, std::time::Instant>,
+    chat_id: &str,
+    now: std::time::Instant,
+) -> bool {
+    declined
+        .get(chat_id)
+        .is_some_and(|at| now.saturating_duration_since(*at) < DECLINED_TTL)
+}
+
+/// Records `chat_id` as declined at `now`, dropping entries already past the TTL so the map stays
+/// as small as the set of chats open in the last half minute.
+fn note_declined_in(
+    declined: &mut std::collections::HashMap<String, std::time::Instant>,
+    chat_id: &str,
+    now: std::time::Instant,
+) {
+    declined.retain(|_, at| now.saturating_duration_since(*at) < DECLINED_TTL);
+    declined.insert(chat_id.to_owned(), now);
+}
+
+fn declined_recently(chat_id: &str) -> bool {
+    let declined = DECLINED.lock().unwrap_or_else(|e| e.into_inner());
+    declined_within(&declined, chat_id, std::time::Instant::now())
+}
+
+fn note_declined(chat_id: &str) {
+    let mut declined = DECLINED.lock().unwrap_or_else(|e| e.into_inner());
+    note_declined_in(&mut declined, chat_id, std::time::Instant::now());
+}
+
+/// Chats whose kept process was warmed with no briefing and has served no turn yet.
+///
+/// The briefing is chosen against the message (`brief::of` ranks by the query; nothing passes
+/// `MIN_RELEVANCE` against an empty one), so a process started before there is a message cannot be
+/// given it. The first turn such a process would serve therefore still asks for the briefing, and
+/// when there is one it lets the warmed process go and starts one that carries it: no latency is
+/// lost when nothing relevant is known, and nothing relevant is silently dropped when it is.
+static UNBRIEFED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn mark_unbriefed(chat_id: &str) {
+    UNBRIEFED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(chat_id.to_owned());
+}
+
+/// Whether `chat_id`'s kept process was warmed unbriefed, clearing the mark: only the first turn
+/// after a warm-up asks, whichever process ends up serving it.
+fn take_unbriefed(chat_id: &str) -> bool {
+    UNBRIEFED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(chat_id)
+}
+
+/// Starts the open chat's process before its first message, so that message does not pay for it.
+///
+/// Called when a visible view opens the chat. Synchronous and cheap: it only looks at what is
+/// already in memory and hands the rest to a task of its own, which decides again with the facts it
+/// has to read (see [`should_prewarm`]).
+pub fn prewarm_open_chat(state: &crate::state::AppState, chat_id: &str) {
+    if is_busy(chat_id)
+        || has_kept_process(chat_id)
+        || WARMING.load(std::sync::atomic::Ordering::SeqCst)
+        || declined_recently(chat_id)
+    {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let state = state.clone();
+    let chat_id = chat_id.to_owned();
+    runtime.spawn(async move { warm_chat(&state, &chat_id).await });
+}
+
+/// The body of [`prewarm_open_chat`]: builds the request a turn of this chat would build, with
+/// nothing to say yet, and keeps the process it spawns.
+async fn warm_chat(state: &crate::state::AppState, chat_id: &str) {
+    let pool = &state.pool;
+    let Ok(cwd) = crate::chats::cwd_of(pool, chat_id).await else {
+        return;
+    };
+    // Unrooted conversations never keep a process; no point reading anything else.
+    if cwd.is_none() {
+        note_declined(chat_id);
+        return;
+    }
+    // Read before anything costlier: with no session there is nothing to resume, and this runs on
+    // every poll of an open transcript.
+    let resume = get_session(pool, chat_id).await.ok().flatten();
+    if resume.is_none() {
+        note_declined(chat_id);
+        return;
+    }
+    let answering = crate::chats::answering(pool, chat_id)
+        .await
+        .unwrap_or_default();
+    let config = crate::config::models_config_now();
+    let (runner, cli) = runner_for_turn(
+        &state.runner,
+        state.assistants.as_ref(),
+        &config,
+        answering.model.as_deref(),
+    );
+    // Reads the conversation's settings file: off the runtime thread, as `send_message_inner` does,
+    // and a join failure reads as "not wired".
+    let hook_wired = match cwd.clone() {
+        Some(dir) => tokio::task::spawn_blocking(move || {
+            crate::governance::autopilot::classifier_hook_is_wired(std::path::Path::new(&dir))
+        })
+        .await
+        .unwrap_or(false),
+        None => false,
+    };
+    // The policy a person's own message at this machine would get: the origin that opened the window.
+    let tool_policy = tool_policy_for(
+        cwd.as_deref(),
+        Origin::Shell,
+        hook_wired,
+        crate::relay::handover_of(pool, None).await,
+    );
+    // The cap is not enforced under test (`ENFORCED_CAP`): `LIVE_PROCESSES` is one counter shared by
+    // every test running in parallel, and counting it here would make a warm-up depend on them.
+    let alive = if ENFORCED_CAP == usize::MAX {
+        0
+    } else {
+        LIVE_PROCESSES.load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let busy = is_busy(chat_id);
+    let warming = WARMING.load(std::sync::atomic::Ordering::SeqCst);
+    if !should_prewarm(
+        true,
+        cli,
+        tool_policy,
+        resume.is_some(),
+        busy,
+        has_kept_process(chat_id),
+        warming,
+        alive,
+    ) {
+        // A turn in flight or another chat being warmed is over in moments; only a refusal that
+        // comes from the conversation itself is worth remembering.
+        if !busy && !warming {
+            note_declined(chat_id);
+        }
+        return;
+    }
+    let Some(resume) = resume else {
+        return;
+    };
+    // Claimed only now, with the decision made, and released by `Warming`'s drop.
+    if WARMING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let _warming = Warming;
+
+    // The chat's slot, held while the process is built, so no turn starts beside it. Taken as a
+    // warm-up's: the chat does not read as busy, and a send waits these moments out instead of being
+    // queued behind a turn that does not exist. Armed to send what waited when it is released: a
+    // message queued meanwhile must not wait for ever.
+    let Some(mut slot) = ChatSlot::acquire_for_warmup(chat_id) else {
+        return;
+    };
+    slot.drain_on_release(state);
+    // A turn may have kept a process between the check above and the slot. Minting a key now would
+    // retire the one that process still holds.
+    if has_kept_process(chat_id) {
+        return;
+    }
+
+    let mode = crate::chats::permission_mode_of(pool, chat_id)
+        .await
+        .unwrap_or(crate::chats::PermissionMode::Auto);
+    let permission = crate::execution::runner::Permission::for_chat(mode);
+    // No turn owns this process yet, so no run id; the conversation's key is what identifies it.
+    let mut env = chat_key::turn_env(tool_policy, true, pool, chat_id, 0, &state.token.0).await;
+    // A process is keyed where it is spawned, and this is where one is.
+    chat_key::rekey(&mut env, pool, chat_id).await;
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // Its own file, not the one a turn writes: a turn starting meanwhile must not have its config
+    // removed from under it.
+    let mcp_path = mcp_config_path(&format!("{chat_id}.warm"));
+    if write_mcp_config(&mcp_path, &build_mcp_config(&exe.to_string_lossy())).is_err() {
+        return;
+    }
+    {
+        // The CLI reads the config as it starts; a minute is far more than that needs.
+        let doomed = mcp_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let _ = std::fs::remove_file(doomed);
+        });
+    }
+
+    let fingerprint = spawn_fingerprint(
+        &answering,
+        None,
+        tool_policy,
+        ambient_mcp_for(tool_policy, answering.ambient_mcp),
+    );
+    let request = chat_run_request(
+        String::new(),
+        Vec::new(),
+        env,
+        cwd.map(std::path::PathBuf::from),
+        permission,
+        Some(resume.clone()),
+        resume,
+        mcp_path,
+        tool_policy,
+        answering,
+        None,
+        cli,
+        None,
+    );
+    // Nobody is waiting for the session id: the process announces it with its first answer, and the
+    // turn that speaks to it records it then.
+    let (session_tx, _) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut live = spawn_live_process(&runner, request, session_tx, chat_id, &fingerprint);
+    // Known by the name a turn's own config has, or the first turn would never fit this process.
+    live.shape = live
+        .shape
+        .clone()
+        .with_mcp_config(Some(mcp_config_path(chat_id)));
+    keep_live(chat_id, live, LIVE_IDLE);
+    // Marked while the slot is still held, so no turn can come between the process and its mark.
+    mark_unbriefed(chat_id);
+}
+
 /// Everything one orchestrator turn is launched with.
 ///
 /// A struct rather than a row of parameters, for the reason `RunRequest` gives about its own: at
@@ -439,14 +910,10 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
     // Built HERE, outside the task, and captured by the async block. A task aborted before its first
     // poll drops its captured state without ever running a line of the body, so a guard constructed
     // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.
-    // Read before `images` is moved into the request below, and named rather than asked inline:
-    // this decides which door the run goes through, and a bare `!images.is_empty()` buried in a
-    // struct literal is not a sentence anybody reads.
-    let carries_pictures = !images.is_empty();
     let turn = TurnGuard { slot, mcp_path };
-    // Kept for after the turn: draining what waited needs the whole state, and `spawn_registered`
-    // takes ownership of it. The chat id is copied for the same reason — it lives on the guard,
-    // which has to be dropped before the drain can take the slot back.
+    // Kept for after the turn: the between-turns reader needs the whole state, and
+    // `spawn_registered` takes ownership of it. The chat id is copied for the same reason — it lives
+    // on the guard, which is dropped before the reader starts.
     let after = state.clone();
     let drained_chat = turn.slot.chat_id.clone();
 
@@ -624,7 +1091,25 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // per-invocation system flag so resumed history does not accumulate copies. Codex rejects
         // that flag, so it receives no block. A conversation is not an outcome, so D15 adds no
         // briefing trace here.
-        let knowledge = if cli == "claude" {
+        // A turn a kept process will serve never reads the briefing: the block travels as a
+        // per-spawn system flag, which a kept process ignores. Decided HERE, after the eviction
+        // above, so a conversation let go of is never taken for one the process will answer.
+        let ambient_mcp = ambient_mcp_for(tool_policy, answering.ambient_mcp);
+        let fingerprint =
+            spawn_fingerprint(&answering, doctrine.as_deref(), tool_policy, ambient_mcp);
+        let kept = may_live
+            && kept_process_fits(
+                &turn.slot.chat_id,
+                &fingerprint,
+                cwd.as_deref(),
+                permission,
+                resume.as_deref(),
+            );
+        // A process warmed ahead of this turn was spawned before there was a message to choose a
+        // briefing against (see `UNBRIEFED`): its first turn still asks for one, and when there is
+        // one the warmed process gives way to a process that carries it.
+        let warmed_unbriefed = take_unbriefed(&turn.slot.chat_id);
+        let knowledge = if briefing_wanted(cli, kept && !warmed_unbriefed) {
             crate::brief::for_prompt(
                 &pool,
                 &crate::knowledge::Context::for_project(None),
@@ -636,122 +1121,42 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         } else {
             None
         };
+        if kept && knowledge.is_some() {
+            evict_live(&turn.slot.chat_id);
+        }
+        // Skipped for the kept process alone: if that process is gone when the turn reaches it, the
+        // turn spawns one, and the spawn reads the briefing the turn did not.
+        let late_briefing: Option<LateBriefing> = (cli == "claude" && kept && !warmed_unbriefed)
+            .then(|| {
+                let pool = pool.clone();
+                let text = text.clone();
+                Box::pin(async move {
+                    crate::brief::for_prompt(
+                        &pool,
+                        &crate::knowledge::Context::for_project(None),
+                        &text,
+                        "assistant",
+                    )
+                    .await
+                    .and_then(|briefing| briefing.block)
+                }) as LateBriefing
+            });
 
-        let request = crate::execution::runner::RunRequest {
-            prompt: text,
+        let request = chat_run_request(
+            text,
+            images,
             env,
-            // Set for every rooted conversation, elevated or not: this is how the CLI finds
-            // the session to resume in the first place. A conversation with no root keeps
-            // `None`, because one quietly given a working directory is one whose relative paths
-            // moved.
             cwd,
             permission,
-            resume_session_id: resume,
-            mcp_config: Some(turn.mcp_path.clone()),
-            mcp_job: None,
-            mcp_team_run: None,
-            // Decided by `tool_policy_for`, which is where the rule is written out. The
-            // default remains what it always was — the orchestrator talks to NucleOS and to
-            // nothing else, and the MCP allowlist does not enforce that on its own, because
-            // an allowlist only grants.
+            resume,
+            session_id,
+            turn.mcp_path.clone(),
             tool_policy,
-            // Stays `None` in the request: `serve_turn` decides the silence rule per door (the
-            // runner's own deadline one-shot, a per-event timeout on a living process).
-            progress_timeout: None,
-            // No ceiling, and the only production `None`. A chat turn is
-            // watched by the person who asked for it, who can stop it — and a turn cut off
-            // mid-answer by a limit nobody set reads as the app breaking rather than as a
-            // brake working. The guard is the turn's deadlines: silence plus a 4 h ceiling for a rooted
-            // turn, the plain 600 s wall for an McpOnly one.
-            max_turns: None,
-            // Always set. `cli_args` reads this only when there is no `--resume`, which is
-            // exactly the first turn — the one that used to be launched with no session id
-            // at all.
-            session_id: Some(session_id),
-            fork_session: false,
-            // Asked for so the tail above carries the answer AS IT IS WRITTEN rather than a
-            // paragraph at a time. It costs nothing when nobody is watching: these are more
-            // events on a stream the daemon already reads line by line, and `extract_reply`
-            // takes the reply from the `result` event either way.
-            include_partial_messages: true,
-            // An orchestrator turn is one message answered and closed; the next one arrives
-            // as its own turn on the resumed session, which is where a Telegram reply
-            // already goes. Nothing here needs a stdin, so it keeps a closed one.
-            images,
-            // Bytes only fit on stdin: an argument vector holds a string and there is
-            // nowhere in it for a picture to go. So a turn carrying one takes the other
-            // door — which is the same one-turn run either way, because `messages` is None
-            // and stdin closes the moment the opening line is written.
-            steerable: carries_pictures,
-
-            // An orchestrator turn is answered by a person watching a chat, so the CLI's
-            // own permission surface is the right one: there IS somebody to approve. It is
-            // `McpOnly` besides, so the surface being argued over is nearly empty.
-            classifier_governs_tools: false,
-            messages: None,
-            // The owner opts in per conversation (decision 2026-10-05), and only a turn that
-            // is not `McpOnly` can use it: `McpOnly` pushes the strict flag unconditionally,
-            // so an unrooted, Telegram or withheld relayed turn never gets the ambient servers.
-            ambient_mcp: ambient_mcp_for(tool_policy, answering.ambient_mcp),
-            // What the conversation was pinned to, or `None` for the runner's configured model.
-            //
-            // This was `None` unconditionally, with a comment saying an orchestrator turn has no
-            // role to route — true of JOB roles, and it read as though the field had no other use.
-            // It had: `cli_args` turns it into `--model`, so the one kind of run a person actually
-            // watches was the one kind that could not choose who answered it.
-            model: answering.model,
-            // `None` for every conversation that never asked, which leaves the CLI's own default in
-            // place — the behaviour every chat had before the column existed.
-            effort: answering.effort,
-            // Who answers when the chosen model is overloaded. Empty for every conversation that
-            // named nobody, which is the CLI's own behaviour: fail rather than quietly substitute.
-            fallback_model: answering.fallback_model,
-            // Beyond `cwd`, which is set just above and is where the turn actually runs. These only
-            // ever GRANT reach, so a conversation that named none is exactly as confined as before.
-            add_dirs: answering
-                .extra_dirs
-                .iter()
-                .map(std::path::PathBuf::from)
-                .collect(),
-            // A ceiling on THIS answer, not on the conversation. The CLI stops the invocation; the
-            // turn's deadlines around this call are still the other guard, and `max_turns` above is
-            // deliberately `None` here for the reason its own comment gives.
-            max_budget_usd: answering.turn_budget_usd,
-            // The helpers this conversation defined, ADDED to whatever the CLI finds in the
-            // project's own `.claude/agents/`. A conversation that defined none sends no flag, and
-            // that is not the same as sending an empty one — see `agents` on `RunRequest`.
-            agents: answering.agents.clone(),
-            // On EVERY turn, because the flag is per invocation and this daemon spawns one per
-            // turn. Instructions sent only on the first would govern the opening message and then
-            // quietly stop mattering — wrong in the way that is hardest to see, since the first
-            // answer is the right one.
-            //
-            // `.or(doctrine)`, not `.or_else`: the chat's own `system_prompt` — read moments ago
-            // from `chats::answering`, where `origin` no longer exists — always wins when it is
-            // there, and the configured Telegram doctrine only fills the slot when it is empty. A
-            // person's own instructions are never replaced, only completed.
-            append_system_prompt: system_prompt_with_knowledge(
-                cli,
-                answering.system_prompt.clone().or(doctrine),
-                knowledge.as_deref(),
-            ),
-            // What this conversation is called, so the session it mints is findable in the CLI's
-            // own `--resume` picker instead of being one more nameless timestamp there.
-            session_name: answering.session_name.clone(),
-            context_window: Some(crate::assistant::window_of(answering.context_window)),
-            // Merged with whatever `tool_policy` denies by `cli_args`, into one flag. This can only
-            // ever narrow: the allow-listing flag beside it grants rather than restricts, so there
-            // is no widening version of this to get wrong.
-            denied_tools: answering.denied_tools.clone(),
-            // The wildcard, on purpose: an orchestrator turn acts for the person watching
-            // the chat and carries the control token, so narrowing what it is offered would
-            // only take away tools it is entitled to call.
-            allowed_mcp_tools: None,
-            // A person is watching, so a background task is worth launching even on the one-shot
-            // path where it dies with the turn. The live path (`start_live_chat`) keeps its process
-            // between turns and would have kept them anyway.
-            background_tasks: true,
-        };
+            answering,
+            doctrine,
+            cli,
+            knowledge.as_deref(),
+        );
 
         // What this turn itself wrote into the model's prompt, priced off the request that is about
         // to become an argument vector, and priced HERE because `request` is moved into `serve_turn`
@@ -773,7 +1178,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         crate::execution::runs::record_authored_prompt(&pool, id, runner.authored_prompt(&request))
             .await;
 
-        let result = serve_turn(
+        let result = serve_turn_briefed(
             &runner,
             request,
             session_tx,
@@ -789,6 +1194,9 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             may_live,
             // A rooted turn that may keep a process is re-keyed by `serve_turn` when it spawns one.
             may_live.then_some(&pool),
+            // What this conversation's process must have been spawned with to serve this turn.
+            &fingerprint,
+            late_briefing,
         )
         .await;
         // The process this turn kept (if any) learns what it has now served, before anything can
@@ -805,11 +1213,6 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // already wrote its status can still be followed by one last wake-up here, and an unguarded
         // write would report a completed turn for a CLI that was killed. First writer wins; no rows
         // means the turn was finalised elsewhere, which is an outcome, not an error.
-        //
-        // Set when the person stopped the turn through its interrupt, which is the one terminal
-        // state that is not followed by a drain (assumption A2: Stop does not start the next
-        // queued message).
-        let mut stopped_softly = false;
         match result {
             // A turn's product is the `result` event, and a CLI that exited without one answered
             // nothing. That is a failed turn, not a completed one — and emphatically not a turn
@@ -824,7 +1227,6 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             // shows the actual fault rather than a wall of JSON.
             Ok(Ok(o)) => match settled_reply(&o.stdout) {
                 Some((status, reply)) => {
-                    stopped_softly = status == "cancelled";
                     // Read out of the same stream the reply came from, and stored beside it. The
                     // live tail is taken away the instant this turn ends, so without this the
                     // actions are visible while the turn runs and gone for ever afterwards.
@@ -986,18 +1388,19 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             }
         }
 
-        // Dropped HERE rather than at the end of the block, and that is the whole of it: the drain
-        // below goes back through `send_message`, which takes the same chat slot this guard is
-        // holding. One line later and it refuses itself, silently, and what waited waits for ever.
+        // Dropped HERE rather than at the end of the block: dropping the guard releases the chat's
+        // slot, and a slot armed by `drain_on_release` sends what waited from a task of its own, so
+        // the next turn never starts inside this one's registered task (whose handle would still be
+        // in `run_handles` and whose end would cut it short). Draining is the slot's job, not this
+        // task's.
+        // An answer the process began on its own before this turn's message was set aside by
+        // `serve_turn`; it is recorded now, while this turn still holds the slot, so the next turn
+        // cannot set another aside before this one is written.
+        record_set_aside(&after, &drained_chat).await;
         drop(turn);
         // The process this turn kept is read from here on, so a background task's own answer is not
         // left waiting for the next person's turn.
         watch_between_turns(&after, &drained_chat);
-        // Not after a soft stop (assumption A2): somebody who pressed Stop has not asked for the
-        // next queued message to start, and a cancel has never reached the drain either.
-        if !stopped_softly {
-            drain_queued(&after, &drained_chat).await;
-        }
     });
 }
 
@@ -1018,4 +1421,231 @@ pub(super) fn settled_reply(stdout: &str) -> Option<(&'static str, Option<String
         ));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::runner::FakeCommandRunner;
+    use crate::state::AppState;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    async fn test_state(runner: Arc<FakeCommandRunner>) -> AppState {
+        AppState {
+            token: crate::auth::Token("t".into()),
+            pool: crate::testdb::fresh_pool().await,
+            telegram_doctrine: None,
+            runner,
+            triage_runner: None,
+            local_triage_disabled: None,
+            assistants: Arc::new(crate::assistants::NoAssistants),
+            run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
+            files_root: None,
+            files_trash: None,
+            workflow_library: None,
+            machine_config_root: None,
+            secrets: Arc::new(crate::secrets::InMemorySecrets::default()),
+            email: Arc::new(crate::state::EmailRuntime::default()),
+            voice: Arc::new(crate::integrations::voice::VoiceRuntime::default()),
+            browser: Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: Arc::new(crate::integrations::web::WebRuntime::disabled()),
+            quota: Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: Arc::new(crate::judge::JudgeRuntime::disabled()),
+            calendar: Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
+            council: Arc::new(crate::council::CouncilRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        }
+    }
+
+    /// A declined chat is not re-evaluated on every poll: it is left alone for the TTL, and only it.
+    #[test]
+    fn a_declined_prewarm_is_not_re_evaluated_inside_the_ttl() {
+        let mut declined = std::collections::HashMap::new();
+        let at = Instant::now();
+
+        note_declined_in(&mut declined, "declined-chat", at);
+
+        assert!(declined_within(
+            &declined,
+            "declined-chat",
+            at + Duration::from_secs(10)
+        ));
+        assert!(
+            !declined_within(&declined, "another-chat", at + Duration::from_secs(10)),
+            "only the chat that was declined is left alone"
+        );
+        assert!(
+            !declined_within(&declined, "declined-chat", at + DECLINED_TTL),
+            "past the TTL the chat is evaluated again"
+        );
+
+        note_declined_in(&mut declined, "later-chat", at + DECLINED_TTL);
+        assert!(
+            !declined.contains_key("declined-chat"),
+            "an expired entry is dropped rather than kept for ever"
+        );
+    }
+
+    /// A process warmed before there was a message carries no briefing; when the first turn has one
+    /// to give, that turn is answered by a process that carries it instead of losing it.
+    #[tokio::test]
+    async fn a_warmed_process_gives_way_when_the_first_turn_has_a_briefing() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = test_state(fake.clone()).await;
+        let chat = "turn-warm-briefed";
+        let root = tempfile::TempDir::new().unwrap();
+        crate::governance::autopilot::wire_classifier_hook(root.path()).unwrap();
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at, cwd)
+             VALUES (?, 'cloud', '2026-01-01T00:00:00Z', ?)",
+        )
+        .bind(chat)
+        .bind(root.path().to_str().unwrap())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        upsert_session(&state.pool, chat, "sess-briefed", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', NULL, 'owner', 'memory',
+                     'zanzibar house rule', 'body', 'active',
+                     '2026-08-19T00:00:00+00:00')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        prewarm_open_chat(&state, chat);
+        let mut warmed = false;
+        for _ in 0..500 {
+            warmed = *fake.calls.lock().unwrap() == 1 && has_kept_process(chat);
+            if warmed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(warmed, "opening the chat did not warm its process");
+        let at_warm = fake.last_append_system_prompt.lock().unwrap().clone();
+        assert!(
+            !matches!(at_warm, Some(Some(ref prompt)) if prompt.contains("zanzibar house rule")),
+            "a warmed process has no message to choose a briefing against: {at_warm:?}"
+        );
+
+        let id = send_message(&state, chat, "zanzibar?", Origin::Shell)
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            2,
+            "the briefed first turn was spoken down the unbriefed warmed process"
+        );
+        let sent = fake.last_append_system_prompt.lock().unwrap().clone();
+        assert!(
+            matches!(sent, Some(Some(ref prompt)) if prompt.contains("zanzibar house rule")),
+            "the first turn after a warm-up lost its briefing: {sent:?}"
+        );
+        evict_live(chat);
+    }
+
+    /// A turn that skipped its briefing because a kept process would serve it, and found that
+    /// process already gone, spawns one that carries the briefing after all.
+    #[tokio::test]
+    async fn a_fallback_spawn_after_a_dead_kept_process_still_carries_the_briefing() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let chat = "turn-dead-kept-briefed";
+
+        // A kept process that fits the turn, and is gone: both ends of its pipes are closed.
+        let (messages, said) =
+            tokio::sync::mpsc::unbounded_channel::<crate::execution::runner::LaterTurn>();
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(said);
+        drop(events);
+        let dead = LiveChat::new(
+            messages,
+            events_rx,
+            Arc::new(Mutex::new(Some("s-1".to_owned()))),
+            tokio::spawn(async {}).abort_handle(),
+            tokio::sync::watch::channel(None).1,
+            crate::execution::runner::Permission::Default,
+            None,
+            SpawnShape::blank(),
+            String::new(),
+            None,
+        );
+        relock(&LIVE_CHATS).insert(chat.to_owned(), dead);
+
+        let request = chat_run_request(
+            "zanzibar?".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            crate::execution::runner::Permission::Default,
+            Some("s-1".to_owned()),
+            "s-1".to_owned(),
+            std::env::temp_dir().join("dead-kept-unused.json"),
+            crate::execution::runner::ToolPolicy::Unrestricted,
+            crate::chats::Answering::default(),
+            None,
+            "claude",
+            None,
+        );
+        let late: LateBriefing = Box::pin(async { Some("\n\nzanzibar house rule".to_owned()) });
+        let runner: Arc<dyn crate::execution::runner::CommandRunner> = fake.clone();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(Mutex::new(String::new()));
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve_turn_briefed(
+                &runner,
+                request,
+                tx,
+                &transcript,
+                chat,
+                turn_deadlines(
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                    crate::execution::runner::ToolPolicy::Unrestricted,
+                ),
+                true,
+                None,
+                "",
+                Some(late),
+            ),
+        )
+        .await;
+
+        let mut sent = None;
+        for _ in 0..500 {
+            sent = fake.last_append_system_prompt.lock().unwrap().clone();
+            if sent.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        evict_live(chat);
+        assert!(
+            matches!(sent, Some(Some(ref prompt)) if prompt.contains("zanzibar house rule")),
+            "the spawn that replaced a dead kept process lost the turn's briefing: {sent:?}"
+        );
+    }
 }

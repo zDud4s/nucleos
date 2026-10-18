@@ -107,31 +107,75 @@ pub async fn send_or_queue(
     images: &[crate::execution::runner::Attachment],
     origin: Origin,
 ) -> Result<Sent, String> {
+    // A person sending again is what ends a hold (after Stop, or after a failed send).
+    release_queue(chat_id);
+    // Serialised here rather than at the drain, because this is the only moment the bytes are in
+    // hand. A message that waits with its pictures is the whole of what was sent; one that waits
+    // without them is half of it, silently.
+    let carried = || {
+        serde_json::to_string(
+            &images
+                .iter()
+                .map(|image| {
+                    serde_json::json!({
+                        "media_type": image.media_type,
+                        "data": image.data,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_string())
+    };
+    // Behind what already waits, even when the chat is free: jumping the queue would answer the
+    // newest thing first.
+    let waiting = crate::chats::queued(&state.pool, chat_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !waiting.is_empty() {
+        crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire(), &carried())
+            .await
+            .map_err(|error| error.to_string())?;
+        spawn_drain_if_free(state, chat_id);
+        return Ok(Sent::Queued);
+    }
     match send_message_with(state, chat_id, text, images, origin).await {
         Ok(id) => Ok(Sent::Turn(id)),
         Err(refusal) if refusal == TURN_IN_PROGRESS => {
-            // Serialised here rather than at the drain, because this is the only moment the bytes
-            // are in hand. A message that waits with its pictures is the whole of what was sent;
-            // one that waits without them is half of it, silently.
-            let carried = serde_json::to_string(
-                &images
-                    .iter()
-                    .map(|image| {
-                        serde_json::json!({
-                            "media_type": image.media_type,
-                            "data": image.data,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_else(|_| "[]".to_string());
-            crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire(), &carried)
+            crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire(), &carried())
                 .await
                 .map_err(|error| error.to_string())?;
+            // The turn may have ended between the refusal and the write; then nobody would drain it.
+            spawn_drain_if_free(state, chat_id);
             Ok(Sent::Queued)
         }
         Err(other) => Err(other),
     }
+}
+
+/// Starts the queue draining in a task of its own when nothing holds the chat's slot; otherwise the
+/// slot's holder drains on release.
+fn spawn_drain_if_free(state: &crate::state::AppState, chat_id: &str) {
+    spawn_drain_through(state, chat_id, false);
+}
+
+/// [`spawn_drain_if_free`] choosing whether the drain respects a hold.
+///
+/// A plain function and not an async one on purpose: `drain_inner` calls it, and spawning
+/// `drain_inner` from inside its own future would ask for that future's `Send` while it is still
+/// being defined — a cycle the compiler refuses.
+fn spawn_drain_through(state: &crate::state::AppState, chat_id: &str, respect_hold: bool) {
+    if is_busy(chat_id) {
+        return;
+    }
+    let state = state.clone();
+    let chat = chat_id.to_string();
+    tokio::spawn(async move {
+        if respect_hold {
+            drain_queued(&state, &chat).await;
+        } else {
+            drain_queued_now(&state, &chat).await;
+        }
+    });
 }
 
 /// Writes a turn's pictures where the window can ask for them again, answering their paths.
@@ -208,43 +252,63 @@ pub(super) async fn record_images(pool: &SqlitePool, id: i64, kept: &[String]) -
 
 /// Sends whatever waited, once the conversation has a turn free for it.
 ///
-/// Called at the very end of a finished turn's task, AFTER its guard has fallen: the drain goes back
-/// through `send_message`, which takes the same chat slot the finished turn is still holding until
-/// then. One line earlier and the drain refuses itself, silently, and the message waits for ever.
+/// Called from ONE place: the release of an armed `ChatSlot` (`ChatSlot::drain_on_release`) spawns it
+/// as a task of its own, after the slot has already been removed from the busy set — the drain goes
+/// back through `send_message`, which takes the same chat slot, so it must run after that slot is
+/// free and outside any run task a Stop could abort. `drain_waiting_queues` calls it once at start-up
+/// for what a previous daemon left waiting.
+///
+/// Respects the hold: after a Stop (`hold_queue`), after a send that failed, or while the newest
+/// assistant run of the chat is `cancelled`, nothing is sent until the person sends again.
 ///
 /// One message per turn, not the whole queue: each drained message becomes a turn that will drain
 /// again when it ends. Sending them all at once would only refuse every one after the first.
 ///
 /// Boxed because this and `send_message` call each other — a real cycle, and the compiler needs the
-/// indirection to size the future. A message that cannot be sent has been taken off the queue by
-/// `take_queued` and is gone, which is the trade that file documents — with one exception: a send
-/// refused only because another turn took the slot first has not been tried at all, and goes back
-/// under its own id for that turn's drain to send.
+/// indirection to size the future. A message a person typed that cannot be sent goes back to the
+/// FRONT of the queue under its old id (`chats::requeue`); if the refusal was only that another turn
+/// took the slot first, nothing was tried and that turn's drain sends it, otherwise the queue is held
+/// and a notice says so. A relay-born message that cannot be sent is dropped, as before.
 ///
 /// A relay-born message gets a second look here that a person's own message does not — see the
 /// `Some(relay_id)` branch below for why the gap between `relay::admit` deciding and this drain
 /// spending the turn is the one place its answer can go stale.
 pub(super) async fn drain_queued(state: &crate::state::AppState, chat_id: &str) {
-    // Again only when the message went back AND nothing holds the slot any more — the turn that
-    // took it ended before the message was back, so its own drain found nothing. Bounded, because
-    // each round needs a turn to start and end inside one send, and a few of those in a row is a
-    // conversation busy enough that its next turn's drain will come.
-    for _ in 0..3 {
-        if !drain_once(state, chat_id).await {
+    drain_inner(state, chat_id, true).await;
+}
+
+/// [`drain_queued`] ignoring the hold: for a person who just sent a message, which is what ends it.
+pub(super) async fn drain_queued_now(state: &crate::state::AppState, chat_id: &str) {
+    drain_inner(state, chat_id, false).await;
+}
+
+async fn drain_inner(state: &crate::state::AppState, chat_id: &str, respect_hold: bool) {
+    if respect_hold {
+        if queue_is_held(chat_id) {
+            return;
+        }
+        let latest: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM runs WHERE chat_id = ? AND mode = 'assistant'
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(chat_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+        if latest.as_deref() == Some("cancelled") {
             return;
         }
     }
-}
-
-/// One message off the queue, sent or put back; `true` when it was put back and nothing is left to
-/// drain it.
-async fn drain_once(state: &crate::state::AppState, chat_id: &str) -> bool {
+    if is_busy(chat_id) {
+        return;
+    }
     let taken = match crate::chats::take_queued(&state.pool, chat_id).await {
         Ok(Some(taken)) => taken,
-        Ok(None) => return false,
+        Ok(None) => return,
         Err(error) => {
             tracing::warn!(%error, chat_id, "could not read what was waiting for this conversation");
-            return false;
+            return;
         }
     };
     // `relay_id` is the relay this message travelled on, or `None` for one a person typed — see
@@ -254,6 +318,22 @@ async fn drain_once(state: &crate::state::AppState, chat_id: &str) -> bool {
     let origin = Origin::from_wire(taken.origin.as_deref());
     let carried = taken.images.clone();
     let relay_id = taken.relay_id;
+    // A conversation that was archived while the message waited does not get it: falling back to
+    // the cloud for a chat that no longer exists would spend money on words nobody is reading.
+    let archived: Option<bool> =
+        sqlx::query_scalar("SELECT archived_at IS NOT NULL FROM chats WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+    if archived == Some(true) {
+        tracing::warn!(
+            chat_id,
+            "a message that had been waiting was dropped: its conversation was archived"
+        );
+        return;
+    }
     let sent = match relay_id {
         // No pictures on this branch: `send_relayed_message` never takes any, for the reason its
         // own doc gives — a relay carries `chat_relays.body`, plain text, never an attachment — so
@@ -293,7 +373,7 @@ async fn drain_once(state: &crate::state::AppState, chat_id: &str) -> bool {
                     relay_id,
                     "a relayed message that had been waiting was dropped: the owner is no longer present"
                 );
-                return false;
+                return;
             }
             let room = match crate::relay::root_of_relay(&state.pool, relay_id).await {
                 Ok(root) => crate::relay::chain_has_room(&state.pool, root, now).await,
@@ -309,7 +389,7 @@ async fn drain_once(state: &crate::state::AppState, chat_id: &str) -> bool {
                     ?refusal,
                     "a relayed message that had been waiting was dropped: its chain has no room left"
                 );
-                return false;
+                return;
             }
             match crate::chats::brain_of(&state.pool, chat_id).await {
                 Ok(Some(_)) => {}
@@ -319,7 +399,7 @@ async fn drain_once(state: &crate::state::AppState, chat_id: &str) -> bool {
                         relay_id,
                         "a relayed message that had been waiting was dropped: its destination is gone or archived"
                     );
-                    return false;
+                    return;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -328,7 +408,7 @@ async fn drain_once(state: &crate::state::AppState, chat_id: &str) -> bool {
                         relay_id,
                         "a relayed message that had been waiting was dropped: its destination could not be read"
                     );
-                    return false;
+                    return;
                 }
             }
             Box::pin(send_relayed_message(
@@ -355,32 +435,73 @@ async fn drain_once(state: &crate::state::AppState, chat_id: &str) -> bool {
             Box::pin(send_message_with(state, chat_id, &text, &images, origin)).await
         }
     };
-    match sent {
-        Ok(_) => {}
-        // Another turn took the slot between this drain's turn ending and this send: a person's
-        // message that arrived in the gap, or the assistant answering on its own. Nothing was tried,
-        // so the message goes back where it was, and the turn holding the slot drains it when it
-        // ends. If that turn has ALREADY ended — it may have drained before the message was back —
-        // nothing else is coming for it, and the caller tries again.
-        Err(refusal) if refusal == TURN_IN_PROGRESS => {
-            match crate::chats::requeue(&state.pool, chat_id, &taken).await {
-                Ok(()) => return !is_busy(chat_id),
-                Err(error) => tracing::warn!(
-                    %error,
-                    chat_id,
-                    "a message that had been waiting found the conversation busy and could not be put back"
-                ),
-            }
-        }
-        Err(refusal) => {
-            tracing::warn!(
-                %refusal,
-                chat_id,
-                "a message that had been waiting could not be sent"
-            );
-        }
+    let Err(refusal) = sent else {
+        return;
+    };
+    tracing::warn!(
+        %refusal,
+        chat_id,
+        "a message that had been waiting could not be sent"
+    );
+    if relay_id.is_some() {
+        return;
     }
-    false
+    put_back_refused(state, chat_id, &taken, &refusal, respect_hold).await;
+}
+
+/// Puts a refused message back at the front under its old id, then decides who sends it next.
+///
+/// On `TURN_IN_PROGRESS` the slot's holder drains on release — but only if it releases AFTER the
+/// row is back. The row was deleted before the send was tried, so a holder that released in
+/// between found the queue empty, and nothing would ever drain the restored row. So the slot is
+/// asked again here, as `send_or_queue` does after its own enqueue. It cannot spin: a drain is
+/// spawned only when the slot is free, and a free slot is exactly what a refusal of this kind
+/// did not see — the next attempt either sends, or meets a new holder that drains on release.
+async fn put_back_refused(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    taken: &crate::chats::Queued,
+    refusal: &str,
+    respect_hold: bool,
+) {
+    // A message a person typed is never lost: it goes back to the front under its old id.
+    if let Err(error) = crate::chats::requeue(&state.pool, chat_id, taken).await {
+        tracing::warn!(%error, chat_id, "a message that could not be sent could not be put back either");
+        return;
+    }
+    // Somebody else holds the slot: they drain it when they release, so there is nothing to report.
+    // Unless they already released, between this drain taking the row and putting it back.
+    if refusal == TURN_IN_PROGRESS {
+        // The same door this drain came through: a drain that respected a hold must not become
+        // one that ignores it just because it lost a race.
+        spawn_drain_through(state, chat_id, respect_hold);
+        return;
+    }
+    hold_queue(chat_id);
+    if let Err(error) = crate::chats::notices::post_system(
+        &state.pool,
+        chat_id,
+        "queue",
+        0,
+        &format!(
+            "A waiting message could not be sent ({refusal}); it is still waiting and goes when you send again."
+        ),
+    )
+    .await
+    {
+        tracing::warn!(%error, chat_id, "could not post the notice about a waiting message");
+    }
+}
+
+/// Drains, once, every queue a previous daemon left waiting. Held queues are left alone.
+pub async fn drain_waiting_queues(state: crate::state::AppState) {
+    let chats: Vec<String> = sqlx::query_scalar("SELECT DISTINCT chat_id FROM chat_queue")
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default();
+    for chat in chats {
+        drain_queued(&state, &chat).await;
+    }
 }
 
 /// Why a turn was refused before it cost anything: this conversation is already answering one.
@@ -560,7 +681,10 @@ pub(super) async fn send_message_inner(
     }
     // Held from here on: every early return, error, and dropped future below releases the chat by
     // dropping this, which is why none of them needs a cleanup statement of its own.
-    let slot = ChatSlot::acquire(chat_id).ok_or(TURN_IN_PROGRESS.to_string())?;
+    // A warm-up holding the chat is waited out: it lets go in moments, and nothing is answering.
+    let slot = ChatSlot::acquire_past_warmup(chat_id)
+        .await
+        .ok_or(TURN_IN_PROGRESS.to_string())?;
 
     // Who answers this conversation. Two steps, in order of how specific the fact is: the chat's
     // own row, then the origin — every Telegram conversation with no row lands on the last one.
@@ -592,6 +716,8 @@ pub(super) async fn send_message_inner(
             .assistant_for(crate::chats::Brain::OpenRouter, pinned_model.as_deref())
         {
             Ok(assistant) => {
+                let mut slot = slot;
+                slot.drain_on_release(state);
                 spawn_local_turn(
                     state,
                     slot,
@@ -627,6 +753,8 @@ pub(super) async fn send_message_inner(
             .assistant_for(crate::chats::Brain::Local, pinned_model.as_deref())
         {
             Ok(assistant) => {
+                let mut slot = slot;
+                slot.drain_on_release(state);
                 return spawn_local_turn(
                     state,
                     slot,
@@ -692,12 +820,20 @@ pub(super) async fn send_message_inner(
             }
         }
     }
+    // Reads the conversation's settings file: off the runtime thread, and a join failure reads as
+    // "not wired", which is what the sync call answered for a file it could not read.
+    let hook_wired = match cwd.clone() {
+        Some(dir) => tokio::task::spawn_blocking(move || {
+            crate::governance::autopilot::classifier_hook_is_wired(std::path::Path::new(&dir))
+        })
+        .await
+        .unwrap_or(false),
+        None => false,
+    };
     let tool_policy = tool_policy_for(
         cwd.as_deref(),
         origin,
-        cwd.as_deref().is_some_and(|dir| {
-            crate::governance::autopilot::classifier_hook_is_wired(std::path::Path::new(dir))
-        }),
+        hook_wired,
         // Whether another conversation handed this turn over, and if so whether it may keep the
         // tools: the first hop out of a typed turn, from a sender that read nothing untrusted
         // (decision of 2026-10-11). Read here, as the turn starts, so a relay that waited in the
@@ -724,7 +860,14 @@ pub(super) async fn send_message_inner(
     let exe = exe.to_string_lossy().to_string();
     let config = build_mcp_config(&exe);
     let mcp_path = mcp_config_path(chat_id);
-    write_mcp_config(&mcp_path, &config).map_err(|e| e.to_string())?;
+    let written = {
+        let path = mcp_path.clone();
+        tokio::task::spawn_blocking(move || write_mcp_config(&path, &config)).await
+    };
+    match written {
+        Ok(result) => result.map_err(|e| e.to_string())?,
+        Err(error) => return Err(error.to_string()),
+    }
 
     // Assigned by the daemon and persisted with the row, exactly as `runs::create_run_inner` does
     // it, so an assistant turn is not the one kind of run that can exist without a session id. A
@@ -795,7 +938,13 @@ pub(super) async fn send_message_inner(
     // A failure here is not a failed turn. The pictures are already in memory and on their way to
     // the model; what is lost is the window's ability to show them afterwards, which is worth a
     // warning and not worth refusing a turn somebody is waiting for.
-    let kept = keep_images(state, id, images);
+    let kept = {
+        let state = state.clone();
+        let images = images.to_vec();
+        tokio::task::spawn_blocking(move || keep_images(&state, id, &images))
+            .await
+            .unwrap_or_default()
+    };
     if let Err(error) = record_images(&state.pool, id, &kept).await {
         tracing::warn!(%error, id, "the turn was sent but its pictures were not recorded");
     }
@@ -835,6 +984,8 @@ pub(super) async fn send_message_inner(
     };
     let cwd = cwd.map(std::path::PathBuf::from);
 
+    let mut slot = slot;
+    slot.drain_on_release(state);
     spawn_assistant_turn(
         state,
         TurnLaunch {
@@ -998,4 +1149,417 @@ pub async fn recent_exchanges(
     });
     rows.reverse();
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assistants::NoAssistants;
+    use crate::auth::Token;
+    use crate::execution::runner::FakeCommandRunner;
+    use crate::state::AppState;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A chat id no other test in this process is using: slots are process-global.
+    fn a_chat(prefix: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        format!(
+            "{prefix}:{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    async fn test_state() -> AppState {
+        AppState {
+            token: Token("t".into()),
+            pool: crate::testdb::fresh_pool().await,
+            telegram_doctrine: None,
+            runner: Arc::new(FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
+            assistants: Arc::new(NoAssistants),
+            run_handles: Arc::new(Mutex::new(HashMap::new())),
+            run_messages: Arc::new(Mutex::new(HashMap::new())),
+            run_tails: Default::default(),
+            files_root: None,
+            files_trash: None,
+            workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
+            quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        }
+    }
+
+    /// The prompts of a chat's assistant turns, oldest first, polled until there are `at_least`.
+    async fn prompts_of(pool: &SqlitePool, chat: &str, at_least: usize) -> Vec<String> {
+        let mut asked = Vec::new();
+        for _ in 0..200 {
+            asked = sqlx::query_scalar(
+                "SELECT prompt FROM runs WHERE chat_id = ? AND mode = 'assistant' ORDER BY id",
+            )
+            .bind(chat)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            if asked.len() >= at_least {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        asked
+    }
+
+    async fn waiting_texts(pool: &SqlitePool, chat: &str) -> Vec<String> {
+        crate::chats::queued(pool, chat)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| message.text)
+            .collect()
+    }
+
+    async fn settled(pool: &SqlitePool, id: i64) {
+        for _ in 0..500 {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("turn {id} never settled");
+    }
+
+    /// Any released slot that was armed sends what waited, in a task of its own.
+    #[tokio::test]
+    async fn a_released_slot_sends_what_waited_in_its_own_task() {
+        let state = test_state().await;
+        let chat = a_chat("released");
+        crate::chats::enqueue(&state.pool, &chat, "waited for the slot", "shell", "[]")
+            .await
+            .unwrap();
+
+        let mut slot = ChatSlot::acquire(&chat).expect("the chat should have been free");
+        slot.drain_on_release(&state);
+        assert!(is_busy(&chat));
+        drop(slot);
+
+        let asked = prompts_of(&state.pool, &chat, 1).await;
+        assert_eq!(asked.len(), 1, "what waited was never sent: {asked:?}");
+        assert!(asked[0].contains("waited for the slot"), "{asked:?}");
+        assert!(waiting_texts(&state.pool, &chat).await.is_empty());
+    }
+
+    /// A message a person typed that the drain cannot send is not lost: it goes back to the front,
+    /// the queue is held and a notice says so.
+    #[tokio::test]
+    async fn a_waiting_message_that_cannot_be_sent_goes_back_to_the_front() {
+        let state = test_state().await;
+        // A local chat on a machine with no local model: `send_message_with` refuses it.
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
+            .await
+            .unwrap();
+        crate::chats::enqueue(&state.pool, &chat, "first", "shell", "[]")
+            .await
+            .unwrap();
+        crate::chats::enqueue(&state.pool, &chat, "second", "shell", "[]")
+            .await
+            .unwrap();
+        let before: Vec<(i64, String)> = crate::chats::queued(&state.pool, &chat)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| (message.id, message.text))
+            .collect();
+
+        drain_queued(&state, &chat).await;
+
+        let after: Vec<(i64, String)> = crate::chats::queued(&state.pool, &chat)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| (message.id, message.text))
+            .collect();
+        assert_eq!(
+            after, before,
+            "the refused message must keep its place and id"
+        );
+        assert!(
+            queue_is_held(&chat),
+            "a failing queue is held, not retried in a loop"
+        );
+        let notices = crate::chats::notices::for_chat(&state.pool, &chat)
+            .await
+            .unwrap();
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.body.contains("could not be sent")
+                    && notice.body.contains(NO_LOCAL_MODEL)),
+            "{notices:?}"
+        );
+        release_queue(&chat);
+    }
+
+    /// A message put back on `TURN_IN_PROGRESS` after the slot's holder already released — so the
+    /// holder's own drain found the queue empty — is still sent, not stranded.
+    #[tokio::test]
+    async fn a_put_back_whose_holder_already_released_is_still_sent() {
+        let state = test_state().await;
+        let chat = a_chat("put-back-race");
+        assert!(!is_busy(&chat), "the holder has already released");
+
+        put_back_refused(
+            &state,
+            &chat,
+            &crate::chats::Queued {
+                id: 4242,
+                text: "lost the race".to_string(),
+                origin: Some("shell".to_string()),
+                images: Some("[]".to_string()),
+                relay_id: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            TURN_IN_PROGRESS,
+            true,
+        )
+        .await;
+
+        let asked = prompts_of(&state.pool, &chat, 1).await;
+        assert_eq!(
+            asked.len(),
+            1,
+            "the restored row was never drained: {asked:?}"
+        );
+        assert!(asked[0].contains("lost the race"), "{asked:?}");
+        assert!(waiting_texts(&state.pool, &chat).await.is_empty());
+        assert!(
+            !queue_is_held(&chat),
+            "a lost race is not a failure: the queue is not held"
+        );
+    }
+
+    /// Queues left waiting by a previous daemon are drained once at start-up, held ones excepted.
+    #[tokio::test]
+    async fn waiting_queues_are_drained_once_at_startup() {
+        let state = test_state().await;
+        let idle = a_chat("startup-idle");
+        let other = a_chat("startup-other");
+        let held = a_chat("startup-held");
+        for (chat, text) in [
+            (&idle, "idle words"),
+            (&other, "other words"),
+            (&held, "held words"),
+        ] {
+            crate::chats::enqueue(&state.pool, chat, text, "shell", "[]")
+                .await
+                .unwrap();
+        }
+        hold_queue(&held);
+
+        drain_waiting_queues(state.clone()).await;
+
+        let idle_asked = prompts_of(&state.pool, &idle, 1).await;
+        let other_asked = prompts_of(&state.pool, &other, 1).await;
+        assert!(
+            idle_asked.iter().any(|p| p.contains("idle words")),
+            "{idle_asked:?}"
+        );
+        assert!(
+            other_asked.iter().any(|p| p.contains("other words")),
+            "{other_asked:?}"
+        );
+        assert_eq!(
+            waiting_texts(&state.pool, &held).await,
+            vec!["held words".to_string()]
+        );
+        release_queue(&held);
+    }
+
+    /// A new message does not jump over the ones already waiting, even when the chat is free.
+    #[tokio::test]
+    async fn a_new_message_waits_behind_what_is_already_waiting() {
+        let state = test_state().await;
+        let chat = a_chat("behind");
+        crate::chats::enqueue(&state.pool, &chat, "older", "shell", "[]")
+            .await
+            .unwrap();
+
+        let outcome = send_or_queue(&state, &chat, "newer", &[], Origin::Shell).await;
+
+        assert_eq!(outcome, Ok(Sent::Queued));
+        let asked = prompts_of(&state.pool, &chat, 1).await;
+        assert!(
+            asked[0].contains("older"),
+            "the oldest message goes first: {asked:?}"
+        );
+    }
+
+    /// After Stop the queue stays put until the person sends again.
+    #[tokio::test]
+    async fn after_a_stop_what_waited_stays_waiting() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("stopped");
+        // A conversation with no directory of its own keeps no process, so Stop takes the kill path.
+        sqlx::query("INSERT INTO chats (chat_id, brain, created_at) VALUES (?, 'cloud', ?)")
+            .bind(&chat)
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        *fake.delay.lock().unwrap() = Some(Duration::from_secs(30));
+        let turn = send_message(&state, &chat, "slow one", Origin::Shell)
+            .await
+            .unwrap();
+        for _ in 0..300 {
+            if state.run_handles.lock().unwrap().contains_key(&turn) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let outcome = send_or_queue(&state, &chat, "behind the slow one", &[], Origin::Shell).await;
+        assert_eq!(outcome, Ok(Sent::Queued));
+
+        let stopped = stop_turn_within(&state, turn, Duration::from_millis(50)).await;
+
+        assert_eq!(stopped, Stopped::Killed);
+        settled(&state.pool, turn).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            waiting_texts(&state.pool, &chat).await,
+            vec!["behind the slow one".to_string()],
+            "Stop must not start what waited"
+        );
+        assert_eq!(prompts_of(&state.pool, &chat, 1).await.len(), 1);
+        assert!(queue_is_held(&chat));
+        release_queue(&chat);
+    }
+
+    /// Stop on a turn that already ended answers NotRunning and aborts whatever shares its id.
+    #[tokio::test]
+    async fn stopping_a_turn_that_already_ended_aborts_nothing() {
+        let state = test_state().await;
+        let chat = a_chat("ended");
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('done', 'completed', 'assistant', ?, '2026-08-09T00:00:00Z') RETURNING id",
+        )
+        .bind(&chat)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let task = tokio::spawn(tokio::time::sleep(Duration::from_secs(60)));
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(id, task.abort_handle());
+
+        let stopped = stop_turn_within(&state, id, Duration::from_millis(50)).await;
+
+        assert_eq!(stopped, Stopped::NotRunning);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "the task of an ended turn was aborted");
+        assert!(
+            state.run_handles.lock().unwrap().contains_key(&id),
+            "the handle of an ended turn was taken"
+        );
+        task.abort();
+    }
+
+    /// A lock a panic poisoned is taken anyway: the data is still there and the next caller needs it.
+    #[test]
+    fn a_poisoned_lock_is_recovered_rather_than_panicked_on() {
+        let lock = Arc::new(Mutex::new(vec![1, 2]));
+        let poisoner = lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poisoning the lock on purpose");
+        })
+        .join();
+        assert!(lock.is_poisoned());
+
+        relock(&lock).push(3);
+
+        assert_eq!(*relock(&lock), vec![1, 2, 3]);
+    }
+
+    /// Pictures are written off the runtime thread and still land where the window can ask for them.
+    #[tokio::test]
+    async fn pictures_written_off_the_runtime_are_still_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::files::ensure_root(dir.path()).unwrap();
+        let mut state = test_state().await;
+        state.files_root = Some(root.clone());
+        let images = vec![crate::execution::runner::Attachment {
+            media_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        }];
+
+        let id = send_message_with(&state, &a_chat("pictures"), "look", &images, Origin::Shell)
+            .await
+            .unwrap();
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT prompt_images FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let paths: Vec<String> =
+            serde_json::from_str(&stored.expect("the turn recorded no pictures")).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(std::fs::read(root.join(&paths[0])).unwrap(), b"hello");
+    }
+
+    /// A send that arrives while the chat's process is being warmed waits the warm-up out and starts
+    /// its turn: nothing was answering, so it is not queued behind a phantom turn, and the chat never
+    /// read as busy (which is what made an archive answer 409 in that window).
+    #[tokio::test]
+    async fn a_send_during_a_prewarm_is_not_reported_as_queued() {
+        let state = test_state().await;
+        let chat = a_chat("warming");
+        let warm = ChatSlot::acquire_for_warmup(&chat).expect("the chat starts free");
+        assert!(
+            !is_busy(&chat),
+            "a warm-up read as a turn in flight, so an archive would be refused"
+        );
+        assert!(
+            ChatSlot::acquire(&chat).is_none(),
+            "a warm-up must still keep a turn from starting beside it"
+        );
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(warm);
+        });
+
+        let outcome = send_or_queue(&state, &chat, "hello", &[], Origin::Shell).await;
+        release.await.unwrap();
+
+        assert!(
+            matches!(outcome, Ok(Sent::Turn(_))),
+            "a send during a warm-up was answered {outcome:?}"
+        );
+        assert!(
+            waiting_texts(&state.pool, &chat).await.is_empty(),
+            "the message was queued behind the warm-up"
+        );
+    }
 }

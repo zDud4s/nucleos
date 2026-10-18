@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { memo, useMemo, type ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { CopyButton } from "../ui";
 import {
@@ -19,10 +19,13 @@ import {
  *
  * Only the model's half goes through it. What a person typed is drawn exactly as they typed it.
  */
-export function Rich({ text }: { text: string }) {
+export const Rich = memo(function Rich({ text }: { text: string }) {
+  // Parsed once per text: a streaming answer re-renders its list many times a second while every
+  // earlier answer's text is unchanged.
+  const parsed = useMemo(() => blocks(text), [text]);
   return (
     <>
-      {blocks(text).map((block, index) =>
+      {parsed.map((block, index) =>
         block.kind === "code" ? (
           /* The block, and the one gesture anybody performs on one. A wrapper rather than a
              button inside the `<pre>`: the `<pre>` scrolls sideways, and a control placed in a
@@ -48,7 +51,7 @@ export function Rich({ text }: { text: string }) {
       )}
     </>
   );
-}
+});
 
 /**
  * A table, as a table.

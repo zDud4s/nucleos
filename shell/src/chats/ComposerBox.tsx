@@ -52,7 +52,8 @@ export function ComposerBox({
   /**
    * A turn is running: while the box is empty the send button is this one instead, in the same
    * place — the corner the hand is already on — the way every chat app turns send into stop.
-   * Typing brings send back, because what is typed then is something to say, not a wish to stop.
+   * Typing brings send back BESIDE stop, which stays reachable: what is typed is something to say,
+   * but the turn is still running and the person may still want it stopped.
    */
   stop?: { onStop: () => void; pending: boolean };
 }) {
@@ -78,6 +79,9 @@ export function ComposerBox({
           }
           onSelect={(event) => onSelect?.(event.currentTarget.selectionStart)}
           onKeyDown={(event) => {
+            // An Enter that confirms an IME candidate is not a message, and not a pick from
+            // the mention list either: checked before the list sees the key.
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return;
             if (onKeyDown?.(event) === true) return;
             if (event.key !== "Enter" || event.shiftKey) return;
             event.preventDefault();
@@ -88,7 +92,7 @@ export function ComposerBox({
       </div>
       <div className="chats-composer-actions">
         {actions}
-        {stopping ? (
+        {stop !== undefined ? (
           <button
             type="button"
             className="chats-send chats-send-stop"
@@ -99,7 +103,8 @@ export function ComposerBox({
           >
             <Square className="chats-send-icon chats-send-stop-icon" aria-hidden="true" />
           </button>
-        ) : (
+        ) : null}
+        {!stopping ? (
           <button
             type="button"
             className="chats-send"
@@ -109,7 +114,7 @@ export function ComposerBox({
           >
             <ArrowUp className="chats-send-icon" aria-hidden="true" />
           </button>
-        )}
+        ) : null}
       </div>
     </div>
   );

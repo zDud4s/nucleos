@@ -36,7 +36,13 @@ export function dueWhileBlurred(query: Query, now: number): boolean {
   if (interval === false) return false;
   if (query.state.fetchStatus !== "idle") return false;
   const last = Math.max(query.state.dataUpdatedAt, query.state.errorUpdatedAt);
-  return now - last >= Math.max(interval, BLURRED_CADENCE);
+  // A conversation with a live turn or a pending ask says so through its query meta, and keeps its
+  // own cadence: a blurred window must still show the answer arriving and the ask waiting.
+  const urgent =
+    (query.meta as { urgentWhileBlurred?: (q: Query) => boolean } | undefined)?.urgentWhileBlurred?.(
+      query,
+    ) === true;
+  return now - last >= (urgent ? interval : Math.max(interval, BLURRED_CADENCE));
 }
 
 /**

@@ -15796,6 +15796,206 @@ mod tests {
         assert!(listed.iter().all(|chat| chat.chat_id != id));
     }
 
+    async fn archive_request(state: &AppState, chat_id: &str) -> axum::response::Response {
+        build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/assistant/chats/{chat_id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Putting away a conversation that is answering would hide a turn that is still being paid
+    /// for, and its answer would land in a chat nobody can see.
+    #[tokio::test]
+    async fn archiving_a_chat_with_a_running_turn_is_refused_with_409() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let _busy = crate::assistant::take_the_slot_for_testing(&id);
+
+        let response = archive_request(&state, &id).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert!(
+            body.to_string().contains("chat_busy"),
+            "the refusal names why: {body}"
+        );
+        let listed = crate::chats::list(&state.pool).await.unwrap();
+        assert!(listed.iter().any(|chat| chat.chat_id == id), "still listed");
+    }
+
+    /// Messages waiting for a turn would be sent into a conversation nobody can see.
+    #[tokio::test]
+    async fn archiving_a_chat_with_queued_messages_is_refused_with_409() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::enqueue(&state.pool, &id, "still to say", "shell", "[]")
+            .await
+            .unwrap();
+
+        let response = archive_request(&state, &id).await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert!(
+            body.to_string().contains("chat_queued"),
+            "the refusal names why: {body}"
+        );
+        let listed = crate::chats::list(&state.pool).await.unwrap();
+        assert!(listed.iter().any(|chat| chat.chat_id == id), "still listed");
+    }
+
+    /// `204` for an archive that matched nothing is the API saying "done" about something it did
+    /// not do.
+    #[tokio::test]
+    async fn archiving_a_chat_that_does_not_exist_is_404() {
+        let state = test_state().await;
+
+        let response = archive_request(&state, "never-opened").await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A PATCH is all or nothing: a valid field beside an invalid one must not land.
+    #[tokio::test]
+    async fn a_patch_with_one_invalid_field_changes_nothing() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+
+        // Every field before `effort` in the handler is valid; `effort` is not a level.
+        let status = patch_chat_request(
+            state.clone(),
+            &id,
+            &serde_json::json!({
+                "cwd": root.path().to_str().unwrap(),
+                "turn_budget_usd": 1.5,
+                "title": "A new name",
+                "effort": "not-a-level",
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            crate::chats::cwd_of(&state.pool, &id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the directory moved anyway"
+        );
+        let (budget, effort, title): (Option<f64>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT turn_budget_usd, effort, title FROM chats WHERE chat_id = ?")
+                .bind(&id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(budget, None, "the ceiling was written anyway");
+        assert_eq!(effort, None);
+        assert_eq!(title, None, "the rename landed anyway");
+    }
+
+    /// `200` with an empty transcript for an id nobody ever used reads as a conversation that
+    /// exists and is quiet.
+    #[tokio::test]
+    async fn the_transcript_of_a_chat_that_does_not_exist_is_404() {
+        let state = test_state().await;
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/assistant/chats/never-opened")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The page carries what was said during ITS turns and the notices from ITS time onward — not
+    /// every aside the conversation ever collected.
+    #[tokio::test]
+    async fn a_transcript_carries_only_what_was_said_during_the_turns_it_returns() {
+        let state = test_state().await;
+        let mut ids = Vec::new();
+        // One more turn than a page holds, so the oldest falls off it.
+        for n in 0..=100 {
+            let at = format!("2026-08-20T{:02}:{:02}:00Z", n / 60, n % 60);
+            let id = sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, chat_id, stdout, created_at)
+                 VALUES (?, 'completed', 'assistant', 'long-chat', 'ok', ?)",
+            )
+            .bind(format!("question {n}"))
+            .bind(at)
+            .execute(&state.pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            ids.push(id);
+        }
+        for (run, text) in [
+            (ids[0], "said in the first"),
+            (ids[100], "said in the last"),
+        ] {
+            sqlx::query(
+                "INSERT INTO chat_said_now (chat_id, run_id, text, origin, created_at)
+                 VALUES ('long-chat', ?, ?, 'shell', '2026-08-20T01:41:00Z')",
+            )
+            .bind(run)
+            .bind(text)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        for (body, at) in [
+            ("before the page", "2026-08-20T00:00:00Z"),
+            ("within the page", "2026-08-20T05:00:00Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO chat_notices
+                     (chat_id, team_run_id, from_agent_id, from_run_id, body, created_at)
+                 VALUES ('long-chat', '', 'nucleos', 0, ?, ?)",
+            )
+            .bind(body)
+            .bind(at)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let body = get_json(&state, "/assistant/chats/long-chat").await;
+
+        assert_eq!(body["more"], true);
+        let turns = body["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 100);
+        let last = turns.last().unwrap();
+        assert_eq!(last["said_now"][0]["text"], "said in the last");
+        assert_eq!(last["said_now"].as_array().map(Vec::len), Some(1));
+        let notices: Vec<&str> = body["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["body"].as_str().unwrap())
+            .collect();
+        assert_eq!(notices, ["within the page"]);
+    }
+
     /// The names a conversation can mention are the ones under its OWN directory.
     ///
     /// An `@` in the composer has to complete against something, and the only defensible something

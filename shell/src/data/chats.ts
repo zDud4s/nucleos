@@ -1,4 +1,10 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import {
   anyTurnLive,
@@ -456,6 +462,11 @@ export interface Command {
   source: CommandSource;
 }
 
+/** Whether a cached list item is a conversation row (the `chats` keys hold many shapes). */
+function isChatSummary(item: unknown): item is ChatSummary {
+  return typeof item === "object" && item !== null && "chat_id" in item;
+}
+
 /** What `PATCH /assistant/chats/{chat_id}` accepts. Any field, or several. */
 export interface ChatPatch {
   chatId: string;
@@ -781,19 +792,29 @@ export function useChatTranscript(chatId: string | null) {
       let incremental =
         watermark !== null && !invalidated && Date.now() - lastFull < TRANSCRIPT_FULL_READ_MS;
       const open = { headers: { [CHAT_OPEN_HEADER]: "1" } };
-      let read = await apiFetch<TranscriptRead>(
+      const first = await apiFetch<TranscriptRead | undefined>(
         incremental ? `${path}?after=${watermark}` : path,
         open,
       );
-      if (incremental && read.more) {
+      let read: TranscriptRead;
+      if (incremental && (first === undefined || first.turns === undefined || first.more)) {
         // More turns past the watermark than one read returns: catching up piecewise would leave a
-        // hole between the pieces, so this one is read in full.
+        // hole between the pieces, so this one is read in full. So is an incremental answer that
+        // carries no turns at all (an empty 204, a daemon or stub that does not know `?after=`):
+        // throwing on it would leave the page on its last read until the next full one, and a
+        // turn that landed meanwhile would not be drawn.
         incremental = false;
         read = await apiFetch<TranscriptRead>(path, open);
+      } else {
+        read = first as TranscriptRead;
       }
       if (!incremental) lastFullRead.set(chatId ?? "", Date.now());
       const fresh = read.turns.map(turnFromRow);
-      const local = held?.turns ?? [];
+      // Re-read AFTER the awaits: a send writes its optimistic turn into the cache while this read
+      // is on the wire, and merging with the pre-await snapshot would erase it. `held` keeps only
+      // the watermark and the `more` answer, which belong to the moment the read was planned.
+      const current = client.getQueryData<Transcript>(queryKey) ?? held;
+      const local = current?.turns ?? [];
       const turns = merge(fresh, local);
       // `more` is about the oldest turn the PAGE holds, and this read only ever asks about the
       // recent hundred. Once somebody has fetched a page above that, every subsequent poll would
@@ -817,7 +838,18 @@ export function useChatTranscript(chatId: string | null) {
       };
     },
     enabled: chatId !== null,
-    refetchInterval: (query) => conversationInterval(anyTurnLive(query.state.data?.turns)),
+    refetchInterval: (query) =>
+      conversationInterval(
+        anyTurnLive(query.state.data?.turns) || (query.state.data?.asks?.length ?? 0) > 0,
+      ),
+    // A live turn or a held ask must not wait for the blurred cadence: the answer arriving and the
+    // question waiting for a person are what a window behind another app most needs to show.
+    meta: {
+      urgentWhileBlurred: (query: { state: { data?: unknown } }) => {
+        const data = query.state.data as Transcript | undefined;
+        return anyTurnLive(data?.turns) || (data?.asks?.length ?? 0) > 0;
+      },
+    },
   });
 }
 
@@ -1265,17 +1297,58 @@ export function useSendMessage(chatId: string) {
         body: JSON.stringify({ chat_id: chatId, text, images, wait_if_busy: true }),
       }),
     retry: false,
-    onSuccess: (result, { text }) => {
+    // Drawn before the daemon answers: a person who pressed Send is looking at the box, and a
+    // bubble that waits for the POST reads as the shell not having heard. The id is far above any
+    // real one so `merge` sorts it last; `onSuccess` swaps in the real id and `onError` removes it.
+    onMutate: ({ text }): { optimistic: Turn } => {
+      const optimistic = optimisticTurn(Number.MAX_SAFE_INTEGER - ++optimisticSeq, text);
+      writeTurns(queryClient, chatId, (turns) => merge(turns, [optimistic]));
+      return { optimistic };
+    },
+    onError: (_error, _vars, context) => {
+      if (context === undefined) return;
+      writeTurns(queryClient, chatId, (turns) =>
+        turns.filter((turn) => turn.id !== context.optimistic.id),
+      );
+    },
+    onSuccess: (result, _vars, context) => {
+      const placeholder = context?.optimistic;
       // Kept rather than sent: there is no turn to draw, and inventing one would put a bubble on
-      // screen for a run that does not exist. The transcript's own read carries what is waiting, so
-      // asking for it again is the whole of what this side has to do.
-      if (result.turn_id === undefined) {
-        void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
-        void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      // screen for a run that does not exist. The placeholder goes, and the transcript's own read
+      // carries what is waiting.
+      if (result.turn_id === undefined || placeholder === undefined) {
+        if (placeholder !== undefined) {
+          writeTurns(queryClient, chatId, (turns) =>
+            turns.filter((turn) => turn.id !== placeholder.id),
+          );
+        }
+        refreshTail(queryClient, chatId);
         return;
       }
-      const optimistic: Turn = {
-        id: result.turn_id,
+      const real: Turn = { ...placeholder, id: result.turn_id };
+      // The daemon's own row, if a read already brought it, wins over this guess (`merge` keeps the
+      // first argument's turn on a shared id).
+      writeTurns(queryClient, chatId, (turns) =>
+        merge(
+          turns.filter((turn) => turn.id !== placeholder.id),
+          [real],
+        ),
+      );
+      refreshTail(queryClient, chatId);
+    },
+  });
+}
+
+/** Counts the optimistic turns this window has drawn, so two sends in a row get distinct ids. */
+let optimisticSeq = 0;
+
+/**
+ * The turn a send draws before the daemon has answered: `asked` is what was just typed, everything
+ * else is unknown until the next read.
+ */
+function optimisticTurn(id: number, text: string): Turn {
+  return {
+        id,
         asked: text,
         answer: null,
         status: "pending",
@@ -1313,34 +1386,60 @@ export function useSendMessage(chatId: string) {
         // another conversation and reaches this one through the daemon's own read.
         relayedFrom: null,
         unprompted: false,
-      };
-      // A `Transcript`, because that is what this key holds. It used to hold a bare array, and
-      // writing the old shape here does not fail a type check — `setQueryData` is TOLD the type —
-      // it fails at runtime inside `merge`, on the one gesture the page exists for. What is handed
-      // and what is queued are carried through untouched: neither is this write's business, and
-      // dropping them would blank the notes above and below the transcript on every send.
-      queryClient.setQueryData<Transcript>(keys.chats.detail(chatId), (current) => ({
-        handed: current?.handed ?? [],
-        queued: current?.queued ?? [],
-        // Carried through for the reason the two above are, and it matters more: a question this
-        // conversation is being HELD on, blanked by an optimistic write, would take the answer
-        // buttons off the screen while the turn behind them went on waiting.
-        asks: current?.asks ?? [],
-        // And carried through for the same reason again: a conversation somebody has pressed
-        // "earlier turns" on has already answered the question of what is above it, and a send
-        // resetting that to `false` would take the button away in the middle of reading back.
-        more: current?.more ?? false,
-        // Carried through untouched, like `handed` and `queued`: what a department said is not this
-        // write's business, and dropping it would make a report vanish the moment somebody typed.
-        notices: current?.notices ?? [],
-        turns: merge(current?.turns ?? [], [optimistic]),
-      }));
-      // The list's "thinking…" reading and its `waiting` count both depend on
-      // this conversation's state, and a person who just sent a message is
-      // looking straight at it — a three-second wait for the badge to agree
-      // reads as the shell not having noticed yet.
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+  };
+}
+
+/**
+ * Rewrite the turns of one conversation's cached transcript.
+ *
+ * A `Transcript`, because that is what this key holds. It used to hold a bare array, and writing
+ * the old shape does not fail a type check — `setQueryData` is TOLD the type — it fails at runtime
+ * inside `merge`. What is handed, queued, asked and noticed is carried through untouched: none of
+ * it is this write's business, and dropping any would blank a part of the page on every send (an
+ * ask blanked here would take the answer buttons off the screen while the turn behind them waited).
+ * `more` is carried too: a send must not take "earlier turns" away in the middle of reading back.
+ * With no cached transcript there is nothing to remove from, so a removal writes nothing.
+ */
+function writeTurns(
+  queryClient: QueryClient,
+  chatId: string,
+  change: (turns: Turn[]) => Turn[],
+): void {
+  queryClient.setQueryData<Transcript>(keys.chats.detail(chatId), (current) => {
+    const turns = change(current?.turns ?? []);
+    if (current === undefined && turns.length === 0) return undefined;
+    return {
+      handed: current?.handed ?? [],
+      queued: current?.queued ?? [],
+      asks: current?.asks ?? [],
+      more: current?.more ?? false,
+      notices: current?.notices ?? [],
+      turns,
+    };
+  });
+}
+
+/**
+ * Ask again for what a mutation changed at the TAIL of the open conversation, and for the list.
+ *
+ * The transcript is REFETCHED and not invalidated: an invalidation makes the next read a full one
+ * (see `useChatTranscript`), whereas a refetch keeps it incremental — only the turns past the
+ * settled watermark. So the list is invalidated with the open conversation's own detail left out,
+ * since `keys.chats.all` is a prefix of it. The list's "thinking…" reading and its `waiting` count
+ * depend on this conversation's state, and a three-second wait for the badge to agree reads as
+ * the shell not having noticed yet.
+ */
+function refreshTail(queryClient: QueryClient, chatId: string): void {
+  void queryClient.refetchQueries({
+    queryKey: keys.chats.detail(chatId),
+    exact: true,
+    type: "active",
+  });
+  const detail = keys.chats.detail(chatId);
+  void queryClient.invalidateQueries({
+    queryKey: keys.chats.all,
+    predicate: (query) =>
+      !(query.queryKey[1] === detail[1] && query.queryKey[2] === detail[2]),
   });
 }
 
@@ -1460,10 +1559,11 @@ export function useStartConversation() {
 export function useLiveTurn(
   turnId: number,
   alive: boolean,
-  options: { stream?: boolean } = {},
+  options: { stream?: boolean; chatId?: string } = {},
 ) {
   const queryClient = useQueryClient();
   const wantStream = options.stream === true && alive;
+  const chatId = options.chatId;
   const [mode, setMode] = useState<"stream" | "poll">("stream");
 
   useEffect(() => {
@@ -1479,7 +1579,17 @@ export function useLiveTurn(
           signal,
           onLive: (live) => queryClient.setQueryData(keys.chats.live(turnId), live),
         });
-        if (outcome === "ended" || signal.aborted) return;
+        if (signal.aborted) return;
+        if (outcome === "ended") {
+          // The stream ending IS the turn settling: ask for the transcript at once instead of
+          // waiting up to a poll interval for the row to say so. An aborted stream is the page
+          // leaving, not the turn ending, so it asks for nothing.
+          if (chatId !== undefined) {
+            refreshTail(queryClient, chatId);
+            void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+          }
+          return;
+        }
         setMode("poll");
         await new Promise<void>((resolve) => {
           const timer = setTimeout(resolve, backoffDelay(attempt));
@@ -1490,7 +1600,7 @@ export function useLiveTurn(
       }
     })();
     return () => controller.abort();
-  }, [turnId, wantStream, queryClient]);
+  }, [turnId, wantStream, queryClient, chatId]);
 
   return useQuery({
     queryKey: keys.chats.live(turnId),
@@ -1498,6 +1608,20 @@ export function useLiveTurn(
     enabled: alive && (!wantStream || mode === "poll"),
     refetchInterval: POLL.turn,
   });
+}
+
+/**
+ * A turn's live state as the cache holds it, without ever asking the daemon.
+ *
+ * For a reader that only wants to show what `useLiveTurn` (mounted elsewhere) has already written —
+ * `enabled: false` means no fetch and no poll, so a second observer costs nothing.
+ */
+export function useLiveTurnSnapshot(turnId: number): LiveTurn | undefined {
+  return useQuery({
+    queryKey: keys.chats.live(turnId),
+    queryFn: () => apiFetch<LiveTurn | undefined>(`/assistant/${turnId}/live`),
+    enabled: false,
+  }).data;
 }
 
 /**
@@ -1587,10 +1711,7 @@ export function useDropQueued(chatId: string) {
         { method: "DELETE" },
       ),
     retry: false,
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    onSettled: () => refreshTail(queryClient, chatId),
   });
 }
 
@@ -1640,6 +1761,22 @@ export function useSetPermissionMode(chatId: string) {
         body: JSON.stringify({ permission_mode: mode }),
       }),
     retry: false,
+    // Shown at once and put back if the daemon refuses: a picker that waits for the round trip
+    // reads as not having heard the click, and the list's rung reads from the same fact.
+    onMutate: async (mode) => {
+      const projectKey = keys.chats.project(chatId);
+      await queryClient.cancelQueries({ queryKey: projectKey, exact: true });
+      const previous = queryClient.getQueryData<ChatProject>(projectKey);
+      if (previous !== undefined) {
+        queryClient.setQueryData<ChatProject>(projectKey, { ...previous, permission_mode: mode });
+      }
+      return { previous };
+    },
+    onError: (_error, _mode, context) => {
+      if (context?.previous !== undefined) {
+        queryClient.setQueryData<ChatProject>(keys.chats.project(chatId), context.previous);
+      }
+    },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
       void queryClient.invalidateQueries({ queryKey: keys.chats.all });
@@ -1765,10 +1902,7 @@ export function useStopTurn(chatId: string) {
     mutationFn: (turnId: number) =>
       apiFetch<{ stopped: string }>(`/assistant/turns/${turnId}/stop`, { method: "POST" }),
     retry: false,
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    onSettled: () => refreshTail(queryClient, chatId),
   });
 }
 
@@ -1784,10 +1918,7 @@ export function useKillTurn(chatId: string) {
   return useMutation({
     mutationFn: (turnId: number) => apiText(`/runs/${turnId}/cancel`, { method: "POST" }),
     retry: false,
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    onSettled: () => refreshTail(queryClient, chatId),
   });
 }
 
@@ -1807,10 +1938,7 @@ export function useSayNow(chatId: string) {
         { method: "POST", body: JSON.stringify({ text }) },
       ),
     retry: false,
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.detail(chatId) });
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    onSettled: () => refreshTail(queryClient, chatId),
   });
 }
 
@@ -1883,6 +2011,34 @@ export function usePatchChat() {
         }),
       }),
     retry: false,
+    // A picker is a gesture with an answer on screen: the model and effort are written into every
+    // cached chat list at once and put back if the daemon refuses.
+    onMutate: ({ chatId, model, effort }) => {
+      const touched = model !== undefined || effort !== undefined;
+      const snapshot = touched
+        ? queryClient.getQueriesData<unknown>({ queryKey: keys.chats.all })
+        : [];
+      for (const [key, data] of snapshot) {
+        if (!Array.isArray(data)) continue;
+        if (!data.some((item) => isChatSummary(item) && item.chat_id === chatId)) continue;
+        queryClient.setQueryData(
+          key,
+          data.map((item) =>
+            isChatSummary(item) && item.chat_id === chatId
+              ? {
+                  ...item,
+                  ...(model !== undefined ? { model } : {}),
+                  ...(effort !== undefined ? { effort } : {}),
+                }
+              : item,
+          ),
+        );
+      }
+      return { snapshot };
+    },
+    onError: (_error, _variables, context) => {
+      for (const [key, data] of context?.snapshot ?? []) queryClient.setQueryData(key, data);
+    },
     onSuccess: (_data, variables) => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.all });
       void queryClient.invalidateQueries({ queryKey: keys.chats.detail(variables.chatId) });

@@ -14,6 +14,30 @@ pub struct ClaudeCliRunner {
     pub resolve_effort: Option<String>,
 }
 
+/// Reads the next stdout line, giving up after `silence` without one.
+///
+/// Not while a tool call is open: a long Bash or Agent call prints nothing until its result, and
+/// that quiet is work in progress, not a stalled run — the same exemption `LiveChat::gather` makes
+/// for a kept process. The run's wall clock still bounds the wait. `Err` carries the deadline that
+/// expired.
+pub(super) async fn next_line_unless_silent<R>(
+    lines: &mut tokio::io::Lines<R>,
+    silence: Option<Duration>,
+    open_tools: &std::collections::HashSet<String>,
+) -> Result<std::io::Result<Option<String>>, Duration>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    match silence {
+        Some(deadline) if open_tools.is_empty() => {
+            tokio::time::timeout(deadline, lines.next_line())
+                .await
+                .map_err(|_| deadline)
+        }
+        _ => Ok(lines.next_line().await),
+    }
+}
+
 /// The stage name a conflict resolution is routed by. Not a job stage — no node carries it — but
 /// the resolution is the daemon's own read-and-merge turn, and naming it lets the same
 /// `model_for_stage` seam route it without a second mechanism.
@@ -175,13 +199,17 @@ impl CommandRunner for ClaudeCliRunner {
                 .take()
                 .expect("stdin piped above when steerable");
             let opening = user_message_line(&request.prompt, &request.images);
+            // A process started ahead of its first message (a conversation opened in the window):
+            // nothing to say yet, so no opening line is written and the CLI waits on its stdin for
+            // the first turn to arrive down `messages`.
+            let warmed = request.prompt.is_empty() && request.images.is_empty();
             let mut messages = request.messages.take();
             steering_task = Some(tokio::spawn(async move {
                 // `ChildStdin` writes straight to the OS pipe, so a completed `write_all` has
                 // already been handed over — there is no buffer left to flush. A failed one means
                 // the CLI is gone, which the exit code and stderr below already report; there is
                 // nothing this task could add and nobody awaiting it to tell.
-                if stdin.write_all(opening.as_bytes()).await.is_err() {
+                if !warmed && stdin.write_all(opening.as_bytes()).await.is_err() {
                     return;
                 }
                 let Some(messages) = messages.as_mut() else {
@@ -241,18 +269,21 @@ impl CommandRunner for ClaudeCliRunner {
         let mut progress_timeout_elapsed: Option<Duration> = None;
         let mut turns = TurnCounter::default();
         let mut turns_exceeded: Option<i64> = None;
+        // Tool calls the CLI has started and not yet answered. While any is open the stream is
+        // quiet because a tool is working, not because the run stalled.
+        let mut open_tools = std::collections::HashSet::new();
 
         loop {
-            let next_line = match request.progress_timeout {
-                Some(deadline) => match tokio::time::timeout(deadline, lines.next_line()).await {
+            let next_line =
+                match next_line_unless_silent(&mut lines, request.progress_timeout, &open_tools)
+                    .await
+                {
                     Ok(result) => result,
-                    Err(_) => {
+                    Err(deadline) => {
                         progress_timeout_elapsed = Some(deadline);
                         break;
                     }
-                },
-                None => lines.next_line().await,
-            };
+                };
             let line = match next_line {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
@@ -263,6 +294,7 @@ impl CommandRunner for ClaudeCliRunner {
             };
             stdout_acc.push_str(&line);
             stdout_acc.push('\n');
+            track_open_tools(&line, &mut open_tools);
             // Mirrored as it arrives, not at the end: the end is exactly what a wall-clock timeout
             // never reaches. A poisoned lock would mean another thread panicked mid-write, which
             // says nothing about this run — keep going rather than take the run down with it.
@@ -316,6 +348,8 @@ impl CommandRunner for ClaudeCliRunner {
                 // and `usage` still describes the turn that ended last.
                 for event in splitter.line(line.clone()) {
                     if let TurnEvent::Ended(turn) = &event {
+                        // A turn that ended has no tool call left running, whatever it opened.
+                        open_tools.clear();
                         turn_ended = true;
                         usage = turn.usage;
                         if turn.cost_usd.is_some() {

@@ -4,7 +4,14 @@ import { render, screen } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-import { MessageList } from "./MessageList";
+const parsing = vi.hoisted(() => ({ blocks: vi.fn() }));
+vi.mock("../lib/rich", async (original) => {
+  const real = await original<typeof import("../lib/rich")>();
+  parsing.blocks.mockImplementation(real.blocks);
+  return { ...real, blocks: parsing.blocks };
+});
+
+import { MessageList, Rich } from "./MessageList";
 
 describe("MessageList", () => {
   it("MessageList draws the person's text verbatim and the agent's through Rich", () => {
@@ -23,5 +30,18 @@ describe("MessageList", () => {
     const code = container.querySelector(".chats-code-block code");
     expect(code).not.toBeNull();
     expect(code?.textContent).toContain("let x = 1;");
+  });
+
+  it("Rich parses a text once across re-renders", () => {
+    parsing.blocks.mockClear();
+    const { rerender } = render(<Rich text="some **answer**" />);
+    expect(parsing.blocks).toHaveBeenCalledTimes(1);
+
+    rerender(<Rich text="some **answer**" />);
+    rerender(<Rich text="some **answer**" />);
+    expect(parsing.blocks).toHaveBeenCalledTimes(1);
+
+    rerender(<Rich text="another answer" />);
+    expect(parsing.blocks).toHaveBeenCalledTimes(2);
   });
 });

@@ -17,7 +17,7 @@ pub(super) static NEXT_WATCHER: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str) {
     let token = NEXT_WATCHER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     {
-        let mut kept = LIVE_CHATS.lock().unwrap();
+        let mut kept = relock(&LIVE_CHATS);
         match kept.get_mut(chat_id) {
             Some(live) => live.watcher = token,
             None => return,
@@ -34,10 +34,13 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
             tokio::time::sleep(BETWEEN_TURNS_TICK).await;
             // No lock is held across an await: the guard lives only in this block. An entry that is
             // gone (a turn took it) or owned by a newer reader ends this one.
-            let (begun, task_lines) = {
-                let mut kept = LIVE_CHATS.lock().unwrap();
+            let (begun, task_lines, has_set_aside) = {
+                let mut kept = relock(&LIVE_CHATS);
                 match kept.get_mut(&chat_id) {
                     Some(live) if live.watcher == token => {
+                        // `serve_turn` moves a set-aside answer off the process already; this only
+                        // catches one a turn path left on it.
+                        keep_set_aside(&chat_id, live);
                         let begun = live.drain_idle();
                         let fresh: Vec<String> = live
                             .carried
@@ -53,7 +56,7 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
                             })
                             .collect();
                         recorded = live.carried.len();
-                        (begun, fresh)
+                        (begun, fresh, relock(&SET_ASIDE).contains_key(&chat_id))
                     }
                     _ => return,
                 }
@@ -61,6 +64,15 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
             // A task that ends between turns is recorded now, not when a later turn reads the line.
             for line in &task_lines {
                 crate::chats::tasks::apply_line(&state.pool, &chat_id, line).await;
+            }
+            // An answer a person's message interrupted was set aside whole by `LiveChat::turn`. The
+            // turn that set it aside records it before letting go of the slot; whatever still waits
+            // (that turn was cancelled first) is recorded here, as the turn of its own that it was.
+            if has_set_aside && let Some(slot) = ChatSlot::acquire(&chat_id) {
+                let mut slot = slot;
+                slot.drain_on_release(&state);
+                record_set_aside(&state, &chat_id).await;
+                drop(slot);
             }
             if !begun {
                 continue;
@@ -70,7 +82,7 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
                 continue;
             };
             let live = {
-                let mut kept = LIVE_CHATS.lock().unwrap();
+                let mut kept = relock(&LIVE_CHATS);
                 let ours = kept.get(&chat_id).is_some_and(|live| live.watcher == token);
                 if ours { kept.remove(&chat_id) } else { None }
             };
@@ -83,37 +95,34 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
     });
 }
 
-/// Records an answer the CLI began on its own as a turn of its own, and gathers the rest of it.
+/// The barrier a process's unprompted answer runs under (see [`open_task_run`]).
 ///
-/// A run with `origin = 'task'`, whose barrier is the PROCESS's (the mode stamped on the last turn it
-/// served, the strictest `read_untrusted` of every turn it served), so it is never cleaner than the
-/// turns it continues. A process with no stamped mode, or a row that cannot be written, stops the
-/// process rather than let an answer run unaccounted, and whatever queued meanwhile is drained.
-pub(super) async fn start_spontaneous_turn(
+/// It comes from the PROCESS: the mode stamped on the last turn it served and the strictest
+/// `read_untrusted` of every turn it served. Never the chat's newest row, which may be a turn that
+/// was stopped before it stamped anything.
+fn barrier_of(process_key: usize) -> Option<(&'static str, Vec<i64>)> {
+    relock(&PROCESS_BARRIERS)
+        .get(&process_key)
+        .map(|held| (held.mode, held.served.clone()))
+}
+
+/// Writes the `origin = 'task'` run row a spontaneous answer is recorded under, and returns its id
+/// and the mode it runs under. `None` when the process has no stamped mode or the row cannot be
+/// written; the caller then stops the process rather than let an answer run unaccounted.
+async fn open_task_run(
     state: &crate::state::AppState,
     chat_id: &str,
-    slot: ChatSlot,
-    mut live: LiveChat,
-) {
-    let prompt = spontaneous_prompt(&live.carried);
-    let session_id = live.session_id.lock().unwrap().clone();
-    // The barrier comes from the PROCESS: the mode stamped on the last turn it served and the
-    // strictest `read_untrusted` of every turn it served. Never the chat's newest row, which may be
-    // a turn that was stopped before it stamped anything.
-    let barrier = PROCESS_BARRIERS
-        .lock()
-        .unwrap()
-        .get(&live.process_key())
-        .map(|held| (held.mode, held.served.clone()));
+    prompt: &str,
+    session_id: &Option<String>,
+    barrier: Option<(&'static str, Vec<i64>)>,
+    process_rung: Option<crate::execution::runner::Permission>,
+) -> Option<(i64, &'static str)> {
     let Some((mode, served)) = barrier else {
         tracing::warn!(
             chat_id = %chat_id,
             "the assistant's unprompted turn has no stamped permission mode to run under; its process was stopped"
         );
-        drop(live);
-        drop(slot);
-        drain_queued(state, chat_id).await;
-        return;
+        return None;
     };
     // The rung the conversation is on NOW must be one this process can be on. `plan`, `acceptEdits`
     // and bypass are the CLI's own `--permission-mode`, fixed at spawn, and the hook keeps a turn on
@@ -138,18 +147,16 @@ pub(super) async fn start_spontaneous_turn(
             Bypass => 3,
         }
     };
-    if now_on
-        .ok()
-        .is_none_or(|now| strictness(now) < strictness(live.permission))
+    if let Some(process_rung) = process_rung
+        && now_on
+            .ok()
+            .is_none_or(|now| strictness(now) < strictness(process_rung))
     {
         tracing::warn!(
             chat_id = %chat_id,
             "the assistant's unprompted turn belongs to a process started on a rung the conversation has left; its process was stopped"
         );
-        drop(live);
-        drop(slot);
-        drain_queued(state, chat_id).await;
-        return;
+        return None;
     }
     // Fails closed: a served row that cannot be read or found counts as having read untrusted text.
     let mut read_untrusted = 0_i64;
@@ -175,8 +182,8 @@ pub(super) async fn start_spontaneous_turn(
                                read_untrusted, permission_mode, created_at)
              VALUES (?, 'running', 'assistant', ?, ?, 'cloud', 'task', ?, ?, ?)",
         )
-        .bind(&prompt)
-        .bind(&session_id)
+        .bind(prompt)
+        .bind(session_id)
         .bind(chat_id)
         .bind(read_untrusted)
         .bind(mode)
@@ -187,23 +194,141 @@ pub(super) async fn start_spontaneous_turn(
     } else {
         Err("a served turn's barrier could not be read".to_owned())
     };
-    let id = match inserted {
-        Ok(done) => done.last_insert_rowid(),
+    match inserted {
+        Ok(done) => {
+            let id = done.last_insert_rowid();
+            crate::chats::stamp_project(&state.pool, id, chat_id).await;
+            Some((id, mode))
+        }
         Err(error) => {
             tracing::warn!(
                 chat_id = %chat_id,
                 %error,
                 "could not record the assistant's unprompted turn; its process was stopped"
             );
-            // The process goes first and the slot after it, then whatever queued up while the slot
-            // was held is let through: nothing else is going to drain it.
-            drop(live);
-            drop(slot);
-            drain_queued(state, chat_id).await;
-            return;
+            None
         }
+    }
+}
+
+/// An answer `LiveChat::turn` set aside, taken off its process with everything recording it needs,
+/// so it outlives that process and cannot be replaced by the next answer set aside on it.
+pub(super) struct SetAside {
+    process_key: usize,
+    session_id: Option<String>,
+    /// The process's barrier when the answer was set aside: the turns that answer continues. Taken
+    /// then because a process that is dropped takes its barrier with it.
+    barrier: Option<(&'static str, Vec<i64>)>,
+    stdout: String,
+    outcome: crate::execution::runner::TurnOutcome,
+}
+
+/// Set-aside answers waiting to be recorded, by chat, oldest first.
+///
+/// Not on the `LiveChat`, where one used to wait for the between-turns watcher: a process dropped
+/// before the watcher ran (it died, went silent, no longer fit) took the answer with it, and a
+/// queued turn that took the process first and set another one aside replaced it.
+pub(super) static SET_ASIDE: LazyLock<Mutex<HashMap<String, Vec<SetAside>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Moves the answer `live` set aside, if any, into [`SET_ASIDE`] under `chat_id`.
+pub(super) fn keep_set_aside(chat_id: &str, live: &mut LiveChat) {
+    let Some((stdout, outcome)) = live.preempted.take() else {
+        return;
     };
-    crate::chats::stamp_project(&state.pool, id, chat_id).await;
+    let process_key = live.process_key();
+    let aside = SetAside {
+        process_key,
+        session_id: relock(&live.session_id).clone(),
+        barrier: barrier_of(process_key),
+        stdout,
+        outcome,
+    };
+    relock(&SET_ASIDE)
+        .entry(chat_id.to_owned())
+        .or_default()
+        .push(aside);
+}
+
+/// Records every answer set aside for `chat_id`, in the order they were set aside. Called by a
+/// holder of the chat's slot.
+pub(super) async fn record_set_aside(state: &crate::state::AppState, chat_id: &str) {
+    let waiting = relock(&SET_ASIDE).remove(chat_id).unwrap_or_default();
+    for aside in waiting {
+        record_preempted(state, chat_id, aside).await;
+    }
+}
+
+/// Records, at once, an answer a person's message arrived in the middle of: `LiveChat::turn` set it
+/// aside whole, so there is nothing left to gather, only a row to write it under.
+async fn record_preempted(state: &crate::state::AppState, chat_id: &str, aside: SetAside) {
+    let SetAside {
+        process_key,
+        session_id,
+        barrier,
+        stdout,
+        outcome,
+    } = aside;
+    let lines: std::collections::VecDeque<crate::execution::runner::TurnEvent> = stdout
+        .lines()
+        .map(|line| crate::execution::runner::TurnEvent::Line(line.to_owned()))
+        .collect();
+    let prompt = spontaneous_prompt(&lines);
+    // No rung to compare: the process that began this answer may be gone, and the answer is already
+    // whole — there is nothing left to stop.
+    let Some((id, mode)) =
+        open_task_run(state, chat_id, &prompt, &session_id, barrier, None).await
+    else {
+        return;
+    };
+    let completed_at = chrono::Utc::now().to_rfc3339();
+    let known = session_id.unwrap_or_default();
+    let o = gathered(outcome, stdout, known);
+    // Only while the process still stands: a dropped one has no barrier left to add this row to,
+    // and a fresh entry under its key would outlive it.
+    if relock(&PROCESS_BARRIERS).contains_key(&process_key) {
+        note_served(process_key, chat_id, id, mode, &state.pool);
+    }
+    record_spontaneous_answer(&state.pool, id, chat_id, &o, &completed_at).await;
+}
+
+/// Records an answer the CLI began on its own as a turn of its own, and gathers the rest of it.
+///
+/// A run with `origin = 'task'`, whose barrier is the PROCESS's (the mode stamped on the last turn it
+/// served, the strictest `read_untrusted` of every turn it served), so it is never cleaner than the
+/// turns it continues. A process with no stamped mode, or a row that cannot be written, stops the
+/// process rather than let an answer run unaccounted, and whatever queued meanwhile is drained.
+pub(super) async fn start_spontaneous_turn(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    slot: ChatSlot,
+    mut live: LiveChat,
+) {
+    // Armed first, so every way out of this function and of the task below lets through whatever
+    // queued while the slot was held: the slot's release drains, nothing here does.
+    let mut slot = slot;
+    slot.drain_on_release(state);
+    let prompt = spontaneous_prompt(&live.carried);
+    let session_id = live
+        .session_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some((id, mode)) = open_task_run(
+        state,
+        chat_id,
+        &prompt,
+        &session_id,
+        barrier_of(live.process_key()),
+        Some(live.permission),
+    )
+    .await
+    else {
+        // The process goes first and the slot after it.
+        drop(live);
+        drop(slot);
+        return;
+    };
 
     // Published before the body is spawned, for the reason `spawn_assistant_turn` gives.
     let transcript = std::sync::Arc::new(Mutex::new(String::new()));
@@ -222,11 +347,15 @@ pub(super) async fn start_spontaneous_turn(
     let chat = chat_id.to_owned();
     crate::execution::runs::spawn_registered(state, id, async move {
         let began = std::time::Instant::now();
+        // Open while the answer is gathered, so Stop reaches this turn softly and a line a person
+        // sends lands in it, exactly as in a person's own turn.
+        let steer = SteerGuard::open(&chat, &live.messages);
         let served = tokio::time::timeout(
             deadlines.ceiling,
             live.gather(&transcript, deadlines.silence),
         )
         .await;
+        drop(steer);
         let completed_at = chrono::Utc::now().to_rfc3339();
         match served {
             Ok(LiveTurn::Answered(outcome)) => {
@@ -235,7 +364,12 @@ pub(super) async fn start_spontaneous_turn(
                     .map(|held| held.clone())
                     .unwrap_or_default();
                 let idle_for = idle_after_spontaneous(live.idle_for, &stdout, began.elapsed());
-                let known = live.session_id.lock().unwrap().clone().unwrap_or_default();
+                let known = live
+                    .session_id
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .unwrap_or_default();
                 let o = gathered(outcome, stdout, known);
                 // The process has now served this turn too, under the same barrier.
                 note_served(live.process_key(), &chat, id, mode, &pool);
@@ -280,10 +414,9 @@ pub(super) async fn start_spontaneous_turn(
                 close_spontaneous(&pool, id, "timed_out", stderr, &completed_at).await;
             }
         }
-        // Released before the drain, which goes back through `send_message` and needs the slot.
+        // Released, which drains what queued meanwhile in a task of its own (armed above).
         drop(slot);
         watch_between_turns(&after, &chat);
-        drain_queued(&after, &chat).await;
     });
 }
 
@@ -365,5 +498,272 @@ pub(super) async fn record_spontaneous_answer(
                 let _ = forget_session(pool, chat_id).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assistants::NoAssistants;
+    use crate::auth::Token;
+    use crate::execution::runner::{FakeCommandRunner, LaterTurn, TurnEvent, TurnOutcome};
+    use crate::state::AppState;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    async fn test_state() -> AppState {
+        AppState {
+            token: Token("t".into()),
+            pool: crate::testdb::fresh_pool().await,
+            telegram_doctrine: None,
+            runner: Arc::new(FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
+            assistants: Arc::new(NoAssistants),
+            run_handles: Arc::new(Mutex::new(HashMap::new())),
+            run_messages: Arc::new(Mutex::new(HashMap::new())),
+            run_tails: Default::default(),
+            files_root: None,
+            files_trash: None,
+            workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
+            quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        }
+    }
+
+    /// An answer the CLI began on its own is a turn like any other, so Stop reaches it softly: the
+    /// process is asked to interrupt, ends the turn, and lives on — rather than being killed.
+    #[tokio::test]
+    async fn a_spontaneous_turn_can_be_stopped_softly() {
+        let state = test_state().await;
+        let chat = "spontaneous-stop-chat";
+
+        let (messages, mut said) = tokio::sync::mpsc::unbounded_channel::<LaterTurn>();
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+        let live = LiveChat::new(
+            messages,
+            events_rx,
+            Arc::new(Mutex::new(Some("s-1".to_owned()))),
+            tokio::spawn(async {}).abort_handle(),
+            tokio::sync::watch::channel(None).1,
+            crate::execution::runner::Permission::Default,
+            None,
+            SpawnShape::blank(),
+            String::new(),
+            None,
+        );
+        note_served(live.process_key(), chat, 1, "auto", &state.pool);
+
+        // The process hears the interrupt and ends the turn, the way the CLI does.
+        let ender = events.clone();
+        let hearing = tokio::spawn(async move {
+            let heard = said.recv().await.expect("no interrupt was written");
+            ender
+                .send(TurnEvent::Ended(TurnOutcome::default()))
+                .unwrap();
+            heard
+        });
+
+        let slot = ChatSlot::acquire(chat).expect("the slot was taken");
+        start_spontaneous_turn(&state, chat, slot, live).await;
+
+        let id: i64 =
+            sqlx::query_scalar("SELECT id FROM runs WHERE chat_id = ? AND origin = 'task'")
+                .bind(chat)
+                .fetch_one(&state.pool)
+                .await
+                .expect("the spontaneous turn was not recorded");
+
+        // Steerable once its gather has begun; the task that opens the guard is spawned.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !is_steerable(chat) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a spontaneous turn is not steerable while it gathers"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let stopped = stop_turn_within(&state, id, Duration::from_secs(5)).await;
+        assert_eq!(stopped, Stopped::Interrupted);
+        assert!(
+            hearing.await.unwrap().interrupt,
+            "what was written was not an interrupt"
+        );
+    }
+
+    /// An answer the process began on its own, set aside by a person's turn, is still recorded when
+    /// the next (drained) turn takes the process first and sets another one aside, and when the
+    /// process is gone before anything recorded either: both become turns of their own.
+    #[tokio::test]
+    async fn a_preempted_spontaneous_answer_survives_a_drained_turn() {
+        let state = test_state().await;
+        let chat = "spontaneous-set-aside-chat";
+
+        let (messages, mut said) = tokio::sync::mpsc::unbounded_channel::<LaterTurn>();
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+        let person = |prompt: &str| {
+            chat_run_request(
+                prompt.to_owned(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                crate::execution::runner::Permission::Default,
+                Some("s-1".to_owned()),
+                "s-1".to_owned(),
+                std::env::temp_dir().join("set-aside-unused.json"),
+                crate::execution::runner::ToolPolicy::Unrestricted,
+                crate::chats::Answering::default(),
+                None,
+                "claude",
+                None,
+            )
+        };
+        // The process stands on the ground a person's turn would ask for, or `serve_turn` would
+        // retire it instead of speaking down it.
+        let live = LiveChat::new(
+            messages,
+            events_rx,
+            Arc::new(Mutex::new(Some("s-1".to_owned()))),
+            tokio::spawn(async {}).abort_handle(),
+            tokio::sync::watch::channel(None).1,
+            crate::execution::runner::Permission::Default,
+            None,
+            SpawnShape::of(&person("")),
+            String::new(),
+            None,
+        );
+        note_served(live.process_key(), chat, 1, "auto", &state.pool);
+        relock(&LIVE_CHATS).insert(chat.to_owned(), live);
+
+        // The process answers each person once it has been written to.
+        let answer = events.clone();
+        let responder = tokio::spawn(async move {
+            while said.recv().await.is_some() {
+                answer
+                    .send(TurnEvent::Line(
+                        serde_json::json!({
+                            "type": "assistant",
+                            "message": {"content": [{"type": "text", "text": "your answer"}]}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+                answer
+                    .send(TurnEvent::Ended(TurnOutcome::default()))
+                    .unwrap();
+            }
+        });
+        // An answer the CLI writes on its own, whole, before the next person's message.
+        let on_its_own = |text: &str| {
+            events
+                .send(TurnEvent::Line(
+                    serde_json::json!({
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": text}]}
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            events
+                .send(TurnEvent::Line(
+                    serde_json::json!({"type": "result", "subtype": "success", "result": text})
+                        .to_string(),
+                ))
+                .unwrap();
+            events
+                .send(TurnEvent::Ended(TurnOutcome::default()))
+                .unwrap();
+        };
+        let runner: Arc<dyn crate::execution::runner::CommandRunner> =
+            Arc::new(FakeCommandRunner::default());
+        let deadlines = turn_deadlines(
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            crate::execution::runner::ToolPolicy::Unrestricted,
+        );
+
+        on_its_own("first on its own");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = Arc::new(Mutex::new(String::new()));
+        let served = serve_turn(
+            &runner,
+            person("me first"),
+            tx,
+            &first,
+            chat,
+            deadlines,
+            true,
+            None,
+            "",
+        )
+        .await;
+        assert!(matches!(served, Ok(Ok(_))), "the first turn did not answer");
+
+        // A queued turn drained before anything recorded the first answer set aside.
+        on_its_own("second on its own");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let second = Arc::new(Mutex::new(String::new()));
+        let served = serve_turn(
+            &runner,
+            person("me again"),
+            tx,
+            &second,
+            chat,
+            deadlines,
+            true,
+            None,
+            "",
+        )
+        .await;
+        assert!(
+            matches!(served, Ok(Ok(_))),
+            "the drained turn did not answer"
+        );
+
+        // And the process is gone before either was recorded.
+        evict_live(chat);
+        responder.abort();
+        record_set_aside(&state, chat).await;
+
+        let recorded: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, stdout FROM runs WHERE chat_id = ? AND origin = 'task' ORDER BY id",
+        )
+        .bind(chat)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "an answer set aside was lost or overwritten: {recorded:?}"
+        );
+        assert_eq!(recorded[0].0, "completed");
+        assert!(
+            recorded[0]
+                .1
+                .as_deref()
+                .is_some_and(|out| out.contains("first on its own")),
+            "{recorded:?}"
+        );
+        assert!(
+            recorded[1]
+                .1
+                .as_deref()
+                .is_some_and(|out| out.contains("second on its own")),
+            "{recorded:?}"
+        );
     }
 }
