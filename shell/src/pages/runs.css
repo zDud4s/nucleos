@@ -893,3 +893,17 @@
   font-style: italic;
   color: var(--text-muted);
 }
+
+/* "Load older": the index's next page, under the last row. */
+.runs-older {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-3) 0 0;
+}
+
+.runs-older-count {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}

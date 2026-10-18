@@ -10490,6 +10490,7 @@ tests:
                 chat_id: None,
                 group_by_chat: false,
                 hide_chat_turns: false,
+                before: None,
             },
         )
         .await
@@ -10546,6 +10547,7 @@ tests:
                 chat_id: None,
                 group_by_chat: false,
                 hide_chat_turns: false,
+                before: None,
             },
         )
         .await
@@ -10592,6 +10594,7 @@ tests:
                 chat_id: None,
                 group_by_chat: false,
                 hide_chat_turns: false,
+                before: None,
             },
         )
         .await
@@ -10680,6 +10683,7 @@ tests:
                 chat_id: None,
                 group_by_chat: false,
                 hide_chat_turns: false,
+                before: None,
             },
         )
         .await
@@ -10736,6 +10740,7 @@ tests:
                 chat_id: None,
                 group_by_chat: false,
                 hide_chat_turns: false,
+                before: None,
             },
         )
         .await
@@ -10774,6 +10779,7 @@ tests:
                 chat_id: None,
                 group_by_chat: false,
                 hide_chat_turns: false,
+                before: None,
             },
         )
         .await
@@ -10798,6 +10804,7 @@ tests:
             chat_id: None,
             group_by_chat: false,
             hide_chat_turns: false,
+            before: None,
         }
     }
 
@@ -11247,6 +11254,132 @@ tests:
         assert_eq!(rows[0].turns, Some(3));
         assert_eq!(rows[1].chat_id.as_deref(), Some("c-1"));
         assert_eq!(rows[1].turns, Some(3));
+    }
+
+    /// `before` pages the index by keyset: the rows strictly older than the cursor run, in the same
+    /// `created_at DESC, id DESC` order, with a `created_at` tie broken by id. Pages never overlap
+    /// and together list every run once.
+    #[tokio::test]
+    async fn search_before_returns_the_next_older_page_without_overlap() {
+        let pool = search_test_pool().await;
+        let mut ids = Vec::new();
+        for second in [1, 2, 2, 3, 4] {
+            ids.push(
+                insert_search_run(
+                    &pool,
+                    "p",
+                    "completed",
+                    "worktree",
+                    "paged",
+                    &format!("2026-10-01T00:00:{second:02}Z"),
+                )
+                .await,
+            );
+        }
+        // Newest first: 4s, 3s, then the two runs at 2s by id descending, then 1s.
+        let expected = vec![ids[4], ids[3], ids[2], ids[1], ids[0]];
+
+        let first = search(
+            &pool,
+            &SearchFilter {
+                limit: 3,
+                ..base_filter()
+            },
+        )
+        .await
+        .unwrap();
+        let first: Vec<i64> = first.iter().map(|row| row.id).collect();
+        assert_eq!(first, expected[..3].to_vec());
+
+        // The cursor sits on the first of the two tied runs: its twin with the lower id follows.
+        let second = search(
+            &pool,
+            &SearchFilter {
+                limit: 3,
+                before: Some(*first.last().unwrap()),
+                ..base_filter()
+            },
+        )
+        .await
+        .unwrap();
+        let second: Vec<i64> = second.iter().map(|row| row.id).collect();
+        assert_eq!(second, expected[3..].to_vec());
+
+        let past_the_end = search(
+            &pool,
+            &SearchFilter {
+                before: Some(ids[0]),
+                ..base_filter()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(past_the_end.is_empty());
+    }
+
+    /// A cursor naming no run is an empty page, never the newest page again: a client that loops on
+    /// "load older" must not be fed the same rows forever.
+    #[tokio::test]
+    async fn search_before_an_unknown_run_returns_nothing() {
+        let pool = search_test_pool().await;
+        insert_search_run(&pool, "p", "completed", "worktree", "x", "2026-10-01T00:00:01Z").await;
+
+        let rows = search(
+            &pool,
+            &SearchFilter {
+                before: Some(9_999),
+                ..base_filter()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    /// Grouped, the cursor pages folded rows: a conversation stays one row with all its turns
+    /// counted, and the cursor is the id the row carries (its newest turn).
+    #[tokio::test]
+    async fn search_grouped_by_chat_before_pages_whole_conversations() {
+        let pool = search_test_pool().await;
+        for (chat, base) in [("c-1", 10), ("c-2", 20)] {
+            for n in 1..=3 {
+                insert_chat_turn(
+                    &pool,
+                    Some(chat),
+                    "completed",
+                    Some(0.1),
+                    &format!("2026-10-01T00:00:{:02}Z", base + n),
+                )
+                .await;
+            }
+        }
+
+        let first = search(
+            &pool,
+            &SearchFilter {
+                limit: 1,
+                ..grouped()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].chat_id.as_deref(), Some("c-2"));
+
+        let older = search(
+            &pool,
+            &SearchFilter {
+                before: Some(first[0].id),
+                ..grouped()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].chat_id.as_deref(), Some("c-1"));
+        assert_eq!(older[0].turns, Some(3));
     }
 
     #[tokio::test]

@@ -3,11 +3,11 @@ import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { DAEMON_NAME } from "../copy";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
-  RUN_LIST_LIMIT,
   RUN_MODE_FILTERS,
   RUN_STATUSES,
   runIsAlive,
   useCreateRun,
+  useRunPages,
   useRuns,
   type RUN_MODES,
   type RunFilters,
@@ -114,7 +114,7 @@ export function Runs() {
   // read: hiding the turns is the page's default, not a filter somebody set.
   // Asking for the `assistant` mode is asking for turns, so it shows them.
   const showChats = search.chats === "show" || search.mode === "assistant";
-  const runs = useRuns({
+  const runs = useRunPages({
     ...filters,
     group: "chat",
     chatTurns: showChats ? undefined : "hide",
@@ -129,10 +129,17 @@ export function Runs() {
    *
    * A query that succeeded once keeps its rows when a later refetch fails, which
    * is what this page wants — a list that blanks reads as *nothing has run*.
-   * The note is how the page says the rows are old.
+   * The note is how the page says the rows are old. A failed "Load older" is
+   * not that — the rows on screen are current — and says so beside its button.
    */
-  const stale = runs.isError && runs.data !== undefined;
-  const rows = runs.data;
+  const stale = runs.isRefetchError && runs.data !== undefined;
+  const rows = runs.data === undefined ? undefined : joinPages(runs.data.pages);
+  const older: OlderPages = {
+    more: runs.hasNextPage,
+    loading: runs.isFetchingNextPage,
+    failed: runs.isFetchNextPageError,
+    load: () => void runs.fetchNextPage(),
+  };
 
   function applyFilters(patch: Partial<RunSearch>) {
     void navigate({
@@ -159,7 +166,7 @@ export function Runs() {
         // region around this sentence read every changed count aloud. What is
         // announced is the failure itself, through the stale and error notes
         // below, which carry their own roles.
-        headline={headline(rows, filters)}
+        headline={headline(rows, filters, older.more)}
         actions={
           <Button
             id={openerId}
@@ -196,6 +203,7 @@ export function Runs() {
       {(rows !== undefined || !runs.isError) && (
         <RunList
           rows={rows}
+          older={older}
           filtered={isFiltered(filters)}
           filters={filters}
           onCompose={composing ? undefined : () => setComposing(true)}
@@ -413,13 +421,43 @@ function isFiltered(filters: RunFilters): boolean {
 
 /* ----------------------------------------------------------------- list -- */
 
+/** The index's "Load older" state, read off the paged query. */
+interface OlderPages {
+  /** The last page came back full, so an older one may exist. */
+  more: boolean;
+  loading: boolean;
+  /** The last "Load older" failed; the pages already on screen are still current. */
+  failed: boolean;
+  load: () => void;
+}
+
+/**
+ * The loaded pages as one list. Each row once, by id: the pages are contiguous
+ * by construction (keyset cursor, refetched in order), and this only keeps a
+ * row that a poll moved between two pages from being drawn twice in between.
+ */
+function joinPages(pages: RunSearchResult[][]): RunSearchResult[] {
+  const seen = new Set<number>();
+  const rows: RunSearchResult[] = [];
+  for (const page of pages) {
+    for (const row of page) {
+      if (seen.has(row.id)) continue;
+      seen.add(row.id);
+      rows.push(row);
+    }
+  }
+  return rows;
+}
+
 function RunList({
   rows,
+  older,
   filtered,
   filters,
   onCompose,
 }: {
   rows: RunSearchResult[] | undefined;
+  older: OlderPages;
   filtered: boolean;
   filters: RunFilters;
   /** Opens the New run panel; absent while it is already open. */
@@ -468,11 +506,25 @@ function RunList({
           ),
         )}
       </Rows>
-      {rows.length >= RUN_LIST_LIMIT && (
-        <p className="runs-ceiling">
-          showing the newest {RUN_LIST_LIMIT} — older runs are not listed here;
-          narrow the filters or search to reach them
-        </p>
+      {older.failed ? (
+        <ErrorNote onRetry={older.load} retryLabel="Load older">
+          Could not load older runs — the ones above are still current.
+        </ErrorNote>
+      ) : (
+        older.more && (
+          <div className="runs-older">
+            <Button
+              onClick={older.load}
+              disabled={older.loading}
+              aria-busy={older.loading}
+            >
+              {older.loading ? "Loading older…" : "Load older"}
+            </Button>
+            <span className="runs-older-count">
+              showing the newest {rows.length}
+            </span>
+          </div>
+        )
       )}
     </>
   );
@@ -1285,6 +1337,7 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
 function headline(
   rows: RunSearchResult[] | undefined,
   filters: RunFilters,
+  more: boolean,
 ): ReactNode | undefined {
   if (rows === undefined) return undefined;
   const live = rows.filter((row) => runIsAlive(row.status)).length;
@@ -1295,17 +1348,11 @@ function headline(
   const filtered = isFiltered(filters);
   if (rows.length === 0)
     return filtered ? "nothing matching these filters" : "nothing in the index";
-  // At the ceiling the count is the page size, not the size of the index, and
-  // "50 in the index" said the second.
-  const count =
-    rows.length >= RUN_LIST_LIMIT
-      ? `the newest ${rows.length}`
-      : `${rows.length}`;
+  // While an older page may exist the count is what is loaded, not the size
+  // of the index, and "50 in the index" said the second.
+  const count = more ? `the newest ${rows.length}` : `${rows.length}`;
   const scope = filtered ? "matching these filters" : "in the index";
-  const said =
-    rows.length >= RUN_LIST_LIMIT && !filtered
-      ? count
-      : `${count} ${scope}`;
+  const said = more && !filtered ? count : `${count} ${scope}`;
   const moving =
     live === 0 ? "none of them still moving" : `${live} still moving`;
   // Failures are counted because they are what the verification read is

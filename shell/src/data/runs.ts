@@ -1,4 +1,10 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { apiFetch, apiText } from "./client";
 import type { RunSearchResult } from "./fleet";
 import { keys } from "./keys";
@@ -236,7 +242,7 @@ function blankToUndefined(value: string | undefined): string | undefined {
   return trimmed === "" ? undefined : trimmed;
 }
 
-function runsQuery(filters: RunFilters): string {
+export function runsQuery(filters: RunFilters, before?: number): string {
   const fields = runFilterFields(filters);
   const params = new URLSearchParams();
   if (fields.project !== undefined) params.set("project_id", fields.project);
@@ -247,7 +253,24 @@ function runsQuery(filters: RunFilters): string {
   if (fields.group !== undefined) params.set("group", fields.group);
   if (fields.chatTurns !== undefined) params.set("chat_turns", fields.chatTurns);
   params.set("limit", String(RUN_LIST_LIMIT));
+  // The keyset cursor (`GET /runs?before=<id>`): the page older than run `id`
+  // in the daemon's own newest-first order. Absent on the first page, so that
+  // page's request is exactly the one it was before paging existed.
+  if (before !== undefined) params.set("before", String(before));
   return `?${params.toString()}`;
+}
+
+/**
+ * Where the page after `page` starts, or `undefined` when there is none.
+ *
+ * A page shorter than the limit is the end of the index. A full page *may* be
+ * the end too — the daemon cannot say so without counting — and the cost of
+ * guessing "more" is one request that answers an empty page, after which the
+ * button goes away.
+ */
+export function nextRunsCursor(page: RunSearchResult[]): number | undefined {
+  if (page.length < RUN_LIST_LIMIT) return undefined;
+  return page[page.length - 1]?.id;
 }
 
 /** Whether a run can still change on its own; waiting on a person does not. */
@@ -269,6 +292,32 @@ export function useRuns(filters: RunFilters) {
   return useQuery({
     queryKey: keys.runs.search(runFilterFields(filters)),
     queryFn: () => apiFetch<RunSearchResult[]>(path),
+    refetchInterval: POLL.fast,
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * The filtered index, a page at a time: the newest page first, and each older
+ * page fetched on request ("Load older") through the daemon's `before` cursor.
+ *
+ * A keyset cursor rather than an offset because the index polls and new runs
+ * land at its head: an offset would slide under them and repeat rows on the
+ * next page. The poll refetches every page already loaded, in order, each from
+ * the cursor the refreshed page before it gives — so pages stay contiguous even
+ * when new runs push rows down from the first one.
+ *
+ * Its own key, marked `paged`, apart from `useRuns`'s: the cache holds a page
+ * list here and a plain array there, and one key answering both shapes would
+ * hand one hook the other's data.
+ */
+export function useRunPages(filters: RunFilters) {
+  return useInfiniteQuery({
+    queryKey: keys.runs.search({ ...runFilterFields(filters), paged: "older" }),
+    queryFn: ({ pageParam }: { pageParam: number | undefined }) =>
+      apiFetch<RunSearchResult[]>(`/runs${runsQuery(filters, pageParam)}`),
+    initialPageParam: undefined as number | undefined,
+    getNextPageParam: (lastPage: RunSearchResult[]) => nextRunsCursor(lastPage),
     refetchInterval: POLL.fast,
     placeholderData: keepPreviousData,
   });
