@@ -90,7 +90,7 @@ export interface Metric<K extends string = MetricKey> {
   /** `undefined` is absent, drawn as an em dash. */
   value: ReactNode | undefined;
   sub: string;
-  /** Absent draws no sparkline (a metric with no series). */
+  /** Absent draws no sparkline (a metric with no series, e.g. devtime cost with no priced day). */
   spark?: { data: ChartDatum[]; keys: ChartKey[]; tone: string; apart?: string; format: (value: number) => string };
   /** The card is in a state that needs attention: drawn with the danger border, the words say why. */
   alert?: boolean;

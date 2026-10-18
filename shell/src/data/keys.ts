@@ -52,6 +52,9 @@ export const keys = {
     quota: (days: number) => ["analytics", "quota", days] as const,
     /** Pipeline blocks (spec analytics-pipeline §5.2). No `global` in it: F1's stale refetch matches on that word. */
     pipeline: (days: number) => ["analytics", "pipeline", days] as const,
+    devtime: (days: number) => ["analytics", "devtime", days] as const,
+    devtimeFindings: (days: number, order: string, cursor: string) =>
+      ["analytics", "devtime-findings", days, order, cursor] as const,
   },
 
   autopilot: {
@@ -185,6 +188,9 @@ export const keys = {
     /** The project's pipeline analytics — `GET /projects/{id}/analytics/pipeline?days=`. */
     analyticsPipeline: (projectId: string, days: number) =>
       ["projects", projectId, "analytics-pipeline", days] as const,
+    devtime: (projectId: string, days: number) => ["projects", projectId, "devtime", days] as const,
+    devtimeFindings: (projectId: string, days: number, order: string, cursor: string) =>
+      ["projects", projectId, "devtime-findings", days, order, cursor] as const,
     /**
      * What this project would lose by leaving, and what is holding it here.
      *

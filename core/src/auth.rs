@@ -336,6 +336,14 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // already reads elsewhere; no free text and no command output (spec analytics-pipeline §9).
     (Method::GET, "/projects/{id}/analytics/pipeline"),
     (Method::GET, "/analytics/pipeline"),
+    // The owner's own development time (spec analytics-devtime §8): aggregates of the devtime spans,
+    // turns and messages, and the findings list with each rule's precision — ids, counts and closed
+    // vocabularies only, never prompt text, commands or file paths, nothing changed. Marking a finding
+    // (`POST /analytics/devtime/findings/{key}/mark`) writes `devtime_feedback` and is in NO table.
+    (Method::GET, "/analytics/devtime"),
+    (Method::GET, "/analytics/devtime/findings"),
+    (Method::GET, "/projects/{id}/analytics/devtime"),
+    (Method::GET, "/projects/{id}/analytics/devtime/findings"),
     (Method::GET, "/projects/{id}/log"),
     (Method::GET, "/projects/{id}/branches"),
     (Method::GET, "/projects/{id}/blame"),
@@ -3544,6 +3552,35 @@ mod tests {
             assert!(permits(&reader, &Method::GET, path), "GET {path}");
             assert!(!permits(&reader, &Method::POST, path), "POST {path}");
         }
+    }
+
+    /// The devtime reads are reads; marking a finding writes `devtime_feedback` and stays in no table,
+    /// so `permits`' default-deny leaves it to Admin and the control token (spec analytics-devtime §8).
+    #[test]
+    fn devtime_reads_are_open_to_a_read_only_key_and_the_mark_is_in_no_table() {
+        let reader = Scope::ApiToken(ApiTokenLevel::ReadOnly);
+        for path in [
+            "/analytics/devtime",
+            "/analytics/devtime/findings",
+            "/projects/7/analytics/devtime",
+            "/projects/7/analytics/devtime/findings",
+        ] {
+            assert!(permits(&reader, &Method::GET, path), "GET {path}");
+        }
+        assert!(!permits(
+            &reader,
+            &Method::POST,
+            "/analytics/devtime/findings/k1/mark"
+        ));
+        let (method, path) = (Method::POST, "/analytics/devtime/findings/{key}/mark");
+        assert!(
+            !route_is_listed(READ_ONLY_ROUTES, &method, path)
+                && !route_is_listed(RUN_CREATING_ROUTES, &method, path)
+                && !route_is_listed(TEAM_ROUTES, &method, path)
+                && !route_is_listed(EMAIL_ROUTES, &method, path)
+                && !route_is_listed(COUNCIL_ROUTES, &method, path),
+            "POST {path} must stay out of every scope table"
+        );
     }
 
     /// Which repository a project points at is in no scope table, and this is the closest call of

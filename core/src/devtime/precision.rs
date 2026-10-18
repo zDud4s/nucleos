@@ -15,7 +15,6 @@ use crate::devtime::store::{
 
 /// One rule's precision over the cases the owner (or an exact detector) has settled.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
 pub struct RulePrecision {
     pub rule_id: String,
     pub level: Level,
@@ -33,7 +32,6 @@ pub struct RulePrecision {
 
 /// Why a mark was refused.
 #[derive(Debug)]
-#[allow(dead_code)] // SP4's endpoint is the reader
 pub enum MarkError {
     UnknownFinding,
     BadVerdict,
@@ -62,7 +60,6 @@ pub struct BaseRate {
 /// A case is a finding that is `exact` or that the owner marked; `n_not_rework` is how many of the
 /// cases the owner marked `not_rework`. The rule is eligible for phase 2 only when it is a base rule
 /// with at least `min_cases` cases and a precision at or above the floor.
-#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
 pub fn precision_of(
     counts: &RuleCaseCounts,
     rule: &Rule,
@@ -98,7 +95,6 @@ pub fn precision_of(
 }
 
 /// Precision of every registered rule, in registry order. A rule with no findings reports no cases.
-#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
 pub async fn rule_report(
     pool: &SqlitePool,
     cfg: &DevtimeRulesConfig,
@@ -121,7 +117,6 @@ pub async fn rule_report(
 /// `FEEDBACK_CAUSES` plus `LEVERS`. The rule, session and rule version are copied from the finding.
 /// Marking again replaces the earlier mark. A cause given with `confirmed` overrides the inferred
 /// lever on display and stays only in feedback.
-#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
 pub async fn mark_case(
     pool: &SqlitePool,
     finding_key: &str,

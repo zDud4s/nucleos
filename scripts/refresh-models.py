@@ -50,6 +50,7 @@ The daemon re-reads the file per request, so nothing needs restarting for a refr
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import pathlib
@@ -69,6 +70,12 @@ CODEX_CACHE = pathlib.Path.home() / ".codex" / "models_cache.json"
 DOCS = "https://platform.claude.com/docs/en"
 MODELS_DOC = f"{DOCS}/about-claude/models/overview.md"
 EFFORT_DOC = f"{DOCS}/build-with-claude/effort.md"
+PRICING_DOC = f"{DOCS}/about-claude/pricing.md"
+# The columns the table must have, in order, after `Model`. A rename is a format change: the page is
+# refused whole (exit 1) rather than read by position and priced from the wrong column.
+PRICING_COLUMNS = ["Base input tokens", "5m cache writes", "1h cache writes",
+                   "Cache hits and refreshes", "Output tokens"]
+PRICE_FIELDS = ("input", "output", "cache_read", "cache_write")
 
 # The same endpoint `capabilities.rs::discover_openrouter` already reads at runtime for a model's
 # context window. Public: no key, no account, no rate limit worth a retry.
@@ -113,6 +120,7 @@ SHIPPED_CLAUDE = ["opus", "sonnet", "fable"]
 
 # The block this script owns. Everything else in the file is somebody's, and is preserved verbatim.
 KEY = "assistant_choices"
+OWNED_KEYS = ("assistant_choices", "prices_as_of", "model_prices")
 
 BANNER = f"""# ─────────────────────────────────────────────────────────────
 # Escrito por `scripts/refresh-models.py`. Editável à mão — o script substitui apenas este bloco e
@@ -182,6 +190,72 @@ def table_rows(markdown: str, start: int, stop: int) -> dict[str, list[str]]:
         key = re.sub(r"[*`]", "", cells[0]).strip()
         rows.setdefault(key, [re.sub(r"[*`]", "", cell).strip() for cell in cells[1:]])
     return rows
+
+
+# ------------------------------------------------------------------------------ prices --
+
+
+def normalise_id(model_id: str) -> str:
+    """The key a price is written under, and the second lookup the daemon tries (spec §4.4).
+
+    Mirrors `config/models.rs::normalise_model_id` exactly: lowercase, no `[..]` context suffix, no
+    `-YYYYMMDD` date suffix, no `-latest`, and in `claude-*` ids `.` becomes `-`.
+    """
+    text = model_id.strip().lower()
+    text = re.sub(r"\[[^\]]*\]$", "", text)
+    text = re.sub(r"-\d{8}$", "", text)
+    text = re.sub(r"-latest$", "", text)
+    if text.startswith("claude-"):
+        text = text.replace(".", "-")
+    return text
+
+
+def per_million(cell: str) -> float | None:
+    """`$0.25 / MTok<sup>1</sup>` -> 0.25. Anything else -> None (never a guess)."""
+    text = re.sub(r"<sup>.*?</sup>", "", cell).strip()
+    found = re.fullmatch(r"\$([0-9]+(?:\.[0-9]+)?)\s*/\s*MTok", text)
+    return float(found.group(1)) if found else None
+
+
+def anthropic_prices(markdown: str):
+    """`(prices, tiered, problems)` from the pricing page, or `None` when its shape changed.
+
+    `prices` maps a normalised id to `{input, output, cache_read, cache_write, source}`; a row whose
+    cells do not all parse is written with every price `None` and adds a problem (exit 1). A model
+    the page prices in tiers ("for prompts up to …") gets NO entry and is listed in `tiered`.
+    """
+    start = markdown.find("## Model pricing")
+    if start < 0:
+        return None
+    stop = markdown.find("\n## ", start + 1)
+    rows = table_rows(markdown, start, stop if stop > 0 else len(markdown))
+    if rows.get("Model") != PRICING_COLUMNS:
+        return None
+    prices: dict[str, dict] = {}
+    tiered: set[str] = set()
+    problems: list[str] = []
+    for name, cells in rows.items():
+        if name == "Model":
+            continue
+        bare = re.sub(r"\s*\(\[.*?\]\(.*?\)\)", "", name).strip()   # "([retired…](…))"
+        tier = re.search(r"\s*\(for prompts [^)]*\)", bare)
+        # Unpriced on purpose (owner, 2026-10-18, open decision 1): a tiered model such as Claude
+        # Haiku 5.5 gets no price rather than a base-tier one, because a wrong cost is worse than
+        # none. A known gap to revisit (TODO in F2's closing report); OpenRouter `overrides` likewise.
+        if tier:
+            tiered.add(normalise_id(slug(bare[: tier.start()])))
+            continue
+        model_id = normalise_id(slug(bare))
+        base, write_5m, _write_1h, hits, out = (per_million(cell) for cell in cells[:5])
+        entry = {"input": base, "output": out, "cache_read": hits, "cache_write": write_5m,
+                 "source": "anthropic"}
+        if None in (base, write_5m, hits, out):
+            problems.append(f"anthropic: could not read the price of {model_id} — written without price")
+            entry = {field: None for field in PRICE_FIELDS} | {"source": "anthropic"}
+        prices[model_id] = entry
+    for model_id in tiered:
+        prices.pop(model_id, None)
+    return prices, tiered, problems
 
 
 def claude_effort_support() -> tuple[set[str], set[str], set[str]]:
@@ -353,6 +427,67 @@ def openrouter_catalogue() -> dict[str, dict] | None:
         fail("the OpenRouter catalogue named no models — the hosted half is unchanged")
         return None
     return served
+
+
+OPENROUTER_PRICE_FIELDS = {"prompt": "input", "completion": "output",
+                           "input_cache_read": "cache_read", "input_cache_write": "cache_write"}
+
+
+def per_token_to_million(raw) -> float | None:
+    """OpenRouter's per-token USD string -> USD per million tokens; anything unreadable -> None."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value < 0 or value != value or value in (float("inf"),):
+        return None
+    return round(value * 1_000_000, 6)
+
+
+def openrouter_prices(served: dict[str, dict]):
+    """`(openai, tiered, anthropic)` from the catalogue `openrouter_catalogue` returned.
+
+    `openai` prices every `openai/*` id (no `:variant`) under its bare, normalised id. `anthropic` is
+    the same for `anthropic/*`, used only to cross-check the vendor page and never written. A model
+    with `overrides` (prices that change past a prompt size) is tiered: named, never priced.
+    """
+    openai: dict[str, dict] = {}
+    anthropic: dict[str, dict] = {}
+    tiered: set[str] = set()
+    for model_id, entry in served.items():
+        vendor, _, bare = model_id.partition("/")
+        if vendor not in ("openai", "anthropic") or ":" in bare or not bare:
+            continue
+        pricing = entry.get("pricing") if isinstance(entry.get("pricing"), dict) else {}
+        key = normalise_id(bare)
+        # Unpriced on purpose (owner, 2026-10-18, open decision 1): OpenRouter `overrides` (most
+        # `openai/*`, `anthropic/claude-haiku-5.5`) mean a tiered price, so no price is written rather
+        # than the base tier's. A known gap to revisit (TODO in F2's closing report).
+        if pricing.get("overrides"):
+            if vendor == "openai":
+                tiered.add(key)
+            continue
+        row = {field: per_token_to_million(pricing.get(name))
+               for name, field in OPENROUTER_PRICE_FIELDS.items()}
+        if vendor == "openai":
+            openai[key] = row | {"source": "openrouter"}
+        else:
+            anthropic[key] = row
+    return openai, tiered, anthropic
+
+
+def crosscheck(vendor: dict[str, dict], other: dict[str, dict]):
+    """The vendor's prices, unchanged, and one warning per field that differs from OpenRouter by > 1%."""
+    warnings: list[str] = []
+    for model_id, mine in vendor.items():
+        theirs = other.get(model_id, {})
+        for field in PRICE_FIELDS:
+            a, b = mine.get(field), theirs.get(field)
+            if a is None or b is None or a == 0:
+                continue
+            if abs(a - b) / a > 0.01:
+                warnings.append(f"{model_id} {field}: anthropic {a} vs openrouter {b} — keeping anthropic's")
+    return vendor, warnings
 
 
 def openrouter_efforts(entry: dict) -> list[str]:
@@ -566,15 +701,17 @@ def render(choices: list[dict]) -> str:
     return "\n".join([BANNER, f"{KEY}:", *(render_row(choice) for choice in choices)])
 
 
-def splice(text: str, block: str) -> str:
-    """Replace the `assistant_choices` block, or append it. Everything else is left untouched.
+def splice(text: str, key: str, block: str) -> str:
+    """Replace the `key` block, or append it. Everything else is left untouched.
+
+    Called once per key this script owns (`OWNED_KEYS`), each replaced surgically.
 
     A surgical text edit and not a load-and-dump: this file is mostly prose, in Portuguese,
     explaining what each key costs — and `yaml.dump` would return it with every comment gone. The
     banner above the block is taken with it, so a rewrite does not stack banners.
     """
     lines = text.splitlines()
-    start = next((i for i, line in enumerate(lines) if line.startswith(f"{KEY}:")), None)
+    start = next((i for i, line in enumerate(lines) if line.startswith(f"{key}:")), None)
     if start is None:
         trimmed = "\n".join(lines).rstrip()
         return f"{trimmed}\n\n{block}\n"
@@ -595,12 +732,61 @@ def splice(text: str, block: str) -> str:
     return "\n\n".join(parts).rstrip() + "\n"
 
 
+PRICE_BANNER = """# ─────────────────────────────────────────────────────────────
+# Escrito por `scripts/refresh-models.py`: preços publicados pelos fornecedores, USD por milhão de
+# tokens, lidos em `prices_as_of`. O daemon usa-os só para o custo ESTIMADO do devtime; nunca é a
+# fatura. Um modelo sem preço legível fica com `null` e o script sai com 1; um modelo com preço por
+# escalões (Haiku 5.5, a maioria dos `openai/*`) não é escrito. Editar à mão é desfeito na próxima passagem.
+# ─────────────────────────────────────────────────────────────"""
+
+
+def render_price_row(model_id: str, price: dict) -> str:
+    def number(value):
+        return "null" if value is None else repr(float(value))
+    fields = ", ".join(f"{field}: {number(price.get(field))}" for field in PRICE_FIELDS)
+    return f"  {model_id}: {{ {fields}, source: {price['source']} }}"
+
+
+def render_prices(prices: dict[str, dict], as_of: str) -> dict[str, str]:
+    """The two owned price keys as blocks, ids sorted so a re-run with the same prices is a no-op diff."""
+    return {
+        "prices_as_of": f'{PRICE_BANNER}\nprices_as_of: "{as_of}"',
+        "model_prices": "\n".join(["model_prices:", *(render_price_row(k, prices[k]) for k in sorted(prices))]),
+    }
+
+
+def refresh_prices(today: str):
+    """`(blocks, complained)`. `blocks` is None when either source could not be read or changed shape:
+    the file's price block is then left exactly as it was — `prices_as_of` keeps saying how old it is."""
+    page = fetch(PRICING_DOC)
+    parsed = anthropic_prices(page) if page is not None else None
+    if parsed is None:
+        if page is not None:
+            fail(f"{PRICING_DOC} no longer has the expected pricing table — prices unchanged")
+        return None, True
+    vendor, tiered, problems = parsed
+    served = openrouter_catalogue()
+    if served is None:
+        return None, True
+    openai, openai_tiered, anthropic_mirror = openrouter_prices(served)
+    vendor, warnings = crosscheck(vendor, anthropic_mirror)
+    for warning in warnings:
+        print(f"prices: {warning}")
+    for model_id in sorted(tiered | openai_tiered):
+        print(f"prices: {model_id} is priced in tiers — written without price")
+    for problem in problems:
+        fail(problem)
+    prices = {**openai, **vendor}   # a vendor id never collides with an openai id; vendor wins anyway
+    print(f"prices: {len(vendor)} anthropic, {len(openai)} openai, as of {today}")
+    return render_prices(prices, today), bool(problems)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="print the block, write nothing")
     parser.add_argument(
         "--only",
-        choices=["claude", "codex", "openrouter"],
+        choices=["claude", "codex", "openrouter", "prices"],
         help="refresh one half and leave the others exactly as they are",
     )
     parser.add_argument(
@@ -731,17 +917,31 @@ def main() -> int:
         print(f"kept {len(unknown)} row(s) of a kind this script does not refresh")
     refreshed += unknown
 
-    if not refreshed:
+    price_blocks = None
+    if args.only in (None, "prices"):
+        price_blocks, price_complained = refresh_prices(datetime.date.today().isoformat())
+        complained = complained or price_complained
+
+    # `--only prices` rewrites no choices at all, so an empty menu is not a failure there.
+    if not refreshed and args.only != "prices":
         fail("nothing to write — no half could be read and the file names none")
         return 1
 
     block = render(refreshed)
     if args.dry_run:
         print()
-        print(block)
+        if args.only != "prices":
+            print(block)
+        if price_blocks is not None:
+            print(price_blocks["prices_as_of"])
+            print(price_blocks["model_prices"])
         return 1 if complained else 0
 
-    CONFIG.write_text(splice(text, block), encoding="utf-8", newline="\n")
+    spliced = text if args.only == "prices" else splice(text, KEY, block)
+    if price_blocks is not None:
+        for key in ("prices_as_of", "model_prices"):
+            spliced = splice(spliced, key, price_blocks[key])
+    CONFIG.write_text(spliced, encoding="utf-8", newline="\n")
     print(f"\nwrote {len(refreshed)} choice(s) to {CONFIG_DISPLAY}")
     print("the daemon re-reads this file per request — nothing needs restarting")
     return 1 if complained else 0

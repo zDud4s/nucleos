@@ -53,7 +53,14 @@ pub(super) async fn turn_env(
         crate::execution::runner::ToolPolicy::Unrestricted if may_live => {
             unstored_chat_key(chat_id)
         }
-        crate::execution::runner::ToolPolicy::Unrestricted => fresh_chat_key(pool, chat_id).await,
+        // A rooted turn that cannot keep a process (a Codex one) can still find the conversation's
+        // Claude process kept from an earlier turn: the pin moved from a Claude model to a Codex
+        // one, and moving it back would make that process fit again. Minting below retires the key
+        // it holds, so it goes first — kept, it would refuse every hook call it made from then on.
+        crate::execution::runner::ToolPolicy::Unrestricted => {
+            super::evict_live(chat_id);
+            fresh_chat_key(pool, chat_id).await
+        }
         _ => control_token.to_string(),
     };
     crate::execution::runs::run_env(&key, run_id, None, crate::speed::Capacity::solo())
@@ -100,5 +107,49 @@ pub(super) async fn fresh_chat_key(pool: &sqlx::SqlitePool, chat_id: &str) -> St
             // leaves a run acting with nobody watching.
             unstored_chat_key(chat_id)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A turn keyed now, because it cannot keep a process, retires the conversation's stored key.
+    /// A process kept for that conversation holds the retired key, so it must not outlive the mint.
+    #[tokio::test]
+    async fn keying_a_turn_that_cannot_keep_a_process_evicts_the_kept_one() {
+        let pool = crate::testdb::fresh_pool().await;
+        let chat_id = "chat-key-evicts-kept";
+        let (messages, _said) = tokio::sync::mpsc::unbounded_channel();
+        let (_events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_stopped, stopped_rx) = tokio::sync::watch::channel(None);
+        let kept = super::super::LiveChat::new(
+            messages,
+            events_rx,
+            std::sync::Arc::new(std::sync::Mutex::new(Some("s-1".to_owned()))),
+            tokio::spawn(async {}).abort_handle(),
+            stopped_rx,
+            crate::execution::runner::Permission::Default,
+            None,
+            super::super::live::SpawnShape::blank(),
+            String::new(),
+            None,
+        );
+        super::super::relock(&super::super::LIVE_CHATS).insert(chat_id.to_owned(), kept);
+
+        turn_env(
+            crate::execution::runner::ToolPolicy::Unrestricted,
+            false,
+            &pool,
+            chat_id,
+            1,
+            "control",
+        )
+        .await;
+
+        assert!(
+            !super::super::relock(&super::super::LIVE_CHATS).contains_key(chat_id),
+            "a kept process outlived the key it holds"
+        );
     }
 }

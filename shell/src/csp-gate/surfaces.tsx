@@ -17,6 +17,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/ui/vendor/dialog";
+import { activeByWaste, ruleShares, turnBars, WASTE_KEYS, TURN_KEYS } from "../analytics/devtime-series";
+import type { DevtimeDay } from "../data/devtime";
 import { AreaChart } from "@/ui/AreaChart";
 import { ShareBar } from "@/ui/ShareBar";
 import { Sparkline } from "@/ui/Sparkline";
@@ -252,6 +254,29 @@ function PaletteSurface({ done }: { done: () => void }) {
  * No chart uses `@visx/axis` any more: its tick labels go through `@visx/text`, which writes
  * `style="overflow: visible"`, so every label here is a bare `<text>`.
  */
+/** DevtimeSection's own classes (`ui-chart-useful/rework/avoidable`, `an-dt-*`) under the strict policy. */
+function DevtimeCharts() {
+  const minutes = (value: number) => `${Math.round(value / 60_000)} min`;
+  const series: DevtimeDay[] = Array.from({ length: 7 }, (_, n) => ({
+    day: `2026-10-${String(10 + n).padStart(2, "0")}`, partial: n === 6, active_ms: 100 * 60_000, wasted_ms: 20 * 60_000,
+    by_kind: { model: 0, tool: 0, subagent: 0, wait_background: 0, wait_machine: 0 },
+    by_waste: { useful: 80 * 60_000, rework: (n % 3) * 60_000, avoidable: 60_000 },
+    turns: 10, interrupted: n % 3, corrections: n % 2, cost_usd: null,
+  }));
+  return (
+    <>
+      <p className="an-dt-quality an-dt-quality-amber">Last read 10 min ago</p>
+      <AreaChart data={activeByWaste(series)} keys={WASTE_KEYS} label="Active time per day by waste" format={minutes}
+                 empty="No sessions in this window" tone="ui-chart-useful" />
+      <AreaChart data={turnBars(series)} keys={TURN_KEYS} label="Interrupted and corrected turns per day" format={String}
+                 empty="No sessions in this window" tone="ui-chart-avoidable" compact />
+      <ShareBar items={ruleShares([{ rule_id: "A1", level: "base", waste: "rework", lever: "spec_gap", ms: 5 * 60_000, findings: 2 },
+                                   { rule_id: "__none__", level: null, waste: null, lever: null, ms: 60_000, findings: 0 }])}
+                format={minutes} label="Waste by rule" />
+    </>
+  );
+}
+
 function ChartSurface({ done }: { done: () => void }) {
   useDoneAfter(done);
   const day = (n: number) => `2026-10-${String(10 + n).padStart(2, "0")}`;
@@ -332,6 +357,7 @@ function ChartSurface({ done }: { done: () => void }) {
         label="Spend by project, last 7 days"
       />
       <ShareBar items={[]} format={usd} label="Spend by project, nothing in it" />
+      <DevtimeCharts />
     </div>
   );
 }

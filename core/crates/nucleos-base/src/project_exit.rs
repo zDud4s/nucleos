@@ -106,6 +106,8 @@ const PROJECT_SCOPED: &[&str] = &[
     "verify_requests",
     "verify_runs",
     "webhook_deliveries",
+    // The workflow ledgers a project's tasks wrote are that project's history too.
+    "workflow_records",
     "worktree_touched_paths",
     "worktrees",
 ];
