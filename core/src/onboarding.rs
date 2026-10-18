@@ -338,7 +338,11 @@ mod tests {
 
         // No such bundle: skipped, not refused, and no pins file appears.
         let empty = library_with(temp.path(), &[]);
-        assert!(pin_default_workflow(&home, &empty, "alpha").unwrap().is_none());
+        assert!(
+            pin_default_workflow(&home, &empty, "alpha")
+                .unwrap()
+                .is_none()
+        );
         assert!(
             !home
                 .join("projects/alpha")
@@ -352,7 +356,11 @@ mod tests {
             .join("projects/beta")
             .join(crate::project::state::PINS_FILE);
         write(&pins, "workflows: []\n");
-        assert!(pin_default_workflow(&home, &library, "beta").unwrap().is_none());
+        assert!(
+            pin_default_workflow(&home, &library, "beta")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(std::fs::read_to_string(&pins).unwrap(), "workflows: []\n");
 
         assert!(pin_default_workflow(&home, &library, "a:b").is_err());

@@ -869,7 +869,10 @@ mod tests {
                 "agents-block.md",
                 "# >>> AI WORKFLOW MANAGED BLOCK >>>\nrules\n# <<< AI WORKFLOW MANAGED BLOCK <<<\n",
             ),
-            (".nucleos/workflow/workflow.md", "# Workflow\nstate lives in <state_dir>\n"),
+            (
+                ".nucleos/workflow/workflow.md",
+                "# Workflow\nstate lives in <state_dir>\n",
+            ),
             (
                 ".claude/skills/planner/SKILL.md",
                 "---\nname: planner\ndescription: plans\n---\nbody\n",
@@ -879,9 +882,15 @@ mod tests {
                 ".claude/agents/wf-planner.md",
                 "---\nname: wf-planner\ndescription: cockpit\ntools: Read, Grep\n---\nbody\n",
             ),
-            (".claude/agents/README.md", "not a cockpit, so no frontmatter needed"),
+            (
+                ".claude/agents/README.md",
+                "not a cockpit, so no frontmatter needed",
+            ),
             // Never materialized, so it may still name the old root.
-            ("scripts/spec_loop.py", "# migrates the legacy .ai/local/loops/\n"),
+            (
+                "scripts/spec_loop.py",
+                "# migrates the legacy .ai/local/loops/\n",
+            ),
             ("scripts/__pycache__/spec_loop.cpython-311.pyc", "bytes"),
         ]
         .into_iter()
@@ -921,7 +930,10 @@ mod tests {
                 std::fs::read(source.join(".claude/skills/planner").join(file)).unwrap(),
             );
         }
-        assert!(!source.join(".agents").exists(), "the source is never written to");
+        assert!(
+            !source.join(".agents").exists(),
+            "the source is never written to"
+        );
         assert!(!library.join("nucleos-dev").join(".2.0.0.staging").exists());
 
         let bundle = workflows::read_bundle(&dir, "nucleos-dev", "2.0.0")
@@ -953,7 +965,10 @@ mod tests {
                 ".claude/agents/wf-planner.md: frontmatter has no `tools`",
             ),
             (
-                vec![(".claude/skills/planner/SKILL.md", Some("# planner\nno frontmatter\n"))],
+                vec![(
+                    ".claude/skills/planner/SKILL.md",
+                    Some("# planner\nno frontmatter\n"),
+                )],
                 ".claude/skills/planner/SKILL.md: no YAML frontmatter",
             ),
             (
@@ -1003,7 +1018,10 @@ mod tests {
                 vec![(".agents/skills/planner/SKILL.md", Some("authored by hand"))],
                 "is generated from .claude/skills/",
             ),
-            (vec![("bundle.yaml", Some("owns: .nucleos/\n"))], "bundle.yaml"),
+            (
+                vec![("bundle.yaml", Some("owns: .nucleos/\n"))],
+                "bundle.yaml",
+            ),
             (
                 vec![(".nucleos/workflow/project.json", Some("{}"))],
                 "is written by the daemon for each checkout",
@@ -1023,7 +1041,13 @@ mod tests {
 
     #[test]
     fn only_a_free_standing_dot_ai_names_the_legacy_root() {
-        for line in [".ai/x", "see `.ai/memory.md`", "~/.ai/local", "(.ai/plans)", "a .ai/b"] {
+        for line in [
+            ".ai/x",
+            "see `.ai/memory.md`",
+            "~/.ai/local",
+            "(.ai/plans)",
+            "a .ai/b",
+        ] {
             assert!(names_legacy_root(line), "{line}");
         }
         for line in [

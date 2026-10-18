@@ -707,14 +707,13 @@ pub(super) async fn post_project_onboard(
     // it, so no roster row is what a NEW project looks like here — and only a new one gets the
     // default workflow; a project already on the roster keeps whatever it uses. An unreadable
     // roster reads as rostered: pinning is the one of the two answers that changes something.
-    let rostered = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM autopilot_state WHERE project_id = ?",
-    )
-    .bind(&id)
-    .fetch_one(&state.pool)
-    .await
-    .map(|rows| rows > 0)
-    .unwrap_or(true);
+    let rostered =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM autopilot_state WHERE project_id = ?")
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .map(|rows| rows > 0)
+            .unwrap_or(true);
     let home = machine_root.clone();
     let gate = body
         .gate_command
