@@ -4,6 +4,7 @@
 //! `{"error": ...}` and the others still come (spec D5). Write side lives in `sampler` (slot
 //! samples) and in `verify::postgate::record_transition` (colour changes).
 
+pub mod landing;
 pub mod sampler;
 pub mod stats;
 

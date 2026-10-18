@@ -400,16 +400,20 @@ fn named_tag(value: Option<&str>, operation: &str, which: &str) -> Result<TagNam
     };
     TagName::new(value).map_err(|reason| format!("{which}: {reason}"))
 }
+/// `vcs_requests.op` for a merge. The analytics buckets (§6.2 rule 5) compare against it.
+pub const MERGE_KIND: &str = "merge";
+/// `vcs_requests.op` for a revert, which the post-merge gate's revert files as `origin = 'daemon'`.
+pub const REVERT_KIND: &str = "revert";
 impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
-            Op::Merge { .. } => "merge",
+            Op::Merge { .. } => MERGE_KIND,
             Op::Push { .. } => "push",
             Op::Tag { .. } => "tag",
             Op::Fetch { .. } => "fetch",
             Op::BranchDelete { .. } => "branch-delete",
             Op::Rebase { .. } => "rebase",
-            Op::Revert { .. } => "revert",
+            Op::Revert { .. } => REVERT_KIND,
         }
     }
 
