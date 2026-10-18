@@ -8,7 +8,7 @@ import {
   type CouncilView,
   type StepView,
 } from "../../data/council";
-import { Button, ErrorNote } from "../../ui";
+import { Button, ErrorNote, Skeleton } from "../../ui";
 import { CouncilRich } from "../CouncilRich";
 import { CouncilSynthesis } from "../CouncilSynthesis";
 import { StepTail } from "../CouncilRounds";
@@ -264,8 +264,17 @@ function ConveneChips({ onPick }: { onPick: (who: Occupant) => void }) {
 
   return (
     <>
-      {waiting && <p className="council-dossier-hint">Reading who can sit…</p>}
-      {unreadable && <p className="council-dossier-hint">Couldn't load who can sit.</p>}
+      {waiting && <Skeleton label="Reading who can sit" lines={2} />}
+      {unreadable && (
+        <ErrorNote
+          onRetry={() => {
+            void agents.refetch();
+            void models.refetch();
+          }}
+        >
+          Couldn't load who can sit.
+        </ErrorNote>
+      )}
       {seatable.length > 0 && (
         <div className="council-dossier-chips" role="group" aria-label="Agents">
           {seatable.map((agent) => (

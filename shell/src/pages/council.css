@@ -749,11 +749,36 @@
 
 /* ---------------------------------------------------------------- the bench -- */
 
-.council-court-judge,
-.council-court-seat,
-.council-court-lectern-group[role="button"] {
+/* The real controls: transparent HTML buttons laid over the drawing, sized in percent of the viewBox. */
+.council-court-hit {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  min-width: var(--hit-min);
+  min-height: var(--hit-min);
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
   cursor: pointer;
-  outline: none;
+}
+
+.council-court-hit-seat {
+  border-radius: 50%;
+}
+
+.council-court-hit:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* The plain-text roster stands in for the SVG's small print below 900px. */
+.council-court-roll {
+  display: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
 .council-court-svg .council-court-bench {
@@ -784,13 +809,8 @@
   filter: drop-shadow(0 0 4px var(--tone-active-fg));
 }
 
-.council-court-judge[aria-pressed="true"] .council-court-bench {
+.council-court-judge[data-selected] .council-court-bench {
   stroke: var(--text);
-  stroke-width: 2;
-}
-
-.council-court-judge:focus-visible .council-court-bench {
-  stroke: var(--focus-ring);
   stroke-width: 2;
 }
 
@@ -878,14 +898,8 @@
   stroke-width: 1.5;
 }
 
-.council-court-lectern-group[aria-pressed="true"] .council-court-lectern,
 .council-court-lectern-group[data-selected] .council-court-lectern {
   stroke: var(--text);
-  stroke-width: 2;
-}
-
-.council-court-lectern-group:focus-visible .council-court-lectern {
-  stroke: var(--focus-ring);
   stroke-width: 2;
 }
 
@@ -963,11 +977,11 @@
   display: none;
 }
 
-.council-court-seat[data-masked]:is(:hover, :focus-visible) .council-court-letter {
+.council-court-seat[data-masked][data-revealed] .council-court-letter {
   display: none;
 }
 
-.council-court-seat[data-masked]:is(:hover, :focus-visible) .council-court-reveal {
+.council-court-seat[data-masked][data-revealed] .council-court-reveal {
   display: inline;
 }
 
@@ -1026,13 +1040,8 @@
   fill: var(--tone-active-bg);
 }
 
-.council-court-seat[aria-pressed="true"] .council-court-seat-disc {
+.council-court-seat[data-selected] .council-court-seat-disc {
   stroke: var(--text);
-  stroke-width: 2;
-}
-
-.council-court-seat:focus-visible .council-court-seat-disc {
-  stroke: var(--focus-ring);
   stroke-width: 2;
 }
 
@@ -1156,6 +1165,7 @@
 }
 
 .council-dossier-chip {
+  min-height: var(--hit-min);
   padding: var(--space-1) var(--space-3);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-pill);
@@ -1267,6 +1277,7 @@
 }
 
 .council-process-step {
+  min-height: var(--hit-min);
   padding: 0;
   border: 0;
   background: transparent;
@@ -1326,6 +1337,11 @@
 
   .council-court-svg .council-court-small {
     display: none;
+  }
+
+  .council-court-roll {
+    display: grid;
+    gap: var(--space-1);
   }
 
   .council-dossier-summary {
