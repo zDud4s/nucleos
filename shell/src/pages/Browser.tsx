@@ -41,6 +41,7 @@ import {
   Section,
   StateBadge,
 } from "../ui";
+import { DAEMON_NAME } from "../copy";
 import "./browser.css";
 
 /**
@@ -145,7 +146,7 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
 
 function MutationNote({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — {what}</ErrorNote>;
 }
 
 /* --------------------------------------------------------- live sessions -- */

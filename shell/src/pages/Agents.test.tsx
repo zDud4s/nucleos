@@ -236,7 +236,7 @@ describe("Agents - the name and the id", () => {
     const cell = (await screen.findByRole("button", { name: "tradutor" })).closest("th") as HTMLElement;
     // Everything separating the name from the id on screen is spatial, and none
     // of it is read out. Without this the row is the same word, twice.
-    expect(cell.textContent).toContain("known to the núcleo as tradutor");
+    expect(cell.textContent).toContain("known to the background service as tradutor");
   });
 
   it("marks the id once a rename has left it behind, and says what still points at it", async () => {
