@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { act, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
@@ -167,12 +167,14 @@ describe("the roster", () => {
     await screen.findByRole("region", { name: "Needs you" });
 
     expect(within(card("asking")).getByText("2 proposals and 1 shadow decision to review")).toBeTruthy();
-    expect(within(card("asking")).getByText("Review")).toBeTruthy();
+    expect(within(card("asking")).getByText("Open")).toBeTruthy();
 
     const failed = within(card("broken")).getByText("gate failed");
     expect(failed.getAttribute("title")).toMatch(/^last run 20 Sept? 2026/);
+    // Said on the card, not only on hover.
+    expect(within(card("broken")).getByText(/^last run 20 Sept? 2026/)).toBeTruthy();
     expect(failed.querySelector('[data-mark="fault"]')).not.toBeNull();
-    expect(within(card("broken")).getByText("See the gate")).toBeTruthy();
+    expect(within(card("broken")).getByText("Open")).toBeTruthy();
 
     // Info and not danger: the gate never measured the code.
     const unrun = within(card("unrun")).getByText("gate could not run");
@@ -181,7 +183,8 @@ describe("the roster", () => {
 
     const gone = within(card("moved")).getByText("folder gone");
     expect(gone.getAttribute("title")).toBe("C:/Projects/moved is not on this disk");
-    expect(within(card("moved")).getByText("Point at the folder")).toBeTruthy();
+    expect(within(card("moved")).getByText("C:/Projects/moved is not on this disk")).toBeTruthy();
+    expect(within(card("moved")).getByText("Open")).toBeTruthy();
 
     const unset = within(card("empty")).getByText("no folder named");
     expect(unset.querySelector('[data-mark="unnamed"]')).not.toBeNull();
@@ -293,9 +296,58 @@ describe("the roster", () => {
     const heading = await screen.findByRole("heading", { name: /no project has been registered/i });
     expect(screen.queryByRole("region", { name: "Quiet" })).toBeNull();
     const teach = heading.parentElement as HTMLElement;
-    expect(within(teach).getByRole("link", { name: "Add a project…" }).getAttribute("href")).toBe(
+    expect(within(teach).getByRole("link", { name: "Add a project" }).getAttribute("href")).toBe(
       "/projects/new",
     );
+  });
+
+  it("says only the error, with a retry, when the roster never answered", async () => {
+    const state = daemonState({ projects: [] });
+    const base = daemonFetch(state);
+    let answering = false;
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/jobs?live=true" || path.startsWith("/runs?live=true")) return [];
+      if (path === "/projects" && init?.method === undefined && !answering) throw new Error("down");
+      return await base(path, init);
+    });
+    daemon.apiText.mockImplementation(daemonText(state));
+    daemon.probeHealth.mockResolvedValue(true);
+    await renderApp({ initialPath: "/projects" });
+
+    const alert = await screen.findByText(/Could not load the projects/);
+    expect(screen.queryByText(/reading the roster/)).toBeNull();
+    expect(screen.queryByRole("status", { name: /Loading the projects/ })).toBeNull();
+    answering = true;
+    await act(async () => {
+      within(alert.closest("p") as HTMLElement).getByRole("button", { name: "Retry" }).click();
+    });
+    expect(await screen.findByRole("heading", { name: /no project has been registered/i })).toBeTruthy();
+  });
+
+  it("filters the groups by name and opens the only match on Enter", async () => {
+    await openRoster([fine("alpha", { open_review_items: 1 }), fine("beta"), fine("alps")]);
+    await screen.findByRole("region", { name: "Quiet" });
+    const box = screen.getByRole("searchbox", { name: "Filter projects by name" });
+
+    await act(async () => {
+      fireEvent.change(box, { target: { value: "AL" } });
+    });
+    expect(names("Needs you")).toEqual(["alpha"]);
+    expect(names("Quiet")).toEqual(["alps"]);
+
+    await act(async () => {
+      fireEvent.change(box, { target: { value: "zzz" } });
+    });
+    expect(screen.getByText(/No project is named like "zzz"/)).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.change(box, { target: { value: "bet" } });
+    });
+    await act(async () => {
+      fireEvent.keyDown(box, { key: "Enter" });
+    });
+    // The workspace opened: its mode links replace the roster.
+    expect(await screen.findByRole("link", { name: "Map" })).toBeTruthy();
   });
 
   it("offers a new project from the header", async () => {

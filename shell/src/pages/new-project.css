@@ -68,7 +68,7 @@
   margin: 0;
   max-width: var(--measure);
   color: var(--text-muted);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   line-height: var(--leading-snug);
 }
 
@@ -122,7 +122,7 @@
 
 .np-option-meta {
   color: var(--text-muted);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
 }
 
 /* The commands: one bordered list, a row each, the source pushed to the right. */
@@ -164,12 +164,11 @@
 
 .np-command-line {
   min-width: 0;
-  overflow: hidden;
   color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* The command is what gets stored, so it is shown whole: it wraps rather than being cut. */
+  overflow-wrap: anywhere;
 }
 
 .np-command-source {
@@ -237,8 +236,8 @@
   padding: var(--space-3) var(--space-4);
   border-radius: var(--radius-md);
   background: var(--surface-sunken);
-  color: var(--text-muted);
-  font-size: var(--text-xs);
+  color: var(--text);
+  font-size: var(--text-sm);
   line-height: var(--leading-snug);
 }
 
@@ -256,7 +255,7 @@
 .np-receipt-title {
   margin: 0 0 var(--space-2);
   color: var(--text-muted);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
 }
 
 .np-receipt-list {
@@ -341,4 +340,43 @@
 .np-step-title[tabindex="-1"]:focus-visible {
   outline: none;
   box-shadow: none;
+}
+
+/* Asked when Escape, the scrim or the X would throw away an edited setup. */
+.np-discard {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+}
+
+.np-discard p {
+  margin: 0;
+}
+
+.np-discard-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+/* Gate command and workflow: configuration, folded when the folder already proposed a gate. */
+.np-advanced {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.np-advanced > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.np-advanced[open] > summary {
+  margin-bottom: var(--space-3);
 }
