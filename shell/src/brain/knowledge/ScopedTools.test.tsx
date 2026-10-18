@@ -84,12 +84,12 @@ describe("ScopedTools - own tools", () => {
     expect(await screen.findByText(/already decided|no longer active/i)).toBeDefined();
   });
 
-  it("says the núcleo did not answer rather than showing an empty list", async () => {
+  it("says the service is not responding rather than showing an empty list", async () => {
     daemon.apiFetch.mockRejectedValue(new Error("down"));
 
     await renderWithRouter(<ScopedTools ownerKind="agent" ownerId="scout" />);
 
-    expect(await screen.findByText(/did not answer/)).toBeDefined();
+    expect(await screen.findByText(/is not responding/)).toBeDefined();
     expect(screen.getByRole("button", { name: "Retry" })).toBeDefined();
   });
 });
