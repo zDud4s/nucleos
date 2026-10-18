@@ -3301,7 +3301,8 @@ mod tests {
             .expect("a configured server must carry an allow-list");
         assert_eq!(
             allowed,
-            "mcp__nucleos__note_finding,mcp__nucleos__verify,mcp__nucleos__verify_status"
+            "mcp__nucleos__note_finding,mcp__nucleos__record,mcp__nucleos__verify,\
+             mcp__nucleos__verify_status"
         );
         assert_ne!(allowed, "mcp__nucleos__*");
         assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));

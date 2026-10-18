@@ -97,11 +97,12 @@ pub enum Scope {
     /// own environment. That is the property that makes it safe, not the mode's name.
     Control,
     /// One autonomous run's key. Minted when the run is created, dead the moment the run stops
-    /// running, and good for exactly six routes: three are one conversation about its own tool
+    /// running, and good for exactly seven routes: three are one conversation about its own tool
     /// calls — asking the safety gate beforehand, waiting for a person's answer when the gate
     /// cannot decide alone, and reporting back what actually happened — the fourth leaves one
-    /// evidenced finding for the next node of its own job, and the last two ask the daemon to
-    /// verify a worktree and read the ticket back.
+    /// evidenced finding for the next node of its own job, the next two ask the daemon to verify a
+    /// worktree and read the ticket back, and the last files one workflow ledger record against
+    /// that same worktree.
     ///
     /// Nothing is lost by keeping it that narrow — only orchestrator turns are given an
     /// `--mcp-config`, so a `worktree`, `shadow` or triage run has no daemon tool to call in the
@@ -186,6 +187,11 @@ const FINDING_ROUTE: &str = "/knowledge/findings";
 /// rule of `Scope::Run` covers them. The daemon, not this table, confines a run to its own worktree.
 const VERIFY_ROUTE: &str = "/verify";
 const VERIFY_STATUS_ROUTE: &str = "/verify/status";
+
+/// File one workflow ledger record (the `record` tool). A run reaches it for the reason it reaches
+/// `/verify`: the record is filed against the run's own worktree, which the daemon resolves and
+/// fences exactly as it does for verification — this table only lets the request in.
+const WORKFLOW_RECORD_ROUTE: &str = "/workflow/records";
 
 /// The email sidecar's whole daemon surface: report what it fetched, and ask where it got to.
 ///
@@ -514,7 +520,8 @@ fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
                     || path == POSTTOOLUSE_ROUTE
                     || path == FINDING_ROUTE
                     || path == VERIFY_ROUTE
-                    || path == VERIFY_STATUS_ROUTE)
+                    || path == VERIFY_STATUS_ROUTE
+                    || path == WORKFLOW_RECORD_ROUTE)
         }
         Scope::Service(Service::Email) => listed(EMAIL_ROUTES),
         Scope::Service(Service::Council) => listed(COUNCIL_ROUTES),
@@ -1753,9 +1760,10 @@ mod tests {
 
     /// The whole point of the scope. A `worktree` or `shadow` run has a Bash tool and the classifier
     /// permits `echo $NUCLEOS_DAEMON_TOKEN`, so whatever is in its environment must be assumed
-    /// published. What it opens is six routes: three are the same conversation about its own tool
-    /// calls, the fourth leaves one evidenced fact inside its own job, and the last two ask the
-    /// daemon to verify a worktree and read the ticket back.
+    /// published. What it opens is seven routes: three are the same conversation about its own tool
+    /// calls, the fourth leaves one evidenced fact inside its own job, the next two ask the daemon
+    /// to verify a worktree and read the ticket back, and the last files a workflow ledger record
+    /// against that worktree.
     #[tokio::test]
     async fn a_run_token_opens_the_gate_route_and_nothing_else() {
         let state = test_state("control-token").await;
@@ -3019,9 +3027,9 @@ mod tests {
         }
     }
 
-    /// The pin that says this scope did not widen the run token beyond its six named routes.
+    /// The pin that says this scope did not widen the run token beyond its seven named routes.
     ///
-    /// `Scope::Run`'s doc claims it is "good for exactly six routes", and other comments in this
+    /// `Scope::Run`'s doc claims it is "good for exactly seven routes", and other comments in this
     /// file lean on that being true. A new scope is exactly the change that makes somebody widen
     /// the old one by accident.
     #[test]
@@ -3033,6 +3041,7 @@ mod tests {
         assert!(permits(&run, &Method::POST, FINDING_ROUTE));
         assert!(permits(&run, &Method::POST, VERIFY_ROUTE));
         assert!(permits(&run, &Method::POST, VERIFY_STATUS_ROUTE));
+        assert!(permits(&run, &Method::POST, WORKFLOW_RECORD_ROUTE));
 
         for (method, pattern) in TEAM_ROUTES {
             assert!(
@@ -3047,11 +3056,12 @@ mod tests {
 
     /// A job node verifies its own worktree through the daemon, so the run key reaches the two
     /// verify routes, and by POST only: the status route takes a body so that one literal path
-    /// grants it, the same reason `FINDING_ROUTE` is a POST.
+    /// grants it, the same reason `FINDING_ROUTE` is a POST. The workflow record route rides with
+    /// them: it files against the same worktree, and by POST only as well.
     #[test]
     fn a_run_key_reaches_the_verify_routes() {
         let run = Scope::Run(1);
-        for route in [VERIFY_ROUTE, VERIFY_STATUS_ROUTE] {
+        for route in [VERIFY_ROUTE, VERIFY_STATUS_ROUTE, WORKFLOW_RECORD_ROUTE] {
             assert!(permits(&run, &Method::POST, route), "POST {route}");
             for method in [Method::GET, Method::PUT, Method::PATCH, Method::DELETE] {
                 assert!(!permits(&run, &method, route), "{method} {route}");
@@ -3060,10 +3070,12 @@ mod tests {
         // Literal paths only: nothing underneath them is granted.
         assert!(!permits(&run, &Method::POST, "/verify/other"));
         assert!(!permits(&run, &Method::POST, "/verify/status/1"));
+        assert!(!permits(&run, &Method::POST, "/workflow/records/1"));
     }
 
     /// Ordering a verification spends the machine's CPU, so the keys that are read-only or
-    /// scoped to a department or a service never get it.
+    /// scoped to a department or a service never get it. Nor do they get the workflow record
+    /// route: none of them has a worktree to file a record against.
     #[test]
     fn read_only_and_team_keys_cannot_reach_verify() {
         let refused = [
@@ -3074,7 +3086,7 @@ mod tests {
             Scope::Service(Service::Council),
         ];
         for scope in &refused {
-            for route in [VERIFY_ROUTE, VERIFY_STATUS_ROUTE] {
+            for route in [VERIFY_ROUTE, VERIFY_STATUS_ROUTE, WORKFLOW_RECORD_ROUTE] {
                 for method in [Method::GET, Method::POST] {
                     assert!(
                         !permits(scope, &method, route),

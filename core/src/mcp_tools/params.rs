@@ -362,6 +362,28 @@ pub(super) struct VerifyParams {
     pub(super) files: Option<Vec<String>>,
     /// The commit or branch to diff against. Absent means the project's integration branch.
     pub(super) base: Option<String>,
+    /// The workflow task this verification is for, the same id you pass to `record`, so the
+    /// task's verifications can be counted. Optional.
+    pub(super) task_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct RecordParams {
+    /// "metric", "rework", "intent" or "event".
+    pub(super) kind: String,
+    /// The workflow task this record belongs to. Use the same id for every record and every
+    /// verify call of one task.
+    pub(super) task_id: String,
+    /// The workflow phase that produced the record, e.g. "plan", "execute" or "review".
+    pub(super) phase: Option<String>,
+    /// For a rework: the step that caught it, e.g. "verify", "review" or "red". Required on a
+    /// rework, refused as blank.
+    pub(super) caught_by: Option<String>,
+    /// The record's own fields, as a JSON object of at most 16 KiB.
+    pub(super) payload: serde_json::Map<String, serde_json::Value>,
+    /// The worktree the task runs in, as an absolute path. Required outside a job node, where the
+    /// daemon knows which worktree you are standing in.
+    pub(super) worktree: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
