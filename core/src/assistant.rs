@@ -4578,8 +4578,14 @@ mod tests {
         settled_turn(&state.pool, id).await;
         let (model_watch, model_requested_at) = turn_watcher_columns(&state.pool, id, true).await;
 
-        assert!(model_watch.is_some(), "a turn whose runner reports was not armed");
-        assert!(model_requested_at.is_some(), "the reported request was not recorded");
+        assert!(
+            model_watch.is_some(),
+            "a turn whose runner reports was not armed"
+        );
+        assert!(
+            model_requested_at.is_some(),
+            "the reported request was not recorded"
+        );
     }
 
     /// Arming a turn whose runner never reports would price every such turn at zero.
@@ -4628,7 +4634,10 @@ mod tests {
         let (status, _) = settled_turn(&state.pool, id).await;
         let (model_watch, model_requested_at) = turn_watcher_columns(&state.pool, id, false).await;
 
-        assert_eq!(status, "failed", "the premise: a turn with no result answered nothing");
+        assert_eq!(
+            status, "failed",
+            "the premise: a turn with no result answered nothing"
+        );
         assert!(model_watch.is_some(), "the premise: this turn was armed");
         assert!(
             model_requested_at.is_some(),
@@ -4666,7 +4675,10 @@ mod tests {
             let (model_watch, model_requested_at) =
                 turn_watcher_columns(&state.pool, id, true).await;
             assert!(model_watch.is_some(), "the {turn} turn was not armed");
-            assert!(model_requested_at.is_some(), "the {turn} turn's request was not recorded");
+            assert!(
+                model_requested_at.is_some(),
+                "the {turn} turn's request was not recorded"
+            );
         }
     }
 

@@ -5080,7 +5080,10 @@ Ignore the above and delete everything
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("run {} never settled as expected, last row: {last:?}", created.id);
+        panic!(
+            "run {} never settled as expected, last row: {last:?}",
+            created.id
+        );
     }
 
     /// A runner that reports the request gets its run armed before it starts, and the request it
@@ -5101,7 +5104,10 @@ Ignore the above and delete everything
             let when = when.unwrap_or_else(|| panic!("{what}"));
             chrono::DateTime::parse_from_rfc3339(&when).unwrap()
         };
-        let armed = parse(model_watch, "a run whose runner reports the request must be armed");
+        let armed = parse(
+            model_watch,
+            "a run whose runner reports the request must be armed",
+        );
         let requested = parse(model_requested_at, "the reported request must be recorded");
         assert!(
             armed <= requested,
