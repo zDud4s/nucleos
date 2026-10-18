@@ -20,6 +20,7 @@ import type { MachineConfig, MachineSecret } from "../data/machine-config";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
 import type { AnalyticsReport, QuotaHistory } from "../data/analytics";
+import type { PipelineReport } from "../data/analytics-pipeline";
 import type {
   ApiTokenSummary,
   BackupInfo,
@@ -222,6 +223,166 @@ export function previewAnalytics(projectId: string | null, rawDays: string | nul
       cost_usd: cents(3.2 - n * 0.27),
       cost_is_estimated: n === 4,
     })),
+  };
+}
+
+/**
+ * `GET /analytics/pipeline` (projectId null) and `GET /projects/{id}/analytics/pipeline`: every block
+ * populated, the newer fields included, and in the global view one project red now (in `bisect`
+ * with a culprit) so the red-now card can be photographed. A project's view is green.
+ */
+export function previewPipeline(projectId: string | null, rawDays: string | null): PipelineReport {
+  const days = windowDays(rawDays);
+  const both = previewDays(days * 2);
+  const list = both.slice(days);
+  const last = days - 1;
+  const partial = (index: number) => index === last;
+  const wave = (day: number, key: number) => (day * 7 + key * 3) % 5;
+  const red = projectId === null;
+  const dist = (p50: number, p95: number, n: number) => ({ p50, p95, n });
+  const dailyLanding = list.map((day, index) => {
+    const total = index % 6 === 5 ? 0 : 2 + wave(index, 1);
+    return { day, partial: partial(index), total, bad: total === 0 ? 0 : wave(index, 2) % 2 };
+  });
+  const total = dailyLanding.reduce((sum, point) => sum + point.total, 0);
+  const bad = dailyLanding.reduce((sum, point) => sum + point.bad, 0);
+  const redSeconds = list.map((_, index) => (red && index % 9 === 3 ? 1800 + index * 60 : 0));
+  return {
+    scope: red ? "global" : "project",
+    project_id: projectId,
+    days,
+    timezone: "UTC",
+    now: new Date(NOW).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    window: { from: list[0], to: list[last] },
+    previous: { from: both[0], to: both[days - 1] },
+    history: {
+      postgate_since: new Date(NOW - 20 * 86_400_000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+      slots_since: new Date(NOW - 12 * 86_400_000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    },
+    landing: {
+      total,
+      prev_total: Math.max(0, total - 7),
+      wait_s: dist(95, 410, total),
+      wait_s_machine: dist(40, 220, total),
+      run_s: dist(300, 1260, total),
+      status_mix: { succeeded: total - bad - 2, failed: bad, escalated: 1, blocked: 1, cancelled: 1, other: 0 },
+      unexecutable: 1,
+      bad_share: bad / total,
+      prev_bad_share: 0.18,
+      failure_buckets: { conflict: 2, gate: 3, blocked: 1, interrupted: 1, other: 0 },
+      daily: dailyLanding,
+      conflicts: { count: 3, rate: 0.12, auto_resolved: 2, work_lost: { nothing: 2, lost: 1 } },
+      owner_blocked: { count: 2, oldest_age_s: 86_400, median_age_s: 7_200 },
+    },
+    gate: {
+      pass_rate: 0.86,
+      prev_pass_rate: 0.9,
+      terminal: 41,
+      first_pass_rate: 0.74,
+      retry_share: 0.26,
+      duration_ms_daily: list.map((day, index) => ({
+        day,
+        partial: partial(index),
+        p50: index % 6 === 5 ? null : 180_000 + wave(index, 3) * 12_000,
+        n: index % 6 === 5 ? 0 : 3 + wave(index, 4),
+      })),
+      most_red: [
+        { group: "core", red: 6, terminal: 20, rate: 0.3 },
+        { group: "shell", red: 3, terminal: 18, rate: 0.17 },
+        { group: "sidecars", red: 1, terminal: 12, rate: 0.08 },
+      ],
+      legacy_runs: 4,
+      flaky: [
+        { project_id: "alpha", group: "core", observed: 12, flaky: 3, rate: 0.25, suspect: true },
+        { project_id: "alpha", group: "shell", observed: 9, flaky: 1, rate: 0.11, suspect: false },
+      ],
+      cache: { hit_rate: 0.38, prev_hit_rate: 0.31 },
+      bypass: { observed: 5, verify_units: 41, ratio: 0.12 },
+    },
+    postgate: {
+      red_now: red,
+      red_since: red ? new Date(NOW - 3 * 3_600_000).toISOString().replace(/\.\d{3}Z$/, "Z") : null,
+      red_phase: red ? "bisect" : null,
+      red_groups: red ? ["core"] : [],
+      culprit_sha: red ? "a1b2c3d4e5f6" : null,
+      red_s_in_window: redSeconds.reduce((sum, seconds) => sum + seconds, 0),
+      prev_red_s: red ? 5_400 : 0,
+      red_events: red ? 4 : 0,
+      reverts: red ? 1 : 0,
+      per_project: red
+        ? [
+            { project_id: "alpha", red_now: true, red_s: 14_400 },
+            { project_id: "bravo", red_now: false, red_s: 2_100 },
+          ]
+        : [],
+      red_s_daily: list.map((day, index) => ({ day, partial: partial(index), red_s: redSeconds[index] })),
+    },
+    jobs: {
+      total: 18,
+      completed: 13,
+      failed: 2,
+      interrupted: 1,
+      live: 2,
+      completion_rate: 13 / 16,
+      prev_completion_rate: 0.7,
+      duration_s: dist(1_500, 5_400, 16),
+      daily: list.map((day, index) => ({
+        day,
+        partial: partial(index),
+        created: wave(index, 5) % 3,
+        completed: wave(index, 6) % 3,
+      })),
+      stuck: {
+        age_over_lifetime: 1,
+        dry_rounds_at_limit: 0,
+        rounds_exhausted: 1,
+        gate_retry_loop: 1,
+        item_stuck: 0,
+        waiting: { slot: 2, budget: 0, quota: 1, disk: 0, excluded: 0, "kill-switch": 0, attention: 1, other: 0 },
+        jobs: [
+          { id: 21, project_id: "alpha" },
+          { id: 19, project_id: "bravo" },
+        ],
+      },
+    },
+    autopilot: {
+      classifier: [
+        { action_class: "git_push", n: 24, agree: 0.96, pending: 1 },
+        { action_class: "file_write", n: 80, agree: 0.99, pending: 0 },
+        { action_class: "shell_exec", n: 6, agree: null, pending: 6 },
+      ],
+      judge: {
+        n: 30,
+        reviewed: 22,
+        latency_ms: dist(2_400, 6_100, 30),
+        input_tokens: 184_000,
+        cost_usd: 1.42,
+        error_rate: 0.03,
+        enforced_share: 0.4,
+        agree: 0.91,
+      },
+      refused_actions: { total: 5, by_status: { denied: 3, expired: 2 } },
+    },
+    pressure: {
+      at_limit_share: 0.22,
+      prev_at_limit_share: 0.15,
+      peak_in_use: 4,
+      prev_peak_in_use: 3,
+      limit: 4,
+      daily_p95: list.map((day, index) => ({
+        day,
+        partial: partial(index),
+        in_use: index < 4 ? null : 2 + (index % 3),
+      })),
+      daily: list.map((day, index) => ({
+        day,
+        partial: partial(index),
+        avg_in_use: index < 4 ? null : 1 + wave(index, 7) / 4,
+        max_in_use: index < 4 ? null : 2 + (index % 3),
+      })),
+      slot_wait_share: 0.18,
+      slot_wait_share_is_lower_bound: true,
+    },
   };
 }
 
@@ -3420,6 +3581,11 @@ export function answer(path: string, init?: RequestInit): unknown {
   */
   const analyticsDaysParam = query.get("days");
   if (route === "/analytics/quota") return previewQuotaHistory(analyticsDaysParam);
+  if (route === "/analytics/pipeline") return previewPipeline(null, analyticsDaysParam);
+  const projectPipeline = /^\/projects\/([^/]+)\/analytics\/pipeline$/.exec(route);
+  if (projectPipeline !== null) {
+    return previewPipeline(decodeURIComponent(projectPipeline[1]), analyticsDaysParam);
+  }
   if (route === "/analytics") return previewAnalytics(null, analyticsDaysParam);
   const projectAnalytics = /^\/projects\/([^/]+)\/analytics$/.exec(route);
   if (projectAnalytics !== null) {
