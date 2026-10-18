@@ -946,6 +946,10 @@ async fn main() {
     // grew for as long as the daemon was ever used — and a transcript is stored twice and indexed a
     // third time, so they grew at three times the obvious rate.
     tokio::spawn(execution::runs::run_retention_loop(state.clone()));
+    // Slot occupancy every minute, rolled into daily rows, for the analytics page's pressure
+    // metric (spec analytics-pipeline §5.3). Its own loop: the retention loop is hourly and this
+    // is per minute, and neither belongs on the slot acquire/release path.
+    tokio::spawn(analytics_pipeline::sampler::run_slot_sampler(state.pool.clone()));
     // The distiller: turns closed jobs queued by the job loop and the vcs queue into learnings.
     tokio::spawn(distill::run_distill_loop(state.clone()));
     // Its own loop: the cadence is file I/O over the transcripts directory, independent of runs.

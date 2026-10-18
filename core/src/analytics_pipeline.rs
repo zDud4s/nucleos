@@ -4,6 +4,9 @@
 //! `{"error": ...}` and the others still come (spec D5). Write side lives in `sampler` (slot
 //! samples) and in `verify::postgate::record_transition` (colour changes).
 
+pub mod sampler;
+pub mod stats;
+
 #[cfg(test)]
 mod tests {
     /// Spec §10: the three history tables exist with the columns and constraints it names.
