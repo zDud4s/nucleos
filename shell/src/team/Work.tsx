@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import {
   TEAM_RUN_LIST_LIMIT,
@@ -197,7 +198,7 @@ function Composer({ teamId, runs }: { teamId: string; runs: TeamRun[] }) {
  * as a failure.
  */
 function StartRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>The núcleo did not answer — no task was started</ErrorNote>;
+  if (!isApiRefusal(error)) return <ErrorNote>The {DAEMON_NAME} is not responding, so no task was started.</ErrorNote>;
   if (error.status === 429) {
     return (
       <RefusalNote
@@ -264,7 +265,7 @@ function LiveTask({ run, ceiling }: { run: TeamRun; ceiling: number | null }) {
  */
 function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
   if (items.length === 0) {
-    return <Quiet says="Nothing planned yet — the núcleo has not picked this up." />;
+    return <Quiet says="Nothing planned yet — the background service has not picked this up." />;
   }
 
   const rounds = [...new Set(items.map((item) => item.round))].sort((a, b) => a - b);

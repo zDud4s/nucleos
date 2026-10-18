@@ -292,6 +292,8 @@
 
 .fi-tree-fault-unread {
   color: var(--tone-danger-fg);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
 }
 
 /* The children of an open node sit at the tree's own density, not the inset's
@@ -618,10 +620,27 @@
   overflow-wrap: anywhere;
 }
 
-/* The undo beside a selection, at the far end of the bar from the verbs that
-   act on the selection. */
+/* The bar in two zones: the verbs that act on the selection (with the count)
+   at the start, the undo and the passing news at the far end. */
+.fi-sel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
 .fi-slot-undo {
   margin-left: auto;
+}
+
+/* Narrow window (800x600): the second zone drops to its own line under the
+   verbs instead of squeezing four buttons and a message into one row. */
+@media (max-width: 60rem) {
+  .fi-selection-bar > .fi-slot-undo {
+    flex: 1 0 100%;
+    margin-left: 0;
+  }
 }
 
 /* The undo, standing in the slot: the slot is already its sunken rung. */
@@ -1360,8 +1379,12 @@ th.fi-col-num .fi-sort-mark {
   cursor: pointer;
 }
 
-.fi-context-item:hover {
-  background: var(--surface-sunken);
+/* One fill for pointer and keyboard alike, lifted from the menu's own surface:
+   `--surface-sunken` is darker than the menu in the dark theme, so the hover
+   sank instead of rising. */
+.fi-context-item:hover,
+.fi-context-item:focus-visible {
+  background: color-mix(in srgb, var(--text) 10%, var(--surface-raised));
 }
 
 /* The global ring at the -2px offset the system allows an inset case: at the
@@ -1471,5 +1494,5 @@ body.fi-dragging * {
 }
 
 .fi-move-again {
-  color: var(--text-faint);
+  color: var(--text-muted);
 }

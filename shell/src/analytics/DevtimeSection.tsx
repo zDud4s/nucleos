@@ -10,7 +10,7 @@ import {
   type Verdict,
 } from "../data/devtime";
 import { compactTokens, humanMinutes } from "../data/project-readings";
-import { AreaChart, Badge, Button, ErrorNote, ShareBar, StaleNote, StatCard, usd } from "../ui";
+import { AreaChart, Badge, ErrorNote, ShareBar, Skeleton, StaleNote, usd } from "../ui";
 import {
   COST_KEYS,
   KIND_KEYS,
@@ -29,7 +29,7 @@ import {
   wastedByClass,
 } from "./devtime-series";
 import { versus, windowShares } from "./series";
-import { Card, MetricCard, joined, plural, summary, type Metric } from "./sections";
+import { Card, MetricCard, joined, plural, summary, unreachable, type Metric } from "./sections";
 
 /**
  * Development time (spec analytics-devtime §7): the owner's own sessions, under F1's readout, with the
@@ -39,6 +39,8 @@ import { Card, MetricCard, joined, plural, summary, type Metric } from "./sectio
 export interface DevtimeSectionProps {
   projectId?: string;
   days: AnalyticsDays;
+  /** The section's id, for the page's section links. */
+  anchor?: string;
 }
 
 type DevtimeMetric = "active" | "waste" | "interruptions" | "cost";
@@ -49,11 +51,11 @@ const percent = (fraction: number) => `${Math.round(fraction * 100)}%`;
 const count = (value: number) => String(Math.round(value));
 const safeId = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "");
 
-export function DevtimeSection({ projectId, days }: DevtimeSectionProps) {
+export function DevtimeSection({ projectId, days, anchor }: DevtimeSectionProps) {
   const report = useDevtime(projectId, days);
   const [open, setOpen] = useState<DevtimeMetric>("active");
   return (
-    <Card label="Development time" className="an-dt">
+    <Card id={anchor} label="Development time" className="an-dt">
       <Body report={report} projectId={projectId} days={days} open={open} onOpen={setOpen} />
     </Card>
   );
@@ -73,19 +75,12 @@ function Body({ report, projectId, days, open, onOpen }: BodyProps) {
   if (data === undefined) {
     if (report.isError) {
       return (
-        <ErrorNote>
-          The núcleo did not answer for development time.{" "}
-          <Button onClick={() => void report.refetch()}>Try again</Button>
+        <ErrorNote onRetry={() => void report.refetch()} retryLabel="Try again">
+          {unreachable("development time")}
         </ErrorNote>
       );
     }
-    return (
-      <div className="an-metrics">
-        {["Active time", "Waste", "Interruptions", "Estimated cost"].map((label) => (
-          <StatCard key={label} label={label} value={undefined} detail="reading…" />
-        ))}
-      </div>
-    );
+    return <Skeleton label="Loading development time" lines={8} />;
   }
   const empty = data.totals.active_ms === 0 && data.totals.turns === 0 && data.tokens.by_model.length === 0;
   return (
@@ -320,7 +315,11 @@ function FindingsSection({ projectId, days }: { projectId?: string; days: Analyt
     <details className="an-about an-dt-findings" onToggle={(event) => setOpened(event.currentTarget.open)}>
       <summary className="an-about-toggle">Findings</summary>
       {findings.data === undefined ? (
-        findings.isError ? <ErrorNote>The núcleo did not answer for findings.</ErrorNote> : opened ? <p className="an-note">reading…</p> : null
+        findings.isError ? (
+          <ErrorNote onRetry={() => void findings.refetch()}>{unreachable("findings")}</ErrorNote>
+        ) : opened ? (
+          <Skeleton label="Loading findings" lines={3} />
+        ) : null
       ) : (
         <>
           {findings.data.thresholds_source !== "file" ? (

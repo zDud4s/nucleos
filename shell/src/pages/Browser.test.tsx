@@ -305,9 +305,8 @@ describe("Browser - driving a session from the shell", () => {
     await waitFor(() => expect(postsTo(world, "/browser/return")).toHaveLength(2));
     expect(JSON.parse(postsTo(world, "/browser/return")[1].body)).toEqual({ session_id: 5, to: "close" });
 
+    // Reversible, so a plain click and no hold.
     fireEvent.click(screen.getByRole("button", { name: "Open real window" }));
-    await afterDwell();
-    fireEvent.click(await screen.findByRole("button", { name: "Swap to a real window here" }));
     await waitFor(() => expect(postsTo(world, "/browser/sessions/5/window")).toHaveLength(1));
   });
 
@@ -330,8 +329,6 @@ describe("Browser - driving a session from the shell", () => {
     expect(drive).toHaveLength(1);
 
     fireEvent.click(drive[0]);
-    await afterDwell();
-    fireEvent.click(await screen.findByRole("button", { name: "Take the wheel again and drive it here" }));
 
     await waitFor(() => expect(postsTo(world, "/browser/sessions/1/take")).toHaveLength(1));
     await waitFor(() => expect(seatNonce(1)).toBe("n1"));
@@ -469,7 +466,7 @@ describe("Browser - the write grant", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Keep them" }));
     await afterDwell();
-    fireEvent.click(await screen.findByRole("button", { name: "Grant these origins" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Grant read on 2 origins" }));
 
     await waitFor(() => {
       expect(world.posted.some((one) => one.path === "/browser/keep")).toBe(true);
@@ -495,7 +492,7 @@ describe("Browser - the write grant", () => {
     fireEvent.click(await screen.findByLabelText(/submit forms here/i));
     fireEvent.click(await screen.findByRole("button", { name: "Keep them" }));
     await afterDwell();
-    fireEvent.click(await screen.findByRole("button", { name: "Grant these origins" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Grant read on 2 origins, and form submission on the site you ended on" }));
 
     await waitFor(() => {
       expect(world.posted.some((one) => one.path === "/browser/keep")).toBe(true);
@@ -526,13 +523,13 @@ describe("Browser - the write grant", () => {
 
     // One badge and one door, for the one site that has something to narrow.
     expect(await screen.findByText("submits forms")).toBeDefined();
-    expect(screen.getAllByRole("button", { name: "Read-only" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Stop submitting" })).toHaveLength(1);
     // Both sites can still be revoked outright; narrowing is the extra door.
     expect(screen.getAllByRole("button", { name: "Revoke" })).toHaveLength(2);
 
-    fireEvent.click(screen.getByRole("button", { name: "Read-only" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop submitting" }));
     await afterDwell();
-    fireEvent.click(await screen.findByRole("button", { name: "Stop agents submitting forms here" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stop agents submitting forms on https://jira.example.org:443" }));
 
     await waitFor(() => {
       expect(world.posted.some((one) => one.path === "/browser/readonly")).toBe(true);

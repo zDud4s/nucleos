@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import {
   Outlet,
@@ -1100,5 +1100,46 @@ describe("Projects - a search hit is a way to the line", () => {
 
     await screen.findByText("one line");
     expect(document.querySelector(".pj-file-mark")).toBeNull();
+  });
+
+  it("filters the listing by name, and says so when nothing matches", async () => {
+    answerWith(
+      projectsWorld({
+        entries: [
+          { name: "gate.rs", is_dir: false },
+          { name: "vcs.rs", is_dir: false },
+        ],
+      }),
+    );
+    await renderProjects("/projects/alpha/browse");
+
+    const box = await screen.findByRole("searchbox", { name: "Filter this folder by name" });
+    fireEvent.change(box, { target: { value: "GA" } });
+    const list = screen.getByRole("list", { name: "Folder contents" });
+    expect(within(list).getAllByRole("link").map((link) => link.textContent)).toEqual(["gate.rs"]);
+
+    fireEvent.change(box, { target: { value: "zzz" } });
+    expect(screen.getByText("nothing in this folder is named like that.")).toBeDefined();
+  });
+
+  it("closes the open file on Escape", async () => {
+    answerWith(projectsWorld({ entries: [{ name: "a.rs", is_dir: false }], file: "one line" }));
+    await renderProjects("/projects/alpha/browse?file=a.rs");
+
+    await screen.findByText("one line");
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByText("one line")).toBeNull());
+  });
+
+  it("re-seeds the search form when the location's query changes", async () => {
+    answerWith(projectsWorld({ entries: [], matches: [] }));
+    const { router } = await renderProjects("/projects/alpha/search?q=first");
+
+    const box = (await screen.findByLabelText("Text to find")) as HTMLInputElement;
+    expect(box.value).toBe("first");
+    await act(async () => {
+      await router.navigate({ to: "/projects/alpha/search", search: { q: "second" } });
+    });
+    await waitFor(() => expect(box.value).toBe("second"));
   });
 });

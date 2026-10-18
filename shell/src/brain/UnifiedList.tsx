@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type Dispatch, type SetStateAction } from "react";
 import { Check, Search, X } from "lucide-react";
 import { useAllCaptures } from "../data/captures";
 import { useApproveKnowledge, useKnowledge, useRejectKnowledge, type Known, type KnownLayer } from "../data/knowledge";
@@ -38,13 +38,43 @@ const LAYER_FILTERS: readonly (readonly [KnownLayer | "all", string])[] = [
   ["working", "Working"],
 ];
 
+/**
+ * State that outlives the component: List and Graph unmount each other, and a filter lost on the
+ * way back is a filter the owner sets twice. Session storage keeps it for the tab (never across
+ * sessions); where storage is blocked it is plain state.
+ */
+function useKept<T extends string>(key: string, initial: T, valid: (value: string) => boolean): [T, Dispatch<SetStateAction<T>>] {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const kept = window.sessionStorage.getItem(`brain.list.${key}`);
+      return kept !== null && valid(kept) ? (kept as T) : initial;
+    } catch {
+      return initial;
+    }
+  });
+  const set: Dispatch<SetStateAction<T>> = (next) => {
+    setValue((prev) => {
+      const resolved = typeof next === "function" ? (next as (p: T) => T)(prev) : next;
+      try {
+        window.sessionStorage.setItem(`brain.list.${key}`, resolved);
+      } catch {
+        // storage blocked: the filter still works for this mount
+      }
+      return resolved;
+    });
+  };
+  return [value, set];
+}
+
 /** The attention-ordered list: what waits for a decision, then notes and knowledge by date. */
 export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
-  const [type, setType] = useState<ItemFilters["type"]>("all");
-  const [state, setState] = useState<ItemFilters["state"]>("in_force");
-  const [layer, setLayer] = useState<KnownLayer | "all">("all");
-  const [scope, setScope] = useState("all");
-  const [q, setQ] = useState("");
+  const [type, setType] = useKept<ItemFilters["type"]>("type", "all", (v) => TYPE_FILTERS.some(([k]) => k === v));
+  const [state, setState] = useKept<ItemFilters["state"]>("state", "in_force", (v) =>
+    STATE_FILTERS.some(([k]) => k === v),
+  );
+  const [layer, setLayer] = useKept<KnownLayer | "all">("layer", "all", (v) => LAYER_FILTERS.some(([k]) => k === v));
+  const [scope, setScope] = useKept<string>("scope", "all", () => true);
+  const [q, setQ] = useKept<string>("q", "", () => true);
 
   const searching = q.trim() !== "";
   const allNotes = useOwnerNotes("all");
@@ -57,7 +87,10 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
   const noteRows = (searching ? found.data : allNotes.data) ?? [];
   const known = knowledge.data ?? [];
   const items = filterItems(toItems(noteRows, known, captureRows.data ?? []), { type, state, layer, scope, q });
-  const deciding = approve.isPending || reject.isPending;
+  // Only the row in flight is held; the others stay usable while one decision is out.
+  const inFlight = approve.isPending ? approve.variables : reject.isPending ? reject.variables : undefined;
+  const decidingId = typeof inFlight === "object" ? inFlight.proposalId : inFlight;
+  const decided = approve.isSuccess ? "Lesson approved" : reject.isSuccess ? "Lesson refused" : "";
   const scopes = scopeOptions(known);
 
   const nothingAtAll =
@@ -116,6 +149,9 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
         )}
       </div>
 
+      <span className="sr-only" role="status">
+        {decided}
+      </span>
       {items.length === 0 ? (
         <Quiet says={searching ? "Nothing matches that." : "Nothing here for these filters."} />
       ) : (
@@ -126,7 +162,7 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
               item={item}
               current={selected === itemRef(item)}
               onSelect={onSelect}
-              deciding={deciding}
+              deciding={decidingId}
               onApprove={(id) => approve.mutate(id)}
               onReject={(id) => reject.mutate(id)}
             />
@@ -146,7 +182,8 @@ interface ItemRowProps {
   item: BrainItem;
   current: boolean;
   onSelect(item: string): void;
-  deciding: boolean;
+  /** Proposal id whose decision is in flight, if any. */
+  deciding: number | undefined;
   onApprove(proposalId: number): void;
   onReject(proposalId: number): void;
 }
@@ -202,10 +239,22 @@ function ItemRow({ item, current, onSelect, deciding, onApprove, onReject }: Ite
       </button>
       {proposalId !== null && (
         <span className="unified-decide">
-          <Button variant="approve" aria-label={`Approve ${title}`} disabled={deciding} onClick={() => onApprove(proposalId)}>
+          <Button
+            variant="approve"
+            aria-label={`Approve ${title}`}
+            title="Approve: the agent will use this text in its prompts"
+            disabled={deciding === proposalId}
+            onClick={() => onApprove(proposalId)}
+          >
             <Check aria-hidden="true" size={14} strokeWidth={2} />
           </Button>
-          <Button variant="ghost" aria-label={`Refuse ${title}`} disabled={deciding} onClick={() => onReject(proposalId)}>
+          <Button
+            variant="ghost"
+            aria-label={`Refuse ${title}`}
+            title="Refuse: the agent will not use this"
+            disabled={deciding === proposalId}
+            onClick={() => onReject(proposalId)}
+          >
             <X aria-hidden="true" size={14} strokeWidth={2} />
           </Button>
         </span>

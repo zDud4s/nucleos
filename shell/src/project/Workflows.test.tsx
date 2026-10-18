@@ -44,7 +44,7 @@ describe("the workflows mode", () => {
    */
   it("says a project has no workflow rather than showing an empty graph", async () => {
     await openWorkflows({ library: [] });
-    expect(await screen.findByText(/No workflow is installed here/)).toBeTruthy();
+    expect((await screen.findAllByText(/No workflow is installed here/)).length).toBeGreaterThan(0);
   });
 
   /**

@@ -159,14 +159,14 @@ describe("the notifications view", () => {
 
     // `config_written` is claimed by no prefix, so "follows its family" would
     // name something that does not exist for it.
-    const loose = await screen.findByLabelText("config_written");
+    const loose = await screen.findByLabelText("project file written");
     expect(loose.tagName).toBe("INPUT");
     expect((loose as HTMLInputElement).checked).toBe(true);
 
     // A kind inside a family keeps the three states, because it has one to
     // inherit from.
     fireEvent.click(screen.getByRole("button", { name: /2 kinds/ }));
-    expect(screen.getByLabelText("job_failed").tagName).toBe("SELECT");
+    expect(screen.getByLabelText("job failed").tagName).toBe("SELECT");
   });
 
   it("shows the selector the núcleo objected to, not a generic failure", async () => {

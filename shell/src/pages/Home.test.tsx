@@ -54,7 +54,7 @@ describe("Home", () => {
     expect(within(await card("Shadow decisions pending")).getByText("7")).toBeDefined();
     expect(await within(await card("Waiting on you")).findByText("2")).toBeDefined();
     expect((await card("Waiting on you")).textContent).toContain(
-      "decisions held for you — not records, and not the calendar",
+      "2 decisions need your answer",
     );
     const spend = await spendRow();
     expect(within(spend).getByText(/\$1\.42/)).toBeDefined();
@@ -88,7 +88,7 @@ describe("Home", () => {
     await renderWithRouter(<Home />);
 
     expect((await card("Waiting on you")).textContent).toContain(
-      "decisions held for you — not records, and not the calendar",
+      "1 decision needs your answer",
     );
     // The card is itself the door to the queue; the separate "Where to look next" sentence was
     // removed by the redesign.
@@ -127,6 +127,16 @@ describe("Home", () => {
     );
     await renderWithRouter(<Home />);
     expect((await spendRow()).querySelector(".ui-gauge-fill")).toBeNull();
+  });
+
+  it("one note with a Retry replaces the repeated refusal when nothing could be read", async () => {
+    daemon.apiFetch.mockRejectedValue(new Error("down"));
+
+    await renderWithRouter(<Home />);
+
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeDefined();
+    expect(document.body.textContent).not.toContain("did not answer");
+    expect(document.body.textContent).not.toContain("núcleo");
   });
 
   it("shows an em dash rather than a zero while nothing has been read", async () => {
@@ -295,7 +305,12 @@ describe("Home", () => {
     // Every action lives one click away, on the page that also shows what you
     // would be acting on. A control here would be pressed by somebody looking at
     // the state of five seconds ago.
-    expect(screen.queryAllByRole("button")).toHaveLength(0);
+    // Glossary Tip marks (aria-describedby) only explain, and Retry only reads again.
+    expect(
+      screen
+        .queryAllByRole("button")
+        .filter((b) => b.getAttribute("aria-describedby") === null && b.textContent !== "Retry"),
+    ).toHaveLength(0);
     // Each reading is a link to its page (no more "Where to look next").
     expect(screen.getByRole("link", { name: "Shadow decisions pending" }).getAttribute("href")).toBe("/autopilot");
     expect(screen.getByRole("link", { name: "Waiting on you" }).getAttribute("href")).toBe("/waiting");

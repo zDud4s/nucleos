@@ -93,6 +93,8 @@ function Tally() {
   const count = <T,>(rows: T[] | undefined, keep: (row: T) => boolean) =>
     rows === undefined ? "—" : String(rows.filter(keep).length);
   const tools = useLoadoutTools("proposed");
+  // A source that failed is unknown, not zero: its figure becomes a dash with a title instead of
+  // disappearing, which would read as "nothing pending".
   const proposed =
     (knowledge.data?.filter((row) => row.status === "proposed").length ?? 0) +
     (Array.isArray(tools.data) ? tools.data.length : 0);
@@ -105,15 +107,27 @@ function Tally() {
       <span>
         <b>{count(knowledge.data, (row) => row.status === "active")}</b> lessons
       </span>
-      {open > 0 && (
-        <span className="brain-tally-asks">
-          <b>{open}</b> {open === 1 ? "question" : "questions"}
+      {asked.isError ? (
+        <span className="brain-tally-asks" title="The questions could not be read">
+          <b>—</b> questions
         </span>
+      ) : (
+        open > 0 && (
+          <span className="brain-tally-asks">
+            <b>{open}</b> {open === 1 ? "question" : "questions"}
+          </span>
+        )
       )}
-      {proposed > 0 && (
-        <span className="brain-tally-asks">
-          <b>{proposed}</b> to approve
+      {knowledge.isError || tools.isError ? (
+        <span className="brain-tally-asks" title="The lessons or tools to approve could not be read">
+          <b>—</b> to approve
         </span>
+      ) : (
+        proposed > 0 && (
+          <span className="brain-tally-asks">
+            <b>{proposed}</b> to approve
+          </span>
+        )
       )}
     </p>
   );
@@ -147,6 +161,7 @@ function useBrainSearch(): BrainSearch {
 function Capture() {
   const create = useCreateNote();
   const [text, setText] = useState("");
+  const [saved, setSaved] = useState(false);
   const areaRef = useRef<HTMLTextAreaElement>(null);
   const navigate = useNavigate();
   const { capture } = useBrainSearch();
@@ -170,7 +185,16 @@ function Capture() {
   const blank = text.trim() === "";
   const save = () => {
     if (blank || create.isPending) return;
-    create.mutate({ text, origin: "shell" }, { onSuccess: () => setText("") });
+    setSaved(false);
+    create.mutate(
+      { text, origin: "shell" },
+      {
+        onSuccess: () => {
+          setText("");
+          setSaved(true);
+        },
+      },
+    );
   };
 
   return (
@@ -192,7 +216,11 @@ function Capture() {
         rows={2}
         placeholder="Write it down — a fact, a reminder, a loose end. No agent reads it until you teach it."
         value={text}
-        onChange={(event) => setText(event.target.value)}
+        aria-describedby="brain-capture-hint"
+        onChange={(event) => {
+          setText(event.target.value);
+          setSaved(false);
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
             event.preventDefault();
@@ -202,13 +230,16 @@ function Capture() {
       />
       <div className="brain-compose-foot">
         {create.isError ? (
-          <ErrorNote>the núcleo did not answer — the note was not saved</ErrorNote>
+          <ErrorNote>the núcleo did not answer — the note was not saved. Your text is still here: press Save to retry.</ErrorNote>
         ) : (
-          <span className="brain-compose-hint" aria-hidden="true">
+          <span className="brain-compose-hint" id="brain-capture-hint">
             <kbd>{IS_MAC ? "⌘" : "Ctrl"}</kbd> <kbd>{IS_MAC ? "Return" : "Enter"}</kbd> saves
           </span>
         )}
-        <Button type="submit" variant="approve" disabled={blank || create.isPending}>
+        <span className="sr-only" role="status">
+          {saved ? "Note saved" : ""}
+        </span>
+        <Button type="submit" disabled={blank || create.isPending}>
           Save
         </Button>
       </div>
@@ -273,7 +304,8 @@ export function BrainGraphView({ item, onItem }: { item?: string; onItem: (item:
     }
   };
 
-  if (graph.isError) return <ErrorNote>the núcleo did not answer — the graph is not known</ErrorNote>;
+  if (graph.isError)
+    return <ErrorNote onRetry={() => void graph.refetch()}>the núcleo did not answer — the graph is not known</ErrorNote>;
   if (graph.data === undefined || model === null) return <Quiet says="Loading the graph…" />;
   const missing = missingSentence(knowledge, projects);
 
@@ -320,11 +352,17 @@ export function BrainListView({
   const tools = useLoadoutTools("proposed");
   const toolsWaiting = Array.isArray(tools.data) ? tools.data.length : 0;
   const hasAsks = (asked.data?.length ?? 0) > 0 || proposed.length > 0 || toolsWaiting > 0;
+  const queueFailed = asked.isError || knowledge.isError || tools.isError;
 
   useEffect(() => {
     if (!isOpen || onClose === undefined) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !event.defaultPrevented) onClose();
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      // Escape in a field means "cancel this field" (it clears a search), never "close the item
+      // I am writing an answer in".
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest("input, textarea, select, [contenteditable=''], [contenteditable='true']")) return;
+      onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -357,6 +395,16 @@ export function BrainListView({
             <WaitingPanel rows={proposed} />
             <ToolRequests />
           </>
+        ) : queueFailed ? (
+          <ErrorNote
+            onRetry={() => {
+              void asked.refetch();
+              void knowledge.refetch();
+              void tools.refetch();
+            }}
+          >
+            Part of what is asked of you could not be read, so an empty queue is not certain.
+          </ErrorNote>
         ) : (
           <div className="brain-aside-empty">
             <p className="brain-aside-empty-title">Nothing open</p>
@@ -401,7 +449,8 @@ function ItemPanel({ item, onItem }: { item: ItemRef; onItem: (item: string) => 
   };
   if (item.kind === "capture") return <CapturePanel key={item.id} id={item.id} onSelect={onItem} />;
   if (item.kind === "knowledge") return <KnowledgePanel key={item.id} id={item.id} onSelect={select} />;
-  if (graph.isError) return <ErrorNote>the núcleo did not answer — the note is not known</ErrorNote>;
+  if (graph.isError)
+    return <ErrorNote onRetry={() => void graph.refetch()}>the núcleo did not answer — the note is not known</ErrorNote>;
   if (graph.data === undefined || model === null) return <Quiet says="Loading…" />;
   return <BrainPanel nodeId={nodeIdOf(item)} graph={graph.data} model={model} onSelect={select} />;
 }

@@ -133,7 +133,7 @@ export function roundsOf(picked: number | null, config: CouncilConfig | null): n
 export function conveneBlocked(pending: boolean, failed: boolean, config: CouncilConfig | null, d: CourtDraft): string | null {
   if (pending) return "Reading the council config…";
   if (failed || config === null) return "The council config could not be read.";
-  if (!config.configured) return "No roster in ~/.nucleos/council.yaml — add one and restart the núcleo.";
+  if (!config.configured) return "No roster in ~/.nucleos/council.yaml — add one and restart the background service.";
   if (occupiedCount(d) === 0) return "Seat at least one member.";
   if (d.chairman === null) return "Choose a chairman.";
   if (d.touched) {

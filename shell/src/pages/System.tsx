@@ -49,6 +49,7 @@ import {
   Badge,
   Button,
   ConfirmButton,
+  CopyButton,
   CopyOnce,
   ErrorNote,
   PageHeader,
@@ -94,20 +95,23 @@ import "./system.css";
  * the sidecar obeys, so nothing on this page decides anything by itself.
  */
 
-/** The five tabs, in the order they read. */
-const VIEWS = ["health", "backups", "tokens", "notifications", "settings"] as const;
+/** The six tabs, in the order they read. */
+const VIEWS = ["health", "limits", "backups", "tokens", "notifications", "settings"] as const;
 export type SystemView = (typeof VIEWS)[number];
 
 const VIEW_LABEL: Record<SystemView, string> = {
   health: "Health",
+  limits: "Limits",
   backups: "Backups",
   tokens: "Tokens",
   notifications: "Notifications",
-  settings: "System",
+  // The slug stays `settings`; only the word changed, because "System" inside the page
+  // called System named nothing.
+  settings: "Machine",
 };
 
 /**
- * A `$view` param as one of the five.
+ * A `$view` param as one of the six.
  *
  * Falls back to `health` rather than refusing: a route parameter is a string,
  * anybody can type one, and a typo in a path is not a missing page.
@@ -133,6 +137,7 @@ export function System() {
         {view === "health" && (
           <HealthView health={health} sidecars={sidecars} />
         )}
+        {view === "limits" && <BudgetPanel />}
         {view === "backups" && <BackupsView />}
         {view === "tokens" && <TokensView />}
         {view === "notifications" && <NotificationsView />}
@@ -166,24 +171,26 @@ export function headlineFor(readout: HealthReadout | undefined): string | undefi
   return parts.join(", ");
 }
 
+/** The same sentence as {@link headlineFor}, toned and with a shape when something is wrong. */
 export function headlineNodeFor(readout: HealthReadout | undefined): ReactNode {
-  if (readout === undefined) return undefined;
-  if (isAggregateTimeout(readout))
-    return "the health readout timed out before it measured anything";
-  const down = readout.subsystems.filter((row) => row.status === "down").length;
-  const degraded = readout.subsystems.filter(
-    (row) => row.status === "degraded",
-  ).length;
-  if (down === 0 && degraded === 0)
-    return "every configured subsystem is healthy";
-  const parts: string[] = [];
-  if (down > 0) parts.push(`${String(down)} down`);
-  if (degraded > 0) parts.push(`${String(degraded)} degraded`);
-  return <span className="ui-wrong">{parts.join(", ")}</span>;
+  const text = headlineFor(readout);
+  if (text === undefined) return undefined;
+  const wrong =
+    readout !== undefined &&
+    !isAggregateTimeout(readout) &&
+    readout.subsystems.some((row) => row.status === "down" || row.status === "degraded");
+  if (!wrong) return text;
+  // The triangle is the second signal: colour alone is not a state.
+  return (
+    <>
+      <span aria-hidden="true">▲ </span>
+      <span className="ui-wrong">{text}</span>
+    </>
+  );
 }
 
 /**
- * The three views — links, and deliberately **not** `Tabs` from `../ui`.
+ * The six views — links, and deliberately **not** `Tabs` from `../ui`.
  *
  * The primitive is the app's one tabs implementation and the reason to reach
  * for it is real: `Bench` gets Radix's roving focus and its `aria-controls`
@@ -239,9 +246,45 @@ function HealthView({
           and stacked they made the health view three screens long. */}
       <div className="sy-health-pair">
         <ScopedKillsPanel />
-        <BudgetPanel />
+        <SpendSummary />
       </div>
     </>
+  );
+}
+
+/**
+ * Spend at a glance, read-only. The forms that change the limits live in the Limits tab: Health
+ * answers "is everything fine?", and a nine-field form is not part of that answer.
+ */
+function SpendSummary() {
+  const budget = useBudget();
+  return (
+    <Panel
+      title="Budget"
+      aside={<Link to="/system/limits">Edit limits</Link>}
+    >
+      {budget.isError && budget.data === undefined && (
+        <SystemListError error={budget.error} what="the budget" />
+      )}
+      {!budget.isError && budget.data === undefined && <Loading>reading the budget…</Loading>}
+      {budget.data !== undefined && budget.data.paused && (
+        <p className="sy-budget-paused" role="status">
+          Autonomous work is currently held: {budget.data.reason}
+        </p>
+      )}
+      {budget.data !== undefined && (
+        <dl className="sy-budget-spend">
+          <div className="sy-fact">
+            <dt>window spend</dt>
+            <dd>${budget.data.window_spend_usd.toFixed(2)}</dd>
+          </div>
+          <div className="sy-fact">
+            <dt>hourly spend</dt>
+            <dd>${budget.data.hourly_spend_usd.toFixed(2)}</dd>
+          </div>
+        </dl>
+      )}
+    </Panel>
   );
 }
 
@@ -253,7 +296,7 @@ function HealthReadoutPanel({
   return (
     <Panel title="Subsystems">
       {health.data === undefined && !health.isError && (
-        <p className="sy-loading">reading…</p>
+        <Loading>reading…</Loading>
       )}
       {health.isError && health.data === undefined && (
         <HealthError error={health.error} />
@@ -261,8 +304,8 @@ function HealthReadoutPanel({
       {health.data !== undefined && isAggregateTimeout(health.data) && (
         <p className="sy-timeout" role="status">
           The readout timed out before it could measure anything below the
-          aggregate — the ten subsystems below were never reached, which is not
-          the same as nine of them being down.
+          aggregate — the subsystems below were never reached, which is not
+          the same as all of them being down.
         </p>
       )}
       {health.data !== undefined && !isAggregateTimeout(health.data) && (
@@ -303,7 +346,15 @@ function pairLabel(runner: string | null, model: string | null, effort: string |
 function RouterReportPanel() {
   const report = useRouteReport();
   const data = report.data;
-  if (report.isError || data === undefined || data.runs <= 0) return null;
+  // Said, not silent: "the router is not configured" and "the report failed" are different
+  // facts, and a page whose thesis is that the safety layer is visible cannot omit either.
+  if (report.isError) {
+    return <Section label="Router"><Quiet says="the router report is unavailable." /></Section>;
+  }
+  if (data === undefined) return null;
+  if (data.runs <= 0) {
+    return <Section label="Router"><Quiet says="no routed runs in the last 30 days." /></Section>;
+  }
   // Among shadow runs with advice only: an apply run launched its advice and cannot disagree.
   const shadowAdvised = data.shadow_advised;
   const rate = shadowAdvised > 0 ? `${Math.round((data.matched / shadowAdvised) * 100)}%` : "n/a";
@@ -451,7 +502,7 @@ function SidecarCardsPanel({
   return (
     <Panel title="Sidecars">
       {sidecars.data === undefined && !sidecars.isError && (
-        <p className="sy-loading">reading…</p>
+        <Loading>reading…</Loading>
       )}
       {sidecars.isError && sidecars.data === undefined && (
         <ErrorNote>
@@ -470,11 +521,14 @@ function SidecarCardsPanel({
 }
 
 function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
+  // The failure and the last line are clipped to one line in the row; this opens them in full.
+  // A `title` did that for a mouse only — a keyboard or a finger never saw the rest.
+  const [wide, setWide] = useState(false);
   return (
     <Row dense className="sy-sidecar-row">
       <div className="sy-sidecar-head">
         <span className="sy-sidecar-name">{sidecar.name}</span>
-        <span className="sy-sidecar-state">{sidecar.state}</span>
+        <StateBadge domain="pillar" state={sidecar.state === "running" ? "ok" : sidecar.state} />
       </div>
       <dl className="sy-sidecar-facts">
         {sidecar.started_at !== null && (
@@ -492,9 +546,9 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
       </dl>
       {/* The third column: what the sidecar last said, and the failure above it when
           there is one — each one clipped line, the whole text in the tooltip. */}
-      <div className="sy-sidecar-out">
+      <div className={wide ? "sy-sidecar-out sy-sidecar-out-wide" : "sy-sidecar-out"}>
         {sidecar.last_failure !== null && (
-          <p className="sy-sidecar-failure" role="alert" title={sidecar.last_failure}>
+          <p className="sy-sidecar-failure" role="alert">
             {sidecar.last_failure}
             {sidecar.last_failure_at !== null && (
               <span className="sy-sidecar-when">
@@ -505,7 +559,7 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
           </p>
         )}
         {sidecar.last_line !== null && (
-          <p className="sy-sidecar-line" title={sidecar.last_line}>
+          <p className="sy-sidecar-line">
             <code>{sidecar.last_line}</code>
             {sidecar.last_line_at !== null && (
               <span className="sy-sidecar-when">
@@ -514,6 +568,17 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
               </span>
             )}
           </p>
+        )}
+        {(sidecar.last_failure !== null || sidecar.last_line !== null) && (
+          <span className="sy-sidecar-tools">
+            <Button variant="quiet" aria-expanded={wide} onClick={() => { setWide(!wide); }}>
+              {wide ? "Show less" : "Show all"}
+            </Button>
+            <CopyButton
+              value={[sidecar.last_failure, sidecar.last_line].filter((t) => t !== null).join("\n")}
+              label={`Copy ${sidecar.name} output`}
+            />
+          </span>
         )}
       </div>
     </Row>
@@ -545,11 +610,11 @@ function ScopedKillsPanel() {
         scheduled rules, repo triggers, e-mail triage — live on <Link to="/autopilot">Autopilot</Link>.
       </PanelNote>
       {kills.isError && kills.data === undefined && <SystemListError error={kills.error} what="the project brakes" />}
-      {!kills.isError && kills.data === undefined && <p className="sy-loading">reading the project brakes…</p>}
+      {!kills.isError && kills.data === undefined && <Loading>reading the project brakes…</Loading>}
       {projects.isError && projects.data === undefined && (
         <SystemListError error={projects.error} what="the projects" />
       )}
-      {!projects.isError && projects.data === undefined && <p className="sy-loading">reading the projects…</p>}
+      {!projects.isError && projects.data === undefined && <Loading>reading the projects…</Loading>}
       {projects.data !== undefined && projects.data.length > 0 && (
         <ul className="sy-brakes" aria-label="Project brakes">
           {projects.data.map((project) => {
@@ -688,6 +753,8 @@ function BudgetPanel() {
   const [badCeilings, setBadCeilings] = useState<string[]>([]);
   const [quotaBrakeForm, setQuotaBrakeForm] = useState<QuotaBrakeFormState | null>(null);
   const [badQuotaBrake, setBadQuotaBrake] = useState(false);
+  const [budgetSaved, setBudgetSaved] = useState(false);
+  const [quotaSaved, setQuotaSaved] = useState(false);
 
   useEffect(() => {
     if (budget.data !== undefined && form === null) {
@@ -702,12 +769,12 @@ function BudgetPanel() {
   }, [quotaBrake.data, quotaBrakeForm]);
 
   return (
-    <Panel title="Budget">
+    <Panel title="Limits">
       {budget.isError && budget.data === undefined && (
         <SystemListError error={budget.error} what="the budget" />
       )}
       {!budget.isError && budget.data === undefined && (
-        <p className="sy-loading">reading the budget…</p>
+        <Loading>reading the budget…</Loading>
       )}
       {budget.data !== undefined && budget.data.paused && (
         <p className="sy-budget-paused" role="status">
@@ -740,8 +807,11 @@ function BudgetPanel() {
                   inputMode="decimal"
                   placeholder="no ceiling"
                   value={form.windowLimit}
+                  aria-invalid={badCeilings.includes("the window limit") ? true : undefined}
+                  aria-describedby={badCeilings.length > 0 ? "sy-budget-error" : undefined}
                   onChange={(event) => {
                     setForm({ ...form, windowLimit: event.target.value });
+                    setBudgetSaved(false);
                     setBadCeilings([]);
                   }}
                 />
@@ -775,8 +845,11 @@ function BudgetPanel() {
                   inputMode="decimal"
                   placeholder="no ceiling"
                   value={form.hourlyLimit}
+                  aria-invalid={badCeilings.includes("the hourly limit") ? true : undefined}
+                  aria-describedby={badCeilings.length > 0 ? "sy-budget-error" : undefined}
                   onChange={(event) => {
                     setForm({ ...form, hourlyLimit: event.target.value });
+                    setBudgetSaved(false);
                     setBadCeilings([]);
                   }}
                 />
@@ -845,14 +918,17 @@ function BudgetPanel() {
                   time_cost_per_hour_usd: parseAmount(form.timeCost),
                   relay_chain_limit_usd: parseAmount(form.relayChainLimit),
                 };
-                setBudget.mutate(change);
+                setBudget.mutate(change, { onSuccess: () => { setBudgetSaved(true); } });
               }}
             />
+            <p className="sy-meta" role="status">{budgetSaved ? "saved" : null}</p>
             {badCeilings.length > 0 && (
-              <ErrorNote>
-                the budget was not sent — {badCeilings.join(" and ")} must be a
-                number, or blank for no ceiling
-              </ErrorNote>
+              <div id="sy-budget-error">
+                <ErrorNote>
+                  the budget was not sent — {badCeilings.join(" and ")} must be a
+                  number, or blank for no ceiling
+                </ErrorNote>
+              </div>
             )}
             {setBudget.isError && (
               <ErrorNote>
@@ -869,9 +945,10 @@ function BudgetPanel() {
                 <input
                   type="checkbox"
                   checked={quotaBrakeForm.enabled}
-                  onChange={(event) =>
-                    setQuotaBrakeForm({ ...quotaBrakeForm, enabled: event.target.checked })
-                  }
+                  onChange={(event) => {
+                    setQuotaBrakeForm({ ...quotaBrakeForm, enabled: event.target.checked });
+                    setQuotaSaved(false);
+                  }}
                 />
                 Enable quota brake
               </label>
@@ -885,8 +962,11 @@ function BudgetPanel() {
                   type="text"
                   inputMode="numeric"
                   value={quotaBrakeForm.fiveHour}
+                  aria-invalid={badQuotaBrake ? true : undefined}
+                  aria-describedby={badQuotaBrake ? "sy-quota-error" : undefined}
                   onChange={(event) => {
                     setQuotaBrakeForm({ ...quotaBrakeForm, fiveHour: event.target.value });
+                    setQuotaSaved(false);
                     setBadQuotaBrake(false);
                   }}
                 />
@@ -899,14 +979,20 @@ function BudgetPanel() {
                   type="text"
                   inputMode="numeric"
                   value={quotaBrakeForm.sevenDay}
+                  aria-invalid={badQuotaBrake ? true : undefined}
+                  aria-describedby={badQuotaBrake ? "sy-quota-error" : undefined}
                   onChange={(event) => {
                     setQuotaBrakeForm({ ...quotaBrakeForm, sevenDay: event.target.value });
+                    setQuotaSaved(false);
                     setBadQuotaBrake(false);
                   }}
                 />
               </div>
             </div>
-            <p className="sy-field-hint">only {quotaBrake.data.provider}'s windows count</p>
+            <p className="sy-field-hint">
+              When {quotaBrake.data.provider}'s usage passes either level, new autonomous work
+              waits until the window resets. Only {quotaBrake.data.provider}'s windows count.
+            </p>
             <ConfirmButton
               label="Save quota brake"
               confirmLabel="Save these three quota brake settings to the daemon"
@@ -919,15 +1005,21 @@ function BudgetPanel() {
                   return;
                 }
                 setBadQuotaBrake(false);
-                setQuotaBrake.mutate({
-                  enabled: quotaBrakeForm.enabled,
-                  pause_above_percent_5h: fiveHour,
-                  pause_above_percent_7d: sevenDay,
-                });
+                setQuotaBrake.mutate(
+                  {
+                    enabled: quotaBrakeForm.enabled,
+                    pause_above_percent_5h: fiveHour,
+                    pause_above_percent_7d: sevenDay,
+                  },
+                  { onSuccess: () => { setQuotaSaved(true); } },
+                );
               }}
             />
+            <p className="sy-meta" role="status">{quotaSaved ? "saved" : null}</p>
             {badQuotaBrake && (
-              <ErrorNote>the quota brake was not sent — usage must be an integer from 1 to 100</ErrorNote>
+              <div id="sy-quota-error">
+                <ErrorNote>the quota brake was not sent — usage must be an integer from 1 to 100</ErrorNote>
+              </div>
             )}
             {setQuotaBrake.isError && (
               <ErrorNote>the quota brake was not changed — the núcleo refused or did not answer</ErrorNote>
@@ -1012,7 +1104,7 @@ function BackupsPanel() {
         <SystemListError error={backups.error} what="the backups" />
       )}
       {!backups.isError && backups.data === undefined && (
-        <p className="sy-loading">reading the backups…</p>
+        <Loading>reading the backups…</Loading>
       )}
       {backups.data !== undefined && backups.data.length > 0 && (
         <Rows label="Backups">
@@ -1109,7 +1201,7 @@ function PiiObservations() {
   return (
     <Panel title="PII observations">
       {pii.isError && pii.data === undefined && <SystemListError error={pii.error} what="the PII tally" />}
-      {!pii.isError && pii.data === undefined && <p className="sy-loading">reading…</p>}
+      {!pii.isError && pii.data === undefined && <Loading>reading…</Loading>}
       {pii.data !== undefined && pii.data.length === 0 && <Quiet says="nothing recorded." />}
       {pii.data !== undefined && pii.data.length > 0 && (
         <table className="sy-pii-table">
@@ -1145,6 +1237,13 @@ function PiiTallyRowView({ row }: { row: PiiTallyRow }) {
 
 const TOKEN_LEVELS: ApiTokenLevel[] = ["read-only", "run-creating", "admin"];
 
+/** What each level allows, said beside the choice and not only in a paragraph above it. */
+const TOKEN_LEVEL_HINT: Record<ApiTokenLevel, string> = {
+  "read-only": "reads most things, not the budget or the kill switch",
+  "run-creating": "can also start work",
+  admin: "everything",
+};
+
 function TokensView() {
   return (
     <>
@@ -1169,10 +1268,17 @@ function TokensPanel() {
   const [name, setName] = useState("");
   const [level, setLevel] = useState<ApiTokenLevel>("read-only");
   const [minted, setMinted] = useState<CreatedApiToken | null>(null);
+  // An admin token is everything, so the first press only asks; the second mints.
+  const [adminAsked, setAdminAsked] = useState(false);
 
   function handleMint() {
     const trimmed = name.trim();
     if (trimmed === "") return;
+    if (level === "admin" && !adminAsked) {
+      setAdminAsked(true);
+      return;
+    }
+    setAdminAsked(false);
     mintToken.mutate(
       { name: trimmed, level },
       {
@@ -1217,42 +1323,66 @@ function TokensPanel() {
             className="sy-field-input"
             type="text"
             placeholder="e.g. ci-runner"
+            maxLength={64}
+            aria-describedby="sy-token-name-hint"
             value={name}
-            onChange={(event) => setName(event.target.value)}
+            onChange={(event) => {
+              setName(event.target.value);
+              setAdminAsked(false);
+            }}
           />
+          <span className="sy-field-hint" id="sy-token-name-hint">
+            1&ndash;64 characters: letters, digits, hyphen or underscore.
+          </span>
         </div>
         <fieldset className="sy-token-levels">
           <legend>Level</legend>
           <div className="sy-token-level-set">
             {TOKEN_LEVELS.map((candidate) => (
-              <label key={candidate} className="sy-token-level">
+              <div key={candidate} className="sy-token-level-item">
+              <label className="sy-token-level">
                 <input
                   type="radio"
                   name="sy-token-level"
                   value={candidate}
                   checked={level === candidate}
-                  onChange={() => setLevel(candidate)}
+                  aria-describedby={`sy-token-level-${candidate}`}
+                  onChange={() => {
+                    setLevel(candidate);
+                    setAdminAsked(false);
+                  }}
                 />
                 {candidate}
               </label>
+              <span className="sr-only" id={`sy-token-level-${candidate}`}>
+                {TOKEN_LEVEL_HINT[candidate]}
+              </span>
+              </div>
             ))}
           </div>
+          <span className="sy-field-hint">{TOKEN_LEVEL_HINT[level]}</span>
         </fieldset>
         <Button
           type="submit"
           variant="ghost"
           disabled={mintToken.isPending || name.trim() === ""}
         >
-          Mint token
+          {adminAsked ? "Mint an admin token" : "Mint token"}
         </Button>
       </form>
+      {adminAsked && (
+        <p className="sy-note" role="status">
+          An admin token can do everything this machine can, including the budget and the kill
+          switch. Press the button again to mint it, or pick another level.
+        </p>
+      )}
       {mintToken.isError && <MintError error={mintToken.error} />}
 
       {tokens.isError && tokens.data === undefined && (
         <SystemListError error={tokens.error} what="the API tokens" />
       )}
       {!tokens.isError && tokens.data === undefined && (
-        <p className="sy-loading">reading the tokens…</p>
+        <Loading>reading the tokens…</Loading>
       )}
       {tokens.data !== undefined && tokens.data.length === 0 && (
         <Quiet says="no token has been minted." />
@@ -1383,7 +1513,7 @@ function EmailConfigPanel() {
         <SystemListError error={email.error} what="the e-mail configuration" />
       )}
       {!email.isError && email.data === undefined && (
-        <p className="sy-loading">reading…</p>
+        <Loading>reading…</Loading>
       )}
       {email.data !== undefined && <EmailConfigFacts config={email.data} />}
     </Panel>
@@ -1432,7 +1562,7 @@ function EmailConfigFacts({ config }: { config: EmailConfig }) {
       </dl>
       <p className="sy-note">
         {config.local_triage_disabled === null
-          ? "local triage: nothing is wrong."
+          ? "local triage: no problem reported."
           : `local triage disabled: ${config.local_triage_disabled}`}
       </p>
     </>
@@ -1447,7 +1577,7 @@ function VoiceConfigPanel() {
         <SystemListError error={voice.error} what="the voice configuration" />
       )}
       {!voice.isError && voice.data === undefined && (
-        <p className="sy-loading">reading…</p>
+        <Loading>reading…</Loading>
       )}
       {voice.data !== undefined && <VoiceConfigFacts config={voice.data} />}
     </Panel>
@@ -1496,7 +1626,7 @@ function CalendarConfigPanel() {
         />
       )}
       {!calendar.isError && calendar.data === undefined && (
-        <p className="sy-loading">reading…</p>
+        <Loading>reading…</Loading>
       )}
       {calendar.data !== undefined && (
         <CalendarConfigFacts config={calendar.data} />
@@ -1541,6 +1671,15 @@ function CalendarConfigFacts({ config }: { config: CalendarConfig }) {
  * when somebody is about to mint their first token and most needs the three
  * levels spelled out.
  */
+/** "reading…" as a polite status, so the wait is announced and the layout has one name for it. */
+function Loading({ children }: { children: ReactNode }) {
+  return (
+    <p className="sy-loading" role="status" aria-busy="true">
+      {children}
+    </p>
+  );
+}
+
 function PanelNote({ empty, says, children }: { empty: boolean; says: string; children: ReactNode }) {
   if (empty) return <Quiet says={says}>{children}</Quiet>;
   return <p className="sy-note">{children}</p>;

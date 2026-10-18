@@ -24,7 +24,22 @@ Adapt the workflow to the current repository without implementing product change
    - CLAUDE.md (only project-specific sections if needed) — never touch a block the daemon manages there; read first, never replace, never duplicate it. <!-- F5-OPEN: whether the daemon still writes a managed import into CLAUDE.md, and its markers. -->
    - `<state_dir>/project.yaml` — write it as **valid YAML** following the rules in "Writing valid `project.yaml`" below. Ensure the `memory_tuning` block exists with defaults (`consolidation_threshold_lines: 150`, `floor: 50`, `ceiling: 300`, `last_ratios: []`, `last_consolidated_at: ""`). Leave existing values intact if the block is already populated.
    - `<state_dir>/models.yaml` — create it if absent, with tool/model assignments per phase; leave existing assignments intact.
-   - `<state_dir>/memory.md` (and `<state_dir>/decisions.md` if absent: header, format line, empty `## Entries`).
+   - `<state_dir>/memory.md` (and `<state_dir>/decisions.md` if absent: header, format line, empty `## Entries`). `memory.md` MUST carry, before `## Entries`, a `## Topic vocabulary` block with exactly two fenced lists: the canonical tags first, then the legacy ones (`(none)` when there are none). Every entry is one line, `- YYYY-MM-DD [tag] fact`, with one canonical tag. The controller slices memory by tag and `assemble_prompt.py` refuses a file without this block, so a `memory.md` without it stops the first execute dispatch. Keep the canonical list short and drawn from the project (e.g. `build tests workflow`), plus `workflow` and `memory`, which later phases write to. Example:
+
+     ````markdown
+     ## Topic vocabulary
+
+     ```
+     build tests workflow memory
+     ```
+
+     ```
+     (none)
+     ```
+
+     ## Entries
+     - 2026-01-01 [tests] The test map is nucleos.tests.yaml; only the daemon's verify runs it.
+     ````
 6. Preserve the workflow role structure (planner, executor, reviewer). Do not hardcode tool or model names anywhere except `<state_dir>/models.yaml`.
 7. Record uncertainty explicitly in `assumptions` and `unknowns`.
 8. After filling `project.yaml`, prompt the user to review `<state_dir>/models.yaml` and adjust tool/model assignments if the defaults do not match their setup.

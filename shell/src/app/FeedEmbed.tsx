@@ -1,4 +1,5 @@
 import { Link } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import { useRecentFeed, type FeedEntry } from "../data/feed";
 import { ErrorNote, Panel, RefusalNote, RelativeTime } from "../ui";
@@ -50,7 +51,7 @@ export function FeedEmbed({ lines = EMBED_LINES }: FeedEmbedProps) {
     >
       {feed.isError && feed.data === undefined && <FeedError error={feed.error} />}
       {feed.data !== undefined && rows.length === 0 && (
-        <p className="ap-empty">the núcleo has not written a line yet.</p>
+        <p className="ap-empty">the {DAEMON_NAME} has not written a line yet.</p>
       )}
       {rows.length > 0 && (
         <ul className="ap-feed" aria-label="Recent feed lines">
@@ -89,7 +90,6 @@ function FeedLine({ entry }: { entry: FeedEntry }) {
           <Link
             to={`/runs/${String(entry.run_id)}`}
             className="ap-link"
-            aria-label={`${summary} — open run ${String(entry.run_id)}`}
           >
             {summary}
           </Link>
@@ -102,5 +102,5 @@ function FeedLine({ entry }: { entry: FeedEntry }) {
 
 function FeedError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the feed</ErrorNote>;
+  return <ErrorNote>Could not reach the {DAEMON_NAME} — nothing is known about the feed.</ErrorNote>;
 }

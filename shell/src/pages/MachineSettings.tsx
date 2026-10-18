@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
   useForgetSecret,
@@ -51,6 +51,18 @@ export function MachineSettings() {
   const config = useMachineConfig();
   const secrets = useMachineSecrets();
   const [chosen, setChosen] = useState<string | null>(null);
+  // Which files have an unsaved draft: every panel stays mounted, so without this a
+  // half-written file is invisible once another one is chosen.
+  const [dirtyAreas, setDirtyAreas] = useState<ReadonlySet<string>>(new Set());
+  const markDirty = useCallback((areaName: string, dirty: boolean) => {
+    setDirtyAreas((previous) => {
+      if (previous.has(areaName) === dirty) return previous;
+      const next = new Set(previous);
+      if (dirty) next.add(areaName);
+      else next.delete(areaName);
+      return next;
+    });
+  }, []);
 
   if (config.isPending) return <p className="sy-loading">reading this machine's settings…</p>;
   if (config.error) {
@@ -92,11 +104,22 @@ export function MachineSettings() {
                   type="button"
                   className={current ? "sy-settings-item sy-settings-item-current" : "sy-settings-item"}
                   aria-current={current ? "true" : undefined}
+                  aria-describedby={`marks-${setting.area}`}
                   onClick={() => setChosen(setting.area)}
                 >
                   <span className="sy-settings-item-name">{setting.area}</span>
+                  {dirtyAreas.has(setting.area) && (
+                    <span className="sy-meta sy-settings-item-dirty" aria-hidden="true">
+                      unsaved
+                    </span>
+                  )}
+                  {/* The marks are drawn for the eye; this is what a screen reader gets, as the
+                      button's description so its NAME stays the visible area. */}
+                  <span className="sr-only" id={`marks-${setting.area}`}>
+                    {markSummary(setting, own, dirtyAreas.has(setting.area))}
+                  </span>
                   {/* Two dots, file and credential: filled when there is one, hollow when not. */}
-                  <span className="sy-settings-item-marks">
+                  <span className="sy-settings-item-marks" aria-hidden="true">
                     <span
                       className={setting.exists ? "sy-mark sy-mark-on" : "sy-mark"}
                       title={setting.exists ? "file written" : "file never written"}
@@ -120,6 +143,7 @@ export function MachineSettings() {
             <div key={setting.path} hidden={setting.area !== area}>
               <SettingPanel
                 setting={setting}
+                onDirty={markDirty}
                 secrets={(secrets.data?.secrets ?? []).filter((row) => row.area === setting.area)}
               />
             </div>
@@ -128,6 +152,17 @@ export function MachineSettings() {
       </div>
     </>
   );
+}
+
+/** The file and credential marks as words, for the row's accessible description. */
+function markSummary(setting: MachineSetting, own: MachineSecret[], unsaved: boolean): string {
+  const missing = own.filter((secret) => secret.present !== true).length;
+  const parts = [setting.exists ? "file written" : "file never written"];
+  if (own.length > 0) {
+    parts.push(missing === 0 ? "credentials set" : `${missing} credential${missing === 1 ? "" : "s"} not set`);
+  }
+  if (unsaved) parts.push("unsaved changes");
+  return parts.join(", ");
 }
 
 /**
@@ -142,15 +177,26 @@ export function MachineSettings() {
 function SettingPanel({
   setting,
   secrets,
+  onDirty,
 }: {
   setting: MachineSetting;
   secrets: MachineSecret[];
+  onDirty: (area: string, dirty: boolean) => void;
 }) {
   const write = useWriteMachineSetting();
   const [draft, setDraft] = useState(setting.contents ?? "");
   const [saved, setSaved] = useState(false);
 
   const dirty = draft !== (setting.contents ?? "");
+  useEffect(() => {
+    onDirty(setting.area, dirty);
+  }, [onDirty, setting.area, dirty]);
+
+  const save = () => {
+    if (!dirty || write.isPending) return;
+    write.mutate({ path: setting.path, contents: draft }, { onSuccess: () => setSaved(true) });
+  };
+  const errorId = `setting-${setting.area}-error`;
 
   return (
     <Panel
@@ -171,7 +217,7 @@ function SettingPanel({
       </dl>
 
       <label className="sy-setting-label" htmlFor={`setting-${setting.area}`}>
-        <span className="sy-meta">{setting.display}</span>
+        {setting.display}
       </label>
       <textarea
         id={`setting-${setting.area}`}
@@ -179,6 +225,14 @@ function SettingPanel({
         spellCheck={false}
         rows={14}
         value={draft}
+        aria-invalid={write.error != null ? true : undefined}
+        aria-describedby={write.error != null ? errorId : undefined}
+        onKeyDown={(event) => {
+          if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+            event.preventDefault();
+            save();
+          }
+        }}
         placeholder={
           setting.exists
             ? undefined
@@ -193,27 +247,38 @@ function SettingPanel({
       <div className="sy-setting-controls">
         <Button
           disabled={!dirty || write.isPending}
-          onClick={() => {
-            write.mutate(
-              { path: setting.path, contents: draft },
-              { onSuccess: () => setSaved(true) },
-            );
-          }}
+          onClick={save}
         >
           {write.isPending ? "saving…" : "Save"}
         </Button>
+        {dirty && !write.isPending && (
+          <Button
+            variant="ghost"
+            onClick={() => {
+              setDraft(setting.contents ?? "");
+              setSaved(false);
+            }}
+          >
+            Revert
+          </Button>
+        )}
         {dirty && !write.isPending && <span className="sy-meta">unsaved</span>}
-        {saved && !dirty && <span className="sy-meta">saved &mdash; {setting.takes_effect}</span>}
+        <span className="sy-meta" role="status">
+          {saved && !dirty ? <>saved &mdash; {setting.takes_effect}</> : null}
+        </span>
       </div>
 
       {/* The parser's own words. A generic "invalid" would send somebody back to
           a file they cannot see to look for a line nobody named. */}
-      {write.error != null &&
-        (isApiRefusal(write.error) ? (
-          <RefusalNote refusal={write.error} />
-        ) : (
-          <ErrorNote>the núcleo did not answer — nothing was written</ErrorNote>
-        ))}
+      {write.error != null && (
+        <div id={errorId}>
+          {isApiRefusal(write.error) ? (
+            <RefusalNote refusal={write.error} />
+          ) : (
+            <ErrorNote>the núcleo did not answer — nothing was written</ErrorNote>
+          )}
+        </div>
+      )}
 
       {/* After the file, not before it: the credential is the second half of the same
           decision, and above the file it pushed every editor in the grid out of line. */}
@@ -241,6 +306,8 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
   const store = useStoreSecret();
   const forget = useForgetSecret();
   const [value, setValue] = useState("");
+  // What just happened, said in a live region: an emptied input is not an announcement.
+  const [outcome, setOutcome] = useState<"stored" | "forgotten" | null>(null);
 
   return (
     <div className="sy-secret">
@@ -267,6 +334,7 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
           placeholder={secret.present === true ? "replace it" : "paste it here"}
           onChange={(event) => {
             setValue(event.target.value);
+            setOutcome(null);
           }}
         />
         <Button
@@ -276,7 +344,7 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
               { key: secret.key, value },
               // Cleared on success only. Clearing it on failure would take away
               // what somebody pasted along with the error telling them why.
-              { onSuccess: () => { setValue(""); } },
+              { onSuccess: () => { setValue(""); setOutcome("stored"); } },
             );
           }}
         >
@@ -293,16 +361,28 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
                label it made the button wider than the box it is for. */
             sayAs={`Forget ${secret.key}`}
             onConfirm={() => {
-              forget.mutate(secret.key);
+              forget.mutate(secret.key, { onSuccess: () => { setOutcome("forgotten"); } });
             }}
           />
         )}
       </div>
+      <p className="sy-meta" role="status">
+        {outcome === "stored" && "stored"}
+        {outcome === "forgotten" && "forgotten"}
+      </p>
       {store.error != null &&
         (isApiRefusal(store.error) ? (
           <RefusalNote refusal={store.error} />
         ) : (
           <ErrorNote>the núcleo did not answer — nothing was stored</ErrorNote>
+        ))}
+      {/* The destructive half fails as loudly as the other: a Forget that silently did
+          nothing leaves the credential set while the button goes back to normal. */}
+      {forget.error != null &&
+        (isApiRefusal(forget.error) ? (
+          <RefusalNote refusal={forget.error} />
+        ) : (
+          <ErrorNote>the núcleo did not answer — nothing was forgotten</ErrorNote>
         ))}
     </div>
   );

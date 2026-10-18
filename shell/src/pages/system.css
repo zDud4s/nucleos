@@ -289,7 +289,7 @@
   justify-content: space-between;
   gap: var(--space-2);
   min-width: 0;
-  min-height: 1.5rem;
+  min-height: var(--hit-min);
 }
 
 .sy-subsystem-reason {
@@ -366,6 +366,20 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Opened in full: the clip is a reading aid, not a limit on what can be read. */
+.sy-sidecar-out-wide .sy-sidecar-line,
+.sy-sidecar-out-wide .sy-sidecar-failure {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.sy-sidecar-tools {
+  display: flex;
+  gap: var(--space-2);
 }
 
 /* The daemon's own words, so mono like the line under it — in the danger
@@ -691,7 +705,7 @@
   cursor: pointer;
 }
 
-.sy-token-level + .sy-token-level {
+.sy-token-level-item + .sy-token-level-item .sy-token-level {
   border-left: 1px solid var(--border);
 }
 
@@ -889,6 +903,12 @@
 .sy-setting-label {
   display: block;
   margin: 0 0 var(--space-1);
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+.sy-settings-item-dirty {
+  margin-left: auto;
 }
 
 .sy-setting-editor {
@@ -982,7 +1002,7 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  min-height: 1.75rem;
+  min-height: var(--hit-min);
 }
 
 .sy-notify-switch {
@@ -1018,6 +1038,16 @@
 
 .sy-notify-disclose:hover {
   background: var(--surface-raised);
+  color: var(--text);
+}
+
+.sy-notify-disclose:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* The one sentence that must not be missed, lifted out of the paragraph it was buried in. */
+.sy-notify-never {
   color: var(--text);
 }
 
@@ -1089,7 +1119,7 @@ p.sy-notify-pop {
   flex-wrap: wrap;
   align-items: center;
   column-gap: var(--space-2);
-  min-height: 1.75rem;
+  min-height: var(--hit-min);
 }
 
 /* The kind's own name, not its family's — truncated rather than wrapped, with

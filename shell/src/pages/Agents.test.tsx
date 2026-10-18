@@ -144,6 +144,11 @@ async function openEditor(name: string): Promise<HTMLElement> {
   return screen.findByRole("dialog", { name: `Editing ${name}` });
 }
 
+/** The editor holds one section at a time; the Remove, Memory and Tools ones sit behind a tab. */
+function openTab(editor: HTMLElement, name: string) {
+  fireEvent.click(within(editor).getByRole("tab", { name }));
+}
+
 /* ------------------------------------------------------------ the shape -- */
 
 describe("Agents - the shape of the page", () => {
@@ -516,6 +521,7 @@ describe("Agents - what stands on an agent", () => {
     renderWithQuery(<Agents />);
 
     const editor = await openEditor("controller");
+    openTab(editor, "Remove");
     expect(within(editor).getByText(/directs Finanças/)).toBeDefined();
     expect(within(editor).getByText(/an item of a team run, or of a job/)).toBeDefined();
   });
@@ -525,6 +531,7 @@ describe("Agents - what stands on an agent", () => {
     renderWithQuery(<Agents />);
 
     const editor = await openEditor("copywriter");
+    openTab(editor, "Remove");
     expect(within(editor).getByText(/No team names copywriter/)).toBeDefined();
     expect(within(editor).getByText(/is not something this page can see/)).toBeDefined();
   });
@@ -543,6 +550,7 @@ describe("Agents - a delete answering 409", () => {
     renderWithQuery(<Agents />);
 
     const editor = await openEditor("director");
+    openTab(editor, "Remove");
     fireEvent.click(within(editor).getByRole("button", { name: "Delete" }));
     await afterDwell();
     fireEvent.click(within(editor).getByRole("button", { name: /Delete director/ }));
@@ -591,6 +599,8 @@ describe("Agents - an empty catalogue", () => {
 
     expect(await screen.findByRole("heading", { name: "No agent has been hired yet" })).toBeDefined();
     expect(screen.getByText(/a name, a speciality/i)).toBeDefined();
+    // The call to action sits inside the lesson as well as in the header.
+    expect(screen.getAllByRole("button", { name: "New agent" })).toHaveLength(2);
     expect(screen.queryByRole("table")).toBeNull();
   });
 });
@@ -611,6 +621,7 @@ describe("Agents - the agent's own memory", () => {
     renderWithQuery(<Agents />);
 
     const dialog = await openEditor("copywriter");
+    openTab(dialog, "Memory and context");
     const memory = await within(dialog).findByRole("region", { name: "Memory" });
 
     expect(await within(memory).findByText("Copy is short")).toBeDefined();
@@ -622,6 +633,44 @@ describe("Agents - the agent's own memory", () => {
 /* ------------------------------------------------------------- the route -- */
 
 describe("Agents - the route", () => {
+  it("splits the editor into sections and keeps Save on the definition only", async () => {
+    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
+    renderWithQuery(<Agents />);
+
+    const editor = await openEditor("copywriter");
+    expect(within(editor).getByRole("button", { name: "Save changes" })).toBeDefined();
+    expect(within(editor).queryByRole("region", { name: "Memory" })).toBeNull();
+
+    openTab(editor, "Tools and loadout");
+    expect(within(editor).queryByRole("button", { name: "Save changes" })).toBeNull();
+    expect(within(editor).queryByLabelText("Name")).toBeNull();
+    expect(within(editor).getAllByRole("button", { name: "Close" }).length).toBeGreaterThan(0);
+  });
+
+  it("says why Save is off, and says Saved once the daemon answered", async () => {
+    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
+    renderWithQuery(<Agents />);
+
+    const editor = await openEditor("copywriter");
+    fireEvent.change(within(editor).getByLabelText("Name"), { target: { value: "  " } });
+    expect(within(editor).getByText("Needs a name")).toBeDefined();
+    expect((within(editor).getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.change(within(editor).getByLabelText("Name"), { target: { value: "copywriter two" } });
+    fireEvent.click(within(editor).getByRole("button", { name: "Save changes" }));
+    expect(await within(editor).findByText("Saved")).toBeDefined();
+  });
+
+  it("keeps the Model hint attached to the field instead of replacing its name", async () => {
+    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
+    renderWithQuery(<Agents />);
+
+    const editor = await openEditor("copywriter");
+    const model = within(editor).getByLabelText("Model");
+    const hint = document.getElementById(model.getAttribute("aria-describedby") ?? "");
+    expect(hint?.textContent).toMatch(/engine's default/);
+  });
+
   it("is registered in the real tree and is no longer the placeholder", async () => {
     const rows = [agent()];
     const shared = daemonFetch(daemonState());

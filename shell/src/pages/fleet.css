@@ -414,6 +414,21 @@
   align-items: center;
 }
 
+/* The rack's New job: a word beside the plus, and a target no smaller than the hit minimum. */
+.fleet-rack-act .ui-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: var(--hit-min);
+}
+
+/* The headline's "+N more" sits inline with the sentence it continues. */
+.fleet-headline .ui-button {
+  display: inline;
+  padding-block: 0;
+  min-height: 0;
+}
+
 .fleet-rack-why {
   font-size: var(--text-sm);
   color: var(--text-muted);

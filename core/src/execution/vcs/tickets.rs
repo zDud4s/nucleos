@@ -71,6 +71,15 @@ pub struct RequestSummary {
     pub resolution_run_id: Option<i64>,
     #[sqlx(default)]
     pub resolution_status: Option<String>,
+    /// The resolution run's gate. `completed` says the agent stopped, not that the gate passed, and
+    /// `resolver::land_finished` hands a resolution to the queue only on no gate or `passed`.
+    #[sqlx(default)]
+    pub resolution_gate_status: Option<String>,
+    /// The resolution run's worktree was removed, which `land_finished` never reads again, so a
+    /// finished resolution in this state is never landed.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub resolution_worktree_gone: bool,
     /// This merge was itself a resolution's landing, so no agent will be minted for it.
     #[sqlx(default)]
     #[serde(default)]
@@ -152,7 +161,13 @@ pub async fn waiting_on_a_person(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec<Re
                 json_extract(args, '$.target') AS target,
                 output_tail, failure_reason, resolution_run_id, from_resolution,
                 (SELECT r.status FROM runs AS r WHERE r.id = vcs_requests.resolution_run_id)
-                    AS resolution_status
+                    AS resolution_status,
+                (SELECT r.gate_status FROM runs AS r WHERE r.id = vcs_requests.resolution_run_id)
+                    AS resolution_gate_status,
+                (resolution_run_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM worktrees AS w
+                     WHERE w.owner_kind = 'run' AND w.owner_id = vcs_requests.resolution_run_id
+                       AND w.removed_at IS NULL)) AS resolution_worktree_gone
            FROM vcs_requests
           WHERE ({WANTS_A_PERSON_SQL}) OR {OWNER_DECISION_SQL}
           ORDER BY id DESC"

@@ -1,24 +1,15 @@
 import { useRef, useState } from "react";
-import { FolderPlus, Globe, Plus, Upload } from "lucide-react";
+import { AtSign, Plus, Upload } from "lucide-react";
 import {
   DropdownMenu,
-  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "../ui/vendor/dropdown-menu";
-import { useChats, useIdeSessions, usePatchChat } from "../data/chats";
 import { isPicture } from "../lib/picture";
 
 /** The largest text file that is inlined into the message. Beyond this it is a document, not context. */
 export const MAX_TEXT_BYTES = 200 * 1024;
-
-/** The tools "Browse the web" stands for. Both come and go together. */
-const WEB_TOOLS = ["WebSearch", "WebFetch"];
 
 const NO_CHAT = "open a conversation first";
 
@@ -54,10 +45,11 @@ function readText(file: File): Promise<string> {
 /**
  * The composer's "+": what can be added to a message besides words.
  *
- * Upload sends pictures to the picture path and inlines small text files; Add context widens what
- * the conversation's tools may reach; Browse the web switches the two web tools. The last two are
- * properties of a conversation, so with no `chatId` (the front door) they are shown disabled with
- * the reason rather than hidden.
+ * Only what goes INTO this message: upload sends pictures to the picture path and inlines small
+ * text files; mention a file opens the "@" completion. What the conversation may reach (folders, the
+ * web) is a property of the conversation, not of one message, and lives in the "⋯" menu alone — it
+ * used to be here too, under different names for the same state. Mentioning needs a conversation,
+ * so with no `chatId` (the front door) it is shown disabled with the reason rather than hidden.
  */
 export function PlusMenu({
   chatId,
@@ -75,30 +67,6 @@ export function PlusMenu({
 }) {
   const input = useRef<HTMLInputElement | null>(null);
   const [note, setNote] = useState<string | null>(null);
-  const chats = useChats();
-  const row = chatId === null ? undefined : (chats.data ?? []).find((c) => c.chat_id === chatId);
-  const sessions = useIdeSessions(chatId !== null);
-  const patch = usePatchChat();
-
-  const granted = row?.extra_dirs ?? [];
-  const known = Array.from(
-    new Set([...(sessions.data ?? []).map((session) => session.cwd), ...granted]),
-  ).filter((folder) => folder !== row?.cwd);
-
-  const denied = row?.denied_tools ?? [];
-  const webOn = !WEB_TOOLS.some((tool) => denied.includes(tool));
-
-  const toggleFolder = (folder: string, on: boolean) => {
-    if (chatId === null) return;
-    const next = on ? [...granted, folder] : granted.filter((path) => path !== folder);
-    patch.mutate({ chatId, extra_dirs: next });
-  };
-
-  const toggleWeb = (on: boolean) => {
-    if (chatId === null) return;
-    const rest = denied.filter((tool) => !WEB_TOOLS.includes(tool));
-    patch.mutate({ chatId, denied_tools: on ? rest : [...rest, ...WEB_TOOLS] });
-  };
 
   const upload = async (files: FileList | null) => {
     const all = Array.from(files ?? []);
@@ -139,41 +107,11 @@ export function PlusMenu({
             <Upload className="chats-plus-icon" aria-hidden="true" />
             Upload from computer
           </DropdownMenuItem>
-          <DropdownMenuSub>
-            <DropdownMenuSubTrigger disabled={chatId === null}>
-              <FolderPlus className="chats-plus-icon" aria-hidden="true" />
-              Add context
-              {chatId === null && <span className="chats-tool-why">{NO_CHAT}</span>}
-            </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent className="chats-meta-menu">
-              <DropdownMenuItem onSelect={onMention}>Mention a file…</DropdownMenuItem>
-              <DropdownMenuLabel>Folders its tools may open</DropdownMenuLabel>
-              {known.length === 0 && (
-                <DropdownMenuItem disabled>no other folders known</DropdownMenuItem>
-              )}
-              {known.map((folder) => (
-                <DropdownMenuCheckboxItem
-                  key={folder}
-                  checked={granted.includes(folder)}
-                  disabled={patch.isPending}
-                  onSelect={(event) => event.preventDefault()}
-                  onCheckedChange={(on) => toggleFolder(folder, on === true)}
-                >
-                  {folder}
-                </DropdownMenuCheckboxItem>
-              ))}
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-          <DropdownMenuCheckboxItem
-            checked={chatId !== null && webOn}
-            disabled={chatId === null || patch.isPending}
-            onSelect={(event) => event.preventDefault()}
-            onCheckedChange={(on) => toggleWeb(on === true)}
-          >
-            <Globe className="chats-plus-icon" aria-hidden="true" />
-            Browse the web
+          <DropdownMenuItem disabled={chatId === null} onSelect={onMention}>
+            <AtSign className="chats-plus-icon" aria-hidden="true" />
+            Mention a file…
             {chatId === null && <span className="chats-tool-why">{NO_CHAT}</span>}
-          </DropdownMenuCheckboxItem>
+          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
       <input

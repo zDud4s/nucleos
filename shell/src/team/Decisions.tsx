@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { AgentEngine, AgentRequest, AgentToolPolicy } from "../data/agents";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import type { Proposal } from "../data/system";
 import { useRejectProposal } from "../data/waiting";
@@ -87,7 +88,9 @@ export function Decisions({ team, runs }: DecisionsProps) {
 
       <Panel title="Actions it wants to take" aside={<Count n={actions.data === undefined ? undefined : theirs.length} />}>
         {actions.isError && actions.data === undefined && (
-          <ErrorNote>NucleOS did not answer, so nothing is known about what is waiting.</ErrorNote>
+          <ErrorNote onRetry={() => void actions.refetch()}>
+            The {DAEMON_NAME} is not responding, so nothing is known about what is waiting.
+          </ErrorNote>
         )}
         {actions.isLoading && <Quiet says="Asking NucleOS…" />}
         {actions.data !== undefined && theirs.length === 0 && (
@@ -470,5 +473,5 @@ function OptionsWith({ current, known }: { current: string; known: string[] }) {
  */
 function DecisionRefusal({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>NucleOS did not answer, so {what}.</ErrorNote>;
+  return <ErrorNote>The {DAEMON_NAME} is not responding, so {what}.</ErrorNote>;
 }

@@ -12,6 +12,7 @@ import {
 } from "react";
 import { Link } from "@tanstack/react-router";
 import { FeedEmbed } from "../app/FeedEmbed";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   READINESS_MIN_AGREE_PERCENT,
@@ -191,17 +192,26 @@ export function Autopilot() {
           refusals={refusals}
           onRefusals={setRefusals}
         />
+        {/* The brakes sit with the ledger, before any evidence: the order this page's doc-comment
+            promises (brakes, then the setting, then the proof, then the work). */}
         <Ledger
           projects={projects.data}
           budget={budget.data}
           pending={proposals.data?.length}
         />
-        <ShadowReviewPanel projectId={selected} project={focused} />
-        <ScoreboardPanel projectId={selected} project={focused} />
-        <JudgePanel projectId={selected} project={focused} />
-        <JudgeReviewPanel projectId={selected} />
-        <ResolvePanel projectId={selected} project={focused} />
         <TriggerKills />
+        {focused !== undefined && <ProjectBar project={focused} />}
+        {selected !== null && <ShadowReviewPanel projectId={selected} project={focused} />}
+        {/* The panels below act on the project in focus. With none (the roster is still being read,
+            or it is empty and the carousel already says so) they would each repeat the same absence. */}
+        {selected !== null && (
+          <>
+            <ScoreboardPanel projectId={selected} project={focused} />
+            <JudgePanel projectId={selected} project={focused} />
+            <JudgeReviewPanel projectId={selected} />
+            <ResolvePanel projectId={selected} project={focused} />
+          </>
+        )}
         <JobsPanel rows={rows} selected={selected} />
         {/* Records of what the night and the barrier already settled. They were on the Waiting
             page, which now holds only what asks for a decision. */}
@@ -219,7 +229,7 @@ function RosterError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
     <ErrorNote>
-      The núcleo did not answer — nothing is known about the roster.
+      Could not reach the {DAEMON_NAME} — nothing is known about the roster.
     </ErrorNote>
   );
 }
@@ -261,7 +271,7 @@ function BudgetPausedBanner({ budget }: { budget: BudgetView }) {
         Autonomous work is held by the budget
       </span>
       <span className="ap-banner-text">
-        {budget.reason ?? "The núcleo did not say which ceiling"} — $
+        {budget.reason ?? `The ${DAEMON_NAME} did not say which ceiling`} — $
         {budget.window_spend_usd.toFixed(2)} spent this{" "}
         {PERIOD_NOUN[budget.period] ?? budget.period}
         {budget.limit_usd === null
@@ -429,6 +439,8 @@ function ProjectCarousel({
   const [pointedAt, setPointedAt] = useState<string | null>(null);
   const [cfg, setCfg] = useState<FanConfig>(() => fanConfig(900));
   const [dragging, setDragging] = useState(false);
+  /** The fan is a picture of the roster; the list under it carries the same triage in words. */
+  const [fanOn, setFanOn] = useState(true);
 
   const base = useId();
   const panelId = `${base}-panel`;
@@ -731,11 +743,11 @@ function ProjectCarousel({
     // The setting for the project in focus is the first thing under the header, with the fan beside it
     // (no section title above either: the index says "1 of N"). The fan is the roster's picture and
     // the setting is the control, so the control is never pushed below the picture.
-    <section className="ap-fan" aria-label="Projects">
+    <section className={fanOn ? "ap-fan" : "ap-fan ap-fan-nofan"} aria-label="Projects">
       {answered && rows.length === 0 && (
         <Teach title="No project is under autopilot">
           <p>
-            A project appears here once the núcleo has been told where it lives.
+            A project appears here once the {DAEMON_NAME} has been told where it lives.
             Nothing is broken and nothing is hidden — there is simply no project
             to govern yet.
           </p>
@@ -831,6 +843,7 @@ function ProjectCarousel({
                         tabIndex={at === index ? 0 : -1}
                         onClick={() => onSelect(row.project_id)}
                         onPointerEnter={() => setPointedAt(row.project_id)}
+                        onFocus={() => setPointedAt(row.project_id)}
                       >
                         {/* The name is content, not `aria-label`: the tab is found by what it says. */}
                         <span className="sr-only">
@@ -848,6 +861,9 @@ function ProjectCarousel({
                     <span className="ap-fan-hint">
                       <kbd>←</kbd> <kbd>→</kbd> on the row, or drag the cards
                     </span>
+                    <Button variant="quiet" onClick={() => setFanOn((on) => !on)}>
+                      {fanOn ? "Hide the fan" : "Show the fan"}
+                    </Button>
                   </div>
                 </div>
                 <p className="ap-fan-readout" aria-hidden="true">
@@ -858,6 +874,12 @@ function ProjectCarousel({
                     </>
                   )}
                 </p>
+                <RosterList
+                  rows={shown}
+                  selected={focused.project_id}
+                  refusals={refusals}
+                  onSelect={onSelect}
+                />
               </>
             )}
           </div>
@@ -867,6 +889,61 @@ function ProjectCarousel({
         {said}
       </p>
     </section>
+  );
+}
+
+/**
+ * The roster as a list, most urgent first: name, the map's word for its mode, and the same reading
+ * the fan's readout gives on hover. It is the triage the fan only draws, and it works with the
+ * keyboard and a screen reader as plain buttons. Ten or twenty projects fit on one screen.
+ */
+function RosterList({
+  rows,
+  selected,
+  refusals,
+  onSelect,
+}: {
+  rows: readonly ProjectSummary[];
+  selected: string;
+  refusals: ReadonlyMap<string, Refused>;
+  onSelect: (projectId: string) => void;
+}) {
+  return (
+    <ul className="ap-roster" aria-label="All projects by urgency">
+      {rows.map((row) => (
+        <li key={row.project_id}>
+          <button
+            type="button"
+            className="ap-roster-row"
+            aria-current={row.project_id === selected ? "true" : undefined}
+            onClick={() => onSelect(row.project_id)}
+          >
+            <span className="ap-roster-name">{row.project_id}</span>
+            <StateBadge domain="autopilot" state={row.mode} />
+            <span className="ap-roster-reading">
+              {readingOf(row, refusals.has(row.project_id))}
+            </span>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * The project every panel below acts on, kept in view while the page scrolls.
+ *
+ * Eight panels read or change the project in focus but the picker is at the top, so somebody in
+ * "Start a job" could send work to a project they stopped looking at. This bar sits in the flow
+ * after the brakes and sticks once the carousel has scrolled away.
+ */
+function ProjectBar({ project }: { project: ProjectSummary }) {
+  return (
+    <div className="ap-project-bar" role="group" aria-label="Project in focus">
+      <span className="ap-project-bar-label">Acting on</span>
+      <strong className="ap-project-bar-name">{project.project_id}</strong>
+      <StateBadge domain="autopilot" state={project.mode} />
+    </div>
   );
 }
 
@@ -1086,7 +1163,7 @@ function FocusSetting({
   return (
     <>
       <p className="ap-fan-focus-title">
-        Setting for<strong>{project.project_id}</strong>
+        Setting for <strong>{project.project_id}</strong>
       </p>
       <p id={gateId} className={gate.open ? "ap-fan-gate" : "ap-fan-gate ap-fan-gate-locked"}>
         {armed ? promotionConsequence(project) : gate.text}
@@ -1134,7 +1211,7 @@ function FocusSetting({
             type="text"
             value={root}
             spellCheck={false}
-            placeholder="C:\\path\\to\\the\\project"
+            placeholder={"C:\\path\\to\\the\\project"}
             onChange={(event) => setRoot(event.target.value)}
           />
           <Button
@@ -1183,7 +1260,7 @@ function FocusSetting({
       )}
       {failed && (
         <ErrorNote>
-          The núcleo did not answer — this project&apos;s setting is unchanged.
+          Could not reach the {DAEMON_NAME} — this project&apos;s setting is unchanged.
         </ErrorNote>
       )}
     </>
@@ -1277,7 +1354,8 @@ function ShadowReviewPanel({
               <RawInput raw={decision.tool_input} />
               <div className="ap-actions">
                 <ConfirmButton
-                  label={`Allow #${decision.id}`}
+                  label="Allow"
+                  subject={`#${decision.id}`}
                   confirmLabel="This should have been allowed"
                   variant="approve"
                   disabled={verdict.isPending}
@@ -1289,7 +1367,8 @@ function ShadowReviewPanel({
                   }
                 />
                 <ConfirmButton
-                  label={`Block #${decision.id}`}
+                  label="Block"
+                  subject={`#${decision.id}`}
                   confirmLabel="This should have been stopped"
                   variant="ghost"
                   disabled={verdict.isPending}
@@ -1313,7 +1392,7 @@ function ShadowReviewPanel({
 function VerdictError({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>the núcleo did not answer — nothing was recorded</ErrorNote>
+      <ErrorNote>Could not reach the {DAEMON_NAME} — nothing was recorded.</ErrorNote>
     );
   }
   return (
@@ -1363,7 +1442,7 @@ function ScoreboardPanel({
     return (
       <Section label="Scoreboard">
         <Quiet says={`${project?.project_id ?? "This project"} has recorded no classified decision yet.`}>
-          <p className="ap-note">Read-only. The bar is {READINESS_MIN_REVIEWED} reviews at {READINESS_MIN_AGREE_PERCENT}% agreement per action class; the ready/total figure is the núcleo&apos;s own and gates the promote control.</p>
+          <p className="ap-note">Read-only. The bar is {READINESS_MIN_REVIEWED} reviews at {READINESS_MIN_AGREE_PERCENT}% agreement per action class; the ready/total figure is the {DAEMON_NAME}&apos;s own and gates the promote control.</p>
         </Quiet>
       </Section>
     );
@@ -1410,7 +1489,7 @@ function ScoreboardPanel({
       )}
       {rows.length > 0 && (
         <p className="ap-note ap-note-foot">
-          the count that decides it is not the count below: the núcleo counts reviews distinct by tool and arguments, so ten answers to the same command are ten here and one at the bar.
+          the count that decides it is not the count below: the {DAEMON_NAME} counts reviews distinct by tool and arguments, so ten answers to the same command are ten here and one at the bar.
         </p>
       )}
     </Panel>
@@ -1432,6 +1511,7 @@ function TallyTable({ label, rows }: { label: string; rows: ClassTally[] }) {
           <th scope="col">reviewed</th>
           <th scope="col">agreed</th>
           <th scope="col">disagreed</th>
+          <th scope="col">agreement</th>
         </tr>
       </thead>
       <tbody>
@@ -1448,10 +1528,46 @@ function TallyTable({ label, rows }: { label: string; rows: ClassTally[] }) {
             <td className="ap-score-num">{row.reviewed}</td>
             <td className="ap-score-num">{row.agree}</td>
             <td className="ap-score-num">{row.disagree}</td>
+            <td className="ap-score-agree">
+              <Agreement row={row} />
+            </td>
           </tr>
         ))}
       </tbody>
     </table>
+  );
+}
+
+/**
+ * How often the owner agreed with the classifier, against the bar a class must clear.
+ *
+ * The page used to leave the division to the reader. The bar is the fill's full width: a class that
+ * reaches it AND has enough reviews says "ready", one that reaches the percentage on too few reviews
+ * says how many more it needs. Nothing reviewed yet is a dash, never 0%.
+ */
+function Agreement({ row }: { row: ClassTally }) {
+  if (row.reviewed === 0) return <span className="ap-agree-none">—</span>;
+  const percent = Math.round((row.agree / row.reviewed) * 100);
+  const enough = row.reviewed >= READINESS_MIN_REVIEWED;
+  const verdict =
+    percent < READINESS_MIN_AGREE_PERCENT
+      ? "below the bar"
+      : enough
+        ? "ready"
+        : `${READINESS_MIN_REVIEWED - row.reviewed} more reviews needed`;
+  return (
+    <span className="ap-agree">
+      <span className="ap-agree-figure">{percent}%</span>
+      <Meter
+        label={`Agreement in ${row.action_class}`}
+        value={percent}
+        ceiling={READINESS_MIN_AGREE_PERCENT}
+        tone="active"
+        format={(n) => `${n}%`}
+        head={false}
+      />
+      <span className="ap-agree-verdict">{verdict}</span>
+    </span>
   );
 }
 
@@ -1551,7 +1667,7 @@ function TriggerKills() {
                 </Button>
               ) : (
                 <p className="ap-trigger-note">
-                  The núcleo will store this brake and nothing in it reads the
+                  The {DAEMON_NAME} will store this brake and nothing in it reads the
                   value, so engaging it would stop nothing. It becomes a real
                   switch when the Teams slice lands and team triggers exist to
                   be held.
@@ -1563,7 +1679,7 @@ function TriggerKills() {
       </Rows>
       {setKill.isError && (
         <ErrorNote>
-          That brake was not changed — the núcleo refused or did not answer.
+          That brake was not changed — the {DAEMON_NAME} refused or could not be reached.
         </ErrorNote>
       )}
     </Panel>
@@ -1618,7 +1734,7 @@ function JobsPanel({
             rather than refuses — two different reasons the button would not do what it says. */}
         {target !== undefined && target.mode === "off" && (
           <p className="ap-hedge">
-            {target.project_id} is off, so the núcleo would not start this.
+            {target.project_id} is off, so the {DAEMON_NAME} would not start this.
           </p>
         )}
         {target !== undefined && target.queue_full && (
@@ -1701,7 +1817,7 @@ function JobRow({ job }: { job: Job }) {
         </Link>
       </div>
       {cancel.isError && (
-        <ErrorNote>The núcleo did not answer — job {job.id} was not stopped.</ErrorNote>
+        <ErrorNote>Could not reach the {DAEMON_NAME} — job {job.id} was not stopped.</ErrorNote>
       )}
     </Inset>
   );
@@ -1710,7 +1826,7 @@ function JobRow({ job }: { job: Job }) {
 function JobError({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
-      <ErrorNote>The núcleo did not answer — no job was started.</ErrorNote>
+      <ErrorNote>Could not reach the {DAEMON_NAME} — no job was started.</ErrorNote>
     );
   return (
     <RefusalNote
@@ -1741,7 +1857,7 @@ function ListError({ error, what }: { error: unknown; what: string }) {
     return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
     <ErrorNote>
-      The núcleo did not answer — nothing is known about {what}.
+      Could not reach the {DAEMON_NAME} — nothing is known about {what}.
     </ErrorNote>
   );
 }

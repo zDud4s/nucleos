@@ -1,7 +1,8 @@
-import { useEffect, useRef, type ReactNode } from "react";
-import { Link, useRouterState } from "@tanstack/react-router";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { ArrowRight } from "lucide-react";
 
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import { useLiveJobs, useLiveRuns } from "../data/fleet";
 import { folderOf, gateOf, headline, inAttentionOrder, whereWaiting } from "../data/roster";
@@ -13,6 +14,7 @@ import { PageHeader } from "../ui/PageHeader";
 import { Quiet } from "../ui/Quiet";
 import { RefusalNote } from "../ui/RefusalNote";
 import { SectionTitle } from "../ui/SectionTitle";
+import { Skeleton } from "../ui/Skeleton";
 import { StaleNote } from "../ui/StaleNote";
 import { Teach } from "../ui/Teach";
 import { readState } from "../ui/state-map";
@@ -94,21 +96,29 @@ export function Roster() {
         the last good read rather than the current one.
       */}
       {stale && <StaleNote dataUpdatedAt={projects.dataUpdatedAt} />}
-      {projects.isError && projects.data === undefined && <RosterError error={projects.error} />}
-
       {gone !== null && <LeftTheRoster removed={gone} />}
 
+      {/*
+        Three explicit branches, never two at once: a roster that failed before it ever answered
+        used to draw the error AND "reading the roster…", two claims that cannot both be true.
+        Pending is a status; a failure with nothing to show is the error with a way to retry; data
+        (fresh or stale) is the page.
+      */}
       {projects.data === undefined ? (
-        <p className="text-sm text-text-faint">reading the roster…</p>
+        projects.isError ? (
+          <RosterError error={projects.error} onRetry={() => void projects.refetch()} />
+        ) : (
+          <Skeleton label="Loading the projects" lines={3} />
+        )
       ) : rows.length === 0 ? (
         <Teach
-          title="No project has been registered with the núcleo"
-          action={<Link to="/projects/new">Add a project…</Link>}
+          title={`No project has been registered with the ${DAEMON_NAME}`}
+          action={<Link to="/projects/new">Add a project</Link>}
         >
           Adding one takes a folder and three questions.
         </Teach>
       ) : (
-        <Groups rows={rows} stale={stale} />
+        <Filtered rows={rows} stale={stale} />
       )}
     </>
   );
@@ -125,9 +135,79 @@ function asOf(dataUpdatedAt: number): string {
   return `as of ${new Date(dataUpdatedAt).toTimeString().slice(0, 8)} — `;
 }
 
-function RosterError({ error }: { error: unknown }) {
+function RosterError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the roster</ErrorNote>;
+  return (
+    <ErrorNote onRetry={onRetry}>
+      Could not load the projects: the {DAEMON_NAME} is not responding, so nothing is known about the
+      roster.
+    </ErrorNote>
+  );
+}
+
+/**
+ * The groups under a name filter.
+ *
+ * Twenty-five projects are looked up by name more often than they are read, and a tile grid cannot
+ * be searched by eye. The filter narrows every group at once (a group left empty is not drawn, as
+ * ever), `/` focuses it from anywhere that is not already a text field, Escape clears it, and Enter
+ * opens the one project left. Its text is held here, above `Groups`, so the groups stay a pure
+ * function of their rows.
+ */
+function Filtered({ rows, stale }: { rows: ProjectSummary[]; stale: boolean }) {
+  const navigate = useNavigate();
+  const [q, setQ] = useState("");
+  const input = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))
+      ) {
+        return;
+      }
+      event.preventDefault();
+      input.current?.focus();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const needle = q.trim().toLowerCase();
+  const shown = needle === "" ? rows : rows.filter((row) => row.project_id.toLowerCase().includes(needle));
+
+  return (
+    <>
+      <input
+        ref={input}
+        className="pj-field-input rs-filter"
+        type="search"
+        value={q}
+        placeholder="Filter by name (press / to focus)"
+        aria-label="Filter projects by name"
+        spellCheck={false}
+        onChange={(event) => setQ(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape" && q !== "") {
+            setQ("");
+          } else if (event.key === "Enter" && shown.length === 1) {
+            void navigate({
+              to: "/projects/$projectId/$view",
+              params: { projectId: shown[0].project_id, view: "state" },
+            });
+          }
+        }}
+      />
+      {shown.length === 0 ? (
+        <Quiet says={`No project is named like "${q.trim()}".`} />
+      ) : (
+        <Groups rows={shown} stale={stale} />
+      )}
+    </>
+  );
 }
 
 /**
@@ -175,7 +255,8 @@ type Mark = "review" | "fault" | "unmeasured" | "unnamed" | "flight";
 interface Reason {
   mark: Mark;
   says: string;
-  title?: string;
+  /** The fact behind the sentence, drawn under it; `title` repeats it for a pointer only as reinforcement. */
+  detail?: string;
 }
 
 /**
@@ -215,28 +296,23 @@ function reasonsFor(project: ProjectSummary, flight: string | null): Reason[] {
     });
   }
   if (gate === "failed") {
-    reasons.push({ mark: "fault", says: "gate failed", title: lastRun(project.last_gate_at ?? null) });
+    reasons.push({ mark: "fault", says: "gate failed", detail: lastRun(project.last_gate_at ?? null) });
   }
   // Info and not danger: the gate could not run — a missing command, a worktree that had gone — and
   // that says nothing at all about the code.
   if (gate === "errored") {
-    reasons.push({ mark: "unmeasured", says: "gate could not run", title: lastRun(project.last_gate_at ?? null) });
+    reasons.push({
+      mark: "unmeasured",
+      says: "gate could not run",
+      detail: lastRun(project.last_gate_at ?? null),
+    });
   }
   if (folder === "missing") {
-    reasons.push({ mark: "fault", says: "folder gone", title: `${project.project_root} is not on this disk` });
+    reasons.push({ mark: "fault", says: "folder gone", detail: `${project.project_root} is not on this disk` });
   }
   if (folder === "unset") reasons.push({ mark: "unnamed", says: "no folder named" });
   if (flight !== null) reasons.push({ mark: "flight", says: flight });
   return reasons;
-}
-
-/** What opening the card is for — the first thing in it somebody can act on. */
-function verbFor(project: ProjectSummary): string {
-  const gate = gateOf(project);
-  if (project.open_review_items > 0) return "Review";
-  if (gate === "failed" || gate === "errored") return "See the gate";
-  if (folderOf(project) !== "ok") return "Point at the folder";
-  return "Open";
 }
 
 function Groups({ rows, stale }: { rows: ProjectSummary[]; stale: boolean }) {
@@ -292,7 +368,6 @@ function Groups({ rows, stale }: { rows: ProjectSummary[]; stale: boolean }) {
                   key={project.project_id}
                   project={project}
                   reasons={reasonsFor(project, flight)}
-                  verb={verbFor(project)}
                 />
               );
             })}
@@ -308,7 +383,6 @@ function Groups({ rows, stale }: { rows: ProjectSummary[]; stale: boolean }) {
                 key={project.project_id}
                 project={project}
                 reasons={reasonsFor(project, flightOf(project.project_id))}
-                verb="Open"
               />
             ))}
           </div>
@@ -374,7 +448,13 @@ function ModeDot({ mode }: { mode: string }) {
   return <span className="rs-dot" data-mode={mode} aria-hidden="true" />;
 }
 
-function Card({ project, reasons, verb }: { project: ProjectSummary; reasons: Reason[]; verb: string }) {
+/*
+  The foot of every card says "Open" and nothing else: the whole card is one link and it goes to the
+  project's State, so a verb like "Review" or "See the gate" promised a destination (the proposals,
+  the gate) the link did not reach. The reasons above say what is wrong; the verb only says what the
+  click does.
+*/
+function Card({ project, reasons }: { project: ProjectSummary; reasons: Reason[] }) {
   return (
     <Link
       className="rs-card"
@@ -388,14 +468,15 @@ function Card({ project, reasons, verb }: { project: ProjectSummary; reasons: Re
       </span>
       <ul className="rs-card-reasons">
         {reasons.map((reason) => (
-          <li key={reason.says} title={reason.title}>
+          <li key={reason.says} title={reason.detail}>
             <span className="rs-mark" data-mark={reason.mark} aria-hidden="true" />
             {reason.says}
+            {reason.detail !== undefined && <span className="rs-reason-detail">{reason.detail}</span>}
           </li>
         ))}
       </ul>
       <span className="rs-card-act">
-        {verb}
+        Open
         <ArrowRight size={14} aria-hidden="true" />
       </span>
     </Link>

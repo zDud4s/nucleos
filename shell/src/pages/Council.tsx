@@ -16,6 +16,7 @@ import {
   type CouncilSummary,
   type CouncilView,
 } from "../data/council";
+import { DAEMON_NAME } from "../copy";
 import { CouncilDeliberation } from "./CouncilRounds";
 import { clearDraft, draftFrom, offerDraft, peekDraft } from "./council-draft";
 import { Courtroom, type CourtSelection } from "./council/Courtroom";
@@ -81,20 +82,31 @@ export function Council() {
       <PageHeader title="Council" headline={headlineFor(rows, councils.data !== undefined)} />
 
       {councilId === null ? (
-        <>
-          <CourtSetup />
+        <div className="council-index" data-running={rows.some((row) => councilIsAlive(row.status)) || undefined}>
+          {/* Same DOM order always, so a row keeps its element when its council settles. When a council is
+              deliberating the list slot is ordered first in CSS: the setup fills a screen and would bury it. */}
+          <div className="council-setup-slot">
+            <CourtSetup />
+          </div>
 
           {stale && <StaleNote dataUpdatedAt={councils.dataUpdatedAt} />}
-          {councils.isError && councils.data === undefined && <ListError error={councils.error} />}
+          {councils.isError && councils.data === undefined && (
+            <ListError error={councils.error} onRetry={() => void councils.refetch()} />
+          )}
 
-          <CouncilList rows={rows} answered={councils.data !== undefined} />
+          <div className="council-list-slot">
+            <CouncilList rows={rows} answered={councils.data !== undefined} />
+          </div>
 
           {councils.data !== undefined && rows.length === 0 && (
             <Teach title="No council has met yet">
-              <p>Ask a question above. Each seat answers on its own, and the chair writes one answer.</p>
+              <p>
+                Ask a question above. Each seat answers on its own, and the chair writes one answer. It pays off when
+                a question has no single right answer, such as which of two designs to build.
+              </p>
             </Teach>
           )}
-        </>
+        </div>
       ) : (
         <CouncilDetail key={councilId} id={councilId} />
       )}
@@ -113,9 +125,11 @@ function headlineFor(rows: CouncilSummary[], answered: boolean): string | undefi
     : `${rows.length} ${noun}, ${running} deliberating`;
 }
 
-function ListError({ error }: { error: unknown }) {
+function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the councils</ErrorNote>;
+  return (
+    <ErrorNote onRetry={onRetry}>Could not reach the {DAEMON_NAME} — nothing is known about the councils</ErrorNote>
+  );
 }
 
 /**
@@ -276,7 +290,7 @@ function OfferedSeats({ draft, onDraft }: { draft: CourtDraft; onDraft: (draft: 
  * those would throw away the one part of the refusal worth reading.
  */
 function ConveneRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — no council was convened</ErrorNote>;
+  if (!isApiRefusal(error)) return <ErrorNote>Could not reach the {DAEMON_NAME} — no council was convened</ErrorNote>;
   return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
 }
 
@@ -291,7 +305,7 @@ function CouncilList({ rows, answered }: { rows: CouncilSummary[]; answered: boo
           line is faint prose about to be replaced by the list; `Quiet` is the
           answer that there is no list, which is the panel's content and is set
           at the rung content is set at. */}
-      {!answered && <p className="council-loading">reading the councils…</p>}
+      {!answered && <p className="council-loading" role="status">reading the councils…</p>}
       {rows.length > 0 && (
         <Rows label="Councils">
           {rows.map((row, index) => (
@@ -355,7 +369,7 @@ function CouncilDetail({ id }: { id: string }) {
         {council.isError ? (
           <DetailError error={council.error} />
         ) : (
-          <p className="council-loading">reading the council…</p>
+          <p className="council-loading" role="status">reading the council…</p>
         )}
       </Panel>
     );
@@ -394,8 +408,8 @@ function CouncilSession({ id, detail }: { id: string; detail: CouncilView }) {
   const wingAction =
     detail.status === "running" ? (
       <ConfirmButton
-        label="Cancel"
-        confirmLabel="Cancel this council"
+        label="Stop council"
+        confirmLabel="Stop this council"
         variant="ghost"
         intent="stop"
         disabled={cancel.isPending}
@@ -422,8 +436,8 @@ function CouncilSession({ id, detail }: { id: string; detail: CouncilView }) {
         <span className="council-phase">{progressOf(detail)}</span>
         <span className="council-phase">
           {detail.rounds_run} of {detail.rounds} {detail.rounds === 1 ? "round" : "rounds"} run
-          {detail.stopped_early ? " · stopped early" : ""}
         </span>
+        {detail.stopped_early && <span className="council-early">stopped early</span>}
         <span className="council-chairman">{chairmanLine(detail)}</span>
         <RelativeTime at={detail.created_at} />
       </div>
@@ -457,7 +471,7 @@ function CouncilSession({ id, detail }: { id: string; detail: CouncilView }) {
           ended, which is not an error and is not silence either. */}
       {cancel.data?.cancelled === false && (
         <p className="council-note" role="status">
-          it had already ended.
+          It had already ended
         </p>
       )}
 
@@ -465,7 +479,7 @@ function CouncilSession({ id, detail }: { id: string; detail: CouncilView }) {
         title="Case record"
         aside={
           <Button aria-expanded={recordOpen} onClick={() => setRecordOpen(!recordOpen)}>
-            {recordOpen ? "Hide" : "Show"}
+            {recordOpen ? "Hide case record" : "Show case record"}
           </Button>
         }
       >
@@ -487,10 +501,10 @@ function DetailError({ error }: { error: unknown }) {
       />
     );
   }
-  return <ErrorNote>the núcleo did not answer — nothing is known about this council</ErrorNote>;
+  return <ErrorNote>Could not reach the {DAEMON_NAME} — nothing is known about this council</ErrorNote>;
 }
 
 function CancelRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — this council was not cancelled</ErrorNote>;
+  return <ErrorNote>Could not reach the {DAEMON_NAME} — this council was not stopped</ErrorNote>;
 }

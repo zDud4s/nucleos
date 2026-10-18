@@ -20,8 +20,13 @@ export function NotchProviders() {
   return (
     <section className="sy-budget-group">
       <h3 className="sy-budget-heading">Quota notch</h3>
+      <p className="sy-field-hint">
+        A preference of this screen only: it is kept in this browser, not on the background service,
+        and does not follow you to another machine. Each tick below decides whether the notch at
+        the top of the window draws that subscription.
+      </p>
       {names.length === 0 ? (
-        <p className="sy-field-hint">no subscription has been read on this machine yet</p>
+        <p className="sy-field-hint">no subscription has been read on this machine yet — sign in to one and it will appear here</p>
       ) : (
         names.map((name) => (
           <div className="sy-field" key={name}>
@@ -36,7 +41,7 @@ export function NotchProviders() {
           </div>
         ))
       )}
-      <p className="sy-field-hint">only what the notch draws; the quota brake is not affected</p>
+      <p className="sy-field-hint">Saved as you tick. Only what the notch draws changes; the quota brake is not affected.</p>
     </section>
   );
 }

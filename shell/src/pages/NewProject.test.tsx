@@ -280,7 +280,7 @@ describe("adding a project", () => {
     });
     await look();
 
-    expect(await screen.findByText(/while it is the núcleo refuses to record a workflow/)).toBeTruthy();
+    expect(await screen.findByText(/while it is the background service refuses to record a workflow/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Add it, in shadow" })).toHaveProperty("disabled", true);
     expect(screen.getByText("the kill switch would refuse the workflow")).toBeTruthy();
 
@@ -460,5 +460,26 @@ describe("adding a project", () => {
 
     expect(await screen.findByText(/only opens in the desktop app/)).toBeTruthy();
     expect(tauri.pickFolder).not.toHaveBeenCalled();
+  });
+
+  /** A stray Escape or scrim click must not throw away an edited setup. */
+  it("asks before discarding a setup that was edited, and keeps it on request", async () => {
+    await openWizard({ detected: detected() });
+    await look();
+    const id = (await screen.findByLabelText("Project id")) as HTMLInputElement;
+    fireEvent.change(id, { target: { value: "renamed" } });
+
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(await screen.findByText(/Discard this setup\?/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    await waitFor(() => expect(screen.queryByText(/Discard this setup\?/)).toBeNull());
+    expect((screen.getByLabelText("Project id") as HTMLInputElement).value).toBe("renamed");
+  });
+
+  /** Reading a folder is a look; only the write is the solid button. */
+  it("makes Look a ghost button and leaves approve to the write", async () => {
+    await openWizard({ detected: detected() });
+    expect(await screen.findByRole("button", { name: "Look" })).toHaveProperty("className", expect.stringContaining("ui-button-ghost"));
   });
 });

@@ -15,6 +15,51 @@
   min-width: 0;
 }
 
+/* ------------------------------------------------------------ section links -- */
+
+/* Runs, Pipeline and Development time are three blocks of one scroll; the links stay in reach. */
+.an-sections {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  padding-block: var(--space-2);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.an-section-link {
+  min-height: var(--hit-min);
+  padding: 0 var(--space-2);
+  border: 0;
+  background: none;
+  font-family: inherit;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.an-section-link:hover {
+  color: var(--text);
+}
+
+.an-runs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+/* The same voice as the Pipeline title, so no block is the one without a heading. */
+.an-runs-title {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
 /* ---------------------------------------------------------------- head row -- */
 
 .an-head {

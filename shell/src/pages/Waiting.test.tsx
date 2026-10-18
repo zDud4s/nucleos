@@ -592,14 +592,31 @@ describe("Waiting - a section with nothing in it", () => {
     // The reasoning is kept rather than cut: a tip inside the name, which describes it. No
     // disclosure and no `why?` button.
     const name = quietName("Browser access requests");
-    expect(name.getAttribute("tabindex")).toBe("0");
-    const tip = name.querySelector<HTMLElement>(".waiting-quiet-tip");
+    const trigger = name.querySelector<HTMLElement>(".ui-tip-text");
+    if (trigger === null) throw new Error("no tip trigger inside the name");
+    expect(trigger.getAttribute("tabindex")).toBe("0");
+    const tip = name.querySelector<HTMLElement>(".ui-tip-pop");
     if (tip === null) throw new Error("no tip inside the name");
     expect(tip.getAttribute("role")).toBe("tooltip");
-    expect(name.getAttribute("aria-describedby")).toBe(tip.id);
+    expect(trigger.getAttribute("aria-describedby")).toBe(tip.id);
     expect(tip.textContent).toMatch(/asking for the window/);
     expect(line.querySelector("details")).toBeNull();
     expect(within(line).queryByRole("button")).toBeNull();
+  });
+
+  it("a queue's reasoning opens on a press and Escape closes it", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld()));
+    await renderWaiting();
+    await waitFor(() => quietName("Git queue"));
+    const name = quietName("Git queue");
+    const trigger = name.querySelector<HTMLElement>(".ui-tip-text");
+    const tip = name.querySelector<HTMLElement>(".ui-tip-pop");
+    if (trigger === null || tip === null) throw new Error("no tip");
+    expect(tip.hidden).toBe(true);
+    fireEvent.click(trigger);
+    expect(tip.hidden).toBe(false);
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    expect(tip.hidden).toBe(true);
   });
 
   /**
@@ -1196,7 +1213,7 @@ describe("Waiting - declining only the action", () => {
     );
     await renderWaiting();
 
-    const decline = await screen.findByRole("button", { name: "Decline action" });
+    const decline = await screen.findByRole("button", { name: "Decline, run continues" });
     fireEvent.click(decline);
     // The control has a real 300 ms dwell; a confirm click inside it is swallowed.
     await new Promise((resolve) => setTimeout(resolve, 350));
@@ -1323,7 +1340,7 @@ describe("Waiting - clamped reasoning has a way out", () => {
 });
 
 describe("Waiting - one verb pair", () => {
-  it("an action approval says Approve, Decline action and Decline and stop run, and keeps each name across the arm", async () => {
+  it("an action approval says Approve, Decline (run continues) and Decline (stop run), and keeps each name across the arm", async () => {
     daemon.apiFetch.mockImplementation(
       waitingFetch(waitingWorld({ approvals: [proposal({ id: 7, run_id: 3 })] })),
     );
@@ -1331,8 +1348,8 @@ describe("Waiting - one verb pair", () => {
     await renderWaiting();
 
     expect(await screen.findByRole("button", { name: "Approve" })).toBeDefined();
-    expect(screen.getByRole("button", { name: "Decline action" })).toBeDefined();
-    const stop = screen.getByRole("button", { name: "Decline and stop run" });
+    expect(screen.getByRole("button", { name: "Decline, run continues" })).toBeDefined();
+    const stop = screen.getByRole("button", { name: "Decline, stop run" });
     // The three sit together in the card's one row of actions.
     expect(stop.closest(".waiting-actions-split")).not.toBeNull();
     expect(screen.queryByRole("button", { name: /Reject|Refuse/ })).toBeNull();
@@ -1340,8 +1357,59 @@ describe("Waiting - one verb pair", () => {
     // Armed, every one still begins with the verb it had at rest, and the consequence follows.
     fireEvent.click(stop);
     expect(screen.getByRole("button", { name: "Decline and end the run" })).toBeDefined();
-    fireEvent.click(screen.getByRole("button", { name: "Decline action" }));
+    fireEvent.click(screen.getByRole("button", { name: "Decline, run continues" }));
     expect(screen.getByRole("button", { name: "Decline action and keep the run going" })).toBeDefined();
+  });
+
+  it("the recruit's caution is visible, and says so when engine or tool policy left the proposal", async () => {
+    const world = waitingWorld({
+      recruits: [proposal({ id: 301, tool_input: JSON.stringify(agentRequest({ engine: "claude" })) })],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    const engine = await screen.findByLabelText("Engine");
+    const caution = document.getElementById(engine.getAttribute("aria-describedby") ?? "");
+    if (caution === null) throw new Error("no caution line");
+    expect(caution.hidden).toBe(false);
+    expect(caution.className).not.toContain("sr-only");
+    expect(caution.textContent).not.toMatch(/Changed from what the director proposed/);
+
+    fireEvent.change(engine, { target: { value: "codex" } });
+    expect(caution.textContent).toMatch(/Changed from what the director proposed/);
+    fireEvent.change(engine, { target: { value: "claude" } });
+    expect(caution.textContent).not.toMatch(/Changed from what the director proposed/);
+  });
+
+  it("the recruit form says the proposal changed under it, and loads the new one on request", async () => {
+    const world = waitingWorld({
+      recruits: [proposal({ id: 301, tool_input: JSON.stringify(agentRequest()) })],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    const { queryClient } = await renderWaiting();
+    const name = await screen.findByLabelText("Name");
+    fireEvent.change(name, { target: { value: "Typed by hand" } });
+    expect(screen.queryByText(/The director changed this proposal/)).toBeNull();
+
+    world.recruits = [
+      proposal({ id: 301, tool_input: JSON.stringify(agentRequest({ name: "Bea" })) }),
+    ];
+    await act(async () => {
+      await queryClient.invalidateQueries();
+    });
+
+    // The form is left as typed, and a status line says it is behind.
+    const said = await screen.findByText(/The director changed this proposal/);
+    expect(said.getAttribute("role")).toBe("status");
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Typed by hand");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load the new proposal" }));
+    await waitFor(() =>
+      expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Bea"),
+    );
+    expect(screen.queryByText(/The director changed this proposal/)).toBeNull();
   });
 
   it("the recruit's Not now is an interlock that says Decline", async () => {
@@ -1425,7 +1493,7 @@ describe("Waiting - the facts a card needs", () => {
       const described = field.getAttribute("aria-describedby");
       expect(described).not.toBeNull();
       expect(document.getElementById(described ?? "")?.textContent).toMatch(/two fields a director gets wrong most often/);
-      expect(field.getAttribute("title")).toMatch(/two fields a director gets wrong most often/);
+      expect(field.getAttribute("title")).toBeNull();
       expect(field.className).toContain("waiting-recruit-input-careful");
     }
     expect(screen.getByLabelText("Speciality").getAttribute("aria-describedby")).toBeNull();
@@ -1519,7 +1587,9 @@ describe("Waiting - an approval says what the run was doing", () => {
 
     await renderWaiting();
 
-    expect(await screen.findByText(/The run is cancelled, not waiting on this/)).toBeDefined();
+    const notice = await screen.findByText(/The run is cancelled, not waiting on this/);
+    expect(notice.getAttribute("role")).toBe("status");
+    expect(notice.className).toBe("waiting-notice");
   });
 });
 
@@ -1642,6 +1712,27 @@ describe("what a git request asks of the reader", () => {
     });
     expect(gitNextStep(merge({ from_resolution: true }))?.yours).toBe(true);
     expect(gitNextStep(merge({ status: "blocked" }))?.before).toBe("submit it again");
+  });
+
+  // Requests 688/689/699: the run `completed` but the resolver refused it, so "the queue lands it
+  // and this clears on its own" was a promise nobody would keep.
+  it("does not promise a landing the resolver will refuse", () => {
+    const done = { resolution_run_id: 7, resolution_status: "completed" } as const;
+    expect(gitNextStep(merge({ ...done, resolution_gate_status: "passed" }))).toMatchObject({
+      run: 7,
+      yours: false,
+    });
+    expect(gitNextStep(merge({ ...done, resolution_gate_status: null }))?.yours).toBe(false);
+    const red = gitNextStep(merge({ ...done, resolution_gate_status: "errored" }));
+    expect(red).toMatchObject({ run: 7, yours: true });
+    expect(red?.after).toContain("gate errored");
+    expect(red?.after).not.toContain("clears on its own");
+    const gone = gitNextStep(merge({ ...done, resolution_gate_status: "passed", resolution_worktree_gone: true }));
+    expect(gone).toMatchObject({ run: 7, yours: true });
+    expect(gone?.after).toContain("worktree is gone");
+  });
+
+  it("names no next step for a request that is not an escalated merge", () => {
     expect(gitNextStep(merge({ op: "push" }))).toBeNull();
   });
 });

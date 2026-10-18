@@ -1,10 +1,11 @@
 // §spec workspace-de-projeto
 
-import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
+import { useEffect, useId, useRef, useState, type MutableRefObject, type ReactNode, type RefObject } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { isTauri } from "@tauri-apps/api/core";
 import { FolderOpen } from "lucide-react";
 import { open as pickFolder } from "@tauri-apps/plugin-dialog";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import {
   suggestedId,
@@ -62,12 +63,26 @@ import {
  * Escape, the scrim or the X, goes back to `/projects`, and the wizard's progress goes with it.
  */
 
+/** What `Found` tells the dialog around it, so closing can be refused or confirmed. */
+interface Guard {
+  busy: boolean;
+  dirty: boolean;
+}
+
 export function NewProject() {
   const navigate = useNavigate();
   const asked = pathFrom(useSearch({ strict: false }) as Record<string, unknown>);
   const [typed, setTyped] = useState(asked ?? "");
   const [looking, setLooking] = useState<string | null>(asked);
   const helpId = useId();
+
+  /*
+    What the wizard below knows and this component needs to close it safely: whether a write is in
+    flight, and whether the person has changed anything from what was proposed. `Found` owns that
+    state, so it reports it here through a ref (a render-time read would be one render late).
+  */
+  const guard = useRef<Guard>({ busy: false, dirty: false });
+  const [asking, setAsking] = useState(false);
 
   const found = useDetect(looking);
 
@@ -107,7 +122,17 @@ export function NewProject() {
       <Modal
         open
         onOpenChange={(open) => {
-          if (!open) void navigate({ to: "/projects" });
+          if (open) return;
+          // Never mid-write: leaving during `finish()` would strand a half-configured project with
+          // no receipt of where it stopped.
+          if (guard.current.busy) return;
+          // Escape, the scrim and the X all land here; a setup somebody edited is not thrown away
+          // by a stray click.
+          if (guard.current.dirty) {
+            setAsking(true);
+            return;
+          }
+          void navigate({ to: "/projects" });
         }}
         title="Add a project"
         description={
@@ -118,6 +143,17 @@ export function NewProject() {
         size="lg"
       >
         <div className="flex flex-col gap-5">
+          {asking ? (
+            <div className="np-discard" role="alert">
+              <p>Discard this setup? Nothing has been written yet, but what you changed here is lost.</p>
+              <div className="np-discard-actions">
+                <Button onClick={() => setAsking(false)}>Keep editing</Button>
+                <Button variant="danger" onClick={() => void navigate({ to: "/projects" })}>
+                  Discard
+                </Button>
+              </div>
+            </div>
+          ) : null}
           <Step n={1} label="The folder">
             {/* The field and its two answers on one line: Browse beside the path it fills, and Look —
                 the step's one action — last and solid. The step heading already says "The folder",
@@ -148,9 +184,11 @@ export function NewProject() {
               {/* `aria-busy` and a word, not a spinner: `useDetect` runs three git commands against a
                   disk, and on a slow one a button that said nothing read as a button that did not
                   work. The name only changes while it is busy, so "Look" is what a voice finds. */}
-              <Button type="submit" variant="approve" aria-busy={found.isFetching}>
+              <Button type="submit" variant="ghost" aria-busy={found.isFetching}>
                 {found.isFetching ? "Looking…" : "Look"}
               </Button>
+              {/* Ghost: reading a folder is a look, not a decision. The one solid button on this
+                  dialog is "Add it, in shadow", the write. */}
             </form>
             <p id={helpId} className="text-xs text-text-muted">
               An absolute path on this machine. Nothing is written until the last step.
@@ -165,6 +203,7 @@ export function NewProject() {
               // carrying the first folder's ticks and id into the second.
               key={found.data.root}
               found={found.data}
+              guard={guard}
               // The path was edited after it was read. Steps two and three still describe the old
               // folder, and adding would register THAT one — so they stay visible, and say so, and
               // the button waits for another look.
@@ -203,7 +242,7 @@ const FOLDER_SENTENCES: Record<string, string> = {
 
 function WhyNot({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer about that folder.</ErrorNote>;
+    return <ErrorNote>Could not read that folder: the {DAEMON_NAME} is not responding.</ErrorNote>;
   }
   return <RefusalNote refusal={error} sentences={FOLDER_SENTENCES} />;
 }
@@ -293,10 +332,12 @@ function shapedId(id: string): string {
 
 function Found({
   found,
+  guard,
   folderEdited,
   onDone,
 }: {
   found: Detected;
+  guard: MutableRefObject<Guard>;
   folderEdited: boolean;
   onDone: (projectId: string) => void;
 }) {
@@ -318,6 +359,8 @@ function Found({
   const [onboardWaiting, setOnboardWaiting] = useState(false);
   /** The gate command to confirm, starting from what the núcleo proposes. Blank is none. */
   const [gate, setGate] = useState(found.gate?.command ?? "");
+  /** Gate and workflow start folded away when the folder already proposed a gate to confirm. */
+  const [advancedOpen, setAdvancedOpen] = useState(found.gate === null);
 
   const library = useWorkflowLibrary();
   const projects = useProjects();
@@ -547,6 +590,19 @@ function Found({
    * behind, so that one unlocks and the button stays.
    */
   const locked = busy || registered;
+
+  const proposedAdopting = found.harnesses[0]?.path ?? null;
+  const dirty =
+    !registered &&
+    (projectId !== suggestedId(found.root) ||
+      gate !== (found.gate?.command ?? "") ||
+      taking.size > 0 ||
+      installing !== null ||
+      adopting !== proposedAdopting ||
+      wip !== 2);
+  useEffect(() => {
+    guard.current = { busy, dirty };
+  });
   const shown = ran?.plan ?? plan;
 
   return (
@@ -572,6 +628,52 @@ function Found({
             name would give one folder two sets of rules and two open-proposal ceilings, and
             neither would be wrong on its own.
           </ConflictNote>
+        ) : null}
+
+        <div className="np-fields">
+          <Field
+            label="Project id"
+            helper={
+              shaped ? (
+                "Lowercase letters, digits and dashes — it becomes the project's address."
+              ) : (
+                <>
+                  {projectId === "" ? "an id is needed" : "not an id yet"} — lowercase letters,
+                  digits and dashes, no dash at either end.
+                  {shapedId(projectId) === "" ? null : (
+                    <>
+                      {" "}
+                      <Button variant="quiet" onClick={() => setProjectId(shapedId(projectId))}>
+                        use {shapedId(projectId)}
+                      </Button>
+                    </>
+                  )}
+                </>
+              )
+            }
+          >
+            <input
+              value={projectId}
+              spellCheck={false}
+              aria-invalid={!shaped || clash}
+              aria-describedby={clash ? idHelpId : undefined}
+              onChange={(event) => setProjectId(event.target.value)}
+              className="w-full font-mono"
+            />
+          </Field>
+        </div>
+
+        {/* An id another project already has. `set_project_mode` is an upsert — the route is how
+            a project is registered at all — so this would not be refused: it would re-point that
+            project at this folder. The one mistake here the daemon cannot catch. */}
+        {clash ? (
+          <div id={idHelpId}>
+            <ConflictNote>
+              There is already a project called <span className="font-mono">{projectId}</span>.
+              Adding this folder under that id would move that project here rather than add a new
+              one — choose another id.
+            </ConflictNote>
+          </div>
         ) : null}
 
         <Harnesses
@@ -615,7 +717,9 @@ function Found({
                       }}
                     />
                     <span className="np-command-name">{suggestion.name}</span>
-                    <span className="np-command-line">{suggestion.command}</span>
+                    <span className="np-command-line" title={suggestion.command}>
+                      {suggestion.command}
+                    </span>
                     <span className="np-command-source">{suggestion.source}</span>
                   </label>
                 ))}
@@ -632,38 +736,13 @@ function Found({
       </Step>
 
       <Step n={3} label="How much it may do">
+        <details
+          className="np-advanced"
+          open={advancedOpen}
+          onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}
+        >
+          <summary>Gate command and workflow</summary>
         <div className="np-fields">
-          <Field
-            label="Project id"
-            helper={
-              shaped ? (
-                "Lowercase letters, digits and dashes — it becomes the project's address."
-              ) : (
-                <>
-                  {projectId === "" ? "an id is needed" : "not an id yet"} — lowercase letters,
-                  digits and dashes, no dash at either end.
-                  {shapedId(projectId) === "" ? null : (
-                    <>
-                      {" "}
-                      <Button variant="quiet" onClick={() => setProjectId(shapedId(projectId))}>
-                        use {shapedId(projectId)}
-                      </Button>
-                    </>
-                  )}
-                </>
-              )
-            }
-          >
-            <input
-              value={projectId}
-              spellCheck={false}
-              aria-invalid={!shaped || clash}
-              aria-describedby={clash ? idHelpId : undefined}
-              onChange={(event) => setProjectId(event.target.value)}
-              className="w-full font-mono"
-            />
-          </Field>
-
           {/* The one claim about what a result MEANS that this page makes, and it makes it only in
               words somebody confirmed: the field starts from the núcleo's proposal and is stored
               as typed. Blank is a real answer — no gate — and can be set later with the rules. */}
@@ -685,18 +764,6 @@ function Found({
           </Field>
         </div>
 
-        {/* An id another project already has. `set_project_mode` is an upsert — the route is how
-            a project is registered at all — so this would not be refused: it would re-point that
-            project at this folder. The one mistake here the daemon cannot catch. */}
-        {clash ? (
-          <div id={idHelpId}>
-            <ConflictNote>
-              There is already a project called <span className="font-mono">{projectId}</span>.
-              Adding this folder under that id would move that project here rather than add a new
-              one — choose another id.
-            </ConflictNote>
-          </div>
-        ) : null}
 
         {found.harnesses.length === 0 && library.data !== undefined && library.data.length > 0 ? (
           <div className="np-fields">
@@ -718,6 +785,7 @@ function Found({
             </Field>
           </div>
         ) : null}
+        </details>
 
         {/* The same name, the same control and the same "no ceiling" as the Settings block this
             number is found under a second later. It was "wip ceiling" here with no way to switch
@@ -764,7 +832,7 @@ function Found({
         {stopHolds && !registered ? (
           <div className="flex flex-col items-start gap-2">
             <ConflictNote>
-              The kill switch is engaged, and while it is the núcleo refuses to record a workflow
+              The kill switch is engaged, and while it is the {DAEMON_NAME} refuses to record a workflow
               for any project. Adding this now would register it and then stop. The project, its
               commands and its ceiling can be added without the workflow, and the workflow adopted
               from the project's page once the stop is released.
@@ -853,7 +921,7 @@ function WriteRefused({ stage, error }: { stage: Planned | undefined; error: unk
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        the núcleo did not answer while {stage?.doing ?? "the project was being set up"}. Whether that
+        The {DAEMON_NAME} did not respond while {stage?.doing ?? "the project was being set up"}. Whether that
         write landed is not known — the project's page will show what it has.
       </ErrorNote>
     );

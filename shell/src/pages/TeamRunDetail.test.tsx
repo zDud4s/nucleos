@@ -397,9 +397,37 @@ describe("TeamRunDetail - cancelling an already-ended run", () => {
 
     await renderTeamRunDetail("/team-runs/run-1");
 
+    // Cancel is a hold: a click with no hold behind it arms it, and a second click after the
+    // dwell confirms (the assistive-technology path of the interlock).
     fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    });
+    fireEvent.click(await screen.findByRole("button", { name: /cancel this run now/i }));
 
     expect(await screen.findByText(/already ended/i)).toBeDefined();
     expect(screen.queryByText("team not found")).toBeNull();
+  });
+});
+
+describe("TeamRunDetail - reading the run", () => {
+  it("says what the director is doing in words, and keeps the raw node in the tooltip", async () => {
+    const run = teamRunView({ id: "run-1", state: "working", director_node: "replanning" });
+    daemon.apiFetch.mockImplementation(teamRunFetch({ "run-1": run }));
+
+    await renderTeamRunDetail("/team-runs/run-1");
+
+    const phrase = await screen.findByText("changing the plan");
+    expect(phrase.getAttribute("title")).toBe("replanning");
+  });
+
+  it("puts the outcome under the title, outside the origin line", async () => {
+    const run = teamRunView({ id: "run-1", state: "stopped", why: "the team's ceiling of $5.00 is spent ($5.12)" });
+    daemon.apiFetch.mockImplementation(teamRunFetch({ "run-1": run }));
+
+    await renderTeamRunDetail("/team-runs/run-1");
+
+    const why = await screen.findByText("the team's ceiling of $5.00 is spent ($5.12)");
+    expect(why.className).toContain("teams-why");
   });
 });

@@ -51,9 +51,14 @@ export function VoiceOrb({
     let frame = 0;
 
     const draw = (now: number) => {
+      const { phase, tap } = inputRef.current;
+      // Nobody is speaking in `off` and `thinking`, so 30fps reads the same, and a hidden window shows nothing.
+      if (document.hidden || (IDLE_PHASES.has(phase) && now - last < IDLE_FRAME_MS)) {
+        frame = requestAnimationFrame(draw);
+        return;
+      }
       const dt = Math.min((now - last) / 1000, 0.1);
       last = now;
-      const { phase, tap } = inputRef.current;
       const source = tap ?? SILENT_TAP;
       const speaking = phase === "speaking";
       const d = orbDrive(phase, speaking ? source.level() : 0);
@@ -128,9 +133,14 @@ export function VoiceOrb({
       aria-hidden="true"
       className="voice-orb"
       data-hearing={phase === "hearing" ? "" : undefined}
+      data-phase={phase}
     />
   );
 }
+
+/** Phases where the orb only breathes: its loop runs at a lower rate (about 30fps). */
+const IDLE_PHASES: ReadonlySet<string> = new Set(["off", "thinking"]);
+const IDLE_FRAME_MS = 30;
 
 /** The resting shape: twenty lines, a twenty-second pole-to-pole cycle, a slight squiggle. */
 const BASE = {
@@ -215,9 +225,11 @@ function paint(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, state: 
 
   // The colour is the canvas's own CSS `color`, so the theme and the hearing colour — and the
   // transition between them — come from the stylesheet rather than from a literal here.
-  const shellColor = getComputedStyle(canvas).color;
+  // One style read per frame: the colour is animated by a CSS transition, so it cannot be cached.
+  const style = getComputedStyle(canvas);
+  const shellColor = style.color;
   const back =
-    getComputedStyle(canvas).getPropertyValue("--surface-sunken").trim() ||
+    style.getPropertyValue("--surface-sunken").trim() ||
     (window.matchMedia("(prefers-color-scheme: light)").matches ? BALL_LIGHT : BALL_DARK);
   const lw = BASE.lineWidth * dpr * Math.max(0.8, Math.min(1.4, width / (300 * dpr)));
   ctx.strokeStyle = shellColor;

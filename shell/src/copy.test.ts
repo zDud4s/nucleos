@@ -22,7 +22,8 @@ function tsxFiles(dir: string): string[] {
 function withoutComments(source: string): string {
   return source
     .replace(/\/\*[\s\S]*?\*\//g, "")
-    .split("\n")
+    // A CRLF checkout (core.autocrlf) leaves a `\r` that `.` will not match, so the line comment would survive.
+    .split(/\r?\n/)
     .map((line) => line.replace(/(^|\s)\/\/.*$/, "$1"))
     .join("\n");
 }
@@ -43,13 +44,7 @@ function offenders(): string[] {
  * page by page, and a file that is not here may not start using either word.
  */
 const STILL_TO_MIGRATE: readonly string[] = [
-  "analytics/AnalyticsView.tsx",
-  "analytics/DevtimeSection.tsx",
-  "analytics/PipelineSection.tsx",
-  "analytics/sections.tsx",
   "app/ConnectionGate.tsx",
-  "app/Dictation.tsx",
-  "app/FeedEmbed.tsx",
   "app/KillSwitchControl.tsx",
   "app/NotificationsDrawer.tsx",
   "app/Sidebar.tsx",
@@ -61,44 +56,23 @@ const STILL_TO_MIGRATE: readonly string[] = [
   "brain/knowledge/ScopedMemory.tsx",
   "brain/knowledge/ScopedTools.tsx",
   "brain/knowledge/WaitingPanel.tsx",
-  "calendar/DaySheet.tsx",
   "canvas/Boundary.tsx",
   "canvas/FleetCanvas.tsx",
   "canvas/MapCanvas.tsx",
-  "chats/ProjectPicker.tsx",
   "context/ContextRefs.tsx",
   "pages/Agents.tsx",
-  "pages/Autopilot.tsx",
-  "pages/AutopilotJudge.tsx",
-  "pages/AutopilotRecords.tsx",
-  "pages/AutopilotResolve.tsx",
   "pages/Brain.tsx",
   "pages/Browser.tsx",
-  "pages/Calendar.tsx",
   "pages/CaptureWait.tsx",
   "pages/Chats.tsx",
-  "pages/Contacts.tsx",
-  "pages/Council.tsx",
   "pages/DistillerModel.tsx",
   "pages/EmbeddingModel.tsx",
   "pages/Feed.tsx",
-  "pages/Files.tsx",
-  "pages/Fleet.tsx",
-  "pages/Home.tsx",
   "pages/LoadoutPreview.tsx",
   "pages/MachineSettings.tsx",
-  "pages/Mail.tsx",
-  "pages/MailDetail.tsx",
-  "pages/NewProject.tsx",
   "pages/NotificationsView.tsx",
-  "pages/Projects.tsx",
   "pages/RemoveProject.tsx",
-  "pages/Roster.tsx",
-  "pages/RunDetail.tsx",
-  "pages/Runs.tsx",
   "pages/System.tsx",
-  "pages/TeamRunDetail.tsx",
-  "pages/Teams.tsx",
   "pages/Voice.tsx",
   "pages/Waiting.tsx",
   "pages/Web.tsx",
@@ -126,12 +100,9 @@ const STILL_TO_MIGRATE: readonly string[] = [
   "project/TriagePanel.tsx",
   "project/WorkflowGraph.tsx",
   "project/Workflows.tsx",
-  "team/Bench.tsx",
-  "team/Decisions.tsx",
   "team/Work.tsx",
   "ui/CopyOnce.tsx",
   "ui/RefusalNote.tsx",
-  "ui/RunPipeline.tsx",
 ];
 
 describe("copy glossary", () => {

@@ -51,7 +51,7 @@ describe("DevtimeSection", () => {
     daemon.apiFetch.mockImplementation(() => new Promise(() => {}));
     await renderWithRouter(<DevtimeSection days={30} />);
     expect(screen.getByRole("region", { name: "Development time" })).toBeTruthy();
-    expect(screen.getAllByText("reading…").length).toBeGreaterThan(0);
+    expect(screen.getByText(/Loading development time/)).toBeTruthy();
   });
 
   it("says there is nothing yet, and why, when the window is empty", async () => {
@@ -62,7 +62,7 @@ describe("DevtimeSection", () => {
 
   it("fails on its own: an error note with a retry, and F1's section is not its business", async () => {
     await mount(busy(), undefined, new Set(["/analytics/devtime"]));
-    expect(await screen.findByText(/The núcleo did not answer for development time\./)).toBeTruthy();
+    expect(await screen.findByText(/Could not read development time/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
   });
 

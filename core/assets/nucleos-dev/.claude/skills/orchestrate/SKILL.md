@@ -36,7 +36,9 @@ Returns a Markdown report containing:
 
 ## Pre-flight checks
 
-Stop immediately if any fail: `<state_dir>/models.yaml` exists; `<state_dir>/project.yaml` `project_name` is not `unknown` (otherwise run bootstrap first); `.nucleos/workflow/dispatch.md` exists; the `executor` skill exists in your discovery path; the bridge skill named after `execute.tool` (`claude` or `codex`) exists in your discovery path; and, for any phase routing to `agent` mode, its cockpit file `.claude/agents/wf-<phase>.md` exists. If missing, use the dispatch error table wording.
+First, a project with no workflow state yet: when `<state_dir>/project.yaml` or `<state_dir>/models.yaml` is missing, or `project_name` is `unknown`, run bootstrap before anything else. Bootstrap is what writes both files, so there is no `bootstrap.tool` to read yet: dispatch it in `agent` mode through the `wf-bootstrap` cockpit on the session's own model, the one exception to dispatch.md's never-substitute rule, and record it in the Phase execution log as `source=session`. When `models.yaml` exists and names `bootstrap`, dispatch through it as usual. After bootstrap returns, re-read both files and continue.
+
+Then stop immediately if any fail: `<state_dir>/models.yaml` exists; `<state_dir>/project.yaml` `project_name` is not `unknown`; `.nucleos/workflow/dispatch.md` exists; the `executor` skill exists in your discovery path; the bridge skill named after `execute.tool` (`claude` or `codex`) exists in your discovery path; and, for any phase routing to `agent` mode, its cockpit file `.claude/agents/wf-<phase>.md` exists. If missing, use the dispatch error table wording.
 
 Then resolve the **session identity** per dispatch.md's "Session identity" rule: use the model actually running this conversation (normalized — strip any `[...]` variant suffix), not the static `session.model`. If they differ, emit the drift warning and proceed with the running model for all routing and inline attribution.
 

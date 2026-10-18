@@ -144,12 +144,12 @@ describe("SessionColumn", () => {
     await renderColumn({ onNew });
 
     // The way in, at the head of the column it folds away with.
-    fireEvent.click(await screen.findByRole("button", { name: "New session" }));
+    fireEvent.click(await screen.findByRole("button", { name: "New conversation" }));
     expect(onNew).toHaveBeenCalledTimes(1);
     // New group sits beside it, on the same row, and nowhere else.
     expect(screen.getAllByRole("button", { name: "New group" })).toHaveLength(1);
     expect(screen.getByRole("button", { name: "New group" }).parentElement).toBe(
-      screen.getByRole("button", { name: "New session" }).parentElement,
+      screen.getByRole("button", { name: "New conversation" }).parentElement,
     );
 
     // The group holds its own row, the rest are ungrouped, and each heading carries a count.
@@ -171,7 +171,7 @@ describe("SessionColumn", () => {
     expect(document.querySelector(".chats-dot-chat")).toBeNull();
 
     // The filter menu: counts per status and per tab state.
-    openMenu(screen.getByRole("button", { name: "Filter sessions" }));
+    openMenu(screen.getByRole("button", { name: "Filter conversations" }));
     expect(await screen.findByRole("menuitemcheckbox", { name: "Needs input (1)" })).toBeDefined();
     expect(screen.getByRole("menuitemcheckbox", { name: "Working (1)" })).toBeDefined();
     expect(screen.getByRole("menuitemcheckbox", { name: "Completed (2)" })).toBeDefined();
@@ -194,7 +194,7 @@ describe("SessionColumn", () => {
     fireEvent.click(chip);
     expect(await screen.findByText("finished one")).toBeDefined();
 
-    fireEvent.change(screen.getByRole("textbox", { name: "Search sessions" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "Search conversations" }), {
       target: { value: "UNREAD" },
     });
     await waitFor(() => expect(screen.queryByText("busy one")).toBeNull());
@@ -216,7 +216,7 @@ describe("SessionColumn", () => {
     );
   });
 
-  it("lists archived sessions only once opened and restores one", async () => {
+  it("lists archived conversations only once opened and restores one", async () => {
     await renderColumn();
     // Not asked for while the section is shut.
     await screen.findByText("Ungrouped (4)");
@@ -224,7 +224,7 @@ describe("SessionColumn", () => {
       daemon.apiFetch.mock.calls.some(([path]) => String(path).includes("archived=true")),
     ).toBe(false);
 
-    const heading = screen.getByText("Archived sessions");
+    const heading = screen.getByText("Archived conversations");
     fireEvent.click(heading);
     expect(await screen.findByText("old thing")).toBeDefined();
     fireEvent.click(screen.getByRole("button", { name: "Restore old thing" }));
@@ -241,7 +241,7 @@ describe("SessionColumn", () => {
     const { unmount } = await renderColumn();
     expect(await screen.findByText("typed in the editor")).toBeDefined();
 
-    openMenu(screen.getByRole("button", { name: "Filter sessions" }));
+    openMenu(screen.getByRole("button", { name: "Filter conversations" }));
     const source = await screen.findByRole("menuitemcheckbox", { name: "From the editor (1)" });
     expect(source.getAttribute("aria-checked")).toBe("true");
     fireEvent.click(source);
@@ -251,7 +251,7 @@ describe("SessionColumn", () => {
     expect(screen.getByText("busy one")).toBeDefined();
     // The menu is still open, which hides the rest of the page from the accessibility tree.
     expect(
-      screen.getByRole("button", { name: "Filter sessions", hidden: true }).hasAttribute("data-on"),
+      screen.getByRole("button", { name: "Filter conversations", hidden: true }).hasAttribute("data-on"),
     ).toBe(true);
 
     unmount();
