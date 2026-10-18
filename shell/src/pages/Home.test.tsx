@@ -54,7 +54,7 @@ describe("Home", () => {
     expect(within(await card("Shadow decisions pending")).getByText("7")).toBeDefined();
     expect(await within(await card("Waiting on you")).findByText("2")).toBeDefined();
     expect((await card("Waiting on you")).textContent).toContain(
-      "decisions held for you — not records, and not the calendar",
+      "2 decisions need your answer",
     );
     const spend = await spendRow();
     expect(within(spend).getByText(/\$1\.42/)).toBeDefined();
@@ -88,7 +88,7 @@ describe("Home", () => {
     await renderWithRouter(<Home />);
 
     expect((await card("Waiting on you")).textContent).toContain(
-      "decisions held for you — not records, and not the calendar",
+      "2 decisions need your answer",
     );
     // The card is itself the door to the queue; the separate "Where to look next" sentence was
     // removed by the redesign.
@@ -127,6 +127,16 @@ describe("Home", () => {
     );
     await renderWithRouter(<Home />);
     expect((await spendRow()).querySelector(".ui-gauge-fill")).toBeNull();
+  });
+
+  it("one note with a Retry replaces the repeated refusal when nothing could be read", async () => {
+    daemon.apiFetch.mockRejectedValue(new Error("down"));
+
+    await renderWithRouter(<Home />);
+
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeDefined();
+    expect(document.body.textContent).not.toContain("did not answer");
+    expect(document.body.textContent).not.toContain("núcleo");
   });
 
   it("shows an em dash rather than a zero while nothing has been read", async () => {

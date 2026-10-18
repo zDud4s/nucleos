@@ -13,8 +13,9 @@ import {
   type ProjectSummary,
   type SubsystemReadout,
 } from "../data/system";
+import { DAEMON_NAME } from "../copy";
 import { useWaitingCount } from "../data/waiting";
-import { Meter, PageHeader, StaleNote, StatCard, ceilingShare, usd } from "../ui";
+import { ErrorNote, Meter, PageHeader, StaleNote, StatCard, Term, ceilingShare, usd } from "../ui";
 
 /**
  * The first screen: what needs you, whether the machine is well, and what it has spent.
@@ -39,7 +40,8 @@ export function Home() {
   // and refused". Read the state of its query (same key) without mounting a second observer: an
   // observer with no queryFn would be a fetcher with nothing to fetch with. Home re-renders on
   // every change of that query because `useWaitingCount` above is subscribed to it.
-  const waitingState = useQueryClient().getQueryState<unknown>(keys.waiting.count);
+  const queryClient = useQueryClient();
+  const waitingState = queryClient.getQueryState<unknown>(keys.waiting.count);
   const waitingRead = {
     isError: waitingState?.status === "error",
     data: waitingState?.data,
@@ -72,6 +74,21 @@ export function Home() {
   ].filter((at): at is number => at !== null);
   const oldestRead = staleReads.length === 0 ? null : Math.min(...staleReads);
 
+  // One note with one Retry for every reading that failed with nothing to show, instead of the
+  // same refusal repeated on each card. Cards with an older good read keep it and go stale.
+  const failed = [
+    projects.isError && projects.data === undefined ? "projects" : null,
+    waitingRead.isError && waitingRead.data === undefined ? "the waiting queue" : null,
+    budget.isError && budget.data === undefined ? "spend" : null,
+    health.isError && health.data === undefined ? "subsystem health" : null,
+  ].filter((name): name is string => name !== null);
+  const retryAll = () => {
+    void projects.refetch();
+    void budget.refetch();
+    void health.refetch();
+    void queryClient.invalidateQueries({ queryKey: keys.waiting.count });
+  };
+
   const notHealthy = subsystems?.filter(
     (row) => row.status === "down" || row.status === "degraded",
   ).length;
@@ -82,6 +99,11 @@ export function Home() {
     <>
       <PageHeader title="Home" headline={headline(roster, waiting, spend, health.data)} />
       {oldestRead !== null && <StaleNote dataUpdatedAt={oldestRead} />}
+      {failed.length > 0 && (
+        <ErrorNote onRetry={retryAll}>
+          {`Could not read ${failed.join(", ")}: the ${DAEMON_NAME} may be stopped.`}
+        </ErrorNote>
+      )}
 
       {/*
         Three tiers, always the same three. What can need you today leads, large: the queue that
@@ -104,15 +126,24 @@ export function Home() {
               value={waiting}
               to="/waiting"
               unread={unreadNote(waitingRead)}
-              // What the number IS, not a table of contents for another page. Four lists are outside it
-              // and for three different reasons: skipped and refused are records, calendar events have no
-              // listing route, and a parked run is the run side of an approval already counted.
+              // What the number IS, and what to do about it. With decisions held, the line asks for
+              // the answer in the awaiting tone (words carry it, so colour is never the only signal).
               detail={
-                waiting === undefined
-                  ? undefined
-                  : waiting === 0
-                    ? "nothing waiting on you"
-                    : "decisions held for you — not records, and not the calendar"
+                waiting === undefined ? undefined : waiting === 0 ? (
+                  "nothing waiting on you"
+                ) : (
+                  <span
+                    style={{
+                      color: "var(--tone-awaiting-fg)",
+                      background: "var(--tone-awaiting-bg)",
+                      border: "1px solid var(--tone-awaiting-border)",
+                      borderRadius: "var(--radius-sm)",
+                      padding: "0 var(--space-2)",
+                    }}
+                  >
+                    {`${String(waiting)} ${waiting === 1 ? "decision needs" : "decisions need"} your answer`}
+                  </span>
+                )
               }
             />
           </Cell>
@@ -167,7 +198,11 @@ export function Home() {
               value={shadowDecisions}
               to="/autopilot"
               unread={unreadNote(projects)}
-              detail="what the autopilot would have done, waiting to be read"
+              detail={
+                <>
+                  what the autopilot would have done in <Term term="shadow">shadow</Term>
+                </>
+              }
             />
           </Cell>
         </div>
@@ -190,9 +225,9 @@ function isStale(read: { isError: boolean; data: unknown }): boolean {
   return read.isError && read.data !== undefined;
 }
 
-/** Why a figure is missing: still reading, or the núcleo did not answer. */
+/** Why a figure is missing: still reading, or the read failed. */
 function unreadNote(read: { isError: boolean }): string {
-  return read.isError ? "the núcleo did not answer" : "reading…";
+  return read.isError ? "could not read" : "reading…";
 }
 
 /**
@@ -269,7 +304,7 @@ function SpendRow({
         <span className="app-home-spend-unread">
           <span className="app-home-spend-title">Spend</span>
           <span aria-hidden="true">—</span>
-          <span className="sr-only">not read</span> {unreadNote(read)}
+          {unreadNote(read)}
         </span>
       ) : (
         <Meter
