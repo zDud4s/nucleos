@@ -160,7 +160,26 @@ pub(super) async fn post_assistant_message(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_openrouter_key",
         )),
+        // The pictures themselves were refused before anything was spent: too many, too big, not
+        // an image the model reads, or a model that reads none. Something the sender changes, so
+        // a 422 that names which, never a 500 that sends them looking for a crash.
+        Err(msg) if picture_refusal(&msg).is_some() => Err(refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            picture_refusal(&msg).unwrap_or("picture_refused"),
+        )),
         Err(_) => Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")),
+    }
+}
+
+/// The slug for each of `assistant::send`'s picture refusals, `None` for anything else.
+fn picture_refusal(msg: &str) -> Option<&'static str> {
+    use crate::assistant::{IMAGE_TOO_LARGE, IMAGE_UNREADABLE, IMAGES_NEED_CLOUD, TOO_MANY_IMAGES};
+    match msg {
+        _ if msg == TOO_MANY_IMAGES => Some("too_many_pictures"),
+        _ if msg == IMAGE_TOO_LARGE => Some("picture_too_large"),
+        _ if msg == IMAGE_UNREADABLE => Some("picture_unreadable"),
+        _ if msg == IMAGES_NEED_CLOUD => Some("pictures_need_cloud"),
+        _ => None,
     }
 }
 

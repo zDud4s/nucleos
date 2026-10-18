@@ -3837,34 +3837,28 @@ mod tests {
     /// The lines it gathers are the turn's own transcript, and the outcome is the turn's own bill.
     #[tokio::test]
     async fn a_living_conversation_answers_a_later_turn_down_the_process_it_already_has() {
-        let (mut live, mut said, events, _why) = live_chat_for_testing();
+        let (mut live, said, events, _why) = live_chat_for_testing();
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-
-        events
-            .send(crate::execution::runner::TurnEvent::Line(
-                "hello".to_owned(),
-            ))
-            .unwrap();
-        events
-            .send(crate::execution::runner::TurnEvent::Ended(
-                crate::execution::runner::TurnOutcome {
+        let heard = answer_each_message(
+            said,
+            events,
+            vec![vec![
+                crate::execution::runner::TurnEvent::Line("hello".to_owned()),
+                crate::execution::runner::TurnEvent::Ended(crate::execution::runner::TurnOutcome {
                     cost_usd: Some(0.08),
                     ..Default::default()
-                },
-            ))
-            .unwrap();
+                }),
+            ]],
+        );
 
         let LiveTurn::Answered(outcome) = live.turn("e agora?", &[], &transcript, None).await
         else {
-            panic!("a process with an answer queued must answer");
+            panic!("a process that answers must answer");
         };
 
         assert_eq!(outcome.cost_usd, Some(0.08));
         assert_eq!(transcript.lock().unwrap().as_str(), "hello\n");
-        assert_eq!(
-            said.recv().await.map(|turn| turn.text).as_deref(),
-            Some("e agora?")
-        );
+        assert_eq!(heard.await.unwrap(), vec!["e agora?".to_owned()]);
     }
 
     /// A turn stops at its OWN end, leaving whatever comes after it for the turn that comes after.
@@ -3875,22 +3869,27 @@ mod tests {
     /// somebody else's.
     #[tokio::test]
     async fn a_turn_gathers_its_own_lines_and_leaves_the_next_turns_alone() {
-        let (mut live, _said, events, _why) = live_chat_for_testing();
+        let (mut live, said, events, _why) = live_chat_for_testing();
         let first = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let second = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-
-        for event in [
-            crate::execution::runner::TurnEvent::Line("mine".to_owned()),
-            crate::execution::runner::TurnEvent::Ended(
-                crate::execution::runner::TurnOutcome::default(),
-            ),
-            crate::execution::runner::TurnEvent::Line("theirs".to_owned()),
-            crate::execution::runner::TurnEvent::Ended(
-                crate::execution::runner::TurnOutcome::default(),
-            ),
-        ] {
-            events.send(event).unwrap();
-        }
+        let _heard = answer_each_message(
+            said,
+            events,
+            vec![
+                vec![
+                    crate::execution::runner::TurnEvent::Line("mine".to_owned()),
+                    crate::execution::runner::TurnEvent::Ended(
+                        crate::execution::runner::TurnOutcome::default(),
+                    ),
+                ],
+                vec![
+                    crate::execution::runner::TurnEvent::Line("theirs".to_owned()),
+                    crate::execution::runner::TurnEvent::Ended(
+                        crate::execution::runner::TurnOutcome::default(),
+                    ),
+                ],
+            ],
+        );
 
         assert!(matches!(
             live.turn("um", &[], &first, None).await,
@@ -3949,6 +3948,66 @@ mod tests {
         ));
         // It really was written — which is the whole reason this case may not be retried.
         drop(said);
+    }
+
+    /// The end of a turn that said nothing, still carried when a person's message is written, is
+    /// not that message's answer: what was said before the message cannot answer it.
+    #[tokio::test]
+    async fn an_answerless_end_carried_from_before_is_not_taken_for_the_next_answer() {
+        let (mut live, said, events, _why) = live_chat_for_testing();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        events
+            .send(crate::execution::runner::TurnEvent::Ended(
+                crate::execution::runner::TurnOutcome {
+                    cost_usd: Some(0.01),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        let _heard = answer_each_message(
+            said,
+            events,
+            vec![vec![
+                crate::execution::runner::TurnEvent::Line("the real answer".to_owned()),
+                crate::execution::runner::TurnEvent::Ended(crate::execution::runner::TurnOutcome {
+                    cost_usd: Some(0.08),
+                    ..Default::default()
+                }),
+            ]],
+        );
+
+        let LiveTurn::Answered(outcome) = live.turn("e agora?", &[], &transcript, None).await
+        else {
+            panic!("a process that answers must answer");
+        };
+
+        assert_eq!(outcome.cost_usd, Some(0.08), "the stale end was taken");
+        assert_eq!(transcript.lock().unwrap().as_str(), "the real answer\n");
+    }
+
+    /// Stands in for the process's side of the pipe: each message written to it is answered with the
+    /// next script, and only once it has been written — the order a real CLI cannot break. Yields
+    /// the texts it heard.
+    fn answer_each_message(
+        mut said: tokio::sync::mpsc::UnboundedReceiver<crate::execution::runner::LaterTurn>,
+        events: tokio::sync::mpsc::UnboundedSender<crate::execution::runner::TurnEvent>,
+        scripts: Vec<Vec<crate::execution::runner::TurnEvent>>,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            let mut heard = Vec::new();
+            for script in scripts {
+                let Some(turn) = said.recv().await else {
+                    break;
+                };
+                heard.push(turn.text);
+                for event in script {
+                    let _ = events.send(event);
+                }
+            }
+            // Held open, as a living process holds its stdout between turns.
+            std::mem::forget(events);
+            heard
+        })
     }
 
     /// A `LiveChat` wired to plain channels instead of a process: the far end of its stdin, and a

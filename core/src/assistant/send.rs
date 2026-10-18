@@ -107,6 +107,9 @@ pub async fn send_or_queue(
     images: &[crate::execution::runner::Attachment],
     origin: Origin,
 ) -> Result<Sent, String> {
+    // Refused before anything waits: a picture that cannot be sent now cannot be sent from the
+    // queue either, and finding that out at the drain is finding it out after the person left.
+    check_images(images)?;
     // A person sending again is what ends a hold (after Stop, or after a failed send).
     release_queue(chat_id);
     // Serialised here rather than at the drain, because this is the only moment the bytes are in
@@ -531,6 +534,42 @@ pub const TOO_MANY_IMAGES: &str = "a turn may carry at most five pictures";
 /// Why a turn was refused before it cost anything: one of its pictures is too big to send.
 pub const IMAGE_TOO_LARGE: &str = "one of those pictures is too large to send";
 
+/// Why a turn was refused before it cost anything: one of its pictures is not a PNG, JPEG, GIF or
+/// WebP, or its bytes are not base64. Either way the API would refuse it after a run row existed,
+/// and `keep_images` would skip it without a word.
+pub const IMAGE_UNREADABLE: &str = "one of those pictures is not a PNG, JPEG, GIF or WebP image";
+
+/// Why a turn was refused before it cost anything: pictures were attached and this conversation
+/// is answered by a local or hosted model, whose turns carry text only.
+pub const IMAGES_NEED_CLOUD: &str =
+    "this conversation's model cannot see pictures; send the message without them";
+
+/// The media types a picture may claim: what the API accepts for an image block.
+pub(super) const IMAGE_MEDIA_TYPES: [&str; 4] =
+    ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Every refusal a turn's pictures alone can earn, decided before anything is written: too many,
+/// too large, a media type the API does not take, or data that is not base64.
+pub(super) fn check_images(images: &[crate::execution::runner::Attachment]) -> Result<(), String> {
+    use base64::Engine;
+    if images.len() > MAX_IMAGES {
+        return Err(TOO_MANY_IMAGES.to_string());
+    }
+    if images.iter().any(|i| i.data.len() > MAX_IMAGE_CHARS) {
+        return Err(IMAGE_TOO_LARGE.to_string());
+    }
+    let unreadable = images.iter().any(|image| {
+        !IMAGE_MEDIA_TYPES.contains(&image.media_type.as_str())
+            || base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .is_err()
+    });
+    if unreadable {
+        return Err(IMAGE_UNREADABLE.to_string());
+    }
+    Ok(())
+}
+
 /// Sends a message with nothing attached. Only the tests send without pictures through this
 /// shorthand; production callers go through `send_message_with`.
 #[cfg(any(test, feature = "testkit"))]
@@ -673,12 +712,7 @@ pub(super) async fn send_message_inner(
 ) -> Result<i64, String> {
     // Refused before the slot is taken, so a turn nobody can send costs nothing and leaves the
     // conversation answerable.
-    if images.len() > MAX_IMAGES {
-        return Err(TOO_MANY_IMAGES.to_string());
-    }
-    if images.iter().any(|i| i.data.len() > MAX_IMAGE_CHARS) {
-        return Err(IMAGE_TOO_LARGE.to_string());
-    }
+    check_images(images)?;
     // Held from here on: every early return, error, and dropped future below releases the chat by
     // dropping this, which is why none of them needs a cleanup statement of its own.
     // A warm-up holding the chat is waited out: it lets go in moments, and nothing is answering.
@@ -715,6 +749,9 @@ pub(super) async fn send_message_inner(
             .assistants
             .assistant_for(crate::chats::Brain::OpenRouter, pinned_model.as_deref())
         {
+            // A hosted turn carries text only: sent anyway, the pictures would be dropped without
+            // a word and the answer would be about a message nobody wrote.
+            Ok(_) if !images.is_empty() => Err(IMAGES_NEED_CLOUD.to_string()),
             Ok(assistant) => {
                 let mut slot = slot;
                 slot.drain_on_release(state);
@@ -752,6 +789,8 @@ pub(super) async fn send_message_inner(
             .assistants
             .assistant_for(crate::chats::Brain::Local, pinned_model.as_deref())
         {
+            // The local route's half of the hosted refusal above, for the same reason.
+            Ok(_) if !images.is_empty() => return Err(IMAGES_NEED_CLOUD.to_string()),
             Ok(assistant) => {
                 let mut slot = slot;
                 slot.drain_on_release(state);
@@ -868,6 +907,9 @@ pub(super) async fn send_message_inner(
         Ok(result) => result.map_err(|e| e.to_string())?,
         Err(error) => return Err(error.to_string()),
     }
+    // From here the file is this function's until `spawn_assistant_turn` takes it: a failed INSERT,
+    // or a future dropped at any await below, removes it rather than leave it in the temp dir.
+    let mcp_file = UnclaimedMcpConfig(Some(mcp_path));
 
     // Assigned by the daemon and persisted with the row, exactly as `runs::create_run_inner` does
     // it, so an assistant turn is not the one kind of run that can exist without a session id. A
@@ -995,13 +1037,34 @@ pub(super) async fn send_message_inner(
             images: images.to_vec(),
             resume,
             session_id,
-            mcp_path,
+            mcp_path: mcp_file.claim(),
             cwd,
             tool_policy,
             doctrine,
         },
     );
     Ok(id)
+}
+
+/// A turn's MCP config written to disk and not yet handed to the turn that will remove it.
+///
+/// Dropped unclaimed — the INSERT failed, or the future was dropped before the turn was spawned —
+/// it removes the file, which nothing else would.
+struct UnclaimedMcpConfig(Option<std::path::PathBuf>);
+
+impl UnclaimedMcpConfig {
+    /// Hands the path to the turn, whose `TurnGuard` removes the file from then on.
+    fn claim(mut self) -> std::path::PathBuf {
+        self.0.take().unwrap_or_default()
+    }
+}
+
+impl Drop for UnclaimedMcpConfig {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// How many past exchanges a local turn is shown.
@@ -1561,5 +1624,108 @@ mod tests {
             waiting_texts(&state.pool, &chat).await.is_empty(),
             "the message was queued behind the warm-up"
         );
+    }
+
+    /// How many run rows a conversation has, which a refused turn must leave at zero.
+    async fn runs_of(pool: &SqlitePool, chat_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn picture(media_type: &str, data: &str) -> crate::execution::runner::Attachment {
+        crate::execution::runner::Attachment {
+            media_type: media_type.into(),
+            data: data.into(),
+        }
+    }
+
+    /// A picture the API would refuse, or whose bytes are not base64, is refused before the run row
+    /// exists — not written as a turn whose pictures `keep_images` then skips without a word.
+    #[tokio::test]
+    async fn a_picture_that_cannot_be_sent_is_refused_before_any_run_row() {
+        let state = test_state().await;
+        for bad in [
+            picture("text/html", "aGVsbG8="),
+            picture("image/png", "not base64 at all!"),
+        ] {
+            let chat = a_chat("unreadable");
+            let sent = send_message_with(&state, &chat, "look", &[bad], Origin::Shell).await;
+            assert_eq!(sent, Err(IMAGE_UNREADABLE.to_string()));
+            assert_eq!(
+                runs_of(&state.pool, &chat).await,
+                0,
+                "a refused turn wrote a row"
+            );
+        }
+    }
+
+    /// A local or hosted conversation carries text only, so pictures sent to one are refused with a
+    /// reason — never dropped while the words go on without them.
+    #[tokio::test]
+    async fn pictures_sent_to_a_local_or_hosted_chat_are_refused_not_dropped() {
+        struct Says;
+        #[async_trait::async_trait]
+        impl crate::models::local_agent::LocalChat for Says {
+            async fn exchange(
+                &self,
+                _messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+            ) -> std::io::Result<serde_json::Value> {
+                Ok(serde_json::json!({"role": "assistant", "content": "a text answer"}))
+            }
+        }
+        struct NoTools;
+        #[async_trait::async_trait]
+        impl crate::models::local_agent::ToolBox for NoTools {
+            fn schemas(&self) -> Vec<serde_json::Value> {
+                Vec::new()
+            }
+            async fn call(
+                &self,
+                _name: &str,
+                _arguments: &serde_json::Value,
+            ) -> crate::models::local_agent::ToolAnswer {
+                unreachable!("this assistant answers without calling tools")
+            }
+        }
+        let mut state = test_state().await;
+        state.assistants = Arc::new(crate::assistants::FixedAssistants(Arc::new(
+            crate::models::local_agent::LocalAssistant::new(Box::new(Says), Box::new(NoTools)),
+        )));
+        for brain in [crate::chats::Brain::Local, crate::chats::Brain::OpenRouter] {
+            let chat = crate::chats::create(&state.pool, brain, None)
+                .await
+                .unwrap();
+            let images = [picture("image/png", "aGVsbG8=")];
+            let sent = send_message_with(&state, &chat, "look", &images, Origin::Shell).await;
+            assert_eq!(sent, Err(IMAGES_NEED_CLOUD.to_string()), "{brain:?}");
+            assert_eq!(runs_of(&state.pool, &chat).await, 0, "{brain:?}");
+        }
+    }
+
+    /// A turn whose run row cannot be written leaves no MCP config behind: nothing else would ever
+    /// remove it, since no `TurnGuard` was made to.
+    #[tokio::test]
+    async fn a_failed_run_insert_leaves_no_mcp_config_behind() {
+        let state = test_state().await;
+        sqlx::query(
+            "CREATE TRIGGER refuse_runs BEFORE INSERT ON runs
+             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let chat = a_chat("mcp-leak");
+
+        let sent = send_message(&state, &chat, "hello", Origin::Shell).await;
+
+        assert!(sent.is_err(), "the INSERT was meant to fail: {sent:?}");
+        let path = crate::assistant::mcp_config_path(&chat);
+        let leaked = path.exists();
+        let _ = std::fs::remove_file(&path);
+        assert!(!leaked, "the MCP config outlived a turn that never started");
     }
 }
