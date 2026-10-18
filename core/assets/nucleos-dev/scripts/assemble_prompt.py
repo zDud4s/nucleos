@@ -318,7 +318,9 @@ def build(args, contract: dict) -> tuple[dict[str, str], list[str], int]:
             bodies.append(f"### {path.name}\n\n" + read(path))
         sections["packet_schema"] = "\n\n".join(bodies)
 
-    if "project_yaml" in allowed:
+    # Bootstrap is the phase that writes project.yaml, so on a fresh project it runs without one;
+    # every other phase that carries it stops when it is missing.
+    if "project_yaml" in allowed and (PROJECT.is_file() or phase != "bootstrap"):
         sections["project_yaml"] = "```yaml\n" + read(PROJECT).rstrip("\n") + "\n```"
 
     if args.intent:
