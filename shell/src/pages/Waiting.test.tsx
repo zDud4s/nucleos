@@ -1464,6 +1464,49 @@ describe("Waiting - one verb pair", () => {
   });
 });
 
+describe("Waiting - reading states and small guards", () => {
+  it("a failed read offers Retry beside the sentence", async () => {
+    const base = waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 })] }));
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/contacts/merges") throw new Error("network down");
+      return await base(path, init);
+    });
+
+    await renderWaiting();
+
+    expect(await screen.findByText(/nothing is known about the suggested merges/)).toBeDefined();
+    expect(screen.getAllByRole("button", { name: "Retry" }).length).toBeGreaterThan(0);
+  });
+
+  it("the count of decisions wears the awaiting tone", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 })] })),
+    );
+
+    await renderWaiting();
+
+    const headline = await screen.findByText("1 waiting on a decision");
+    expect(headline.className).toContain("ui-awaiting");
+  });
+
+  it("an exclusion request that names no pair cannot be approved", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(
+        waitingWorld({
+          exclusions: [
+            proposal({ id: 31, kind: "fleet-exclusion", tool_input: JSON.stringify({ paths: [] }) }),
+          ],
+        }),
+      ),
+    );
+
+    await renderWaiting();
+
+    const approve = await screen.findByRole("button", { name: "Approve request #31" });
+    expect((approve as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
 describe("Waiting - the facts a card needs", () => {
   it("an approval's run and project sit in its head with no uppercase labels", async () => {
     daemon.apiFetch.mockImplementation(

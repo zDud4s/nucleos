@@ -840,3 +840,12 @@
 .waiting-provenance .waiting-provenance-head ~ .waiting-provenance-head {
   margin-top: var(--space-2);
 }
+
+/* The recruitment fields are the only inputs on this page, and a decision page cannot have an
+   input whose focus is not drawn: the ring is the shared one, stated here so it does not depend
+   on a reset elsewhere. */
+.waiting-recruit-input:focus-visible,
+.waiting-recruit-textarea:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
