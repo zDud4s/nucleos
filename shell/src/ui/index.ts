@@ -48,6 +48,7 @@ export {
 } from "./Palette";
 export { Panel, type PanelProps, type PanelVariant } from "./Panel";
 export { ProviderMark, type ProviderMarkProps } from "./ProviderMark";
+export { QueryState, type QueryLike, type QueryStateProps } from "./QueryState";
 export { Quiet, QuietTips, type QuietProps } from "./Quiet";
 export { Ring, type RingProps, type RingTrack } from "./Ring";
 /**
@@ -84,12 +85,15 @@ export { Section, type SectionProps } from "./Section";
 export { SectionTitle, type SectionTitleProps } from "./SectionTitle";
 export { ShareBar, type ShareBarProps, type ShareItem } from "./ShareBar";
 export { SlotPips, type SlotPipsProps } from "./SlotPips";
+export { Skeleton, type SkeletonProps } from "./Skeleton";
 export { Sparkline, type SparklineProps } from "./Sparkline";
 export { StaleNote, type StaleNoteProps } from "./StaleNote";
 export { StatCard, type StatCardProps } from "./StatCard";
 export { StateBadge, type StateBadgeProps } from "./StateBadge";
 export { StepLine, type StepLineProps, type StepPoint, type StepSeries } from "./StepLine";
 export { Teach, type TeachProps } from "./Teach";
+export { Tip, type TipProps, type TipState } from "./Tip";
+export { Term, type TermProps } from "./Term";
 export { Well, type WellProps } from "./Well";
 export { Who, type WhoProps } from "./Who";
 export { readState, type StateDomain, type StateReading } from "./state-map";
