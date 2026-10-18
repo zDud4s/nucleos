@@ -488,6 +488,7 @@ async fn apply_event(
             model,
             effort,
             usage,
+            billing,
             tool_uses,
             ..
         } => {
@@ -507,6 +508,9 @@ async fn apply_event(
                     output_tokens: usage[3],
                     has_tool_use: i64::from(!tool_uses.is_empty()),
                     parser_version: PARSER_VERSION,
+                    cache_creation_1h_tokens: billing.cache_creation_1h,
+                    speed: billing.speed.clone(),
+                    inference_geo: billing.inference_geo.clone(),
                 },
             )
             .await?;
@@ -1190,7 +1194,7 @@ mod tests {
             .expect("the file has a row");
         assert_eq!(state.offset, len);
 
-        let appended = "{\"type\":\"assistant\",\"timestamp\":\"2026-10-04T10:00:20.000Z\",\"sessionId\":\"s-par\",\"message\":{\"id\":\"m3\",\"model\":\"claude-x\",\"usage\":{\"output_tokens\":3},\"content\":[{\"type\":\"text\",\"text\":\"more\"}]}}\n";
+        let appended = "{\"type\":\"assistant\",\"timestamp\":\"2026-10-04T10:00:20.000Z\",\"sessionId\":\"s-par\",\"message\":{\"id\":\"m3\",\"model\":\"claude-x\",\"usage\":{\"output_tokens\":3,\"cache_creation_input_tokens\":8,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":8},\"speed\":\"fast\",\"inference_geo\":\"us\"},\"content\":[{\"type\":\"text\",\"text\":\"more\"}]}}\n";
         std::fs::OpenOptions::new()
             .append(true)
             .open(&file)
@@ -1202,6 +1206,18 @@ mod tests {
         assert_eq!(second.lines_read, 1, "only the appended line is read");
         assert_eq!(count(&h.pool, "devtime_messages").await, 3);
         assert_eq!(count(&h.pool, "devtime_attempts").await, 3);
+        // The billing mode reaches the row (migration 0214).
+        let billing: (i64, Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT cache_creation_tokens, cache_creation_1h_tokens, speed, inference_geo
+             FROM devtime_messages WHERE message_id = 'm3'",
+        )
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            billing,
+            (8, Some(8), Some("fast".into()), Some("us".into()))
+        );
         let grown = devtime_store::file_state(&h.pool, &path_key(&file))
             .await
             .unwrap()
