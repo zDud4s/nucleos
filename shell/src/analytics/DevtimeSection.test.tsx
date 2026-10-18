@@ -34,8 +34,10 @@ function busy(): DaemonState {
   report.tokens = { ...report.tokens, cost_usd: 4.2, prices_as_of: "2026-10-17", unpriced_models: ["sonnet"],
     dropped_prices: ["claude-haiku-5-5: input is not a finite, non-negative number"],
     by_model: [
-      { model: "claude-opus-4-7", effort: "high", input: 1000, cache_read: 9000, cache_creation: 0, output: 500, messages: 3, cost_usd: 4.2 },
-      { model: "sonnet", effort: "unknown", input: 10, cache_read: 0, cache_creation: 0, output: 5, messages: 1, cost_usd: null },
+      { model: "claude-opus-4-7", effort: "high", input: 1000, cache_read: 9000, cache_creation: 0, output: 500, messages: 3, cost_usd: 4.2,
+        cost_low: 4.2, cost_high: 4.2 },
+      { model: "sonnet", effort: "unknown", input: 10, cache_read: 0, cache_creation: 0, output: 5, messages: 1, cost_usd: null,
+        cost_low: null, cost_high: null },
     ] };
   return daemonState({ devtime: report, devtimeFindings: devtimeFindings() });
 }
@@ -125,6 +127,27 @@ describe("DevtimeSection", () => {
       "Unreadable prices ignored in nucleos-models.yaml: claude-haiku-5-5: input is not a finite, non-negative number.",
     )).toBeTruthy();
     expect(screen.getByText("Estimated, prices of 2026-10-17. Never compared with an invoice.")).toBeTruthy();
+  });
+
+  it("shows the cost as a range when older usage has no cache-duration split", async () => {
+    const state = busy();
+    state.devtime.tokens = { ...state.devtime.tokens, cost_usd: 48, cost_low: 41, cost_high: 48 };
+    await mount(state);
+    const card = await screen.findByRole("button", { name: /Estimated cost/ });
+    const range = within(card).getByText("$41.00–$48.00");
+    expect(range.getAttribute("title")).toMatch(/no cache-duration split/);
+    fireEvent.click(card);
+    expect(screen.getByText(/^Between \$41\.00 and \$48\.00: older usage has no cache-duration split/)).toBeTruthy();
+  });
+
+  it("shows no range when the bounds are within 1%", async () => {
+    const state = busy();
+    state.devtime.tokens = { ...state.devtime.tokens, cost_usd: 4.2, cost_low: 4.19, cost_high: 4.2 };
+    await mount(state);
+    const card = await screen.findByRole("button", { name: /Estimated cost/ });
+    expect(within(card).queryByText(/–/)).toBeNull();
+    fireEvent.click(card);
+    expect(screen.queryByText(/no cache-duration split/)).toBeNull();
   });
 
   it("keeps today's segment partial in what it hands the chart", async () => {

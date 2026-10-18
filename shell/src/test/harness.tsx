@@ -929,7 +929,8 @@ export function devtimeOverview(overrides: Partial<DevtimeOverview> = {}): Devti
     totals: { ...previous, wait_human_ms: 0, idle_ms: 0, inferred_waste_ms: 0, turns: 0,
               correction_coverage: null, previous },
     waste_by_rule: [], waste_by_lever: [],
-    tokens: { by_model: [], cache_hit_ratio: null, cost_usd: null, cost_estimated: true, prices_as_of: null,
+    tokens: { by_model: [], cache_hit_ratio: null, cost_usd: null, cost_low: null, cost_high: null,
+              cost_estimated: true, prices_as_of: null,
               unpriced_models: [], dropped_prices: [], previous: { cost_usd: null, cache_hit_ratio: null } },
     ...overrides,
   };
