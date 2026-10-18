@@ -327,7 +327,7 @@ describe("the roster", () => {
   it("filters the groups by name and opens the only match on Enter", async () => {
     await openRoster([fine("alpha", { open_review_items: 1 }), fine("beta"), fine("alps")]);
     await screen.findByRole("region", { name: "Quiet" });
-    const box = screen.getByRole("searchbox", { name: "Filter projects by name" });
+    const box = screen.getByRole("searchbox", { name: "Search projects" });
 
     await act(async () => {
       fireEvent.change(box, { target: { value: "AL" } });

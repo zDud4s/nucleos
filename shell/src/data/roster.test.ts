@@ -220,7 +220,7 @@ describe("headline", () => {
   });
 
   it("says so when there is nothing at all", () => {
-    expect(headline([])).toBe("the núcleo knows of no project");
+    expect(headline([])).toBe("no project is registered");
   });
 });
 
