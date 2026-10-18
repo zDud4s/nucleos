@@ -683,6 +683,15 @@ mod tests {
             .unwrap()
     }
 
+    /// The structural marker of `Outcome::Unexecutable` (migration 0208), read back as a bool.
+    async fn unexecutable_of(pool: &sqlx::SqlitePool, id: i64) -> bool {
+        sqlx::query_scalar::<_, bool>("SELECT unexecutable FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
     async fn run_id_of(pool: &sqlx::SqlitePool, id: i64) -> Option<i64> {
         sqlx::query_scalar("SELECT run_id FROM vcs_requests WHERE id = ?")
             .bind(id)
@@ -2500,6 +2509,10 @@ mod tests {
         // `output_tail` can be caught being written: revert this arm to a `Failed` with an empty
         // tail and every other assertion here still passes.
         assert!(
+            unexecutable_of(&pool, corrupt).await,
+            "the unparseable row carries the marker"
+        );
+        assert!(
             output_tail_of(&pool, corrupt).await.is_none(),
             "a row that never reached an argv writes no output tail; that NULL is what tells it \
              apart from an operation that ran and failed"
@@ -2664,6 +2677,104 @@ mod tests {
             ("succeeded", Some("abc123")),
             "the row and what it published survive; only the diagnostic ages out"
         );
+    }
+
+    /// Owner decision 1: `Outcome::Unexecutable` marks the row structurally. The status stays
+    /// `failed` (no change to the status vocabulary); the marker is the new column.
+    #[tokio::test]
+    async fn an_unexecutable_outcome_sets_the_marker() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            id,
+            Outcome::Unexecutable {
+                reason: "bad row".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status_of(&pool, id).await, "failed");
+        assert!(unexecutable_of(&pool, id).await);
+    }
+
+    /// The other half: a failure that DID reach an argv (an exit code, a tail) is plain bad work
+    /// and must not carry the marker, or the landing block would stop counting it as such.
+    #[tokio::test]
+    async fn a_failed_outcome_leaves_the_marker_clear() {
+        let pool = test_pool().await;
+        let id = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            id,
+            Outcome::Failed {
+                reason: "git said no".into(),
+                exit_code: Some(1),
+                output_tail: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status_of(&pool, id).await, "failed");
+        assert!(!unexecutable_of(&pool, id).await);
+    }
+
+    /// Why the marker exists at all: `prune_output_tails` nulls the tail after 30 days, and the
+    /// marker must outlive that. Both rows are past retention; only the plain failure still had a
+    /// tail to drop, and only the marked one stays marked.
+    #[tokio::test]
+    async fn pruning_output_tails_does_not_touch_the_unexecutable_marker() {
+        let pool = test_pool().await;
+        let marked = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            marked,
+            Outcome::Unexecutable {
+                reason: "bad row".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let plain = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        finish(
+            &pool,
+            plain,
+            Outcome::Failed {
+                reason: "git said no".into(),
+                exit_code: Some(1),
+                output_tail: "boom".into(),
+            },
+        )
+        .await
+        .unwrap();
+        backdate(&pool, marked, 31).await;
+        backdate(&pool, plain, 31).await;
+
+        let pruned = prune_output_tails(&pool, 30, chrono::Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(pruned, 1, "only the plain failure still had a tail to drop");
+        assert_eq!(output_tail_of(&pool, plain).await, None);
+        assert!(
+            unexecutable_of(&pool, marked).await,
+            "the marker survives the sweep"
+        );
+        assert!(!unexecutable_of(&pool, plain).await);
     }
 
     /// The three things the sweep must not touch, in one test because each is a different reason.
@@ -2865,10 +2976,11 @@ mod tests {
         assert_eq!(reason.as_deref(), Some("merge conflict"));
     }
 
-    /// The deferred decision, settled in the row rather than in prose: `output_tail IS NULL` means the
-    /// request never reached an argv. Both of these rows read `failed`, so without a structural
-    /// discriminator anyone querying failures for execution diagnostics finds entries with no exit code
-    /// and no output and no way to tell why.
+    /// The deferred decision, settled in the row rather than in prose: the `unexecutable` column
+    /// (migration 0208) marks a request that never reached an argv. Both of these rows read `failed`,
+    /// so without a structural discriminator anyone querying failures for execution diagnostics finds
+    /// entries with no exit code and no output and no way to tell why. The NULL tail still holds, but
+    /// only until `prune_output_tails` empties every tail after 30 days; the marker outlives it.
     #[tokio::test]
     async fn a_request_that_never_ran_is_distinguishable_from_one_that_ran_and_failed() {
         let pool = test_pool().await;
@@ -2907,6 +3019,8 @@ mod tests {
         assert_eq!(status_of(&pool, ran).await, "failed");
         assert!(output_tail_of(&pool, never_ran).await.is_none());
         assert!(output_tail_of(&pool, ran).await.is_some());
+        assert!(unexecutable_of(&pool, never_ran).await);
+        assert!(!unexecutable_of(&pool, ran).await);
     }
 
     /// Only the holder of a claim may end it.

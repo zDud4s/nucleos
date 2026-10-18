@@ -269,13 +269,11 @@ pub enum Outcome {
     /// a result of the operation.
     ///
     /// Recorded as `failed`, because there is no other honest status for it and adding one would
-    /// mean a migration for a case that only a corrupt row can produce. It is told apart in the row
-    /// **structurally**, not by reading the prose: every other variant writes an `output_tail`
-    /// (possibly empty), and this one writes NULL. `status = 'failed' AND output_tail IS NULL` is
-    /// therefore exactly "this row could not be executed", and it is queryable. The status half is
-    /// not decoration — `reconcile_interrupted` writes a terminal status without touching this
-    /// column, so it leaves NULL on rows where git may well have run, and so does every row still
-    /// queued, running or awaiting approval.
+    /// mean a status-vocabulary change for a case that only a corrupt row can produce. It is told
+    /// apart in the row **structurally**, not by reading the prose: `finish` sets the `unexecutable`
+    /// column (migration 0208) for this variant and for no other, and a column, unlike
+    /// `output_tail`, is not emptied by `prune_output_tails` after 30 days. The NULL tail this
+    /// variant still writes is a side effect, no longer the discriminator.
     ///
     /// It does *not* mean "no subprocess ran". An operation can fail before reaching one — the
     /// integration worktree turning out not to be a worktree — and that writes an empty tail rather
@@ -285,7 +283,7 @@ pub enum Outcome {
 }
 impl Outcome {
     /// The `status` column this outcome writes. `Unexecutable` shares `failed` with `Failed`; what
-    /// tells them apart in the row is `output_tail IS NULL`, not this.
+    /// tells them apart in the row is the `unexecutable` column (migration 0208), not this.
     ///
     /// One function rather than a string in each of `finish`'s match arms, because `drain_once` now
     /// needs the same answer for the feed: two places deciding what an outcome is called would
@@ -408,9 +406,9 @@ pub async fn claim_next(
                 format!("stored operation for vcs request {id} could not be parsed: {error}");
             // Terminal rather than back to `queued`: re-queueing would hand the same unparseable
             // row out again on the next poll, forever. `Unexecutable` rather than `Failed` because
-            // this row never reached an argv, and that is what leaves `output_tail` NULL — the
-            // structural discriminator `Outcome::Unexecutable`'s doc comment describes. This arm is
-            // its only producer.
+            // this row never reached an argv, and that is what sets the `unexecutable` column — the
+            // structural marker `Outcome::Unexecutable`'s doc comment describes. This arm is its
+            // only producer.
             let released = match finish(
                 &mut *transaction,
                 id,
@@ -470,6 +468,9 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
         Outcome::AwaitingOwner { map_blob, .. } => Some(map_blob.clone()),
         _ => None,
     };
+    // Structural, like `status`: read before the match below consumes the outcome. Only
+    // `Unexecutable` marks the row (migration 0208); `Failed` and `Escalated` ran something.
+    let unexecutable = matches!(&outcome, Outcome::Unexecutable { .. });
     let (result_sha, failure_reason, exit_code, output_tail) = match outcome {
         Outcome::Succeeded { sha, output_tail } => (sha, None, None, Some(output_tail)),
         Outcome::Blocked {
@@ -499,7 +500,8 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
             SET status = ?1,
                 finished_at = CASE WHEN ?1 = 'awaiting_owner' THEN NULL ELSE ?2 END,
                 result_sha = ?3, failure_reason = ?4, exit_code = ?5, output_tail = ?6,
-                pending_map_blob = COALESCE(?8, pending_map_blob)
+                pending_map_blob = COALESCE(?8, pending_map_blob),
+                unexecutable = ?9
           WHERE id = ?7 AND status = 'running'",
     )
     .bind(status)
@@ -510,6 +512,7 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
     .bind(output_tail)
     .bind(id)
     .bind(pending_map_blob)
+    .bind(unexecutable)
     .execute(executor)
     .await?;
     if finished.rows_affected() != 1 {
