@@ -164,6 +164,9 @@ pub struct DevtimeTokens {
     pub cost_estimated: bool,
     pub prices_as_of: Option<String>,
     pub unpriced_models: Vec<String>,
+    /// One `"<model id>: <reason>"` per price the models file had and the parse dropped as unreadable,
+    /// so a model that reads unpriced because of a bad line says so beside the cost.
+    pub dropped_prices: Vec<String>,
     pub previous: PreviousTokens,
 }
 
@@ -555,6 +558,7 @@ fn tokens_block(window: Window, rows: &[MessageDayRow], models: &ModelsConfig) -
         cost_estimated: true,
         prices_as_of: models.prices_as_of.clone(),
         unpriced_models: unpriced,
+        dropped_prices: models.price_warnings.clone(),
         previous: PreviousTokens {
             cost_usd: total_cost(&before),
             cache_hit_ratio: hit_ratio(&before),
@@ -1123,7 +1127,7 @@ mod tests {
             output: Some(output),
             cache_read: Some(cache_read),
             cache_write: Some(cache_write),
-            source: None,
+            ..ModelPrice::default()
         }
     }
 
@@ -1203,6 +1207,23 @@ mod tests {
         let alias = tokens.by_model.iter().find(|row| row.model == "sonnet");
         let alias = alias.unwrap();
         assert_eq!((alias.input, alias.cost_usd), (1_000_000, None));
+    }
+
+    /// A price the models file had and the parse dropped is named beside the cost, not only logged.
+    #[tokio::test]
+    async fn a_dropped_price_is_listed_beside_the_cost() {
+        let pool = pool().await;
+        let mut models = priced(&[]);
+        let tokens = overview_priced(&pool, Scope::Global, 7, &models)
+            .await
+            .tokens;
+        assert!(tokens.dropped_prices.is_empty());
+        models.price_warnings =
+            vec!["claude-haiku-5-5: input is not a finite, non-negative number".into()];
+        let tokens = overview_priced(&pool, Scope::Global, 7, &models)
+            .await
+            .tokens;
+        assert_eq!(tokens.dropped_prices, models.price_warnings);
     }
 
     #[tokio::test]

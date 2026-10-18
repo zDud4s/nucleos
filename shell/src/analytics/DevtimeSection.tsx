@@ -247,6 +247,9 @@ function TokensPanel({ report }: { report: DevtimeOverview }) {
       {tokens.unpriced_models.length > 0 ? (
         <p className="an-note">{`Cost does not include ${plural(tokens.unpriced_models.length, "model", "models")} without a price.`}</p>
       ) : null}
+      {tokens.dropped_prices.length > 0 ? (
+        <p className="an-note">{`Unreadable prices ignored in nucleos-models.yaml: ${tokens.dropped_prices.join("; ")}.`}</p>
+      ) : null}
       <p className="an-note">
         {tokens.prices_as_of === null
           ? "No prices yet: run scripts/refresh-models.py."

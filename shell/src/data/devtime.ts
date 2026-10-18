@@ -71,6 +71,8 @@ export interface DevtimeTokens {
   cost_estimated: true;
   prices_as_of: string | null;
   unpriced_models: string[];
+  /** `"<model id>: <reason>"` per price the daemon dropped as unreadable from nucleos-models.yaml. */
+  dropped_prices: string[];
   previous: { cost_usd: number | null; cache_hit_ratio: number | null };
 }
 

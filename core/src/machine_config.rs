@@ -647,6 +647,13 @@ url: http://example.com:8080
             validate_models(&models_file("local_engine: ollama\n")).is_ok(),
             "naming the engine it already used changes nothing"
         );
+        assert!(
+            validate_models(&models_file(
+                "model_prices:\n  m: { input: \"abc\" }\n  ok: { input: 1.0 }\n"
+            ))
+            .is_ok(),
+            "an unreadable price drops that entry at load, so the door does not refuse the file for it"
+        );
     }
 
     /// Every row is a bare file name under the root, and a person is shown it as `~/.nucleos/...`.

@@ -930,7 +930,7 @@ export function devtimeOverview(overrides: Partial<DevtimeOverview> = {}): Devti
               correction_coverage: null, previous },
     waste_by_rule: [], waste_by_lever: [],
     tokens: { by_model: [], cache_hit_ratio: null, cost_usd: null, cost_estimated: true, prices_as_of: null,
-              unpriced_models: [], previous: { cost_usd: null, cache_hit_ratio: null } },
+              unpriced_models: [], dropped_prices: [], previous: { cost_usd: null, cache_hit_ratio: null } },
     ...overrides,
   };
 }

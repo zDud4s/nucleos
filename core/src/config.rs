@@ -3502,7 +3502,156 @@ ok: {{ input: 2.0, output: 8.0 }}\n"
                 ("opus", "gpt"),
                 "{bad}: routing still loads"
             );
+            assert!(
+                config.price_warnings.iter().any(|w| w.starts_with("m: ")),
+                "{bad}: and the drop is recorded, not only logged: {:?}",
+                config.price_warnings
+            );
         }
+    }
+
+    #[test]
+    fn model_prices_drop_only_a_wrong_typed_or_wrong_shaped_entry() {
+        // A wrong TYPE is the same mistake as a wrong number: it costs that one entry, never the file.
+        for bad in [
+            "m: { input: \"abc\", output: 1.0 }",
+            "m: { input: [1], output: 1.0 }",
+            "m: just a string",
+            "m: [1, 2]",
+            "m: { input: 1.0, tiers: [{ min_prompt_tokens: -5, input: 2.0 }] }",
+            "m: { input: 1.0, tiers: [{ min_prompt_tokens: 10, input: -2.0 }] }",
+            "m: { input: 1.0, tiers: [{ min_prompt_tokens: 10, output: \"x\" }] }",
+            "m: { input: 1.0, cache_write_1h: .nan }",
+            "m: { input: 1.0, fast: { input: -8.0, output: 40.0 } }",
+            "m: { input: 1.0, fast: oops }",
+            "m: { input: 1.0, geo_us_mult: -1.1 }",
+        ] {
+            let text = format!(
+                "claude_model: opus\ncodex_model: gpt\nmodel_prices:\n  {bad}\n  \
+ok: {{ input: 2.0, output: 8.0 }}\n"
+            );
+            let config = parse_models_config(&text).unwrap_or_else(|e| panic!("{bad}: {e}"));
+            assert!(config.price_of("m").is_none(), "{bad}: the bad entry is dropped");
+            assert_eq!(
+                config.price_of("ok").unwrap().input,
+                Some(2.0),
+                "{bad}: its sibling still loads"
+            );
+            assert_eq!(config.claude_model, "opus", "{bad}: routing still loads");
+            assert_eq!(
+                config.price_warnings.len(),
+                1,
+                "{bad}: exactly the one drop is recorded: {:?}",
+                config.price_warnings
+            );
+            assert!(config.price_warnings[0].starts_with("m: "), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_model_prices_block_that_is_not_a_mapping_costs_the_prices_and_nothing_else() {
+        let config = parse_models_config(
+            "claude_model: opus\ncodex_model: gpt\nmodel_prices: [1, 2]\n",
+        )
+        .unwrap();
+        assert!(config.model_prices.is_empty());
+        assert_eq!(config.claude_model, "opus");
+        assert_eq!(config.price_warnings.len(), 1, "{:?}", config.price_warnings);
+        // A null block is a file with no prices, which is not a warning.
+        let empty =
+            parse_models_config("claude_model: opus\ncodex_model: gpt\nmodel_prices: ~\n").unwrap();
+        assert!(empty.model_prices.is_empty() && empty.price_warnings.is_empty());
+        // Routing keys keep their strict grammar: a wrong type there still refuses the file.
+        assert!(parse_models_config("claude_model: [1]\ncodex_model: gpt\n").is_err());
+    }
+
+    const HAIKU_AND_OPUS: &str = "claude_model: opus\ncodex_model: gpt\nmodel_prices:\n  \
+claude-haiku-5-5: { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125, cache_write_1h: 0.2, \
+tiers: [{ min_prompt_tokens: 100001, input: 0.5, output: 2.5, cache_read: 0.05, cache_write: 0.625, cache_write_1h: 1.0 }], \
+geo_us_mult: 1.1, source: anthropic }\n  \
+claude-opus-5-5: { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25, cache_write_1h: 10.0, \
+fast: { input: 8.0, output: 40.0 }, geo_us_mult: 1.1, source: anthropic }\n  \
+half-tier: { input: 1.0, output: 4.0, tiers: [{ min_prompt_tokens: 10, input: 2.0 }, { min_prompt_tokens: 100, input: 3.0 }] }\n";
+
+    fn close(a: Option<f64>, b: f64) -> bool {
+        a.is_some_and(|a| (a - b).abs() < 1e-9)
+    }
+
+    #[test]
+    fn a_tiered_price_parses_with_its_tiers_fast_rate_and_residency_multiplier() {
+        let config = parse_models_config(HAIKU_AND_OPUS).unwrap();
+        assert!(config.price_warnings.is_empty(), "{:?}", config.price_warnings);
+        let haiku = config.price_of("claude-haiku-5-5").unwrap();
+        assert_eq!(haiku.cache_write_1h, Some(0.2));
+        assert_eq!(haiku.tiers.len(), 1);
+        assert_eq!(haiku.tiers[0].min_prompt_tokens, 100_001);
+        assert_eq!(haiku.geo_us_mult, Some(1.1));
+        // `price_of` answers the base tier for every caller that predates tiers.
+        assert_eq!((haiku.input, haiku.output), (Some(0.1), Some(0.5)));
+        let opus = config.price_of("claude-opus-5-5").unwrap();
+        assert_eq!(
+            opus.fast.as_ref().map(|f| (f.input, f.output)),
+            Some((8.0, 40.0))
+        );
+    }
+
+    #[test]
+    fn rates_for_picks_the_tier_by_prompt_length_from_its_threshold() {
+        let config = parse_models_config(HAIKU_AND_OPUS).unwrap();
+        let haiku = config.price_of("claude-haiku-5-5").unwrap();
+        let base = haiku.rates_for(100_000, false, false);
+        assert_eq!(
+            (base.input, base.output, base.cache_read, base.cache_write, base.cache_write_1h),
+            (Some(0.1), Some(0.5), Some(0.01), Some(0.125), Some(0.2)),
+            "up to 100,000 prompt tokens is the base tier"
+        );
+        let long = haiku.rates_for(100_001, false, false);
+        assert_eq!(
+            (long.input, long.output, long.cache_read, long.cache_write, long.cache_write_1h),
+            (Some(0.5), Some(2.5), Some(0.05), Some(0.625), Some(1.0)),
+            "over 100,000 the whole request moves to the long tier"
+        );
+        // A tier carries only the rates it overrides; the highest threshold exceeded wins.
+        let half = config.price_of("half-tier").unwrap();
+        assert_eq!(half.rates_for(9, false, false).input, Some(1.0));
+        assert_eq!(half.rates_for(10, false, false).input, Some(2.0));
+        assert_eq!(half.rates_for(1_000, false, false).input, Some(3.0));
+        assert_eq!(
+            half.rates_for(1_000, false, false).output,
+            Some(4.0),
+            "an output the tier does not name is the base one"
+        );
+    }
+
+    #[test]
+    fn rates_for_applies_fast_mode_and_us_residency_on_top() {
+        let config = parse_models_config(HAIKU_AND_OPUS).unwrap();
+        let opus = config.price_of("claude-opus-5-5").unwrap();
+        let fast = opus.rates_for(0, true, false);
+        assert_eq!((fast.input, fast.output), (Some(8.0), Some(40.0)));
+        // Caching multipliers apply on top of the fast rate: 0.1x, 1.25x and 2x of its input.
+        assert!(close(fast.cache_read, 0.8), "{fast:?}");
+        assert!(close(fast.cache_write, 10.0), "{fast:?}");
+        assert!(close(fast.cache_write_1h, 16.0), "{fast:?}");
+        let geo = opus.rates_for(0, false, true);
+        assert!(close(geo.input, 5.5) && close(geo.output, 27.5), "{geo:?}");
+        assert!(close(geo.cache_read, 0.55) && close(geo.cache_write_1h, 11.0), "{geo:?}");
+        let both = opus.rates_for(0, true, true);
+        assert!(close(both.input, 8.8) && close(both.output, 44.0), "{both:?}");
+        let haiku = config.price_of("claude-haiku-5-5").unwrap();
+        let long_geo = haiku.rates_for(200_000, false, true);
+        assert!(close(long_geo.input, 0.55) && close(long_geo.output, 2.75), "{long_geo:?}");
+    }
+
+    #[test]
+    fn rates_for_answers_unpriced_for_a_mode_it_has_no_price_for() {
+        // A wrong cost is worse than none: a fast or US-resident request on a model whose entry does
+        // not price that mode reads unpriced, never as the standard rate.
+        let config = parse_models_config(HAIKU_AND_OPUS).unwrap();
+        let haiku = config.price_of("claude-haiku-5-5").unwrap();
+        assert_eq!(haiku.rates_for(0, true, false), Rates::default());
+        let half = config.price_of("half-tier").unwrap();
+        assert_eq!(half.rates_for(0, false, true), Rates::default());
     }
 
     #[test]

@@ -32,6 +32,7 @@ function busy(): DaemonState {
     previous: { active_ms: 50 * MIN, wasted_ms: 12 * MIN, waste_ratio: 0.24, interruption_rate: 0.3, correction_rate: null } };
   report.quality = { ...report.quality, ingest_enabled: true, last_cycle_at: new Date(Date.now() - 60_000).toISOString(), sessions: 5 };
   report.tokens = { ...report.tokens, cost_usd: 4.2, prices_as_of: "2026-10-17", unpriced_models: ["sonnet"],
+    dropped_prices: ["claude-haiku-5-5: input is not a finite, non-negative number"],
     by_model: [
       { model: "claude-opus-4-7", effort: "high", input: 1000, cache_read: 9000, cache_creation: 0, output: 500, messages: 3, cost_usd: 4.2 },
       { model: "sonnet", effort: "unknown", input: 10, cache_read: 0, cache_creation: 0, output: 5, messages: 1, cost_usd: null },
@@ -120,6 +121,9 @@ describe("DevtimeSection", () => {
     const sonnet = within(table).getByRole("row", { name: /sonnet/ });
     expect(within(sonnet).getByText("no price")).toBeTruthy();
     expect(screen.getByText("Cost does not include 1 model without a price.")).toBeTruthy();
+    expect(screen.getByText(
+      "Unreadable prices ignored in nucleos-models.yaml: claude-haiku-5-5: input is not a finite, non-negative number.",
+    )).toBeTruthy();
     expect(screen.getByText("Estimated, prices of 2026-10-17. Never compared with an invoice.")).toBeTruthy();
   });
 
