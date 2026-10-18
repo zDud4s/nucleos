@@ -293,6 +293,7 @@ function AttachmentRow({ emailId, attachment }: { emailId: number; attachment: E
   const save = useSaveAttachment(emailId);
   const download = useDownloadAttachment(emailId);
   const senderName = attachment.filename ?? `attachment ${attachment.position}`;
+  const menu = useRef<HTMLDetailsElement>(null);
 
   // One row of the panel's hairline-ruled list, not a box of its own: name, type
   // and size, then both actions on the same line, and any outcome spanning the
@@ -313,9 +314,21 @@ function AttachmentRow({ emailId, attachment }: { emailId: number; attachment: E
       >
         Download
       </Button>
-      <Button variant="quiet" disabled={save.isPending} onClick={() => save.mutate(attachment.position)}>
-        Save to files
-      </Button>
+      {/* One main action per row; the second way out waits behind "More", and a native
+          disclosure carries the keyboard and screen-reader grammar. */}
+      <details className="mail-detail-more" ref={menu}>
+        <summary>More</summary>
+        <Button
+          variant="quiet"
+          disabled={save.isPending}
+          onClick={() => {
+            save.mutate(attachment.position);
+            menu.current?.removeAttribute("open");
+          }}
+        >
+          Save to files
+        </Button>
+      </details>
       {/* The name shown here is the one the DAEMON wrote it under — sanitised
           and de-collided, and never assumed to be `senderName` above; the two
           can legitimately differ for the same attachment. */}

@@ -141,9 +141,30 @@ describe("Contacts — finding people", () => {
     expect(screen.getByText("bob@example.com")).toBeDefined();
 
     fireEvent.change(screen.getByRole("searchbox", { name: "Search people" }), { target: { value: "" } });
-    fireEvent.click(screen.getByRole("button", { name: "Urgent" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Urgent/ }));
     expect(screen.queryByText("bob@example.com")).toBeNull();
     expect(screen.getByText("ana@example.com")).toBeDefined();
+  });
+});
+
+describe("Contacts — verdict undo", () => {
+  it("offers Undo after Mute and sends the previous verdict back", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/contacts") return [correspondent({ verdict: "pin" })];
+      if (path === "/contacts/merges") return [];
+      return undefined;
+    });
+
+    renderWithQuery(<Contacts />);
+    fireEvent.click(await screen.findByRole("button", { name: "Mute" }));
+
+    expect(await screen.findByText("Ana marked noise")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+
+    await vi.waitFor(() => {
+      const sent = daemon.apiFetch.mock.calls.filter(([path]) => String(path).includes("verdict"));
+      expect(sent).toHaveLength(2);
+    });
   });
 });
 
