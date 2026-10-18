@@ -946,6 +946,7 @@ function NewRunForm({
               label="Start run"
               confirmLabel="Start in real mode"
               sayAs="starts a real run, acting on the files in the working directory as they are"
+              variant="approve"
               intent="go"
               disabled={blank || create.isPending}
               describedBy={[describedBy, realId].filter(Boolean).join(" ")}

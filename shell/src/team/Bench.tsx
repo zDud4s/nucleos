@@ -14,7 +14,6 @@ import {
   type TeamView,
 } from "../data/teams";
 import {
-  Badge,
   Button,
   ConfirmButton,
   Count,
@@ -214,7 +213,7 @@ function BenchHead({
         <h1 className="teams-bench-name">{team.name}</h1>
         {/* "waiting on you" belongs to Waiting's decision count; this is open team action. */}
         {unknown ? (
-          <Badge tone="off">unknown</Badge>
+          <StateBadge domain="department" state="unknown" />
         ) : (
           <StateBadge domain="department" state={live > 0 ? "working" : waiting > 0 ? "waiting" : "idle"} />
         )}

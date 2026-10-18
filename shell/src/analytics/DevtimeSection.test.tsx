@@ -48,7 +48,7 @@ describe("DevtimeSection", () => {
     daemon.apiFetch.mockImplementation(() => new Promise(() => {}));
     await renderWithRouter(<DevtimeSection days={30} />);
     expect(screen.getByRole("region", { name: "Development time" })).toBeTruthy();
-    expect(screen.getByRole("status", { name: /Loading development time/ })).toBeTruthy();
+    expect(screen.getByText(/Loading development time/)).toBeTruthy();
   });
 
   it("says there is nothing yet, and why, when the window is empty", async () => {

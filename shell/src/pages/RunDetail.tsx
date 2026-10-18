@@ -786,8 +786,7 @@ function useRunEvents(text: string): RunEvent[] {
     events: [],
   });
   return useMemo(() => {
-    const finished = text.lastIndexOf("
-") + 1;
+    const finished = text.lastIndexOf("\n") + 1;
     const state = cache.current;
     const intact =
       state.done <= finished && text.slice(Math.max(0, state.done - GUARD), state.done) === state.guard;

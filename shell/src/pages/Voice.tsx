@@ -402,9 +402,7 @@ function Captions({ voice, hotkey }: { voice: ConversationView; hotkey: string }
 }
 
 /** The smallest voice.yaml that turns the pillar on; any speech-to-text program that takes a WAV path works. */
-const MINIMAL_VOICE_YAML = "enabled: true
-stt_command: whisper-cli -m model.bin
-";
+const MINIMAL_VOICE_YAML = "enabled: true\nstt_command: whisper-cli -m model.bin\n";
 const VOICE_YAML_PATH = "~/.nucleos/voice.yaml";
 
 /** What stands in the room's middle instead of the captions, on a machine that cannot transcribe. */

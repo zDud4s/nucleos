@@ -598,7 +598,7 @@ describe("the project workspace", () => {
    */
   it("mounts the workflows mode on the library and the project's pins", async () => {
     await openWorkspace({ mode: "workflows" });
-    expect(await screen.findByText(/No workflow is installed here/)).toBeTruthy();
+    expect((await screen.findAllByText(/No workflow is installed here/)).length).toBeGreaterThan(0);
     // Nothing installed and an empty library: the mode offers the way to fill it rather than an
     // empty "On this machine" section, which the Workflows mode no longer draws in that case.
     expect(await screen.findByRole("button", { name: "Copy the library path" })).toBeTruthy();

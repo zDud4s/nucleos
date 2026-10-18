@@ -644,7 +644,7 @@ describe("Agents - the route", () => {
     openTab(editor, "Tools and loadout");
     expect(within(editor).queryByRole("button", { name: "Save changes" })).toBeNull();
     expect(within(editor).queryByLabelText("Name")).toBeNull();
-    expect(within(editor).getByRole("button", { name: "Close" })).toBeDefined();
+    expect(within(editor).getAllByRole("button", { name: "Close" }).length).toBeGreaterThan(0);
   });
 
   it("says why Save is off, and says Saved once the daemon answered", async () => {

@@ -453,7 +453,7 @@ describe("the page", () => {
     });
     await page();
 
-    expect(await screen.findByText(/nothing is known about this month/)).toBeDefined();
+    expect(await screen.findByText(/nothing is known about this period/)).toBeDefined();
   });
 
   it("quotes a refusal on the events route instead of replacing it with generic copy", async () => {

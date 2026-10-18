@@ -3768,7 +3768,7 @@ describe("the editor's sessions, in the same list as the rest", () => {
       await screen.findByPlaceholderText("Carry on where you left off…"),
     ).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("link", { name: /o que ficou por fazer/i }));
+    fireEvent.click(screen.getAllByRole("link", { name: /o que ficou por fazer/i })[0]);
 
     expect(await screen.findByText("aqui estou")).toBeTruthy();
   });

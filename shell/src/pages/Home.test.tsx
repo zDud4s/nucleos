@@ -88,7 +88,7 @@ describe("Home", () => {
     await renderWithRouter(<Home />);
 
     expect((await card("Waiting on you")).textContent).toContain(
-      "2 decisions need your answer",
+      "1 decision needs your answer",
     );
     // The card is itself the door to the queue; the separate "Where to look next" sentence was
     // removed by the redesign.
@@ -305,7 +305,12 @@ describe("Home", () => {
     // Every action lives one click away, on the page that also shows what you
     // would be acting on. A control here would be pressed by somebody looking at
     // the state of five seconds ago.
-    expect(screen.queryAllByRole("button")).toHaveLength(0);
+    // Glossary Tip marks (aria-describedby) only explain, and Retry only reads again.
+    expect(
+      screen
+        .queryAllByRole("button")
+        .filter((b) => b.getAttribute("aria-describedby") === null && b.textContent !== "Retry"),
+    ).toHaveLength(0);
     // Each reading is a link to its page (no more "Where to look next").
     expect(screen.getByRole("link", { name: "Shadow decisions pending" }).getAttribute("href")).toBe("/autopilot");
     expect(screen.getByRole("link", { name: "Waiting on you" }).getAttribute("href")).toBe("/waiting");

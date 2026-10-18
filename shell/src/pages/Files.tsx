@@ -1630,7 +1630,7 @@ function pageHeadline(rootUnavailable: boolean, entries: Entry[] | undefined, fa
  * to check, and leaves the route count and the pillar vocabulary to the code.
  */
 function FilesUnavailableTeach() {
-  const path = "%LOCALAPPDATA%\nucleos\NucleOS\data\files";
+  const path = "%LOCALAPPDATA%\\nucleos\\NucleOS\\data\\files";
   const [copied, setCopied] = useState(false);
   return (
     <Teach title="The files folder could not be opened">

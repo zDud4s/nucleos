@@ -1465,7 +1465,7 @@ describe("Fleet — asking for a job", () => {
     const start = screen.getByRole("button", { name: "Start job" }) as HTMLButtonElement;
     expect(start.disabled).toBe(true);
     const hint = document.getElementById(start.getAttribute("aria-describedby")!.split(" ")[0])!;
-    expect(hint.textContent).toMatch(/waits until this says what the job should work on/);
+    expect(hint.textContent).toMatch(/Describe the work to enable Start job/);
 
     fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
     expect(start.disabled).toBe(false);
@@ -2056,7 +2056,7 @@ describe("Fleet — loading, retry and the headline's reach", () => {
   });
 
   it("names the Fields' controls with their visible labels and no aria-label of their own", async () => {
-    daemon.apiFetch.mockImplementation(fleetFetch(fleetState()));
+    daemon.apiFetch.mockImplementation(fleetFetch(fleetState({ concurrency: { house: { limit: 4, held: 0 }, projects: [column()] } })));
     await renderWithRouter(<Fleet />);
     fireEvent.click(await screen.findByRole("button", { name: "New job" }));
 
@@ -2066,7 +2066,7 @@ describe("Fleet — loading, retry and the headline's reach", () => {
   });
 
   it("starts a project's job from a button that says New job, and says which project after", async () => {
-    daemon.apiFetch.mockImplementation(fleetFetch(fleetState()));
+    daemon.apiFetch.mockImplementation(fleetFetch(fleetState({ concurrency: { house: { limit: 4, held: 0 }, projects: [column()] } })));
     await renderWithRouter(<Fleet />);
 
     const button = await screen.findByRole("button", { name: "New job in alpha" });

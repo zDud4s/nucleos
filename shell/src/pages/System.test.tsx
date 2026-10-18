@@ -406,7 +406,7 @@ async function renderSystemAt(initialPath: string) {
 /** The settings tab shows one file at a time: pick it from the list first. */
 async function openSettingsFile(area: string): Promise<void> {
   const list = await screen.findByRole("list", { name: "Settings files" });
-  fireEvent.click(within(list).getByRole("button", { name: area }));
+  fireEvent.click(within(list).getByRole("button", { name: new RegExp(`^${area}\\b`) }));
 }
 
 function rowFor(list: HTMLElement, name: string): HTMLElement {
@@ -981,7 +981,7 @@ describe("System - quota brake", () => {
     expect(enabled.checked).toBe(false);
     expect(fiveHour.value).toBe("85");
     expect(sevenDay.value).toBe("90");
-    expect(within(block).getByText("only claude's windows count")).toBeDefined();
+    expect(within(block).getByText(/Only claude's windows count\./)).toBeDefined();
 
     fireEvent.click(enabled);
     fireEvent.change(fiveHour, { target: { value: "80" } });
@@ -1185,7 +1185,7 @@ describe("System - this machine's settings", () => {
     // the list, and each opening its own file.
     const list = await screen.findByRole("list", { name: "Settings files" });
     for (const area of ["web", "browser", "council", "models"]) {
-      fireEvent.click(within(list).getByRole("button", { name: area }));
+      fireEvent.click(within(list).getByRole("button", { name: new RegExp(`^${area}\\b`) }));
       expect(await screen.findByRole("heading", { name: area })).toBeDefined();
     }
     expect(daemon.apiFetch).toHaveBeenCalledWith("/config/machine");

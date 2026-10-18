@@ -118,7 +118,7 @@ describe("PipelineSection", () => {
     const red = card("Post-merge gate");
     expect(within(red).getByText("Red")).toBeTruthy();
     expect(within(red).getByText("Red for 1 h 30 (phase: bisect)")).toBeTruthy();
-    expect(within(red).getByRole("img", { name: "Red" })).toBeTruthy();
+    expect(within(red).getByRole("img", { name: "Needs attention" })).toBeTruthy();
     expect(red.closest(".an-metric")?.classList.contains("an-metric-alert")).toBe(true);
     // Red opens first, and its project is a way into the state view.
     expect(red.getAttribute("aria-pressed")).toBe("true");

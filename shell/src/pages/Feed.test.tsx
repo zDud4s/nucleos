@@ -561,13 +561,13 @@ describe("Feed - taking a mark back, and one model for the filters", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     // Nothing moved: no navigation, no search, the page is still live.
     expect(screen.queryByText(/the page has stopped refreshing/)).toBeNull();
-    expect(feedCalls().some((path) => path.includes("since="))).toBe(false);
+    expect(feedCalls().some((path) => path.includes("kind=job_failed"))).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     expect(await screen.findByText(/the page has stopped refreshing/)).toBeDefined();
     await waitFor(() => {
-      const searched = feedCalls().find((path) => path.includes("since=")) ?? "";
-      expect(searched).toContain("kind=job_failed");
+      const searched = feedCalls().find((path) => path.includes("kind=job_failed")) ?? "";
+      expect(searched).toContain("since=");
     });
   });
 

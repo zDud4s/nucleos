@@ -1021,7 +1021,7 @@ describe("Files — reachable without a mouse", () => {
 
     renderWithQuery(<Files />);
     const tree = screen.getByRole("tree", { name: "Folders" });
-    const root = within(tree).getByRole("treeitem", { name: "files" });
+    const root = within(tree).getByRole("treeitem", { name: "Files" });
     expect(root.tabIndex).toBe(0);
     await within(tree).findByRole("treeitem", { name: "invoices" });
 

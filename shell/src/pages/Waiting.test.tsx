@@ -1363,7 +1363,7 @@ describe("Waiting - one verb pair", () => {
 
   it("the recruit's caution is visible, and says so when engine or tool policy left the proposal", async () => {
     const world = waitingWorld({
-      recruits: [proposal({ id: 301, tool_input: JSON.stringify(agentRequest()) })],
+      recruits: [proposal({ id: 301, tool_input: JSON.stringify(agentRequest({ engine: "claude" })) })],
     });
     daemon.apiFetch.mockImplementation(waitingFetch(world));
 

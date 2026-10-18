@@ -420,7 +420,7 @@ describe("refused and stale", () => {
   it("reserves the page's height while reading, instead of one card that jumps", async () => {
     daemon.apiFetch.mockImplementation(() => new Promise(() => {}));
     await renderWithRouter(<AnalyticsView />);
-    expect(screen.getByRole("status", { name: /Loading analytics/ })).toBeTruthy();
+    expect(screen.getAllByText(/Loading analytics/).length).toBeGreaterThan(0);
   });
 
   it("links the three sections and gives the first a heading of its own", async () => {

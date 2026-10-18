@@ -19,7 +19,6 @@ import {
   type TeamView,
 } from "../data/teams";
 import {
-  Badge,
   Button,
   ErrorNote,
   Meter,
@@ -536,7 +535,7 @@ function DepartmentRow({
  */
 function RowState({ live, waiting }: { live: number | null; waiting: number | null }) {
   // "idle" would be a claim about a read that has not answered.
-  if (live === null || waiting === null) return <Badge tone="off">unknown</Badge>;
+  if (live === null || waiting === null) return <StateBadge domain="department" state="unknown" />;
   const state = live > 0 ? "working" : waiting > 0 ? "waiting" : "idle";
   return <StateBadge domain="department" state={state} />;
 }
