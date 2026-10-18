@@ -163,7 +163,10 @@ pub async fn build(
         ),
         jobs: block("jobs", jobs::read(pool, project, window, now).await),
         autopilot: block("autopilot", autopilot::read(pool, project, window).await),
-        pressure: Some(block("pressure", pressure::read(pool, project, window).await)),
+        pressure: Some(block(
+            "pressure",
+            pressure::read(pool, project, window).await,
+        )),
     }
 }
 
