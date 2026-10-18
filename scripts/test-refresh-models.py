@@ -247,21 +247,36 @@ def cases():
 
 
     # --- prices: Anthropic's page ------------------------------------------------
-    prices, tiered, problems = refresh_models.anthropic_prices(PRICING_MD)
+    prices, problems = refresh_models.anthropic_prices(PRICING_MD)
     yield ("pricing_markdown_fixture_parses_to_per_million_prices",
            prices["claude-opus-4-7"],
-           {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25, "source": "anthropic"})
+           {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25, "cache_write_1h": 10.0,
+            "source": "anthropic"})
     yield ("a footnote marker does not stop a price from parsing",
            prices["claude-sonnet-5"]["input"], 2.0)
     yield ("a retired model's link is not part of its id",
            "claude-opus-4-1" in prices, True)
-    yield ("a tiered model is named, written without price, and is not a problem",
-           (sorted(tiered), "claude-haiku-5-5" in prices, problems), (["claude-haiku-5-5"], False, []))
+    yield ("a model priced by prompt length is one entry: the base tier plus a tier over 100,000 tokens",
+           (prices["claude-haiku-5-5"], problems),
+           ({"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125, "cache_write_1h": 0.2,
+             "source": "anthropic",
+             "tiers": [{"min_prompt_tokens": 100_001, "input": 0.5, "output": 2.5, "cache_read": 0.05,
+                        "cache_write": 0.625, "cache_write_1h": 1.0}]}, []))
+    orphan = "\n".join(line for line in PRICING_MD.splitlines() if "up to 100,000" not in line)
+    prices, problems = refresh_models.anthropic_prices(orphan)
+    yield ("a tier with no base row is unreadable: written without price, and a problem",
+           (prices["claude-haiku-5-5"]["input"], "tiers" in prices["claude-haiku-5-5"], len(problems)),
+           (None, False, 1))
+    odd = PRICING_MD.replace("(for prompts over 100,000 tokens)", "(for prompts between 1 and 2 tokens)")
+    prices, problems = refresh_models.anthropic_prices(odd)
+    yield ("a tier phrase it cannot read is never guessed at",
+           (prices["claude-haiku-5-5"]["input"], len(problems)), (None, 1))
     broken = PRICING_MD.replace("| $25 / MTok |", "| ask sales |")
-    prices, _, problems = refresh_models.anthropic_prices(broken)
+    prices, problems = refresh_models.anthropic_prices(broken)
     yield ("price_unreadable_is_written_without_price_and_exits_1 (parser half)",
            (prices["claude-opus-4-7"], len(problems)),
-           ({"input": None, "output": None, "cache_read": None, "cache_write": None, "source": "anthropic"}, 1))
+           ({"input": None, "output": None, "cache_read": None, "cache_write": None, "cache_write_1h": None,
+             "source": "anthropic"}, 1))
     renamed = PRICING_MD.replace("Output tokens", "Output")
     yield ("pricing_page_format_change_fails_loudly (parser half): a renamed column is None, not a guess",
            refresh_models.anthropic_prices(renamed), None)
@@ -277,19 +292,34 @@ def cases():
         {"id": "openai/gpt-5.5", "pricing": {"prompt": "0.00000125", "completion": "0.00001",
                                               "input_cache_read": "0.000000125"}},
         {"id": "openai/gpt-5.5:batch", "pricing": {"prompt": "0.0000006", "completion": "0.000005"}},
-        {"id": "openai/gpt-6-tiered", "pricing": {"prompt": "0.000002", "completion": "0.00001",
-                                                   "overrides": [{"min_prompt_tokens": 272000}]}},
+        {"id": "openai/gpt-6-tiered", "pricing": {
+            "prompt": "0.000002", "completion": "0.00001", "input_cache_write_1h": "0.000004",
+            "overrides": [{"min_prompt_tokens": 272000, "prompt": "0.000004", "completion": "0.00002",
+                           "input_cache_read": "0.0000004"}]}},
+        {"id": "openai/gpt-night", "pricing": {
+            "prompt": "0.000002", "completion": "0.00001",
+            "overrides": [{"utc_days": [0, 1], "utc_start": "00:00", "utc_end": "06:00", "prompt": "0.000001"}]}},
+        {"id": "openai/gpt-mixed", "pricing": {
+            "prompt": "0.000002", "completion": "0.00001",
+            "overrides": [{"min_prompt_tokens": 1000, "prompt": "0.000003"},
+                          {"utc_start": "00:00", "utc_end": "06:00", "prompt": "0.000001"}]}},
         {"id": "anthropic/claude-opus-4.7", "pricing": {"prompt": "0.000005", "completion": "0.000025",
                                                          "input_cache_read": "0.0000005",
                                                          "input_cache_write": "0.00000625"}},
         {"id": "google/gemini-x", "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
     )
-    openai, tiered, crosscheck = refresh_models.openrouter_prices(catalogue)
+    openai, unsupported, crosscheck = refresh_models.openrouter_prices(catalogue)
     yield ("openrouter_pricing_sample_converts_per_token_to_per_million",
            openai["gpt-5.5"],
-           {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": None, "source": "openrouter"})
-    yield ("batch variants and other vendors are not priced; tiered ones are named",
-           (sorted(openai), sorted(tiered)), (["gpt-5.5"], ["gpt-6-tiered"]))
+           {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": None, "cache_write_1h": None,
+            "source": "openrouter"})
+    yield ("a prompt-length override becomes a tier carrying only the rates it overrides",
+           openai["gpt-6-tiered"],
+           {"input": 2.0, "output": 10.0, "cache_read": None, "cache_write": None, "cache_write_1h": 4.0,
+            "source": "openrouter",
+            "tiers": [{"min_prompt_tokens": 272000, "input": 4.0, "output": 20.0, "cache_read": 0.4}]})
+    yield ("batch variants and other vendors are not priced; time-of-day overrides are named, never priced",
+           (sorted(openai), sorted(unsupported)), (["gpt-5.5", "gpt-6-tiered"], ["gpt-mixed", "gpt-night"]))
     yield ("anthropic entries come back apart, normalised, for the cross-check only",
            crosscheck["claude-opus-4-7"]["output"], 25.0)
     vendor = {"claude-opus-4-7": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25,
@@ -317,13 +347,25 @@ def cases():
     yield ("a price row is flow-style with explicit nulls",
            refresh_models.render_price_row("gpt-5.5", {"input": 1.25, "output": 10.0, "cache_read": 0.125,
                                                        "cache_write": None, "source": "openrouter"}),
-           '  gpt-5.5: { input: 1.25, output: 10.0, cache_read: 0.125, cache_write: null, source: openrouter }')
+           '  gpt-5.5: { input: 1.25, output: 10.0, cache_read: 0.125, cache_write: null, '
+           'cache_write_1h: null, source: openrouter }')
+    yield ("a tiered row writes its tiers inline, each with only the rates it carries",
+           refresh_models.render_price_row("claude-haiku-5-5", {
+               "input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125, "cache_write_1h": 0.2,
+               "source": "anthropic",
+               "tiers": [{"min_prompt_tokens": 100_001, "input": 0.5, "output": 2.5}]}),
+           '  claude-haiku-5-5: { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125, '
+           'cache_write_1h: 0.2, tiers: [{ min_prompt_tokens: 100001, input: 0.5, output: 2.5 }], '
+           'source: anthropic }')
     good = '{"data": [{"id": "openai/gpt-5.5", "pricing": {"prompt": "0.00000125", "completion": "0.00001"}}]}'
     with fake_bodies({refresh_models.PRICING_DOC: PRICING_MD, refresh_models.OPENROUTER_MODELS: good}):
         blocks, complained = refresh_models.refresh_prices("2026-10-18")
     yield ("a clean read writes both sources and does not complain",
            ("claude-opus-4-7:" in blocks["model_prices"], "gpt-5.5:" in blocks["model_prices"], complained),
            (True, True, False))
+    yield ("a clean read writes the tiered model with its tier",
+           "claude-haiku-5-5: { input: 0.1" in blocks["model_prices"]
+           and "min_prompt_tokens: 100001" in blocks["model_prices"], True)
     with fake_bodies({refresh_models.PRICING_DOC: broken, refresh_models.OPENROUTER_MODELS: good}):
         blocks, complained = refresh_models.refresh_prices("2026-10-18")
     yield ("price_unreadable_is_written_without_price_and_exits_1",

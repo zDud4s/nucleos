@@ -127,8 +127,22 @@ pub struct ModelsConfig {
     /// Vendor-published prices, USD per million tokens, keyed by normalised model id. Written by the
     /// script, never by hand: there is no hand-kept price catalogue (owner, 2026-10-17). Read per
     /// request like the rest of this file, so a refresh needs no restart.
-    #[serde(default)]
+    ///
+    /// Filled by [`parse_models_config`] from `raw_model_prices`, entry by entry, so one unreadable
+    /// entry costs that entry and never the file.
+    #[serde(skip)]
     pub model_prices: std::collections::BTreeMap<String, ModelPrice>,
+    /// `model_prices` exactly as the file wrote it, any shape. Read as a bare YAML value so that a
+    /// wrong type in one price cannot fail the whole file: model routing must not depend on it
+    /// (owner, 2026-10-18). Emptied by [`parse_models_config`] once converted.
+    /// `pub` only because the daemon binary builds this struct with `..Default::default()`.
+    #[serde(default, rename = "model_prices")]
+    #[doc(hidden)]
+    pub raw_model_prices: serde_yaml::Value,
+    /// One `"<model id>: <reason>"` per price entry [`parse_models_config`] dropped, so the drop is
+    /// visible where the cost is shown and not only in the daemon's log.
+    #[serde(skip)]
+    pub price_warnings: Vec<String>,
 }
 
 /// One row of the conversation's model picker.
@@ -782,6 +796,8 @@ impl Default for ModelsConfig {
             assistant_choices: default_assistant_choices(),
             prices_as_of: None,
             model_prices: std::collections::BTreeMap::new(),
+            raw_model_prices: serde_yaml::Value::Null,
+            price_warnings: Vec::new(),
         }
     }
 }
@@ -817,6 +833,17 @@ pub const MODELS_CONFIG_DISPLAY_PATH: &str = "~/.nucleos/nucleos-models.yaml";
 
 /// One model's published prices. A `None` field is a price the script could not read: tokens of that
 /// kind make the model "unpriced", never priced at zero.
+///
+/// The top-level rates are the base tier, which is all `price_of` callers that predate tiers see.
+/// The rest is what the vendors' tables say beyond one flat rate (read 2026-10-18):
+/// - `tiers`: Anthropic prices Claude Haiku 5.5 at $0.10 in / $0.50 out up to 100,000 prompt tokens
+///   and $0.50 / $2.50 above, cache rates scaling with it. The tier keys on ONE request's prompt
+///   length (input + cache reads + cache writes) and the higher price applies to the whole request.
+///   OpenRouter publishes the same shape as `pricing.overrides[].min_prompt_tokens`.
+/// - `cache_write` is the 5-minute write (1.25x input at Anthropic), `cache_write_1h` the 1-hour one
+///   (2x input); both vendors publish them apart.
+/// - `fast`: the request's `speed: fast` rate (Opus 5.5: $8 / $40).
+/// - `geo_us_mult`: `inference_geo: "us"` multiplies every category (1.1 at Anthropic).
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
 pub struct ModelPrice {
     #[serde(default)]
@@ -825,11 +852,213 @@ pub struct ModelPrice {
     pub output: Option<f64>,
     #[serde(default)]
     pub cache_read: Option<f64>,
+    /// The 5-minute cache write.
     #[serde(default)]
     pub cache_write: Option<f64>,
+    /// The 1-hour cache write.
+    #[serde(default)]
+    pub cache_write_1h: Option<f64>,
+    /// Prompt-length tiers over the base rates, in any order; see [`ModelPrice::rates_for`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<PriceTier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<FastPrice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo_us_mult: Option<f64>,
     /// `anthropic` or `openrouter`; informational.
     #[serde(default)]
     pub source: Option<String>,
+}
+
+/// The rates for requests whose prompt is at least `min_prompt_tokens`, OpenRouter's own key and
+/// meaning; Anthropic's "for prompts over 100,000 tokens" is written as 100,001. A tier carries only
+/// the rates it overrides; a `None` rate is the base one.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+pub struct PriceTier {
+    pub min_prompt_tokens: u64,
+    #[serde(default)]
+    pub input: Option<f64>,
+    #[serde(default)]
+    pub output: Option<f64>,
+    #[serde(default)]
+    pub cache_read: Option<f64>,
+    #[serde(default)]
+    pub cache_write: Option<f64>,
+    #[serde(default)]
+    pub cache_write_1h: Option<f64>,
+}
+
+/// Fast mode's input and output rates. Caching multipliers apply on top of them.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+pub struct FastPrice {
+    pub input: f64,
+    pub output: f64,
+}
+
+/// The rates one request is billed at, USD per million tokens; `None` is unpriced.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Rates {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+    pub cache_write_1h: Option<f64>,
+}
+
+impl Rates {
+    fn scaled(self, by: f64) -> Rates {
+        let times = |rate: Option<f64>| rate.map(|r| r * by);
+        Rates {
+            input: times(self.input),
+            output: times(self.output),
+            cache_read: times(self.cache_read),
+            cache_write: times(self.cache_write),
+            cache_write_1h: times(self.cache_write_1h),
+        }
+    }
+}
+
+impl ModelPrice {
+    /// The rates for ONE request: `prompt_tokens` is its input + cache reads + cache writes, `fast` its
+    /// `speed: fast`, `geo_us` its `inference_geo: "us"`.
+    ///
+    /// The tier is the one with the highest threshold the prompt reaches, overlaid on the base rates.
+    /// Fast replaces input and output and scales the cache rates by the same factor; residency then
+    /// multiplies everything. A mode the entry has no price for answers every rate `None`: billing a
+    /// fast or US-resident request at the standard rate is a wrong cost, and a wrong cost is worse
+    /// than none (spec devtime §4.4).
+    pub fn rates_for(&self, prompt_tokens: u64, fast: bool, geo_us: bool) -> Rates {
+        let mut rates = Rates {
+            input: self.input,
+            output: self.output,
+            cache_read: self.cache_read,
+            cache_write: self.cache_write,
+            cache_write_1h: self.cache_write_1h,
+        };
+        if let Some(tier) = self
+            .tiers
+            .iter()
+            .filter(|tier| prompt_tokens >= tier.min_prompt_tokens)
+            .max_by_key(|tier| tier.min_prompt_tokens)
+        {
+            rates = Rates {
+                input: tier.input.or(rates.input),
+                output: tier.output.or(rates.output),
+                cache_read: tier.cache_read.or(rates.cache_read),
+                cache_write: tier.cache_write.or(rates.cache_write),
+                cache_write_1h: tier.cache_write_1h.or(rates.cache_write_1h),
+            };
+        }
+        if fast {
+            let Some(price) = &self.fast else {
+                return Rates::default();
+            };
+            let factor = rates.input.filter(|r| *r > 0.0).map(|r| price.input / r);
+            let cache = |rate: Option<f64>| rate.zip(factor).map(|(r, f)| r * f);
+            rates = Rates {
+                input: Some(price.input),
+                output: Some(price.output),
+                cache_read: cache(rates.cache_read),
+                cache_write: cache(rates.cache_write),
+                cache_write_1h: cache(rates.cache_write_1h),
+            };
+        }
+        if geo_us {
+            let Some(mult) = self.geo_us_mult else {
+                return Rates::default();
+            };
+            rates = rates.scaled(mult);
+        }
+        rates
+    }
+
+    /// Every rate this entry carries, named, for validation: base, tiers, fast and the multiplier.
+    fn named_rates(&self) -> Vec<(String, f64)> {
+        let mut named = Vec::new();
+        let mut push = |name: String, rate: Option<f64>| {
+            if let Some(rate) = rate {
+                named.push((name, rate));
+            }
+        };
+        for (field, rate) in [
+            ("input", self.input),
+            ("output", self.output),
+            ("cache_read", self.cache_read),
+            ("cache_write", self.cache_write),
+            ("cache_write_1h", self.cache_write_1h),
+            ("geo_us_mult", self.geo_us_mult),
+        ] {
+            push(field.to_string(), rate);
+        }
+        for (index, tier) in self.tiers.iter().enumerate() {
+            for (field, rate) in [
+                ("input", tier.input),
+                ("output", tier.output),
+                ("cache_read", tier.cache_read),
+                ("cache_write", tier.cache_write),
+                ("cache_write_1h", tier.cache_write_1h),
+            ] {
+                push(format!("tiers[{index}].{field}"), rate);
+            }
+        }
+        if let Some(fast) = &self.fast {
+            push("fast.input".to_string(), Some(fast.input));
+            push("fast.output".to_string(), Some(fast.output));
+        }
+        named
+    }
+}
+
+/// Converts the file's raw `model_prices` value entry by entry: what parses and validates is kept,
+/// everything else is dropped with a warning and a `"<id>: <reason>"` line in the second half.
+fn convert_model_prices(
+    raw: serde_yaml::Value,
+) -> (std::collections::BTreeMap<String, ModelPrice>, Vec<String>) {
+    let mut prices = std::collections::BTreeMap::new();
+    let mut dropped = Vec::new();
+    let entries = match raw {
+        serde_yaml::Value::Null => return (prices, dropped),
+        serde_yaml::Value::Mapping(entries) => entries,
+        _ => {
+            tracing::warn!("model_prices is not a mapping; every price ignored");
+            dropped.push("model_prices: not a mapping of model id to price".to_string());
+            return (prices, dropped);
+        }
+    };
+    for (key, value) in entries {
+        let Some(id) = key.as_str().map(str::to_string) else {
+            tracing::warn!(key = ?key, "model_prices key is not a model id; entry dropped");
+            dropped.push(format!("{key:?}: the key is not a model id"));
+            continue;
+        };
+        // The mapping is checked here because serde would read a sequence positionally, as
+        // `input, output, ...`, and price a list nobody meant as one.
+        let parsed = if value.is_mapping() {
+            serde_yaml::from_value::<ModelPrice>(value).map_err(|error| error.to_string())
+        } else {
+            Err("not a mapping of price fields".to_string())
+        };
+        let reason = match parsed {
+            Err(reason) => reason,
+            Ok(price) => match price
+                .named_rates()
+                .into_iter()
+                .find(|(_, rate)| !rate.is_finite() || *rate < 0.0)
+            {
+                Some((field, _)) => format!("{field} is not a finite, non-negative number"),
+                None => {
+                    prices.insert(id, price);
+                    continue;
+                }
+            },
+        };
+        // A wrong or unreadable price is a wrong cost. It drops that one model's entry (so the model
+        // reads "unpriced") and nothing else: one bad line must not take model routing down with it
+        // (owner, 2026-10-18).
+        tracing::warn!(model = %id, %reason, "model_prices entry unreadable; entry dropped");
+        dropped.push(format!("{id}: {reason}"));
+    }
+    (prices, dropped)
 }
 
 /// The second lookup `price_of` tries, and the key the script writes (spec devtime §4.4): lowercase,
@@ -891,27 +1120,9 @@ pub fn models_config_path() -> Option<std::path::PathBuf> {
 pub fn parse_models_config(contents: &str) -> Result<ModelsConfig, String> {
     let mut config =
         serde_yaml::from_str::<ModelsConfig>(contents).map_err(|error| error.to_string())?;
-    // A negative or non-finite price is a wrong cost. It drops that one model's entry (so the model
-    // reads "unpriced") and nothing else: one bad line must not take model routing down with it
-    // (owner, 2026-10-18).
-    config.model_prices.retain(|id, price| {
-        let bad = [
-            ("input", price.input),
-            ("output", price.output),
-            ("cache_read", price.cache_read),
-            ("cache_write", price.cache_write),
-        ]
-        .into_iter()
-        .find(|(_, value)| value.is_some_and(|v| !v.is_finite() || v < 0.0));
-        if let Some((field, _)) = bad {
-            tracing::warn!(
-                model = %id,
-                field,
-                "model_prices entry is not a finite, non-negative number; entry dropped"
-            );
-        }
-        bad.is_none()
-    });
+    let (prices, dropped) = convert_model_prices(std::mem::take(&mut config.raw_model_prices));
+    config.model_prices = prices;
+    config.price_warnings = dropped;
     Ok(config)
 }
 

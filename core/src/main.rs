@@ -267,6 +267,7 @@ async fn main() {
         .as_deref()
         .map(config::load_calendar_config)
         .unwrap_or_default();
+    // Startup copy: ingestion keeps it for the run; the findings routes read the cached file per request.
     let devtime_config = machine_file(machine_config::DEVTIME_FILE)
         .as_deref()
         .map(config::load_devtime_config)

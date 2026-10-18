@@ -62,15 +62,22 @@ export interface ModelTokens {
   model: string; effort: string;
   input: number; cache_read: number; cache_creation: number; output: number;
   messages: number; cost_usd: number | null;
+  /** Bounds of `cost_usd` over cache writes of unknown duration (5-minute / 1-hour); equal when known. */
+  cost_low: number | null; cost_high: number | null;
 }
 
 export interface DevtimeTokens {
   by_model: ModelTokens[];
   cache_hit_ratio: number | null;
+  /** The best estimate: cache writes of unknown duration priced as 1-hour, which Claude Code writes. */
   cost_usd: number | null;
+  /** Bounds of `cost_usd`: unknown-duration cache writes all 5-minute (low) or all 1-hour (high). */
+  cost_low: number | null; cost_high: number | null;
   cost_estimated: true;
   prices_as_of: string | null;
   unpriced_models: string[];
+  /** `"<model id>: <reason>"` per price the daemon dropped as unreadable from nucleos-models.yaml. */
+  dropped_prices: string[];
   previous: { cost_usd: number | null; cache_hit_ratio: number | null };
 }
 
@@ -106,7 +113,11 @@ export interface DevtimeFinding {
   rule: RuleView | null;
 }
 
-export interface DevtimeFindings { items: DevtimeFinding[]; next_cursor: string | null; rules: RuleView[] }
+/** Where the precision thresholds came from: the file, its last valid version, or the built-in defaults. */
+export type ThresholdsSource = "file" | "last_good" | "default";
+export interface DevtimeFindings {
+  items: DevtimeFinding[]; next_cursor: string | null; rules: RuleView[]; thresholds_source: ThresholdsSource;
+}
 export interface MarkOutcome { finding_key: string; feedback: FindingFeedback; rule: RuleView | null }
 
 export const FINDINGS_PAGE = 50;

@@ -123,10 +123,20 @@ function QualityStrip({ report }: { report: DevtimeOverview }) {
   );
 }
 
+/** Why the cost can read as a range: messages read before the cache split was recorded. */
+const WHY_RANGE = "Older usage has no cache-duration split: the estimate prices its cache writes as 1-hour, the low end as 5-minute.";
+
+/** The bounds of an estimate, when the unknown cache split moves it by more than 1%; else null. */
+function costRange(low: number | null, high: number | null): [string, string] | null {
+  if (low === null || high === null || high - low <= 0.01 * high) return null;
+  return [usd(low), usd(high)];
+}
+
 function devtimeMetrics(report: DevtimeOverview): Metric<DevtimeMetric>[] {
   const { totals, tokens, days } = report;
   const series = report.days_series;
   const cost = costSeries(series);
+  const range = costRange(tokens.cost_low, tokens.cost_high);
   return [
     {
       key: "active", label: "Active time", value: minutes(totals.active_ms),
@@ -147,7 +157,13 @@ function devtimeMetrics(report: DevtimeOverview): Metric<DevtimeMetric>[] {
     },
     {
       key: "cost", label: "Estimated cost",
-      value: tokens.cost_usd === null ? undefined : (<>{usd(tokens.cost_usd)} <Badge tone="info">estimated</Badge></>),
+      value: tokens.cost_usd === null ? undefined : (
+        <>
+          {usd(tokens.cost_usd)}{" "}
+          {range === null ? null : <><span title={WHY_RANGE}>{`${range[0]}–${range[1]}`}</span>{" "}</>}
+          <Badge tone="info">estimated</Badge>
+        </>
+      ),
       sub: joined([
         versus(tokens.cost_usd, tokens.previous.cost_usd, days),
         tokens.unpriced_models.length > 0 ? `excludes ${tokens.unpriced_models.length} unpriced` : "",
@@ -209,6 +225,7 @@ function InterruptionsPanel({ report }: { report: DevtimeOverview }) {
 
 function TokensPanel({ report }: { report: DevtimeOverview }) {
   const { tokens } = report;
+  const range = costRange(tokens.cost_low, tokens.cost_high);
   const sum = (row: ModelTokens) => row.input + row.cache_read + row.cache_creation + row.output;
   const hit = (row: ModelTokens) => {
     const base = row.input + row.cache_read + row.cache_creation;
@@ -241,6 +258,12 @@ function TokensPanel({ report }: { report: DevtimeOverview }) {
       </table>
       {tokens.unpriced_models.length > 0 ? (
         <p className="an-note">{`Cost does not include ${plural(tokens.unpriced_models.length, "model", "models")} without a price.`}</p>
+      ) : null}
+      {range !== null ? (
+        <p className="an-note">{`Between ${range[0]} and ${range[1]}: older usage has no cache-duration split, so its cache writes are priced as 1-hour (the high end) and as 5-minute at the low end.`}</p>
+      ) : null}
+      {tokens.dropped_prices.length > 0 ? (
+        <p className="an-note">{`Unreadable prices ignored in nucleos-models.yaml: ${tokens.dropped_prices.join("; ")}.`}</p>
       ) : null}
       <p className="an-note">
         {tokens.prices_as_of === null
@@ -299,6 +322,11 @@ function FindingsSection({ projectId, days }: { projectId?: string; days: Analyt
         ) : null
       ) : (
         <>
+          {findings.data.thresholds_source !== "file" ? (
+            <p className="an-note">
+              {findings.data.thresholds_source === "last_good" ? "Using last valid devtime.yaml" : "Using default thresholds"}
+            </p>
+          ) : null}
           <ul className="an-dt-finding-list">
             {findings.data.items.map((item) => (
               <FindingRow key={item.finding_key} item={item} days={days} inProject={projectId !== undefined} />

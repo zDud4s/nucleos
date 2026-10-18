@@ -32,9 +32,12 @@ function busy(): DaemonState {
     previous: { active_ms: 50 * MIN, wasted_ms: 12 * MIN, waste_ratio: 0.24, interruption_rate: 0.3, correction_rate: null } };
   report.quality = { ...report.quality, ingest_enabled: true, last_cycle_at: new Date(Date.now() - 60_000).toISOString(), sessions: 5 };
   report.tokens = { ...report.tokens, cost_usd: 4.2, prices_as_of: "2026-10-17", unpriced_models: ["sonnet"],
+    dropped_prices: ["claude-haiku-5-5: input is not a finite, non-negative number"],
     by_model: [
-      { model: "claude-opus-4-7", effort: "high", input: 1000, cache_read: 9000, cache_creation: 0, output: 500, messages: 3, cost_usd: 4.2 },
-      { model: "sonnet", effort: "unknown", input: 10, cache_read: 0, cache_creation: 0, output: 5, messages: 1, cost_usd: null },
+      { model: "claude-opus-4-7", effort: "high", input: 1000, cache_read: 9000, cache_creation: 0, output: 500, messages: 3, cost_usd: 4.2,
+        cost_low: 4.2, cost_high: 4.2 },
+      { model: "sonnet", effort: "unknown", input: 10, cache_read: 0, cache_creation: 0, output: 5, messages: 1, cost_usd: null,
+        cost_low: null, cost_high: null },
     ] };
   return daemonState({ devtime: report, devtimeFindings: devtimeFindings() });
 }
@@ -120,7 +123,31 @@ describe("DevtimeSection", () => {
     const sonnet = within(table).getByRole("row", { name: /sonnet/ });
     expect(within(sonnet).getByText("no price")).toBeTruthy();
     expect(screen.getByText("Cost does not include 1 model without a price.")).toBeTruthy();
+    expect(screen.getByText(
+      "Unreadable prices ignored in nucleos-models.yaml: claude-haiku-5-5: input is not a finite, non-negative number.",
+    )).toBeTruthy();
     expect(screen.getByText("Estimated, prices of 2026-10-17. Never compared with an invoice.")).toBeTruthy();
+  });
+
+  it("shows the cost as a range when older usage has no cache-duration split", async () => {
+    const state = busy();
+    state.devtime.tokens = { ...state.devtime.tokens, cost_usd: 48, cost_low: 41, cost_high: 48 };
+    await mount(state);
+    const card = await screen.findByRole("button", { name: /Estimated cost/ });
+    const range = within(card).getByText("$41.00–$48.00");
+    expect(range.getAttribute("title")).toMatch(/no cache-duration split/);
+    fireEvent.click(card);
+    expect(screen.getByText(/^Between \$41\.00 and \$48\.00: older usage has no cache-duration split/)).toBeTruthy();
+  });
+
+  it("shows no range when the bounds are within 1%", async () => {
+    const state = busy();
+    state.devtime.tokens = { ...state.devtime.tokens, cost_usd: 4.2, cost_low: 4.19, cost_high: 4.2 };
+    await mount(state);
+    const card = await screen.findByRole("button", { name: /Estimated cost/ });
+    expect(within(card).queryByText(/–/)).toBeNull();
+    fireEvent.click(card);
+    expect(screen.queryByText(/no cache-duration split/)).toBeNull();
   });
 
   it("keeps today's segment partial in what it hands the chart", async () => {
@@ -135,6 +162,21 @@ describe("DevtimeSection", () => {
     expect(daemon.apiFetch.mock.calls.some(([path]) => String(path).includes("/findings"))).toBe(false);
     fireEvent.click(screen.getByText("Findings"));
     expect(await screen.findByText("few cases (3)")).toBeTruthy();
+  });
+
+  it("says so when the thresholds are not the file's", async () => {
+    const state = busy();
+    state.devtimeFindings.thresholds_source = "last_good";
+    await mount(state);
+    fireEvent.click(await screen.findByText("Findings"));
+    expect(await screen.findByText("Using last valid devtime.yaml")).toBeTruthy();
+  });
+
+  it("is silent about thresholds that come from the file", async () => {
+    await mount(busy());
+    fireEvent.click(await screen.findByText("Findings"));
+    await screen.findByText("few cases (3)");
+    expect(screen.queryByText(/Using (last valid|default)/)).toBeNull();
   });
 
   it("badges a low-precision rule and notes global precision in a project's view", async () => {

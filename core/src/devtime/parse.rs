@@ -32,6 +32,11 @@ pub use strip::*;
 
 /// The parser generation. Derived rows carry it so a parser fix can re-derive what it changed.
 /// Version 2 adds the correction flag, the `wrong_shell` class, `refs` and git paths.
+///
+/// Reading the billing mode ([`Billing`], migration 0214) left it at 2 on purpose. A bump re-reads
+/// nothing — file offsets stand, so old messages keep their unknown (NULL) mode either way — and
+/// its one effect is the rules fingerprint, which would re-rule every session for fields no rule
+/// reads.
 pub const PARSER_VERSION: i64 = 2;
 
 const INTERRUPT_MARK: &str = "[Request interrupted by user";
@@ -203,6 +208,7 @@ pub enum EventKind {
         effort: Option<String>,
         /// `[input, cache_read, cache_creation, output]`, the column order of `devtime_messages`.
         usage: [i64; 4],
+        billing: Billing,
         tool_uses: Vec<ToolUse>,
         has_text: bool,
     },
@@ -224,6 +230,17 @@ pub enum EventKind {
     Compact {
         duration_ms: Option<i64>,
     },
+}
+
+/// What a message was billed as beyond its counts (`message.usage`). `None` is absent from the
+/// transcript, which the cost read treats as unknown, never as the cheap side.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Billing {
+    /// `cache_creation.ephemeral_1h_input_tokens`: the 1-hour part of the cache writes.
+    pub cache_creation_1h: Option<i64>,
+    /// `standard` or `fast`.
+    pub speed: Option<String>,
+    pub inference_geo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +445,19 @@ fn parse_assistant(rec: &Map<String, Value>) -> Parsed {
         count("cache_creation_input_tokens"),
         count("output_tokens"),
     ];
+    let usage_map = msg.get("usage").and_then(Value::as_object);
+    let billing = Billing {
+        cache_creation_1h: usage_map
+            .and_then(|u| u.get("cache_creation"))
+            .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+            .and_then(Value::as_i64),
+        speed: usage_map
+            .and_then(|u| text_of(u, "speed"))
+            .map(str::to_string),
+        inference_geo: usage_map
+            .and_then(|u| text_of(u, "inference_geo"))
+            .map(str::to_string),
+    };
     let mut tool_uses = Vec::new();
     let mut has_text = false;
     if let Some(blocks) = msg.get("content").and_then(Value::as_array) {
@@ -448,6 +478,7 @@ fn parse_assistant(rec: &Map<String, Value>) -> Parsed {
             model: model.to_string(),
             effort: text_of(rec, "effort").map(str::to_string),
             usage,
+            billing,
             tool_uses,
             has_text,
         },
@@ -944,6 +975,7 @@ mod tests {
                     usage: ua,
                     has_text,
                     tool_uses,
+                    ..
                 },
                 EventKind::Assistant {
                     message_id: ib,
@@ -962,6 +994,35 @@ mod tests {
             }
             other => panic!("expected two assistants, got {other:?}"),
         }
+    }
+
+    /// The billing mode beside the counts: the 1-hour part of the cache writes (the total stays in
+    /// `usage`), `speed` and `inference_geo`. A transcript without them reads all-unknown.
+    #[test]
+    fn assistant_usage_carries_the_billing_mode() {
+        let usage = json!({"input_tokens": 3, "cache_read_input_tokens": 100,
+                           "cache_creation_input_tokens": 50, "output_tokens": 7,
+                           "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                                              "ephemeral_1h_input_tokens": 50},
+                           "service_tier": "standard", "speed": "fast", "inference_geo": "us"});
+        let l = assistant_line("msg_b", "claude-x", usage, json!([]));
+        let EventKind::Assistant { usage, billing, .. } = event(parse_line(&l)).kind else {
+            panic!("not an assistant")
+        };
+        assert_eq!(usage, [3, 100, 50, 7]);
+        assert_eq!(
+            billing,
+            Billing {
+                cache_creation_1h: Some(50),
+                speed: Some("fast".into()),
+                inference_geo: Some("us".into()),
+            }
+        );
+        let bare = assistant_line("msg_c", "claude-x", json!({"input_tokens": 1}), json!([]));
+        let EventKind::Assistant { billing, .. } = event(parse_line(&bare)).kind else {
+            panic!("not an assistant")
+        };
+        assert_eq!(billing, Billing::default());
     }
 
     #[test]

@@ -183,6 +183,10 @@ pub struct MessageRow {
     pub output_tokens: i64,
     pub has_tool_use: i64,
     pub parser_version: i64,
+    /// The 1-hour part of `cache_creation_tokens`; `None` unknown (migration 0214).
+    pub cache_creation_1h_tokens: Option<i64>,
+    pub speed: Option<String>,
+    pub inference_geo: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
@@ -419,7 +423,8 @@ pub async fn mark_turn_interrupted(
 
 /// One row per message id. A message streams as several snapshots whose usage only grows, so the row
 /// keeps the snapshot with the largest four-field usage sum (ties keep what is there), the earliest
-/// `first_at`, the latest `last_at`, and `has_tool_use` as an OR.
+/// `first_at`, the latest `last_at`, and `has_tool_use` as an OR. The 1-hour cache count travels
+/// with the kept snapshot's cache total, even when unknown; `speed` and `inference_geo` like `model`.
 pub async fn upsert_message(conn: &mut SqliteConnection, row: &MessageRow) -> sqlx::Result<()> {
     const BIGGER: &str = "(excluded.input_tokens + excluded.cache_read_tokens
          + excluded.cache_creation_tokens + excluded.output_tokens)
@@ -427,9 +432,15 @@ pub async fn upsert_message(conn: &mut SqliteConnection, row: &MessageRow) -> sq
     let sql = format!(
         "INSERT INTO devtime_messages
             (session_id, lane, message_id, first_at, last_at, model, effort, input_tokens,
-             cache_read_tokens, cache_creation_tokens, output_tokens, has_tool_use, parser_version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cache_read_tokens, cache_creation_tokens, output_tokens, has_tool_use, parser_version,
+             cache_creation_1h_tokens, speed, inference_geo)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(session_id, message_id) DO UPDATE SET
+            cache_creation_1h_tokens = CASE WHEN {BIGGER} THEN excluded.cache_creation_1h_tokens
+                ELSE cache_creation_1h_tokens END,
+            speed = CASE WHEN {BIGGER} THEN COALESCE(excluded.speed, speed) ELSE speed END,
+            inference_geo = CASE WHEN {BIGGER} THEN COALESCE(excluded.inference_geo, inference_geo)
+                ELSE inference_geo END,
             first_at = MIN(first_at, excluded.first_at),
             last_at = MAX(last_at, excluded.last_at),
             has_tool_use = MAX(has_tool_use, excluded.has_tool_use),
@@ -455,6 +466,9 @@ pub async fn upsert_message(conn: &mut SqliteConnection, row: &MessageRow) -> sq
         .bind(row.output_tokens)
         .bind(row.has_tool_use)
         .bind(row.parser_version)
+        .bind(row.cache_creation_1h_tokens)
+        .bind(&row.speed)
+        .bind(&row.inference_geo)
         .execute(&mut *conn)
         .await?;
     Ok(())
@@ -833,7 +847,7 @@ pub async fn session_rows(pool: &SqlitePool, session_id: &str) -> sqlx::Result<S
     let messages = sqlx::query_as::<_, MessageRow>(
         "SELECT session_id, lane, message_id, first_at, last_at, model, effort, input_tokens,
                 cache_read_tokens, cache_creation_tokens, output_tokens, has_tool_use,
-                parser_version
+                parser_version, cache_creation_1h_tokens, speed, inference_geo
          FROM devtime_messages WHERE session_id = ? ORDER BY first_at, message_id",
     )
     .bind(session_id)
@@ -1076,6 +1090,10 @@ mod tests {
                     "output_tokens",
                     "has_tool_use",
                     "parser_version",
+                    // 0214: the billing mode, NULL on rows ingested before it.
+                    "cache_creation_1h_tokens",
+                    "speed",
+                    "inference_geo",
                 ],
             ),
             (
@@ -1270,6 +1288,56 @@ mod tests {
         assert_eq!(row.first_at, "2026-10-04T10:00:01.000Z");
         assert_eq!(row.last_at, "2026-10-04T10:00:03.000Z");
         assert_eq!(row.has_tool_use, 1, "has_tool_use is an OR");
+    }
+
+    /// The billing mode is the kept snapshot's: the 1-hour count belongs to that snapshot's cache
+    /// total, so a smaller snapshot never replaces it, and an unknown speed or geo never erases one.
+    #[tokio::test]
+    async fn message_upsert_keeps_the_billing_mode_of_the_kept_snapshot() {
+        let pool = test_pool().await;
+        let mut tx = begin_chunk(&pool).await.unwrap();
+        let at = "2026-10-04T10:00:01.000Z";
+        let snapshot = |creation: i64, one_hour: Option<i64>, speed: Option<&str>| MessageRow {
+            cache_creation_tokens: creation,
+            cache_creation_1h_tokens: one_hour,
+            speed: speed.map(str::to_string),
+            inference_geo: speed.map(|_| "us".to_string()),
+            ..message("m1", at, at, 1, 0)
+        };
+        upsert_message(&mut tx, &snapshot(30, Some(20), Some("fast")))
+            .await
+            .unwrap();
+        upsert_message(&mut tx, &snapshot(10, Some(0), Some("standard")))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let rows = session_rows(&pool, "s1").await.unwrap();
+        let row = &rows.messages[0];
+        assert_eq!(
+            (
+                row.cache_creation_tokens,
+                row.cache_creation_1h_tokens,
+                row.speed.as_deref(),
+                row.inference_geo.as_deref()
+            ),
+            (30, Some(20), Some("fast"), Some("us"))
+        );
+        let mut tx = begin_chunk(&pool).await.unwrap();
+        upsert_message(&mut tx, &snapshot(50, None, None))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let rows = session_rows(&pool, "s1").await.unwrap();
+        let row = &rows.messages[0];
+        assert_eq!(
+            (
+                row.cache_creation_tokens,
+                row.cache_creation_1h_tokens,
+                row.speed.as_deref()
+            ),
+            (50, None, Some("fast")),
+            "a bigger snapshot's unknown split is unknown; its unknown speed keeps the known one"
+        );
     }
 
     #[tokio::test]
