@@ -1483,16 +1483,15 @@ mod tests {
         ));
     }
 
-    /// `EXPLAIN QUERY PLAN` of a project read over 90 days for `alpha`, one `detail` per step.
-    async fn project_plan(pool: &sqlx::SqlitePool, sql: &str) -> Vec<String> {
+    /// `EXPLAIN QUERY PLAN` of a read over 90 days, for `alpha` when `project` (the `$project`
+    /// form binds `?3`, the global one does not), one `detail` per step.
+    async fn read_plan(pool: &sqlx::SqlitePool, sql: &str, project: bool) -> Vec<String> {
         use sqlx::Row as _;
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+        let query = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
             .bind("2026-07-19T00:00:00.000Z")
-            .bind("2026-10-17T12:00:00.000Z")
-            .bind("alpha")
-            .fetch_all(pool)
-            .await
-            .unwrap();
+            .bind("2026-10-17T12:00:00.000Z");
+        let query = if project { query.bind("alpha") } else { query };
+        let rows = query.fetch_all(pool).await.unwrap();
         rows.iter()
             .map(|row| row.get::<String, _>("detail"))
             .collect()
@@ -1502,41 +1501,81 @@ mod tests {
         plan.iter().any(|line| line.contains(needle))
     }
 
-    /// Spec §6.5: the planner's answer is recorded. Every project read starts from
-    /// `idx_devtime_sessions_project` (migration 0210) and reaches its rows through a session
-    /// index; no devtime table is scanned. The one-form `(?3 IS NULL OR ss.project_id = ?3)` reads
-    /// these replaced planned `SCAN sp` for a single project.
+    /// `SCAN` steps over a table; the span read's own CTEs (`one_day`, `pieces`, `parts`) are not.
+    fn table_scans(plan: &[String]) -> Vec<&String> {
+        plan.iter()
+            .filter(|line| line.starts_with("SCAN "))
+            .filter(|line| !["one_day", "pieces", "parts"].iter().any(|cte| line.contains(cte)))
+            .collect()
+    }
+
+    /// Spec §6.5: the planner's answer is recorded. The turn and session project reads start from
+    /// `idx_devtime_sessions_project` (migration 0210); no devtime table is scanned. The one-form
+    /// `(?3 IS NULL OR ss.project_id = ?3)` reads these replaced planned `SCAN sp` for a single
+    /// project. The span and message reads walk a day index instead — see the next test.
     #[tokio::test]
     async fn the_project_span_read_reaches_spans_through_an_index() {
         let pool = pool().await;
         for sql in [
-            crate::devtime::store::SPAN_DAY_PROJECT_SQL,
-            crate::devtime::store::MESSAGE_DAY_PROJECT_SQL,
             crate::devtime::store::TURN_DAY_PROJECT_SQL,
             crate::devtime::store::SESSION_COUNTS_PROJECT_SQL,
         ] {
-            let plan = project_plan(&pool, sql).await;
+            let plan = read_plan(&pool, sql, true).await;
             println!("{plan:#?}");
             assert!(
                 mentions(&plan, "idx_devtime_sessions_project"),
                 "the project's sessions are found by index: {plan:#?}"
             );
-            // `SCAN days` and `SCAN CONSTANT ROW` are the recursive day list, not a table.
-            let table_scans: Vec<&String> = plan
-                .iter()
-                .filter(|line| line.starts_with("SCAN ") && !line.contains("days"))
-                .filter(|line| !line.contains("CONSTANT ROW"))
-                .collect();
             assert!(
-                table_scans.is_empty(),
+                table_scans(&plan).is_empty(),
                 "no devtime table is scanned: {plan:#?}"
             );
         }
-        let plan = project_plan(&pool, crate::devtime::store::SPAN_DAY_PROJECT_SQL).await;
-        assert!(
-            mentions(&plan, "INDEX idx_devtime_spans_session"),
-            "spans must be reached by index: {plan:#?}"
-        );
+    }
+
+    /// Spec §9 performance, the planner's answer recorded: both forms of the span and message
+    /// reads take their rows from the day indexes of migration 0211 in GROUP BY order, so the only
+    /// sort left is the span read's last merge of a few rows per day. Joining spans to a recursive
+    /// day list instead paired every span with every day: 20 s for the 50,000 spans of the timing
+    /// test below.
+    #[tokio::test]
+    async fn the_day_reads_take_their_rows_in_group_order_from_the_day_indexes() {
+        use crate::devtime::store::{
+            MESSAGE_DAY_PROJECT_SQL, MESSAGE_DAY_SQL, SPAN_DAY_PROJECT_SQL, SPAN_DAY_SQL,
+        };
+        let pool = pool().await;
+        let reads = [
+            (SPAN_DAY_SQL, false, "idx_devtime_spans_day", 1),
+            (SPAN_DAY_PROJECT_SQL, true, "idx_devtime_spans_day", 1),
+            (MESSAGE_DAY_SQL, false, "idx_devtime_messages_day", 0),
+            (MESSAGE_DAY_PROJECT_SQL, true, "idx_devtime_messages_day", 0),
+        ];
+        for (sql, project, index, sorts) in reads {
+            let plan = read_plan(&pool, sql, project).await;
+            println!("{plan:#?}");
+            assert!(
+                mentions(&plan, index),
+                "the rows come from {index}: {plan:#?}"
+            );
+            assert!(
+                table_scans(&plan).is_empty(),
+                "no devtime table is scanned: {plan:#?}"
+            );
+            // `USE TEMP B-TREE FOR GROUP BY` is the only plan step naming a GROUP BY.
+            let grouping_sorts = plan.iter().filter(|line| line.contains("FOR GROUP BY"));
+            assert_eq!(
+                grouping_sorts.count(),
+                sorts,
+                "rows are grouped in index order: {plan:#?}"
+            );
+        }
+        for (sql, project) in [(SPAN_DAY_SQL, false), (SPAN_DAY_PROJECT_SQL, true)] {
+            let plan = read_plan(&pool, sql, project).await;
+            assert!(
+                mentions(&plan, "idx_devtime_spans_multiday"),
+                "the spans that cross a midnight are found by index: {plan:#?}"
+            );
+        }
     }
 
     /// Spec §9 performance: 90 days, 50,000 spans. Ignored by default — a timing test is not

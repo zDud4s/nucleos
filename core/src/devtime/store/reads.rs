@@ -30,40 +30,92 @@ pub struct SpanDayRow {
 /// either value of `?3`, so it cannot start from an index on `project_id`. The project form starts
 /// from `idx_devtime_sessions_project` (migration 0210) and reaches the rows by session; the
 /// global form names no `?3`, and is the same scan it always was.
+///
+/// The span and message reads are the exception: they walk the day indexes of migration 0211 in
+/// GROUP BY order (`CROSS JOIN` keeps the devtime table outermost) and check the project per row,
+/// so a project costs at most what the global read does. Through the project index the rows came
+/// out in session order and were sorted before grouping — 590 ms against 180 ms for the project
+/// that holds 98% of the real database's spans. The four-literal arm splices `$filter` in twice,
+/// for reads with two passes over the table.
 macro_rules! global_and_project {
     ($global:ident, $project:ident, $head:literal, $filter:literal, $tail:literal $(,)?) => {
         pub(crate) const $global: &str = concat!($head, $tail);
         pub(crate) const $project: &str = concat!($head, $filter, $tail);
     };
+    (
+        $global:ident,
+        $project:ident,
+        $head:literal,
+        $filter:literal,
+        $mid:literal,
+        $tail:literal $(,)?
+    ) => {
+        pub(crate) const $global: &str = concat!($head, $mid, $tail);
+        pub(crate) const $project: &str = concat!($head, $filter, $mid, $filter, $tail);
+    };
 }
 
 // Span time clipped to `[?1, ?2)` and split at each UTC midnight — see `span_day_rows`.
+//
+// Two passes, because joining every span to a recursive list of the window's days made SQLite pair
+// each span with each day (50,000 spans x 180 days took 20 s in the debug build). A span that
+// starts and ends on one day is its own only piece: `one_day` reads those from
+// `idx_devtime_spans_day` already in GROUP BY order, so they are summed without a sort. The few
+// that cross a midnight (295 of 210,000 on the real database) come from
+// `idx_devtime_spans_multiday` and are cut one day at a time by `pieces`. Each piece is the old
+// `(min(e, d1) - max(s, d0))` of its day, and `substr(.., 1, 10)` is `date()` for the one stamp
+// format written (module doc). The `BETWEEN` repeats what the window already implies, so the index
+// is read from the window's first day instead of from the beginning.
 global_and_project!(
     SPAN_DAY_SQL,
     SPAN_DAY_PROJECT_SQL,
-    "WITH RECURSIVE days(d) AS (
-         SELECT date(?1)
-         UNION ALL SELECT date(d, '+1 day') FROM days WHERE date(d, '+1 day') < ?2
-     ),
-     bounds AS (
-         SELECT d, d || 'T00:00:00.000Z' AS d0, date(d, '+1 day') || 'T00:00:00.000Z' AS d1 FROM days
+    "WITH RECURSIVE one_day AS (
+         SELECT substr(sp.started_at, 1, 10) AS d, sp.kind, sp.waste, sp.rule_id, sp.lever,
+                sp.confidence,
+                CASE WHEN sp.lane = 'main' THEN 'main' ELSE 'other' END AS lane_class,
+                SUM((julianday(min(sp.ended_at, ?2)) - julianday(max(sp.started_at, ?1)))
+                    * 86400000.0) AS ms
+         FROM devtime_spans sp
+         CROSS JOIN devtime_sessions ss ON ss.session_id = sp.session_id
+         WHERE substr(sp.started_at, 1, 10) = substr(sp.ended_at, 1, 10)
+           AND substr(sp.started_at, 1, 10) BETWEEN substr(?1, 1, 10) AND substr(?2, 1, 10)
+           AND sp.started_at < ?2 AND sp.ended_at > ?1
+           AND min(sp.ended_at, ?2) > substr(sp.started_at, 1, 10) || 'T00:00:00.000Z'",
+    " AND ss.project_id = ?3",
+    "
+         GROUP BY 1, 2, 3, 4, 5, 6, 7
      ),
      clipped AS (
          SELECT sp.kind, sp.waste, sp.rule_id, sp.lever, sp.confidence,
                 CASE WHEN sp.lane = 'main' THEN 'main' ELSE 'other' END AS lane_class,
                 max(sp.started_at, ?1) AS s, min(sp.ended_at, ?2) AS e
          FROM devtime_spans sp
-         JOIN devtime_sessions ss ON ss.session_id = sp.session_id
-         WHERE sp.started_at < ?2 AND sp.ended_at > ?1",
-    " AND ss.project_id = ?3",
+         CROSS JOIN devtime_sessions ss ON ss.session_id = sp.session_id
+         WHERE substr(sp.started_at, 1, 10) <> substr(sp.ended_at, 1, 10)
+           AND sp.started_at < ?2 AND sp.ended_at > ?1",
     "
+     ),
+     pieces(kind, waste, rule_id, lever, confidence, lane_class, d, s, e) AS (
+         SELECT kind, waste, rule_id, lever, confidence, lane_class, date(s), s, e
+         FROM clipped WHERE e > date(s) || 'T00:00:00.000Z'
+         UNION ALL
+         SELECT kind, waste, rule_id, lever, confidence, lane_class, date(d, '+1 day'),
+                date(d, '+1 day') || 'T00:00:00.000Z', e
+         FROM pieces WHERE e > date(d, '+1 day') || 'T00:00:00.000Z'
+     ),
+     parts AS (
+         SELECT d, kind, waste, rule_id, lever, confidence, lane_class, ms FROM one_day
+         UNION ALL
+         SELECT d, kind, waste, rule_id, lever, confidence, lane_class,
+                (julianday(min(e, date(d, '+1 day') || 'T00:00:00.000Z')) - julianday(s))
+                    * 86400000.0
+         FROM pieces
      )
-     SELECT b.d AS day, c.kind, c.waste, c.rule_id, c.lever, c.confidence, c.lane_class,
-            CAST(round(SUM((julianday(min(c.e, b.d1)) - julianday(max(c.s, b.d0))) * 86400000.0))
-                 AS INTEGER) AS ms
-     FROM clipped c JOIN bounds b ON c.s < b.d1 AND c.e > b.d0
-     GROUP BY b.d, c.kind, c.waste, c.rule_id, c.lever, c.confidence, c.lane_class
-     ORDER BY b.d",
+     SELECT d AS day, kind, waste, rule_id, lever, confidence, lane_class,
+            CAST(round(SUM(ms)) AS INTEGER) AS ms
+     FROM parts
+     GROUP BY d, kind, waste, rule_id, lever, confidence, lane_class
+     ORDER BY d",
 );
 
 /// Span time clipped to `[since, until)` and split at each UTC midnight (spec §4.2, §6.2): a span
@@ -102,18 +154,21 @@ pub struct MessageDayRow {
     pub messages: i64,
 }
 
+// `idx_devtime_messages_day` (0211) covers this read and hands it the rows in GROUP BY order, like
+// `one_day` above; the `BETWEEN` is again implied by the window.
 global_and_project!(
     MESSAGE_DAY_SQL,
     MESSAGE_DAY_PROJECT_SQL,
-    "SELECT date(m.first_at) AS day, m.model, m.effort,
+    "SELECT substr(m.first_at, 1, 10) AS day, m.model, m.effort,
             COALESCE(SUM(COALESCE(m.input_tokens, 0)), 0) AS input,
             COALESCE(SUM(COALESCE(m.cache_read_tokens, 0)), 0) AS cache_read,
             COALESCE(SUM(COALESCE(m.cache_creation_tokens, 0)), 0) AS cache_creation,
             COALESCE(SUM(COALESCE(m.output_tokens, 0)), 0) AS output,
             COUNT(*) AS messages
      FROM devtime_messages m
-     JOIN devtime_sessions ss ON ss.session_id = m.session_id
-     WHERE m.first_at >= ?1 AND m.first_at < ?2",
+     CROSS JOIN devtime_sessions ss ON ss.session_id = m.session_id
+     WHERE substr(m.first_at, 1, 10) BETWEEN substr(?1, 1, 10) AND substr(?2, 1, 10)
+       AND m.first_at >= ?1 AND m.first_at < ?2",
     " AND ss.project_id = ?3",
     "
      GROUP BY day, m.model, m.effort
