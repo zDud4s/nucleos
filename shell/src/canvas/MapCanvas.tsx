@@ -17,6 +17,7 @@ import type {
   Standing,
 } from "../data/project-map";
 import { useFileItems } from "../data/project-map";
+import { DAEMON_NAME } from "../copy";
 import { SectionTitle } from "../ui";
 import { NODE_H, type Layout } from "./layered";
 import {
@@ -783,7 +784,7 @@ function FileLevel({
     <div className="flex flex-col gap-2">
       {found.isError ? (
         <p className="text-sm text-text-muted">
-          The núcleo could not read this file — it may have moved since the map was walked.
+          The {DAEMON_NAME} could not read this file — it may have moved since the map was walked.
         </p>
       ) : found.data === undefined ? (
         <p className="text-sm text-text-faint">Reading the file…</p>
