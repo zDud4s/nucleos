@@ -34,10 +34,13 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
             tokio::time::sleep(BETWEEN_TURNS_TICK).await;
             // No lock is held across an await: the guard lives only in this block. An entry that is
             // gone (a turn took it) or owned by a newer reader ends this one.
-            let (begun, task_lines, has_preempted) = {
+            let (begun, task_lines, has_set_aside) = {
                 let mut kept = relock(&LIVE_CHATS);
                 match kept.get_mut(&chat_id) {
                     Some(live) if live.watcher == token => {
+                        // `serve_turn` moves a set-aside answer off the process already; this only
+                        // catches one a turn path left on it.
+                        keep_set_aside(&chat_id, live);
                         let begun = live.drain_idle();
                         let fresh: Vec<String> = live
                             .carried
@@ -53,7 +56,7 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
                             })
                             .collect();
                         recorded = live.carried.len();
-                        (begun, fresh, live.preempted.is_some())
+                        (begun, fresh, relock(&SET_ASIDE).contains_key(&chat_id))
                     }
                     _ => return,
                 }
@@ -62,28 +65,13 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
             for line in &task_lines {
                 crate::chats::tasks::apply_line(&state.pool, &chat_id, line).await;
             }
-            // An answer a person's message interrupted was set aside whole by `LiveChat::turn`; it
-            // is recorded at once as the turn of its own that it was.
-            if has_preempted && let Some(slot) = ChatSlot::acquire(&chat_id) {
+            // An answer a person's message interrupted was set aside whole by `LiveChat::turn`. The
+            // turn that set it aside records it before letting go of the slot; whatever still waits
+            // (that turn was cancelled first) is recorded here, as the turn of its own that it was.
+            if has_set_aside && let Some(slot) = ChatSlot::acquire(&chat_id) {
                 let mut slot = slot;
-                let taken = {
-                    let mut kept = relock(&LIVE_CHATS);
-                    kept.get_mut(&chat_id)
-                        .filter(|live| live.watcher == token)
-                        .and_then(|live| {
-                            let session = live
-                                .session_id
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .clone();
-                            let key = live.process_key();
-                            live.preempted.take().map(|aside| (aside, key, session))
-                        })
-                };
-                if let Some(((stdout, outcome), key, session)) = taken {
-                    slot.drain_on_release(&state);
-                    record_preempted(&state, &chat_id, key, session, stdout, outcome).await;
-                }
+                slot.drain_on_release(&state);
+                record_set_aside(&state, &chat_id).await;
                 drop(slot);
             }
             if !begun {
@@ -107,6 +95,17 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
     });
 }
 
+/// The barrier a process's unprompted answer runs under (see [`open_task_run`]).
+///
+/// It comes from the PROCESS: the mode stamped on the last turn it served and the strictest
+/// `read_untrusted` of every turn it served. Never the chat's newest row, which may be a turn that
+/// was stopped before it stamped anything.
+fn barrier_of(process_key: usize) -> Option<(&'static str, Vec<i64>)> {
+    relock(&PROCESS_BARRIERS)
+        .get(&process_key)
+        .map(|held| (held.mode, held.served.clone()))
+}
+
 /// Writes the `origin = 'task'` run row a spontaneous answer is recorded under, and returns its id
 /// and the mode it runs under. `None` when the process has no stamped mode or the row cannot be
 /// written; the caller then stops the process rather than let an answer run unaccounted.
@@ -115,14 +114,8 @@ async fn open_task_run(
     chat_id: &str,
     prompt: &str,
     session_id: &Option<String>,
-    process_key: usize,
+    barrier: Option<(&'static str, Vec<i64>)>,
 ) -> Option<(i64, &'static str)> {
-    // The barrier comes from the PROCESS: the mode stamped on the last turn it served and the
-    // strictest `read_untrusted` of every turn it served. Never the chat's newest row, which may be
-    // a turn that was stopped before it stamped anything.
-    let barrier = relock(&PROCESS_BARRIERS)
-        .get(&process_key)
-        .map(|held| (held.mode, held.served.clone()));
     let Some((mode, served)) = barrier else {
         tracing::warn!(
             chat_id = %chat_id,
@@ -183,29 +176,81 @@ async fn open_task_run(
     }
 }
 
-/// Records, at once, an answer a person's message arrived in the middle of: `LiveChat::turn` set it
-/// aside whole, so there is nothing left to gather, only a row to write it under.
-async fn record_preempted(
-    state: &crate::state::AppState,
-    chat_id: &str,
+/// An answer `LiveChat::turn` set aside, taken off its process with everything recording it needs,
+/// so it outlives that process and cannot be replaced by the next answer set aside on it.
+pub(super) struct SetAside {
     process_key: usize,
     session_id: Option<String>,
+    /// The process's barrier when the answer was set aside: the turns that answer continues. Taken
+    /// then because a process that is dropped takes its barrier with it.
+    barrier: Option<(&'static str, Vec<i64>)>,
     stdout: String,
     outcome: crate::execution::runner::TurnOutcome,
-) {
+}
+
+/// Set-aside answers waiting to be recorded, by chat, oldest first.
+///
+/// Not on the `LiveChat`, where one used to wait for the between-turns watcher: a process dropped
+/// before the watcher ran (it died, went silent, no longer fit) took the answer with it, and a
+/// queued turn that took the process first and set another one aside replaced it.
+pub(super) static SET_ASIDE: LazyLock<Mutex<HashMap<String, Vec<SetAside>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Moves the answer `live` set aside, if any, into [`SET_ASIDE`] under `chat_id`.
+pub(super) fn keep_set_aside(chat_id: &str, live: &mut LiveChat) {
+    let Some((stdout, outcome)) = live.preempted.take() else {
+        return;
+    };
+    let process_key = live.process_key();
+    let aside = SetAside {
+        process_key,
+        session_id: relock(&live.session_id).clone(),
+        barrier: barrier_of(process_key),
+        stdout,
+        outcome,
+    };
+    relock(&SET_ASIDE)
+        .entry(chat_id.to_owned())
+        .or_default()
+        .push(aside);
+}
+
+/// Records every answer set aside for `chat_id`, in the order they were set aside. Called by a
+/// holder of the chat's slot.
+pub(super) async fn record_set_aside(state: &crate::state::AppState, chat_id: &str) {
+    let waiting = relock(&SET_ASIDE).remove(chat_id).unwrap_or_default();
+    for aside in waiting {
+        record_preempted(state, chat_id, aside).await;
+    }
+}
+
+/// Records, at once, an answer a person's message arrived in the middle of: `LiveChat::turn` set it
+/// aside whole, so there is nothing left to gather, only a row to write it under.
+async fn record_preempted(state: &crate::state::AppState, chat_id: &str, aside: SetAside) {
+    let SetAside {
+        process_key,
+        session_id,
+        barrier,
+        stdout,
+        outcome,
+    } = aside;
     let lines: std::collections::VecDeque<crate::execution::runner::TurnEvent> = stdout
         .lines()
         .map(|line| crate::execution::runner::TurnEvent::Line(line.to_owned()))
         .collect();
     let prompt = spontaneous_prompt(&lines);
-    let Some((id, mode)) = open_task_run(state, chat_id, &prompt, &session_id, process_key).await
+    let Some((id, mode)) = open_task_run(state, chat_id, &prompt, &session_id, barrier).await
     else {
         return;
     };
     let completed_at = chrono::Utc::now().to_rfc3339();
     let known = session_id.unwrap_or_default();
     let o = gathered(outcome, stdout, known);
-    note_served(process_key, chat_id, id, mode, &state.pool);
+    // Only while the process still stands: a dropped one has no barrier left to add this row to,
+    // and a fresh entry under its key would outlive it.
+    if relock(&PROCESS_BARRIERS).contains_key(&process_key) {
+        note_served(process_key, chat_id, id, mode, &state.pool);
+    }
     record_spontaneous_answer(&state.pool, id, chat_id, &o, &completed_at).await;
 }
 
@@ -231,8 +276,14 @@ pub(super) async fn start_spontaneous_turn(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let Some((id, mode)) =
-        open_task_run(state, chat_id, &prompt, &session_id, live.process_key()).await
+    let Some((id, mode)) = open_task_run(
+        state,
+        chat_id,
+        &prompt,
+        &session_id,
+        barrier_of(live.process_key()),
+    )
+    .await
     else {
         // The process goes first and the slot after it.
         drop(live);
@@ -510,6 +561,166 @@ mod tests {
         assert!(
             hearing.await.unwrap().interrupt,
             "what was written was not an interrupt"
+        );
+    }
+
+    /// An answer the process began on its own, set aside by a person's turn, is still recorded when
+    /// the next (drained) turn takes the process first and sets another one aside, and when the
+    /// process is gone before anything recorded either: both become turns of their own.
+    #[tokio::test]
+    async fn a_preempted_spontaneous_answer_survives_a_drained_turn() {
+        let state = test_state().await;
+        let chat = "spontaneous-set-aside-chat";
+
+        let (messages, mut said) = tokio::sync::mpsc::unbounded_channel::<LaterTurn>();
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+        let live = LiveChat::new(
+            messages,
+            events_rx,
+            Arc::new(Mutex::new(Some("s-1".to_owned()))),
+            tokio::spawn(async {}).abort_handle(),
+            tokio::sync::watch::channel(None).1,
+            crate::execution::runner::Permission::Default,
+            None,
+            String::new(),
+            None,
+        );
+        note_served(live.process_key(), chat, 1, "auto", &state.pool);
+        relock(&LIVE_CHATS).insert(chat.to_owned(), live);
+
+        // The process answers each person once it has been written to.
+        let answer = events.clone();
+        let responder = tokio::spawn(async move {
+            while said.recv().await.is_some() {
+                answer
+                    .send(TurnEvent::Line(
+                        serde_json::json!({
+                            "type": "assistant",
+                            "message": {"content": [{"type": "text", "text": "your answer"}]}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+                answer
+                    .send(TurnEvent::Ended(TurnOutcome::default()))
+                    .unwrap();
+            }
+        });
+        // An answer the CLI writes on its own, whole, before the next person's message.
+        let on_its_own = |text: &str| {
+            events
+                .send(TurnEvent::Line(
+                    serde_json::json!({
+                        "type": "assistant",
+                        "message": {"content": [{"type": "text", "text": text}]}
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            events
+                .send(TurnEvent::Line(
+                    serde_json::json!({"type": "result", "subtype": "success", "result": text})
+                        .to_string(),
+                ))
+                .unwrap();
+            events
+                .send(TurnEvent::Ended(TurnOutcome::default()))
+                .unwrap();
+        };
+        let person = |prompt: &str| {
+            chat_run_request(
+                prompt.to_owned(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                crate::execution::runner::Permission::Default,
+                Some("s-1".to_owned()),
+                "s-1".to_owned(),
+                std::env::temp_dir().join("set-aside-unused.json"),
+                crate::execution::runner::ToolPolicy::Unrestricted,
+                crate::chats::Answering::default(),
+                None,
+                "claude",
+                None,
+            )
+        };
+        let runner: Arc<dyn crate::execution::runner::CommandRunner> =
+            Arc::new(FakeCommandRunner::default());
+        let deadlines = turn_deadlines(
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            crate::execution::runner::ToolPolicy::Unrestricted,
+        );
+
+        on_its_own("first on its own");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = Arc::new(Mutex::new(String::new()));
+        let served = serve_turn(
+            &runner,
+            person("me first"),
+            tx,
+            &first,
+            chat,
+            deadlines,
+            true,
+            None,
+            "",
+        )
+        .await;
+        assert!(matches!(served, Ok(Ok(_))), "the first turn did not answer");
+
+        // A queued turn drained before anything recorded the first answer set aside.
+        on_its_own("second on its own");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let second = Arc::new(Mutex::new(String::new()));
+        let served = serve_turn(
+            &runner,
+            person("me again"),
+            tx,
+            &second,
+            chat,
+            deadlines,
+            true,
+            None,
+            "",
+        )
+        .await;
+        assert!(
+            matches!(served, Ok(Ok(_))),
+            "the drained turn did not answer"
+        );
+
+        // And the process is gone before either was recorded.
+        evict_live(chat);
+        responder.abort();
+        record_set_aside(&state, chat).await;
+
+        let recorded: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, stdout FROM runs WHERE chat_id = ? AND origin = 'task' ORDER BY id",
+        )
+        .bind(chat)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "an answer set aside was lost or overwritten: {recorded:?}"
+        );
+        assert_eq!(recorded[0].0, "completed");
+        assert!(
+            recorded[0]
+                .1
+                .as_deref()
+                .is_some_and(|out| out.contains("first on its own")),
+            "{recorded:?}"
+        );
+        assert!(
+            recorded[1]
+                .1
+                .as_deref()
+                .is_some_and(|out| out.contains("second on its own")),
+            "{recorded:?}"
         );
     }
 }

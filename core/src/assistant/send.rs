@@ -720,7 +720,10 @@ pub(super) async fn send_message_inner(
     }
     // Held from here on: every early return, error, and dropped future below releases the chat by
     // dropping this, which is why none of them needs a cleanup statement of its own.
-    let slot = ChatSlot::acquire(chat_id).ok_or(TURN_IN_PROGRESS.to_string())?;
+    // A warm-up holding the chat is waited out: it lets go in moments, and nothing is answering.
+    let slot = ChatSlot::acquire_past_warmup(chat_id)
+        .await
+        .ok_or(TURN_IN_PROGRESS.to_string())?;
 
     // Who answers this conversation. Two steps, in order of how specific the fact is: the chat's
     // own row, then the origin — every Telegram conversation with no row lands on the last one.
@@ -1562,5 +1565,39 @@ mod tests {
             serde_json::from_str(&stored.expect("the turn recorded no pictures")).unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(std::fs::read(root.join(&paths[0])).unwrap(), b"hello");
+    }
+
+    /// A send that arrives while the chat's process is being warmed waits the warm-up out and starts
+    /// its turn: nothing was answering, so it is not queued behind a phantom turn, and the chat never
+    /// read as busy (which is what made an archive answer 409 in that window).
+    #[tokio::test]
+    async fn a_send_during_a_prewarm_is_not_reported_as_queued() {
+        let state = test_state().await;
+        let chat = a_chat("warming");
+        let warm = ChatSlot::acquire_for_warmup(&chat).expect("the chat starts free");
+        assert!(
+            !is_busy(&chat),
+            "a warm-up read as a turn in flight, so an archive would be refused"
+        );
+        assert!(
+            ChatSlot::acquire(&chat).is_none(),
+            "a warm-up must still keep a turn from starting beside it"
+        );
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(warm);
+        });
+
+        let outcome = send_or_queue(&state, &chat, "hello", &[], Origin::Shell).await;
+        release.await.unwrap();
+
+        assert!(
+            matches!(outcome, Ok(Sent::Turn(_))),
+            "a send during a warm-up was answered {outcome:?}"
+        );
+        assert!(
+            waiting_texts(&state.pool, &chat).await.is_empty(),
+            "the message was queued behind the warm-up"
+        );
     }
 }

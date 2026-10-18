@@ -1,6 +1,8 @@
 //! The live-process pool, barriers, idle policy, and reaping.
 
 use super::*;
+// Lives with the runner's other stream readings, since the one-shot loop needs it too.
+use crate::execution::runner::track_open_tools;
 
 /// How long a conversation's process waits for a turn that may never come.
 ///
@@ -133,7 +135,8 @@ pub(super) struct LiveChat {
     /// silence deadline does not apply: a long command is not a hung process.
     pub(super) open_tools: HashSet<String>,
     /// An answer the CLI began on its own that a person's message arrived in the middle of: set
-    /// aside whole so it is not handed to that person, and recorded by the between-turns watcher.
+    /// aside whole so it is not handed to that person, and moved to `SET_ASIDE` by `serve_turn` as
+    /// soon as the turn is back, to be recorded from there.
     pub(super) preempted: Option<(String, crate::execution::runner::TurnOutcome)>,
 }
 
@@ -711,44 +714,6 @@ fn is_answer_line(line: &str) -> bool {
                 .map(|kind| matches!(kind, "assistant" | "stream_event"))
         })
         .unwrap_or(false)
-}
-
-/// Where a pending tool call opens and closes in the stream: an assistant line's `tool_use` ids
-/// open, a user line's `tool_result.tool_use_id`s close. Pure, so `gather` and its test share it.
-pub(super) fn track_open_tools(line: &str, open: &mut HashSet<String>) {
-    if !line.contains("tool_use") && !line.contains("tool_result") {
-        return;
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-        return;
-    };
-    let Some(items) = value
-        .pointer("/message/content")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return;
-    };
-    match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("assistant") => {
-            for item in items {
-                if item.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
-                    && let Some(id) = item.get("id").and_then(serde_json::Value::as_str)
-                {
-                    open.insert(id.to_owned());
-                }
-            }
-        }
-        Some("user") => {
-            for item in items {
-                if item.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
-                    && let Some(id) = item.get("tool_use_id").and_then(serde_json::Value::as_str)
-                {
-                    open.remove(id);
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 #[cfg(test)]

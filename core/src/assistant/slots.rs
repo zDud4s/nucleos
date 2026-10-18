@@ -18,7 +18,21 @@ pub(super) struct ChatSlot {
     /// Armed by [`ChatSlot::drain_on_release`]: when the slot is released, what waited for this chat
     /// is sent from a task of its own.
     drain: Option<crate::state::AppState>,
+    /// Taken by [`ChatSlot::acquire_for_warmup`]: the chat is being warmed, not answered.
+    warmup: bool,
 }
+
+/// Chats whose slot is held by a warm-up rather than a turn, a subset of `BUSY_CHATS`.
+///
+/// A warm-up holds the slot only while it builds the process (a few reads and a spawn), so no turn
+/// starts beside it. Nobody is answering in that window, and a person must not be told otherwise:
+/// [`is_busy`] does not count it, and a send waits it out ([`ChatSlot::acquire_past_warmup`]) instead
+/// of being queued behind a turn that does not exist.
+static WARMUP_HELD: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// How long a send waits for a warm-up to let go of the chat before it is queued after all (the
+/// warm-up's slot drains on release, so a message queued then is still sent).
+const WARMUP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Takes a lock a panic poisoned anyway: the data is still there and the next caller needs it.
 pub(super) fn relock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -52,7 +66,41 @@ impl ChatSlot {
             .then(|| Self {
                 chat_id: chat_id.to_string(),
                 drain: None,
+                warmup: false,
             })
+    }
+
+    /// Claims the chat for a warm-up: held like a turn's slot, but not reported as busy.
+    ///
+    /// Both sets are written under the `BUSY_CHATS` lock, so [`is_busy`] (which takes that lock
+    /// first) never sees the chat taken without also seeing who took it.
+    pub(super) fn acquire_for_warmup(chat_id: &str) -> Option<Self> {
+        let mut busy = relock(&BUSY_CHATS);
+        if !busy.insert(chat_id.to_string()) {
+            return None;
+        }
+        relock(&WARMUP_HELD).insert(chat_id.to_string());
+        Some(Self {
+            chat_id: chat_id.to_string(),
+            drain: None,
+            warmup: true,
+        })
+    }
+
+    /// [`ChatSlot::acquire`] for a turn, waiting out a warm-up that holds the chat: the warm-up
+    /// lets go within moments, and the turn then finds the process it just warmed. `None` only when
+    /// a turn holds the chat, or the warm-up outlasts [`WARMUP_WAIT`].
+    pub(super) async fn acquire_past_warmup(chat_id: &str) -> Option<Self> {
+        let deadline = tokio::time::Instant::now() + WARMUP_WAIT;
+        loop {
+            if let Some(slot) = Self::acquire(chat_id) {
+                return Some(slot);
+            }
+            if !relock(&WARMUP_HELD).contains(chat_id) || tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     /// Arms the slot: once released, it sends what waited for the chat, in a detached task of its
@@ -65,6 +113,10 @@ impl ChatSlot {
 impl Drop for ChatSlot {
     fn drop(&mut self) {
         relock(&BUSY_CHATS).remove(&self.chat_id);
+        // After the busy set: in between, the chat reads as free, which it is.
+        if self.warmup {
+            relock(&WARMUP_HELD).remove(&self.chat_id);
+        }
         if let Some(state) = self.drain.take()
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
@@ -383,8 +435,14 @@ pub fn take_the_slot_for_testing(chat_id: &str) -> impl Drop {
 /// what the database happened to record. Asking `runs` instead would be wrong in both directions: a
 /// row still marked `running` after the daemon was killed says busy when nothing is, and the window
 /// between `ChatSlot::acquire` and the INSERT says free when the chat is already taken.
+///
+/// A warm-up holding the slot is not a turn ([`WARMUP_HELD`]): nothing is answering, so a chat
+/// being warmed is not busy for an archive, a PATCH or a fresh context.
 pub fn is_busy(chat_id: &str) -> bool {
-    relock(&BUSY_CHATS).contains(chat_id)
+    // The busy set first and released before the second lock, the order `acquire_for_warmup`
+    // writes them in.
+    let taken = relock(&BUSY_CHATS).contains(chat_id);
+    taken && !relock(&WARMUP_HELD).contains(chat_id)
 }
 
 /// Owns a turn's chat slot and its temp MCP config for the length of the turn, releasing both when

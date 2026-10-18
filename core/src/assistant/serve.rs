@@ -16,8 +16,51 @@ use super::*;
 ///
 /// `fingerprint` is [`spawn_fingerprint`] of the turn: a kept process is spoken to only when it was
 /// spawned with the same one.
+///
+/// The turn path calls [`serve_turn_briefed`], which is this with the briefing a skipped kept
+/// process leaves unread; this form, with none, is what the tests drive.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn serve_turn(
+    runner: &std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
+    request: crate::execution::runner::RunRequest,
+    session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    transcript: &std::sync::Arc<Mutex<String>>,
+    chat_id: &str,
+    deadlines: TurnDeadlines,
+    may_live: bool,
+    fresh_key: Option<&sqlx::SqlitePool>,
+    fingerprint: &str,
+) -> Result<std::io::Result<crate::execution::runner::RunOutcome>, tokio::time::error::Elapsed> {
+    serve_turn_briefed(
+        runner,
+        request,
+        session_tx,
+        transcript,
+        chat_id,
+        deadlines,
+        may_live,
+        fresh_key,
+        fingerprint,
+        None,
+    )
+    .await
+}
+
+/// The briefing a turn left unread because a kept process was going to serve it (the block is a
+/// per-spawn flag such a process would discard), read only if the turn has to spawn after all.
+pub(super) type LateBriefing =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
+
+/// Serves one turn (see `serve_turn`), for a turn that may have skipped its briefing on the strength
+/// of a kept process.
+///
+/// That process can turn out to be gone by the time the turn reaches it (`LiveTurn::NotWritten`), or
+/// be taken away in between; the turn then spawns one, and that spawn is exactly what the briefing
+/// is for. `late_briefing` is read at that point and appended the way `chat_run_request` appends it,
+/// so a fallback spawn carries what a turn with no kept process would have carried.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn serve_turn_briefed(
     runner: &std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
     mut request: crate::execution::runner::RunRequest,
     session_tx: tokio::sync::mpsc::UnboundedSender<String>,
@@ -27,6 +70,7 @@ pub(super) async fn serve_turn(
     may_live: bool,
     fresh_key: Option<&sqlx::SqlitePool>,
     fingerprint: &str,
+    late_briefing: Option<LateBriefing>,
 ) -> Result<std::io::Result<crate::execution::runner::RunOutcome>, tokio::time::error::Elapsed> {
     if !may_live {
         request.progress_timeout = deadlines.silence;
@@ -79,6 +123,10 @@ pub(super) async fn serve_turn(
                 ),
             )
             .await;
+            // An answer the CLI began on its own before this message, set aside by `turn`, leaves
+            // the process HERE, whatever became of the turn: the process may be dropped below, or
+            // taken by the next turn before anything recorded it, and either would lose it.
+            keep_set_aside(chat_id, &mut live);
             match served {
                 Ok(LiveTurn::Answered(outcome)) => {
                     drop(steer);
@@ -125,6 +173,17 @@ pub(super) async fn serve_turn(
     if let Some(pool) = fresh_key {
         chat_key::rekey(&mut request.env, pool, chat_id).await;
     }
+    // Only a Claude turn ever skips its briefing (`briefing_wanted`), so the block is appended as
+    // Claude's.
+    if let Some(late) = late_briefing
+        && let Some(block) = late.await
+    {
+        request.append_system_prompt = system_prompt_with_knowledge(
+            "claude",
+            request.append_system_prompt.take(),
+            Some(&block),
+        );
+    }
 
     start_live_chat(
         runner,
@@ -162,7 +221,7 @@ pub(super) fn has_kept_process(chat_id: &str) -> bool {
 }
 
 /// Whether the process the conversation has kept would serve a turn with these facts: the same rules
-/// [`serve_turn`] applies before it speaks down one, asked without taking it.
+/// [`serve_turn_briefed`] applies before it speaks down one, asked without taking it.
 ///
 /// Used before the turn builds its request, to skip what a kept process would discard.
 pub(super) fn kept_process_fits(

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -40,6 +40,15 @@ function renderFeed(path = "/feed") {
 /* ------------------------------------------------------------- fixtures -- */
 
 const MINUTE = 60_000;
+
+// The page groups lines by local calendar day, and the fixtures below reach back up to a day from
+// "now". Pinned to midday before any fixture is built (several are built when this file is
+// collected), so a run between 00:00 and 01:35 — or one that crosses midnight — does not split them
+// across two days. The clock still advances with real time, so waits and refreshes behave as before.
+vi.useFakeTimers({ toFake: ["Date"], now: new Date(2026, 9, 17, 12, 0, 0), shouldAdvanceTime: true });
+afterAll(() => {
+  vi.useRealTimers();
+});
 
 /** A line `minutesAgo` before now — inside every window the page offers. */
 function entry(overrides: Partial<FeedEntry> & { minutesAgo?: number } = {}): FeedEntry {

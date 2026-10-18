@@ -528,7 +528,7 @@ pub(super) fn chat_run_request(
 ///
 /// A process takes its model, effort, tool denials, directories and instructions as arguments once,
 /// when it starts, so a conversation that changed any of them must get a new process rather than a
-/// wrong one. [`serve_turn`] compares this against what the process was spawned with
+/// wrong one. [`serve_turn_briefed`] compares this against what the process was spawned with
 /// (`LiveChat::spawned_with`).
 ///
 /// Computed from the conversation's own settings and NEVER from the per-turn briefing: that block
@@ -781,9 +781,11 @@ async fn warm_chat(state: &crate::state::AppState, chat_id: &str) {
     }
     let _warming = Warming;
 
-    // The chat's slot, held while the process is built, so no turn starts beside it. Armed to send
-    // what waited when it is released: a message queued meanwhile must not wait for ever.
-    let Some(mut slot) = ChatSlot::acquire(chat_id) else {
+    // The chat's slot, held while the process is built, so no turn starts beside it. Taken as a
+    // warm-up's: the chat does not read as busy, and a send waits these moments out instead of being
+    // queued behind a turn that does not exist. Armed to send what waited when it is released: a
+    // message queued meanwhile must not wait for ever.
+    let Some(mut slot) = ChatSlot::acquire_for_warmup(chat_id) else {
         return;
     };
     slot.drain_on_release(state);
@@ -1111,6 +1113,23 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         if kept && knowledge.is_some() {
             evict_live(&turn.slot.chat_id);
         }
+        // Skipped for the kept process alone: if that process is gone when the turn reaches it, the
+        // turn spawns one, and the spawn reads the briefing the turn did not.
+        let late_briefing: Option<LateBriefing> = (cli == "claude" && kept && !warmed_unbriefed)
+            .then(|| {
+                let pool = pool.clone();
+                let text = text.clone();
+                Box::pin(async move {
+                    crate::brief::for_prompt(
+                        &pool,
+                        &crate::knowledge::Context::for_project(None),
+                        &text,
+                        "assistant",
+                    )
+                    .await
+                    .and_then(|briefing| briefing.block)
+                }) as LateBriefing
+            });
 
         let request = chat_run_request(
             text,
@@ -1148,7 +1167,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         crate::execution::runs::record_authored_prompt(&pool, id, runner.authored_prompt(&request))
             .await;
 
-        let result = serve_turn(
+        let result = serve_turn_briefed(
             &runner,
             request,
             session_tx,
@@ -1166,6 +1185,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             may_live.then_some(&pool),
             // What this conversation's process must have been spawned with to serve this turn.
             &fingerprint,
+            late_briefing,
         )
         .await;
         // The process this turn kept (if any) learns what it has now served, before anything can
@@ -1362,6 +1382,10 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // the next turn never starts inside this one's registered task (whose handle would still be
         // in `run_handles` and whose end would cut it short). Draining is the slot's job, not this
         // task's.
+        // An answer the process began on its own before this turn's message was set aside by
+        // `serve_turn`; it is recorded now, while this turn still holds the slot, so the next turn
+        // cannot set another aside before this one is written.
+        record_set_aside(&after, &drained_chat).await;
         drop(turn);
         // The process this turn kept is read from here on, so a background task's own answer is not
         // left waiting for the next person's turn.
@@ -1530,5 +1554,86 @@ mod tests {
             "the first turn after a warm-up lost its briefing: {sent:?}"
         );
         evict_live(chat);
+    }
+
+    /// A turn that skipped its briefing because a kept process would serve it, and found that
+    /// process already gone, spawns one that carries the briefing after all.
+    #[tokio::test]
+    async fn a_fallback_spawn_after_a_dead_kept_process_still_carries_the_briefing() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let chat = "turn-dead-kept-briefed";
+
+        // A kept process that fits the turn, and is gone: both ends of its pipes are closed.
+        let (messages, said) =
+            tokio::sync::mpsc::unbounded_channel::<crate::execution::runner::LaterTurn>();
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(said);
+        drop(events);
+        let dead = LiveChat::new(
+            messages,
+            events_rx,
+            Arc::new(Mutex::new(Some("s-1".to_owned()))),
+            tokio::spawn(async {}).abort_handle(),
+            tokio::sync::watch::channel(None).1,
+            crate::execution::runner::Permission::Default,
+            None,
+            String::new(),
+            None,
+        );
+        relock(&LIVE_CHATS).insert(chat.to_owned(), dead);
+
+        let request = chat_run_request(
+            "zanzibar?".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            crate::execution::runner::Permission::Default,
+            Some("s-1".to_owned()),
+            "s-1".to_owned(),
+            std::env::temp_dir().join("dead-kept-unused.json"),
+            crate::execution::runner::ToolPolicy::Unrestricted,
+            crate::chats::Answering::default(),
+            None,
+            "claude",
+            None,
+        );
+        let late: LateBriefing = Box::pin(async { Some("\n\nzanzibar house rule".to_owned()) });
+        let runner: Arc<dyn crate::execution::runner::CommandRunner> = fake.clone();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = Arc::new(Mutex::new(String::new()));
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve_turn_briefed(
+                &runner,
+                request,
+                tx,
+                &transcript,
+                chat,
+                turn_deadlines(
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                    crate::execution::runner::ToolPolicy::Unrestricted,
+                ),
+                true,
+                None,
+                "",
+                Some(late),
+            ),
+        )
+        .await;
+
+        let mut sent = None;
+        for _ in 0..500 {
+            sent = fake.last_append_system_prompt.lock().unwrap().clone();
+            if sent.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        evict_live(chat);
+        assert!(
+            matches!(sent, Some(Some(ref prompt)) if prompt.contains("zanzibar house rule")),
+            "the spawn that replaced a dead kept process lost the turn's briefing: {sent:?}"
+        );
     }
 }
