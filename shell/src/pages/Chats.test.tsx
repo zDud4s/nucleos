@@ -4731,7 +4731,7 @@ describe("reading a transcript back", () => {
 
     const turn = (await screen.findByText("que horas sao")).closest("li") as HTMLElement;
     expect(within(turn).getByText("you")).toBeTruthy();
-    expect(within(turn).getByText("background service")).toBeTruthy();
+    expect(within(turn).getByText("service")).toBeTruthy();
   });
 
   it("draws a fenced block as code rather than as three backticks", async () => {
