@@ -488,7 +488,13 @@ mod tests {
     async fn span_split_at_midnight_sums_to_clipped_length() {
         let pool = pool().await;
         session(&pool, "s1", "alpha", "2026-10-10T23:00:00.000Z", None).await;
-        tool_span(&pool, "s1", "2026-10-10T23:30:00.000Z", "2026-10-11T00:45:00.000Z").await;
+        tool_span(
+            &pool,
+            "s1",
+            "2026-10-10T23:30:00.000Z",
+            "2026-10-11T00:45:00.000Z",
+        )
+        .await;
         let rows = span_day_rows(&pool, None, S, U).await.unwrap();
         assert_eq!(ms_on(&rows, "2026-10-10"), 30 * MIN);
         assert_eq!(ms_on(&rows, "2026-10-11"), 45 * MIN);
@@ -500,8 +506,20 @@ mod tests {
     async fn span_clipped_at_window_edges() {
         let pool = pool().await;
         session(&pool, "s1", "alpha", "2026-09-30T22:00:00.000Z", None).await;
-        tool_span(&pool, "s1", "2026-09-30T23:00:00.000Z", "2026-10-01T00:20:00.000Z").await;
-        tool_span(&pool, "s1", "2026-10-03T11:50:00.000Z", "2026-10-03T12:30:00.000Z").await;
+        tool_span(
+            &pool,
+            "s1",
+            "2026-09-30T23:00:00.000Z",
+            "2026-10-01T00:20:00.000Z",
+        )
+        .await;
+        tool_span(
+            &pool,
+            "s1",
+            "2026-10-03T11:50:00.000Z",
+            "2026-10-03T12:30:00.000Z",
+        )
+        .await;
         let rows = span_day_rows(&pool, None, S, "2026-10-03T12:00:00.000Z")
             .await
             .unwrap();
@@ -557,8 +575,20 @@ mod tests {
         let pool = pool().await;
         session(&pool, "a", "alpha", "2026-10-05T09:00:00.000Z", None).await;
         session(&pool, "b", "beta", "2026-10-05T09:00:00.000Z", None).await;
-        tool_span(&pool, "a", "2026-10-05T09:00:00.000Z", "2026-10-05T09:01:00.000Z").await;
-        tool_span(&pool, "b", "2026-10-05T09:00:00.000Z", "2026-10-05T09:02:00.000Z").await;
+        tool_span(
+            &pool,
+            "a",
+            "2026-10-05T09:00:00.000Z",
+            "2026-10-05T09:01:00.000Z",
+        )
+        .await;
+        tool_span(
+            &pool,
+            "b",
+            "2026-10-05T09:00:00.000Z",
+            "2026-10-05T09:02:00.000Z",
+        )
+        .await;
         let alpha = span_day_rows(&pool, Some("alpha"), S, U).await.unwrap();
         let all = span_day_rows(&pool, None, S, U).await.unwrap();
         assert_eq!(alpha.iter().map(|r| r.ms).sum::<i64>(), MIN);
@@ -607,7 +637,15 @@ mod tests {
         let pool = pool().await;
         session(&pool, "s1", "alpha", "2026-10-05T09:00:00.000Z", None).await;
         turn(&pool, "s1", 1, "2026-10-05T09:00:00.000Z", true, Some(true)).await;
-        turn(&pool, "s1", 2, "2026-10-05T09:10:00.000Z", false, Some(false)).await;
+        turn(
+            &pool,
+            "s1",
+            2,
+            "2026-10-05T09:10:00.000Z",
+            false,
+            Some(false),
+        )
+        .await;
         turn(&pool, "s1", 3, "2026-10-05T09:20:00.000Z", false, None).await;
         let rows = turn_day_rows(&pool, None, S, U).await.unwrap();
         assert_eq!(
@@ -653,7 +691,13 @@ mod tests {
     #[tokio::test]
     async fn findings_page_joins_feedback_and_paginates_stably() {
         let pool = pool().await;
-        for (key, cost) in [("k1", 500), ("k2", 400), ("k3", 400), ("k4", 100), ("k5", 50)] {
+        for (key, cost) in [
+            ("k1", 500),
+            ("k2", 400),
+            ("k3", 400),
+            ("k4", 100),
+            ("k5", 50),
+        ] {
             finding(&pool, key, "alpha", RULE, "2026-10-05T09:00:00.000Z", cost).await;
         }
         crate::devtime::precision::mark_case(&pool, "k2", "not_rework", None)
@@ -683,12 +727,24 @@ mod tests {
         let pool = pool().await;
         finding(&pool, "old", "alpha", RULE, "2026-09-01T09:00:00.000Z", 900).await;
         finding(&pool, "a", "alpha", RULE, "2026-10-05T09:00:00.000Z", 1).await;
-        finding(&pool, "b", "alpha", OTHER_RULE, "2026-10-06T09:00:00.000Z", 1).await;
+        finding(
+            &pool,
+            "b",
+            "alpha",
+            OTHER_RULE,
+            "2026-10-06T09:00:00.000Z",
+            1,
+        )
+        .await;
         finding(&pool, "c", "beta", RULE, "2026-10-07T09:00:00.000Z", 1).await;
         let recent = findings_page(&pool, None, S, U, None, FindingOrder::Recent, 50, None)
             .await
             .unwrap();
-        let keys: Vec<&str> = recent.items.iter().map(|r| r.finding_key.as_str()).collect();
+        let keys: Vec<&str> = recent
+            .items
+            .iter()
+            .map(|r| r.finding_key.as_str())
+            .collect();
         assert_eq!(keys, ["c", "b", "a"]);
         let order = FindingOrder::Cost;
         let filtered = findings_page(&pool, Some("alpha"), S, U, Some(RULE), order, 50, None)

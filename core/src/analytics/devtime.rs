@@ -294,8 +294,8 @@ pub(crate) fn assemble(
     totals.interruption_rate = ratio(current_turns.interrupted, current_turns.turns);
     totals.correction_rate = ratio(current_turns.corrections, current_turns.known);
     // `None` without a known turn (spec §6.4's last sentence), so `turns` is non-zero here.
-    totals.correction_coverage = (current_turns.known != 0)
-        .then(|| current_turns.known as f64 / current_turns.turns as f64);
+    totals.correction_coverage =
+        (current_turns.known != 0).then(|| current_turns.known as f64 / current_turns.turns as f64);
     prev.interruption_rate = ratio(previous_turns.interrupted, previous_turns.turns);
     prev.correction_rate = ratio(previous_turns.corrections, previous_turns.known);
     totals.previous = prev;
@@ -522,13 +522,23 @@ fn total_cost(rows: &[ModelTokens]) -> Option<f64> {
 
 fn tokens_block(window: Window, rows: &[MessageDayRow], models: &ModelsConfig) -> DevtimeTokens {
     let previous = window.previous();
-    let mut current = tally(rows.iter().filter(|r| window.holds(&r.day)).cloned(), models);
-    let before = tally(rows.iter().filter(|r| previous.holds(&r.day)).cloned(), models);
+    let mut current = tally(
+        rows.iter().filter(|r| window.holds(&r.day)).cloned(),
+        models,
+    );
+    let before = tally(
+        rows.iter().filter(|r| previous.holds(&r.day)).cloned(),
+        models,
+    );
     current.sort_by(|a, b| {
         b.cost_usd
             .is_some()
             .cmp(&a.cost_usd.is_some())
-            .then_with(|| b.cost_usd.unwrap_or(0.0).total_cmp(&a.cost_usd.unwrap_or(0.0)))
+            .then_with(|| {
+                b.cost_usd
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.cost_usd.unwrap_or(0.0))
+            })
             .then_with(|| (b.input + b.output).cmp(&(a.input + a.output)))
             .then_with(|| a.model.cmp(&b.model))
     });
@@ -784,7 +794,9 @@ pub async fn mark_finding(
 mod tests {
     use super::*;
     // Named, not globbed: the fixture's `Span` struct is what the tests build.
-    use crate::devtime::store::fixture::{Span, finding, insert_span, message, session, span, turn};
+    use crate::devtime::store::fixture::{
+        Span, finding, insert_span, message, session, span, turn,
+    };
 
     const MIN: i64 = 60_000;
     /// A real rule id from `RULES`.
@@ -816,9 +828,15 @@ mod tests {
         days: i64,
         models: &ModelsConfig,
     ) -> DevtimeOverview {
-        devtime_overview(pool, models, scope, Window::new(days, now()).unwrap(), now())
-            .await
-            .unwrap()
+        devtime_overview(
+            pool,
+            models,
+            scope,
+            Window::new(days, now()).unwrap(),
+            now(),
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1004,14 +1022,26 @@ mod tests {
         let pool = pool().await;
         session(&pool, "s1", "alpha", "2026-10-15T09:00:00.000Z", None).await;
         turn(&pool, "s1", 1, "2026-10-15T09:00:00.000Z", true, Some(true)).await;
-        turn(&pool, "s1", 2, "2026-10-15T09:10:00.000Z", false, Some(false)).await;
+        turn(
+            &pool,
+            "s1",
+            2,
+            "2026-10-15T09:10:00.000Z",
+            false,
+            Some(false),
+        )
+        .await;
         turn(&pool, "s1", 3, "2026-10-15T09:20:00.000Z", false, None).await;
         turn(&pool, "s1", 4, "2026-10-15T09:30:00.000Z", false, None).await;
         let report = overview(&pool, Scope::Global, 7).await;
         let t = &report.totals;
         assert_eq!(t.turns, 4);
         assert_eq!(t.interruption_rate, Some(0.25));
-        assert_eq!(t.correction_rate, Some(0.5), "1 correction over 2 known turns");
+        assert_eq!(
+            t.correction_rate,
+            Some(0.5),
+            "1 correction over 2 known turns"
+        );
         assert_eq!(t.correction_coverage, Some(0.5));
         let day = report
             .days_series
@@ -1136,11 +1166,29 @@ mod tests {
         session(&pool, "s1", "alpha", "2026-10-15T09:00:00.000Z", None).await;
         let one_m = [1_000_000, 0, 0, 0];
         let at9 = "2026-10-15T09:00:00.000Z";
-        message(&pool, "s1", "main", "m1", at9, Some("claude-sonnet-5"), one_m).await;
+        message(
+            &pool,
+            "s1",
+            "main",
+            "m1",
+            at9,
+            Some("claude-sonnet-5"),
+            one_m,
+        )
+        .await;
         let at901 = "2026-10-15T09:01:00.000Z";
         message(&pool, "s1", "main", "m2", at901, Some("sonnet"), one_m).await;
         let at902 = "2026-10-15T09:02:00.000Z";
-        message(&pool, "s1", "main", "m3", at902, Some("gpt-5.5"), [0, 0, 10, 0]).await;
+        message(
+            &pool,
+            "s1",
+            "main",
+            "m3",
+            at902,
+            Some("gpt-5.5"),
+            [0, 0, 10, 0],
+        )
+        .await;
         let mut half = full(1.25, 10.0, 0.125, 0.0);
         half.cache_write = None;
         let models = priced(&[
@@ -1162,7 +1210,16 @@ mod tests {
         let pool = pool().await;
         session(&pool, "s1", "alpha", "2026-10-15T09:00:00.000Z", None).await;
         let at9 = "2026-10-15T09:00:00.000Z";
-        message(&pool, "s1", "main", "m1", at9, Some("claude-sonnet-5"), [10, 0, 0, 0]).await;
+        message(
+            &pool,
+            "s1",
+            "main",
+            "m1",
+            at9,
+            Some("claude-sonnet-5"),
+            [10, 0, 0, 0],
+        )
+        .await;
         // No model_prices at all.
         let tokens = overview(&pool, Scope::Global, 7).await.tokens;
         assert_eq!((tokens.cost_usd, tokens.prices_as_of.clone()), (None, None));
@@ -1180,7 +1237,12 @@ mod tests {
         let rows = [
             ("m1", "2026-10-13T09:00:00.000Z", "sonnet", one_m),
             ("m2", "2026-10-14T09:00:00.000Z", "claude-sonnet-5", one_m),
-            ("m3", "2026-10-15T09:00:00.000Z", "claude-sonnet-5", [0, 0, 0, 100_000]),
+            (
+                "m3",
+                "2026-10-15T09:00:00.000Z",
+                "claude-sonnet-5",
+                [0, 0, 0, 100_000],
+            ),
             // gpt-5.5 is priced for input but not cache writes, and writes cache on the 16th:
             // unpriced over the window, so its input on the 15th adds nothing either.
             ("m4", "2026-10-15T10:00:00.000Z", "gpt-5.5", one_m),
@@ -1207,7 +1269,11 @@ mod tests {
         assert_eq!(cost("2026-10-12"), None, "no usage at all");
         assert_eq!(cost("2026-10-13"), None, "only an unpriced alias");
         assert_eq!(cost("2026-10-14"), Some(3.0));
-        assert_eq!(cost("2026-10-15"), Some(1.5), "the window-unpriced gpt-5.5 adds nothing");
+        assert_eq!(
+            cost("2026-10-15"),
+            Some(1.5),
+            "the window-unpriced gpt-5.5 adds nothing"
+        );
         assert_eq!(cost("2026-10-16"), None, "only the window-unpriced gpt-5.5");
         let summed: f64 = report.days_series.iter().filter_map(|d| d.cost_usd).sum();
         assert!(
@@ -1244,7 +1310,12 @@ mod tests {
         let tokens = overview(&pool, Scope::Global, 7).await.tokens;
         let row = &tokens.by_model[0];
         assert_eq!(
-            (row.model.as_str(), row.effort.as_str(), row.messages, row.input),
+            (
+                row.model.as_str(),
+                row.effort.as_str(),
+                row.messages,
+                row.input
+            ),
             (UNKNOWN, UNKNOWN, 1, 0)
         );
     }
@@ -1268,15 +1339,27 @@ mod tests {
     #[test]
     fn rule_with_few_cases_has_null_precision() {
         let view = rule_view(&counts(3, 0), &precision_cfg());
-        assert_eq!((view.precision, view.low_precision, view.n_cases), (None, false, 3));
+        assert_eq!(
+            (view.precision, view.low_precision, view.n_cases),
+            (None, false, 3)
+        );
     }
 
     #[test]
     fn low_precision_requires_min_cases_and_below_floor() {
         let cfg = precision_cfg();
-        assert!(rule_view(&counts(20, 5), &cfg).low_precision, "0.75 over 20 cases");
-        assert!(!rule_view(&counts(20, 4), &cfg).low_precision, "0.80 is at the floor");
-        assert!(!rule_view(&counts(19, 10), &cfg).low_precision, "too few cases to judge");
+        assert!(
+            rule_view(&counts(20, 5), &cfg).low_precision,
+            "0.75 over 20 cases"
+        );
+        assert!(
+            !rule_view(&counts(20, 4), &cfg).low_precision,
+            "0.80 is at the floor"
+        );
+        assert!(
+            !rule_view(&counts(19, 10), &cfg).low_precision,
+            "too few cases to judge"
+        );
     }
 
     #[test]
@@ -1309,7 +1392,15 @@ mod tests {
         )
         .await;
         let before = overview(&pool, Scope::Global, 7).await.totals;
-        finding(&pool, "k1", "alpha", RULE, "2026-10-15T09:00:00.000Z", 9_999_999).await;
+        finding(
+            &pool,
+            "k1",
+            "alpha",
+            RULE,
+            "2026-10-15T09:00:00.000Z",
+            9_999_999,
+        )
+        .await;
         let after = overview(&pool, Scope::Global, 7).await;
         assert_eq!(after.totals, before);
         assert_eq!(after.waste_by_rule[0].findings, 1);
@@ -1375,7 +1466,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            (again.feedback.verdict.as_str(), again.feedback.cause.as_deref()),
+            (
+                again.feedback.verdict.as_str(),
+                again.feedback.cause.as_deref()
+            ),
             ("confirmed", Some("spec_gap"))
         );
         assert_eq!(again.rule.unwrap().n_not_rework, 0);
