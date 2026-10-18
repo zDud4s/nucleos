@@ -366,6 +366,8 @@ export function previewPipeline(projectId: string | null, rawDays: string | null
         error_rate: 0.03,
         enforced_share: 0.4,
         agree: 0.91,
+        basis: "band",
+        unit: "action",
       },
       refused_actions: { total: 5, by_status: { denied: 3, expired: 2 } },
     },

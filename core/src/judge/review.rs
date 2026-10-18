@@ -111,7 +111,11 @@ pub struct JudgeReadiness {
 /// Distinct reviewed actions, minus every action a human ever disagreed with - `shadow.rs`'s
 /// `AGREE_DISTINCT` arithmetic, over the judge's band instead of the classifier's decision. A
 /// capped allow is `band = 'allow'`: D11 measures the judge's opinion, not its effect.
-const READINESS_SELECT: &str =
+///
+/// `pub(crate)` because the pipeline analytics (`analytics_pipeline/autopilot.rs`) shows the same
+/// figure over a time window and must not drift from the gate's arithmetic. The fragment expects
+/// the aliases `jv` (`judge_verdicts`) and `r` (its `runs` row) and carries no bound parameter.
+pub(crate) const READINESS_SELECT: &str =
     "COUNT(DISTINCT jv.tool_name || char(31) || jv.tool_input_digest) AS reviewed,
      COUNT(DISTINCT jv.tool_name || char(31) || jv.tool_input_digest)
      - COUNT(DISTINCT CASE

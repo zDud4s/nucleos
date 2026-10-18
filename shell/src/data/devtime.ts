@@ -113,7 +113,11 @@ export interface DevtimeFinding {
   rule: RuleView | null;
 }
 
-export interface DevtimeFindings { items: DevtimeFinding[]; next_cursor: string | null; rules: RuleView[] }
+/** Where the precision thresholds came from: the file, its last valid version, or the built-in defaults. */
+export type ThresholdsSource = "file" | "last_good" | "default";
+export interface DevtimeFindings {
+  items: DevtimeFinding[]; next_cursor: string | null; rules: RuleView[]; thresholds_source: ThresholdsSource;
+}
 export interface MarkOutcome { finding_key: string; feedback: FindingFeedback; rule: RuleView | null }
 
 export const FINDINGS_PAGE = 50;

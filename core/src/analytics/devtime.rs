@@ -14,7 +14,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 
 use super::{Scope, Window};
-use crate::config::{DevtimeRulesConfig, ModelPrice, ModelsConfig};
+use crate::config::{DevtimeRulesConfig, ModelPrice, ModelsConfig, ThresholdsSource};
 use crate::devtime::precision::{self, MarkError, RulePrecision};
 use crate::devtime::rules::RULES;
 use crate::devtime::store::{
@@ -762,6 +762,8 @@ pub struct DevtimeFindings {
     pub items: Vec<FindingItem>,
     pub next_cursor: Option<String>,
     pub rules: Vec<RuleView>,
+    /// Which `devtime.yaml` the precision thresholds above were computed under.
+    pub thresholds_source: ThresholdsSource,
 }
 
 pub struct FindingsQuery<'a> {
@@ -795,6 +797,7 @@ pub fn decode_cursor(raw: &str, order: FindingOrder) -> Option<FindingCursor> {
 pub async fn devtime_findings(
     pool: &SqlitePool,
     rules: &DevtimeRulesConfig,
+    thresholds_source: ThresholdsSource,
     scope: Scope<'_>,
     window: Window,
     now: DateTime<Utc>,
@@ -846,6 +849,7 @@ pub async fn devtime_findings(
         items,
         next_cursor: page.next.map(|next| encode_cursor(&next, query.order)),
         rules: views,
+        thresholds_source,
     })
 }
 
@@ -1747,9 +1751,19 @@ mod tests {
             cursor: None,
         };
         let scope = Scope::Project("alpha");
-        let alpha = devtime_findings(&pool, &precision_cfg(), scope, window, now(), &query)
-            .await
-            .unwrap();
+        let source = ThresholdsSource::File;
+        let alpha = devtime_findings(
+            &pool,
+            &precision_cfg(),
+            source,
+            scope,
+            window,
+            now(),
+            &query,
+        )
+        .await
+        .unwrap();
+        assert_eq!(alpha.thresholds_source, ThresholdsSource::File);
         assert_eq!(alpha.items.len(), 1, "only alpha's finding is listed");
         // ...but the rule's precision is global (spec §4.5): beta's marked finding is its one case.
         let rule = alpha.items[0].rule.as_ref().unwrap();

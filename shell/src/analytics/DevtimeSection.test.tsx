@@ -164,6 +164,21 @@ describe("DevtimeSection", () => {
     expect(await screen.findByText("few cases (3)")).toBeTruthy();
   });
 
+  it("says so when the thresholds are not the file's", async () => {
+    const state = busy();
+    state.devtimeFindings.thresholds_source = "last_good";
+    await mount(state);
+    fireEvent.click(await screen.findByText("Findings"));
+    expect(await screen.findByText("Using last valid devtime.yaml")).toBeTruthy();
+  });
+
+  it("is silent about thresholds that come from the file", async () => {
+    await mount(busy());
+    fireEvent.click(await screen.findByText("Findings"));
+    await screen.findByText("few cases (3)");
+    expect(screen.queryByText(/Using (last valid|default)/)).toBeNull();
+  });
+
   it("badges a low-precision rule and notes global precision in a project's view", async () => {
     const state = busy();
     state.projects = [project({ project_id: "nucleos" })];

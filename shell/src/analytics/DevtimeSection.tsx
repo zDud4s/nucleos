@@ -323,6 +323,11 @@ function FindingsSection({ projectId, days }: { projectId?: string; days: Analyt
         findings.isError ? <ErrorNote>The núcleo did not answer for findings.</ErrorNote> : opened ? <p className="an-note">reading…</p> : null
       ) : (
         <>
+          {findings.data.thresholds_source !== "file" ? (
+            <p className="an-note">
+              {findings.data.thresholds_source === "last_good" ? "Using last valid devtime.yaml" : "Using default thresholds"}
+            </p>
+          ) : null}
           <ul className="an-dt-finding-list">
             {findings.data.items.map((item) => (
               <FindingRow key={item.finding_key} item={item} days={days} inProject={projectId !== undefined} />
