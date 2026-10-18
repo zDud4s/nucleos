@@ -19,6 +19,7 @@ import {
   RefusalNote,
   Row,
   Rows,
+  Skeleton,
 } from "../ui";
 import "./context.css";
 
@@ -104,9 +105,11 @@ export function ContextRefs({ ownerKind, ownerId }: ContextRefsProps) {
 
   let body: ReactNode;
   if (refs.isError) {
-    body = <Quiet says="the núcleo did not answer — these context files are unknown" />;
+    body = (
+      <ErrorNote onRetry={() => void refs.refetch()}>the núcleo did not answer — these context files are unknown</ErrorNote>
+    );
   } else if (refs.data === undefined) {
-    body = <Quiet says="Loading…" />;
+    body = <Skeleton label="Loading context files…" lines={2} />;
   } else if (refs.data.length === 0) {
     body = <Quiet says="No context files yet." />;
   } else {
