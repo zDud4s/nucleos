@@ -26,8 +26,21 @@ pub(crate) const LANDING_ROWS_SQL: &str = "SELECT status, op, origin, created_at
 /// Metric 2's read, windowed by when a row stopped mattering (spec §6.1, 2): `settled_at` when the
 /// person it waited for was let off, else `finished_at`. A row with neither is still open and is
 /// not in it. Current window only: conflicts carry no previous figure.
+///
+/// `resolved_by_origin` is who filed the landing that settled the row (`daemon` when the resolver
+/// handed its own finished resolution over, `shell` when a person ran `--land`), and
+/// `has_decided_proposal` whether a person approved or rejected anything the resolution's run
+/// asked: the two facts that tell a conflict the daemon closed alone from one a person helped close.
+///
+/// The outer table stays unaliased and its `WHERE` spelled exactly as `vcs_requests_by_ended`'s
+/// expression (migration 0209), so the window still searches that index.
 pub(crate) const LANDING_SETTLED_SQL: &str = "SELECT status, op, origin, created_at, started_at,
-        finished_at, unexecutable, failure_reason, settled_reason, discarded
+        finished_at, unexecutable, failure_reason, settled_reason, discarded,
+        (SELECT landed.origin FROM vcs_requests AS landed
+          WHERE landed.id = vcs_requests.resolved_by) AS resolved_by_origin,
+        EXISTS (SELECT 1 FROM proposals AS p
+                 WHERE p.run_id = vcs_requests.resolution_run_id
+                   AND p.status IN ('approved', 'rejected')) AS has_decided_proposal
    FROM vcs_requests
   WHERE COALESCE(settled_at, finished_at) >= ?1 AND COALESCE(settled_at, finished_at) < ?2
     AND (?3 IS NULL OR project_id = ?3)
@@ -54,11 +67,15 @@ pub(crate) struct Row {
     pub finished_at: Option<String>,
     pub unexecutable: bool,
     failure_reason: Option<String>,
-    /// Only `LANDING_SETTLED_SQL` selects these two.
+    /// Only `LANDING_SETTLED_SQL` selects these four.
     #[sqlx(default)]
     settled_reason: Option<String>,
     #[sqlx(default)]
     discarded: Option<String>,
+    #[sqlx(default)]
+    resolved_by_origin: Option<String>,
+    #[sqlx(default)]
+    has_decided_proposal: bool,
 }
 
 pub(crate) async fn rows(
@@ -181,9 +198,14 @@ pub struct Conflicts {
     pub count: i64,
     /// `count` over the rows that ended in the window.
     pub rate: Option<f64>,
-    /// Conflicts that stopped wanting a person without one: a resolution landed them
-    /// (`resolved`) or their source reached the target (`merged`).
+    /// Conflicts that stopped wanting a person without one: settled `resolved` by a landing the
+    /// daemon itself filed (`origin = 'daemon'`, the resolver's handover), with no proposal of the
+    /// resolution's run approved or rejected by a person.
     pub auto_resolved: i64,
+    /// Conflicts that went away with a person somewhere in it: settled `merged` or `superseded`,
+    /// or `resolved` without meeting `auto_resolved`'s bar (landed from the shell, by hand, or
+    /// after a decided proposal). `dismissed` and the rest are in neither.
+    pub settled_otherwise: i64,
     pub work_lost: WorkLost,
 }
 
@@ -305,8 +327,21 @@ pub(crate) fn landing_block(rows: &[Row], window: Window) -> Landing {
     }
 }
 
-/// Settlement reasons that mean the conflict went away by itself (`vcs::tickets`).
-const AUTO_SETTLED: [&str; 2] = ["resolved", "merged"];
+/// `Origin::Daemon`'s spelling in `vcs_requests.origin`, written out as `postgate.rs` does: the
+/// queue keeps `as_str` private.
+const DAEMON_ORIGIN: &str = "daemon";
+
+/// Settlement reasons that mean the conflict went away without the owner deciding it on the
+/// Waiting page (`vcs::tickets`). Only `resolved` can be the daemon's alone.
+const SETTLED_AWAY: [&str; 3] = ["resolved", "merged", "superseded"];
+
+/// A conflict the daemon closed alone: its resolution landed under a request the daemon filed,
+/// and nobody approved or rejected anything the resolution's run asked on the way.
+fn is_auto_resolved(row: &Row) -> bool {
+    row.settled_reason.as_deref() == Some("resolved")
+        && row.resolved_by_origin.as_deref() == Some(DAEMON_ORIGIN)
+        && !row.has_decided_proposal
+}
 
 /// PURE: metric 2 from the rows that ended in the window.
 pub(crate) fn conflicts_block(rows: &[Row]) -> Conflicts {
@@ -314,12 +349,15 @@ pub(crate) fn conflicts_block(rows: &[Row]) -> Conflicts {
         .iter()
         .filter(|row| bucket(row) == Some(Bucket::Conflict))
         .collect();
-    let auto_resolved = conflicts
+    let auto_resolved = conflicts.iter().filter(|row| is_auto_resolved(row)).count() as i64;
+    let settled_otherwise = conflicts
         .iter()
         .filter(|row| {
-            row.settled_reason
-                .as_deref()
-                .is_some_and(|reason| AUTO_SETTLED.contains(&reason))
+            !is_auto_resolved(row)
+                && row
+                    .settled_reason
+                    .as_deref()
+                    .is_some_and(|reason| SETTLED_AWAY.contains(&reason))
         })
         .count() as i64;
     let mut work_lost = WorkLost::default();
@@ -334,6 +372,7 @@ pub(crate) fn conflicts_block(rows: &[Row]) -> Conflicts {
         count: conflicts.len() as i64,
         rate: stats::ratio(conflicts.len() as i64, rows.len() as i64),
         auto_resolved,
+        settled_otherwise,
         work_lost,
     }
 }
@@ -684,9 +723,44 @@ pub(crate) mod tests {
             .unwrap();
     }
 
+    /// What `land::submit` leaves behind when a resolution lands: a landing filed by `origin`, linked
+    /// from `conflict` by `resolved_by`, with `run` as the conflict's resolution run. The landing
+    /// finished before the window, so it is not itself one of the rows that ended in it.
+    async fn resolve_through(pool: &SqlitePool, conflict: i64, origin: &'static str, run: i64) {
+        let landing = Req {
+            origin,
+            created: "2026-10-01T10:00:00+00:00",
+            started: Some("2026-10-01T10:00:12+00:00"),
+            finished: Some("2026-10-01T10:00:53+00:00"),
+            ..merged()
+        };
+        let landing = request(pool, landing).await;
+        sqlx::query("UPDATE vcs_requests SET resolved_by = ?, resolution_run_id = ? WHERE id = ?")
+            .bind(landing)
+            .bind(run)
+            .bind(conflict)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A proposal `run` raised, left in `status`.
+    async fn proposal(pool: &SqlitePool, run: i64, status: &str) {
+        sqlx::query(
+            "INSERT INTO proposals (kind, status, run_id, reasoning, created_at)
+             VALUES ('action-approval', ?, ?, 'r', '2026-10-17T10:30:00+00:00')",
+        )
+        .bind(status)
+        .bind(run)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     /// Spec §6.1, 2: a conflict is an escalation or a failure on git's CONFLICT; it resolved
-    /// itself when settled as `resolved` or `merged`; work lost splits `nothing` from a list of
-    /// what is missing. The window is `settled_at`, else `finished_at`.
+    /// itself when a landing the daemon filed settled it as `resolved`; `merged` went away with a
+    /// person in it; work lost splits `nothing` from a list of what is missing. The window is
+    /// `settled_at`, else `finished_at`.
     #[tokio::test]
     async fn conflicts_count_escalated_and_conflict_failures_auto_resolved_and_work_lost() {
         let pool = crate::testdb::fresh_pool().await;
@@ -699,6 +773,7 @@ pub(crate) mod tests {
         let today = "2026-10-17T11:00:00+00:00";
         // Finished before the window, settled inside it: in.
         let id = request(&pool, long_ago.clone()).await;
+        resolve_through(&pool, id, "daemon", 7).await;
         settle(&pool, id, "2026-10-16T10:00:00+00:00", "resolved").await;
         let conflict_text = "CONFLICT (content): Merge conflict in a.rs";
         request(&pool, ended("failed", conflict_text)).await;
@@ -732,7 +807,11 @@ pub(crate) mod tests {
         let conflicts = block_of(&pool).await.conflicts.unwrap();
         assert_eq!(conflicts.count, 4, "{conflicts:?}");
         assert_eq!(conflicts.rate, Some(0.5), "four of eight ended rows");
-        assert_eq!(conflicts.auto_resolved, 2, "not the dismissed one");
+        assert_eq!(
+            conflicts.auto_resolved, 1,
+            "the daemon-landed resolution, not the merged or the dismissed one"
+        );
+        assert_eq!(conflicts.settled_otherwise, 1, "the merged one");
         let lost = WorkLost {
             nothing: 1,
             lost: 1,
@@ -740,6 +819,86 @@ pub(crate) mod tests {
         assert_eq!(conflicts.work_lost, lost, "an unknown loss is neither");
         let json = serde_json::to_string(&conflicts).unwrap();
         assert!(!json.contains("a.rs"), "{json}");
+    }
+
+    /// Only the daemon's own handover counts, and only when nobody decided anything the
+    /// resolution's run asked: an approved or rejected proposal is a person in the loop, a pending
+    /// one is not (yet). A landing a person filed from the shell is never the daemon's alone.
+    #[tokio::test]
+    async fn auto_resolved_counts_only_daemon_landed_resolutions_without_a_decided_proposal() {
+        let pool = crate::testdb::fresh_pool().await;
+        let today = "2026-10-17T11:00:00+00:00";
+        let cases: [(&'static str, Option<&str>); 5] = [
+            ("daemon", None),
+            ("daemon", Some("approved")),
+            ("daemon", Some("rejected")),
+            ("daemon", Some("pending")),
+            ("shell", None),
+        ];
+        for (run, (origin, decided)) in (1..).zip(cases) {
+            let id = request(&pool, ended("escalated", "conflict")).await;
+            resolve_through(&pool, id, origin, run).await;
+            if let Some(status) = decided {
+                proposal(&pool, run, status).await;
+            }
+            settle(&pool, id, today, "resolved").await;
+        }
+
+        let conflicts = block_of(&pool).await.conflicts.unwrap();
+        assert_eq!(conflicts.count, 5, "{conflicts:?}");
+        assert_eq!(
+            conflicts.auto_resolved, 2,
+            "the undecided and the pending one: {conflicts:?}"
+        );
+        assert_eq!(
+            conflicts.settled_otherwise, 3,
+            "approved, rejected, and the shell's landing: {conflicts:?}"
+        );
+    }
+
+    /// `settle_by_record` also settles `resolved` when somebody merged the resolution's branch by
+    /// hand: a plain merge, so `land` never wrote `resolved_by` and no daemon landing exists.
+    #[tokio::test]
+    async fn a_resolution_merged_by_hand_is_not_auto_resolved() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = request(&pool, ended("escalated", "conflict")).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_run_id = 9 WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        settle(&pool, id, "2026-10-17T11:00:00+00:00", "resolved").await;
+
+        let conflicts = block_of(&pool).await.conflicts.unwrap();
+        assert_eq!(conflicts.count, 1, "{conflicts:?}");
+        assert_eq!(conflicts.auto_resolved, 0, "{conflicts:?}");
+        assert_eq!(conflicts.settled_otherwise, 1, "{conflicts:?}");
+    }
+
+    /// `merged` (its source reached the target) and `superseded` (a later request on the same
+    /// merge succeeded) went away with a person somewhere in it; `dismissed` is the owner's own
+    /// call on the Waiting page and is in neither count.
+    #[tokio::test]
+    async fn merged_and_superseded_are_settled_otherwise() {
+        let pool = crate::testdb::fresh_pool().await;
+        let today = "2026-10-17T11:00:00+00:00";
+        let conflict_text = "CONFLICT (content): Merge conflict in a.rs";
+        for (req, reason) in [
+            (ended("escalated", "x"), "merged"),
+            (ended("failed", conflict_text), "superseded"),
+            (ended("escalated", "x"), "dismissed"),
+        ] {
+            let id = request(&pool, req).await;
+            settle(&pool, id, today, reason).await;
+        }
+
+        let conflicts = block_of(&pool).await.conflicts.unwrap();
+        assert_eq!(conflicts.count, 3, "{conflicts:?}");
+        assert_eq!(conflicts.auto_resolved, 0, "{conflicts:?}");
+        assert_eq!(
+            conflicts.settled_otherwise, 2,
+            "merged and superseded, not dismissed: {conflicts:?}"
+        );
     }
 
     /// Spec §6.1, 3: what the Waiting page counts (`WANTS_A_PERSON_SQL`, `OWNER_DECISION_SQL`,

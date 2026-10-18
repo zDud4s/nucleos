@@ -271,7 +271,7 @@ export function previewPipeline(projectId: string | null, rawDays: string | null
       prev_bad_share: 0.18,
       failure_buckets: { conflict: 2, gate: 3, blocked: 1, interrupted: 1, other: 0 },
       daily: dailyLanding,
-      conflicts: { count: 3, rate: 0.12, auto_resolved: 2, work_lost: { nothing: 2, lost: 1 } },
+      conflicts: { count: 3, rate: 0.12, auto_resolved: 2, settled_otherwise: 1, work_lost: { nothing: 2, lost: 1 } },
       owner_blocked: { count: 2, oldest_age_s: 86_400, median_age_s: 7_200 },
     },
     gate: {
@@ -338,10 +338,16 @@ export function previewPipeline(projectId: string | null, rawDays: string | null
         rounds_exhausted: 1,
         gate_retry_loop: 1,
         item_stuck: 0,
-        waiting: { slot: 2, budget: 0, quota: 1, disk: 0, excluded: 0, "kill-switch": 0, attention: 1, other: 0 },
         jobs: [
           { id: 21, project_id: "alpha" },
           { id: 19, project_id: "bravo" },
+        ],
+      },
+      waiting: {
+        by_reason: { slot: 2, budget: 0, quota: 1, disk: 0, excluded: 0, "kill-switch": 0, attention: 1, other: 0 },
+        jobs: [
+          { id: 40, project_id: "bravo" },
+          { id: 58, project_id: "bravo" },
         ],
       },
     },

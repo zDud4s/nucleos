@@ -410,6 +410,11 @@ async fn resolve_target(
 /// and the session waiting on the original ticket reads a stale `escalated` rather than the answer
 /// — worse for that one wait, never wrong, which is the trade `escalated_request_id`'s own doc
 /// comment makes explicit.
+///
+/// `origin` records who asked: `Origin::Shell` for a person's `--land`, `Origin::Daemon` for the
+/// resolver handing over a resolution it finished on its own (`resolver::land_finished`). Both
+/// carry their own approval, so the row starts `queued` either way; the column is what lets
+/// metric 2 tell a conflict the daemon closed alone from one a person landed.
 pub async fn submit(
     pool: &sqlx::SqlitePool,
     repo: &ResolvedRepo,
@@ -417,6 +422,7 @@ pub async fn submit(
     source: &str,
     requested_target: Option<&str>,
     deadline: Instant,
+    origin: Origin,
 ) -> Result<i64, LandRefusal> {
     let source = Branch::new(source).map_err(LandRefusal::Refused)?;
     let from_resolution =
@@ -466,9 +472,9 @@ pub async fn submit(
     };
 
     let submission = if from_resolution {
-        crate::execution::vcs::submit_resolution(pool, repo, &op, Origin::Shell).await
+        crate::execution::vcs::submit_resolution(pool, repo, &op, origin).await
     } else {
-        crate::execution::vcs::submit(pool, repo, &op, Origin::Shell).await
+        crate::execution::vcs::submit(pool, repo, &op, origin).await
     };
 
     let id = match submission {
@@ -866,9 +872,17 @@ mod tests {
         let feat_sha = sha_of(&repo, "feat/x");
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
-        let id = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
-            .await
-            .expect("a checkout parked elsewhere must not stop feat/x landing on master");
+        let id = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            None,
+            deadline(),
+            Origin::Shell,
+        )
+        .await
+        .expect("a checkout parked elsewhere must not stop feat/x landing on master");
 
         assert!(
             crate::execution::vcs::drain_once(
@@ -950,9 +964,17 @@ mod tests {
     /// Submits `feat/x` for landing and drains once: the first half of every map-approval test.
     async fn land_feat_x_once(pool: &sqlx::SqlitePool, repo: &Path) -> i64 {
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
-        let id = submit(pool, &repo_id, repo, "feat/x", None, deadline())
-            .await
-            .expect("submit the landing");
+        let id = submit(
+            pool,
+            &repo_id,
+            repo,
+            "feat/x",
+            None,
+            deadline(),
+            Origin::Shell,
+        )
+        .await
+        .expect("submit the landing");
         assert!(
             crate::execution::vcs::drain_once(
                 pool,
@@ -1381,9 +1403,17 @@ mod tests {
         seed_project(&pool, "alpha", &repo, Some("master")).await;
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
-        let refusal = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
-            .await
-            .expect_err("feat/x is already part of master — there is nothing left to land");
+        let refusal = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            None,
+            deadline(),
+            Origin::Shell,
+        )
+        .await
+        .expect_err("feat/x is already part of master — there is nothing left to land");
 
         assert!(
             matches!(refusal, LandRefusal::NothingToLand(_)),
@@ -1447,6 +1477,7 @@ mod tests {
             "feat/x",
             Some("release"),
             deadline(),
+            Origin::Shell,
         )
         .await
         .unwrap_err();
@@ -1476,9 +1507,55 @@ mod tests {
         seed_project(&pool, "alpha", &repo, Some("master")).await;
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
 
-        submit(&pool, &repo_id, &repo, "feat/x", Some("master"), deadline())
-            .await
-            .expect("naming the integration branch explicitly must be admitted");
+        submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            Some("master"),
+            deadline(),
+            Origin::Shell,
+        )
+        .await
+        .expect("naming the integration branch explicitly must be admitted");
+    }
+
+    /// A person's `--land` (the route passes `Origin::Shell`) is recorded as the session it came
+    /// from, never as the daemon: metric 2 counts only `daemon` landings as conflicts closed with
+    /// nobody in them.
+    #[tokio::test]
+    async fn a_session_landing_keeps_shell_origin() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-origin-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+
+        let id = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            None,
+            deadline(),
+            Origin::Shell,
+        )
+        .await
+        .expect("an ordinary landing is admitted");
+
+        let (origin, status): (String, String) =
+            sqlx::query_as("SELECT origin, status FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(origin, "shell");
+        assert_eq!(
+            status, "queued",
+            "a session's order carries its own approval"
+        );
     }
 
     /// **Why `resolve_target` reads the table before it asks what the default would have been.**
@@ -1517,6 +1594,7 @@ mod tests {
             "feat/x",
             Some("release"),
             deadline(),
+            Origin::Shell,
         )
         .await
         .expect("an admitted target that exists must not need a derivable default to land");
@@ -1550,6 +1628,7 @@ mod tests {
             "feat/x",
             Some("release"),
             deadline(),
+            Origin::Shell,
         )
         .await
         .unwrap_err();
@@ -1588,6 +1667,7 @@ mod tests {
             "feat/x",
             Some("release"),
             deadline(),
+            Origin::Shell,
         )
         .await
         .expect("an admitted target that exists must be submitted");
@@ -1637,6 +1717,7 @@ mod tests {
             "feat/x",
             Some("release"),
             deadline(),
+            Origin::Shell,
         )
         .await
         .expect("an admitted target that exists must be submitted");
@@ -1684,9 +1765,17 @@ mod tests {
         seed_project(&pool, "alpha", &repo, Some("master")).await;
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
-        let id = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
-            .await
-            .expect("a red gate is discovered at execution, not at submission");
+        let id = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            None,
+            deadline(),
+            Origin::Shell,
+        )
+        .await
+        .expect("a red gate is discovered at execution, not at submission");
 
         let executor = crate::execution::git_exec::GitExecutor {
             machine_root: Some(machine_root),
@@ -1727,9 +1816,17 @@ mod tests {
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
 
         // The conflict, exactly as an ordinary landing meets it.
-        let original = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
-            .await
-            .expect("an ordinary landing is admitted; the conflict is discovered at execution");
+        let original = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            None,
+            deadline(),
+            Origin::Shell,
+        )
+        .await
+        .expect("an ordinary landing is admitted; the conflict is discovered at execution");
         assert!(
             crate::execution::vcs::drain_once(
                 &pool,
@@ -1769,9 +1866,17 @@ mod tests {
         assert!(git_in(&repo, &["commit", "--no-edit"]));
         assert!(git_in(&repo, &["checkout", "-q", "master"]));
 
-        let resolution = submit(&pool, &repo_id, &repo, "nucleos/run-42", None, deadline())
-            .await
-            .expect("a verified resolution is admitted");
+        let resolution = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "nucleos/run-42",
+            None,
+            deadline(),
+            Origin::Shell,
+        )
+        .await
+        .expect("a verified resolution is admitted");
         assert_ne!(
             resolution, original,
             "the resolution is a NEW request, not the old one reborn"
@@ -1853,9 +1958,17 @@ mod tests {
             .await
             .expect("break admission so the resolution cannot be admitted");
 
-        let refusal = submit(&pool, &repo_id, &repo, "nucleos/run-77", None, deadline())
-            .await
-            .expect_err("admission is broken on purpose — the resolution cannot land");
+        let refusal = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "nucleos/run-77",
+            None,
+            deadline(),
+            Origin::Shell,
+        )
+        .await
+        .expect_err("admission is broken on purpose — the resolution cannot land");
 
         assert!(
             matches!(refusal, LandRefusal::NotAdmitted(_)),
@@ -2115,9 +2228,17 @@ mod tests {
         std::fs::write(target_dir.join("sentinel"), "x").unwrap();
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
-        let id = submit(&pool, &repo_id, &repo, "feat/x", None, deadline())
-            .await
-            .expect("the landing is admitted");
+        let id = submit(
+            &pool,
+            &repo_id,
+            &repo,
+            "feat/x",
+            None,
+            deadline(),
+            Origin::Shell,
+        )
+        .await
+        .expect("the landing is admitted");
         assert!(
             crate::execution::vcs::drain_once(
                 &pool,

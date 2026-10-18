@@ -72,7 +72,7 @@ struct LiveJob {
 /// Why waiting jobs wait. Every known reason is always present (0 when none); a reason this list
 /// does not know, and a NULL one, count under `other`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct Waiting {
+pub struct WaitReasons {
     pub slot: i64,
     pub budget: i64,
     pub quota: i64,
@@ -82,6 +82,15 @@ pub struct Waiting {
     pub kill_switch: i64,
     pub attention: i64,
     pub other: i64,
+}
+
+/// Jobs parked by a brake (`Brake::Park`), which comes back on its own. Not a stuck signal: a
+/// job parked for seconds is not stuck, and one that never comes back is caught by
+/// `age_over_lifetime`, since parked time counts toward its lifetime.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Waiting {
+    pub by_reason: WaitReasons,
+    pub jobs: Vec<StuckJob>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -97,7 +106,6 @@ pub struct Stuck {
     pub rounds_exhausted: i64,
     pub gate_retry_loop: i64,
     pub item_stuck: i64,
-    pub waiting: Waiting,
     pub jobs: Vec<StuckJob>,
 }
 
@@ -122,6 +130,7 @@ pub struct Jobs {
     pub duration_s: Dist,
     pub daily: Vec<JobDay>,
     pub stuck: Stuck,
+    pub waiting: Waiting,
 }
 
 fn in_window(row: &Row, window: Window) -> bool {
@@ -153,8 +162,13 @@ fn completion_rate(rows: &[&Row]) -> Option<f64> {
     stats::ratio(completed, ended)
 }
 
-/// PURE: the stuck signals over the jobs live now, each counted once per job.
-fn stuck_block(jobs: &[LiveJob], items: &[(i64, String, i64)], now: DateTime<Utc>) -> Stuck {
+/// PURE: the stuck signals over the jobs live now, each counted once per job, and apart from
+/// them the jobs that are merely parked.
+fn stuck_block(
+    jobs: &[LiveJob],
+    items: &[(i64, String, i64)],
+    now: DateTime<Utc>,
+) -> (Stuck, Waiting) {
     let mut by_job: HashMap<i64, Vec<(&str, i64)>> = HashMap::new();
     for (job_id, status, attempts) in items {
         by_job
@@ -164,6 +178,7 @@ fn stuck_block(jobs: &[LiveJob], items: &[(i64, String, i64)], now: DateTime<Utc
     }
 
     let mut stuck = Stuck::default();
+    let mut parked = Waiting::default();
     for job in jobs {
         let lifetime = if commissioned_with_an_allowance(job.rule_name.as_deref(), job.budget_usd) {
             COMMISSIONED_JOB_LIFETIME
@@ -203,7 +218,7 @@ fn stuck_block(jobs: &[LiveJob], items: &[(i64, String, i64)], now: DateTime<Utc
         stuck.gate_retry_loop += i64::from(retry_loop);
         stuck.item_stuck += i64::from(item_stuck);
         if waiting {
-            let reasons = &mut stuck.waiting;
+            let reasons = &mut parked.by_reason;
             match job.wait_reason.as_deref() {
                 Some("slot") => reasons.slot += 1,
                 Some("budget") => reasons.budget += 1,
@@ -214,8 +229,14 @@ fn stuck_block(jobs: &[LiveJob], items: &[(i64, String, i64)], now: DateTime<Utc
                 Some("attention") => reasons.attention += 1,
                 _ => reasons.other += 1,
             }
+            if parked.jobs.len() < STUCK_SHOWN {
+                parked.jobs.push(StuckJob {
+                    id: job.id,
+                    project_id: job.project_id.clone(),
+                });
+            }
         }
-        let flagged = age || dry || exhausted || retry_loop || item_stuck || waiting;
+        let flagged = age || dry || exhausted || retry_loop || item_stuck;
         if flagged && stuck.jobs.len() < STUCK_SHOWN {
             stuck.jobs.push(StuckJob {
                 id: job.id,
@@ -223,11 +244,11 @@ fn stuck_block(jobs: &[LiveJob], items: &[(i64, String, i64)], now: DateTime<Utc
             });
         }
     }
-    stuck
+    (stuck, parked)
 }
 
 /// PURE: the block from the rows of both windows and the live jobs.
-fn jobs_block(rows: &[Row], stuck: Stuck, window: Window) -> Jobs {
+fn jobs_block(rows: &[Row], (stuck, waiting): (Stuck, Waiting), window: Window) -> Jobs {
     let now_rows: Vec<&Row> = rows.iter().filter(|r| in_window(r, window)).collect();
     let prev_rows: Vec<&Row> = rows
         .iter()
@@ -272,6 +293,7 @@ fn jobs_block(rows: &[Row], stuck: Stuck, window: Window) -> Jobs {
         duration_s: stats::dist(durations),
         daily,
         stuck,
+        waiting,
     }
 }
 
@@ -432,13 +454,14 @@ mod tests {
         item(&pool, done, 1, "gate_failed", 1).await;
         item(&pool, done, 2, "conflicted", 0).await;
 
-        let stuck = block_of(&pool).await.stuck;
+        let block = block_of(&pool).await;
+        let stuck = block.stuck;
         assert_eq!(stuck.age_over_lifetime, 1);
         assert_eq!(stuck.dry_rounds_at_limit, 1);
         assert_eq!(stuck.rounds_exhausted, 1);
         assert_eq!(stuck.gate_retry_loop, 1);
         assert_eq!(stuck.item_stuck, 1);
-        assert_eq!(stuck.waiting, Waiting::default());
+        assert_eq!(block.waiting, Waiting::default());
         let listed: Vec<(i64, &str)> = stuck
             .jobs
             .iter()
@@ -454,9 +477,25 @@ mod tests {
         assert_eq!(listed, expected);
     }
 
+    /// A brake parks a job and lifts itself: parked alone, a job is not stuck.
+    #[tokio::test]
+    async fn a_waiting_job_alone_is_not_listed_as_stuck() {
+        let pool = crate::testdb::fresh_pool().await;
+        let waiting = Job {
+            wait_reason: Some("slot"),
+            ..aged("a", "waiting", Duration::seconds(30))
+        };
+        let id = insert(&pool, waiting).await;
+        let block = block_of(&pool).await;
+        assert_eq!(block.stuck, Stuck::default());
+        assert_eq!(block.waiting.by_reason.slot, 1);
+        let listed: Vec<i64> = block.waiting.jobs.iter().map(|j| j.id).collect();
+        assert_eq!(listed, [id]);
+    }
+
     /// Spec §11: `waiting` is grouped by every reason, known keys present at 0.
     #[tokio::test]
-    async fn jobs_waiting_groups_by_every_wait_reason() {
+    async fn waiting_jobs_are_listed_under_waiting_by_reason() {
         let pool = crate::testdb::fresh_pool().await;
         let reasons = [
             ("a", Some("slot")),
@@ -464,25 +503,46 @@ mod tests {
             ("c", Some("kill-switch")),
             ("d", None),
         ];
+        let mut ids = Vec::new();
         for (project, reason) in reasons {
             let waiting = Job {
                 wait_reason: reason,
                 ..aged(project, "waiting", Duration::hours(1))
             };
-            insert(&pool, waiting).await;
+            ids.push(insert(&pool, waiting).await);
         }
-        let waiting = block_of(&pool).await.stuck.waiting;
-        let expected = Waiting {
+        let waiting = block_of(&pool).await.waiting;
+        let expected = WaitReasons {
             slot: 1,
             quota: 1,
             kill_switch: 1,
             other: 1,
-            ..Waiting::default()
+            ..WaitReasons::default()
         };
-        assert_eq!(waiting, expected);
+        assert_eq!(waiting.by_reason, expected);
+        let mut listed: Vec<i64> = waiting.jobs.iter().map(|j| j.id).collect();
+        listed.sort_unstable();
+        assert_eq!(listed, ids);
         let json = serde_json::to_value(&waiting).unwrap();
-        assert_eq!(json["kill-switch"], 1);
-        assert_eq!(json["budget"], 0);
+        assert_eq!(json["by_reason"]["kill-switch"], 1);
+        assert_eq!(json["by_reason"]["budget"], 0);
+        assert_eq!(json["jobs"].as_array().unwrap().len(), 4);
+    }
+
+    /// Parked time counts toward the lifetime, so a wait that never ends still shows as stuck.
+    #[tokio::test]
+    async fn a_waiting_job_past_its_lifetime_is_stuck_by_age() {
+        let pool = crate::testdb::fresh_pool().await;
+        let waiting = Job {
+            wait_reason: Some("quota"),
+            ..aged("a", "waiting", MAX_JOB_LIFETIME + Duration::hours(1))
+        };
+        let id = insert(&pool, waiting).await;
+        let block = block_of(&pool).await;
+        assert_eq!(block.stuck.age_over_lifetime, 1);
+        let listed: Vec<i64> = block.stuck.jobs.iter().map(|j| j.id).collect();
+        assert_eq!(listed, [id]);
+        assert_eq!(block.waiting.by_reason.quota, 1);
     }
 
     /// Outcomes over the window by `created_at`, the rate and the duration of finished jobs.

@@ -92,6 +92,8 @@ struct JudgeRow {
 /// The judge's opinion against a person's: `band` allow with approve, or deny with reject. Same
 /// rule as the judge review's own readiness (`judge/review.rs`, D11) - the band, not the effect
 /// (`final_decision`), so a capped allow does not count as a disagreement.
+/// `final_decision` is also recorded before the hook's unattended/DontAsk conversions (`judge.rs`
+/// `VerdictRow`), so it is not the decision the run finally received either.
 fn judge_agrees(row: &JudgeRow) -> bool {
     matches!(
         (row.band.as_deref(), row.human_verdict.as_deref()),
