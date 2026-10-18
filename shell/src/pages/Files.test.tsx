@@ -332,7 +332,7 @@ describe("Files — uploading", () => {
     fireEvent.change(screen.getByLabelText("Upload"), { target: { files } });
 
     expect(await screen.findByText(/1 of 3 files from that upload stayed behind/)).toBeDefined();
-    expect(screen.getByText(/second\.txt — the núcleo could not write that file to disk/)).toBeDefined();
+    expect(screen.getByText(/second\.txt — the background service could not write that file to disk/)).toBeDefined();
     expect(screen.getByText("first.txt")).toBeDefined();
     expect(screen.getByText("third.txt")).toBeDefined();
   });
@@ -765,6 +765,32 @@ describe("Files — reachable without a mouse", () => {
     await waitFor(() => expect(moved).toEqual([["report.docx", "archive/report.docx"]]));
   });
 
+  it("only picks on Enter in the move tree, and moves with the Move button", async () => {
+    const moved: [string, string][] = [];
+    daemon.apiFetch.mockImplementation(
+      makeFilesDaemon({
+        list: withArchive,
+        onMove: (from, to) => {
+          moved.push([from, to]);
+        },
+      }),
+    );
+
+    renderWithQuery(<Files />);
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Select report.docx" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move…" }));
+    const picker = screen.getByRole("navigation", { name: "Destination folder" });
+    const archive = await within(picker).findByRole("button", { name: "archive" });
+    fireEvent.click(archive);
+    const item = within(picker).getByRole("treeitem", { name: "archive" });
+    fireEvent.keyDown(item, { key: "Enter" });
+    fireEvent.keyDown(item, { key: "Enter" });
+    expect(moved).toEqual([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Move" }));
+    await waitFor(() => expect(moved).toEqual([["report.docx", "archive/report.docx"]]));
+  });
+
   it("cuts with Ctrl+X and moves into the folder on screen with Ctrl+V", async () => {
     const moved: [string, string][] = [];
     daemon.apiFetch.mockImplementation(
@@ -816,7 +842,7 @@ describe("Files — reachable without a mouse", () => {
     expect(target.classList.contains("fi-drop-over")).toBe(false);
     fireEvent.pointerMove(target, { clientX: 60, clientY: 80 });
     expect(target.classList.contains("fi-drop-over")).toBe(true);
-    expect(screen.getByText("move report.docx to files/archive/")).toBeDefined();
+    expect(screen.getByText("Move report.docx to archive")).toBeDefined();
     fireEvent.pointerUp(target, { clientX: 60, clientY: 80 });
 
     await waitFor(() => expect(moved).toEqual([["report.docx", "archive/report.docx"]]));
@@ -928,6 +954,22 @@ describe("Files — reachable without a mouse", () => {
     expect(document.activeElement).toBe(name);
   });
 
+  it("closes the row menu when the window is resized", async () => {
+    daemon.apiFetch.mockImplementation(makeFilesDaemon({ list: () => [entry({ name: "report.docx" })] }));
+
+    renderWithQuery(<Files />);
+    await screen.findByText("report.docx");
+    const wrap = document.querySelector(".fi-table-wrap");
+    if (!(wrap instanceof HTMLElement)) throw new Error("table wrap not found");
+
+    fireEvent.keyDown(wrap, { key: "ArrowDown" });
+    fireEvent.keyDown(document.activeElement ?? wrap, { key: "F10", shiftKey: true });
+    await screen.findByRole("menu", { name: "Actions for report.docx" });
+
+    fireEvent(window, new Event("resize"));
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+  });
+
   it("keeps a failed move inside its own form, and clears it on Cancel", async () => {
     daemon.apiFetch.mockImplementation(
       makeFilesDaemon({
@@ -1037,6 +1079,32 @@ describe("Files — reachable without a mouse", () => {
     const tree = screen.getByRole("navigation", { name: "Folders" });
     expect(await within(tree).findByText("2026")).toBeDefined();
     expect(within(tree).getByRole("button", { name: "Collapse invoices" })).toBeDefined();
+  });
+
+  it("leaves the tree one Tab stop when an ancestor of the open folder is folded", async () => {
+    daemon.apiFetch.mockImplementation(
+      makeFilesDaemon({
+        list: (path) =>
+          path === ""
+            ? [entry({ name: "invoices", is_dir: true, size_bytes: 0 })]
+            : path === "invoices"
+              ? [entry({ name: "2026", is_dir: true, size_bytes: 0 })]
+              : [],
+      }),
+    );
+
+    renderWithQuery(<Files />);
+    fireEvent.click(within(await screen.findByRole("table")).getByText("invoices/"));
+    fireEvent.click(await screen.findByText("2026/"));
+    const tree = screen.getByRole("navigation", { name: "Folders" });
+    fireEvent.click(await within(tree).findByRole("button", { name: "Collapse invoices" }));
+
+    await waitFor(() => expect(within(tree).queryByText("2026")).toBeNull());
+    const stops = within(tree)
+      .getAllByRole("treeitem")
+      .filter((item) => item.tabIndex === 0);
+    expect(stops).toHaveLength(1);
+    expect(stops[0]?.getAttribute("aria-label")).toBe("invoices");
   });
 });
 
