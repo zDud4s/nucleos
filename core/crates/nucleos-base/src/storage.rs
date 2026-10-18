@@ -352,7 +352,7 @@ mod tests {
             ),
             (
                 "SELECT id FROM runs WHERE status = 'awaiting_approval'",
-                "idx_runs_awaiting_approval",
+                "runs_by_status_created",
             ),
             (
                 "SELECT 1 FROM runs WHERE project_id = 'p' AND status = 'running'",
