@@ -136,7 +136,12 @@ pub struct Quality {
 }
 
 /// One (model, effort) of the window. `cost_usd` is `None` when the model has no price, or lacks
-/// one for a kind of token it used.
+/// one for a kind of token it used (a fast or US-resident request counts as its own kind).
+///
+/// `cost_usd` is the best estimate; `cost_low`/`cost_high` bound it where the cache writes' duration
+/// is unknown (messages ingested before migration 0214): low prices them all at the 5-minute rate,
+/// high at the 1-hour one, and the estimate takes high, since Claude Code writes 1-hour cache. All
+/// three are equal when every split is known.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ModelTokens {
     pub model: String,
@@ -147,6 +152,8 @@ pub struct ModelTokens {
     pub output: i64,
     pub messages: i64,
     pub cost_usd: Option<f64>,
+    pub cost_low: Option<f64>,
+    pub cost_high: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -160,6 +167,9 @@ pub struct DevtimeTokens {
     pub by_model: Vec<ModelTokens>,
     pub cache_hit_ratio: Option<f64>,
     pub cost_usd: Option<f64>,
+    /// The bounds of `cost_usd` over an unknown cache-write duration, as in [`ModelTokens`].
+    pub cost_low: Option<f64>,
+    pub cost_high: Option<f64>,
     /// Always true: transcripts carry no cost, this is tokens x published price (spec §4.4).
     pub cost_estimated: bool,
     pub prices_as_of: Option<String>,
@@ -193,7 +203,9 @@ pub struct DevtimeOverview {
 #[derive(Debug, Default)]
 pub(crate) struct Reads {
     pub spans: Vec<SpanDayRow>,
+    /// Bucketed by `thresholds` (see [`MessageDayRow::bucket`]).
     pub messages: Vec<MessageDayRow>,
+    pub thresholds: Vec<u64>,
     pub turns: Vec<TurnDayRow>,
     pub sessions: SessionCounts,
     pub findings_by_rule: Vec<(String, i64)>,
@@ -211,9 +223,11 @@ pub async fn devtime_overview(
     let since = stamp(window.previous().start());
     let current = stamp(window.start());
     let until = stamp(now.min(window.end()));
+    let thresholds = prompt_thresholds(models);
     let reads = Reads {
         spans: store::span_day_rows(pool, project, &since, &until).await?,
-        messages: store::message_day_rows(pool, project, &since, &until).await?,
+        messages: store::message_day_rows(pool, project, &since, &until, &thresholds).await?,
+        thresholds,
         turns: store::turn_day_rows(pool, project, &since, &until).await?,
         sessions: store::session_counts(pool, project, &current, &until).await?,
         findings_by_rule: store::finding_rule_counts(pool, project, &current, &until).await?,
@@ -302,8 +316,8 @@ pub(crate) fn assemble(
     prev.interruption_rate = ratio(previous_turns.interrupted, previous_turns.turns);
     prev.correction_rate = ratio(previous_turns.corrections, previous_turns.known);
     totals.previous = prev;
-    let tokens = tokens_block(window, &reads.messages, models);
-    for (day, usd) in cost_by_day(window, &reads.messages, models, &tokens.by_model) {
+    let tokens = tokens_block(window, reads, models);
+    for (day, usd) in cost_by_day(window, reads, models, &tokens.by_model) {
         if let Some(entry) = series.get_mut(&day) {
             entry.cost_usd = Some(usd);
         }
@@ -465,45 +479,112 @@ fn wasted_active(window: Window, spans: &[SpanDayRow]) -> impl Iterator<Item = &
 
 /* --------------------------------------------------------------- tokens -- */
 
-/// USD for one row, or `None` when the model has no price or lacks one for a kind of token it used.
-fn cost_of(price: Option<&ModelPrice>, row: &ModelTokens) -> Option<f64> {
-    let price = price?;
-    let mut usd = 0.0;
-    for (tokens, rate) in [
-        (row.input, price.input),
-        (row.output, price.output),
-        (row.cache_read, price.cache_read),
-        (row.cache_creation, price.cache_write),
-    ] {
-        if tokens != 0 {
-            usd += tokens as f64 * rate? / 1_000_000.0;
-        }
-    }
-    Some(usd)
+/// Every distinct prompt threshold of the price table, ascending: the buckets the day read splits
+/// messages by, so each can be priced at its own tier. A 0 threshold is the base, bucket 0 already.
+fn prompt_thresholds(models: &ModelsConfig) -> Vec<u64> {
+    let thresholds: std::collections::BTreeSet<u64> = models
+        .model_prices
+        .values()
+        .flat_map(|price| price.tiers.iter().map(|tier| tier.min_prompt_tokens))
+        .filter(|threshold| *threshold > 0)
+        .collect();
+    thresholds.into_iter().collect()
 }
 
-/// Sums one window's message rows per (model, effort) and prices each; the SQL never sees a price.
-fn tally(rows: impl Iterator<Item = MessageDayRow>, models: &ModelsConfig) -> Vec<ModelTokens> {
-    let mut by: BTreeMap<(Option<String>, String), ModelTokens> = BTreeMap::new();
+/// An estimate and its bounds, USD (see [`ModelTokens`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Cost {
+    usd: f64,
+    low: f64,
+    high: f64,
+}
+
+impl std::ops::Add for Cost {
+    type Output = Cost;
+    fn add(self, other: Cost) -> Cost {
+        Cost {
+            usd: self.usd + other.usd,
+            low: self.low + other.low,
+            high: self.high + other.high,
+        }
+    }
+}
+
+/// USD for one day row, or `None` when the model has no price or lacks one for a kind of token the
+/// row used. Every message of a row shares its tier, speed and residency, so the row is priced at
+/// [`ModelPrice::rates_for`] of its bucket's threshold: within a bucket the tier cannot change.
+/// An unknown speed or residency (before 0214) is the standard one.
+///
+/// Cache writes: the known 1-hour ones at `cache_write_1h`, the known rest at `cache_write`, and an
+/// unknown split low at the 5-minute rate, high and best at the 1-hour one. An entry with only one
+/// of the two write rates prices an unknown split at it on both sides, and never a known write of
+/// the missing duration (a wrong cost is worse than none, spec devtime §4.4).
+fn row_cost(price: Option<&ModelPrice>, row: &MessageDayRow, thresholds: &[u64]) -> Option<Cost> {
+    let price = price?;
+    let prompt = match usize::try_from(row.bucket).unwrap_or(0) {
+        0 => 0,
+        bucket => *thresholds.get(bucket - 1)?,
+    };
+    let rates = price.rates_for(
+        prompt,
+        row.speed.as_deref() == Some("fast"),
+        row.inference_geo.as_deref() == Some("us"),
+    );
+    let usd = |tokens: i64, rate: Option<f64>| match tokens {
+        0 => Some(0.0),
+        _ => rate.map(|rate| tokens as f64 * rate / 1_000_000.0),
+    };
+    let five_minute =
+        (row.cache_creation - row.cache_creation_1h - row.cache_creation_unknown).max(0);
+    let known = usd(row.input, rates.input)?
+        + usd(row.output, rates.output)?
+        + usd(row.cache_read, rates.cache_read)?
+        + usd(five_minute, rates.cache_write)?
+        + usd(row.cache_creation_1h, rates.cache_write_1h)?;
+    let unknown = row.cache_creation_unknown;
+    let low = usd(unknown, rates.cache_write.or(rates.cache_write_1h))?;
+    let high = usd(unknown, rates.cache_write_1h.or(rates.cache_write))?;
+    Some(Cost {
+        usd: known + high,
+        low: known + low,
+        high: known + high,
+    })
+}
+
+/// Sums one window's message rows per (model, effort), pricing each row at its own tier and mode;
+/// the SQL never sees a price.
+fn tally<'a>(
+    rows: impl Iterator<Item = &'a MessageDayRow>,
+    models: &ModelsConfig,
+    thresholds: &[u64],
+) -> Vec<ModelTokens> {
+    let mut by: BTreeMap<(Option<String>, String), (ModelTokens, Option<Cost>)> = BTreeMap::new();
     for row in rows {
         let effort = row.effort.clone().unwrap_or_else(|| UNKNOWN.into());
-        let entry = by
+        let (entry, cost) = by
             .entry((row.model.clone(), effort.clone()))
-            .or_insert_with(|| ModelTokens {
-                model: row.model.clone().unwrap_or_else(|| UNKNOWN.into()),
-                effort,
-                ..ModelTokens::default()
+            .or_insert_with(|| {
+                let entry = ModelTokens {
+                    model: row.model.clone().unwrap_or_else(|| UNKNOWN.into()),
+                    effort,
+                    ..ModelTokens::default()
+                };
+                (entry, Some(Cost::default()))
             });
         entry.input += row.input;
         entry.cache_read += row.cache_read;
         entry.cache_creation += row.cache_creation;
         entry.output += row.output;
         entry.messages += row.messages;
+        // A NULL model is never priced, even if somebody wrote a price under "unknown".
+        let price = row.model.as_deref().and_then(|m| models.price_of(m));
+        *cost = cost.zip(row_cost(price, row, thresholds)).map(|(a, b)| a + b);
     }
-    by.into_iter()
-        .map(|((model, _), mut entry)| {
-            // A NULL model is never priced, even if somebody wrote a price under "unknown".
-            entry.cost_usd = cost_of(model.as_deref().and_then(|m| models.price_of(m)), &entry);
+    by.into_values()
+        .map(|(mut entry, cost)| {
+            entry.cost_usd = cost.map(|c| c.usd);
+            entry.cost_low = cost.map(|c| c.low);
+            entry.cost_high = cost.map(|c| c.high);
             entry
         })
         .collect()
@@ -518,20 +599,24 @@ fn hit_ratio(rows: &[ModelTokens]) -> Option<f64> {
     ratio(read, base)
 }
 
-fn total_cost(rows: &[ModelTokens]) -> Option<f64> {
-    let priced: Vec<f64> = rows.iter().filter_map(|row| row.cost_usd).collect();
+/// The sum of one cost field over the priced rows; `None` when no row is priced.
+fn total_cost(rows: &[ModelTokens], field: fn(&ModelTokens) -> Option<f64>) -> Option<f64> {
+    let priced: Vec<f64> = rows.iter().filter_map(field).collect();
     (!priced.is_empty()).then(|| priced.iter().sum())
 }
 
-fn tokens_block(window: Window, rows: &[MessageDayRow], models: &ModelsConfig) -> DevtimeTokens {
+fn tokens_block(window: Window, reads: &Reads, models: &ModelsConfig) -> DevtimeTokens {
     let previous = window.previous();
+    let rows = &reads.messages;
     let mut current = tally(
-        rows.iter().filter(|r| window.holds(&r.day)).cloned(),
+        rows.iter().filter(|r| window.holds(&r.day)),
         models,
+        &reads.thresholds,
     );
     let before = tally(
-        rows.iter().filter(|r| previous.holds(&r.day)).cloned(),
+        rows.iter().filter(|r| previous.holds(&r.day)),
         models,
+        &reads.thresholds,
     );
     current.sort_by(|a, b| {
         b.cost_usd
@@ -554,13 +639,15 @@ fn tokens_block(window: Window, rows: &[MessageDayRow], models: &ModelsConfig) -
     unpriced.dedup();
     DevtimeTokens {
         cache_hit_ratio: hit_ratio(&current),
-        cost_usd: total_cost(&current),
+        cost_usd: total_cost(&current, |row| row.cost_usd),
+        cost_low: total_cost(&current, |row| row.cost_low),
+        cost_high: total_cost(&current, |row| row.cost_high),
         cost_estimated: true,
         prices_as_of: models.prices_as_of.clone(),
         unpriced_models: unpriced,
         dropped_prices: models.price_warnings.clone(),
         previous: PreviousTokens {
-            cost_usd: total_cost(&before),
+            cost_usd: total_cost(&before, |row| row.cost_usd),
             cache_hit_ratio: hit_ratio(&before),
         },
         by_model: current,
@@ -571,10 +658,11 @@ fn tokens_block(window: Window, rows: &[MessageDayRow], models: &ModelsConfig) -
 /// only a (model, effort) the window priced counts, so a model unpriced over the window (no entry,
 /// or no price for a token kind it used on some day) adds nothing on any day and the days sum to
 /// `tokens.cost_usd`. A day absent from the map — no usage, or only unpriced usage — reads
-/// `cost_usd: null`, as the window total does when no row could be priced.
+/// `cost_usd: null`, as the window total does when no row could be priced. Each row is priced as
+/// in `tally`, and a day takes the best estimate.
 fn cost_by_day(
     window: Window,
-    rows: &[MessageDayRow],
+    reads: &Reads,
     models: &ModelsConfig,
     priced_rows: &[ModelTokens],
 ) -> BTreeMap<String, f64> {
@@ -584,7 +672,7 @@ fn cost_by_day(
         .map(|row| (row.model.as_str(), row.effort.as_str()))
         .collect();
     let mut by_day: BTreeMap<String, f64> = BTreeMap::new();
-    for row in rows.iter().filter(|row| window.holds(&row.day)) {
+    for row in reads.messages.iter().filter(|row| window.holds(&row.day)) {
         // A NULL model is never priced (as in `tally`).
         let Some(model) = row.model.as_deref() else {
             continue;
@@ -592,16 +680,9 @@ fn cost_by_day(
         if !priced.contains(&(model, row.effort.as_deref().unwrap_or(UNKNOWN))) {
             continue;
         }
-        let cell = ModelTokens {
-            input: row.input,
-            cache_read: row.cache_read,
-            cache_creation: row.cache_creation,
-            output: row.output,
-            ..ModelTokens::default()
-        };
-        // Priced over the window implies priced for every token kind this day used.
-        if let Some(usd) = cost_of(models.price_of(model), &cell) {
-            *by_day.entry(row.day.clone()).or_default() += usd;
+        // Priced over the window implies every row of it priced.
+        if let Some(cost) = row_cost(models.price_of(model), row, &reads.thresholds) {
+            *by_day.entry(row.day.clone()).or_default() += cost.usd;
         }
     }
     by_day
@@ -797,9 +878,10 @@ pub async fn mark_finding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{FastPrice, PriceTier};
     // Named, not globbed: the fixture's `Span` struct is what the tests build.
     use crate::devtime::store::fixture::{
-        Span, finding, insert_span, message, session, span, turn,
+        Span, billed_message, finding, insert_span, message, session, span, turn,
     };
 
     const MIN: i64 = 60_000;
@@ -1304,6 +1386,154 @@ mod tests {
         );
     }
 
+    /// Claude Haiku 5.5's published shape: $0.10 / $0.50 up to 100,000 prompt tokens and
+    /// $0.50 / $2.50 from 100,001, cache rates scaling with it.
+    fn haiku() -> ModelPrice {
+        ModelPrice {
+            cache_write_1h: Some(0.20),
+            tiers: vec![PriceTier {
+                min_prompt_tokens: 100_001,
+                input: Some(0.50),
+                output: Some(2.50),
+                cache_read: Some(0.05),
+                cache_write: Some(0.625),
+                cache_write_1h: Some(1.0),
+            }],
+            ..full(0.10, 0.50, 0.01, 0.125)
+        }
+    }
+
+    const STANDARD: (Option<&str>, Option<&str>) = (Some("standard"), Some("global"));
+
+    fn close(got: Option<f64>, want: f64) -> bool {
+        got.is_some_and(|got| (got - want).abs() < 1e-9)
+    }
+
+    /// The tier keys on ONE request's prompt (input + cache reads + cache writes): a message at
+    /// 100,001 is billed whole at the long rates, one at 100,000 at the base, and a day holding both
+    /// sums them exactly — in the window total, the model row and the day series alike.
+    #[tokio::test]
+    async fn each_message_is_priced_at_the_tier_its_own_prompt_reaches() {
+        let pool = pool().await;
+        session(&pool, "s1", "alpha", "2026-10-15T09:00:00.000Z", None).await;
+        let rows = [
+            ("long", "2026-10-15T09:00:00.000Z", [1, 100_000, 0, 1_000]),
+            ("base", "2026-10-15T10:00:00.000Z", [100_000, 0, 0, 1_000]),
+            ("small", "2026-10-15T11:00:00.000Z", [10, 0, 0, 10]),
+        ];
+        for (id, at, tokens) in rows {
+            let model = "claude-haiku-5-5";
+            billed_message(&pool, "s1", id, at, model, tokens, Some(0), STANDARD).await;
+        }
+        let models = priced(&[("claude-haiku-5-5", haiku())]);
+        let report = overview_priced(&pool, Scope::Global, 7, &models).await;
+        let long = (1.0 * 0.50 + 100_000.0 * 0.05 + 1_000.0 * 2.50) / 1e6;
+        let base = (100_000.0 * 0.10 + 1_000.0 * 0.50) / 1e6;
+        let small = (10.0 * 0.10 + 10.0 * 0.50) / 1e6;
+        let want = long + base + small;
+        let tokens = &report.tokens;
+        assert!(close(tokens.cost_usd, want), "{:?} vs {want}", tokens.cost_usd);
+        assert!(close(tokens.by_model[0].cost_usd, want));
+        assert_eq!((tokens.cost_low, tokens.cost_high), (tokens.cost_usd, tokens.cost_usd));
+        let day = report.days_series.iter().find(|d| d.day == "2026-10-15");
+        assert!(close(day.unwrap().cost_usd, want));
+        let flat = (100_001.0 * 0.10 + 100_000.0 * 0.01 + 2_010.0 * 0.50 + 10.0 * 0.10) / 1e6;
+        assert!(want > flat, "summing before pricing would have billed the base tier");
+    }
+
+    /// `speed: fast` replaces input and output (and scales the cache rates by the same factor);
+    /// `inference_geo: us` multiplies everything. A fast request of a model with no fast price
+    /// makes the model unpriced rather than standard-priced.
+    #[tokio::test]
+    async fn fast_and_us_resident_requests_are_priced_at_their_multipliers() {
+        let pool = pool().await;
+        session(&pool, "s1", "alpha", "2026-10-15T09:00:00.000Z", None).await;
+        let opus = ModelPrice {
+            cache_write_1h: Some(10.0),
+            fast: Some(FastPrice {
+                input: 8.0,
+                output: 40.0,
+            }),
+            geo_us_mult: Some(1.1),
+            ..full(5.0, 25.0, 0.5, 6.25)
+        };
+        let models = priced(&[
+            ("claude-opus-5-5", opus),
+            ("claude-sonnet-5", full(3.0, 15.0, 0.3, 3.75)),
+        ]);
+        let one_m = [1_000_000, 0, 0, 100_000];
+        let (fast_us, us) = ((Some("fast"), Some("us")), (Some("standard"), Some("us")));
+        let rows = [
+            ("a", "2026-10-15T09:00:00.000Z", "claude-opus-5-5", fast_us),
+            ("b", "2026-10-15T10:00:00.000Z", "claude-opus-5-5", us),
+            ("c", "2026-10-15T11:00:00.000Z", "claude-opus-5-5", STANDARD),
+            ("d", "2026-10-15T12:00:00.000Z", "claude-sonnet-5", fast_us),
+        ];
+        for (id, at, model, mode) in rows {
+            billed_message(&pool, "s1", id, at, model, one_m, Some(0), mode).await;
+        }
+        let tokens = overview_priced(&pool, Scope::Global, 7, &models)
+            .await
+            .tokens;
+        let want = (8.0 + 4.0) * 1.1 + (5.0 + 2.5) * 1.1 + (5.0 + 2.5);
+        assert!(close(tokens.cost_usd, want), "{:?} vs {want}", tokens.cost_usd);
+        assert_eq!(tokens.unpriced_models, ["claude-sonnet-5"]);
+    }
+
+    /// Known 1-hour writes at the 1-hour rate, the known rest at the 5-minute one; the bounds meet.
+    #[tokio::test]
+    async fn one_hour_cache_writes_are_priced_at_the_one_hour_rate() {
+        let pool = pool().await;
+        session(&pool, "s1", "alpha", "2026-10-15T09:00:00.000Z", None).await;
+        let at = "2026-10-15T09:00:00.000Z";
+        let tokens = [0, 0, 1_000_000, 0];
+        let model = "claude-sonnet-5";
+        billed_message(&pool, "s1", "m1", at, model, tokens, Some(600_000), STANDARD).await;
+        let sonnet = ModelPrice {
+            cache_write_1h: Some(6.0),
+            ..full(3.0, 15.0, 0.3, 3.75)
+        };
+        let models = priced(&[("claude-sonnet-5", sonnet)]);
+        let tokens = overview_priced(&pool, Scope::Global, 7, &models)
+            .await
+            .tokens;
+        let want = 0.4 * 3.75 + 0.6 * 6.0;
+        assert!(close(tokens.cost_usd, want), "{:?} vs {want}", tokens.cost_usd);
+        assert_eq!((tokens.cost_low, tokens.cost_high), (tokens.cost_usd, tokens.cost_usd));
+    }
+
+    /// A message ingested before 0214 has no cache split: low prices its writes at 5 minutes, high
+    /// at 1 hour, and the estimate is high, which is what Claude Code writes. Known usage beside it
+    /// is the same on both sides.
+    #[tokio::test]
+    async fn an_unknown_cache_split_gives_a_range_whose_estimate_is_the_high_end() {
+        let pool = pool().await;
+        session(&pool, "s1", "alpha", "2026-10-15T09:00:00.000Z", None).await;
+        let model = "claude-sonnet-5";
+        let rows = [
+            ("old", "2026-10-15T09:00:00.000Z", [0, 0, 1_000_000, 0], None),
+            ("new", "2026-10-15T10:00:00.000Z", [1_000_000, 0, 0, 0], Some(0)),
+        ];
+        for (id, at, tokens, one_hour) in rows {
+            billed_message(&pool, "s1", id, at, model, tokens, one_hour, STANDARD).await;
+        }
+        let sonnet = ModelPrice {
+            cache_write_1h: Some(6.0),
+            ..full(3.0, 15.0, 0.3, 3.75)
+        };
+        let models = priced(&[("claude-sonnet-5", sonnet)]);
+        let report = overview_priced(&pool, Scope::Global, 7, &models).await;
+        let tokens = &report.tokens;
+        assert!(close(tokens.cost_low, 3.0 + 3.75), "{:?}", tokens.cost_low);
+        assert!(close(tokens.cost_high, 3.0 + 6.0), "{:?}", tokens.cost_high);
+        assert_eq!(tokens.cost_usd, tokens.cost_high);
+        let row = &tokens.by_model[0];
+        assert!(row.cost_low < row.cost_high);
+        assert_eq!(row.cost_usd, row.cost_high);
+        let day = report.days_series.iter().find(|d| d.day == "2026-10-15");
+        assert_eq!(day.unwrap().cost_usd, tokens.cost_usd, "a day takes the estimate");
+    }
+
     #[tokio::test]
     async fn cache_hit_ratio_null_when_no_input() {
         let tokens = overview(&pool().await, Scope::Global, 7).await.tokens;
@@ -1559,24 +1789,27 @@ mod tests {
     }
 
     /// Spec §9 performance, the planner's answer recorded: both forms of the span and message
-    /// reads take their rows from the day indexes of migration 0211 in GROUP BY order, so the only
-    /// sort left is the span read's last merge of a few rows per day. Joining spans to a recursive
-    /// day list instead paired every span with every day: 20 s for the 50,000 spans of the timing
-    /// test below.
+    /// reads take their rows from the day indexes of migrations 0211/0214 in GROUP BY order, so the
+    /// only sort left is the span read's last merge of a few rows per day. Joining spans to a
+    /// recursive day list instead paired every span with every day: 20 s for the 50,000 spans of
+    /// the timing test below. The message read holds with any number of prompt thresholds: each
+    /// bucket's arm walks the index in its own GROUP BY order (`message_day_sql`).
     #[tokio::test]
     async fn the_day_reads_take_their_rows_in_group_order_from_the_day_indexes() {
-        use crate::devtime::store::{
-            MESSAGE_DAY_PROJECT_SQL, MESSAGE_DAY_SQL, SPAN_DAY_PROJECT_SQL, SPAN_DAY_SQL,
-        };
+        use crate::devtime::store::{SPAN_DAY_PROJECT_SQL, SPAN_DAY_SQL, message_day_sql};
         let pool = pool().await;
-        let reads = [
-            (SPAN_DAY_SQL, false, "idx_devtime_spans_day", 1),
-            (SPAN_DAY_PROJECT_SQL, true, "idx_devtime_spans_day", 1),
-            (MESSAGE_DAY_SQL, false, "idx_devtime_messages_day", 0),
-            (MESSAGE_DAY_PROJECT_SQL, true, "idx_devtime_messages_day", 0),
+        let mut reads = vec![
+            (SPAN_DAY_SQL.to_string(), false, "idx_devtime_spans_day", 1),
+            (SPAN_DAY_PROJECT_SQL.to_string(), true, "idx_devtime_spans_day", 1),
         ];
+        for thresholds in 0..=2 {
+            for project in [false, true] {
+                let sql = message_day_sql(project, thresholds);
+                reads.push((sql, project, "idx_devtime_messages_day", 0));
+            }
+        }
         for (sql, project, index, sorts) in reads {
-            let plan = read_plan(&pool, sql, project).await;
+            let plan = read_plan(&pool, &sql, project).await;
             println!("{plan:#?}");
             assert!(
                 mentions(&plan, index),

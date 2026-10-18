@@ -140,56 +140,103 @@ pub async fn span_day_rows(
     }
 }
 
-/// Tokens on one UTC day (of `first_at`, no split: a message is an instant), per model and effort.
-/// Every lane is summed. `NULL` model/effort stay `None` here; the assembler names them `unknown`.
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+/// Tokens on one UTC day (of `first_at`, no split: a message is an instant), per model, effort,
+/// billing mode and prompt-length bucket. Every lane is summed. `NULL` model/effort stay `None`
+/// here; the assembler names them `unknown`. `NULL` speed/geo are unknown (rows before 0214).
+#[derive(Debug, Clone, Default, PartialEq, sqlx::FromRow)]
 pub struct MessageDayRow {
     pub day: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub speed: Option<String>,
+    pub inference_geo: Option<String>,
+    /// How many of the read's prompt thresholds every message of the row reaches, a prompt being
+    /// one request's input + cache reads + cache writes: 0 below the first, `k` from the `k`-th on.
+    pub bucket: i64,
     pub input: i64,
     pub cache_read: i64,
+    /// Every cache write, of either duration.
     pub cache_creation: i64,
+    /// Of `cache_creation`, the 1-hour writes of messages whose split is known.
+    pub cache_creation_1h: i64,
+    /// Of `cache_creation`, the writes of messages whose split is unknown (NULL).
+    pub cache_creation_unknown: i64,
     pub output: i64,
     pub messages: i64,
 }
 
-// `idx_devtime_messages_day` (0211) covers this read and hands it the rows in GROUP BY order, like
-// `one_day` above; the `BETWEEN` is again implied by the window.
-global_and_project!(
-    MESSAGE_DAY_SQL,
-    MESSAGE_DAY_PROJECT_SQL,
-    "SELECT substr(m.first_at, 1, 10) AS day, m.model, m.effort,
-            COALESCE(SUM(COALESCE(m.input_tokens, 0)), 0) AS input,
-            COALESCE(SUM(COALESCE(m.cache_read_tokens, 0)), 0) AS cache_read,
-            COALESCE(SUM(COALESCE(m.cache_creation_tokens, 0)), 0) AS cache_creation,
-            COALESCE(SUM(COALESCE(m.output_tokens, 0)), 0) AS output,
-            COUNT(*) AS messages
-     FROM devtime_messages m
-     CROSS JOIN devtime_sessions ss ON ss.session_id = m.session_id
-     WHERE substr(m.first_at, 1, 10) BETWEEN substr(?1, 1, 10) AND substr(?2, 1, 10)
-       AND m.first_at >= ?1 AND m.first_at < ?2",
-    " AND ss.project_id = ?3",
-    "
-     GROUP BY day, m.model, m.effort
-     ORDER BY day, m.model, m.effort",
-);
+/// One request's prompt length, the quantity a price tier keys on.
+const MESSAGE_PROMPT: &str = "(m.input_tokens + m.cache_read_tokens + m.cache_creation_tokens)";
 
+/// The day read for `thresholds` prompt thresholds (bound ascending after the window and the
+/// project: `?3..` globally, `?4..` for a project).
+///
+/// Prices stay out of SQL, but a tier is chosen per request, so the sums cannot cross a threshold.
+/// One arm per bucket, `UNION ALL`: a bucket in the GROUP BY would sort every message of the window,
+/// because no index can hold an expression over bound values, whereas each arm takes its rows from
+/// `idx_devtime_messages_day` (0214) in its GROUP BY order, covered, with its prompt range checked
+/// per row. That costs one walk of the window's index entries per bucket, and the price table has a
+/// handful of distinct thresholds. Rows come in no particular order; the `BETWEEN` is implied by the
+/// window, as in `one_day` above.
+pub(crate) fn message_day_sql(project: bool, thresholds: usize) -> String {
+    let first = if project { 4 } else { 3 };
+    let filter = if project { " AND ss.project_id = ?3" } else { "" };
+    let arms: Vec<String> = (0..=thresholds)
+        .map(|bucket| {
+            let mut range = String::new();
+            if bucket > 0 {
+                range.push_str(&format!(
+                    " AND {MESSAGE_PROMPT} >= ?{}",
+                    first + bucket - 1
+                ));
+            }
+            if bucket < thresholds {
+                range.push_str(&format!(" AND {MESSAGE_PROMPT} < ?{}", first + bucket));
+            }
+            format!(
+                "SELECT substr(m.first_at, 1, 10) AS day, m.model, m.effort, m.speed,
+                        m.inference_geo, {bucket} AS bucket,
+                        COALESCE(SUM(m.input_tokens), 0) AS input,
+                        COALESCE(SUM(m.cache_read_tokens), 0) AS cache_read,
+                        COALESCE(SUM(m.cache_creation_tokens), 0) AS cache_creation,
+                        COALESCE(SUM(COALESCE(
+                            MIN(m.cache_creation_1h_tokens, m.cache_creation_tokens), 0)), 0)
+                            AS cache_creation_1h,
+                        COALESCE(SUM(CASE WHEN m.cache_creation_1h_tokens IS NULL
+                            THEN m.cache_creation_tokens ELSE 0 END), 0) AS cache_creation_unknown,
+                        COALESCE(SUM(m.output_tokens), 0) AS output,
+                        COUNT(*) AS messages
+                 FROM devtime_messages m
+                 CROSS JOIN devtime_sessions ss ON ss.session_id = m.session_id
+                 WHERE substr(m.first_at, 1, 10) BETWEEN substr(?1, 1, 10) AND substr(?2, 1, 10)
+                   AND m.first_at >= ?1 AND m.first_at < ?2{filter}{range}
+                 GROUP BY day, m.model, m.effort, m.speed, m.inference_geo"
+            )
+        })
+        .collect();
+    arms.join("\n UNION ALL\n ")
+}
+
+/// `thresholds` ascending and distinct; a row's `bucket` indexes them (see [`MessageDayRow`]).
 pub async fn message_day_rows(
     pool: &SqlitePool,
     project_id: Option<&str>,
     since: &str,
     until: &str,
+    thresholds: &[u64],
 ) -> sqlx::Result<Vec<MessageDayRow>> {
-    let sql = match project_id {
-        Some(_) => MESSAGE_DAY_PROJECT_SQL,
-        None => MESSAGE_DAY_SQL,
-    };
-    let query = sqlx::query_as::<_, MessageDayRow>(sql).bind(since);
-    match project_id {
-        Some(project) => query.bind(until).bind(project).fetch_all(pool).await,
-        None => query.bind(until).fetch_all(pool).await,
+    debug_assert!(thresholds.windows(2).all(|pair| pair[0] < pair[1]));
+    let sql = message_day_sql(project_id.is_some(), thresholds.len());
+    let mut query = sqlx::query_as::<_, MessageDayRow>(sqlx::AssertSqlSafe(sql))
+        .bind(since)
+        .bind(until);
+    if let Some(project) = project_id {
+        query = query.bind(project);
     }
+    for threshold in thresholds {
+        query = query.bind(i64::try_from(*threshold).unwrap_or(i64::MAX));
+    }
+    query.fetch_all(pool).await
 }
 
 /// Turns on one UTC day (of `started_at`). `correction_known` counts turns whose
@@ -510,6 +557,34 @@ pub(crate) mod fixture {
         .unwrap();
     }
 
+    /// A main-lane message with its billing mode: `one_hour` of its cache writes `[2]` were 1-hour
+    /// (`None` unknown), `speed` and `geo` as the transcript said them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn billed_message(
+        pool: &SqlitePool,
+        session: &str,
+        id: &str,
+        at: &str,
+        model: &str,
+        tokens: [i64; 4],
+        one_hour: Option<i64>,
+        (speed, geo): (Option<&str>, Option<&str>),
+    ) {
+        message(pool, session, "main", id, at, Some(model), tokens).await;
+        sqlx::query(
+            "UPDATE devtime_messages SET cache_creation_1h_tokens = ?, speed = ?, inference_geo = ?
+             WHERE session_id = ? AND message_id = ?",
+        )
+        .bind(one_hour)
+        .bind(speed)
+        .bind(geo)
+        .bind(session)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     pub(crate) async fn turn(
         pool: &SqlitePool,
         session: &str,
@@ -716,7 +791,7 @@ mod tests {
         message(&pool, "s1", "main", "m1", m1, opus, [10, 20, 30, 40]).await;
         message(&pool, "s1", "agent:x", "m2", m2, opus, [1, 0, 0, 1]).await;
         message(&pool, "s1", "main", "m3", m3, None, [5, 0, 0, 5]).await;
-        let rows = message_day_rows(&pool, None, S, U).await.unwrap();
+        let rows = message_day_rows(&pool, None, S, U, &[]).await.unwrap();
         let day_one = rows.iter().find(|r| r.day == "2026-10-05").unwrap();
         assert_eq!(
             (
@@ -728,11 +803,79 @@ mod tests {
             ),
             (11, 20, 30, 41, 2)
         );
+        assert_eq!(
+            (
+                day_one.cache_creation_1h,
+                day_one.cache_creation_unknown,
+                day_one.bucket
+            ),
+            (0, 30, 0),
+            "a message ingested before 0214 has an unknown cache split"
+        );
         let unknown = rows.iter().find(|r| r.day == "2026-10-06").unwrap();
         assert_eq!(
             (unknown.model.as_deref(), unknown.effort.as_deref()),
             (None, None)
         );
+    }
+
+    /// A message's prompt (input + cache reads + cache writes) puts it in the bucket of the
+    /// thresholds it reaches, inclusive; billing mode and the known 1-hour writes are kept apart,
+    /// and no message is lost or counted twice across the arms.
+    #[tokio::test]
+    async fn messages_split_by_prompt_bucket_and_billing_mode() {
+        let pool = pool().await;
+        session(&pool, "s1", "alpha", "2026-10-05T09:00:00.000Z", None).await;
+        let at = |minute: u32| format!("2026-10-05T09:{minute:02}:00.000Z");
+        let haiku = "claude-haiku-5-5";
+        let standard = (Some("standard"), Some("global"));
+        // Prompts: 99,999 | 100,000 (reaches the first, inclusive) | 250,000 | 100,000 fast.
+        let fast_us = (Some("fast"), Some("us"));
+        let messages = [
+            ("a", 1, [99_999, 0, 0, 1], Some(0), standard),
+            ("b", 2, [50_000, 40_000, 10_000, 2], Some(6_000), standard),
+            ("c", 3, [250_000, 0, 0, 3], Some(0), standard),
+            ("d", 4, [90_000, 0, 10_000, 4], None, fast_us),
+        ];
+        for (id, minute, tokens, one_hour, mode) in messages {
+            billed_message(&pool, "s1", id, &at(minute), haiku, tokens, one_hour, mode).await;
+        }
+        let mut rows = message_day_rows(&pool, None, S, U, &[100_000, 200_000])
+            .await
+            .unwrap();
+        rows.sort_by_key(|row| (row.bucket, row.speed.clone()));
+        let summary: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.bucket,
+                    row.speed.as_deref(),
+                    row.inference_geo.as_deref(),
+                    row.output,
+                    row.cache_creation,
+                    row.cache_creation_1h,
+                    row.cache_creation_unknown,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (0, Some("standard"), Some("global"), 1, 0, 0, 0),
+                (1, Some("fast"), Some("us"), 4, 10_000, 0, 10_000),
+                (1, Some("standard"), Some("global"), 2, 10_000, 6_000, 0),
+                (2, Some("standard"), Some("global"), 3, 0, 0, 0),
+            ]
+        );
+        let project = message_day_rows(&pool, Some("alpha"), S, U, &[100_000, 200_000])
+            .await
+            .unwrap();
+        assert_eq!(
+            project.len(),
+            rows.len(),
+            "the project form binds the same thresholds"
+        );
+        assert_eq!(project.iter().map(|row| row.messages).sum::<i64>(), 4);
     }
 
     #[tokio::test]
