@@ -1505,7 +1505,11 @@ mod tests {
     fn table_scans(plan: &[String]) -> Vec<&String> {
         plan.iter()
             .filter(|line| line.starts_with("SCAN "))
-            .filter(|line| !["one_day", "pieces", "parts"].iter().any(|cte| line.contains(cte)))
+            .filter(|line| {
+                !["one_day", "pieces", "parts"]
+                    .iter()
+                    .any(|cte| line.contains(cte))
+            })
             .collect()
     }
 
