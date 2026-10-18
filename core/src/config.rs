@@ -3531,7 +3531,10 @@ ok: {{ input: 2.0, output: 8.0 }}\n"
 ok: {{ input: 2.0, output: 8.0 }}\n"
             );
             let config = parse_models_config(&text).unwrap_or_else(|e| panic!("{bad}: {e}"));
-            assert!(config.price_of("m").is_none(), "{bad}: the bad entry is dropped");
+            assert!(
+                config.price_of("m").is_none(),
+                "{bad}: the bad entry is dropped"
+            );
             assert_eq!(
                 config.price_of("ok").unwrap().input,
                 Some(2.0),
@@ -3550,13 +3553,17 @@ ok: {{ input: 2.0, output: 8.0 }}\n"
 
     #[test]
     fn a_model_prices_block_that_is_not_a_mapping_costs_the_prices_and_nothing_else() {
-        let config = parse_models_config(
-            "claude_model: opus\ncodex_model: gpt\nmodel_prices: [1, 2]\n",
-        )
-        .unwrap();
+        let config =
+            parse_models_config("claude_model: opus\ncodex_model: gpt\nmodel_prices: [1, 2]\n")
+                .unwrap();
         assert!(config.model_prices.is_empty());
         assert_eq!(config.claude_model, "opus");
-        assert_eq!(config.price_warnings.len(), 1, "{:?}", config.price_warnings);
+        assert_eq!(
+            config.price_warnings.len(),
+            1,
+            "{:?}",
+            config.price_warnings
+        );
         // A null block is a file with no prices, which is not a warning.
         let empty =
             parse_models_config("claude_model: opus\ncodex_model: gpt\nmodel_prices: ~\n").unwrap();
@@ -3580,7 +3587,11 @@ half-tier: { input: 1.0, output: 4.0, tiers: [{ min_prompt_tokens: 10, input: 2.
     #[test]
     fn a_tiered_price_parses_with_its_tiers_fast_rate_and_residency_multiplier() {
         let config = parse_models_config(HAIKU_AND_OPUS).unwrap();
-        assert!(config.price_warnings.is_empty(), "{:?}", config.price_warnings);
+        assert!(
+            config.price_warnings.is_empty(),
+            "{:?}",
+            config.price_warnings
+        );
         let haiku = config.price_of("claude-haiku-5-5").unwrap();
         assert_eq!(haiku.cache_write_1h, Some(0.2));
         assert_eq!(haiku.tiers.len(), 1);
@@ -3601,13 +3612,25 @@ half-tier: { input: 1.0, output: 4.0, tiers: [{ min_prompt_tokens: 10, input: 2.
         let haiku = config.price_of("claude-haiku-5-5").unwrap();
         let base = haiku.rates_for(100_000, false, false);
         assert_eq!(
-            (base.input, base.output, base.cache_read, base.cache_write, base.cache_write_1h),
+            (
+                base.input,
+                base.output,
+                base.cache_read,
+                base.cache_write,
+                base.cache_write_1h
+            ),
             (Some(0.1), Some(0.5), Some(0.01), Some(0.125), Some(0.2)),
             "up to 100,000 prompt tokens is the base tier"
         );
         let long = haiku.rates_for(100_001, false, false);
         assert_eq!(
-            (long.input, long.output, long.cache_read, long.cache_write, long.cache_write_1h),
+            (
+                long.input,
+                long.output,
+                long.cache_read,
+                long.cache_write,
+                long.cache_write_1h
+            ),
             (Some(0.5), Some(2.5), Some(0.05), Some(0.625), Some(1.0)),
             "over 100,000 the whole request moves to the long tier"
         );
@@ -3635,12 +3658,21 @@ half-tier: { input: 1.0, output: 4.0, tiers: [{ min_prompt_tokens: 10, input: 2.
         assert!(close(fast.cache_write_1h, 16.0), "{fast:?}");
         let geo = opus.rates_for(0, false, true);
         assert!(close(geo.input, 5.5) && close(geo.output, 27.5), "{geo:?}");
-        assert!(close(geo.cache_read, 0.55) && close(geo.cache_write_1h, 11.0), "{geo:?}");
+        assert!(
+            close(geo.cache_read, 0.55) && close(geo.cache_write_1h, 11.0),
+            "{geo:?}"
+        );
         let both = opus.rates_for(0, true, true);
-        assert!(close(both.input, 8.8) && close(both.output, 44.0), "{both:?}");
+        assert!(
+            close(both.input, 8.8) && close(both.output, 44.0),
+            "{both:?}"
+        );
         let haiku = config.price_of("claude-haiku-5-5").unwrap();
         let long_geo = haiku.rates_for(200_000, false, true);
-        assert!(close(long_geo.input, 0.55) && close(long_geo.output, 2.75), "{long_geo:?}");
+        assert!(
+            close(long_geo.input, 0.55) && close(long_geo.output, 2.75),
+            "{long_geo:?}"
+        );
     }
 
     #[test]
