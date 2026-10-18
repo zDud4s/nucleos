@@ -4093,6 +4093,17 @@ mod tests {
         assert_eq!(row.rounds, i64::from(crate::config::DEFAULT_COUNCIL_ROUNDS));
     }
 
+    /// The config is written before the council row exists, so a write that fails can no longer
+    /// strand a `running` council; the helper is what reports it.
+    #[test]
+    fn an_unwritable_mcp_config_is_an_error_not_a_panic() {
+        let dir = std::env::temp_dir().join(format!("nucleos-mcp-blocked-{}", std::process::id()));
+        std::fs::write(&dir, b"a file where a directory is needed").unwrap();
+        let blocked = dir.join("config.json");
+        assert!(super::launch::write_mcp_config(&blocked).is_err());
+        let _ = std::fs::remove_file(&dir);
+    }
+
     #[tokio::test]
     async fn driver_roles_reach_every_phase_of_their_seat() {
         let runner = std::sync::Arc::new(ScriptedRunner::default());
