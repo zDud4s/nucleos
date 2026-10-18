@@ -1,13 +1,11 @@
 import {
   useEffect,
   useId,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type Dispatch,
   type KeyboardEvent as ReactKeyboardEvent,
-  type PointerEvent as ReactPointerEvent,
   type SetStateAction,
 } from "react";
 import { Link } from "@tanstack/react-router";
@@ -43,6 +41,7 @@ import {
   Badge,
   Button,
   ConfirmButton,
+  Disclosure,
   Count,
   ErrorNote,
   Inset,
@@ -56,6 +55,7 @@ import {
   Row,
   Rows,
   Section,
+  SectionNav,
   StaleNote,
   StateBadge,
   Teach,
@@ -64,21 +64,12 @@ import {
 } from "../ui";
 import { whereWaiting } from "../data/roster";
 import {
-  EASE,
-  caption,
-  cardPose,
-  circularOffset,
   describeProject,
   evidence,
-  fanConfig,
   gateFor,
   headlineFor,
   holdOrder,
-  nearestTarget,
-  shortPath,
-  slideDuration,
   urgencyOf,
-  type FanConfig,
 } from "../lib/autopilot-fan";
 import {
   MODE_MEANING,
@@ -92,6 +83,15 @@ import { JudgeOpinionLine, JudgePanel, JudgeReviewPanel } from "./AutopilotJudge
 import { RefusedActionsPanel, SkippedItemsPanel } from "./AutopilotRecords";
 import { ResolvePanel } from "./AutopilotResolve";
 import "./autopilot.css";
+
+/** The page's map: where each group of panels starts, in the order the page reads. */
+const SECTIONS = [
+  { id: "ap-setting", label: "Setting" },
+  { id: "ap-brakes", label: "Brakes" },
+  { id: "ap-evidence", label: "Evidence" },
+  { id: "ap-jobs", label: "Jobs" },
+  { id: "ap-records", label: "Records" },
+];
 
 /** The three periods the núcleo writes, as the noun each one is: `daily` becomes `day`, not `dai`. */
 const PERIOD_NOUN: Record<string, string> = {
@@ -182,42 +182,57 @@ export function Autopilot() {
         <RosterError error={projects.error} />
       )}
 
+      <SectionNav label="Autopilot sections" items={SECTIONS} />
+
       <div className="ap-sections">
-        <ProjectCarousel
-          rows={rows}
-          answered={answered}
-          order={order}
-          selected={selected}
-          onSelect={setChosen}
-          refusals={refusals}
-          onRefusals={setRefusals}
-        />
+        <div id="ap-setting" className="ap-block">
+          <ProjectCarousel
+            rows={rows}
+            answered={answered}
+            order={order}
+            selected={selected}
+            onSelect={setChosen}
+            refusals={refusals}
+            onRefusals={setRefusals}
+          />
+        </div>
         {/* The brakes sit with the ledger, before any evidence: the order this page's doc-comment
             promises (brakes, then the setting, then the proof, then the work). */}
-        <Ledger
-          projects={projects.data}
-          budget={budget.data}
-          pending={proposals.data?.length}
-        />
-        <TriggerKills />
-        {focused !== undefined && <ProjectBar project={focused} />}
-        {selected !== null && <ShadowReviewPanel projectId={selected} project={focused} />}
+        <div id="ap-brakes" className="ap-block">
+          <Ledger
+            projects={projects.data}
+            budget={budget.data}
+            pending={proposals.data?.length}
+          />
+          <TriggerKills />
+        </div>
         {/* The panels below act on the project in focus. With none (the roster is still being read,
             or it is empty and the carousel already says so) they would each repeat the same absence. */}
-        {selected !== null && (
-          <>
-            <ScoreboardPanel projectId={selected} project={focused} />
-            <JudgePanel projectId={selected} project={focused} />
-            <JudgeReviewPanel projectId={selected} />
-            <ResolvePanel projectId={selected} project={focused} />
-          </>
-        )}
-        <JobsPanel rows={rows} selected={selected} />
+        <div id="ap-evidence" className="ap-block">
+          {focused !== undefined && <ProjectBar project={focused} />}
+          {selected !== null && <ShadowReviewPanel projectId={selected} project={focused} />}
+          {selected !== null && <ScoreboardPanel projectId={selected} project={focused} />}
+          {selected !== null && (
+            <Disclosure label="Advanced: judge and resolve">
+              <JudgePanel projectId={selected} project={focused} />
+              <JudgeReviewPanel projectId={selected} />
+              <ResolvePanel projectId={selected} project={focused} />
+            </Disclosure>
+          )}
+        </div>
+        <div id="ap-jobs" className="ap-block">
+          <JobsPanel rows={rows} selected={selected} />
+        </div>
         {/* Records of what the night and the barrier already settled. They were on the Waiting
-            page, which now holds only what asks for a decision. */}
-        <SkippedItemsPanel />
-        <RefusedActionsPanel />
-        <FeedEmbed />
+            page, which now holds only what asks for a decision. Records, not controls: shut until
+            somebody wants to read back. */}
+        <div id="ap-records" className="ap-block">
+          <Disclosure label="Records and feed">
+            <SkippedItemsPanel />
+            <RefusedActionsPanel />
+            <FeedEmbed />
+          </Disclosure>
+        </div>
       </div>
     </>
   );
@@ -354,19 +369,6 @@ function clamp(n: number, low: number, high: number): number {
   return Math.max(low, Math.min(high, n));
 }
 
-/**
- * Whether the fan should jump rather than slide.
- *
- * Read per slide rather than once, so a preference changed while the page is open is obeyed. No
- * `matchMedia` at all (jsdom) counts as reduced: with no layout there is nothing to animate.
- */
-function reducedMotion(): boolean {
-  return (
-    typeof window.matchMedia !== "function" ||
-    window.matchMedia("(prefers-reduced-motion: reduce)").matches
-  );
-}
-
 /** The map without one project's entry — the same map when it had none, so nothing re-renders. */
 function without(
   map: ReadonlyMap<string, Refused>,
@@ -387,34 +389,18 @@ function readingOf(project: ProjectSummary, refused: boolean): string {
   return bits.join(" · ");
 }
 
-/** A drag in progress: where it started, where it is, and the last tenth of a second of it. */
-interface Drag {
-  pointer: number;
-  startX: number;
-  lastX: number;
-  /** The card the fan rested on when the drag began; a fling travels at most three from it. */
-  from: number;
-  moved: boolean;
-  samples: { t: number; x: number }[];
-}
-
 /**
- * The roster as a fan, one project in focus at a time, and the setting for that project under it.
+ * The roster as an index, one project in focus at a time, and the setting for that project under it.
  *
- * Three parts, in the order they are read. The index is every project at once, most urgent first —
- * the answer to "is everything fine?" that one card cannot give — and it is the keyboard's only way
- * in: a tablist with one tab stop whose selection follows focus. The stage is drawing, not
- * controls: hidden from assistive technology as a whole, it takes pointer input only (a drag, a
- * fling, a click on a neighbouring card, a sideways swipe) and never a tab stop. The panel below is
- * the selected project's setting, and nobody else's.
+ * Two parts, in the order they are read. The index is every project at once, most urgent first —
+ * the answer to "is everything fine?" that one card cannot give — and it is the keyboard's way in:
+ * a tablist with one tab stop whose selection follows focus. Under it the list gives the same
+ * triage in words, ten or twenty projects to a screen. The panel is the selected project's
+ * setting, and nobody else's.
  *
  * One mutation for the whole roster, each refusal kept against the project that caused it: only one
  * project's switch is on screen at a time, and a refusal has to outlive walking to another project
  * and back.
- *
- * The fan moves through CSSOM (`element.style`) inside animation frames, which the production CSP
- * allows and a `<style>` element it refuses — so never `AnimatePresence mode="popLayout"` nor View
- * Transitions, which both build one. The curve is `--ease`, solved in `lib/autopilot-fan.ts`.
  */
 function ProjectCarousel({
   rows,
@@ -434,13 +420,9 @@ function ProjectCarousel({
   onRefusals: Dispatch<SetStateAction<ReadonlyMap<string, Refused>>>;
 }) {
   const setMode = useSetProjectMode();
-  /** What the live region says: a change that went through, or a project the stage moved to. */
+  /** What the live region says: a change that went through. */
   const [said, setSaid] = useState("");
   const [pointedAt, setPointedAt] = useState<string | null>(null);
-  const [cfg, setCfg] = useState<FanConfig>(() => fanConfig(900));
-  const [dragging, setDragging] = useState(false);
-  /** The fan is a picture of the roster; the list under it carries the same triage in words. */
-  const [fanOn, setFanOn] = useState(true);
 
   const base = useId();
   const panelId = `${base}-panel`;
@@ -458,160 +440,8 @@ function ProjectCarousel({
   const index = found < 0 ? 0 : found;
   const focused: ProjectSummary | undefined = shown[index];
   const many = total >= 2;
-  const hasStage = total > 0;
 
-  const stageRef = useRef<HTMLDivElement>(null);
-  const cards = useRef(new Map<string, HTMLElement>());
   const tabs = useRef<(HTMLButtonElement | null)[]>([]);
-  /** Where the fan is, in cards: fractional while it moves, whole once it rests. */
-  const progress = useRef(0);
-  const slide = useRef<{ to: number; frame: number } | null>(null);
-  const drag = useRef<Drag | null>(null);
-  const placed = useRef(false);
-  /**
-   * What the motion reads between renders. The animation frames and the listeners outlive the
-   * render that started them, so they read the latest roster and selection from here.
-   */
-  const latest = useRef({ shown, index, cfg, refusals, onSelect });
-
-  /** Every card's pose for the current `progress`, written straight to its style. */
-  function paint() {
-    const now = latest.current.shown;
-    const fan = latest.current.cfg;
-    now.forEach((row, at) => {
-      const card = cards.current.get(row.project_id);
-      if (card === undefined) return;
-      const pose = cardPose(circularOffset(at, progress.current, now.length), now.length, fan);
-      card.style.transform = `translate(${pose.x}px, ${pose.y}px) rotate(${pose.rot}deg) scale(${pose.scale})`;
-      card.style.opacity = String(pose.opacity);
-      card.style.zIndex = String(pose.z);
-      card.style.visibility = pose.hidden ? "hidden" : "visible";
-      const dim = card.querySelector<HTMLElement>(".ap-fan-dim");
-      if (dim !== null) dim.style.opacity = String(pose.dim);
-      const facts = card.querySelector<HTMLElement>(".ap-fan-facts");
-      if (facts !== null) facts.style.opacity = String(pose.factsOpacity);
-    });
-  }
-
-  /** A selection made by the stage, which the index cannot announce: said in the live region. */
-  function chooseFromStage(at: number) {
-    const row = latest.current.shown[at];
-    if (row === undefined) return;
-    latest.current.onSelect(row.project_id);
-    setSaid(describeProject(row, latest.current.refusals.has(row.project_id)));
-  }
-
-  /** Where the fan came to rest decides the selection — unless something already chose it. */
-  function settle() {
-    const count = latest.current.shown.length;
-    if (count === 0) return;
-    const rounded = Math.round(progress.current);
-    const next = count >= 3 ? wrap(rounded, count) : clamp(rounded, 0, count - 1);
-    progress.current = next;
-    paint();
-    if (next !== latest.current.index) chooseFromStage(next);
-  }
-
-  /** Slide to `target` on the app's curve: 240 ms, half as long again past one card, none reduced. */
-  function animateTo(target: number) {
-    const count = latest.current.shown.length;
-    const goal = count >= 3 ? target : clamp(target, 0, Math.max(0, count - 1));
-    if (slide.current !== null) cancelAnimationFrame(slide.current.frame);
-    slide.current = null;
-    const from = progress.current;
-    const duration = slideDuration(Math.abs(goal - from), reducedMotion());
-    if (duration === 0) {
-      progress.current = goal;
-      paint();
-      settle();
-      return;
-    }
-    const start = performance.now();
-    const step = (now: number) => {
-      const k = Math.min(1, (now - start) / duration);
-      progress.current = from + (goal - from) * EASE(k);
-      paint();
-      if (k < 1) {
-        slide.current = { to: goal, frame: requestAnimationFrame(step) };
-      } else {
-        slide.current = null;
-        settle();
-      }
-    };
-    slide.current = { to: goal, frame: requestAnimationFrame(step) };
-  }
-
-  // After every commit: the motion reads the new roster, and every card — new ones included —
-  // takes its pose. Layout effects, so a card is never painted once at the origin first.
-  useLayoutEffect(() => {
-    latest.current = { shown, index, cfg, refusals, onSelect };
-    paint();
-  });
-
-  // The index, a card click, a swipe or a settled drag chose a project: the fan catches up, the
-  // near way round a ring. The first time there is a roster it is simply placed.
-  useLayoutEffect(() => {
-    if (total === 0) return;
-    if (!placed.current) {
-      placed.current = true;
-      progress.current = index;
-      paint();
-      return;
-    }
-    const from = slide.current?.to ?? progress.current;
-    animateTo(nearestTarget(index, from, total));
-    // `paint`/`animateTo` read everything else through `latest`; only these two start a slide.
-  }, [index, total]);
-
-  // Sized by the stage and not the window: inside the app the rail takes 15rem of it. A width of
-  // zero is a stage nobody can see (or jsdom), and measuring it would shrink the cards to nothing.
-  useLayoutEffect(() => {
-    const stage = stageRef.current;
-    if (stage === null) return;
-    const measure = () => {
-      const width = stage.clientWidth;
-      if (width === 0) return;
-      const next = fanConfig(width);
-      stage.style.setProperty("--ap-fan-card-w", `${next.cardW}px`);
-      stage.style.setProperty("--ap-fan-card-h", `${next.cardH}px`);
-      setCfg((current) =>
-        current.cardW === next.cardW && current.compact === next.compact ? current : next,
-      );
-    };
-    measure();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measure);
-    observer.observe(stage);
-    return () => observer.disconnect();
-  }, [hasStage]);
-
-  // A trackpad's sideways swipe, and only that — a vertical wheel still scrolls the page. Bound
-  // by hand because React's `onWheel` is passive and could not keep the page from scrolling.
-  useEffect(() => {
-    const stage = stageRef.current;
-    if (stage === null) return;
-    let swept = 0;
-    const onWheel = (event: WheelEvent) => {
-      if (Math.abs(event.deltaX) <= Math.abs(event.deltaY)) return;
-      event.preventDefault();
-      swept += event.deltaX;
-      if (Math.abs(swept) <= 60 || slide.current !== null) return;
-      const count = latest.current.shown.length;
-      const at = latest.current.index + Math.sign(swept);
-      swept = 0;
-      const next = count >= 3 ? wrap(at, count) : clamp(at, 0, count - 1);
-      if (next !== latest.current.index) chooseFromStage(next);
-    };
-    stage.addEventListener("wheel", onWheel, { passive: false });
-    return () => stage.removeEventListener("wheel", onWheel);
-  }, [hasStage]);
-
-  useEffect(
-    () => () => {
-      if (slide.current !== null) cancelAnimationFrame(slide.current.frame);
-    },
-    [],
-  );
 
   /** The arrows walk the index — a ring at three or more, a line below — and Home/End go to its ends. */
   function onIndexKey(event: ReactKeyboardEvent<HTMLDivElement>) {
@@ -628,67 +458,6 @@ function ProjectCarousel({
     if (row === undefined) return;
     onSelect(row.project_id);
     tabs.current[next]?.focus();
-  }
-
-  function onStageDown(event: ReactPointerEvent<HTMLDivElement>) {
-    if (total <= 1 || event.button !== 0) return;
-    // The name and path of the card in focus can be selected and copied; a drag there would steal it.
-    if (event.target instanceof Element && event.target.closest(".ap-fan-card-focus .ap-fan-selectable") !== null) {
-      return;
-    }
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-    drag.current = {
-      pointer: event.pointerId,
-      startX: event.clientX,
-      lastX: event.clientX,
-      from: Math.round(slide.current?.to ?? progress.current),
-      moved: false,
-      samples: [{ t: event.timeStamp, x: event.clientX }],
-    };
-  }
-
-  function onStageMove(event: ReactPointerEvent<HTMLDivElement>) {
-    const held = drag.current;
-    if (held === null || event.pointerId !== held.pointer) return;
-    const dx = event.clientX - held.lastX;
-    held.lastX = event.clientX;
-    if (!held.moved && Math.abs(event.clientX - held.startX) > 4) {
-      held.moved = true;
-      setDragging(true);
-      if (slide.current !== null) {
-        cancelAnimationFrame(slide.current.frame);
-        slide.current = null;
-      }
-    }
-    if (!held.moved) return;
-    let delta = -dx / (cfg.xStep * 1.2);
-    // Two cards do not wrap, so past either end the drag resists instead of travelling.
-    if (total < 3 && (progress.current + delta < 0 || progress.current + delta > total - 1)) {
-      delta *= 0.3;
-    }
-    progress.current += delta;
-    held.samples.push({ t: event.timeStamp, x: event.clientX });
-    while (held.samples.length > 2 && event.timeStamp - held.samples[0].t > 100) held.samples.shift();
-    paint();
-  }
-
-  function onStageUp(event: ReactPointerEvent<HTMLDivElement>) {
-    const held = drag.current;
-    if (held === null || event.pointerId !== held.pointer) return;
-    drag.current = null;
-    if (!held.moved) {
-      // Whatever the browser painted on top is what was clicked — no geometry to keep in step.
-      const hit = document.elementFromPoint?.(event.clientX, event.clientY)?.closest(".ap-fan-card");
-      const at = hit instanceof HTMLElement ? Number(hit.dataset.index) : Number.NaN;
-      if (Number.isInteger(at) && at !== index) chooseFromStage(at);
-      return;
-    }
-    setDragging(false);
-    const first = held.samples[0];
-    const last = held.samples[held.samples.length - 1];
-    const velocity = ((last.x - first.x) / Math.max(1, last.t - first.t)) * 1000;
-    const projected = progress.current - velocity / (cfg.xStep * 4.5);
-    animateTo(clamp(Math.round(projected), held.from - 3, held.from + 3));
   }
 
   /**
@@ -730,20 +499,10 @@ function ProjectCarousel({
       : null;
   const ranks = shown.map((row) => urgencyOf(row, refusals.has(row.project_id)));
   const pointed = shown.find((row) => row.project_id === pointedAt) ?? focused;
-  const stageClass = [
-    "ap-fan-stage",
-    total <= 1 ? "ap-fan-stage-single" : "",
-    dragging ? "ap-fan-stage-dragging" : "",
-    cfg.compact ? "ap-fan-stage-compact" : "",
-  ]
-    .filter((name) => name !== "")
-    .join(" ");
-
   return (
-    // The setting for the project in focus is the first thing under the header, with the fan beside it
-    // (no section title above either: the index says "1 of N"). The fan is the roster's picture and
-    // the setting is the control, so the control is never pushed below the picture.
-    <section className={fanOn ? "ap-fan" : "ap-fan ap-fan-nofan"} aria-label="Projects">
+    // The setting for the project in focus is the first thing under the header, with the roster's
+    // index and list under it (no section title above either: the index says "1 of N").
+    <section className="ap-fan" aria-label="Projects">
       {answered && rows.length === 0 && (
         <Teach title="No project is under autopilot">
           <p>
@@ -756,8 +515,6 @@ function ProjectCarousel({
       {!answered && <p className="ap-loading">Reading the roster…</p>}
       {focused !== undefined && (
         <>
-          {/* The setting leads, in the document and on the screen: project, mode, switch. The fan
-              is the picture of the roster and sits beside it (above ~1100px) or under it. */}
           <div className="ap-fan-control">
             <div
               className="ap-fan-focus"
@@ -783,34 +540,6 @@ function ProjectCarousel({
           </div>
 
           <div className="ap-fan-view">
-            <div
-              ref={stageRef}
-              className={stageClass}
-              aria-hidden="true"
-              onPointerDown={onStageDown}
-              onPointerMove={onStageMove}
-              onPointerUp={onStageUp}
-              onPointerCancel={onStageUp}
-            >
-              {shown.map((row, at) => (
-                <article
-                  key={row.project_id}
-                  ref={(element) => {
-                    if (element === null) cards.current.delete(row.project_id);
-                    else cards.current.set(row.project_id, element);
-                  }}
-                  data-index={at}
-                  className={at === index ? "ap-fan-card ap-fan-card-focus" : "ap-fan-card"}
-                >
-                  <FanCard
-                    project={row}
-                    refused={refusals.has(row.project_id)}
-                    cardW={cfg.cardW}
-                  />
-                </article>
-              ))}
-            </div>
-
             {many && (
               <>
                 <div className="ap-fan-index">
@@ -859,11 +588,8 @@ function ProjectCarousel({
                     </span>
                     <strong className="ap-fan-position-name">{focused.project_id}</strong>
                     <span className="ap-fan-hint">
-                      <kbd>←</kbd> <kbd>→</kbd> on the row, or drag the cards
+                      <kbd>←</kbd> <kbd>→</kbd> on the row
                     </span>
-                    <Button variant="quiet" onClick={() => setFanOn((on) => !on)}>
-                      {fanOn ? "Hide the fan" : "Show the fan"}
-                    </Button>
                   </div>
                 </div>
                 <p className="ap-fan-readout" aria-hidden="true">
@@ -894,7 +620,7 @@ function ProjectCarousel({
 
 /**
  * The roster as a list, most urgent first: name, the map's word for its mode, and the same reading
- * the fan's readout gives on hover. It is the triage the fan only draws, and it works with the
+ * the index readout gives on hover. It is the same triage in words, and it works with the
  * keyboard and a screen reader as plain buttons. Ten or twenty projects fit on one screen.
  */
 function RosterList({
@@ -948,155 +674,6 @@ function ProjectBar({ project }: { project: ProjectSummary }) {
 }
 
 /**
- * One card: who the project is, the one thing that needs you if anything does, and its reading.
- *
- * Identity first — the name in the display face and the map's word for its mode, then its folder in
- * mono, shortened from the middle so the end that tells two projects apart survives. The exception
- * band is the only tinted box a card carries.
- */
-function FanCard({
-  project,
-  refused,
-  cardW,
-}: {
-  project: ProjectSummary;
-  refused: boolean;
-  cardW: number;
-}) {
-  const room = Math.floor((cardW - 26) / 6.7);
-  return (
-    <>
-      <div className="ap-fan-dim" />
-      <div className="ap-fan-id">
-        <div className="ap-fan-id-row">
-          <h3 className="ap-fan-name ap-fan-selectable" title={project.project_id}>
-            {project.project_id}
-          </h3>
-          <StateBadge domain="autopilot" state={project.mode} />
-        </div>
-        {project.project_root === null ? (
-          <p className="ap-fan-root ap-fan-root-none">no folder named</p>
-        ) : (
-          <p className="ap-fan-root ap-fan-selectable" title={project.project_root}>
-            {shortPath(project.project_root, room)}
-          </p>
-        )}
-      </div>
-      {refused ? (
-        <p className="ap-fan-exception">Setting refused — see below</p>
-      ) : project.queue_full ? (
-        <p className="ap-fan-exception">Queue full — review one to release it</p>
-      ) : null}
-      <FanVisor project={project} />
-      <FanFacts project={project} />
-    </>
-  );
-}
-
-/**
- * The reading, in a sunken well. In shadow and off it is the evidence: classes clearing the bar,
- * one segment per class in the mode's tone. Once a project acts the evidence is history, and what
- * matters is how full its review queue is — proposals and shadow decisions together, which is
- * what `open_review_items` counts and what the ceiling holds.
- */
-function FanVisor({ project }: { project: ProjectSummary }) {
-  if (project.mode === "active") {
-    return (
-      <div className="ap-fan-visor">
-        <span className="ap-fan-visor-label">waiting for review</span>
-        <div className="ap-fan-reading">
-          <span className="ap-fan-figure">
-            {project.open_review_items}
-            {project.wip_limit === null ? null : (
-              <span className="ap-fan-figure-of">/{project.wip_limit}</span>
-            )}
-          </span>
-          <Meter
-            label="waiting for review"
-            value={project.open_review_items}
-            ceiling={project.wip_limit}
-            tone="pending"
-            head={false}
-          />
-          <span className="ap-fan-caption">acting on its own</span>
-        </div>
-      </div>
-    );
-  }
-  return (
-    <div className="ap-fan-visor">
-      <span className="ap-fan-visor-label">classes ready</span>
-      <div className="ap-fan-reading">
-        {project.classes_total === 0 ? (
-          <span className="ap-fan-figure ap-fan-figure-word">none yet</span>
-        ) : (
-          <span className="ap-fan-figure">
-            {project.classes_ready}
-            <span className="ap-fan-figure-of">/{project.classes_total}</span>
-          </span>
-        )}
-        {project.classes_total === 0 ? (
-          <div className="ap-fan-track ap-fan-track-empty" />
-        ) : (
-          <div className={`ap-fan-track ap-fan-tone-${project.mode}`}>
-            {Array.from({ length: project.classes_total }, (_, at) => (
-              <span
-                key={at}
-                className={at < project.classes_ready ? "ap-fan-seg ap-fan-seg-on" : "ap-fan-seg"}
-              />
-            ))}
-          </div>
-        )}
-        <span className="ap-fan-caption">{caption(project)}</span>
-      </div>
-    </div>
-  );
-}
-
-/** The two facts under the well: what is waiting for a verdict, and how full the queue is. */
-function FanFacts({ project }: { project: ProjectSummary }) {
-  // Which queue, not just how many: a person reading the bare number went to the proposals list
-  // and found it empty, because on that project all of it was shadow decisions. `null` when the
-  // daemon sent no split, and then the line says only what the total is.
-  const waitingWhere = whereWaiting(project);
-  if (project.mode === "active") {
-    return (
-      <dl className="ap-fan-facts">
-        <div className="ap-fan-fact">
-          <dt>classes ready</dt>
-          <dd>
-            {project.classes_ready}/{project.classes_total}
-          </dd>
-        </div>
-        <div className="ap-fan-fact">
-          <dt>to review</dt>
-          <dd>{project.pending}</dd>
-        </div>
-      </dl>
-    );
-  }
-  return (
-    <dl className="ap-fan-facts">
-      <div className="ap-fan-fact">
-        <dt>to review</dt>
-        <dd>{project.pending}</dd>
-      </div>
-      <div className="ap-fan-fact">
-        <dt>queue</dt>
-        <dd>
-          {project.wip_limit === null
-            ? project.open_review_items
-            : `${project.open_review_items} of ${project.wip_limit}`}
-          <span className="ap-fan-fact-sub" title={waitingWhere ?? undefined}>
-            {waitingWhere ?? (project.wip_limit === null ? "no ceiling" : "waiting for review")}
-          </span>
-        </dd>
-      </div>
-    </dl>
-  );
-}
-
-/**
  * The selected project's setting: whose it is, its gate, the switch, and whatever the núcleo said
  * to the last change.
  *
@@ -1105,7 +682,7 @@ function FanFacts({ project }: { project: ProjectSummary }) {
  * the reader is no longer looking at.
  *
  * The gate is a line every project has, always rendered and at least two lines tall, so the switch
- * under it never moves as the fan turns: an acting project says how to stop it, an earned one says
+ * under it never moves as the project changes: an acting project says how to stop it, an earned one says
  * so, any other says why not in the núcleo's terms. While the third segment is armed the same line
  * says what confirming would do — and that segment is described by it from the first render, because
  * a description attached at the moment of arming lands on a button that already has focus and is
@@ -1477,7 +1054,7 @@ function ScoreboardPanel({
         <TallyTable label="Shadow evidence" rows={evidence} />
       )}
       {history.length > 0 && (
-        <div className="ap-group">
+        <div className="ap-block">
           {/* `level={3}` because this heading sits inside a `Panel` that already
               has an `h2`. Announced as a sibling of "Scoreboard" it would tell a
               screen reader the enforced rows are a section of the page rather

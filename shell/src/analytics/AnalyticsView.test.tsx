@@ -426,7 +426,7 @@ describe("refused and stale", () => {
   it("links the three sections and gives the first a heading of its own", async () => {
     await mount(busy());
     const nav = await screen.findByRole("navigation", { name: "Sections" });
-    expect(within(nav).getAllByRole("button").map((button) => button.textContent)).toEqual([
+    expect(within(nav).getAllByRole("link").map((link) => link.textContent)).toEqual([
       "Summary",
       "Pipeline",
       "Development time",

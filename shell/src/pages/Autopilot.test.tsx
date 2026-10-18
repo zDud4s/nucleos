@@ -54,6 +54,12 @@ function renderCockpit() {
   return renderWithRouter(<Autopilot />, { initialPath: "/autopilot" });
 }
 
+/** The cockpit with its records opened: the skipped, refused and feed panels sit in a shut disclosure. */
+async function renderRecords() {
+  await renderCockpit();
+  fireEvent.click(await screen.findByRole("button", { name: "Records and feed" }));
+}
+
 /* ------------------------------------------------------------- fixtures -- */
 
 function tally(overrides: Partial<ClassTally> = {}): ClassTally {
@@ -377,17 +383,16 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     expect(selectedTab().textContent?.startsWith("bravo")).toBe(true);
     expect(panel().querySelector(".ap-fan-focus-title strong")?.textContent).toBe("bravo");
 
-    // The stage is drawing, not controls: hidden from assistive technology as a whole, so the
-    // focused card is read off the page by its class and not by any role.
-    const card = document.querySelector(".ap-fan-card-focus");
-    expect(card).not.toBeNull();
-    expect(card?.closest('[aria-hidden="true"]')).not.toBeNull();
-    expect(card?.textContent).toContain("bravo");
-    const words = Array.from(card?.querySelectorAll(".ui-badge") ?? []).map((badge) => badge.textContent);
+    // The list under the index names every project, the focused one marked, with the map's word
+    // for its mode (`active`, the daemon's literal, never "acting").
+    const roster = screen.getByRole("list", { name: "All projects by urgency" });
+    const current = roster.querySelector('[aria-current="true"]');
+    expect(current?.textContent).toContain("bravo");
+    const words = Array.from(current?.querySelectorAll(".ui-badge") ?? []).map((badge) => badge.textContent);
     expect(words).toContain("active");
     expect(words).not.toContain("acting");
 
-    // And the panels below follow the project the fan opened on.
+    // And the panels below follow the project the index opened on.
     expect(await screen.findByText("Nothing is waiting for a verdict on bravo.")).toBeDefined();
   });
 
@@ -1008,7 +1013,7 @@ describe("Autopilot - the overnight and barrier records", () => {
   it("shows the records as panels once there are rows, and one line while there are none", async () => {
     daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
 
-    await renderCockpit();
+    await renderRecords();
 
     // Empty: one quiet line each, with the reasoning behind "why?".
     const skipped = await screen.findByRole("region", { name: "Skipped items" });
@@ -1021,7 +1026,7 @@ describe("Autopilot - the overnight and barrier records", () => {
     const world = cockpitWorld({ skipped: [proposal({ id: 41, kind: "skipped-item" })] });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));
 
-    await renderCockpit();
+    await renderRecords();
 
     fireEvent.click(await screen.findByRole("button", { name: "Put item #41 away" }));
 
@@ -1060,7 +1065,7 @@ describe("Autopilot - the overnight and barrier records", () => {
     });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));
 
-    await renderCockpit();
+    await renderRecords();
     const list = await screen.findByRole("list", { name: "Skipped items" });
 
     expect(within(list).getByText("job 27 \u00B7 item 4")).toBeDefined();
@@ -1086,7 +1091,7 @@ describe("Autopilot - the overnight and barrier records", () => {
     });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));
 
-    await renderCockpit();
+    await renderRecords();
     const list = await screen.findByRole("list", { name: "Skipped items" });
 
     expect(within(list).getByText("job 27 \u00B7 the job's review")).toBeDefined();
@@ -1100,7 +1105,7 @@ describe("Autopilot - the overnight and barrier records", () => {
     });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));
 
-    await renderCockpit();
+    await renderRecords();
     const list = await screen.findByRole("list", { name: "Skipped items" });
 
     expect(within(list).getByText("a job this record can no longer trace")).toBeDefined();
@@ -1121,7 +1126,7 @@ describe("Autopilot - the overnight and barrier records", () => {
     });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));
 
-    await renderCockpit();
+    await renderRecords();
 
     const list = await screen.findByRole("list", { name: "Refused actions" });
     const panel = list.closest("section");
@@ -1158,7 +1163,7 @@ describe("Autopilot - the overnight and barrier records", () => {
     });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));
 
-    await renderCockpit();
+    await renderRecords();
     const list = await screen.findByRole("list", { name: "Refused actions" });
 
     // The tool that brought the words in, and the url — the half that decides whether this was
@@ -1177,7 +1182,7 @@ describe("Autopilot - the overnight and barrier records", () => {
     });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));
 
-    await renderCockpit();
+    await renderRecords();
     const list = await screen.findByRole("list", { name: "Refused actions" });
 
     expect(within(list).getByText("create_run")).toBeDefined();
@@ -1284,7 +1289,7 @@ describe("Autopilot - agreement, the project in focus, and the page order", () =
     expect(screen.queryByRole("group", { name: "Project in focus" })).toBeNull();
   });
 
-  it("lists every project by urgency as buttons, and can hide the fan", async () => {
+  it("lists every project by urgency as buttons, with no fan to hide", async () => {
     const world = cockpitWorld({
       projects: [
         project({ project_id: "alpha", mode: "shadow" }),
@@ -1297,9 +1302,53 @@ describe("Autopilot - agreement, the project in focus, and the page order", () =
 
     const roster = await screen.findByRole("list", { name: "All projects by urgency" });
     expect(within(roster).getAllByRole("button")).toHaveLength(2);
+    expect(document.querySelector(".ap-fan-stage")).toBeNull();
+    expect(screen.queryByRole("button", { name: /the fan/ })).toBeNull();
+  });
+});
 
-    fireEvent.click(screen.getByRole("button", { name: "Hide the fan" }));
-    expect(document.querySelector(".ap-fan-nofan")).not.toBeNull();
-    expect(screen.getByRole("button", { name: "Show the fan" })).toBeDefined();
+describe("Autopilot - the page map and the advanced panels", () => {
+  it("offers a section nav whose entries point at groups that exist", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+
+    await renderCockpit();
+
+    const nav = await screen.findByRole("navigation", { name: "Autopilot sections" });
+    const links = within(nav).getAllByRole("link");
+    expect(links.map((link) => link.textContent)).toEqual([
+      "Setting",
+      "Brakes",
+      "Evidence",
+      "Jobs",
+      "Records",
+    ]);
+    for (const link of links) {
+      const id = (link.getAttribute("href") ?? "").replace(/^#/, "");
+      expect(document.getElementById(id)).not.toBeNull();
+    }
+  });
+
+  it("keeps the records and the advanced evidence shut until asked", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+
+    await renderCockpit();
+
+    const records = await screen.findByRole("button", { name: "Records and feed" });
+    expect(records.getAttribute("aria-expanded")).toBe("false");
+    const advanced = screen.getByRole("button", { name: "Advanced: judge and resolve" });
+    expect(advanced.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(records);
+    expect(records.getAttribute("aria-expanded")).toBe("true");
+    expect(await screen.findByRole("region", { name: "Skipped items" })).toBeDefined();
+  });
+
+  it("puts the trigger brakes in the same group as the ledger", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+
+    await renderCockpit();
+
+    const brakes = await screen.findByRole("list", { name: "Trigger brakes" });
+    expect(brakes.closest("#ap-brakes")).not.toBeNull();
   });
 });
