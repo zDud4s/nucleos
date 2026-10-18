@@ -93,14 +93,29 @@ pub struct SpendRow {
 /// zero/near-zero-duration run is never counted as $0 (spec §8.5: unmeasured cost is never free).
 const MIN_APPROX_SECONDS: i64 = 60;
 
+/// The most wall time one run is ever approximated for: four hours, so $12 at the default $3/h.
+///
+/// Nothing else bounds it. No run has a hard duration limit — the runners' timeouts are silence
+/// timeouts, and an assistant turn whose CLI hangs stays `running` until somebody cancels it or the
+/// daemon restarts — so without a ceiling the approximation grows with the clock and stops meaning
+/// anything. Run 900677, a browser-panel turn that never reported a result, sat open for 44.6 hours
+/// and was billed $133.71 on the Analytics page for it. Four hours because the longest run in the
+/// house database that reported its own usage while doing work ran 2.7 hours, and the largest cost
+/// any run ever reported is $11.57: the cap still covers the most expensive run ever measured, and
+/// past it the elapsed time says the run was forgotten, not that it was spending.
+const MAX_APPROX_SECONDS: i64 = 4 * 60 * 60;
+
 /// PURE: what a run that lasted `created_at`..`end` is assumed to have cost at `rate_per_hour`.
 ///
 /// Public because the same approximation is written durably at termination (`runs.rs`) for a run
 /// that ended without reporting a cost. Two implementations of one number would drift, and the drift
-/// would show up as a total that moves the moment a stored value lands.
+/// would show up as a total that moves the moment a stored value lands. The same function is what
+/// the Analytics page prices with (`analytics/sessions.rs`), for the same reason.
+///
+/// Floored at `MIN_APPROX_SECONDS` and capped at `MAX_APPROX_SECONDS`.
 pub fn time_approx_usd(created_at: DateTime<Utc>, end: DateTime<Utc>, rate_per_hour: f64) -> f64 {
     let elapsed_seconds = (end - created_at).num_seconds();
-    let seconds = elapsed_seconds.max(MIN_APPROX_SECONDS);
+    let seconds = elapsed_seconds.clamp(MIN_APPROX_SECONDS, MAX_APPROX_SECONDS);
     (seconds as f64 / 3600.0) * rate_per_hour
 }
 
@@ -904,6 +919,55 @@ mod tests {
         approx(
             compute_spend(&rows, ts("2026-07-20T10:30:00Z"), &cfg(3.0)),
             1.5,
+        );
+    }
+
+    /// The shape of run 900677: no reported cost, open 44.6 hours. Uncapped that was $133.71 at
+    /// $3/h; the approximation stops at four hours, $12, whether the run has ended or is still open
+    /// and measured to `now`.
+    #[test]
+    fn an_unreported_cost_is_capped_at_four_hours() {
+        let ended = SpendRow {
+            session_id: Some("forgotten".into()),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
+            created_at: ts("2026-10-15T20:10:41Z"),
+            completed_at: Some(ts("2026-10-17T16:44:50Z")),
+        };
+        let open = SpendRow {
+            completed_at: None,
+            ..ended.clone()
+        };
+        let now = ts("2026-10-18T00:00:00Z");
+
+        approx(compute_spend(&[ended], now, &cfg(3.0)), 12.0);
+        approx(compute_spend(&[open], now, &cfg(3.0)), 12.0);
+        approx(
+            time_approx_usd(ts("2026-10-15T20:10:41Z"), ts("2026-10-17T16:44:50Z"), 3.0),
+            12.0,
+        );
+    }
+
+    /// The cap is a ceiling and nothing else: a run that ran less than four hours is approximated
+    /// exactly as before, three hours at $3/h being $9.
+    #[test]
+    fn an_unreported_cost_under_the_cap_is_unchanged() {
+        let rows = vec![SpendRow {
+            session_id: Some("s1".into()),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            num_turns: None,
+            created_at: ts("2026-07-20T09:00:00Z"),
+            completed_at: Some(ts("2026-07-20T12:00:00Z")),
+        }];
+        approx(
+            compute_spend(&rows, ts("2026-07-20T13:00:00Z"), &cfg(3.0)),
+            9.0,
         );
     }
 

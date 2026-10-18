@@ -332,4 +332,25 @@ mod tests {
         assert!(!priced[1].estimated);
         assert!((priced[1].usd - 1.25).abs() < 1e-9);
     }
+
+    /// The card that showed run 900677 at "$133.71 est.": a browser-panel turn with no reported
+    /// cost, open 44.6 hours. The page prices with the ceiling's own approximation, so it carries
+    /// the same four-hour cap — $12 at $3/h, still marked as an estimate.
+    #[test]
+    fn a_forgotten_run_is_priced_at_the_capped_estimate() {
+        let mut forgotten = row(900677, None, "2026-10-17T16:44:50Z", None, None);
+        forgotten.created_at = "2026-10-15T20:10:41Z".into();
+        forgotten.mode = "assistant".into();
+        forgotten.project_id = None;
+        let rows = vec![forgotten];
+
+        let priced = price(&rows, 3.0).unwrap();
+
+        assert!(priced[0].estimated);
+        assert!(
+            (priced[0].usd - 12.0).abs() < 1e-9,
+            "four hours at $3/h, got {}",
+            priced[0].usd
+        );
+    }
 }
