@@ -519,7 +519,12 @@ export function VoiceRoom({
 
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
     const scheme = window.matchMedia("(prefers-color-scheme: light)");
-    let palette = readPalette(scheme.matches);
+    // An explicit `data-theme` on the root beats the system preference, as it does in the stylesheets.
+    const isLight = () => {
+      const forced = document.documentElement.getAttribute("data-theme");
+      return forced === "light" ? true : forced === "dark" ? false : scheme.matches;
+    };
+    let palette = readPalette(isLight());
     const box: Box = { w: 0, h: 0, dpr: 1 };
     const sand = createSand();
     const plate = newTrack(MODES_DISC);
@@ -614,9 +619,13 @@ export function VoiceRoom({
     };
     // The theme changed: take its colours again, and repaint at once if nothing is going to.
     const onScheme = () => {
-      palette = readPalette(scheme.matches);
+      palette = readPalette(isLight());
       if (reduced.matches) drawRoom(ctx, box, palette, sand);
     };
+    // A theme picked inside the app is an attribute on the root, which `prefers-color-scheme` never reports.
+    const themeObserver =
+      typeof MutationObserver === "function" ? new MutationObserver(onScheme) : null;
+    themeObserver?.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
     reduced.addEventListener("change", onMotion);
     scheme.addEventListener("change", onScheme);
     // Moving or still, the first frame already shows the phase's figure instead of random dust.
@@ -629,6 +638,7 @@ export function VoiceRoom({
       settleRef.current = null;
       cancelAnimationFrame(frame);
       observer.disconnect();
+      themeObserver?.disconnect();
       reduced.removeEventListener("change", onMotion);
       scheme.removeEventListener("change", onScheme);
     };

@@ -167,6 +167,24 @@ export function Voice() {
     archiveButton.current?.focus();
   }
 
+  /* The dock grows (stacked columns, notes, outcomes) and the captions and the orb are placed
+     against its top edge. Its measured height goes to the room as a CSS variable, so they step
+     clear instead of sitting under it; 96px is what the room's geometry assumes. */
+  const roomRef = useRef<HTMLDivElement>(null);
+  const dockRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const room = roomRef.current;
+    const dock = dockRef.current;
+    if (room === null || dock === null || typeof ResizeObserver !== "function") return;
+    const measure = () => {
+      room.style.setProperty("--voice-dock-h", `${Math.max(96, Math.ceil(dock.offsetHeight))}px`);
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(dock);
+    measure();
+    return () => observer.disconnect();
+  }, []);
+
   const memoCount = memos.data?.length;
   const dictationCount = dictations.data?.length;
   const counts = [
@@ -177,6 +195,7 @@ export function Voice() {
   return (
     <div
       className="voice-room"
+      ref={roomRef}
       data-phase={voice.phase}
       data-archive={archiveOpen ? "open" : undefined}
       data-live={on || phase !== "idle" ? "" : undefined}
@@ -217,7 +236,7 @@ export function Voice() {
 
       {armed ? <Captions voice={voice} hotkey={conversationHotkey} /> : <NotArmed />}
 
-      <div className="voice-dock">
+      <div className="voice-dock" ref={dockRef}>
         <div className="voice-dock-diag">
           <ConversationStatus voice={voice} />
         </div>
@@ -804,7 +823,7 @@ function MemoList({
       {rows !== undefined && rows.length === 0 ? (
         <Section label="Memos">
           <Quiet says="no memos yet">
-            <p>A memo is a capture that stays a note — start one above, or press the memo hotkey from anywhere.</p>
+            <p>A memo is a capture that stays a note — use Start memo, or press the memo hotkey from anywhere.</p>
           </Quiet>
         </Section>
       ) : (
@@ -850,7 +869,7 @@ function DictationList({ dictations }: { dictations: ReturnType<typeof useDictat
       {rows !== undefined && rows.length === 0 ? (
         <Section label="Dictations">
           <Quiet says="no dictations yet">
-            <p className="voice-note">A dictation is a capture that gets pasted where you were typing — start one above, or press the dictation hotkey from anywhere.</p>
+            <p className="voice-note">A dictation is a capture that gets pasted where you were typing — use Start dictation, or press the dictation hotkey from anywhere.</p>
           </Quiet>
         </Section>
       ) : (
