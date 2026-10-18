@@ -1711,7 +1711,7 @@ mod tests {
             .is_ok_and(|status| status.success());
 
         // A plan writes nothing, the pointer included.
-        sync(&checkout, &pins, &library, &record, None, Mode::Plan).unwrap();
+        sync(&checkout, &pins, &library, &record, None, Mode::Preview).unwrap();
         assert!(!checkout.join(PROJECT_POINTER).exists());
 
         let outcomes = sync(&checkout, &pins, &library, &record, None, Mode::Apply).unwrap();
