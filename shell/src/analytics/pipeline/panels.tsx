@@ -397,9 +397,13 @@ function autopilotPanel(autopilot: Autopilot): PanelContent {
             ["Cost", usd(judge.cost_usd)],
             ["Errors", percentOr(judge.error_rate)],
             ["Enforced", percentOr(judge.enforced_share)],
-            ["Agree", `${percentOr(judge.agree)} · ${judge.reviewed} with a human verdict`],
+            ["Agree", `${percentOr(judge.agree)} · ${judge.reviewed} actions with your verdict`],
           ]}
         />
+        <p className="an-note">
+          Agree is the judge&apos;s opinion against your verdict, counted per distinct action. A capped allow counts as
+          an allow.
+        </p>
         <ShareBar
           label="Refused actions by status"
           format={count}

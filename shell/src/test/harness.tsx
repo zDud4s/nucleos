@@ -885,6 +885,8 @@ export function pipelineReport(overrides: Partial<PipelineReport> = {}): Pipelin
         error_rate: null,
         enforced_share: null,
         agree: null,
+        basis: "band",
+        unit: "action",
       },
       refused_actions: { total: 0, by_status: {} },
     },

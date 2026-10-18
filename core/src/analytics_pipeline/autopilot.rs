@@ -13,6 +13,7 @@ use sqlx::SqlitePool;
 use super::stats::{self, Dist};
 use crate::analytics::Window;
 use crate::governance::shadow::AGREE_CASE;
+use crate::judge::READINESS_SELECT;
 
 /// Only rows a person has judged count toward `n` and `agree`; the rest are `pending`, not
 /// disagreement. `AGREE_CASE` qualifies its columns with the table name, so no alias here.
@@ -32,9 +33,26 @@ pub(crate) fn classifier_sql() -> String {
 
 pub(crate) const JUDGE_SQL: &str =
     "SELECT jv.latency_ms, jv.input_tokens, jv.cost_usd, jv.error IS NOT NULL AS errored,
-        jv.enforced, jv.band, jv.human_verdict
+        jv.enforced
    FROM judge_verdicts jv LEFT JOIN runs r ON r.id = jv.run_id
   WHERE jv.created_at >= ?1 AND jv.created_at < ?2 AND (?3 IS NULL OR r.project_id = ?3)";
+
+/// The judge's agreement with a person over the window, in the unit the promotion gate counts in:
+/// distinct actions `(tool_name, tool_input_digest)`, by `band`. The arithmetic is
+/// `judge::review`'s `READINESS_SELECT` itself - one fragment for both callers, so this figure and
+/// D11's `readiness_on` cannot drift - and only the window and the project filter are added. The
+/// opposite-band check inside the fragment looks at the project's whole history, as the gate does.
+/// The key does not carry the project, so with no project filter an identical action in two
+/// projects is one action.
+pub(crate) fn judge_agreement_sql() -> String {
+    format!(
+        "SELECT {READINESS_SELECT}
+           FROM judge_verdicts jv LEFT JOIN runs r ON r.id = jv.run_id
+          WHERE jv.human_verdict IS NOT NULL
+            AND jv.created_at >= ?1 AND jv.created_at < ?2
+            AND (?3 IS NULL OR r.project_id = ?3)"
+    )
+}
 
 /// No fixed list of statuses: only `pending` is confirmed, so the page shows whatever comes.
 pub(crate) const REFUSED_SQL: &str = "SELECT status, COUNT(*) FROM proposals
@@ -54,15 +72,22 @@ pub struct ClassAgreement {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Judge {
+    /// Verdicts in the window, one per consultation.
     pub n: i64,
-    /// Verdicts a person has judged.
+    /// Distinct actions a person has judged (not verdict rows): the unit of `agree`.
     pub reviewed: i64,
     pub latency_ms: Dist,
     pub input_tokens: i64,
     pub cost_usd: f64,
     pub error_rate: Option<f64>,
     pub enforced_share: Option<f64>,
+    /// The judge's opinion against the person's, per distinct action; a capped allow counts as an
+    /// allow. See [`judge_agreement_sql`].
     pub agree: Option<f64>,
+    /// What `agree` compares: the judge's `band`, not the decision that finally took effect.
+    pub basis: &'static str,
+    /// What `agree` and `reviewed` count: distinct actions, as the promotion gate does.
+    pub unit: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -85,40 +110,27 @@ struct JudgeRow {
     cost_usd: f64,
     errored: i64,
     enforced: i64,
-    band: Option<String>,
-    human_verdict: Option<String>,
 }
 
-/// The judge's opinion against a person's: `band` allow with approve, or deny with reject. Same
-/// rule as the judge review's own readiness (`judge/review.rs`, D11) - the band, not the effect
-/// (`final_decision`), so a capped allow does not count as a disagreement.
-/// `final_decision` is also recorded before the hook's unattended/DontAsk conversions (`judge.rs`
-/// `VerdictRow`), so it is not the decision the run finally received either.
-fn judge_agrees(row: &JudgeRow) -> bool {
-    matches!(
-        (row.band.as_deref(), row.human_verdict.as_deref()),
-        (Some("allow"), Some("approve")) | (Some("deny"), Some("reject"))
-    )
-}
-
-/// PURE: the judge figures from the window's verdicts.
-fn judge_block(rows: &[JudgeRow]) -> Judge {
+/// PURE: the judge figures from the window's verdicts, plus `(reviewed, agreeing)` distinct
+/// actions from [`judge_agreement_sql`]. The agreement rule is the band, not the effect
+/// (`final_decision`), so a capped allow does not count as a disagreement; `final_decision` is
+/// also recorded before the hook's unattended/DontAsk conversions (`judge.rs` `VerdictRow`), so it
+/// is not the decision the run finally received either.
+fn judge_block(rows: &[JudgeRow], reviewed: i64, agreeing: i64) -> Judge {
     let n = rows.len() as i64;
-    let reviewed: Vec<&JudgeRow> = rows
-        .iter()
-        .filter(|row| row.human_verdict.is_some())
-        .collect();
-    let agreeing = reviewed.iter().filter(|row| judge_agrees(row)).count() as i64;
     let flagged = |keep: fn(&JudgeRow) -> bool| rows.iter().filter(|row| keep(row)).count() as i64;
     Judge {
         n,
-        reviewed: reviewed.len() as i64,
+        reviewed,
         latency_ms: stats::dist(rows.iter().filter_map(|row| row.latency_ms).collect()),
         input_tokens: rows.iter().filter_map(|row| row.input_tokens).sum(),
         cost_usd: rows.iter().map(|row| row.cost_usd).sum(),
         error_rate: stats::ratio(flagged(|row| row.errored != 0), n),
         enforced_share: stats::ratio(flagged(|row| row.enforced != 0), n),
-        agree: stats::ratio(agreeing, reviewed.len() as i64),
+        agree: stats::ratio(agreeing, reviewed),
+        basis: "band",
+        unit: "action",
     }
 }
 
@@ -128,8 +140,8 @@ pub(crate) async fn read(
     window: Window,
 ) -> sqlx::Result<Autopilot> {
     // `AssertSqlSafe` because the text is built at run time. Safe by construction: the only
-    // interpolated fragment is the private `AGREE_CASE` const, and the project stays a bound
-    // parameter, as in `governance::shadow::scoreboard`.
+    // interpolated fragments are the `AGREE_CASE` and `READINESS_SELECT` consts, and the project
+    // stays a bound parameter, as in `governance::shadow::scoreboard`.
     let classes: Vec<(String, i64, i64, i64)> =
         sqlx::query_as(sqlx::AssertSqlSafe(classifier_sql()))
             .bind(window.from_bound())
@@ -143,6 +155,13 @@ pub(crate) async fn read(
         .bind(project)
         .fetch_all(pool)
         .await?;
+    let (reviewed, agreeing): (i64, i64) =
+        sqlx::query_as(sqlx::AssertSqlSafe(judge_agreement_sql()))
+            .bind(window.from_bound())
+            .bind(window.to_bound())
+            .bind(project)
+            .fetch_one(pool)
+            .await?;
     let refused: Vec<(String, i64)> = sqlx::query_as(REFUSED_SQL)
         .bind(window.from_bound())
         .bind(window.to_bound())
@@ -160,7 +179,7 @@ pub(crate) async fn read(
                 pending,
             })
             .collect(),
-        judge: judge_block(&judge),
+        judge: judge_block(&judge, reviewed, agreeing),
         refused_actions: Refused {
             total: refused.iter().map(|(_, count)| count).sum(),
             by_status: refused.into_iter().collect(),
@@ -218,16 +237,22 @@ mod tests {
     );
 
     async fn verdict(pool: &SqlitePool, created: &str, v: Verdict) {
+        verdict_of(pool, created, "d", v).await;
+    }
+
+    /// [`verdict`] of the action `('Write', digest)`.
+    async fn verdict_of(pool: &SqlitePool, created: &str, digest: &str, v: Verdict) {
         let (run_id, band, human, latency, tokens, cost, error, enforced) = v;
         sqlx::query(
             "INSERT INTO judge_verdicts (run_id, tool_name, tool_input_digest, action_class,
                                          classifier_decision, judge, model, questions_version,
                                          band, final_decision, enforced, latency_ms,
                                          input_tokens, cost_usd, error, human_verdict, created_at)
-             VALUES (?, 'Write', 'd', 'fs.write', 'allow', 'observe', 'm', 1,
+             VALUES (?, 'Write', ?, 'fs.write', 'allow', 'observe', 'm', 1,
                      ?, 'allow', ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(run_id)
+        .bind(digest)
         .bind(band)
         .bind(enforced)
         .bind(latency)
@@ -321,9 +346,11 @@ mod tests {
             (b, Some("allow"), None, Some(200), Some(30), 0.3, None, 1),
             (b, None, None, None, None, 0.0, Some("timeout"), 0),
         ];
-        for row in rows {
-            verdict(&pool, created, row).await;
-        }
+        // Two different actions: the allow and the deny are not one inconsistent action.
+        verdict_of(&pool, created, "d", rows[0]).await;
+        verdict_of(&pool, created, "e", rows[1]).await;
+        verdict_of(&pool, created, "d", rows[2]).await;
+        verdict_of(&pool, created, "d", rows[3]).await;
         // Outside the window: not counted.
         let old = (
             a,
@@ -339,6 +366,7 @@ mod tests {
 
         let judge = window_read(&pool, None).await.judge;
         assert_eq!((judge.n, judge.reviewed), (4, 2));
+        assert_eq!((judge.basis, judge.unit), ("band", "action"));
         let latency = (
             judge.latency_ms.p50,
             judge.latency_ms.p95,
@@ -349,11 +377,116 @@ mod tests {
         assert!(close(judge.cost_usd, 0.6), "{judge:?}");
         assert_eq!(judge.error_rate, Some(0.25));
         assert_eq!(judge.enforced_share, Some(0.25));
-        // The allow was approved and the deny was approved too: one agreement of two reviewed.
+        // The allow was approved and the deny was approved too: one agreement of two reviewed
+        // actions.
         assert_eq!(judge.agree, Some(0.5));
 
         let only_b = window_read(&pool, Some("b")).await.judge;
         assert_eq!((only_b.n, only_b.reviewed, only_b.agree), (2, 0, None));
+    }
+
+    /// One verdict row of the action `('Write', digest)` with every column agreement reads.
+    async fn action_verdict(
+        pool: &SqlitePool,
+        run_id: i64,
+        digest: &str,
+        (band, capped, final_decision, human): (&str, i64, &str, Option<&str>),
+    ) {
+        sqlx::query(
+            "INSERT INTO judge_verdicts (run_id, tool_name, tool_input_digest, action_class,
+                                         classifier_decision, judge, model, questions_version,
+                                         band, capped, final_decision, human_verdict, created_at)
+             VALUES (?, 'Write', ?, 'fs.write', 'allow', 'observe', 'm', 1,
+                     ?, ?, ?, ?, '2026-10-16T10:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(digest)
+        .bind(band)
+        .bind(capped)
+        .bind(final_decision)
+        .bind(human)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// D11 measures the judge's opinion, not its effect: an allow the cap turned into a question
+    /// still agrees with a person who approved it.
+    #[tokio::test]
+    async fn a_capped_allow_counts_as_an_agreeing_allow() {
+        let pool = crate::testdb::fresh_pool().await;
+        let a = run(&pool, "a").await;
+        action_verdict(
+            &pool,
+            a,
+            "x",
+            ("allow", 1, "pending_approval", Some("approve")),
+        )
+        .await;
+
+        let judge = window_read(&pool, None).await.judge;
+        assert_eq!((judge.reviewed, judge.agree), (1, Some(1.0)));
+    }
+
+    /// The gate's unit is the distinct action: a repeat adds no evidence, reviewed or not.
+    #[tokio::test]
+    async fn two_rows_of_one_action_count_as_one_reviewed_action() {
+        let pool = crate::testdb::fresh_pool().await;
+        let a = run(&pool, "a").await;
+        action_verdict(&pool, a, "x", ("allow", 0, "allow", Some("approve"))).await;
+        action_verdict(&pool, a, "x", ("allow", 0, "allow", None)).await;
+        action_verdict(&pool, a, "x", ("allow", 0, "allow", Some("approve"))).await;
+
+        let judge = window_read(&pool, None).await.judge;
+        assert_eq!(judge.n, 3);
+        assert_eq!((judge.reviewed, judge.agree), (1, Some(1.0)));
+    }
+
+    /// Fail-closed, as the gate: an action the judge answered in both decisive bands never agrees,
+    /// whichever of its rows the person happened to answer.
+    #[tokio::test]
+    async fn an_action_with_an_allow_and_a_deny_never_agrees() {
+        let pool = crate::testdb::fresh_pool().await;
+        let a = run(&pool, "a").await;
+        action_verdict(&pool, a, "x", ("allow", 0, "allow", Some("approve"))).await;
+        action_verdict(&pool, a, "x", ("deny", 0, "deny", None)).await;
+
+        let judge = window_read(&pool, None).await.judge;
+        assert_eq!((judge.reviewed, judge.agree), (1, Some(0.0)));
+    }
+
+    /// The figure is the promotion gate's, windowed: over data wholly inside the window, the same
+    /// project gets the same reviewed count and the same agreement from both.
+    #[tokio::test]
+    async fn the_figure_equals_the_promotion_gates_readiness() {
+        let pool = crate::testdb::fresh_pool().await;
+        let a = run(&pool, "a").await;
+        let b = run(&pool, "b").await;
+        let rows = [
+            (a, "1", ("allow", 0, "allow", Some("approve"))),
+            (a, "1", ("allow", 0, "allow", Some("approve"))),
+            (a, "2", ("allow", 1, "pending_approval", Some("approve"))),
+            (a, "3", ("deny", 0, "deny", Some("approve"))),
+            (a, "4", ("deny", 0, "deny", Some("reject"))),
+            (a, "5", ("allow", 0, "allow", Some("approve"))),
+            (a, "5", ("deny", 0, "deny", None)),
+            (a, "6", ("allow", 0, "allow", None)),
+            // Another project: neither the gate's nor the figure's.
+            (b, "7", ("deny", 0, "deny", Some("approve"))),
+        ];
+        for (run_id, digest, columns) in rows {
+            action_verdict(&pool, run_id, digest, columns).await;
+        }
+
+        let gate = crate::judge::readiness(&pool, "a").await.unwrap();
+        assert_eq!((gate.reviewed, gate.agree), (5, 3));
+        let judge = window_read(&pool, Some("a")).await.judge;
+        assert_eq!(judge.reviewed, gate.reviewed);
+        let agree = judge.agree.unwrap();
+        assert!(
+            close(agree, gate.agree as f64 / gate.reviewed as f64),
+            "{judge:?}"
+        );
     }
 
     /// Spec §11: refused actions by whatever statuses exist, no fixed list.
