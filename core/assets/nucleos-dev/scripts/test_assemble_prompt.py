@@ -112,6 +112,21 @@ class AssemblePrompt(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("project.json", r.stderr)
 
+    def test_bootstrap_runs_before_project_yaml_exists(self):
+        # Bootstrap is the phase that writes project.yaml, so a fresh project has none yet.
+        shutil.copytree(BUNDLE / ".claude" / "skills" / "bootstrap", self.root / ".claude" / "skills" / "bootstrap")
+        (self.state / "project.yaml").unlink()
+        r = self.run_script(phase="bootstrap")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        manifest = json.loads((self.state / "prompts" / "t1-bootstrap-1.manifest.json").read_text(encoding="utf-8"))
+        self.assertNotIn("project_yaml", manifest["prompt_sections"])
+
+    def test_a_missing_project_yaml_still_stops_a_phase_that_reads_it(self):
+        (self.state / "project.yaml").unlink()
+        r = self.run_script("--packet", ".nucleos/workflow/packets/execute.md", "--memory-tags", "workflow")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("project.yaml", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
